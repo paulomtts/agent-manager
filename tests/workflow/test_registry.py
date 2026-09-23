@@ -96,12 +96,13 @@ def test_default_registry_holds_exactly_the_names_task_yaml_uses() -> None:
     assert BUILTIN_FUNCTION_NAMES == TASK_YAML_NAMES
 
 
-def test_default_registry_resolves_the_four_reducers_to_the_real_callables() -> None:
+def test_default_registry_resolves_the_five_reducers_to_the_real_callables() -> None:
     registry = default_registry()
     assert registry.resolve("exploration_output_gate") is reducers.exploration_output_gate
     assert registry.resolve("verification_gate") is reducers.verification_gate
     assert registry.resolve("review_gate") is reducers.review_gate
     assert registry.resolve("plan_hash_gate") is reducers.plan_hash_gate
+    assert registry.resolve("verification_passed_gate") is reducers.verification_passed_gate
 
 
 def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> None:
@@ -115,7 +116,7 @@ def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> 
 
 def test_placeholders_resolve_at_load_time_and_raise_when_called() -> None:
     registry = default_registry()
-    for name in ("rollup.set_status", "critic_blockers_gate", "verification_passed_gate"):
+    for name in ("rollup.set_status", "critic_blockers_gate"):
         fn = registry.resolve(name)
         with pytest.raises(NotImplementedError) as caught:
             fn()

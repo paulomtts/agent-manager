@@ -19,6 +19,7 @@ from agent_manager.steps.reducers import (
     plan_hash_mismatch,
     review_gate,
     verification_gate,
+    verification_passed_gate,
 )
 
 
@@ -540,3 +541,29 @@ def test_the_wrapper_returns_none_or_a_detail_verdict():
     assert gate["detail"] == plan_hash_mismatch("a1b2c3d4", "ffffffff")
     # task.js only logs the drift (line 833); the stop is review_gate's.
     assert "blocked" not in gate
+
+
+def test_verification_passed_gate_passes_a_green_suite():
+    assert verification_passed_gate({"passed": True, "verified": [], "detail": ""}) is None
+
+
+def test_verification_passed_gate_blocks_a_red_suite_and_carries_its_detail():
+    verdict = verification_passed_gate(
+        {"passed": False, "verified": [], "detail": "verification failed: uv run pytest — 1 failed"}
+    )
+    assert verdict["blocked"] == "verification"
+    assert "1 failed" in verdict["detail"]
+
+
+def test_verification_passed_gate_blocks_a_truthy_stand_in_for_passed():
+    """Strict identity, like `verification_gate`'s opt-out: a step that reported
+    `passed: "yes"` has not told us the suite was green, it has told us it is
+    broken."""
+    verdict = verification_passed_gate({"passed": "yes", "verified": [], "detail": ""})
+    assert verdict["blocked"] == "verification"
+
+
+def test_verification_passed_gate_blocks_anything_that_is_not_a_result_mapping():
+    verdict = verification_passed_gate(None)
+    assert verdict["blocked"] == "verification"
+    assert "no verification result" in verdict["detail"]

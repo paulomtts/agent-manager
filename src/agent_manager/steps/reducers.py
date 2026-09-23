@@ -292,3 +292,35 @@ def exploration_output_gate(
             f"command: {_json(full_suite)}"
         }
     return None
+
+
+# The `verify` phase's gate (`builtin/task.yaml`). `verify.run_suite` reports
+# what happened and judges nothing -- it returns `passed: false` for a red
+# command and raises `VerifyError` only for a command it could not launch at
+# all. Something has to turn "red" into a stop, and doing it here rather than
+# inside the step keeps the one rule in one place, the way `review_gate` owns
+# the dirty-worktree rule. Identity on `True`, for the same reason
+# `verification_gate`'s opt-out uses it: a step that answered `passed: "yes"`
+# is broken, and reading that as green would ship unverified work.
+def verification_passed_gate(result: object) -> dict[str, str] | None:
+    """``None`` when the suite really passed, else a blocked verdict."""
+    if not isinstance(result, Mapping):
+        return {
+            "blocked": "verification",
+            "detail": (
+                "no verification result to judge: the verify step returned "
+                f"{_js_text(result)} instead of a result mapping, so nothing "
+                "established that this subtask's tests are green."
+            ),
+        }
+    if result.get("passed") is True:
+        return None
+    detail = str(result.get("detail") or "").strip()
+    return {
+        "blocked": "verification",
+        "detail": detail
+        or (
+            "the verification suite did not pass and reported no detail "
+            f"(result: {_json(dict(result))})"
+        ),
+    }

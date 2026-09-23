@@ -337,6 +337,7 @@ def run_subtask(
     commands: Sequence[str] = (),
     card: models.Card | None = None,
     parent_story: models.Card | None = None,
+    extra_context: Mapping[str, Any] | None = None,
     agent_runner: AgentPhaseRunner | None = None,
     start_phase: str | None = None,
     clock: Clock = _utcnow,
@@ -345,11 +346,29 @@ def run_subtask(
 
     `story_id` is the caller's: `Store.record_phase` and `Store.record_subtask`
     are both keyed by it, and nothing in a subtask knows its story.
+
+    `extra_context` is the caller's half of the binding table (§12): the shipped
+    `builtin/task.yaml` gates on `verification_gate(suite_cmds,
+    allow_no_verification, caller_provided)` and `exploration_output_gate(explore,
+    provided_verification)`, and `subtask_context` is a fixed table that holds
+    none of those names. Rather than teach this module about a particular
+    document's gates, the caller supplies them. Reserved keys are refused: a
+    caller that could overwrite `worktree` would point every later step at a
+    path the engine never derived.
     """
     index = _start_index(workflow, start_phase)
     context = subtask_context(
         subtask, repo_dir, commands, card=card, parent_story=parent_story
     )
+    if extra_context:
+        reserved = sorted(set(extra_context) & set(RESERVED_CONTEXT_KEYS))
+        if reserved:
+            raise EngineError(
+                "extra_context supplies "
+                f"{', '.join(repr(key) for key in reserved)}, which the engine owns "
+                f"(reserved: {', '.join(RESERVED_CONTEXT_KEYS)})"
+            )
+        context.update(extra_context)
     context.update(_document_paths(workflow, card))
     summary = SubtaskSummary()
 
