@@ -1473,8 +1473,7 @@ def test_document_paths_are_bound_from_the_writes_templates(store):
         subtask=_subtask(),
         repo_dir=REPO,
         card=CARD,
-        # `*args` so this test is indifferent to the seam Task 7 widens.
-        agent_runner=lambda *args: {},
+        agent_runner=lambda phase, context, rendered: {},
     )
 
     assert seen == {"spec_path": SPEC_PATH, "plan_path": PLAN_PATH}
@@ -1740,3 +1739,47 @@ phases:
     assert summary.results["spec_path"] == {"not": "a path"}
     assert dict(recorded["implement"].sections)["spec_path"] == SPEC_PATH
     assert seen["spec_path"] == SPEC_PATH
+
+
+RESERVED_DETAILS = """
+name: reserved-details
+phases:
+  - name: card_details
+    kind: deterministic
+    run: step.collide
+  - name: parent_story_details
+    kind: deterministic
+    run: step.collide
+  - name: explore
+    kind: agent
+    role: explorer
+    inputs: [card, parent_story]
+"""
+
+
+def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(store):
+    """The membership check above is only a constant; this is the behaviour it buys.
+
+    A document is free to name a phase `card_details`, and its result must not
+    become what the next phase's `card` input renders.
+    """
+    recorded: dict[str, Any] = {}
+    workflow = _workflow(RESERVED_DETAILS, {"step.collide": lambda card: {"not": "a card"}})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=_recording_runner(recorded),
+    )
+
+    assert summary.results["card_details"] == {"not": "a card"}
+    sections = dict(recorded["explore"].sections)
+    assert json.loads(sections["card"])["title"] == "Resolve phase inputs"
+    assert json.loads(sections["parent_story"])["title"] == (
+        "The workflow document and the engine"
+    )

@@ -46,7 +46,14 @@ RESERVED_CONTEXT_KEYS = (
     "spec_path",
     "plan_path",
 )
-"""The context keys the engine itself sets, and no phase result may replace.
+"""The context keys the engine owns, and no phase result may replace.
+
+`subtask_context` always sets all but `spec_path` and `plan_path`; those two are
+set by `_document_paths` only when some agent phase in the document declares
+them as inputs. Reserved either way: a key the engine may set is a key a phase
+result must never take over, whether this particular document made it appear or
+not.
+
 
 Named as a constant because phase results land in the same mapping under the
 phase's name: a phase called `worktree` -- the shipped `builtin/task.yaml`
