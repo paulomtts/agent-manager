@@ -12,7 +12,9 @@ other place to be tested.
 
 import math
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -91,6 +93,37 @@ def test_a_timeout_kills_the_child_and_returns_a_value(tmp_path):
     assert "before the sleep" in log.read_text()
     # The kill actually happened -- we did not just wait out the 30s sleep.
     assert outcome.duration < 20.0
+
+
+def test_a_timeout_kills_the_processes_the_child_started(tmp_path):
+    # A harness is itself a process launcher. Killing only the direct child
+    # leaves its workers running against the worktree the run is about to
+    # reuse, still burning tokens, and still holding the attempt log open --
+    # exactly the wedged state the timeout exists to end.
+    log = tmp_path / "stdout.log"
+    child = (
+        "import subprocess, sys, time; "
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "print(g.pid, flush=True); "
+        "time.sleep(60)"
+    )
+    outcome = launcher.run_direct(
+        [sys.executable, "-c", child],
+        cwd=tmp_path,
+        timeout=2.0,
+        stdout_path=log,
+    )
+    assert outcome.timed_out is True
+    grandchild = int(log.read_text().split()[0])
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(grandchild, signal.SIGKILL)
+    pytest.fail(f"process {grandchild} outlived the launcher's timeout kill")
 
 
 def test_the_child_runs_in_the_cwd_it_was_given(tmp_path):

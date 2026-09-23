@@ -20,6 +20,7 @@ cannot change.
 """
 
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -60,6 +61,25 @@ class LauncherFn(Protocol):
         timeout: float,
         stdout_path: Path,
     ) -> Outcome: ...
+
+
+def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the timed-out process and everything it started.
+
+    A harness spawns workers of its own, and killing only the process we
+    spawned leaves them running against the worktree the next attempt reuses,
+    still writing into the log we are about to close. `run_direct` puts the
+    child in its own session, so the whole tree is one process group.
+
+    The group can already be gone -- the child may exit between the timeout
+    firing and the signal -- which is not an error. `process.wait()` still
+    runs, so the wait status is collected and nothing is left a zombie.
+    """
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
+    process.wait()
 
 
 def run_direct(
@@ -106,15 +126,15 @@ def run_direct(
             stdin=devnull,
             stdout=log,
             stderr=subprocess.STDOUT,
+            # Its own session, so the timeout can kill the whole tree below it
+            # and not just the process we spawned.
+            start_new_session=True,
         )
         try:
             exit_code: int | None = process.wait(timeout=timeout)
             timed_out = False
         except subprocess.TimeoutExpired:
-            process.kill()
-            # Reap it, so the wait status is collected and the log file has no
-            # writer left when we close it.
-            process.wait()
+            _kill_tree(process)
             exit_code = None
             timed_out = True
 
