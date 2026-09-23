@@ -22,11 +22,13 @@ repo docs a `repo_docs` input asks for, and the only file written is the
 """
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from agent_manager import dag, models
 from agent_manager.errors import EngineError
 from agent_manager.workflow.loader import AgentPhase
 
@@ -137,6 +139,8 @@ _TABLE: dict[str, Resolver] = {
     "parent_story": _inline_json("parent_story_details", allow_empty=True),
     "explore": _inline_json("explore"),
     "verification": _inline_json("commands"),
+    "spec_path": _verbatim("spec_path"),
+    "plan_path": _verbatim("plan_path"),
     "branch": _verbatim("branch"),
     "base_branch": _verbatim("base"),
 }
@@ -174,3 +178,39 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
 def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
+
+
+_PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
+
+
+def expand_writes(
+    template: str, card: models.Card, *, phase: str, input_name: str
+) -> str:
+    """The repo-relative path a phase's `writes:` template names, for one card.
+
+    `{stem}` is the only placeholder, and `dag.task_stem` is the only thing that
+    fills it: the stem is the load-bearing short card id plus a slug of the
+    title, and every other derived name in the program comes from the same
+    function. An unknown placeholder is a document bug, not something to leave
+    literal in a path an agent is told to write to.
+    """
+    unknown = sorted({found for found in _PLACEHOLDER.findall(template) if found != "stem"})
+    if unknown:
+        raise EngineError(
+            f"the writes template {template!r} uses "
+            f"{', '.join(repr(name) for name in unknown)}; the only placeholder this "
+            "engine expands is {stem}",
+            phase=phase,
+            parameter=input_name,
+        )
+    expanded = template.replace("{stem}", dag.task_stem(card))
+    parts = PurePosixPath(expanded)
+    if parts.is_absolute() or ".." in parts.parts:
+        raise EngineError(
+            f"the writes template {template!r} resolves to {expanded!r}, which leaves "
+            "the worktree; a document-path input must name a file inside the worktree "
+            "the agent runs in",
+            phase=phase,
+            parameter=input_name,
+        )
+    return expanded

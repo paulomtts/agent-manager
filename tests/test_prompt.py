@@ -194,3 +194,50 @@ def test_a_card_input_on_a_context_with_no_card_details_is_named_as_such():
     assert caught.value.parameter == "card"
     assert "never populated" in str(caught.value)
     assert "card_details" in str(caught.value)
+
+
+def test_spec_path_and_plan_path_render_as_the_path_alone(tmp_path):
+    """§7: documents are passed by path. The file's contents must not leak in."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("SENTINEL-DO-NOT-INLINE\n", encoding="utf-8")
+
+    rendered = prompt.render_prompt(
+        _phase(["spec_path", "plan_path"]),
+        _context(spec_path=str(spec_file), plan_path="docs/superpowers/plans/x.md"),
+    )
+
+    assert _section(rendered, "spec_path") == str(spec_file)
+    assert _section(rendered, "plan_path") == "docs/superpowers/plans/x.md"
+    assert "SENTINEL-DO-NOT-INLINE" not in rendered.text
+
+
+def test_expand_writes_substitutes_the_dag_task_stem():
+    expanded = prompt.expand_writes(
+        "docs/superpowers/specs/{stem}.md", CARD, phase="spec", input_name="spec_path"
+    )
+
+    assert expanded == f"docs/superpowers/specs/{dag.task_stem(CARD)}.md"
+    assert expanded == "docs/superpowers/specs/resolve-phase-inputs-968fba15.md"
+
+
+def test_expand_writes_refuses_a_placeholder_it_does_not_know():
+    with pytest.raises(EngineError) as caught:
+        prompt.expand_writes(
+            "docs/{kind}/{stem}.md", CARD, phase="spec", input_name="spec_path"
+        )
+
+    assert caught.value.phase == "spec"
+    assert caught.value.parameter == "spec_path"
+    assert "'kind'" in str(caught.value)
+    assert "{stem}" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "template", ["../{stem}.md", "/etc/{stem}.md", "docs/../../{stem}.md"]
+)
+def test_expand_writes_refuses_a_template_that_leaves_the_worktree(template):
+    """Review Focus: a document path input must name a file inside the worktree."""
+    with pytest.raises(EngineError) as caught:
+        prompt.expand_writes(template, CARD, phase="spec", input_name="spec_path")
+
+    assert "leaves the worktree" in str(caught.value)
