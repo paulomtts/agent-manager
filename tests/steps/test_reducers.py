@@ -243,3 +243,80 @@ def test_an_empty_caller_provided_mapping_takes_the_plausibility_branch():
     assert exploration_output_gate(explore_ok, {}) is None
     explore_bad = {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["a"]}}
     assert "implausible command" in exploration_output_gate(explore_bad, {})["detail"]
+
+
+# ── count_of ─────────────────────────────────────────────────────────────────
+# No JS counterpart: Python's coercions are looser than JS's, so the port needs
+# its own pins. task.js lines 79-89 explain why "unusable" must never collapse
+# to zero — a Review that reported no count at all would otherwise be judged as
+# having found ZERO COMMITS and stop the run blaming Implement.
+
+import math
+
+from agent_manager.steps.reducers import count_of
+from agent_manager.steps.reducers import _is_integer, _js_text
+
+
+@pytest.mark.parametrize(("value", "expected"), [(3, 3), (0, 0), (-2, -2), (1.5, 1.5)])
+def test_a_real_number_is_returned_as_is(value, expected):
+    assert count_of(value) == expected
+
+
+@pytest.mark.parametrize("text", ["3", " 3 ", "3.0", "+3", "1e3", "\t3\n"])
+def test_a_numeric_string_is_parsed(text):
+    assert _is_integer(count_of(text))
+
+
+def test_a_numeric_string_parses_to_its_value():
+    assert count_of("3") == 3
+    assert count_of(" 3 ") == 3
+    assert count_of("1e3") == 1000
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "   ", "three", [], {}, object(), b"3", 3j]
+)
+def test_an_unusable_value_is_not_a_number_and_not_zero(value):
+    result = count_of(value)
+    assert math.isnan(result)
+    assert result != 0
+    assert not _is_integer(result)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_a_bool_is_not_a_count(value):
+    # typeof true !== 'number' in JS, but bool is an int subclass in Python.
+    # Reading True as 1 would invent a commit that nobody counted.
+    assert math.isnan(count_of(value))
+    assert not _is_integer(count_of(value))
+
+
+@pytest.mark.parametrize("text", ["1_0", "٣", "inf", "Infinity", "nan", "0x10", "1,0"])
+def test_a_python_only_numeric_spelling_is_unusable(text):
+    # Python's float()/int() accept all of these; JS Number() returns NaN for
+    # every one. Accepting them would read garbage as a real count.
+    assert math.isnan(count_of(text))
+
+
+def test_is_integer_matches_number_is_integer():
+    assert _is_integer(3)
+    assert _is_integer(3.0)
+    assert _is_integer(-0.0)
+    assert not _is_integer(1.5)
+    assert not _is_integer(math.nan)
+    assert not _is_integer(math.inf)
+    assert not _is_integer(True)
+    assert not _is_integer("3")
+    assert not _is_integer(None)
+
+
+def test_js_text_renders_values_the_way_a_template_literal_does():
+    assert _js_text(None) == "null"
+    assert _js_text(True) == "true"
+    assert _js_text(False) == "false"
+    assert _js_text("three") == "three"
+    assert _js_text("") == ""
+    assert _js_text(3) == "3"
+    assert _js_text(3.0) == "3"
+    assert _js_text(1.5) == "1.5"
+    assert _js_text(math.nan) == "NaN"

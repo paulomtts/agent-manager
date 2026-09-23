@@ -13,6 +13,8 @@ to pass, or a verdict ``dict`` to fail.
 """
 
 import json
+import math
+import re
 from collections.abc import Mapping
 
 
@@ -79,6 +81,76 @@ def _json(value: object) -> str:
 def _field(mapping: object, name: str) -> object:
     """Read ``name`` off a mapping, or ``None`` if it is not a mapping at all."""
     return mapping.get(name) if isinstance(mapping, Mapping) else None
+
+
+# JS `Number()` accepts exactly this grammar for a decimal literal. Python's
+# float() is looser — it takes "1_0", "inf", "nan" and non-ASCII digits like
+# "٣" — so the string is screened first. [0-9] rather than \d on purpose:
+# \d matches Unicode digits that JS would reject.
+_JS_DECIMAL = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _js_number(text: str) -> float:
+    """Parse ``text`` the way JS ``Number()`` does, or ``nan`` if it would not."""
+    body = text.strip()
+    if not _JS_DECIMAL.fullmatch(body):
+        return math.nan
+    return float(body)
+
+
+def _is_integer(value: object) -> bool:
+    """The ``Number.isInteger`` equivalent: a real, finite, whole number."""
+    # bool first: it is an int subclass in Python, but not a number in JS.
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return value.is_integer()  # False for nan and inf
+    return False
+
+
+def _js_text(value: object) -> str:
+    """Render ``value`` as a JS template literal would, not as Python ``repr``.
+
+    ``None`` is "null", not "None"; ``True`` is "true", not "True"; a whole
+    float is "3", not "3.0". These strings go into operator-facing details, so
+    they must read as the harness JSON the numbers came from.
+    """
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    return _json(value)
+
+
+# Number() is too eager to be a validator here: Number(null) and Number('')
+# are both 0, so a Review that reported no count at all would be judged as
+# having found ZERO COMMITS and the run would stop claiming the implementation
+# produced nothing. That is a fabricated fact pinned on the wrong stage. An
+# absent count is unusable, not zero — only a real number, or a string holding
+# one, counts.
+def count_of(value: object) -> float | int:
+    """The reported count, or ``nan`` — never zero — when it is unusable."""
+    if isinstance(value, bool):
+        return math.nan
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str) and value.strip() != "":
+        return _js_number(value)
+    return math.nan
 
 
 def exploration_output_gate(
