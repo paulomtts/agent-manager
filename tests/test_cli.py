@@ -1237,12 +1237,22 @@ def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatc
     assert "canned gate failure" in envelope["data"]["detail"]
 
 
+def _fail_board_writes(monkeypatch) -> None:
+    def refuse(*args, **kwargs):
+        raise cli.board.BoardError("simulated board write failure")
+
+    monkeypatch.setattr(cli.board, "set_status", refuse)
+
+
 @requires_git
 @requires_brd
-def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
+def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
+    project, cards, monkeypatch
+):
     """§12: a run that says `done` while the card never moved is the exact
-    failure this list exists to prevent. `rollup.set_status` is still a registry
-    placeholder that raises, which is one honest way for the write to fail."""
+    failure this list exists to prevent. The board write is made to fail by
+    having `board.set_status` raise, which is one honest way for it to fail."""
+    _fail_board_writes(monkeypatch)
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -1258,11 +1268,14 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
 
 @requires_git
 @requires_brd
-def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, cards):
+def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
+    project, cards, monkeypatch
+):
     """`AgentRunner` collects gate warnings on itself (dispatch.py:375) because
     an `AgentPhaseRunner` returns a result and has no second channel. §12 forbids
     a run reporting a clean success while a gate warned, so the payload has to
     carry that list too -- not just `SubtaskSummary.warnings`."""
+    _fail_board_writes(monkeypatch)
 
     class WarningRunner:
         def __init__(self) -> None:
