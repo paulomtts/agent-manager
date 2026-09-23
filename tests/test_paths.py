@@ -166,3 +166,18 @@ def test_run_tree_never_lands_inside_a_worktree(monkeypatch, tmp_path):
     assert not run.is_relative_to(worktree)
     assert not attempt.is_relative_to(worktree)
     assert list(worktree.iterdir()) == []
+
+
+def test_attempt_dir_renders_attempt_as_plain_decimal(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    card_dir = paths.run_dir("run-abc") / "abc123"
+
+    assert paths.attempt_dir("run-abc", "abc123", "implement", 0) == (
+        card_dir / "implement.0"
+    )
+    assert paths.attempt_dir("run-abc", "abc123", "implement", 10) == (
+        card_dir / "implement.10"
+    )
+    assert paths.attempt_dir("run-abc", "abc123", "implement", 1) != paths.attempt_dir(
+        "run-abc", "abc123", "implement", 10
+    )
