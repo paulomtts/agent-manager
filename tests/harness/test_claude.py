@@ -14,6 +14,7 @@ test (§14 lines 489-490).
 import ast
 import tomllib
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -288,26 +289,83 @@ def test_crlf_line_endings_and_human_spelling_report_the_same_numbers():
     )
 
 
-def _imports() -> tuple[set[str], set[str]]:
-    source = Path(claude_module.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    plain: set[str] = set()
-    froms: set[str] = set()
-    for node in ast.walk(tree):
+def _imported_names(source: str) -> set[str]:
+    """Every module a source file imports, in every spelling it could use.
+
+    `import os.path`, `from os import execv` and `from agent_manager.harness
+    import launcher` all reach the same modules as the obvious spellings, so
+    every dotted prefix and every `from X import y` pair is reported. A guard
+    that only knew the obvious spelling would pass on the very rewrite it
+    exists to catch.
+    """
+    names: set[str] = set()
+
+    def add(dotted: str) -> None:
+        parts = dotted.split(".")
+        names.update(".".join(parts[: i + 1]) for i in range(len(parts)))
+
+    for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
-            plain.update(alias.name for alias in node.names)
+            for alias in node.names:
+                add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            froms.add(node.module)
-    return plain, froms
+            add(node.module)
+            for alias in node.names:
+                add(f"{node.module}.{alias.name}")
+    return names
+
+
+FORBIDDEN_IMPORTS = frozenset(
+    {"subprocess", "os", "shutil", "signal", "agent_manager.harness.launcher"}
+)
+"""Everything that could start, find or signal a process from inside the
+adapter. `agent_manager.harness.launcher` is listed because reaching the
+launcher directly defeats §14 line 485's injection just as thoroughly as
+`subprocess` would."""
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import subprocess",
+        "import os",
+        "import os.path",
+        "from os import execv",
+        "import subprocess as sp",
+        "from agent_manager.harness import launcher",
+        "from agent_manager.harness.launcher import run_direct",
+        "import agent_manager.harness.launcher as runner",
+        "import shutil",
+        "import signal",
+    ],
+)
+def test_the_import_guard_catches_every_spelling_of_launching(source):
+    # The guard below is only worth its line count if it fails on the rewrites
+    # a future edit would actually reach for, so each one is pinned here.
+    assert _imported_names(source) & FORBIDDEN_IMPORTS, source
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["import math", "import re", "from pydantic import ValidationError", ""],
+)
+def test_the_import_guard_clears_what_the_adapter_legitimately_needs(source):
+    # And it must not be a guard that rejects everything, which would pass the
+    # test above for the wrong reason.
+    assert not _imported_names(source) & FORBIDDEN_IMPORTS, source
 
 
 def test_the_adapter_launches_nothing_itself():
     # §14 line 485: the launcher is injected, and one launcher serves every
     # adapter. The moment this module can start a process, that stops being
     # true and every test above it starts spawning things.
-    plain, froms = _imports()
-    assert "subprocess" not in plain | froms
-    assert "os" not in plain | froms
-    assert "agent_manager.harness.launcher" not in froms
-    assert not hasattr(claude_module, "subprocess")
+    source = Path(claude_module.__file__).read_text(encoding="utf-8")
+    assert not _imported_names(source) & FORBIDDEN_IMPORTS
+    # Imports are the source-level half; these are the runtime half, catching a
+    # module pulled in under any alias by `importlib` or assigned after import.
+    for name, value in vars(claude_module).items():
+        assert not isinstance(value, ModuleType) or value.__name__ in {
+            "math",
+            "re",
+        }, name
     assert not hasattr(claude_module, "run_direct")
