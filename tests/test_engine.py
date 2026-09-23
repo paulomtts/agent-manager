@@ -781,3 +781,163 @@ def test_a_raising_when_fails_its_phase_rather_than_not_skipping(store):
     assert summary.failed_phase == "plan_check"
     assert "unreadable plan front matter" in summary.detail
     assert _projected_phases(store) == [("plan_check", "failed")]
+
+
+BEST_EFFORT = """
+name: board
+phases:
+  - name: mark_in_progress
+    kind: deterministic
+    run: rollup.set_status
+    args: { status: in_progress }
+    best_effort: true
+  - name: work
+    kind: deterministic
+    run: step.work
+  - name: mark_done
+    kind: deterministic
+    run: rollup.done
+    args: { status: done }
+    best_effort: true
+    gates: [done_gate]
+"""
+
+
+def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store):
+    calls: list[str] = []
+
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        calls.append(f"mark:{status}")
+        raise RuntimeError("brd exited 1: board is locked")
+
+    def work(card: str) -> dict[str, Any]:
+        calls.append("work")
+        return {}
+
+    def done(card: str, status: str) -> dict[str, Any]:
+        calls.append(f"done:{status}")
+        return {}
+
+    def done_gate(result: dict[str, Any]) -> None:
+        return None
+
+    workflow = _workflow(
+        BEST_EFFORT,
+        {
+            "rollup.set_status": set_status,
+            "step.work": work,
+            "rollup.done": done,
+            "done_gate": done_gate,
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["mark:in_progress", "work", "done:done"]
+    assert summary.status == "done"
+    assert summary.failed_phase is None
+    assert len(summary.warnings) == 1
+    assert "mark_in_progress" in summary.warnings[0]
+    assert "board is locked" in summary.warnings[0]
+    assert _projected_phases(store) == [
+        ("mark_in_progress", "failed"),
+        ("work", "done"),
+        ("mark_done", "done"),
+    ]
+    assert store.journal.read()[-1].payload["status"] == "done"
+
+
+def test_a_best_effort_phase_with_a_failing_gate_only_warns(store):
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        return {}
+
+    def work(card: str) -> dict[str, Any]:
+        return {}
+
+    def done(card: str, status: str) -> dict[str, Any]:
+        return {"moved": False}
+
+    def done_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"blocked": "board", "detail": "card is still in_progress"}
+
+    workflow = _workflow(
+        BEST_EFFORT,
+        {
+            "rollup.set_status": set_status,
+            "step.work": work,
+            "rollup.done": done,
+            "done_gate": done_gate,
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "done"
+    assert len(summary.warnings) == 1
+    assert "card is still in_progress" in summary.warnings[0]
+    assert _projected_phases(store)[-1] == ("mark_done", "failed")
+
+
+def test_a_best_effort_binding_failure_only_warns(store):
+    def set_status(card: str, status: str, missing_thing: str) -> dict[str, Any]:
+        return {}
+
+    def work(card: str) -> dict[str, Any]:
+        return {}
+
+    def done(card: str, status: str) -> dict[str, Any]:
+        return {}
+
+    def done_gate(result: dict[str, Any]) -> None:
+        return None
+
+    workflow = _workflow(
+        BEST_EFFORT,
+        {
+            "rollup.set_status": set_status,
+            "step.work": work,
+            "rollup.done": done,
+            "done_gate": done_gate,
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "done"
+    assert "missing_thing" in summary.warnings[0]
+
+
+def test_a_failed_best_effort_phase_contributes_no_result(store):
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        raise RuntimeError("board is locked")
+
+    def work(card: str) -> dict[str, Any]:
+        return {}
+
+    def done(card: str, status: str) -> dict[str, Any]:
+        return {}
+
+    def done_gate(result: dict[str, Any]) -> None:
+        return None
+
+    workflow = _workflow(
+        BEST_EFFORT,
+        {
+            "rollup.set_status": set_status,
+            "step.work": work,
+            "rollup.done": done,
+            "done_gate": done_gate,
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert set(summary.results) == {"work", "mark_done"}

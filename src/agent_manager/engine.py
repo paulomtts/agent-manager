@@ -278,6 +278,16 @@ def run_subtask(
         )
         summary.warnings.extend(outcome.warnings)
         if not outcome.ok:
+            if phase.best_effort:
+                # §12: the board write is the one thing allowed to fail quietly.
+                # Quietly in the *run*, not in the report -- a run that says
+                # `done` while the card never moved is the failure mode this
+                # warning exists to prevent.
+                summary.warnings.append(
+                    f"best-effort phase {phase.name!r} failed: {outcome.detail}"
+                )
+                index += 1
+                continue
             summary.status = "escalated"
             summary.failed_phase = phase.name
             summary.detail = outcome.detail
