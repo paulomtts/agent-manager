@@ -105,7 +105,6 @@ def test_a_phase_named_base_branch_cannot_overwrite_the_alias():
     assert context["base_branch"] == "m1/story-base"
 
 
-
 def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
     def step(branch: str, repo_dir: Path) -> dict[str, Any]:
         return {"branch": branch, "repo_dir": repo_dir}

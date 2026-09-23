@@ -1,5 +1,11 @@
 """Pure-functions tier (design spec §14): reads one packaged YAML file and
-resolves names against the default registry. Nothing is executed."""
+resolves names against the default registry.
+
+Nothing outside this process is touched -- no filesystem beyond the packaged
+YAML, no network, no git. The acceptance tests at the bottom of the file do
+*call* the resolved gates, against result models dumped in memory, because a
+gate that binds and returns the wrong verdict is the failure this file exists
+to catch."""
 
 import inspect
 from pathlib import Path
