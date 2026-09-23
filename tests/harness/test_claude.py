@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager.harness.base import HarnessAdapter
+from agent_manager.harness.base import HarnessAdapter, Usage
 from agent_manager.harness.claude import ClaudeAdapter
 from agent_manager.models import Dispatch
 from agent_manager.roles.loader import bundles_dir
@@ -179,3 +179,108 @@ def test_a_model_that_looks_like_a_flag_stays_its_own_argv_element():
     # out of, the argv -- argv elements are never re-split.
     argv = ClaudeAdapter().build_command(_dispatch(model="--help"))
     assert argv[:3] == ["claude", "--model", "--help"]
+
+
+FULL_LOG = (
+    "Reading the plan...\n"
+    "Running the test suite.\n"
+    '{"type":"result","subtype":"success","is_error":false,'
+    '"result":"implemented","total_cost_usd":0.3142,'
+    '"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,'
+    '"input_tokens":8123,"output_tokens":1544}}\n'
+)
+
+
+def test_a_full_usage_report_comes_back_whole():
+    assert ClaudeAdapter().parse_usage(FULL_LOG) == Usage(
+        tokens_in=8123, tokens_out=1544, cost=0.3142
+    )
+
+
+def test_a_log_with_no_usage_reports_nothing():
+    # D4: stdout is a log, not a channel. A usage-free log is a *successful*
+    # attempt, so this is None rather than an exception or a zeroed Usage.
+    adapter = ClaudeAdapter()
+    assert adapter.parse_usage("") is None
+    assert adapter.parse_usage("just some chatter\nand a traceback-ish line\n") is None
+
+
+def test_partial_reporting_yields_a_partial_usage():
+    usage = ClaudeAdapter().parse_usage(
+        '{"usage":{"input_tokens":12,"output_tokens":7}}\n'
+    )
+    assert usage == Usage(tokens_in=12, tokens_out=7)
+    assert usage.cost is None
+
+
+def test_the_last_report_wins():
+    # A log that reports twice is reporting cumulatively; the final line is the
+    # one that describes the whole run.
+    log = (
+        '{"usage":{"input_tokens":10,"output_tokens":2},"total_cost_usd":0.01}\n'
+        "...more work...\n"
+        '{"usage":{"input_tokens":90,"output_tokens":30},"total_cost_usd":0.25}\n'
+    )
+    assert ClaudeAdapter().parse_usage(log) == Usage(
+        tokens_in=90, tokens_out=30, cost=0.25
+    )
+
+
+def test_the_result_carries_no_key_outside_the_three():
+    # `Usage` is extra="forbid" and its names match Attempt's one for one, so
+    # the engine's journalling stays a copy, never a translation.
+    usage = ClaudeAdapter().parse_usage(FULL_LOG)
+    assert usage is not None
+    dumped = usage.model_dump()
+    assert set(dumped) == {"tokens_in", "tokens_out", "cost"}
+    assert Usage.model_validate(dumped) == usage
+
+
+@pytest.mark.parametrize(
+    ("log", "expected"),
+    [
+        ('{"usage":{"input_tokens":', None),
+        ('{"usage":{"input_tokens":-5,"output_tokens":7}}', Usage(tokens_out=7)),
+        ('{"usage":{"input_tokens":"many","output_tokens":7}}', Usage(tokens_out=7)),
+        ('{"input_tokens":4,"total_cost_usd":inf}', Usage(tokens_in=4)),
+        ('{"input_tokens":4,"total_cost_usd":nan}', Usage(tokens_in=4)),
+        ('{"total_cost_usd":-1.5}', None),
+        ("\x00\x01 binary noise \xff", None),
+    ],
+)
+def test_hostile_logs_never_raise(log, expected):
+    # A cosmetic change in another program's log must not fail an attempt that
+    # produced a valid result file -- every bad value is dropped, and dropping
+    # everything means None.
+    assert ClaudeAdapter().parse_usage(log) == expected
+
+
+def test_cache_counters_are_not_mistaken_for_the_prompt_size():
+    # `cache_creation_input_tokens` ends in `input_tokens`; a substring match
+    # would journal a cache counter as the prompt size.
+    log = (
+        '{"usage":{"cache_creation_input_tokens":4096,'
+        '"cache_read_input_tokens":2048,"output_tokens":11}}'
+    )
+    assert ClaudeAdapter().parse_usage(log) == Usage(tokens_out=11)
+
+
+def test_a_multi_megabyte_log_is_parsed_without_backtracking():
+    # A chatty agent run is routinely this big, and parse_usage sees the whole
+    # file once per attempt.
+    log = ("thinking about the plan, reading files, running tests\n" * 40_000) + FULL_LOG
+    assert len(log) > 2_000_000
+    assert ClaudeAdapter().parse_usage(log) == Usage(
+        tokens_in=8123, tokens_out=1544, cost=0.3142
+    )
+
+
+def test_crlf_line_endings_and_human_spelling_report_the_same_numbers():
+    crlf = FULL_LOG.replace("\n", "\r\n")
+    assert ClaudeAdapter().parse_usage(crlf) == Usage(
+        tokens_in=8123, tokens_out=1544, cost=0.3142
+    )
+    human = "Input tokens: 8,123\r\nOutput tokens: 1544\r\nCost: $0.3142\r\n"
+    assert ClaudeAdapter().parse_usage(human) == Usage(
+        tokens_in=8123, tokens_out=1544, cost=0.3142
+    )
