@@ -183,3 +183,199 @@ def test_a_role_with_no_default_model_for_the_harness_is_a_named_engine_error(tm
 
     assert caught.value.phase == "explore"
     assert "default model" in str(caught.value)
+
+
+import json
+from dataclasses import dataclass, field
+
+from pydantic import BaseModel, ConfigDict
+
+from agent_manager.harness.base import Outcome
+
+
+class FakeResult(BaseModel):
+    """The canned result model the fake phases in this file declare."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    ok: bool = True
+
+
+VALID_RESULT = json.dumps({"summary": "explored the tree", "ok": True})
+INVALID_RESULT = json.dumps({"ok": True})
+NOT_JSON = "I could not produce JSON, sorry."
+
+
+@dataclass
+class FakeLauncher:
+    """A `LauncherFn` double that writes canned files instead of running anything.
+
+    `results[i]` is attempt i+1's `result.json` text, or `None` to write no
+    result file at all; the last entry repeats for any further attempt.
+    """
+
+    results: list[str | None]
+    stdout: str = "usage: tokens\n"
+    exit_code: int | None = 0
+    timed_out: bool = False
+    calls: list[list[str]] = field(default_factory=list)
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        self.calls.append(list(argv))
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_text(self.stdout, encoding="utf-8")
+        canned = self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+        if canned is not None:
+            result_path = Path(argv[argv.index("--result") + 1])
+            result_path.write_text(canned, encoding="utf-8")
+        return Outcome(
+            argv=list(argv),
+            exit_code=self.exit_code,
+            timed_out=self.timed_out,
+            duration=1.25,
+            stdout_path=stdout_path,
+        )
+
+
+def _outcome(tmp_path: Path, *, exit_code: int | None = 0, timed_out: bool = False) -> Outcome:
+    log = tmp_path / "stdout.log"
+    log.write_text("usage: tokens\n", encoding="utf-8")
+    return Outcome(
+        argv=["fake-harness"],
+        exit_code=exit_code,
+        timed_out=timed_out,
+        duration=1.25,
+        stdout_path=log,
+    )
+
+
+def test_a_dispatch_points_at_the_attempt_directorys_result_file(data_home, tmp_path):
+    role = load_role("explorer", root=make_role(tmp_path / "bundles").parent)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    attempt = paths.attempt_dir(RUN_ID, CARD, "explore", 1)
+    prompt_path = _rendered().write(attempt)
+
+    built = dispatch.build_dispatch(
+        target=dispatch.Target(adapter=FakeAdapter(), model="fake-model"),
+        role=role,
+        cwd=worktree,
+        prompt_path=prompt_path,
+        attempt_dir=attempt,
+        timeout=90.0,
+    )
+
+    assert built.harness == "fake"
+    assert built.model == "fake-model"
+    assert built.role == "explorer"
+    assert built.cwd == worktree
+    assert built.prompt_path == attempt / "prompt.txt"
+    assert built.result_path == attempt / "result.json"
+    assert built.timeout == 90.0
+
+
+def test_a_valid_result_file_classifies_ok(data_home, tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(VALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, FakeResult)
+
+    assert verdict.status == "ok"
+    assert verdict.result == {"summary": "explored the tree", "ok": True}
+
+
+def test_a_result_that_fails_the_model_classifies_schema_invalid(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(INVALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, FakeResult)
+
+    assert verdict.status == "schema_invalid"
+    assert "summary" in verdict.detail
+
+
+def test_a_non_json_result_classifies_schema_invalid(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(NOT_JSON, encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, FakeResult)
+
+    assert verdict.status == "schema_invalid"
+    assert "not valid JSON" in verdict.detail
+
+
+def test_a_result_file_that_is_not_utf8_classifies_schema_invalid(tmp_path):
+    # Review Focus: a harness that writes latin-1 bytes must not crash the walk.
+    result = tmp_path / "result.json"
+    result.write_bytes(b'{"summary": "caf\xe9"}')
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, FakeResult)
+
+    assert verdict.status == "schema_invalid"
+    assert "UTF-8" in verdict.detail
+
+
+def test_a_phase_with_no_result_model_takes_the_json_object_as_its_result(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps({"anything": [1, 2]}), encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, None)
+
+    assert verdict.status == "ok"
+    assert verdict.result == {"anything": [1, 2]}
+
+
+def test_a_json_array_with_no_result_model_classifies_schema_invalid(tmp_path):
+    # Review Focus: later phases and every gate read a mapping; a list would
+    # bind as a phase result nothing downstream can read.
+    result = tmp_path / "result.json"
+    result.write_text("[1, 2, 3]", encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path), result, None)
+
+    assert verdict.status == "schema_invalid"
+    assert "JSON object" in verdict.detail
+
+
+def test_a_missing_result_file_after_exit_zero_classifies_harness_error(tmp_path):
+    verdict = dispatch.classify(_outcome(tmp_path), tmp_path / "absent.json", FakeResult)
+
+    assert verdict.status == "harness_error"
+    assert "no result file" in verdict.detail
+
+
+def test_a_non_zero_exit_classifies_harness_error(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(VALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path, exit_code=2), result, FakeResult)
+
+    assert verdict.status == "harness_error"
+    assert "exited 2" in verdict.detail
+
+
+def test_a_timeout_classifies_harness_error_and_never_reads_the_result(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(VALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(
+        _outcome(tmp_path, exit_code=None, timed_out=True), result, FakeResult
+    )
+
+    assert verdict.status == "harness_error"
+    assert "timed out" in verdict.detail
+    assert verdict.result is None
+
+
+def test_stdout_is_never_the_channel(tmp_path):
+    # Spec test 15: a perfectly good result in the log does not rescue a bad
+    # result file (D4).
+    result = tmp_path / "result.json"
+    result.write_text(INVALID_RESULT, encoding="utf-8")
+    outcome = _outcome(tmp_path)
+    outcome.stdout_path.write_text(VALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(outcome, result, FakeResult)
+
+    assert verdict.status == "schema_invalid"

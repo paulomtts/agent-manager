@@ -19,12 +19,17 @@ Three rules shape everything here, and none of them is negotiable:
   clean-tree check or be swept into a commit.
 """
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ValidationError
 
 from agent_manager import models, paths, prompt
 from agent_manager.errors import EngineError
-from agent_manager.harness.base import HarnessAdapter
+from agent_manager.harness.base import HarnessAdapter, Outcome
 from agent_manager.harness.registry import DEFAULT_HARNESS
 from agent_manager.roles.loader import RoleBundle
 
@@ -119,3 +124,117 @@ def resolve_target(
             phase=phase,
         )
     return Target(adapter=adapter, model=model)
+
+
+DEFAULT_TIMEOUT = 1800.0
+"""Wall-clock seconds one attempt gets, matching `models.Dispatch.timeout`'s own
+default (§8 line 315): a ceiling that stops a wedged process, not a budget."""
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """How one attempt ended, before the retry policy is consulted.
+
+    Internal-only state, so a dataclass rather than a pydantic model (CLAUDE.md).
+
+    `status` is one of §6 line 277's four outcomes and is the value journalled.
+    `fatal` marks a failure no `retry.on` list can make retryable -- a gate that
+    raised instead of returning a verdict, per the spec's error paths -- and is
+    kept separate from `status` because the journalled outcome name is part of
+    the contract and must stay one of the four.
+    """
+
+    status: models.AttemptStatus
+    result: Any = None
+    detail: str | None = None
+    fatal: bool = False
+
+
+def build_dispatch(
+    *,
+    target: Target,
+    role: RoleBundle,
+    cwd: Path,
+    prompt_path: Path,
+    attempt_dir: Path,
+    timeout: float,
+) -> models.Dispatch:
+    """Everything one harness process needs, for one attempt (§8 lines 315-318).
+
+    The result path is inside the attempt directory and therefore outside the
+    worktree (§6 step 3); `cwd` is the subtask worktree, which is where D7 pins
+    the harness.
+    """
+    return models.Dispatch(
+        harness=target.adapter.name,
+        model=target.model,
+        role=role.name,
+        cwd=cwd,
+        prompt_path=prompt_path,
+        result_path=attempt_dir / RESULT_NAME,
+        timeout=timeout,
+    )
+
+
+def classify(
+    outcome: Outcome, result_path: Path, model: type[BaseModel] | None
+) -> Verdict:
+    """One attempt's outcome, from the launcher's report and the result file.
+
+    The order is §6 line 278's, and it is load-bearing: a timeout or a non-zero
+    exit is a `harness_error` whatever is on disk, and a missing file after a
+    clean exit is a `harness_error` too -- nothing is parsed in either case.
+    Only past those does the file get read, and from there every failure is
+    `schema_invalid`, because a file that exists and cannot be validated is
+    exactly what re-dispatching with the validator's text can fix.
+
+    A verdict of `ok` here means "the result file is good"; the gates run after
+    and may still turn it into `gate_failed`.
+
+    A validated result is returned as its JSON-mode dump rather than as the
+    model instance: the ported gates read it with `Mapping.get`
+    (`steps/reducers.py`), and §7 inlines it into a later phase's prompt as
+    JSON. Handing them a `BaseModel` would make every gate silently read `None`.
+    """
+    if outcome.timed_out:
+        return Verdict(
+            "harness_error",
+            detail=f"the harness timed out and was killed after {outcome.duration:.1f}s",
+        )
+    if outcome.exit_code != 0:
+        return Verdict("harness_error", detail=f"the harness exited {outcome.exit_code}")
+    if not result_path.is_file():
+        return Verdict(
+            "harness_error", detail=f"the harness wrote no result file at {result_path}"
+        )
+    try:
+        text = result_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        return Verdict(
+            "schema_invalid", detail=f"{result_path} is not valid UTF-8 text: {error}"
+        )
+    except OSError as error:
+        return Verdict(
+            "schema_invalid",
+            detail=f"{result_path} cannot be read: {type(error).__name__}: {error}",
+        )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        return Verdict("schema_invalid", detail=f"{result_path} is not valid JSON: {error}")
+    if model is None:
+        if not isinstance(data, dict):
+            return Verdict(
+                "schema_invalid",
+                detail=(
+                    f"{result_path} must hold a JSON object, got "
+                    f"{type(data).__name__}: later phases and every gate read the "
+                    "result by key"
+                ),
+            )
+        return Verdict("ok", result=data)
+    try:
+        validated = model.model_validate(data)
+    except ValidationError as error:
+        return Verdict("schema_invalid", detail=str(error))
+    return Verdict("ok", result=validated.model_dump(mode="json"))
