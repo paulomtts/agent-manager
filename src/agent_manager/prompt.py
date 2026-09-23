@@ -278,6 +278,15 @@ open it.
 """
 
 
+RESULT_HEADING = "## Result contract"
+"""Heading of the section that tells the agent where its `result.json` goes.
+
+Only present when the phase asks for a result. The schema in it comes from the
+model the engine will validate against, so the instruction and the validator
+cannot drift (addendum R2 §2).
+"""
+
+
 def compose_brief(
     role: RoleBundle,
     rendered: RenderedPrompt,
@@ -302,6 +311,9 @@ def compose_brief(
         heading = f"{METHODOLOGY_HEADING_PREFIX}{filename}"
         parts.append(heading + "\n" + body.strip("\n"))
     parts.append(rendered.text)
+    contract = _result_contract(rendered.phase, result_path, result_model)
+    if contract is not None:
+        parts.append(contract)
     return _join_sections(parts)
 
 
@@ -312,6 +324,52 @@ def _join_sections(parts: list[str]) -> str:
     untouched, because a methodology document's own blank lines are part of it.
     """
     return "\n\n".join(part.strip("\n") for part in parts) + "\n"
+
+
+def _result_contract(
+    phase: str, result_path: Path | str | None, result_model: type[BaseModel] | None
+) -> str | None:
+    """The contract section, or `None` when this phase asks for no result.
+
+    Half a contract is a caller bug, not something to render partially. A
+    relative path is refused because it would resolve inside the worktree the
+    agent is `cd`'d into. `model_json_schema()` is called straight through: a
+    model that cannot describe itself is a defect in the result models.
+    """
+    if result_path is None and result_model is None:
+        return None
+    if result_path is None or result_model is None:
+        raise EngineError(
+            "a result contract needs both result_path and result_model; got "
+            f"result_path={None if result_path is None else str(result_path)!r} and "
+            f"result_model={getattr(result_model, '__name__', None)!r}",
+            phase=phase,
+        )
+    path = Path(result_path)
+    if not path.is_absolute():
+        raise EngineError(
+            f"the result path {str(result_path)!r} is not absolute; the brief has to "
+            "name one unambiguous location outside the worktree the agent runs in, "
+            "and a relative path would resolve inside it",
+            phase=phase,
+        )
+    schema = json.dumps(result_model.model_json_schema(), indent=2, ensure_ascii=False)
+    return (
+        f"{RESULT_HEADING}\n"
+        "When you are done, write your result as valid JSON to exactly this path:\n"
+        "\n"
+        f"{path}\n"
+        "\n"
+        "That path is deliberately outside the worktree you are working in. Do not "
+        "create the file inside the worktree, and do not write it anywhere else -- "
+        "nothing else is read as your result.\n"
+        "\n"
+        "The JSON must validate against this schema:\n"
+        "\n"
+        "```json\n"
+        f"{schema}\n"
+        "```"
+    )
 
 
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")

@@ -549,3 +549,131 @@ def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
     brief = prompt.compose_brief(role, _rendered())
 
     assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
+
+
+class StandInResult(BaseModel):
+    """Stands in for a `results.RESULT_MODELS` entry, which is story 5cc741ec's."""
+
+    summary: str
+    files: list[str] = []
+
+
+def _fenced_json(brief: str) -> dict:
+    """The one ```json block the contract embeds, parsed back."""
+    body = brief.split("```json\n", 1)[1].split("\n```", 1)[0]
+    return json.loads(body)
+
+
+def test_the_contract_states_the_absolute_path_and_embeds_the_real_schema():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=Path("/var/agent-manager/runs/r1/card/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+
+    assert prompt.RESULT_HEADING in brief
+    assert "/var/agent-manager/runs/r1/card/implement.1/result.json" in brief
+    assert _fenced_json(brief) == StandInResult.model_json_schema()
+    assert "summary" in _fenced_json(brief)["properties"]
+
+
+def test_the_contract_says_write_valid_json_and_stay_out_of_the_worktree():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=Path("/var/agent-manager/runs/r1/card/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+    contract = brief.split(prompt.RESULT_HEADING, 1)[1]
+
+    assert "valid JSON" in contract
+    assert "outside the worktree" in contract
+
+
+def test_the_contract_lands_after_the_rendered_prompt():
+    brief = prompt.compose_brief(
+        _role(methodology={"writing-plans.md": PLANS_BODY}),
+        _rendered(),
+        result_path=Path("/runs/r1/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+
+    assert brief.index("# phase: implement") < brief.index(prompt.RESULT_HEADING)
+
+
+def test_a_phase_with_no_result_gets_no_contract_section():
+    brief = prompt.compose_brief(_role(), _rendered())
+
+    assert prompt.RESULT_HEADING not in brief
+    assert "```json" not in brief
+
+
+def test_a_result_path_given_as_a_string_is_accepted_and_rendered():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+    )
+
+    assert "/runs/r1/implement.1/result.json" in brief
+
+
+def test_a_schema_with_non_ascii_prose_is_embedded_unescaped():
+    class Unicode(BaseModel):
+        summary: str = Field(description="the finding — in one line")
+
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=Unicode,
+    )
+
+    assert "the finding — in one line" in brief
+    assert "\\u2014" not in brief
+    assert _fenced_json(brief) == Unicode.model_json_schema()
+
+
+def test_a_result_path_without_a_model_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(
+            _role(), _rendered(), result_path="/runs/r1/implement.1/result.json"
+        )
+
+    assert "implement" in str(error.value)
+    assert error.value.phase == "implement"
+    assert "result_model" in str(error.value)
+
+
+def test_a_result_model_without_a_path_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(_role(), _rendered(), result_model=StandInResult)
+
+    assert error.value.phase == "implement"
+    assert "result_path" in str(error.value)
+
+
+def test_a_relative_result_path_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(
+            _role(),
+            _rendered(),
+            result_path="attempts/implement.1/result.json",
+            result_model=StandInResult,
+        )
+
+    assert error.value.phase == "implement"
+    assert "attempts/implement.1/result.json" in str(error.value)
+
+
+def test_composing_a_contract_creates_no_file(tmp_path):
+    prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=tmp_path / "implement.1" / "result.json",
+        result_model=StandInResult,
+    )
+
+    assert list(tmp_path.iterdir()) == []
