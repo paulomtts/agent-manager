@@ -22,42 +22,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_manager import models
+from agent_manager.errors import EngineError
 from agent_manager.store import Store
 from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
 
 _EMPTY = inspect.Parameter.empty
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
-
-class EngineError(RuntimeError):
-    """The engine refused to run, or could not make sense of, a phase.
-
-    Carries the coordinates an operator needs to find the offending line of the
-    workflow document: which phase, which registered function, which parameter.
-    """
-
-    def __init__(
-        self,
-        reason: str,
-        *,
-        phase: str | None = None,
-        function: str | None = None,
-        parameter: str | None = None,
-    ) -> None:
-        self.reason = reason
-        self.phase = phase
-        self.function = function
-        self.parameter = parameter
-        parts = []
-        if phase is not None:
-            parts.append(f"phase {phase!r}")
-        if function is not None:
-            parts.append(f"function {function!r}")
-        if parameter is not None:
-            parts.append(f"parameter {parameter!r}")
-        prefix = ", ".join(parts)
-        super().__init__(f"{prefix}: {reason}" if prefix else reason)
-
+# `EngineError` is imported, not defined, so `prompt.py` can raise it without
+# importing this module back. `engine.EngineError` is still the public name.
 
 RESERVED_CONTEXT_KEYS = ("card", "branch", "base", "worktree", "repo_dir", "commands")
 """The context keys `subtask_context` always sets.
