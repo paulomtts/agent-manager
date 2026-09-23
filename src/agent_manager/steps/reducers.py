@@ -94,4 +94,8 @@ def exploration_output_gate(
             f"findings on a subtask: {_json(summary[:80])}"
         }
 
+    full_suite = _field(_field(explore, "verification"), "fullSuite")
+    if not isinstance(full_suite, list):
+        return {"detail": "exploration did not return an array for verification.fullSuite"}
+
     return None

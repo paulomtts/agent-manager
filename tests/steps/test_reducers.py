@@ -99,3 +99,23 @@ def test_a_long_whitespace_only_summary_is_short_once_stripped():
 def test_a_missing_or_non_string_summary_returns_a_verdict_instead_of_raising(explore):
     gate = exploration_output_gate(explore, None)
     assert "implausibly short" in gate["detail"]
+
+
+def test_a_verification_mapping_without_full_suite_is_caught_not_raised():
+    gate = exploration_output_gate({"summary": REAL_SUMMARY, "verification": {}}, None)
+    assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
+
+
+def test_an_explore_with_no_verification_key_at_all_is_caught_not_raised():
+    gate = exploration_output_gate({"summary": REAL_SUMMARY}, None)
+    assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
+
+
+@pytest.mark.parametrize("not_a_list", ["uv run pytest", {"0": "uv run pytest"}, 3, None])
+def test_a_non_array_full_suite_is_caught(not_a_list):
+    # A bare string is iterable in Python but is not an array in JS; it must be
+    # rejected, never scanned character by character.
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": not_a_list}}, None
+    )
+    assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
