@@ -76,6 +76,11 @@ def test_the_protocol_methods_have_the_signatures_the_spec_prints():
 
 def test_a_structural_stub_satisfies_the_adapter_interface():
     adapter: base.HarnessAdapter = StubAdapter()
+    # The annotation above is for the type-checker only -- a local annotation
+    # is never evaluated at run time -- so conformance is asserted here, or
+    # this test would only be exercising the stub it defines itself.
+    for member in base.HarnessAdapter.__protocol_attrs__:
+        assert hasattr(adapter, member), member
     assert adapter.name == "stub"
     assert adapter.capabilities == frozenset({"browser"})
     argv = adapter.build_command(_dispatch())
