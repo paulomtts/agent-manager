@@ -460,8 +460,11 @@ def interrupted_phase(subtask: models.SubtaskRun, workflow: Workflow) -> str | N
     a phase recorded `started` is the crash signature §9 names -- the manager
     died while that phase was in flight -- and the first such phase wins;
     otherwise the process died between phases and the first phase not recorded
-    `done` is the one that never ran, corrected by `_skipped_origin` for the
-    stretch a `skip_to` jumped over.
+    `done` is the one that never ran -- except inside a stretch a `skip_to`
+    jumped over, which is unrecorded for a reason that is not a crash. Such a
+    stretch is handed back to the jumping phase only while its target is still
+    unfinished; once the target is `done` the walk demonstrably ran past the
+    stretch, and the scan carries on to the phase that really is missing.
 
     `None` means every phase of the document is `done`: only the final status
     write was lost, and `resume_run` refuses rather than re-running `mark_done`.
@@ -476,7 +479,16 @@ def interrupted_phase(subtask: models.SubtaskRun, workflow: Workflow) -> str | N
         if record is not None and record.status == "done":
             continue
         origin = _skipped_origin(workflow, recorded, index)
-        return phase.name if origin is None else origin
+        if origin is None:
+            return phase.name
+        target = recorded.get(workflow.phase(origin).skip_to)
+        if target is None or target.status != "done":
+            return origin
+        # The jump landed and its target ran to `done`, so the walk went on past
+        # this stretch: the phases inside it are unrecorded because they were
+        # skipped, not because the crash reached them. Scan on -- restarting at
+        # `origin` here would re-dispatch every phase from the target forward,
+        # `implement` included.
     return None
 
 

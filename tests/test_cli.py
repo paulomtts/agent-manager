@@ -515,6 +515,50 @@ def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_chec
     assert cli.interrupted_phase(subtask, workflow) == "mark_done"
 
 
+SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan")
+"""The phases `plan_check: skip_to implement` jumps over, which the engine
+records nowhere at all (engine.py:431-433 only appends to the in-memory
+summary), so an unrecorded stretch reads the same as one that never ran."""
+
+
+def test_a_skipped_stretch_the_walk_ran_past_does_not_drag_the_restart_back():
+    """The commonest resume there is: a card whose plan was already validated
+    took `plan_check`'s jump, `implement` ran to `done`, and the process died
+    before `review`. `spec` is unrecorded because it was skipped, not because it
+    was interrupted -- and restarting at `plan_check` would re-dispatch a
+    finished `implement`, the single most expensive phase of the document."""
+    workflow = _task_workflow()
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            *[
+                _recorded(name, "done")
+                for name in workflow.phase_names[:4]
+                if name not in SKIPPED_STRETCH
+            ],
+            _recorded("implement", "done", [_pure_attempt(1)]),
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, workflow) == "review"
+
+
+def test_a_skipped_stretch_with_only_the_final_write_lost_restarts_at_mark_done():
+    """Same jump, run out to `verify`: nothing but `mark_done` is left, so the
+    skip explains nothing and the restart must not walk the tail again."""
+    workflow = _task_workflow()
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            _recorded(name, "done")
+            for name in workflow.phase_names
+            if name not in SKIPPED_STRETCH and name != "mark_done"
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, workflow) == "mark_done"
+
+
 def test_a_subtask_with_every_phase_done_has_no_phase_to_resume():
     """The condition `resume_run` turns into `NotResumableError`: only the final
     status write was lost, and re-running `mark_done` would not be a resume."""
@@ -2420,6 +2464,27 @@ def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_tra
 
     assert "explore" in str(caught.value)
     assert isinstance(caught.value, cli.HANDLED)
+
+
+@requires_git
+@requires_brd
+def test_resume_refuses_a_subtask_whose_every_phase_is_already_done(project, cards):
+    """`interrupted_phase` returning `None` is a refusal of its own inside
+    `resume_run`: every phase finished and only the closing status write was
+    lost, so there is nothing to re-run. Without that branch the `None` falls
+    straight into `resume_start_phase`, which would answer with the loader's
+    "no phase named None" instead of the one thing an operator needs to hear.
+    """
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    _record_interrupted(
+        project, cards, run_id, done=tuple(load_builtin("task").phase_names)
+    )
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert cards["subtask"] in str(caught.value)
+    assert "no phase to re-run" in str(caught.value)
 
 
 def test_resume_of_an_unknown_run_is_an_envelope(projection):
