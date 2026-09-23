@@ -11,6 +11,12 @@ answer decides one thing: whether the workflow's `plan_check` phase skips
 straight to `implement` (design §5 lines 169-173).
 """
 
+import re
+from collections.abc import Mapping
+from pathlib import Path
+
+from agent_manager.dag import short_id
+
 VALIDATED_MARKER = "<!-- task-pipeline: validated -->"
 """What Validate writes into a plan it has signed off.
 
@@ -50,3 +56,36 @@ def pick_plan(filenames: object, card: str) -> str | None:
         return None
     hits = sorted(name for name in filenames if matches_card(name, card))
     return hits[-1] if hits else None
+
+
+_SHORT_ID = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _card_short_id(card: object) -> str:
+    """The card's eight-character short id, whatever shape the card arrives in.
+
+    `dag.short_id` owns the derivation and is never duplicated here; this only
+    dispatches on shape, because `short_id` accepts a full UUID string and
+    nothing else -- not a mapping, not an object, not an already-short id.
+    Anything it rejects raises `ValueError` here too, before any filesystem
+    touch: a typo must not read as "no plan found".
+    """
+    if isinstance(card, str):
+        if _SHORT_ID.match(card):
+            return card
+        return short_id(card)
+    # The same read `dag._field` performs, reimplemented rather than imported:
+    # `_field` is private to that module and not part of its public surface.
+    raw = card.get("id") if isinstance(card, Mapping) else getattr(card, "id", None)
+    return short_id(raw)
+
+
+def _plans_dir(plans_dir: object | None, repo_dir: object | None) -> str:
+    """The directory to list: the explicit one, else `<repo_dir>/.claude/plans`."""
+    if plans_dir is not None:
+        return str(plans_dir)
+    if repo_dir is None:
+        raise ValueError(
+            "plan_check.find_validated_plan needs plans_dir or repo_dir, got neither"
+        )
+    return str(Path(repo_dir) / ".claude" / "plans")

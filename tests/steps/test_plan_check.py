@@ -7,6 +7,10 @@ must force an outcome a real filesystem will not produce on demand (an
 unreadable file), exactly as the ported `plan-check.test.mjs` uses its `fakeFs`.
 """
 
+from pathlib import Path
+
+import pytest
+
 from agent_manager.steps import plan_check
 from agent_manager.steps.plan_check import VALIDATED_MARKER, matches_card, pick_plan
 
@@ -59,3 +63,48 @@ def test_pick_plan_is_none_when_nothing_matches():
     assert pick_plan(["task-other-deadbeef.md"], "a32af745") is None
     assert pick_plan([], "a32af745") is None
     assert pick_plan(None, "a32af745") is None
+
+
+CARD_UUID = "a32af745-0322-4a49-9dd9-44630af9632d"
+
+
+def test_an_already_short_lowercase_id_passes_straight_through():
+    assert plan_check._card_short_id("a32af745") == "a32af745"
+
+
+def test_a_full_uuid_resolves_through_dag_short_id():
+    assert plan_check._card_short_id(CARD_UUID) == "a32af745"
+    assert plan_check._card_short_id(CARD_UUID.replace("-", "")) == "a32af745"
+    # dag.short_id accepts either case in a full id and lowercases it, so an
+    # uppercase FULL uuid is normalised rather than rejected (spec §3).
+    assert plan_check._card_short_id(CARD_UUID.upper()) == "a32af745"
+
+
+def test_a_card_mapping_or_object_resolves_via_its_id_field():
+    class Card:
+        id = CARD_UUID
+
+    assert plan_check._card_short_id({"id": CARD_UUID}) == "a32af745"
+    assert plan_check._card_short_id(Card()) == "a32af745"
+
+
+def test_an_uppercase_or_malformed_card_id_raises_rather_than_matching_nothing():
+    # Accepting it would turn a caller's typo into "no plan found" -- a gate
+    # failing open in the direction that halts a run for a reason that is not
+    # true.
+    for bad in ["A32AF745", "42", "zzzzzzzz", "", "not-a-uuid", None, 42]:
+        with pytest.raises(ValueError):
+            plan_check._card_short_id(bad)
+    with pytest.raises(ValueError):
+        plan_check._card_short_id({"title": "no id here"})
+
+
+def test_the_plans_dir_defaults_under_the_repo_and_an_explicit_one_wins():
+    assert plan_check._plans_dir(None, "/abs/repo") == "/abs/repo/.claude/plans"
+    assert plan_check._plans_dir("/p", "/abs/repo") == "/p"
+    assert plan_check._plans_dir(Path("/p"), None) == "/p"
+
+
+def test_neither_plans_dir_nor_repo_dir_is_a_caller_bug_not_a_first_run():
+    with pytest.raises(ValueError, match="plans_dir"):
+        plan_check._plans_dir(None, None)
