@@ -9,12 +9,17 @@ that it raised: the validation error is what a retrying agent reads, so a status
 typo has to name the statuses that would have worked.
 """
 
+import importlib
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from pydantic import ValidationError
 
+import agent_manager
 from agent_manager import models
 
 
@@ -428,3 +433,108 @@ def test_full_tree_preserves_nesting_and_subtask_order():
     assert [phase.name for phase in in_progress.phases] == ["explore", "implement"]
     assert in_progress.phases[1].attempts[0].dispatch.role == "coder"
     assert in_progress.phases[1].ended_at is None
+
+
+def test_full_run_round_trips_through_json():
+    # D5: the DB is a projection, the journal is truth. Rebuilding the
+    # projection must not lose a field on the way through JSON.
+    run = _full_run()
+    assert models.Run.model_validate(run.model_dump(mode="json")) == run
+
+
+def test_round_trip_survives_a_naive_started_at():
+    # A timestamp written without an offset must come back as the same instant,
+    # not shifted and not rejected.
+    naive = datetime(2026, 9, 23, 10, 0)
+    run = _full_run().model_copy(update={"started_at": naive})
+    restored = models.Run.model_validate(run.model_dump(mode="json"))
+    assert restored.started_at == naive
+    assert restored == run
+
+
+def test_round_trip_keeps_an_in_flight_attempt_in_flight():
+    run = _full_run()
+    restored = models.Run.model_validate(run.model_dump(mode="json"))
+    attempt = restored.stories[0].subtasks[1].phases[1].attempts[0]
+    assert attempt.status == "started"
+    assert attempt.exit_code is None
+    assert attempt.cost is None
+
+
+def test_journal_coordinates_are_reachable_from_the_tree():
+    # A journal line carries run id, card, phase, attempt and a sequence number;
+    # the first four must locate a node here (the sequence number lives only in
+    # the journal).
+    run = _full_run()
+    subtask = run.stories[0].subtasks[1]
+    phase = subtask.phases[1]
+    attempt = phase.attempts[0]
+    assert (run.id, subtask.card_id, phase.name, attempt.n) == (
+        "run-2026-09-23-01",
+        "1535b285",
+        "implement",
+        1,
+    )
+
+
+def test_unknown_fields_are_rejected_at_every_level():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Run(
+            id="run-2026-09-23-01",
+            workflow="task",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m1/",
+            sequence=7,
+        )
+    assert "sequence" in str(excinfo.value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.Attempt(n=1, dispatch=_dispatch(), tokens=10)
+    assert "tokens" in str(excinfo.value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.PhaseRun(name="verify", kind="deterministic", finished_at=None)
+    assert "finished_at" in str(excinfo.value)
+
+
+def test_nested_collection_defaults_are_per_instance():
+    first = models.Run(
+        id="run-1",
+        workflow="task",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    )
+    second = models.Run(
+        id="run-2",
+        workflow="task",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    )
+    first.stories.append(
+        models.StoryRun(card_id="8831189b", title="Foundations", level=0)
+    )
+    first.config.harness_map["coder"] = models.HarnessAssignment(
+        harness="claude", model="sonnet"
+    )
+    assert second.stories == []
+    assert second.config.harness_map == {}
+    assert first.config is not second.config
+
+
+def test_importing_models_needs_no_environment_and_no_disk():
+    # Pure data module: no env reads, no sqlite, no paths.py, so a fresh import
+    # with an empty environment must still succeed.
+    with mock.patch.dict(os.environ, {}, clear=True):
+        sys.modules.pop("agent_manager.models", None)
+        try:
+            fresh = importlib.import_module("agent_manager.models")
+            assert fresh.Run.__name__ == "Run"
+            assert not hasattr(fresh, "os")
+            assert not hasattr(fresh, "sqlite3")
+            assert not hasattr(fresh, "paths")
+        finally:
+            sys.modules["agent_manager.models"] = models
+            agent_manager.models = models

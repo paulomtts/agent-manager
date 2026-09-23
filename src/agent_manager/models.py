@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Status = Literal["pending", "started", "done", "failed", "escalated"]
 """Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
@@ -40,7 +40,14 @@ Launcher = Literal["direct", "bwrap", "container"]
 
 
 class _Model(BaseModel):
-    """Shared base for every state model; Task 4 gives it its `model_config`."""
+    """Shared config for every state model.
+
+    Unknown keys are an error, never a silent drop: a journal line from an older
+    schema must surface as a validation failure rather than as data loss in the
+    rebuilt projection.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class Dispatch(_Model):
