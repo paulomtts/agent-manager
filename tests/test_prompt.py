@@ -631,6 +631,43 @@ def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
     assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
 
 
+def _shipped_coder_brief() -> str:
+    """The real coder bundle's brief for a real `implement` render.
+
+    Asserted through `compose_brief` rather than by reading `system.md`, so the
+    loader path (`roles/loader.py` -> `RoleBundle.system` -> the brief's first
+    part) is covered too: standing instructions that never reach the brief are
+    standing instructions no agent ever reads.
+    """
+    rendered = prompt.render_prompt(
+        _phase(["plan_path", "spec_path", "branch", "base_branch", "plan_hash"]),
+        _context(),
+    )
+    return prompt.compose_brief(roles_loader.load_role("coder"), rendered)
+
+
+def test_the_coder_brief_states_the_trailer_rule_beside_the_hash_it_must_use():
+    brief = _shipped_coder_brief()
+
+    assert f"\n## plan_hash\n{PLAN_HASH}\n" in brief
+    assert "`Plan-Hash: <hash>`" in brief
+    assert "Never compute the hash yourself" in brief
+    assert "Never leave a commit untagged" in brief
+
+
+def test_the_coder_brief_states_the_resume_rule_and_who_commits_the_documents():
+    """Main design §9 line 379: commits carrying the current hash are resumed
+    from, untagged ones are debris the coder reports rather than rewrites."""
+    brief = _shipped_coder_brief()
+
+    assert "git log <base_branch>..HEAD" in brief
+    assert "Continue from the next uncompleted plan step" in brief
+    assert "`blocked: true`" in brief
+    assert "`blocked_reason`" in brief
+    assert "Never rewrite, amend, squash or delete them." in brief
+    assert "committed by the engine" in brief
+
+
 class StandInResult(BaseModel):
     """Stands in for a `results.RESULT_MODELS` entry, which is story 5cc741ec's."""
 
