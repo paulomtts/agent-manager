@@ -11,6 +11,7 @@ other place to be tested.
 """
 
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -179,14 +180,31 @@ def test_a_missing_executable_propagates_rather_than_looking_like_an_exit(tmp_pa
 
 def test_a_child_that_reads_stdin_gets_eof_instead_of_hanging(tmp_path):
     # An interactive harness prompting for confirmation must not burn the whole
-    # timeout on every attempt.
+    # timeout on every attempt. The manager's own fd 0 is loaded with readable
+    # data for the duration of the call, because under pytest fd 0 is already
+    # /dev/null -- a launcher that simply inherited stdin would otherwise pass
+    # this test by accident.
     log = tmp_path / "stdout.log"
-    outcome = launcher.run_direct(
-        [sys.executable, "-c", "import sys; print('stdin gave', repr(sys.stdin.read()))"],
-        cwd=tmp_path,
-        timeout=30.0,
-        stdout_path=log,
-    )
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"y\n")
+    os.close(write_fd)
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(read_fd, 0)
+        os.close(read_fd)
+        outcome = launcher.run_direct(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('stdin gave', repr(sys.stdin.read()))",
+            ],
+            cwd=tmp_path,
+            timeout=30.0,
+            stdout_path=log,
+        )
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
     assert outcome.exit_code == 0
     assert outcome.timed_out is False
     assert "stdin gave ''" in log.read_text()
