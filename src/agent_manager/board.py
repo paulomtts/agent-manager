@@ -172,3 +172,24 @@ def show(card_id: str, *, repo_dir: Path | None = None) -> models.Card:
         completed.stdout, argv=argv, exit_code=completed.returncode
     )
     return _validated(models.Card, data, argv=argv)
+
+
+def tree(card_id: str, *, repo_dir: Path | None = None) -> models.CardNode:
+    """A card and its descendants, via `brd tree`.
+
+    brd's `build_tree` always answers with a list; rooted at one card id that
+    list holds exactly one node, which is what callers want. Ordering and depth
+    come from brd -- nothing is re-sorted or re-parented here.
+    """
+    argv = tree_argv(card_id)
+    completed = _run(argv, repo_dir)
+    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
+    if not isinstance(data, list) or len(data) != 1:
+        found = len(data) if isinstance(data, list) else type(data).__name__
+        raise BoardError(
+            f"brd tree {card_id} returned {found} where exactly one root was "
+            "expected",
+            argv=argv,
+            exit_code=completed.returncode,
+        )
+    return _validated(models.CardNode, data[0], argv=argv)

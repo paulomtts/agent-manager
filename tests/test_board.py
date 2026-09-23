@@ -303,3 +303,77 @@ def test_show_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
         board.show("141c96e6", repo_dir=not_a_project)
     assert excinfo.value.error_type == "ProjectNotFoundError"
     assert excinfo.value.exit_code == 1
+
+
+@requires_brd
+def test_tree_returns_the_root_node_not_a_list(temp_board):
+    # brd's build_tree always returns list[dict]; a bare id just makes it a
+    # singleton. Callers want the node.
+    milestone = _add_card(temp_board, "Milestone 1")
+    node = board.tree(milestone, repo_dir=temp_board)
+    assert isinstance(node, models.CardNode)
+    assert node.id == milestone
+    assert node.title == "Milestone 1"
+
+
+@requires_brd
+def test_tree_preserves_milestone_story_subtask_nesting(temp_board):
+    milestone = _add_card(temp_board, "Milestone 1")
+    story = _add_card(temp_board, "Naming and the brd board adapter", milestone)
+    first = _add_card(temp_board, "Port card naming from naming.mjs", story)
+    second = _add_card(temp_board, "Add the brd board adapter", story)
+
+    node = board.tree(milestone, repo_dir=temp_board)
+
+    assert [child.id for child in node.children] == [story]
+    story_node = node.children[0]
+    assert [grandchild.id for grandchild in story_node.children] == [first, second]
+    assert story_node.children[1].title == "Add the brd board adapter"
+    assert story_node.children[1].children == []
+
+
+@requires_brd
+def test_tree_rooted_at_a_leaf_has_no_children(temp_board):
+    milestone = _add_card(temp_board, "Milestone 1")
+    subtask = _add_card(temp_board, "Add the brd board adapter", milestone)
+    node = board.tree(subtask, repo_dir=temp_board)
+    assert node.id == subtask
+    assert node.children == []
+
+
+@requires_brd
+def test_tree_does_not_re_sort_or_re_parent_what_brd_returned(temp_board):
+    # Ordering and depth are brd's. Compare against brd's own raw JSON.
+    milestone = _add_card(temp_board, "Milestone 1")
+    for title in ("story a", "story b", "story c"):
+        _add_card(temp_board, title, milestone)
+
+    raw = _brd_json(temp_board, "tree", milestone)
+    node = board.tree(milestone, repo_dir=temp_board)
+
+    assert [child.id for child in node.children] == [
+        child["id"] for child in raw[0]["children"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [[], [{"id": "a", "title": "a", "status": "todo", "children": []},
+          {"id": "b", "title": "b", "status": "todo", "children": []}],
+     {"id": "a", "title": "a", "status": "todo", "children": []}],
+    ids=["empty-list", "two-roots", "bare-dict"],
+)
+def test_tree_requires_exactly_one_root(data, tmp_path, monkeypatch):
+    # A future brd change, or a board.py bug, must not become an IndexError or
+    # a silently-wrong root.
+    fake_brd = tmp_path / "brd"
+    fake_brd.write_text(
+        "#!/bin/sh\ncat <<'EOF'\n"
+        + json.dumps({"ok": True, "data": data})
+        + "\nEOF\n"
+    )
+    fake_brd.chmod(0o755)
+    monkeypatch.setattr(board, "BRD", str(fake_brd))
+    with pytest.raises(board.BoardError) as excinfo:
+        board.tree("141c96e6", repo_dir=tmp_path)
+    assert "exactly one root" in str(excinfo.value)
