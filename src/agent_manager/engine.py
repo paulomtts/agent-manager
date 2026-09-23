@@ -205,6 +205,12 @@ def run_subtask(
         outcome = _run_deterministic(
             phase, workflow, store, story_id, subtask, context, clock
         )
+        if not outcome.ok:
+            summary.status = "escalated"
+            summary.failed_phase = phase.name
+            summary.detail = outcome.detail
+            _record_subtask_status(store, story_id, subtask, "escalated")
+            return summary
         _bind_result(context, phase.name, outcome.result)
         summary.results[phase.name] = outcome.result
         index += 1
@@ -251,13 +257,33 @@ def _run_deterministic(
 ) -> _Outcome:
     started_at = clock()
     _record_phase(store, story_id, subtask, phase, "started", started_at, None)
-    function = workflow.function(phase.run)
-    kwargs = bind_arguments(
-        function, context, phase.args, phase=phase.name, function=phase.run
-    )
-    result = function(**kwargs)
+    try:
+        function = workflow.function(phase.run)
+        kwargs = bind_arguments(
+            function, context, phase.args, phase=phase.name, function=phase.run
+        )
+        result = function(**kwargs)
+        if not isinstance(result, Mapping):
+            raise EngineError(
+                f"returned {type(result).__name__}, but a deterministic phase must "
+                "return a mapping: a gate or a later `when` would read anything else "
+                "as closed and the run would branch wrongly",
+                phase=phase.name,
+                function=phase.run,
+            )
+    except Exception as error:
+        # Deliberately total. A step is other people's code -- GitError, OSError,
+        # anything -- and an exception escaping the walk would leave the subtask
+        # recorded `started` forever, which is exactly what resume mistakes for
+        # work in flight.
+        _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
+        return _Outcome(ok=False, detail=_render_error(error))
     _record_phase(store, story_id, subtask, phase, "done", started_at, clock())
     return _Outcome(ok=True, result=result)
+
+
+def _render_error(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
 
 
 def _record_phase(

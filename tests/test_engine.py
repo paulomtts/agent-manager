@@ -391,3 +391,109 @@ phases:
     }
     assert seen["worktree"] == real_worktree
     assert _projected_phases(store) == [("worktree", "done"), ("after", "done")]
+
+
+def test_a_raising_step_escalates_and_the_exception_does_not_propagate(store):
+    calls: list[str] = []
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        raise OSError("disk went away")
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        return {}
+
+    document = """
+name: two
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+  - name: beta
+    kind: deterministic
+    run: step.beta
+"""
+    workflow = _workflow(document, {"step.alpha": alpha, "step.beta": beta})
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["alpha"]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "alpha"
+    assert "disk went away" in summary.detail
+    assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
+    assert _projected_phases(store) == [("alpha", "failed")]
+    assert store.journal.read()[-1].event == "subtask_upsert"
+    assert store.journal.read()[-1].payload["status"] == "escalated"
+
+
+def test_a_binding_failure_escalates_without_calling_the_step(store):
+    calls: list[str] = []
+
+    def alpha(card: str, missing_thing: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {}
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": alpha})
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == []
+    assert summary.status == "escalated"
+    assert "missing_thing" in summary.detail
+
+
+@pytest.mark.parametrize("returned", [None, ["a", "list"], True, "a string"])
+def test_a_non_mapping_step_result_escalates(store, returned):
+    def alpha(card: str) -> Any:
+        return returned
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": alpha})
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "alpha"
+    assert "mapping" in summary.detail
+    assert _projected_phases(store) == [("alpha", "failed")]
+
+
+def test_a_failed_phase_result_is_not_offered_to_later_phases(store):
+    def alpha(card: str) -> dict[str, Any]:
+        raise RuntimeError("nope")
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": alpha})
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.results == {}
