@@ -786,3 +786,86 @@ def test_rebuilding_one_run_leaves_another_runs_rows_alone(repo):
         assert rebuilding.load_run(RUN_ID) is not None
     finally:
         rebuilding.close()
+
+
+def test_a_status_transition_on_a_parent_keeps_the_children_recorded_before_it(repo):
+    # §9: a transition is the same node journalled again. Replaying the later
+    # line must not drop the phases and attempts that were journalled between
+    # the two, or a rebuild would silently amputate the in-flight subtask.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        st.record_story(_story().model_copy(update={"status": "done"}))
+        st.record_subtask(
+            "8831189b",
+            _subtask("ef248597", base="m1/task-fdebc746").model_copy(
+                update={"status": "done"}
+            ),
+        )
+        st.record_phase(
+            "8831189b",
+            "ef248597",
+            models.PhaseRun(
+                name="implement",
+                kind="agent",
+                status="done",
+                started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+                ended_at=datetime(2026, 9, 23, 10, 30, tzinfo=timezone.utc),
+            ),
+        )
+        run = st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+
+    story = run.stories[0]
+    assert story.status == "done"
+    assert [subtask.card_id for subtask in story.subtasks] == ["fdebc746", "ef248597"]
+
+    subtask = story.subtasks[1]
+    assert subtask.status == "done"
+    assert [phase.name for phase in subtask.phases] == ["explore", "implement"]
+
+    implement = subtask.phases[1]
+    assert implement.status == "done"
+    assert [attempt.n for attempt in implement.attempts] == [1]
+
+
+def test_read_returns_lines_in_sequence_order_not_file_order(repo):
+    # A line can reach the file out of order (two writers, a partial flush).
+    # `seq` is the ordering, so `read` sorts by it and `replay` folds in that
+    # order rather than in the order the bytes happen to sit on disk.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}))
+    _append_raw(
+        journal,
+        {
+            "seq": 3,
+            "ts": "2026-09-23T10:20:00+00:00",
+            "run_id": RUN_ID,
+            "event": "story_upsert",
+            "story": "8831189b",
+            "payload": _story().model_dump(mode="json", exclude={"subtasks"})
+            | {"status": "done"},
+        },
+    )
+    _append_raw(
+        journal,
+        {
+            "seq": 2,
+            "ts": "2026-09-23T10:10:00+00:00",
+            "run_id": RUN_ID,
+            "event": "story_upsert",
+            "story": "8831189b",
+            "payload": _story().model_dump(mode="json", exclude={"subtasks"})
+            | {"status": "started"},
+        },
+    )
+
+    assert [line.seq for line in journal.read()] == [1, 2, 3]
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        run = st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+    assert run.stories[0].status == "done"
