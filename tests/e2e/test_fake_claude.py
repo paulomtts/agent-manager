@@ -323,3 +323,127 @@ def test_a_feedback_block_after_the_contract_does_not_hide_the_contract(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(result_path.read_text(encoding="utf-8"))["blockers"] is False
+
+
+IMPLEMENT_SCHEMA = {
+    "properties": {
+        "blocked": {"type": "boolean"},
+        "blocked_reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "resumed": {"type": "boolean"},
+        "plan_hash": {"type": "string"},
+        "report": {"type": "string"},
+    },
+    "type": "object",
+}
+"""`results.ImplementResult`'s shape, written out here rather than imported:
+the fake is a standalone script and learns a schema only from a brief."""
+
+PLAN_RELATIVE = "docs/superpowers/plans/x-00000001.md"
+BRIEF_HASH = "0badcafe"
+"""Deliberately NOT the sha256 of the plan file the fixture writes. The
+disagreement is what proves the fake reads the brief rather than hashing."""
+
+
+def _implement_repo(tmp_path):
+    """A real git repo with a committed plan file, as `implement` finds one."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(root)], check=True, capture_output=True
+    )
+    for key, value in (
+        ("user.email", "tests@example.com"),
+        ("user.name", "agent-manager tests"),
+        ("commit.gpgsign", "false"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(root), "config", key, value],
+            check=True,
+            capture_output=True,
+        )
+    plan = root / PLAN_RELATIVE
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# plan\n\nvalidated: yes\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-m", "docs: the spec and the plan"],
+        check=True,
+        capture_output=True,
+    )
+    return root
+
+
+def _implement_brief_text(digest=None):
+    """An `implement` brief, optionally without its `## plan_hash` section."""
+    section = "" if digest is None else f"\n## plan_hash\n{digest}\n"
+    return (
+        "# Coder\n\nstanding instructions\n\n"
+        "# phase: implement\n# role: coder\n"
+        f"\n## plan_path\n{PLAN_RELATIVE}\n"
+        f"{section}"
+    )
+
+
+def _head_message(repo):
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", "-s", "--format=%B", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_the_fake_coder_takes_its_trailer_hash_from_the_brief_not_the_plan_file(
+    tmp_path,
+):
+    """R4: the fake may know only what the brief says. It must not hash the plan."""
+    repo = _implement_repo(tmp_path)
+    on_disk = fake_claude.plan_hash_of(repo / PLAN_RELATIVE)
+    assert on_disk != BRIEF_HASH  # non-vacuity: the two really do disagree
+
+    payload = fake_claude.build_result(
+        "implement",
+        fake_claude.payload_from_schema(IMPLEMENT_SCHEMA),
+        _implement_brief_text(BRIEF_HASH),
+        repo,
+    )
+
+    assert payload["plan_hash"] == BRIEF_HASH
+    message = _head_message(repo)
+    assert message.rstrip("\n").endswith(f"Plan-Hash: {BRIEF_HASH}")
+    assert on_disk not in message
+
+
+def test_an_implement_brief_with_no_plan_hash_section_stops_the_fake(tmp_path):
+    """The mechanism that makes the production-wiring test fail if the input is
+    ever dropped from `implement`'s `inputs` in `builtin/task.yaml`."""
+    repo = _implement_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.build_result(
+            "implement",
+            fake_claude.payload_from_schema(IMPLEMENT_SCHEMA),
+            _implement_brief_text(),
+            repo,
+        )
+
+    assert "plan_hash" in str(caught.value)
+    assert "implement" in str(caught.value)
+
+
+def test_a_padded_plan_hash_section_still_produces_a_single_line_trailer(tmp_path):
+    """Review focus: a body padded with blank lines must not end the commit
+    message in a blank `Plan-Hash:` line that `review_gate` reads as debris."""
+    repo = _implement_repo(tmp_path)
+    text = _implement_brief_text(BRIEF_HASH).replace(
+        f"\n## plan_hash\n{BRIEF_HASH}\n", f"\n## plan_hash\n\n{BRIEF_HASH}\n\n"
+    )
+
+    payload = fake_claude.build_result(
+        "implement", fake_claude.payload_from_schema(IMPLEMENT_SCHEMA), text, repo
+    )
+
+    assert payload["plan_hash"] == BRIEF_HASH
+    assert _head_message(repo).rstrip("\n").splitlines()[-1] == (
+        f"Plan-Hash: {BRIEF_HASH}"
+    )

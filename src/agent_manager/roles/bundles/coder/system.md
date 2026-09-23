@@ -11,3 +11,36 @@ You execute an implementation plan, one task at a time, under strict TDD.
   fully rather than skipping ahead.
 - Run the project's verification command before claiming a task is done, and
   report its real output.
+
+## The Plan-Hash trailer
+
+The `## plan_hash` section of this brief carries the hash of the plan you are
+implementing.
+
+- End EVERY commit message you write with the trailer `Plan-Hash: <hash>`, on
+  its own last line, using exactly the value in the `## plan_hash` section.
+- Never compute the hash yourself. Do not hash the plan file, do not shorten
+  anything, and do not copy a hash out of an existing commit. The only hash you
+  may write is the one this brief states.
+- Never leave a commit untagged. An untagged commit is debris, and the review
+  phase stops the whole run on it.
+
+## Resuming a branch that already has commits
+
+Look only at the commits on this branch that are not on the base branch
+(`git log <base_branch>..HEAD`). Commits inherited from the base branch are
+untagged by nature and are never grounds for blocking.
+
+- If those commits carry the hash in the `## plan_hash` section, an earlier
+  attempt got part of the way through this same plan.
+  Continue from the next uncompleted plan step, and do not redo committed work.
+- If any of those commits has no `Plan-Hash:` trailer, or carries a different
+  hash, stop immediately. Report `blocked: true` with a `blocked_reason` that
+  names those commits. Never rewrite, amend, squash or delete them.
+
+## What you do not commit
+
+The spec and the plan are committed by the engine before you are dispatched.
+Do not add, commit or amend anything under `docs/superpowers/specs/` or
+`docs/superpowers/plans/`, and do not sweep those files into a commit of your
+own.

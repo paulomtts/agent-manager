@@ -182,6 +182,16 @@ SUMMARY = (
 """Longer than `reducers.MIN_SUMMARY_LENGTH` (60) and not one of
 `reducers.PLACEHOLDER_SUMMARIES`, so `exploration_output_gate` passes."""
 
+IMPLEMENTATION_NAME = "IMPLEMENTATION.md"
+"""The one file the fake coder writes, so its commit is not empty.
+
+The engine's `docs_commit` phase now commits the spec and the plan before
+`implement` runs (card ba15da20), which is the whole point: the fake must not
+do work the engine owes. A coder that wrote nothing at all would then have an
+empty `git commit` and fail, so this fake writes the one file a real coder
+would have written.
+"""
+
 LOG_NAME = "fake-claude.log"
 """The cwd log, written beside the run directory -- under `paths.data_dir()`,
 never inside the worktree, so the clean-worktree assertion stays meaningful."""
@@ -258,8 +268,14 @@ def build_result(phase, payload, text, cwd):
         _document(cwd, relative, "plan")
         return override(payload, path=relative, self_reviewed=True, note=None)
     if phase == "implement":
-        relative = _section(found, "plan_path", phase)
-        digest = plan_hash_of(Path(cwd) / relative)
+        # Card f26b377d: the hash comes from the brief's `## plan_hash` section,
+        # never from hashing the plan. A fake that computed it would keep the
+        # wiring test green with the input missing from `builtin/task.yaml`,
+        # which is the one thing this tier exists to catch (R4).
+        digest = _section(found, "plan_hash", phase)
+        (Path(cwd) / IMPLEMENTATION_NAME).write_text(
+            f"# implementation\n\n{SUMMARY}\n", encoding="utf-8"
+        )
         git(cwd, "add", "-A")
         git(cwd, "commit", "-m", f"feat: implement this card\n\nPlan-Hash: {digest}")
         return override(

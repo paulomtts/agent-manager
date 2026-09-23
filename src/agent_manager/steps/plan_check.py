@@ -171,3 +171,63 @@ def has_validated_plan(result: object) -> bool:
     if not isinstance(result, Mapping):
         return False
     return bool(result.get("found")) and bool(result.get("validated"))
+
+
+def _resolved_plan_path(plan_path: object, worktree: object | None) -> Path:
+    """The plan file to mark: absolute as given, else rooted at `worktree`.
+
+    `prompt.expand_writes` hands the engine a repo-RELATIVE posix path, so a
+    relative `plan_path` with no worktree would resolve against whatever the
+    process CWD happens to be and stamp the marker into the wrong file (or
+    create nothing anyone reads). That is a caller bug, raised up front in the
+    style of `_plans_dir` above and `verify._required_worktree`.
+    """
+    text = "" if plan_path is None else str(plan_path).strip()
+    if text == "":
+        raise ValueError(
+            f"plan_check.mark_validated needs a plan_path, got {plan_path!r}"
+        )
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    root = "" if worktree is None else str(worktree).strip()
+    if root == "":
+        raise ValueError(
+            f"plan_check.mark_validated got the relative plan_path {text!r} and no "
+            f"worktree to root it at (worktree={worktree!r})"
+        )
+    return Path(root) / path
+
+
+def mark_validated(
+    plan_path: str | Path, worktree: object | None = None
+) -> dict[str, object]:
+    """Record that Validate signed this plan, by appending `VALIDATED_MARKER`.
+
+    The deterministic phase's result (design §6) -- a plain dict, since it
+    crosses no process boundary and so needs no Pydantic model (`CLAUDE.md`).
+    Filesystem only, like the rest of this module: the plan file is the only
+    thing touched, and no hash is computed here (sibling ba15da20 owns that).
+
+    Idempotent by literal containment, the same test `find_validated_plan`
+    applies, so the writer and the reader can never disagree: an already-marked
+    plan is left BYTE-IDENTICAL rather than rewritten, which is what makes a
+    resumed run (design §9) safe. Appending instead of rewriting is deliberate
+    -- it cannot re-encode or re-terminate a single existing byte.
+
+    No `try` here on purpose: a missing, unreadable or non-UTF-8 plan must reach
+    `engine._run_deterministic`, which is total, records the phase failed and
+    escalates. A silent "nothing to mark" success would hand the sibling a
+    Plan-Hash over a file that was never marked.
+    """
+    path = _resolved_plan_path(plan_path, worktree)
+    text = path.read_text(encoding="utf-8")
+    if VALIDATED_MARKER in text:
+        return {"path": str(path), "appended": False}
+    # `newline="\n"` so the two characters written are exactly the two intended,
+    # on any platform; append mode so every byte already in the file survives.
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+        handle.write(f"{VALIDATED_MARKER}\n")
+    return {"path": str(path), "appended": True}

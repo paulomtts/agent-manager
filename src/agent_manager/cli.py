@@ -25,7 +25,15 @@ from typing import Any, Protocol
 
 import typer
 
-from agent_manager import board, dag, dispatch, engine, models, store as store_module
+from agent_manager import (
+    board,
+    dag,
+    dispatch,
+    engine,
+    models,
+    prompt,
+    store as store_module,
+)
 from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
 from agent_manager.store import Store
@@ -507,19 +515,27 @@ def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
     excluded by name -- `_bind_result` skips writing those back anyway, which
     means a same-named phase's result is never what a later phase reads.
 
+    An input whose name is not itself a phase can still name one: `plan_hash` is
+    resolved out of `docs_commit`'s result. `prompt.INPUT_PRODUCERS`, derived
+    from the resolution table, is the one place that mapping lives.
+
     Transitive by construction, and terminating: each hop moves strictly earlier
-    in `phase_names`. In `builtin/task.yaml` the only edge is `spec` -> `explore`.
+    in `phase_names`. In `builtin/task.yaml` the edges are `spec` -> `explore`
+    and `implement` -> `docs_commit`.
     """
     order = {name: index for index, name in enumerate(workflow.phase_names)}
     current = phase_name
     while True:
         phase = workflow.phase(current)
         producers = [
-            name
+            prompt.INPUT_PRODUCERS.get(name, name)
             for name in getattr(phase, "inputs", ())
-            if name in order
-            and name not in engine.RESERVED_CONTEXT_KEYS
-            and order[name] < order[current]
+            if name not in engine.RESERVED_CONTEXT_KEYS
+        ]
+        producers = [
+            name
+            for name in producers
+            if order.get(name, order[current]) < order[current]
         ]
         if not producers:
             return current

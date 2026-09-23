@@ -31,6 +31,9 @@ PARENT = models.Card(
     status="in_progress",
 )
 
+PLAN_HASH = "9f3a12bc"
+"""`docs_commit.plan_hash()`'s shape: 8 lowercase hex characters."""
+
 
 def _phase(inputs, *, name="implement", role="coder", **extra) -> AgentPhase:
     return AgentPhase(kind="agent", name=name, role=role, inputs=list(inputs), **extra)
@@ -49,6 +52,7 @@ def _context(**overrides):
         "spec_path": "docs/superpowers/specs/resolve-phase-inputs-968fba15.md",
         "plan_path": "docs/superpowers/plans/resolve-phase-inputs-968fba15.md",
         "explore": {"summary": "read engine.py", "files": ["src/agent_manager/engine.py"]},
+        "docs_commit": {"plan_hash": PLAN_HASH},
     }
     context.update(overrides)
     return context
@@ -345,8 +349,83 @@ def test_an_unreadable_repo_doc_is_an_engine_error_naming_the_phase(tmp_path):
     assert "CLAUDE.md" in str(caught.value)
 
 
-def test_the_table_carries_exactly_the_nine_names_section_7_fixes():
-    """§7's table is fixed. A tenth name is a design change, not a code change."""
+def test_plan_hash_renders_the_digest_the_docs_commit_step_returned():
+    """§7: a hash is a short string, so it is inlined exactly like `branch`."""
+    rendered = prompt.render_prompt(_phase(["plan_hash"]), _context())
+
+    assert _section(rendered, "plan_hash") == PLAN_HASH
+    assert rendered.text.endswith(f"\n## plan_hash\n{PLAN_HASH}\n")
+
+
+def test_a_phase_that_does_not_declare_plan_hash_needs_no_docs_commit_key():
+    """Lazy per declared name: `explore`, `spec`, `plan`, `validate_*` and
+    `review` all run before or without `docs_commit`, so resolution must never
+    be attempted for a name the phase did not ask for."""
+    context = _context()
+    del context["docs_commit"]
+
+    rendered = prompt.render_prompt(
+        _phase(["spec_path", "plan_path"], name="plan", role="planner"), context
+    )
+
+    assert rendered.inputs == ("spec_path", "plan_path")
+    assert "plan_hash" not in rendered.text
+
+
+def test_plan_hash_without_a_docs_commit_result_names_the_context_key():
+    context = _context()
+    del context["docs_commit"]
+
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(_phase(["plan_hash"]), context)
+
+    assert caught.value.phase == "implement"
+    assert caught.value.parameter == "plan_hash"
+    assert "nothing in the context supplies it" in str(caught.value)
+    assert "docs_commit" in str(caught.value)
+
+
+@pytest.mark.parametrize("result", [{}, {"plan_hash": None}, {"digest": "9f3a12bc"}])
+def test_a_docs_commit_result_without_the_digest_is_a_step_contract_breach(result):
+    """Distinct from the missing-key case: the phase ran and returned something,
+    but that something did not carry `plan_hash`."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(_phase(["plan_hash"]), _context(docs_commit=result))
+
+    assert caught.value.phase == "implement"
+    assert caught.value.parameter == "plan_hash"
+    assert "supplied no 'plan_hash'" in str(caught.value)
+    assert "nothing in the context supplies it" not in str(caught.value)
+
+
+def test_a_docs_commit_result_that_is_not_a_mapping_is_an_engine_error():
+    """Review Focus: a step that started returning a bare string must produce a
+    named EngineError, not an AttributeError out of the renderer."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(_phase(["plan_hash"]), _context(docs_commit="9f3a12bc"))
+
+    assert caught.value.parameter == "plan_hash"
+    assert "not a mapping" in str(caught.value)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_plan_hash_from_docs_commit_is_refused(blank):
+    """Review Focus: an empty section would be stamped as a blank trailer."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(
+            _phase(["plan_hash"]), _context(docs_commit={"plan_hash": blank})
+        )
+
+    assert caught.value.parameter == "plan_hash"
+    assert "supplied no 'plan_hash'" in str(caught.value)
+
+
+def test_the_table_carries_exactly_the_ten_names_section_7_fixes():
+    """§7's table is fixed. An eleventh name is a design change, not a code change.
+
+    `plan_hash` is the tenth, added by card f26b377d together with its row in
+    §7's table in `docs/superpowers/specs/2026-09-23-agent-manager-design.md`.
+    """
     rendered = prompt.render_prompt(
         _phase(
             [
@@ -359,6 +438,7 @@ def test_the_table_carries_exactly_the_nine_names_section_7_fixes():
                 "branch",
                 "base_branch",
                 "verification",
+                "plan_hash",
             ]
         ),
         _context(),
@@ -374,8 +454,17 @@ def test_the_table_carries_exactly_the_nine_names_section_7_fixes():
         "branch",
         "base_branch",
         "verification",
+        "plan_hash",
     )
     assert sorted(prompt._TABLE) == sorted(rendered.inputs)
+
+
+def test_the_producer_map_is_derived_from_the_table_it_describes():
+    """A resolver that reads another phase's result is a resume dependency:
+    `cli.resume_start_phase` has to back off over that phase. The mapping is
+    published from the table itself, so it cannot disagree with the resolver."""
+    assert prompt.INPUT_PRODUCERS == {"plan_hash": "docs_commit"}
+    assert set(prompt.INPUT_PRODUCERS) <= set(prompt._TABLE)
 
 
 def test_write_puts_utf8_prompt_text_in_the_attempt_directory(tmp_path):
@@ -548,6 +637,43 @@ def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
     brief = prompt.compose_brief(role, _rendered())
 
     assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
+
+
+def _shipped_coder_brief() -> str:
+    """The real coder bundle's brief for a real `implement` render.
+
+    Asserted through `compose_brief` rather than by reading `system.md`, so the
+    loader path (`roles/loader.py` -> `RoleBundle.system` -> the brief's first
+    part) is covered too: standing instructions that never reach the brief are
+    standing instructions no agent ever reads.
+    """
+    rendered = prompt.render_prompt(
+        _phase(["plan_path", "spec_path", "branch", "base_branch", "plan_hash"]),
+        _context(),
+    )
+    return prompt.compose_brief(roles_loader.load_role("coder"), rendered)
+
+
+def test_the_coder_brief_states_the_trailer_rule_beside_the_hash_it_must_use():
+    brief = _shipped_coder_brief()
+
+    assert f"\n## plan_hash\n{PLAN_HASH}\n" in brief
+    assert "`Plan-Hash: <hash>`" in brief
+    assert "Never compute the hash yourself" in brief
+    assert "Never leave a commit untagged" in brief
+
+
+def test_the_coder_brief_states_the_resume_rule_and_who_commits_the_documents():
+    """Main design §9 line 379: commits carrying the current hash are resumed
+    from, untagged ones are debris the coder reports rather than rewrites."""
+    brief = _shipped_coder_brief()
+
+    assert "git log <base_branch>..HEAD" in brief
+    assert "Continue from the next uncompleted plan step" in brief
+    assert "`blocked: true`" in brief
+    assert "`blocked_reason`" in brief
+    assert "Never rewrite, amend, squash or delete them." in brief
+    assert "committed by the engine" in brief
 
 
 class StandInResult(BaseModel):

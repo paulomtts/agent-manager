@@ -24,7 +24,16 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dag, dispatch, models, paths, store as store_module
+from agent_manager import (
+    board,
+    cli,
+    dag,
+    dispatch,
+    models,
+    paths,
+    prompt,
+    store as store_module,
+)
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.steps.reducers import verification_gate
 from agent_manager.workflow.loader import load_builtin
@@ -527,8 +536,8 @@ def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_chec
     assert cli.interrupted_phase(subtask, workflow) == "mark_done"
 
 
-SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan")
-"""The phases `plan_check: skip_to implement` jumps over, which the engine
+SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan", "mark_validated")
+"""The phases `plan_check: skip_to docs_commit` jumps over, which the engine
 records nowhere at all (engine.py:431-433 only appends to the in-memory
 summary), so an unrecorded stretch reads the same as one that never ran."""
 
@@ -548,6 +557,7 @@ def test_a_skipped_stretch_the_walk_ran_past_does_not_drag_the_restart_back():
                 for name in workflow.phase_names[:4]
                 if name not in SKIPPED_STRETCH
             ],
+            _recorded("docs_commit", "done"),
             _recorded("implement", "done", [_pure_attempt(1)]),
         ],
     )
@@ -589,10 +599,25 @@ def test_an_interrupted_spec_backs_off_to_the_phase_whose_result_it_binds():
     assert cli.resume_start_phase(_task_workflow(), "spec") == "explore"
 
 
-def test_an_interrupted_implement_stays_at_implement():
-    """`implement` declares `[plan_path, spec_path, branch, base_branch]`, all of
-    which `subtask_context` and `_document_paths` supply from the record."""
-    assert cli.resume_start_phase(_task_workflow(), "implement") == "implement"
+def test_an_interrupted_implement_backs_off_to_the_phase_that_binds_its_plan_hash():
+    """`implement` declares `[plan_path, spec_path, branch, base_branch,
+    plan_hash]`. The first four come from the record; `plan_hash` is
+    `docs_commit`'s result, which lives only in the in-memory binding table, so
+    a walk started at `implement` could not render its brief. `docs_commit` is
+    idempotent (nothing to commit and the branch already carries the hash
+    returns the same digest), so re-running it is the whole recovery. Card
+    f26b377d."""
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "docs_commit"
+
+
+def test_the_resume_walk_reads_its_producer_map_out_of_the_prompt_table(monkeypatch):
+    """`input name -> producing phase` has one home: the nested resolvers in
+    `prompt._TABLE`, which are what make the dependency real. A second,
+    hand-written copy in `cli.py` would go stale the day a resolver reads a
+    different phase, and the walk would restart somewhere that cannot render."""
+    monkeypatch.setitem(prompt.INPUT_PRODUCERS, "plan_hash", "mark_validated")
+
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "mark_validated"
 
 
 def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
@@ -603,7 +628,7 @@ def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orpha
     subtask = _pure_subtask(
         "card-1",
         [
-            *[_recorded(name, "done") for name in workflow.phase_names[:10]],
+            *[_recorded(name, "done") for name in workflow.phase_names[:11]],
             _recorded("verify", "started"),
         ],
     )
@@ -1070,6 +1095,25 @@ EXPLORE_RESULT = {
 }
 
 
+def _canned_agent_result(phase, context) -> dict[str, Any]:
+    """The canned result a faked agent phase returns.
+
+    The real Plan agent writes the plan file that the deterministic
+    `mark_validated` phase then stamps, so the fake writes a stand-in there. The
+    real `docs_commit` phase then commits the spec and the plan, so the fake
+    writes a stand-in spec too.
+    """
+    if phase.name == "spec":
+        spec = Path(context["worktree"]) / context["spec_path"]
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("# canned spec\n", encoding="utf-8")
+    if phase.name == "plan":
+        plan = Path(context["worktree"]) / context["plan_path"]
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("# canned plan\n", encoding="utf-8")
+    return {"phase": phase.name, "ok": True}
+
+
 def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str | None = None):
     """An `engine.AgentPhaseRunner` that returns canned results and runs nothing.
 
@@ -1087,7 +1131,7 @@ def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str 
             )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -2524,7 +2568,7 @@ def recording_runner(
         )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -2578,7 +2622,7 @@ def test_a_run_killed_mid_implement_resumes_and_leaves_no_started_attempt(projec
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
 
     assert payload["status"] == "done"
-    assert payload["resumed_from"] == "implement"
+    assert payload["resumed_from"] == "docs_commit"
     assert {"phase": "implement", "n": 1} in payload["discarded_attempts"]
     assert payload["run_id"] == run_id
     assert payload["card_id"] == cards["subtask"]
@@ -2653,7 +2697,7 @@ def test_resume_passes_its_own_allow_no_verification_into_the_gate_context(proje
             contexts.append(dict(context))
             if phase.name == "explore":
                 return dict(EXPLORE_RESULT)
-            return {"phase": phase.name, "ok": True}
+            return _canned_agent_result(phase, context)
 
         return collect
 
@@ -2850,7 +2894,7 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "done"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
     assert envelope["data"]["discarded_attempts"] == [{"phase": "implement", "n": 1}]
     assert "\n" not in result.stdout.strip()
 
@@ -2887,7 +2931,7 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "escalated"
     assert envelope["data"]["failed_phase"] == "review"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
 
 
 @requires_git
@@ -2927,7 +2971,7 @@ def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["data"]["resumed_from"] == "implement"
+    assert json.loads(result.stdout)["data"]["resumed_from"] == "docs_commit"
     assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
     assert contexts[0]["allow_no_verification"] is False
 

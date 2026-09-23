@@ -49,6 +49,8 @@ EXPECTED_PHASES = (
     ("validate_spec", "agent"),
     ("plan", "agent"),
     ("validate_plan", "agent"),
+    ("mark_validated", "deterministic"),
+    ("docs_commit", "deterministic"),
     ("implement", "agent"),
     ("review", "agent"),
     ("verify", "deterministic"),
@@ -63,7 +65,7 @@ def test_builtin_task_loads_against_the_default_registry() -> None:
     assert workflow.description
 
 
-def test_builtin_task_has_the_twelve_phases_in_spec_order() -> None:
+def test_builtin_task_has_the_fourteen_phases_in_spec_order() -> None:
     workflow = load_builtin("task")
     assert tuple((phase.name, phase.kind) for phase in workflow.phases) == EXPECTED_PHASES
 
@@ -87,12 +89,59 @@ def test_no_agent_phase_precedes_the_worktree_phase() -> None:
     assert names.index("worktree") < min(agent_indexes)
 
 
-def test_plan_check_skips_forward_to_implement_when_a_plan_exists() -> None:
+def test_plan_check_skips_forward_to_docs_commit_when_a_plan_exists() -> None:
     phase = load_builtin("task").phase("plan_check")
     assert isinstance(phase, DeterministicPhase)
     assert phase.run == "plan_check.find_validated_plan"
     assert phase.when == "plan_check.has_validated_plan"
-    assert phase.skip_to == "implement"
+    assert phase.skip_to == "docs_commit"
+
+
+def test_docs_commit_sits_between_the_marker_and_the_coder() -> None:
+    """The hash this phase stamps is the hash of the plan file WITH the
+    validated marker on it, which is the hash `review` recomputes -- so it has
+    to run after `mark_validated`. It must also run before `implement`, or the
+    coder's own `git add` would sweep the documents into its commit and the
+    docs commit would never exist."""
+    workflow = load_builtin("task")
+    phase = workflow.phase("docs_commit")
+    assert isinstance(phase, DeterministicPhase)
+    assert phase.run == "docs_commit.commit_documents"
+    # No args: `bind_arguments` takes card_details, spec_path, plan_path and
+    # worktree from the context by parameter name. Not best-effort and not
+    # gated: an uncommitted or untagged pair of documents must escalate.
+    assert phase.args == {}
+    assert phase.gates == []
+    assert phase.best_effort is False
+    assert phase.when is None
+    assert phase.skip_to is None
+
+    names = workflow.phase_names
+    assert names.index("mark_validated") < names.index("docs_commit")
+    assert names.index("docs_commit") < names.index("implement")
+
+
+def test_mark_validated_stamps_the_plan_between_validation_and_implement() -> None:
+    """Placement IS the guard: `validate_plan` is gated by
+    `critic_blockers_gate`, and a non-retryable gate failure escalates the
+    subtask out of the walk (engine.run_subtask) before this index is reached.
+    So an unvalidated plan is never marked, with no extra logic here."""
+    workflow = load_builtin("task")
+    phase = workflow.phase("mark_validated")
+    assert isinstance(phase, DeterministicPhase)
+    assert phase.run == "plan_check.mark_validated"
+    # No args: `bind_arguments` takes `plan_path` and `worktree` from the
+    # context by parameter name. No gates and not best-effort: an unmarked plan
+    # makes the next run re-plan, so a failure here must escalate.
+    assert phase.args == {}
+    assert phase.gates == []
+    assert phase.best_effort is False
+    assert phase.when is None
+    assert phase.skip_to is None
+
+    names = workflow.phase_names
+    assert names.index("validate_plan") < names.index("mark_validated")
+    assert names.index("mark_validated") < names.index("implement")
 
 
 @pytest.mark.parametrize(
@@ -153,6 +202,45 @@ def test_review_carries_both_of_its_gates() -> None:
     assert isinstance(phase, AgentPhase)
     assert phase.gates == ["review_gate", "plan_hash_gate"]
     assert phase.inputs == ["branch", "base_branch", "plan_path"]
+    # The reviewer recomputes the hash from the plan file; card f26b377d gives
+    # the input to the coder only.
+    assert "plan_hash" not in phase.inputs
+
+
+def test_implement_is_handed_the_plan_hash_last_after_the_documents() -> None:
+    """Card f26b377d: the coder cannot stamp a trailer it was never told. The
+    hash renders last, after the documents and the branches, because that order
+    is the document author's emphasis and `render_prompt` preserves it."""
+    phase = load_builtin("task").phase("implement")
+    assert isinstance(phase, AgentPhase)
+    assert phase.role == "coder"
+    assert phase.result == "ImplementResult"
+    assert phase.inputs == [
+        "plan_path",
+        "spec_path",
+        "branch",
+        "base_branch",
+        "plan_hash",
+    ]
+    assert phase.gates == []
+
+
+def test_no_phase_declares_plan_hash_before_docs_commit_runs() -> None:
+    """Review focus: `plan_hash` reads `context["docs_commit"]`, which the
+    engine only binds once that phase has run. A phase declaring it earlier
+    would raise at render time, mid-run. Driven from the loaded document, never
+    a hardcoded list."""
+    workflow = load_builtin("task")
+    names = workflow.phase_names
+    declaring = [
+        phase.name
+        for phase in workflow.phases
+        if isinstance(phase, AgentPhase) and "plan_hash" in phase.inputs
+    ]
+
+    assert declaring == ["implement"]  # non-vacuity
+    for name in declaring:
+        assert names.index("docs_commit") < names.index(name)
 
 
 def test_every_resolved_function_is_the_registry_binding() -> None:
@@ -342,6 +430,7 @@ def _phase_results() -> dict[str, Any]:
         "validate_spec": _critic_result(),
         "plan": _plan_result(),
         "validate_plan": _critic_result(),
+        "docs_commit": {"plan_hash": PLAN_HASH},
         "implement": _implement_result(),
         "review": _review_result(),
         "verify": {"passed": True, "detail": ""},

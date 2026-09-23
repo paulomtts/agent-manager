@@ -1136,6 +1136,16 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     def has_plan(result: dict[str, Any]) -> bool:
         return bool(result.get("validated"))
 
+    def mark_validated(plan_path: str, worktree: Any) -> dict[str, Any]:
+        calls.append("plan_check.mark_validated")
+        return {"path": plan_path, "appended": True}
+
+    def commit_documents(
+        card_details: Any, spec_path: str, plan_path: str, worktree: Any
+    ) -> dict[str, Any]:
+        calls.append("docs_commit.commit_documents")
+        return {"plan_hash": "a1b2c3d4"}
+
     def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
@@ -1152,6 +1162,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "worktree.ensure": ensure,
         "plan_check.find_validated_plan": find_plan,
         "plan_check.has_validated_plan": has_plan,
+        "plan_check.mark_validated": mark_validated,
+        "docs_commit.commit_documents": commit_documents,
         "verify.run_suite": run_suite,
         "verification_passed_gate": verification_passed_gate,
         "critic_blockers_gate": agent_only_gate,
@@ -1189,6 +1201,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "agent:validate_spec",
         "agent:plan",
         "agent:validate_plan",
+        "plan_check.mark_validated",
+        "docs_commit.commit_documents",
         "agent:implement",
         "agent:review",
         "verify.run_suite",
@@ -1201,6 +1215,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "worktree",
         "mark_in_progress",
         "plan_check",
+        "mark_validated",
+        "docs_commit",
         "verify",
         "mark_done",
     ]
@@ -1589,6 +1605,16 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
     def has_plan(result: dict[str, Any]) -> bool:
         return bool(result.get("validated"))
 
+    def mark_validated(plan_path: str, worktree: Any) -> dict[str, Any]:
+        calls.append("plan_check.mark_validated")
+        return {"path": plan_path, "appended": True}
+
+    def commit_documents(
+        card_details: Any, spec_path: str, plan_path: str, worktree: Any
+    ) -> dict[str, Any]:
+        calls.append("docs_commit.commit_documents")
+        return {"plan_hash": "a1b2c3d4"}
+
     def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
@@ -1604,6 +1630,8 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         "worktree.ensure": ensure,
         "plan_check.find_validated_plan": find_plan,
         "plan_check.has_validated_plan": has_plan,
+        "plan_check.mark_validated": mark_validated,
+        "docs_commit.commit_documents": commit_documents,
         "verify.run_suite": run_suite,
         "verification_passed_gate": passed,
         "critic_blockers_gate": agent_only_gate,
@@ -1660,6 +1688,8 @@ def test_a_resume_started_at_explore_never_re_runs_the_worktree_phase(store):
     assert [name for name, _status in _projected_phases(store)] == [
         "mark_in_progress",
         "plan_check",
+        "mark_validated",
+        "docs_commit",
         "verify",
         "mark_done",
     ]
@@ -1681,7 +1711,13 @@ def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(st
 
     summary = _walk_builtin(store, recorded, validated=True)
 
-    assert summary.skipped == ["spec", "validate_spec", "plan", "validate_plan"]
+    assert summary.skipped == [
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "mark_validated",
+    ]
     assert set(recorded) == {"explore", "implement", "review"}
     sections = dict(recorded["implement"].sections)
     assert sections["spec_path"] == SPEC_PATH
@@ -1700,7 +1736,7 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
         "validate_spec": ("card", "spec_path"),
         "plan": ("spec_path", "plan_path"),
         "validate_plan": ("spec_path", "plan_path"),
-        "implement": ("plan_path", "spec_path", "branch", "base_branch"),
+        "implement": ("plan_path", "spec_path", "branch", "base_branch", "plan_hash"),
         "review": ("branch", "base_branch", "plan_path"),
     }
 

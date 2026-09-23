@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager import models
 from agent_manager.engine import bind_arguments
 from agent_manager.errors import EngineError
-from agent_manager.steps import plan_check, reducers, rollup, verify, worktree
+from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
 from agent_manager.workflow.registry import (
     BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
@@ -83,9 +84,11 @@ def test_names_are_sorted_and_membership_is_cheap() -> None:
 # (design spec lines 146-225).
 TASK_YAML_NAMES = (
     "critic_blockers_gate",
+    "docs_commit.commit_documents",
     "exploration_output_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
+    "plan_check.mark_validated",
     "plan_hash_gate",
     "review_gate",
     "rollup.set_status",
@@ -122,7 +125,68 @@ def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> 
     assert registry.resolve("verify.run_suite") is verify.run_suite
     assert registry.resolve("plan_check.find_validated_plan") is plan_check.find_validated_plan
     assert registry.resolve("plan_check.has_validated_plan") is plan_check.has_validated_plan
+    assert registry.resolve("plan_check.mark_validated") is plan_check.mark_validated
+    assert registry.resolve("docs_commit.commit_documents") is docs_commit.commit_documents
     assert registry.resolve("rollup.set_status") is rollup.set_status
+
+
+def test_the_engine_can_bind_mark_validated_out_of_the_subtask_context() -> None:
+    """Review focus: the phase carries no `args:`, so both parameters have to
+    come from the context by name -- `plan_path` from `engine._document_paths`
+    and `worktree` from `engine.subtask_context`. If either name drifted, the
+    phase would die at runtime while every unit test still passed."""
+    bound = bind_arguments(
+        plan_check.mark_validated,
+        {
+            "card": "a32af745",
+            "worktree": Path("/repo/.claude/worktrees/m2/task-rows-a32af745"),
+            "plan_path": "docs/superpowers/plans/task-rows-a32af745.md",
+            "spec_path": "docs/superpowers/specs/task-rows-a32af745.md",
+            "commands": ["uv run pytest"],
+        },
+        None,
+        phase="mark_validated",
+        function="plan_check.mark_validated",
+    )
+
+    assert bound == {
+        "plan_path": "docs/superpowers/plans/task-rows-a32af745.md",
+        "worktree": Path("/repo/.claude/worktrees/m2/task-rows-a32af745"),
+    }
+
+
+def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context() -> None:
+    """The phase carries no `args:`, so all four parameters have to come from the
+    context by name -- `card_details` and `worktree` from
+    `engine.subtask_context`, `spec_path` and `plan_path` from
+    `engine._document_paths`. `git_runner` has a default and must NOT be bound
+    out of a context that happens to hold no such key."""
+    card = models.Card(
+        id="6f1a2f2e-1f1c-4f0e-9a6d-0c2f3b4a5d6e",
+        title="Commit the spec and plan with the Plan-Hash trailer",
+        status="todo",
+    )
+    bound = bind_arguments(
+        docs_commit.commit_documents,
+        {
+            "card": "ba15da20",
+            "card_details": card,
+            "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+            "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+            "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+            "commands": ["uv run pytest"],
+        },
+        None,
+        phase="docs_commit",
+        function="docs_commit.commit_documents",
+    )
+
+    assert bound == {
+        "card_details": card,
+        "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+        "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+        "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+    }
 
 
 def test_the_engine_can_bind_the_documents_args_to_the_rollup_step() -> None:

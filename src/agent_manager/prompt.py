@@ -139,6 +139,48 @@ def _verbatim(key: str) -> Resolver:
     return resolve
 
 
+def _phase_field(phase_key: str, field: str) -> Resolver:
+    """One field of an earlier phase's result, inlined as its own string.
+
+    `engine._bind_result` stores a phase's result in the context under the
+    phase's own name, so `docs_commit`'s `{"plan_hash": digest}` lands at
+    `context["docs_commit"]["plan_hash"]`. Input names are the document's
+    vocabulary and context keys are the callees' names, so the declared input
+    stays `plan_hash` while the lookup is nested -- the same split
+    `base_branch` -> `base` already has.
+
+    Two failures, deliberately distinguished. The phase never ran, so its key
+    is absent: `_required` reports that, and it is the case a document hits by
+    declaring the input on a phase that precedes the producer. The phase ran
+    but its result does not carry the field: that is a step-contract breach,
+    which no reordering of the document fixes.
+    """
+
+    def resolve(request: _Request) -> str:
+        result = _required(request, phase_key)
+        if not isinstance(result, Mapping):
+            raise EngineError(
+                f"is declared as an input, but the {phase_key!r} entry in the "
+                f"context is a {type(result).__name__}, not a mapping, so it can "
+                f"supply no {field!r}",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        value = result.get(field)
+        if value is None or not str(value).strip():
+            raise EngineError(
+                f"is declared as an input, but the {phase_key!r} result supplied "
+                f"no {field!r} (that result carries: "
+                f"{', '.join(sorted(str(key) for key in result)) or 'nothing'})",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        return str(value)
+
+    resolve.produced_by = phase_key  # type: ignore[attr-defined]
+    return resolve
+
+
 def _inline_json(key: str, *, allow_empty: bool = False) -> Resolver:
     """A context value inlined as JSON -- §7's form for small structured results.
 
@@ -232,8 +274,24 @@ _TABLE: dict[str, Resolver] = {
     "plan_path": _verbatim("plan_path"),
     "branch": _verbatim("branch"),
     "base_branch": _verbatim("base"),
+    "plan_hash": _phase_field("docs_commit", "plan_hash"),
 }
 """The fixed §7 resolution table, keyed by the name a document may declare."""
+
+
+INPUT_PRODUCERS: dict[str, str] = {
+    name: resolver.produced_by  # type: ignore[attr-defined]
+    for name, resolver in _TABLE.items()
+    if hasattr(resolver, "produced_by")
+}
+"""Declared input name -> the phase whose result its resolver reads.
+
+Derived from `_TABLE`, never hand-written: `_phase_field` stamps the phase key
+on the resolver it builds, so this map cannot disagree with the lookup it
+describes. `cli.resume_start_phase` reads it, because an input resolved out of
+another phase's result is a dependency on that phase having run in *this*
+process -- the journal never replays the binding table.
+"""
 
 
 def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:
