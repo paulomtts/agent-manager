@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -92,3 +93,23 @@ def test_project_db_path_resolves_symlinked_spelling(monkeypatch, tmp_path):
     link.symlink_to(project_root)
 
     assert paths.project_db_path(link) == paths.project_db_path(project_root)
+
+
+def test_project_db_path_digest_is_sha256_of_resolved_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    expected = hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()
+    result = paths.project_db_path(project_root)
+    assert result.name == f"{expected}.db"
+
+
+def test_project_db_path_accepts_a_root_that_does_not_exist(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    absent = tmp_path / "not-cloned-yet"
+
+    result = paths.project_db_path(absent)
+    assert result.parent == tmp_path / "data" / "agent-manager" / "projects"
+    assert result.name.endswith(".db")
+    assert not absent.exists()
