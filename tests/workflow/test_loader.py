@@ -203,10 +203,13 @@ phases:
         load_workflow(document, registry_with("demo.run"))
 
     message = str(caught.value)
-    assert "worktree" in message
-    assert "worktree.ensure" in message
-    assert "run" in message
+    # Substring checks on bare words like "run" or "worktree" would be satisfied
+    # by the registered name "demo.run" and by "worktree.ensure" itself, so the
+    # phase and the position are pinned as whole fragments and as attributes.
+    assert "phase 'worktree' run 'worktree.ensure'" in message
     assert "demo.run" in message  # what WAS registered
+    assert caught.value.phase == "worktree"
+    assert caught.value.field == "run"
     assert caught.value.unknown == ("worktree.ensure",)
 
 
@@ -227,8 +230,9 @@ phases:
         load_workflow(document, registry_with("demo.run"))
 
     assert caught.value.unknown == ("plan_check.has_validated_plan",)
-    assert "when" in str(caught.value)
-    assert "plan_check" in str(caught.value)
+    assert "phase 'plan_check' when 'plan_check.has_validated_plan'" in str(caught.value)
+    assert caught.value.phase == "plan_check"
+    assert caught.value.field == "when"
 
 
 def test_unknown_gate_name_fails_at_load_time() -> None:
@@ -244,8 +248,9 @@ phases:
         load_workflow(document, registry_with("review_gate"))
 
     assert caught.value.unknown == ("plan_hash_gate",)
-    assert "gate" in str(caught.value)
-    assert "review" in str(caught.value)
+    assert "phase 'review' gate 'plan_hash_gate'" in str(caught.value)
+    assert caught.value.phase == "review"
+    assert caught.value.field == "gate"
 
 
 def test_every_unknown_name_is_reported_in_one_error() -> None:
@@ -266,8 +271,9 @@ phases:
 
     assert caught.value.unknown == ("missing.run", "missing.when", "missing_gate")
     message = str(caught.value)
-    assert "'first'" in message
-    assert "'second'" in message
+    assert "phase 'first' run 'missing.run'" in message
+    assert "phase 'first' when 'missing.when'" in message
+    assert "phase 'second' gate 'missing_gate'" in message
     assert caught.value.workflow == "demo"
 
 
@@ -406,3 +412,4 @@ phases:
     assert caught.value.phase == "second"
     assert caught.value.field == "skip_to"
     assert expected in str(caught.value)
+
