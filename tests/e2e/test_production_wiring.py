@@ -79,3 +79,27 @@ def test_the_worktree_is_clean_after_the_run(worktree):
     assert list(worktree.rglob("result.json")) == []
     assert list(worktree.rglob("prompt.txt")) == []
     assert list(worktree.rglob("stdout.log")) == []
+
+
+def test_the_brief_carries_the_result_path_and_the_schema(agent_attempts):
+    """Addendum R2: the brief is one on-disk document that states the absolute
+    result path and embeds `model_json_schema()`.
+
+    The fake has no other source for either, so this assertion is what turns a
+    prompt-composition regression into a named failure instead of a mysterious
+    missing result file.
+    """
+    workflow = load_builtin("task")
+
+    for name in AGENT_PHASES:
+        attempt = agent_attempts[name]
+        text = Path(attempt.prompt_path).read_text(encoding="utf-8")
+        declared = workflow.phase(name).result
+        model = results.RESULT_MODELS[declared]
+        schema = json.dumps(
+            model.model_json_schema(), indent=2, ensure_ascii=False
+        )
+
+        assert prompt.RESULT_HEADING in text, name
+        assert str(attempt.result_path) in text, name
+        assert schema in text, name
