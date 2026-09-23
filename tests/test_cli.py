@@ -527,7 +527,7 @@ def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_chec
     assert cli.interrupted_phase(subtask, workflow) == "mark_done"
 
 
-SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan")
+SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan", "mark_validated")
 """The phases `plan_check: skip_to implement` jumps over, which the engine
 records nowhere at all (engine.py:431-433 only appends to the in-memory
 summary), so an unrecorded stretch reads the same as one that never ran."""
@@ -603,7 +603,7 @@ def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orpha
     subtask = _pure_subtask(
         "card-1",
         [
-            *[_recorded(name, "done") for name in workflow.phase_names[:10]],
+            *[_recorded(name, "done") for name in workflow.phase_names[:11]],
             _recorded("verify", "started"),
         ],
     )
@@ -1070,6 +1070,19 @@ EXPLORE_RESULT = {
 }
 
 
+def _canned_agent_result(phase, context) -> dict[str, Any]:
+    """The canned result a faked agent phase returns.
+
+    The real Plan agent writes the plan file that the deterministic
+    `mark_validated` phase then stamps, so the fake writes a stand-in there.
+    """
+    if phase.name == "plan":
+        plan = Path(context["worktree"]) / context["plan_path"]
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("# canned plan\n", encoding="utf-8")
+    return {"phase": phase.name, "ok": True}
+
+
 def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str | None = None):
     """An `engine.AgentPhaseRunner` that returns canned results and runs nothing.
 
@@ -1087,7 +1100,7 @@ def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str 
             )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -2524,7 +2537,7 @@ def recording_runner(
         )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -2653,7 +2666,7 @@ def test_resume_passes_its_own_allow_no_verification_into_the_gate_context(proje
             contexts.append(dict(context))
             if phase.name == "explore":
                 return dict(EXPLORE_RESULT)
-            return {"phase": phase.name, "ok": True}
+            return _canned_agent_result(phase, context)
 
         return collect
 

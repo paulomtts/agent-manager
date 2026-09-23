@@ -212,6 +212,7 @@ BUILTIN_FUNCTION_NAMES = (
     "exploration_output_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
+    "plan_check.mark_validated",
     "plan_hash_gate",
     "review_gate",
     "rollup.set_status",
@@ -255,5 +256,6 @@ def default_registry() -> FunctionRegistry:
     registry.register("verify.run_suite", verify.run_suite)
     registry.register("plan_check.find_validated_plan", plan_check.find_validated_plan)
     registry.register("plan_check.has_validated_plan", plan_check.has_validated_plan)
+    registry.register("plan_check.mark_validated", plan_check.mark_validated)
     registry.register("rollup.set_status", rollup.set_status)
     return registry

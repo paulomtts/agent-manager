@@ -54,6 +54,10 @@ phases:
     result: CriticResult
     gates: [critic_blockers_gate]
 
+  - name: mark_validated
+    kind: deterministic
+    run: plan_check.mark_validated
+
   - name: implement
     kind: agent
     role: coder

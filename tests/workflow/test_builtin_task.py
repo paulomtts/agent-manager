@@ -49,6 +49,7 @@ EXPECTED_PHASES = (
     ("validate_spec", "agent"),
     ("plan", "agent"),
     ("validate_plan", "agent"),
+    ("mark_validated", "deterministic"),
     ("implement", "agent"),
     ("review", "agent"),
     ("verify", "deterministic"),
@@ -63,7 +64,7 @@ def test_builtin_task_loads_against_the_default_registry() -> None:
     assert workflow.description
 
 
-def test_builtin_task_has_the_twelve_phases_in_spec_order() -> None:
+def test_builtin_task_has_the_thirteen_phases_in_spec_order() -> None:
     workflow = load_builtin("task")
     assert tuple((phase.name, phase.kind) for phase in workflow.phases) == EXPECTED_PHASES
 
@@ -93,6 +94,29 @@ def test_plan_check_skips_forward_to_implement_when_a_plan_exists() -> None:
     assert phase.run == "plan_check.find_validated_plan"
     assert phase.when == "plan_check.has_validated_plan"
     assert phase.skip_to == "implement"
+
+
+def test_mark_validated_stamps_the_plan_between_validation_and_implement() -> None:
+    """Placement IS the guard: `validate_plan` is gated by
+    `critic_blockers_gate`, and a non-retryable gate failure escalates the
+    subtask out of the walk (engine.run_subtask) before this index is reached.
+    So an unvalidated plan is never marked, with no extra logic here."""
+    workflow = load_builtin("task")
+    phase = workflow.phase("mark_validated")
+    assert isinstance(phase, DeterministicPhase)
+    assert phase.run == "plan_check.mark_validated"
+    # No args: `bind_arguments` takes `plan_path` and `worktree` from the
+    # context by parameter name. No gates and not best-effort: an unmarked plan
+    # makes the next run re-plan, so a failure here must escalate.
+    assert phase.args == {}
+    assert phase.gates == []
+    assert phase.best_effort is False
+    assert phase.when is None
+    assert phase.skip_to is None
+
+    names = workflow.phase_names
+    assert names.index("validate_plan") < names.index("mark_validated")
+    assert names.index("mark_validated") < names.index("implement")
 
 
 @pytest.mark.parametrize(
