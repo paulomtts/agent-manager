@@ -677,3 +677,64 @@ def test_composing_a_contract_creates_no_file(tmp_path):
     )
 
     assert list(tmp_path.iterdir()) == []
+
+
+FEEDBACK = "The verify step failed: two tests error on a missing fixture."
+
+
+def test_feedback_is_the_last_section_and_comes_after_the_contract():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+        feedback=FEEDBACK,
+    )
+
+    assert brief.index(prompt.RESULT_HEADING) < brief.index(prompt.FEEDBACK_HEADING)
+    assert brief.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")
+
+
+def test_without_feedback_the_heading_is_absent():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+    )
+
+    assert prompt.FEEDBACK_HEADING not in brief
+
+
+def test_the_brief_without_feedback_is_a_prefix_of_the_brief_with_it():
+    role = _role(methodology={"test-driven-development.md": TDD_BODY})
+    rendered = _rendered()
+    contract = {
+        "result_path": "/runs/r1/implement.1/result.json",
+        "result_model": StandInResult,
+    }
+
+    base = prompt.compose_brief(role, rendered, **contract)
+    retry = prompt.compose_brief(role, rendered, **contract, feedback=FEEDBACK)
+
+    assert retry.startswith(base)
+    assert retry.count(prompt.RESULT_HEADING) == 1
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\n", " \t\n "])
+def test_blank_feedback_produces_no_feedback_section(blank):
+    brief = prompt.compose_brief(_role(), _rendered(), feedback=blank)
+
+    assert prompt.FEEDBACK_HEADING not in brief
+    assert brief == prompt.compose_brief(_role(), _rendered())
+
+
+def test_feedback_that_already_ends_in_newlines_does_not_accumulate_blank_lines():
+    role = _role()
+    rendered = _rendered()
+
+    base = prompt.compose_brief(role, rendered)
+    retry = prompt.compose_brief(role, rendered, feedback=FEEDBACK + "\n\n\n")
+
+    assert retry.startswith(base)
+    assert retry.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")

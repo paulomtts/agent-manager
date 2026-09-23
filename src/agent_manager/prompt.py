@@ -314,6 +314,8 @@ def compose_brief(
     contract = _result_contract(rendered.phase, result_path, result_model)
     if contract is not None:
         parts.append(contract)
+    if feedback is not None and feedback.strip():
+        parts.append(FEEDBACK_HEADING + "\n" + feedback.strip("\n"))
     return _join_sections(parts)
 
 
