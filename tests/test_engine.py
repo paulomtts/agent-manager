@@ -1696,9 +1696,9 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
 
     assert {name: rendered.inputs for name, rendered in recorded.items()} == {
         "explore": ("card", "parent_story", "repo_docs", "verification"),
-        "spec": ("card", "explore"),
+        "spec": ("card", "explore", "spec_path"),
         "validate_spec": ("card", "spec_path"),
-        "plan": ("spec_path",),
+        "plan": ("spec_path", "plan_path"),
         "validate_plan": ("spec_path", "plan_path"),
         "implement": ("plan_path", "spec_path", "branch", "base_branch"),
         "review": ("branch", "base_branch", "plan_path"),
