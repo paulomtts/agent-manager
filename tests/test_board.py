@@ -168,6 +168,7 @@ def test_decode_tolerates_an_error_envelope_without_a_message():
         )
     assert excinfo.value.error_type is None
     assert excinfo.value.exit_code == 1
+    assert excinfo.value.message == "brd reported a failure with no message"
 
 
 @pytest.mark.parametrize(
@@ -202,6 +203,20 @@ def test_a_non_zero_exit_is_an_error_even_behind_an_ok_envelope():
         )
     assert excinfo.value.exit_code == 3
     assert "exited 3" in str(excinfo.value)
+
+
+def test_an_ok_envelope_with_no_data_raises_board_error():
+    # brd promises {"ok": true, "data": ...}; an ok envelope without `data` is
+    # a broken contract, not a None payload to hand on to model validation.
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(
+            json.dumps({"ok": True}),
+            argv=board.show_argv("141c96e6"),
+            exit_code=0,
+        )
+    assert "no data" in str(excinfo.value)
+    assert excinfo.value.argv == ["brd", "show", "141c96e6"]
+    assert excinfo.value.exit_code == 0
 
 
 def test_data_missing_a_required_field_raises_board_error():
