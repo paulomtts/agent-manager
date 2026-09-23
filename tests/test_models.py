@@ -92,15 +92,15 @@ def test_attempt_records_a_finished_outcome():
 def test_attempt_requires_n_and_dispatch():
     with pytest.raises(ValidationError) as excinfo:
         models.Attempt()
-    message = str(excinfo.value)
-    assert "n" in message
-    assert "dispatch" in message
+    # Both field names are substrings of pydantic's boilerplate ("validation",
+    # "Input"), so match the error locations, not the rendered message.
+    assert {error["loc"] for error in excinfo.value.errors()} == {("n",), ("dispatch",)}
 
 
 def test_attempt_rejects_a_non_numeric_n():
     with pytest.raises(ValidationError) as excinfo:
         models.Attempt(n="first", dispatch=_dispatch())
-    assert "n" in str(excinfo.value)
+    assert [error["loc"] for error in excinfo.value.errors()] == [("n",)]
 
 
 def test_attempt_rejects_a_bool_n():
@@ -267,7 +267,8 @@ def test_run_requires_an_id():
             base_branch="main",
             branch_prefix="m1/",
         )
-    assert "id" in str(excinfo.value)
+    # "id" is a substring of "validation", so assert on the error location.
+    assert [error["loc"] for error in excinfo.value.errors()] == [("id",)]
 
 
 def test_run_rejects_an_empty_id():
@@ -280,7 +281,7 @@ def test_run_rejects_an_empty_id():
             base_branch="main",
             branch_prefix="m1/",
         )
-    assert "id" in str(excinfo.value)
+    assert [error["loc"] for error in excinfo.value.errors()] == [("id",)]
 
 
 def test_run_rejects_a_non_list_stories():
