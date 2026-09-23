@@ -343,6 +343,59 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
 
 @requires_git
 @requires_brd
+def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, cards):
+    """`AgentRunner` collects gate warnings on itself (dispatch.py:375) because
+    an `AgentPhaseRunner` returns a result and has no second channel. §12 forbids
+    a run reporting a clean success while a gate warned, so the payload has to
+    carry that list too -- not just `SubtaskSummary.warnings`."""
+
+    class WarningRunner:
+        def __init__(self) -> None:
+            self.warnings = ["explore attempt 1: gate exploration_output_gate warned"]
+            self._inner = fake_runner()
+
+        def __call__(self, phase, context, rendered):
+            return self._inner(phase, context, rendered)
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: WarningRunner(),
+    )
+
+    assert payload["status"] == "done"
+    assert "explore attempt 1: gate exploration_output_gate warned" in payload["warnings"]
+    # The summary's own best-effort warnings are still there: the two lists are
+    # concatenated, not one replaced by the other.
+    assert any("mark_done" in warning for warning in payload["warnings"])
+
+
+@requires_git
+@requires_brd
+def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards):
+    """The run id is a directory name and a join key, so which clock produced it
+    is behaviour, not decoration: `started_at` and the id must be the same
+    instant."""
+    frozen = datetime(2026, 9, 23, 14, 5, 6, tzinfo=timezone.utc)
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        clock=lambda: frozen,
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["run_id"] == cli.mint_run_id(cards["subtask"], frozen)
+    assert payload["run_id"].startswith("20260923T140506Z-")
+    row = sqlite3.connect(paths.project_db_path(project)).execute(
+        "SELECT started_at FROM runs WHERE id = ?", (payload["run_id"],)
+    ).fetchone()
+    assert row[0].startswith("2026-09-23T14:05:06")
+
+
+@requires_git
+@requires_brd
 def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
     payload = cli.run_card(
         cards["subtask"],
@@ -388,6 +441,10 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
     assert list(project.rglob("journal.jsonl")) == []
     assert list(project.rglob("*.db")) == []
     porcelain = _git(project, "status", "--porcelain").splitlines()
+    # Non-emptiness first: the run really does add the worktree, so an empty
+    # porcelain would mean the fixture stopped showing it and the `all()` below
+    # would pass on nothing.
+    assert porcelain, "the run's own worktree should show up as untracked"
     assert all(".claude" in line or ".brd" in line for line in porcelain), porcelain
     assert (paths.run_dir(payload["run_id"]) / "journal.jsonl").is_file()
 
