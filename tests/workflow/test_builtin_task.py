@@ -40,9 +40,9 @@ from agent_manager.workflow.registry import (
 
 # Design spec lines 146-225, in file order.
 EXPECTED_PHASES = (
+    ("worktree", "deterministic"),
     ("explore", "agent"),
     ("mark_in_progress", "deterministic"),
-    ("worktree", "deterministic"),
     ("plan_check", "deterministic"),
     ("spec", "agent"),
     ("validate_spec", "agent"),
@@ -65,6 +65,25 @@ def test_builtin_task_loads_against_the_default_registry() -> None:
 def test_builtin_task_has_the_twelve_phases_in_spec_order() -> None:
     workflow = load_builtin("task")
     assert tuple((phase.name, phase.kind) for phase in workflow.phases) == EXPECTED_PHASES
+
+
+def test_no_agent_phase_precedes_the_worktree_phase() -> None:
+    """R6: every agent phase is dispatched with the subtask's worktree as its
+    cwd (`dispatch.AgentRunner._worktree`), so `worktree.ensure` has to have run
+    before the first of them. Asserted against the loaded document rather than
+    the YAML text, so any future reorder of the file fails right here."""
+    phases = load_builtin("task").phases
+    names = [phase.name for phase in phases]
+    agent_indexes = [
+        index for index, phase in enumerate(phases) if isinstance(phase, AgentPhase)
+    ]
+
+    # Non-vacuity: a loader change that stopped yielding `AgentPhase` instances,
+    # or a rename of the worktree phase, must fail here and not pass emptily.
+    assert "worktree" in names
+    assert len(agent_indexes) == 7
+
+    assert names.index("worktree") < min(agent_indexes)
 
 
 def test_plan_check_skips_forward_to_implement_when_a_plan_exists() -> None:

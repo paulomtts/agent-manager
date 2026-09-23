@@ -454,9 +454,9 @@ def test_the_interrupted_phase_is_the_one_recorded_started():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
             _recorded("spec", "done", [_pure_attempt(1)]),
             _recorded("validate_spec", "done", [_pure_attempt(1)]),
@@ -475,9 +475,9 @@ def test_a_crash_between_phases_restarts_at_the_first_phase_not_done():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
         ],
     )
 
@@ -492,14 +492,26 @@ def test_a_skipped_stretch_restarts_at_the_phase_whose_when_decided_the_skip():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
         ],
     )
 
     assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
+
+
+def test_a_run_that_lost_everything_after_the_first_phase_restarts_at_explore():
+    """The first phase of the document is `worktree` (R6), so the cheapest real
+    crash there is -- the process dying right after the worktree was created --
+    must restart at `explore` and never re-create the worktree."""
+    workflow = _task_workflow()
+    assert workflow.phase_names[0] == "worktree"
+
+    subtask = _pure_subtask("card-1", [_recorded("worktree", "done")])
+
+    assert cli.interrupted_phase(subtask, workflow) == "explore"
 
 
 def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_check():
@@ -2697,7 +2709,7 @@ def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_tra
         project,
         cards,
         run_id,
-        done=("explore", "mark_in_progress", "worktree", "plan_check"),
+        done=("worktree", "explore", "mark_in_progress", "plan_check"),
     )
 
     with pytest.raises(EngineError) as caught:
