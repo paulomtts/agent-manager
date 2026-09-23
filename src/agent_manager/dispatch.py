@@ -43,11 +43,12 @@ RESULT_NAME = "result.json"
 STDOUT_NAME = "stdout.log"
 """The captured harness log of one attempt (§6 step 4). A log, not a channel."""
 
-FEEDBACK_HEADING = "## feedback on the previous attempt"
-"""Heading of the block §6 step 7 appends before a re-dispatch.
+FEEDBACK_HEADING = prompt.FEEDBACK_HEADING
+"""Re-exported from `prompt` so callers and tests keep this name.
 
-A `##` section, matching `prompt._assemble`'s section format, so the retry
-prompt reads as one more input section rather than as a stray paragraph.
+The string itself moved to `prompt.py` with the brief composer that also emits
+it; `dispatch` imports `prompt`, so binding the name here costs nothing and
+makes it impossible for the two to disagree.
 """
 
 

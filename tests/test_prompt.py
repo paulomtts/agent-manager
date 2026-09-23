@@ -406,3 +406,10 @@ def test_write_does_not_create_the_directory_and_says_which_one_was_missing(tmp_
     assert str(missing) in str(caught.value)
     assert caught.value.phase == "implement"
     assert not missing.exists()
+
+
+def test_the_feedback_heading_lives_in_prompt_and_dispatch_reuses_it():
+    from agent_manager import dispatch
+
+    assert prompt.FEEDBACK_HEADING == "## feedback on the previous attempt"
+    assert dispatch.FEEDBACK_HEADING is prompt.FEEDBACK_HEADING

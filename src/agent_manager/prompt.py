@@ -34,6 +34,15 @@ from agent_manager.workflow.loader import AgentPhase
 
 _MISSING = object()
 
+FEEDBACK_HEADING = "## feedback on the previous attempt"
+"""Heading of the block §6 step 7 appends before a re-dispatch.
+
+A `##` section, matching `_assemble`'s section format, so the retry block reads
+as one more section rather than as a stray paragraph. It lives here, not in
+`dispatch`, because `dispatch` imports `prompt` and never the reverse: the
+composer needs the same heading and a second copy of the string could drift.
+"""
+
 
 @dataclass(frozen=True)
 class RenderedPrompt:
