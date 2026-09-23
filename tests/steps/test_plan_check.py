@@ -379,3 +379,98 @@ def test_a_marked_plan_reads_back_as_validated_through_find_validated_plan(
         "path": str(directory / "2026-09-task-rows-a32af745.md"),
         "validated": True,
     }
+
+
+def test_a_relative_plan_path_is_rooted_at_the_worktree(tmp_path: Path):
+    # Exactly what the engine binds: `prompt.expand_writes` yields a
+    # repo-relative posix path, and `worktree` is a reserved context key.
+    worktree = tmp_path / "worktree"
+    plans = worktree / "docs" / "superpowers" / "plans"
+    plans.mkdir(parents=True)
+    relative = "docs/superpowers/plans/task-rows-a32af745.md"
+    (plans / "task-rows-a32af745.md").write_text("# plan\n", encoding="utf-8")
+    decoy = tmp_path / "task-rows-a32af745.md"
+    decoy.write_text("# decoy\n", encoding="utf-8")
+
+    got = plan_check.mark_validated(relative, worktree)
+
+    assert got == {"path": str(plans / "task-rows-a32af745.md"), "appended": True}
+    assert VALIDATED_MARKER in (plans / "task-rows-a32af745.md").read_text(
+        encoding="utf-8"
+    )
+    assert decoy.read_text(encoding="utf-8") == "# decoy\n"
+
+
+@pytest.mark.parametrize("worktree", [None, "", "   "])
+def test_a_relative_plan_path_without_a_worktree_is_a_caller_bug(
+    tmp_path: Path, worktree: object
+):
+    # Never resolve against the process CWD: that stamps the marker into a file
+    # nobody asked for, or creates one nobody reads.
+    (tmp_path / "task-rows-a32af745.md").write_text("# plan\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="worktree"):
+        plan_check.mark_validated("docs/superpowers/plans/x.md", worktree)
+
+    assert (tmp_path / "task-rows-a32af745.md").read_text(encoding="utf-8") == "# plan\n"
+
+
+def test_a_missing_plan_file_is_not_swallowed(tmp_path: Path):
+    # `find_validated_plan` treats an unreadable plan as "re-plan"; here there is
+    # no benign answer, so the engine's total handler must see the error.
+    with pytest.raises(FileNotFoundError):
+        plan_check.mark_validated(tmp_path / "nothing-here-a32af745.md")
+
+
+def test_a_plan_whose_prose_mentions_the_marker_is_left_untouched(tmp_path: Path):
+    # Review focus: containment is a literal substring test anywhere in the file
+    # (see VALIDATED_MARKER's docstring), so a plan that merely discusses the
+    # marker already reads as validated -- it must not be marked a second time.
+    plan = _plan_file(
+        tmp_path, f"# plan\n\nValidate appends `{VALIDATED_MARKER}` here.\n\nstep one\n"
+    )
+    before = plan.read_bytes()
+
+    got = plan_check.mark_validated(plan)
+
+    assert got == {"path": str(plan), "appended": False}
+    assert plan.read_bytes() == before
+    assert plan.read_text(encoding="utf-8").count(VALIDATED_MARKER) == 1
+
+
+def test_an_empty_plan_becomes_exactly_the_marker_line(tmp_path: Path):
+    # Review focus: no leading blank line -- `text` is empty, so no separator is
+    # written, and the file is a single valid marker line.
+    plan = _plan_file(tmp_path, "")
+
+    got = plan_check.mark_validated(plan)
+
+    assert got == {"path": str(plan), "appended": True}
+    assert plan.read_text(encoding="utf-8") == f"{VALIDATED_MARKER}\n"
+
+
+def test_a_plan_that_is_not_utf8_fails_loudly_and_is_left_untouched(tmp_path: Path):
+    # Review focus: UnicodeDecodeError is a ValueError, not an OSError, so it
+    # needs naming. It must escape to the engine's total handler, and nothing
+    # may be appended to a file we could not read.
+    plan = tmp_path / "task-rows-a32af745.md"
+    plan.write_bytes(b"# plan\n\xff\xfe not utf-8\n")
+    before = plan.read_bytes()
+
+    with pytest.raises(UnicodeDecodeError):
+        plan_check.mark_validated(plan)
+
+    assert plan.read_bytes() == before
+
+
+def test_an_absolute_plan_path_ignores_the_worktree(tmp_path: Path):
+    # Review focus: the engine always binds `worktree`, so the absolute case has
+    # to win rather than be joined into a path that does not exist.
+    plan = _plan_file(tmp_path, "# plan\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    got = plan_check.mark_validated(plan, elsewhere)
+
+    assert got == {"path": str(plan), "appended": True}
+    assert VALIDATED_MARKER in plan.read_text(encoding="utf-8")
