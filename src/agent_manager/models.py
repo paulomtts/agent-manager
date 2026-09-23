@@ -94,6 +94,15 @@ class PhaseRun(_Model):
     status: Status = "pending"
     started_at: datetime | None = None
     ended_at: datetime | None = None
+    detail: str | None = None
+    """Why a `failed` phase failed, in the journal line that records it.
+
+    The journal is the truth the projection is rebuilt from (§9), so a phase
+    recorded `failed` with no cause leaves an audit trail nobody can act on
+    once the process that held the in-memory summary is gone. Empty for every
+    other status.
+    """
+
     attempts: list[Attempt] = Field(default_factory=list)
 
 
