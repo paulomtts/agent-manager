@@ -590,10 +590,15 @@ def test_an_interrupted_spec_backs_off_to_the_phase_whose_result_it_binds():
     assert cli.resume_start_phase(_task_workflow(), "spec") == "explore"
 
 
-def test_an_interrupted_implement_stays_at_implement():
-    """`implement` declares `[plan_path, spec_path, branch, base_branch]`, all of
-    which `subtask_context` and `_document_paths` supply from the record."""
-    assert cli.resume_start_phase(_task_workflow(), "implement") == "implement"
+def test_an_interrupted_implement_backs_off_to_the_phase_that_binds_its_plan_hash():
+    """`implement` declares `[plan_path, spec_path, branch, base_branch,
+    plan_hash]`. The first four come from the record; `plan_hash` is
+    `docs_commit`'s result, which lives only in the in-memory binding table, so
+    a walk started at `implement` could not render its brief. `docs_commit` is
+    idempotent (nothing to commit and the branch already carries the hash
+    returns the same digest), so re-running it is the whole recovery. Card
+    f26b377d."""
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "docs_commit"
 
 
 def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
@@ -2598,7 +2603,7 @@ def test_a_run_killed_mid_implement_resumes_and_leaves_no_started_attempt(projec
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
 
     assert payload["status"] == "done"
-    assert payload["resumed_from"] == "implement"
+    assert payload["resumed_from"] == "docs_commit"
     assert {"phase": "implement", "n": 1} in payload["discarded_attempts"]
     assert payload["run_id"] == run_id
     assert payload["card_id"] == cards["subtask"]
@@ -2870,7 +2875,7 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "done"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
     assert envelope["data"]["discarded_attempts"] == [{"phase": "implement", "n": 1}]
     assert "\n" not in result.stdout.strip()
 
@@ -2907,7 +2912,7 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "escalated"
     assert envelope["data"]["failed_phase"] == "review"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
 
 
 @requires_git
@@ -2947,7 +2952,7 @@ def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["data"]["resumed_from"] == "implement"
+    assert json.loads(result.stdout)["data"]["resumed_from"] == "docs_commit"
     assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
     assert contexts[0]["allow_no_verification"] is False
 

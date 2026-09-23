@@ -492,6 +492,13 @@ def interrupted_phase(subtask: models.SubtaskRun, workflow: Workflow) -> str | N
     return None
 
 
+INPUT_PRODUCERS = {"plan_hash": "docs_commit"}
+"""Declared inputs whose name is not the phase that produces them.
+
+`prompt._TABLE` reads `plan_hash` out of `context["docs_commit"]`, so the input
+is a dependency on the `docs_commit` phase having run in this process."""
+
+
 def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
     """`phase_name`, backed off over the earlier phases whose results it binds.
 
@@ -515,12 +522,11 @@ def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
     while True:
         phase = workflow.phase(current)
         producers = [
-            name
+            INPUT_PRODUCERS.get(name, name)
             for name in getattr(phase, "inputs", ())
-            if name in order
-            and name not in engine.RESERVED_CONTEXT_KEYS
-            and order[name] < order[current]
+            if name not in engine.RESERVED_CONTEXT_KEYS
         ]
+        producers = [name for name in producers if order.get(name, order[current]) < order[current]]
         if not producers:
             return current
         current = min(producers, key=lambda name: order[name])
