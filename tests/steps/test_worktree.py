@@ -116,3 +116,106 @@ def test_run_git_raises_git_error_carrying_argv_and_exit_code(tmp_path: Path):
         worktree.run_git(argv)
     assert excinfo.value.argv == argv
     assert excinfo.value.exit_code not in (None, 0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"branch": ""}, "branch"),
+        ({"branch": "   "}, "branch"),
+        ({"base": ""}, "base"),
+        ({"base": "   "}, "base"),
+        ({"worktree": "relative/wt"}, "worktree"),
+        ({"worktree": ""}, "worktree"),
+        ({"repo_dir": "relative/repo"}, "repo_dir"),
+        ({"repo_dir": ""}, "repo_dir"),
+    ],
+    ids=[
+        "empty-branch",
+        "blank-branch",
+        "empty-base",
+        "blank-base",
+        "relative-worktree",
+        "empty-worktree",
+        "relative-repo-dir",
+        "empty-repo-dir",
+    ],
+)
+def test_bad_arguments_raise_before_any_git_invocation(kwargs, expected):
+    calls: list[list[str]] = []
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": "/abs/wt",
+        "repo_dir": "/abs/repo",
+        **kwargs,
+    }
+    with pytest.raises(ValueError, match=expected):
+        worktree.ensure(**args, git_runner=_recorder(calls))
+    assert calls == []
+
+
+@requires_git
+def test_a_fresh_branch_and_missing_worktree_is_created(repo: Path, tmp_path: Path):
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    assert wt.is_dir()
+    assert result == {
+        "branch": "m1/task-9",
+        "worktree": str(wt),
+        "branch_existed": False,
+        "worktree_existed": False,
+        "created": True,
+        "commit_count": 0,
+    }
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-9"
+
+
+@requires_git
+def test_a_directory_that_is_not_a_registered_worktree_propagates_gits_failure(
+    repo: Path, tmp_path: Path
+):
+    # An existing directory that git does not know about is NOT "already
+    # prepared": `worktree add` refuses it, and that refusal must surface
+    # rather than be reported as a quiet no-op.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "stray.txt").write_text("not a worktree\n")
+
+    with pytest.raises(GitError) as excinfo:
+        worktree.ensure(
+            branch="m1/task-9",
+            base="main",
+            worktree=str(wt),
+            repo_dir=str(repo),
+        )
+
+    assert "worktree" in excinfo.value.argv
+    assert "add" in excinfo.value.argv
+
+
+@requires_git
+def test_an_exact_branch_match_is_required_before_checking_out(
+    repo: Path, tmp_path: Path
+):
+    # `m1/task-9` exists; `m1/task-` is a different branch and must be cut new.
+    _git(repo, "branch", "m1/task-9")
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    assert result["branch_existed"] is False
+    assert result["created"] is True
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-"
