@@ -264,3 +264,49 @@ def test_documents_committed_without_a_trailer_raise_instead_of_lying(
     assert SPEC_RELATIVE in message
     assert PLAN_RELATIVE in message
     assert _commit_count(repo) == before
+
+
+def _exploding_runner(argv: list[str]) -> str:
+    raise AssertionError(f"pre-flight must run no git command, but ran: {argv!r}")
+
+
+@requires_git
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"plan_path": "docs/superpowers/plans/absent.md"}, "absent.md"),
+        ({"spec_path": "docs/superpowers/specs/absent.md"}, "absent.md"),
+        ({"spec_path": ""}, "spec_path"),
+        ({"plan_path": "   "}, "plan_path"),
+        ({"plan_path": None}, "plan_path"),
+        ({"worktree": "relative/worktree"}, "worktree"),
+        ({"card_details": None}, "card_details"),
+        ({"card_details": FakeCard(title="  ")}, "title"),
+        ({"spec_path": "../escape.md"}, "escape.md"),
+    ],
+)
+def test_a_bad_argument_raises_value_error_before_any_git_runs(
+    repo: Path, overrides: dict, needle: str
+) -> None:
+    _write_documents(repo)
+
+    with pytest.raises(ValueError) as caught:
+        _run(repo, git_runner=_exploding_runner, **overrides)
+
+    assert needle in str(caught.value)
+
+
+@requires_git
+def test_a_worktree_reached_through_a_symlink_still_works(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Review focus: `tmp_path` (and `/tmp` on macOS) can sit behind a symlink,
+    so containment has to be decided on `realpath`, not on the literal string."""
+    _write_documents(repo)
+    link = tmp_path / "link-to-repo"
+    link.symlink_to(repo, target_is_directory=True)
+
+    result = _run(repo, worktree=str(link))
+
+    assert reducers.is_plan_hash(result["plan_hash"])
+    assert _commit_count(repo) == 2

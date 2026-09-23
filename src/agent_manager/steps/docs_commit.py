@@ -12,6 +12,7 @@ shell string and nothing to quote.
 """
 
 import hashlib
+import os
 from pathlib import Path
 
 from agent_manager.steps.worktree import GitError, GitRunner, run_git
@@ -80,6 +81,73 @@ def _branch_carries(git_runner: GitRunner, worktree_path: str, digest: str) -> b
     return any(line.strip() == wanted for line in log.splitlines())
 
 
+def _required_relative_path(value: object, field: str) -> str:
+    """A non-blank relative document path, or `ValueError` before any git call."""
+    if not isinstance(value, (str, Path)):
+        raise ValueError(
+            f"docs_commit.commit_documents needs a path string for {field}, "
+            f"got {value!r}"
+        )
+    text = str(value).strip()
+    if text == "":
+        raise ValueError(
+            f"docs_commit.commit_documents needs a non-empty {field}, got {value!r}"
+        )
+    if Path(text).is_absolute():
+        raise ValueError(
+            f"docs_commit.commit_documents needs a worktree-relative {field}, but "
+            f"{text!r} is absolute; `git add --` would stage a file outside the run"
+        )
+    return text
+
+
+def _required_worktree(value: object) -> str:
+    """An existing absolute worktree directory, or `ValueError` up front."""
+    if not isinstance(value, (str, Path)):
+        raise ValueError(
+            f"docs_commit.commit_documents needs an absolute worktree path, "
+            f"got {value!r}"
+        )
+    text = str(value).strip()
+    if text == "" or not Path(text).is_absolute() or not Path(text).is_dir():
+        raise ValueError(
+            f"docs_commit.commit_documents needs an existing absolute worktree "
+            f"directory, got {value!r}"
+        )
+    return text
+
+
+def _required_title(card_details: object) -> str:
+    """The card's non-blank title, or `ValueError` before any git call.
+
+    `engine.subtask_context` binds `card_details` to `None` when the caller
+    supplied no card, so `None` must not surface as an `AttributeError`.
+    """
+    title = getattr(card_details, "title", None)
+    if not isinstance(title, str) or title.strip() == "":
+        raise ValueError(
+            "docs_commit.commit_documents needs card_details carrying a non-blank "
+            f"title for the commit subject, got {card_details!r}"
+        )
+    return title
+
+
+def _inside(root: str, candidate: Path, field: str) -> Path:
+    """`candidate`, proven to live under `root`, or `ValueError`.
+
+    `realpath` on both sides so a symlinked tmp directory is not rejected.
+    """
+    real_root = Path(os.path.realpath(root))
+    real_candidate = Path(os.path.realpath(candidate))
+    if real_root != real_candidate and real_root not in real_candidate.parents:
+        raise ValueError(
+            f"docs_commit.commit_documents refuses {field} {str(candidate)!r}: it "
+            f"resolves to {str(real_candidate)!r}, which is outside the worktree "
+            f"{root!r}"
+        )
+    return real_candidate
+
+
 def _document_paths(worktree_path: str, spec_path: str, plan_path: str) -> tuple[Path, Path]:
     """The two documents as absolute paths under the worktree."""
     root = Path(worktree_path)
@@ -99,9 +167,21 @@ def commit_documents(
     phase needs no `args:` at all. Returns a plain dict (design §6), stored in
     the context under the phase name.
     """
-    worktree_path = str(worktree)
-    title = getattr(card_details, "title", None)
+    worktree_path = _required_worktree(worktree)
+    spec_path = _required_relative_path(spec_path, "spec_path")
+    plan_path = _required_relative_path(plan_path, "plan_path")
+    title = _required_title(card_details)
+
     spec_file, plan_file = _document_paths(worktree_path, spec_path, plan_path)
+    spec_file = _inside(worktree_path, spec_file, "spec_path")
+    plan_file = _inside(worktree_path, plan_file, "plan_path")
+    for field, path in (("spec_path", spec_file), ("plan_path", plan_file)):
+        if not path.is_file():
+            raise ValueError(
+                f"docs_commit.commit_documents cannot find the {field} document at "
+                f"{str(path)!r}; the `{field.removesuffix('_path')}` phase was "
+                "supposed to write it"
+            )
 
     digest = plan_hash(plan_file.read_bytes())
 
