@@ -14,12 +14,43 @@ is strictly better than validating nothing and calling the result `ok`.
 
 from collections.abc import Mapping
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_manager.errors import EngineError
 
 RESULT_MODELS: dict[str, type[BaseModel]] = {}
 """Every `result:` name with a model behind it. Empty on this branch."""
+
+
+class _Result(BaseModel):
+    """Shared config for every phase result model (design §2).
+
+    ``extra="forbid"`` for the reason ``models._Model`` gives: an unknown key in
+    an agent-written file is a signal, not something to drop. ``strict=True``
+    because a result file is written by a language model -- ``"3"`` for
+    ``commit_count`` or ``1`` for ``refused`` is exactly the sloppiness this
+    validation exists to catch. Model-wide rather than per-field, because every
+    field here is equally untrusted.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class Verification(_Result):
+    """What Explore reports about how this repo is verified (addendum R1)."""
+
+    full_suite: list[str] = Field(serialization_alias="fullSuite")
+    typecheck: str
+    lint: list[str]
+
+
+class ExploreResult(_Result):
+    """The `explore` phase's result file (`builtin/task.yaml` line 9)."""
+
+    refused: bool
+    reason: str | None
+    summary: str
+    verification: Verification
 
 
 def resolve_result_model(
