@@ -149,3 +149,80 @@ def test_verification_rejects_a_non_string_inside_full_suite():
         )
 
     assert "full_suite" in str(caught.value)
+
+
+def test_critic_result_accepts_a_full_payload():
+    critic = results.CriticResult(
+        blockers=True,
+        reason="the spec's alias choice contradicts the reducers",
+        summary="reviewed the design against reducers.py",
+    )
+
+    assert critic.blockers is True
+    assert critic.reason == "the spec's alias choice contradicts the reducers"
+    assert critic.summary == "reviewed the design against reducers.py"
+
+
+def test_critic_result_rejects_a_missing_reason():
+    # `reason` is nullable but required: the agent says "no reason" explicitly.
+    with pytest.raises(ValidationError) as caught:
+        results.CriticResult(blockers=False, summary="nothing blocking")
+
+    assert "reason" in str(caught.value)
+
+
+def test_critic_result_does_not_coerce_a_string_into_blockers():
+    with pytest.raises(ValidationError) as caught:
+        results.CriticResult(blockers="true", reason=None, summary="nothing blocking")
+
+    assert "blockers" in str(caught.value)
+
+
+def test_critic_result_rejects_an_unknown_key():
+    with pytest.raises(ValidationError) as caught:
+        results.CriticResult(
+            blockers=False, reason=None, summary="nothing blocking", verdict="ok"
+        )
+
+    assert "verdict" in str(caught.value)
+
+
+def test_plan_result_accepts_a_full_payload():
+    plan = results.PlanResult(
+        path="docs/superpowers/plans/task-define-the-five-phase-c873fc52.md",
+        self_reviewed=True,
+        note=None,
+    )
+
+    assert plan.path.endswith("c873fc52.md")
+    assert plan.self_reviewed is True
+    assert plan.note is None
+
+
+def test_plan_result_rejects_a_missing_path():
+    with pytest.raises(ValidationError) as caught:
+        results.PlanResult(self_reviewed=True, note=None)
+
+    assert "path" in str(caught.value)
+
+
+def test_plan_result_does_not_coerce_a_path_object_into_str():
+    with pytest.raises(ValidationError) as caught:
+        results.PlanResult(path=["a", "b"], self_reviewed=True, note=None)
+
+    assert "path" in str(caught.value)
+
+
+def test_plan_result_has_no_skill_invoked_field():
+    # D6 inlines the methodology into the prompt: there is no skill to detect,
+    # so a result file claiming one is an unknown key.
+    with pytest.raises(ValidationError) as caught:
+        results.PlanResult(
+            path="docs/superpowers/plans/p.md",
+            self_reviewed=True,
+            note=None,
+            skill_invoked=True,
+        )
+
+    assert "skill_invoked" in str(caught.value)
+    assert "skill_invoked" not in results.PlanResult.model_fields

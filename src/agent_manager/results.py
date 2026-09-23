@@ -66,3 +66,23 @@ def resolve_result_model(
             phase=phase,
         )
     return model
+
+
+class CriticResult(_Result):
+    """The `critic` phase's result file (`builtin/task.yaml` lines 39 and 53)."""
+
+    blockers: bool
+    reason: str | None
+    summary: str
+
+
+class PlanResult(_Result):
+    """The `plan` phase's result file (`builtin/task.yaml` line 46).
+
+    No `skill_invoked`: D6 inlines the planning methodology into the prompt, so
+    there is no skill invocation left to report.
+    """
+
+    path: str
+    self_reviewed: bool
+    note: str | None
