@@ -480,3 +480,89 @@ class Store:
             },
         )
         self._conn.commit()
+
+    # -- reading -------------------------------------------------------------
+
+    def load_run(self, run_id: str) -> models.Run | None:
+        """Assemble the projection back into the §9 tree, or `None` if absent.
+
+        Every value goes back through the `models` validators, so a projection
+        that drifted from the schema fails here rather than downstream.
+        """
+        row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+
+        run = models.Run(
+            id=row["id"],
+            workflow=row["workflow"],
+            repo_dir=row["repo_dir"],
+            base_branch=row["base_branch"],
+            branch_prefix=row["branch_prefix"],
+            status=row["status"],
+            started_at=row["started_at"],
+            config=json.loads(row["config"]),
+        )
+
+        for story_row in self._conn.execute(
+            "SELECT * FROM stories WHERE run_id = ? ORDER BY position", (run_id,)
+        ).fetchall():
+            story = models.StoryRun(
+                card_id=story_row["card_id"],
+                title=story_row["title"],
+                level=story_row["level"],
+                status=story_row["status"],
+                tip_branch=story_row["tip_branch"],
+            )
+            run.stories.append(story)
+
+            for subtask_row in self._conn.execute(
+                "SELECT * FROM subtasks WHERE run_id = ? AND story_id = ?"
+                " ORDER BY position",
+                (run_id, story.card_id),
+            ).fetchall():
+                subtask = models.SubtaskRun(
+                    card_id=subtask_row["card_id"],
+                    branch=subtask_row["branch"],
+                    base_branch=subtask_row["base_branch"],
+                    status=subtask_row["status"],
+                    worktree_path=subtask_row["worktree_path"],
+                )
+                story.subtasks.append(subtask)
+
+                for phase_row in self._conn.execute(
+                    "SELECT * FROM phases WHERE run_id = ? AND story_id = ?"
+                    " AND card_id = ? ORDER BY position",
+                    (run_id, story.card_id, subtask.card_id),
+                ).fetchall():
+                    phase = models.PhaseRun(
+                        name=phase_row["name"],
+                        kind=phase_row["kind"],
+                        status=phase_row["status"],
+                        started_at=phase_row["started_at"],
+                        ended_at=phase_row["ended_at"],
+                    )
+                    subtask.phases.append(phase)
+
+                    for attempt_row in self._conn.execute(
+                        "SELECT * FROM attempts WHERE run_id = ? AND story_id = ?"
+                        " AND card_id = ? AND phase = ? ORDER BY n",
+                        (run_id, story.card_id, subtask.card_id, phase.name),
+                    ).fetchall():
+                        phase.attempts.append(
+                            models.Attempt(
+                                n=attempt_row["n"],
+                                dispatch=json.loads(attempt_row["dispatch"]),
+                                status=attempt_row["status"],
+                                exit_code=attempt_row["exit_code"],
+                                duration=attempt_row["duration"],
+                                tokens_in=attempt_row["tokens_in"],
+                                tokens_out=attempt_row["tokens_out"],
+                                cost=attempt_row["cost"],
+                                prompt_path=attempt_row["prompt_path"],
+                                result_path=attempt_row["result_path"],
+                                stdout_path=attempt_row["stdout_path"],
+                            )
+                        )
+
+        return run

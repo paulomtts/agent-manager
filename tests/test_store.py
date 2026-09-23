@@ -416,3 +416,109 @@ def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
     assert list(repo.iterdir()) == []
     assert paths.project_db_path(repo).is_relative_to(tmp_path / "data")
     assert store.Journal(RUN_ID).path.is_relative_to(tmp_path / "data")
+
+
+def _record_full_run(st: store.Store, repo: Path) -> None:
+    """One run, two subtasks, three phases, a finished and an in-flight attempt."""
+    st.record_run(_run(repo))
+    st.record_story(_story())
+
+    st.record_subtask("8831189b", _subtask("fdebc746").model_copy(update={"status": "done"}))
+    st.record_phase(
+        "8831189b",
+        "fdebc746",
+        models.PhaseRun(
+            name="verify",
+            kind="deterministic",
+            status="done",
+            started_at=datetime(2026, 9, 23, 10, 5, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 9, 23, 10, 6, tzinfo=timezone.utc),
+        ),
+    )
+
+    st.record_subtask("8831189b", _subtask("ef248597", base="m1/task-fdebc746"))
+    st.record_phase(
+        "8831189b",
+        "ef248597",
+        models.PhaseRun(
+            name="explore",
+            kind="agent",
+            status="done",
+            started_at=datetime(2026, 9, 23, 10, 10, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 9, 23, 10, 12, tzinfo=timezone.utc),
+        ),
+    )
+    st.record_attempt(
+        "8831189b",
+        "ef248597",
+        "explore",
+        models.Attempt(
+            n=1,
+            dispatch=_dispatch(card="ef248597", phase="explore"),
+            status="ok",
+            exit_code=0,
+            duration=31.25,
+            tokens_in=8000,
+            tokens_out=1500,
+            cost=0.31,
+            prompt_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/prompt.txt"),
+            result_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/result.json"),
+            stdout_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log"),
+        ),
+    )
+    st.record_phase(
+        "8831189b",
+        "ef248597",
+        models.PhaseRun(
+            name="implement",
+            kind="agent",
+            status="started",
+            started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+        ),
+    )
+    st.record_attempt(
+        "8831189b",
+        "ef248597",
+        "implement",
+        models.Attempt(n=1, dispatch=_dispatch(card="ef248597", phase="implement")),
+    )
+
+
+def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert loaded is not None
+    assert loaded.id == RUN_ID
+    assert loaded.repo_dir == repo
+    assert loaded.started_at == datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+    assert loaded.config.harness_map["coder"].model == "sonnet"
+
+    story = loaded.stories[0]
+    assert [subtask.card_id for subtask in story.subtasks] == ["fdebc746", "ef248597"]
+    subtask = story.subtasks[1]
+    assert subtask.base_branch == "m1/task-fdebc746"
+    assert [phase.name for phase in subtask.phases] == ["explore", "implement"]
+
+    finished = subtask.phases[0].attempts[0]
+    assert finished.status == "ok"
+    assert finished.cost == pytest.approx(0.31)
+    assert finished.stdout_path == Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log")
+    assert finished.dispatch.role == "coder"
+
+    in_flight = subtask.phases[1].attempts[0]
+    assert in_flight.status == "started"
+    assert in_flight.exit_code is None
+    assert in_flight.cost is None
+
+
+def test_load_run_returns_none_for_an_unknown_run(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        assert st.load_run("run-never-started") is None
+    finally:
+        st.close()
