@@ -245,8 +245,9 @@ def test_ansi_colour_and_over_long_lines_are_flattened_in_the_result(tmp_path: P
 
     result = verify.run_suite(["fake-linter"], str(tmp_path), runner=runner)
     assert result["verified"][0]["tail"] == "E" * 300 + "…"
-    assert "\x1b" not in result["detail"]
-    assert len(result["detail"]) <= 601
+    # `detail` is flattened too, and carries its own larger cap (600), so it is
+    # not silently clipped to a per-command tail's 300.
+    assert result["detail"] == f"verification failed: fake-linter — {'E' * 400}"
 
 
 def test_a_command_that_cannot_be_launched_raises_verify_error(tmp_path: Path):
@@ -260,6 +261,17 @@ def test_a_command_that_cannot_be_launched_raises_verify_error(tmp_path: Path):
             ["definitely-not-a-real-binary --version"], str(tmp_path), runner=runner
         )
     assert "definitely-not-a-real-binary" in str(excinfo.value)
+
+
+def test_an_unrunnable_command_raises_verify_error_too(tmp_path: Path):
+    # A non-executable file is the other half of the spec's "cannot be
+    # launched" row: also a misconfigured card, never `passed: false`.
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        raise PermissionError(13, "Permission denied", argv[0])
+
+    with pytest.raises(VerifyError) as excinfo:
+        verify.run_suite(["./not-executable.sh"], str(tmp_path), runner=runner)
+    assert "./not-executable.sh" in str(excinfo.value)
 
 
 def _recorder() -> tuple[list[tuple[list[str], str]], verify.CommandRunner]:
