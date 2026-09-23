@@ -1591,6 +1591,129 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
     assert payload["status"] == "done"
 
 
+def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
+    """The exact `run_card` payload shape, for tests that replace `run_card`.
+
+    Spelled out rather than built from a loop so that a key this program stops
+    returning shows up here as a diff, not as a silently absent assertion.
+    """
+    return {
+        "run_id": "20260923T140506Z-cbe34d00",
+        "card_id": card_id,
+        "story_id": story_id,
+        "branch": "m2/task-fake-cbe34d00",
+        "base_branch": "main",
+        "worktree": "/tmp/agent-manager-fake-worktree",
+        "status": "done",
+        "failed_phase": None,
+        "detail": None,
+        "skipped": [],
+        "warnings": [],
+    }
+
+
+@requires_git
+@requires_brd
+def test_repeated_verify_options_reach_run_card_in_command_line_order(
+    project, cards, monkeypatch
+):
+    """§12's suite is the caller's to supply, and the engine runs the commands in
+    sequence -- so the order the operator typed is behaviour, not decoration."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen["card_id"] = card_id
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
+
+
+@requires_git
+@requires_brd
+def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
+    """`gate_context` calls `list(commands)` and `verification_gate` tells an
+    empty suite apart from a missing one, so `None` here would be a crash or a
+    silently different verdict."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    assert seen["commands"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
+    project, cards, monkeypatch
+):
+    """Review Focus: one occurrence is one whole command string. The CLI does no
+    word-splitting, no parsing and no validation -- whether a command is nonsense
+    is the engine's business, not this layer's."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest -k 'not slow'",
+        "--verify",
+        "",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
+
+
+@requires_git
+@requires_brd
+def test_verify_values_reach_the_gate_context_through_the_real_run_card(
+    project, cards, monkeypatch
+):
+    """The whole chain, not just the call: `--verify` -> `run_card` ->
+    `gate_context` -> the context `builtin/task.yaml` binds its gates out of."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner(seen))
+
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+    )
+
+    assert result.exit_code == 0
+    _phase, context = seen[0]
+    assert context["suite_cmds"] == ["uv run pytest", "uv run ruff check"]
+    assert context["allow_no_verification"] is False
+    assert context["caller_provided"] is False
+    assert context["provided_verification"] is None
+
+
 @pytest.fixture
 def projection(tmp_path, monkeypatch) -> Path:
     """A project root whose SQLite projection is written directly.

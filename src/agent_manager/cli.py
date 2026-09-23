@@ -774,6 +774,14 @@ def run(
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
     ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. Passed through verbatim "
+            "and in the order given; the engine runs them in sequence."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card through the task workflow, end to end."""
@@ -784,6 +792,7 @@ def run(
             base_branch=base_branch,
             branch_prefix=branch_prefix,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
