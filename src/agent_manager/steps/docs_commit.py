@@ -34,6 +34,7 @@ def plan_hash(content: bytes) -> str:
     """
     return hashlib.sha256(content).hexdigest()[:_HASH_LENGTH]
 
+
 SUBJECT_TEMPLATE = "docs: add spec and plan for {title}"
 """The docs commit's subject line. One template, so the step that writes it and
 any future reader that greps for it cannot disagree about the wording."""
