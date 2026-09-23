@@ -106,7 +106,37 @@ def _verbatim(key: str) -> Resolver:
     return resolve
 
 
+def _inline_json(key: str, *, allow_empty: bool = False) -> Resolver:
+    """A context value inlined as JSON -- §7's form for small structured results.
+
+    `allow_empty` is for `parent_story` alone: a subtask card genuinely may have
+    no parent story, and `null` is the honest rendering of that. Everywhere else
+    an unpopulated key is a bug in the caller, reported as one.
+    """
+
+    def resolve(request: _Request) -> str:
+        value = _present(request, key) if allow_empty else _required(request, key)
+        return json.dumps(_jsonable(value), indent=2, ensure_ascii=False, default=str)
+
+    return resolve
+
+
+def _jsonable(value: Any) -> Any:
+    """A pydantic model as its JSON-mode dump; anything else unchanged.
+
+    `default=str` on the dump catches whatever is left (a `Path` in `commands`):
+    a prompt that says `/repo/scripts/check.sh` is strictly better than a
+    `TypeError` escaping the renderer over a value the agent only has to read.
+    """
+    dump = getattr(value, "model_dump", None)
+    return dump(mode="json") if callable(dump) else value
+
+
 _TABLE: dict[str, Resolver] = {
+    "card": _inline_json("card_details"),
+    "parent_story": _inline_json("parent_story_details", allow_empty=True),
+    "explore": _inline_json("explore"),
+    "verification": _inline_json("commands"),
     "branch": _verbatim("branch"),
     "base_branch": _verbatim("base"),
 }
