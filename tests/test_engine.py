@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from agent_manager import engine, models, store as store_module
+from agent_manager.errors import AgentPhaseFailed
 from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
 from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
@@ -1784,8 +1785,6 @@ def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
         "The workflow document and the engine"
     )
 
-
-from agent_manager.errors import AgentPhaseFailed
 
 
 def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store):

@@ -8,11 +8,20 @@ JSONL journal. No process is ever started -- the launcher is injected, and one
 test asserts `subprocess.Popen` is never reached.
 """
 
+import json
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
-from agent_manager import dispatch, paths, prompt
+from agent_manager import dispatch, engine, models, paths, prompt, store as store_module
+from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.harness.base import Outcome, Usage
+from agent_manager.roles.loader import load_role
+from agent_manager.workflow.loader import load_workflow
+from agent_manager.workflow.registry import FunctionRegistry
 
 RUN_ID = "run-2026-09-23-01"
 CARD = "bf8e415b"
@@ -90,11 +99,6 @@ def test_a_written_prompt_lands_in_the_attempt_directory(data_home):
     assert written == attempt / "prompt.txt"
     assert "try again" in written.read_text(encoding="utf-8")
 
-
-from agent_manager import models
-from agent_manager.errors import EngineError
-from agent_manager.harness.base import Usage
-from agent_manager.roles.loader import load_role
 
 POLICY = """\
 allowed_tools = ["Read"]
@@ -184,13 +188,6 @@ def test_a_role_with_no_default_model_for_the_harness_is_a_named_engine_error(tm
     assert caught.value.phase == "explore"
     assert "default model" in str(caught.value)
 
-
-import json
-from dataclasses import dataclass, field
-
-from pydantic import BaseModel, ConfigDict
-
-from agent_manager.harness.base import Outcome
 
 
 class FakeResult(BaseModel):
@@ -381,10 +378,6 @@ def test_stdout_is_never_the_channel(tmp_path):
     assert verdict.status == "schema_invalid"
 
 
-from agent_manager import engine
-from agent_manager.workflow.loader import load_workflow
-from agent_manager.workflow.registry import FunctionRegistry
-
 AGENT_DOCUMENT = """
 name: agentic
 phases:
@@ -538,11 +531,6 @@ def test_a_gate_whose_parameter_nothing_supplies_is_a_named_engine_error():
     assert caught.value.parameter == "provided_verification"
     assert caught.value.function == "output_gate"
 
-
-import subprocess
-
-from agent_manager import models, store as store_module
-from agent_manager.errors import AgentPhaseFailed
 
 STORY_ID = "2143808b"
 
