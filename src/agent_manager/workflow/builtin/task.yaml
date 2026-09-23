@@ -65,7 +65,7 @@ phases:
   - name: implement
     kind: agent
     role: coder
-    inputs: [plan_path, spec_path, branch, base_branch]
+    inputs: [plan_path, spec_path, branch, base_branch, plan_hash]
     result: ImplementResult
 
   - name: review

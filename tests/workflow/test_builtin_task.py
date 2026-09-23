@@ -202,6 +202,45 @@ def test_review_carries_both_of_its_gates() -> None:
     assert isinstance(phase, AgentPhase)
     assert phase.gates == ["review_gate", "plan_hash_gate"]
     assert phase.inputs == ["branch", "base_branch", "plan_path"]
+    # The reviewer recomputes the hash from the plan file; card f26b377d gives
+    # the input to the coder only.
+    assert "plan_hash" not in phase.inputs
+
+
+def test_implement_is_handed_the_plan_hash_last_after_the_documents() -> None:
+    """Card f26b377d: the coder cannot stamp a trailer it was never told. The
+    hash renders last, after the documents and the branches, because that order
+    is the document author's emphasis and `render_prompt` preserves it."""
+    phase = load_builtin("task").phase("implement")
+    assert isinstance(phase, AgentPhase)
+    assert phase.role == "coder"
+    assert phase.result == "ImplementResult"
+    assert phase.inputs == [
+        "plan_path",
+        "spec_path",
+        "branch",
+        "base_branch",
+        "plan_hash",
+    ]
+    assert phase.gates == []
+
+
+def test_no_phase_declares_plan_hash_before_docs_commit_runs() -> None:
+    """Review focus: `plan_hash` reads `context["docs_commit"]`, which the
+    engine only binds once that phase has run. A phase declaring it earlier
+    would raise at render time, mid-run. Driven from the loaded document, never
+    a hardcoded list."""
+    workflow = load_builtin("task")
+    names = workflow.phase_names
+    declaring = [
+        phase.name
+        for phase in workflow.phases
+        if isinstance(phase, AgentPhase) and "plan_hash" in phase.inputs
+    ]
+
+    assert declaring == ["implement"]  # non-vacuity
+    for name in declaring:
+        assert names.index("docs_commit") < names.index(name)
 
 
 def test_every_resolved_function_is_the_registry_binding() -> None:

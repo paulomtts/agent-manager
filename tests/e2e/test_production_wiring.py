@@ -159,6 +159,10 @@ def test_the_implement_commit_carries_a_plan_hash_trailer_review_agrees_with(
     assert review["porcelain"] == ""
     assert review["commit_count"] == len(revisions)
     assert review["tagged_count"] == review["commit_count"]
+    # The value reached the AGENT, not merely the result file: the recorded
+    # brief on disk carries it as its own section (spec "Tests" item 12).
+    brief = Path(agent_attempts["implement"].prompt_path).read_text(encoding="utf-8")
+    assert f"\n## plan_hash\n{expected}\n" in brief, brief
 
 
 def test_this_module_runs_in_the_default_suite_unmarked(request):
