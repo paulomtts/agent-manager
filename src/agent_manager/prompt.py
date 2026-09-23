@@ -134,9 +134,67 @@ def _jsonable(value: Any) -> Any:
     return dump(mode="json") if callable(dump) else value
 
 
+REPO_DOC_NAMES = ("CLAUDE.md", "AGENTS.md")
+"""The repo-level conventions documents, in the order they are shown."""
+
+REPO_DOC_LINES = 40
+"""§7's "first N lines". An excerpt orients the agent; the file is in the
+worktree it is already sitting in, so the rest costs it one read."""
+
+
+def _repo_docs(request: _Request) -> str:
+    """Path plus an excerpt of each repo conventions document that exists.
+
+    Resolves against the worktree root when there is one and against `repo_dir`
+    when there is not: `explore` is the first phase of `builtin/task.yaml` and
+    the `worktree` phase runs two phases later, so at explore time there is no
+    worktree to read from. Absence of both files is a stated fact, not a failure
+    -- plenty of repositories have neither. Unreadability *is* a failure: a file
+    that is there and cannot be read is a broken checkout, not an empty one.
+    """
+    root = _repo_docs_root(request)
+    blocks = []
+    for name in REPO_DOC_NAMES:
+        block = _repo_doc(request, root / name)
+        if block is not None:
+            blocks.append(block)
+    if not blocks:
+        return f"no {' or '.join(REPO_DOC_NAMES)} at {root}"
+    return "\n\n".join(blocks)
+
+
+def _repo_docs_root(request: _Request) -> Path:
+    worktree = request.context.get("worktree")
+    if worktree is not None and Path(worktree).is_dir():
+        return Path(worktree)
+    return Path(_required(request, "repo_dir"))
+
+
+def _repo_doc(request: _Request, path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise EngineError(
+            f"{path} exists but cannot be read: {type(error).__name__}: {error}",
+            phase=request.phase.name,
+            parameter=request.name,
+        ) from error
+    lines = text.splitlines()
+    head = "\n".join(lines[:REPO_DOC_LINES])
+    if len(lines) <= REPO_DOC_LINES:
+        return f"path: {path}\n{len(lines)} line(s), shown in full:\n{head}"
+    return (
+        f"path: {path}\nfirst {REPO_DOC_LINES} of {len(lines)} lines "
+        f"({len(lines) - REPO_DOC_LINES} more, open the file for the rest):\n{head}"
+    )
+
+
 _TABLE: dict[str, Resolver] = {
     "card": _inline_json("card_details"),
     "parent_story": _inline_json("parent_story_details", allow_empty=True),
+    "repo_docs": _repo_docs,
     "explore": _inline_json("explore"),
     "verification": _inline_json("commands"),
     "spec_path": _verbatim("spec_path"),

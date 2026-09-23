@@ -241,3 +241,136 @@ def test_expand_writes_refuses_a_template_that_leaves_the_worktree(template):
         prompt.expand_writes(template, CARD, phase="spec", input_name="spec_path")
 
     assert "leaves the worktree" in str(caught.value)
+
+
+def _repo_docs_phase():
+    return _phase(["repo_docs"], name="explore", role="explorer")
+
+
+def test_repo_docs_renders_the_path_and_the_whole_file_when_it_is_short(tmp_path):
+    """Review Focus: a file at or under the limit is not labelled truncated."""
+    (tmp_path / "CLAUDE.md").write_text(
+        "\n".join(f"line {n}" for n in range(1, prompt.REPO_DOC_LINES + 1)) + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = prompt.render_prompt(_repo_docs_phase(), _context(repo_dir=tmp_path))
+
+    body = _section(rendered, "repo_docs")
+    assert str(tmp_path / "CLAUDE.md") in body
+    assert "shown in full" in body
+    assert "more" not in body
+    assert f"line {prompt.REPO_DOC_LINES}" in body
+
+
+def test_repo_docs_truncates_a_long_file_and_says_so(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text(
+        "\n".join(f"line {n}" for n in range(1, 101)) + "\n", encoding="utf-8"
+    )
+
+    rendered = prompt.render_prompt(_repo_docs_phase(), _context(repo_dir=tmp_path))
+
+    body = _section(rendered, "repo_docs")
+    assert f"first {prompt.REPO_DOC_LINES} of 100 lines" in body
+    assert f"line {prompt.REPO_DOC_LINES}" in body
+    assert f"line {prompt.REPO_DOC_LINES + 1}" not in body
+    assert "60 more" in body
+
+
+def test_repo_docs_includes_both_files_in_a_fixed_order(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("the claude doc\n", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("the agents doc\n", encoding="utf-8")
+
+    body = _section(
+        prompt.render_prompt(_repo_docs_phase(), _context(repo_dir=tmp_path)), "repo_docs"
+    )
+
+    assert body.index("the claude doc") < body.index("the agents doc")
+
+
+def test_repo_docs_reads_repo_dir_while_the_subtask_has_no_worktree_yet(tmp_path):
+    """`explore` is the first phase; the `worktree` phase runs two phases later."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "CLAUDE.md").write_text("from the repo\n", encoding="utf-8")
+
+    body = _section(
+        prompt.render_prompt(
+            _repo_docs_phase(),
+            _context(repo_dir=repo, worktree=tmp_path / "worktrees" / "not-made-yet"),
+        ),
+        "repo_docs",
+    )
+
+    assert "from the repo" in body
+
+
+def test_repo_docs_reads_the_worktree_root_once_it_exists(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "CLAUDE.md").write_text("from the repo\n", encoding="utf-8")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "CLAUDE.md").write_text("from the worktree\n", encoding="utf-8")
+
+    body = _section(
+        prompt.render_prompt(
+            _repo_docs_phase(), _context(repo_dir=repo, worktree=worktree)
+        ),
+        "repo_docs",
+    )
+
+    assert "from the worktree" in body
+    assert "from the repo" not in body
+
+
+def test_repo_docs_with_neither_file_states_the_absence(tmp_path):
+    body = _section(
+        prompt.render_prompt(_repo_docs_phase(), _context(repo_dir=tmp_path)), "repo_docs"
+    )
+
+    assert body == f"no CLAUDE.md or AGENTS.md at {tmp_path}"
+
+
+def test_an_unreadable_repo_doc_is_an_engine_error_naming_the_phase(tmp_path):
+    (tmp_path / "CLAUDE.md").write_bytes(b"\xff\xfe not utf-8 \xff")
+
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(_repo_docs_phase(), _context(repo_dir=tmp_path))
+
+    assert caught.value.phase == "explore"
+    assert caught.value.parameter == "repo_docs"
+    assert "CLAUDE.md" in str(caught.value)
+
+
+def test_the_table_carries_exactly_the_nine_names_section_7_fixes():
+    """§7's table is fixed. A tenth name is a design change, not a code change."""
+    rendered = prompt.render_prompt(
+        _phase(
+            [
+                "card",
+                "parent_story",
+                "repo_docs",
+                "explore",
+                "spec_path",
+                "plan_path",
+                "branch",
+                "base_branch",
+                "verification",
+            ]
+        ),
+        _context(),
+    )
+
+    assert rendered.inputs == (
+        "card",
+        "parent_story",
+        "repo_docs",
+        "explore",
+        "spec_path",
+        "plan_path",
+        "branch",
+        "base_branch",
+        "verification",
+    )
+    assert sorted(prompt._TABLE) == sorted(rendered.inputs)
