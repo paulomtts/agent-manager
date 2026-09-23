@@ -1524,3 +1524,282 @@ def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, mo
         result = runner.invoke(cli.app, argv)
         assert result.exit_code == cli.EXIT_ERROR, argv
         assert json.loads(result.stdout)["error"]["type"] == "RepoDirError"
+
+
+def _write_logs_attempt(
+    run_id: str, phase: str, n: int, *, stdout: bool = True
+) -> models.Attempt:
+    """One attempt's three files on disk, plus the row that points at them.
+
+    The *test* calls `paths.attempt_dir` -- which creates the directory -- because
+    in production `dispatch.AgentRunner` is what creates it. `logs` itself must
+    never call it, and `test_logs_writes_nothing` is what pins that.
+    """
+    directory = paths.attempt_dir(run_id, "card-1", phase, n)
+    (directory / "prompt.txt").write_text(f"prompt for {phase}.{n}\n", encoding="utf-8")
+    (directory / "result.json").write_text(
+        json.dumps({"phase": phase, "attempt": n}), encoding="utf-8"
+    )
+    if stdout:
+        (directory / "stdout.log").write_text(f"stdout of {phase}.{n}\n", encoding="utf-8")
+    return models.Attempt(
+        n=n,
+        dispatch=_recorded_dispatch(run_id),
+        status="ok" if n > 1 else "gate_failed",
+        exit_code=0 if n > 1 else 1,
+        prompt_path=directory / "prompt.txt",
+        result_path=directory / "result.json",
+        stdout_path=directory / "stdout.log",
+    )
+
+
+def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
+    """A run with two agent phases (two attempts, then one) and a pending phase.
+
+    The trailing `verify` phase has no attempts, so the no-flag default has to
+    skip it to reach `implement`.
+    """
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow="task",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="done",
+                started_at=RECORDED_AT,
+            )
+        )
+        opened.record_story(
+            models.StoryRun(card_id="story-1", title="The CLI", level=0, status="done")
+        )
+        opened.record_subtask(
+            "story-1",
+            models.SubtaskRun(
+                card_id="card-1", branch="m1/task-x", base_branch="main", status="done"
+            ),
+        )
+        opened.record_phase(
+            "story-1", "card-1", models.PhaseRun(name="explore", kind="agent", status="done")
+        )
+        opened.record_attempt(
+            "story-1", "card-1", "explore", _write_logs_attempt(run_id, "explore", 1)
+        )
+        opened.record_attempt(
+            "story-1", "card-1", "explore", _write_logs_attempt(run_id, "explore", 2)
+        )
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="implement", kind="agent", status="done"),
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "implement",
+            _write_logs_attempt(run_id, "implement", 1, stdout=stdout),
+        )
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="verify", kind="deterministic", status="pending"),
+        )
+    finally:
+        opened.close()
+
+
+LOGS_RUN_ID = "20260923T090000Z-cbe34d00"
+
+
+def test_logs_with_no_flags_reports_the_latest_attempt_of_the_latest_phase(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert data["run_id"] == LOGS_RUN_ID
+    assert data["story_id"] == "story-1"
+    assert data["card"] == "card-1"
+    assert data["phase"] == "implement"
+    assert data["attempt"] == 1
+    assert data["artifacts"]["prompt"]["text"] == "prompt for implement.1\n"
+    assert data["artifacts"]["result"]["text"] == '{"phase": "implement", "attempt": 1}'
+    assert data["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+    assert "\n" not in result.stdout.strip()
+
+
+def test_logs_phase_and_attempt_together_select_an_earlier_attempt(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "logs",
+            LOGS_RUN_ID,
+            "card-1",
+            "--phase",
+            "explore",
+            "--attempt",
+            "1",
+            "--repo-dir",
+            str(projection),
+        ],
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)["data"]
+    assert data["phase"] == "explore"
+    assert data["attempt"] == 1
+    assert data["status"] == "gate_failed"
+    assert data["exit_code"] == 1
+    assert data["artifacts"]["prompt"]["text"] == "prompt for explore.1\n"
+
+
+def test_logs_pretty_indents_the_same_envelope(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    plain = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+    pretty = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection), "--pretty"]
+    )
+
+    assert pretty.exit_code == 0
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+def test_logs_reports_an_attempt_whose_stdout_was_never_written(projection):
+    """An attempt that exists is always reportable: the missing file is the
+    finding, not a reason to refuse."""
+    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert data["artifacts"]["prompt"]["present"] is True
+    assert data["artifacts"]["stdout"]["present"] is False
+    assert data["artifacts"]["stdout"]["text"] is None
+    assert data["artifacts"]["stdout"]["path"].endswith("stdout.log")
+
+
+def test_logs_for_an_unknown_run_is_an_envelope(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", "no-such-run", "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+
+
+def test_logs_for_a_card_that_is_not_in_the_run_is_an_envelope(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-9", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownCardError"
+    assert "card-9" in envelope["error"]["message"]
+    assert LOGS_RUN_ID in envelope["error"]["message"]
+
+
+def test_logs_for_an_unknown_phase_or_attempt_is_an_envelope(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+
+    unknown_phase = runner.invoke(cli.app, [*base, "--phase", "reveiw"])
+    assert unknown_phase.exit_code == cli.EXIT_ERROR
+    phase_envelope = json.loads(unknown_phase.stdout)
+    assert phase_envelope["error"]["type"] == "UnknownPhaseError"
+    assert "reveiw" in phase_envelope["error"]["message"]
+    assert "implement" in phase_envelope["error"]["message"]
+
+    unknown_attempt = runner.invoke(cli.app, [*base, "--phase", "explore", "--attempt", "9"])
+    assert unknown_attempt.exit_code == cli.EXIT_ERROR
+    attempt_envelope = json.loads(unknown_attempt.stdout)
+    assert attempt_envelope["error"]["type"] == "UnknownAttemptError"
+    assert "9" in attempt_envelope["error"]["message"]
+
+
+def test_logs_with_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(tmp_path / "missing")]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "RepoDirError"
+    assert "missing" in envelope["error"]["message"]
+
+
+def _runs_snapshot() -> dict[str, bytes]:
+    """Every path under `XDG_DATA_HOME/agent-manager/runs`, with file contents.
+
+    Only the `runs` tree: the SQLite projection's own `-wal` and `-shm` sidecars
+    come and go with any reader, including a legitimate read-only one, so the
+    `attempts` table is snapshotted as rows instead.
+    """
+    root = paths.data_dir() / "runs"
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _attempt_rows(root: Path) -> list[tuple]:
+    conn = sqlite3.connect(paths.project_db_path(root))
+    try:
+        return conn.execute(
+            "SELECT run_id, story_id, card_id, phase, n, status, prompt_path,"
+            " result_path, stdout_path FROM attempts ORDER BY phase, n"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_logs_writes_nothing(projection):
+    """`logs` is read-only: it opens no `Journal`, records nothing, and never
+    calls `paths.attempt_dir` or `paths.run_dir`, both of which mkdir as a side
+    effect. A refusal for an unknown run must leave no `runs/<run-id>` behind."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    success = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+    assert success.exit_code == 0
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+
+    refusal = runner.invoke(
+        cli.app, ["logs", "no-such-run", "card-1", "--repo-dir", str(projection)]
+    )
+    assert refusal.exit_code == cli.EXIT_ERROR
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()

@@ -693,3 +693,69 @@ def runs(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+def logs_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+
+    Read-only, like `status_for`: the projection is reached through the free
+    `open_db` / `load_run` rather than `Store.open`, which would construct a
+    `Journal` and therefore mint a run directory for a run that may not exist.
+    The connection is closed on every path including the refusals.
+
+    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
+    "most recent run" reading of it to default to.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+        if run is None:
+            raise UnknownRunError(
+                f"run {run_id!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+        found = find_subtask(run, card)
+        if found is None:
+            raise UnknownCardError(
+                f"card {card!r} is not in run {run_id!r}"
+                f" (`agent-manager status {run_id}` lists the cards that are)"
+            )
+        story, subtask = found
+        chosen_phase, chosen_attempt = select_attempt(subtask, phase=phase, attempt=attempt)
+        return logs_payload(run, story, subtask, chosen_phase, chosen_attempt)
+    finally:
+        conn.close()
+
+
+@app.command("logs")
+def logs(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to read."),
+    card: str = typer.Argument(..., metavar="CARD", help="The subtask card id."),
+    phase: str | None = typer.Option(
+        None, "--phase", help="Which phase. Defaults to the last one with attempts."
+    ),
+    attempt: int | None = typer.Option(
+        None, "--attempt", help="Which attempt. Defaults to the highest recorded."
+    ),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is read."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Print one attempt's prompt, result and captured stdout."""
+    try:
+        payload = logs_for(
+            run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+        )
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
