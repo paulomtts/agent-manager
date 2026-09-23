@@ -34,9 +34,9 @@ def test_an_unknown_result_name_is_a_named_engine_error():
 
 
 def test_the_shipped_table_is_empty_and_says_why():
-    # The five names in builtin/task.yaml have no field schema anywhere in the
-    # design spec; inventing one is not this card's decision. Validating
-    # nothing would be worse -- an unknown name fails loudly instead.
+    # The five names in builtin/task.yaml now have models below, but putting
+    # them in the table is a sibling card's decision, not this one's.
+    # Validating nothing would be worse -- an unknown name fails loudly instead.
     assert results.RESULT_MODELS == {}
 
 
@@ -454,6 +454,7 @@ def test_a_dumped_review_with_no_commits_blocks_on_implement():
     assert verdict["blocked"] == "implement"
     assert "no commits on top of master" in verdict["detail"]
 
+
 _REAL_SUMMARY = (
     "results.py holds the result-name table; steps/reducers.py holds the ported "
     "gates and reads camelCase keys off the dumped result mapping"
@@ -485,6 +486,7 @@ def test_the_models_leave_an_empty_summary_for_the_gate_to_judge():
 
     verdict = reducers.exploration_output_gate(dumped, None)
     assert "implausibly short/placeholder" in verdict["detail"]
+
 
 def test_the_embedded_json_schema_names_snake_case_only():
     # R2 embeds model_json_schema() in the agent's prompt, and validation

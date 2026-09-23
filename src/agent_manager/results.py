@@ -53,21 +53,6 @@ class ExploreResult(_Result):
     verification: Verification
 
 
-def resolve_result_model(
-    name: str, table: Mapping[str, type[BaseModel]], *, phase: str
-) -> type[BaseModel]:
-    """The model class `name` refers to, or an `EngineError` naming the phase."""
-    model = table.get(name)
-    if model is None:
-        raise EngineError(
-            f"declares result {name!r}, which no result model is registered for "
-            f"(registered: {', '.join(sorted(table)) or 'nothing'}); a result file "
-            "cannot be validated against a model that does not exist",
-            phase=phase,
-        )
-    return model
-
-
 class CriticResult(_Result):
     """The `critic` phase's result file (`builtin/task.yaml` lines 39 and 53)."""
 
@@ -120,3 +105,18 @@ class ReviewResult(_Result):
     commit_count: int = Field(serialization_alias="commitCount")
     tagged_count: int = Field(serialization_alias="taggedCount")
     plan_hash: str
+
+
+def resolve_result_model(
+    name: str, table: Mapping[str, type[BaseModel]], *, phase: str
+) -> type[BaseModel]:
+    """The model class `name` refers to, or an `EngineError` naming the phase."""
+    model = table.get(name)
+    if model is None:
+        raise EngineError(
+            f"declares result {name!r}, which no result model is registered for "
+            f"(registered: {', '.join(sorted(table)) or 'nothing'}); a result file "
+            "cannot be validated against a model that does not exist",
+            phase=phase,
+        )
+    return model
