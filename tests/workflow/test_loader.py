@@ -189,3 +189,97 @@ def test_a_phase_that_does_not_exist_raises_rather_than_key_error() -> None:
         workflow.phase("nope")
     with pytest.raises(UnknownFunctionError):
         workflow.function("nope")
+
+
+def test_unknown_run_name_fails_at_load_time_naming_the_phase() -> None:
+    document = """
+name: demo
+phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.ensure
+"""
+    with pytest.raises(UnknownFunctionError) as caught:
+        load_workflow(document, registry_with("demo.run"))
+
+    message = str(caught.value)
+    assert "worktree" in message
+    assert "worktree.ensure" in message
+    assert "run" in message
+    assert "demo.run" in message  # what WAS registered
+    assert caught.value.unknown == ("worktree.ensure",)
+
+
+def test_unknown_when_name_fails_at_load_time() -> None:
+    document = """
+name: demo
+phases:
+  - name: plan_check
+    kind: deterministic
+    run: demo.run
+    when: plan_check.has_validated_plan
+    skip_to: implement
+  - name: implement
+    kind: agent
+    role: coder
+"""
+    with pytest.raises(UnknownFunctionError) as caught:
+        load_workflow(document, registry_with("demo.run"))
+
+    assert caught.value.unknown == ("plan_check.has_validated_plan",)
+    assert "when" in str(caught.value)
+    assert "plan_check" in str(caught.value)
+
+
+def test_unknown_gate_name_fails_at_load_time() -> None:
+    document = """
+name: demo
+phases:
+  - name: review
+    kind: agent
+    role: reviewer
+    gates: [review_gate, plan_hash_gate]
+"""
+    with pytest.raises(UnknownFunctionError) as caught:
+        load_workflow(document, registry_with("review_gate"))
+
+    assert caught.value.unknown == ("plan_hash_gate",)
+    assert "gate" in str(caught.value)
+    assert "review" in str(caught.value)
+
+
+def test_every_unknown_name_is_reported_in_one_error() -> None:
+    document = """
+name: demo
+phases:
+  - name: first
+    kind: deterministic
+    run: missing.run
+    when: missing.when
+  - name: second
+    kind: agent
+    role: coder
+    gates: [missing_gate, missing_gate]
+"""
+    with pytest.raises(UnknownFunctionError) as caught:
+        load_workflow(document, registry_with())
+
+    assert caught.value.unknown == ("missing.run", "missing.when", "missing_gate")
+    message = str(caught.value)
+    assert "'first'" in message
+    assert "'second'" in message
+    assert caught.value.workflow == "demo"
+
+
+def test_resolution_happens_before_any_function_is_called() -> None:
+    """The invariant: nothing the document names runs during a load."""
+    calls: list[str] = []
+
+    def spy(*args: object, **kwargs: object) -> None:
+        calls.append("called")
+
+    registry = FunctionRegistry()
+    registry.register("demo.run", spy)
+    load_workflow(MINIMAL, registry)
+
+    assert calls == []

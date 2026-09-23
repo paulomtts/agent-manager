@@ -239,9 +239,34 @@ def _function_names(phase: DeterministicPhase | AgentPhase) -> Iterator[tuple[st
 
 
 def _resolve(workflow: Workflow, registry: FunctionRegistry) -> Workflow:
+    """Bind every referenced name, or refuse the whole document.
+
+    Every offender in the document is collected before raising: reporting one
+    per load attempt turns fixing a workflow into an N-round trip, and the
+    engine only ever loads once, at the top of a run.
+    """
     functions: dict[str, Function] = {}
+    missing: list[tuple[str, str, str]] = []
     for phase in workflow.phases:
-        for _position, name in _function_names(phase):
-            if name not in functions:
+        for position, name in _function_names(phase):
+            if name in functions:
+                continue
+            if name in registry:
                 functions[name] = registry.resolve(name)
+            else:
+                missing.append((phase.name, position, name))
+    if missing:
+        detail = "; ".join(
+            f"phase {phase!r} {position} {name!r}" for phase, position, name in missing
+        )
+        unknown = tuple(dict.fromkeys(name for _phase, _position, name in missing))
+        raise UnknownFunctionError(
+            f"names {len(unknown)} function(s) nobody registered: {detail} "
+            f"(registered: {', '.join(registry.names()) or 'nothing'})",
+            workflow=workflow.name,
+            phase=missing[0][0],
+            field=missing[0][1],
+            unknown=unknown,
+            registered=registry.names(),
+        )
     return workflow.model_copy(update={"functions": functions})
