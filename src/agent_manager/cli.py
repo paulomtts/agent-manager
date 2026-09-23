@@ -734,7 +734,9 @@ def logs_for(
                 f" (`agent-manager status {run_id}` lists the cards that are)"
             )
         story, subtask = found
-        chosen_phase, chosen_attempt = select_attempt(subtask, phase=phase, attempt=attempt)
+        chosen_phase, chosen_attempt = select_attempt(
+            subtask, phase=phase, attempt=attempt
+        )
         return logs_payload(run, story, subtask, chosen_phase, chosen_attempt)
     finally:
         conn.close()
