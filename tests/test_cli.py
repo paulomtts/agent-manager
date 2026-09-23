@@ -2128,3 +2128,295 @@ def test_logs_writes_nothing(projection):
     assert _runs_snapshot() == tree_before
     assert _attempt_rows(projection) == rows_before
     assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
+"""The clock `_crash_mid_phase` injects, so the run id is known without reading
+a payload the crash never produced."""
+
+
+def recording_runner(
+    *,
+    store,
+    run_id: str,
+    story_id: str,
+    card_id: str,
+    crash_at: str | None = None,
+    seen: list[str] | None = None,
+):
+    """A fake `engine.AgentPhaseRunner` that writes the rows a real one writes.
+
+    §14's Engine tier: no adapter, no launcher, no harness process. It does
+    record what `dispatch.AgentRunner` records -- the phase `started`, then an
+    attempt `started` before the dispatch, then the terminal pair -- and numbers
+    its attempt directories with the real `dispatch.next_attempt`, because that
+    ordering is exactly what `resume` has to find and repair.
+
+    `crash_at` raises `KeyboardInterrupt` in the window between the two writes: a
+    `BaseException`, so it escapes `engine.run_subtask`'s `except Exception` the
+    way `kill -INT` escapes it, leaving subtask, phase and attempt all `started`.
+    """
+
+    def runner(phase, context, rendered):
+        if seen is not None:
+            seen.append(phase.name)
+        n = dispatch.next_attempt(run_id, card_id, phase.name)
+        directory = paths.attempt_dir(run_id, card_id, phase.name, n)
+        prompt_path = directory / "prompt.txt"
+        prompt_path.write_text(rendered.text, encoding="utf-8")
+        attempt = models.Attempt(
+            n=n,
+            dispatch=models.Dispatch(
+                harness="fake",
+                model="fake",
+                role=phase.role,
+                cwd=Path(context["worktree"]),
+                prompt_path=prompt_path,
+                result_path=directory / "result.json",
+            ),
+            status="started",
+            prompt_path=prompt_path,
+        )
+        store.record_phase(
+            story_id, card_id, models.PhaseRun(name=phase.name, kind="agent", status="started")
+        )
+        store.record_attempt(story_id, card_id, phase.name, attempt)
+        if crash_at is not None and phase.name == crash_at:
+            raise KeyboardInterrupt(f"simulated kill during {phase.name}")
+        store.record_attempt(
+            story_id,
+            card_id,
+            phase.name,
+            attempt.model_copy(update={"status": "ok", "exit_code": 0}),
+        )
+        store.record_phase(
+            story_id, card_id, models.PhaseRun(name=phase.name, kind="agent", status="done")
+        )
+        if phase.name == "explore":
+            return dict(EXPLORE_RESULT)
+        return {"phase": phase.name, "ok": True}
+
+    return runner
+
+
+def _resume_factory(seen: list[str] | None = None, crash_at: str | None = None):
+    """A `cli.RunnerFactory` handing `recording_runner` the store the CLI opened."""
+
+    def factory(*, workflow, store, run_id, story_id, card_id):
+        return recording_runner(
+            store=store,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            crash_at=crash_at,
+            seen=seen,
+        )
+
+    return factory
+
+
+def _crash_mid_phase(project: Path, cards: dict[str, str], phase: str) -> str:
+    """Drive a real `run_card` until it is killed inside `phase`, and name the run."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=project,
+            base_branch="main",
+            clock=lambda: CRASHED_AT,
+            runner_factory=_resume_factory(crash_at=phase),
+        )
+    return run_id
+
+
+@requires_git
+@requires_brd
+def test_a_run_killed_mid_implement_resumes_and_leaves_no_started_attempt(project, cards):
+    """§14's required test: a simulated crash mid-phase, then a resume.
+
+    The crash leaves the subtask, the phase and the attempt all recorded
+    `started`; §9 says resume discards the in-flight attempt and re-runs that
+    phase from the top. An attempt row left `started` after the run finished is
+    the corruption this whole command exists to prevent.
+    """
+    run_id = _crash_mid_phase(project, cards, "implement")
+    assert [
+        row for row in _attempt_rows(project) if row[3] == "implement" and row[5] == "started"
+    ] != []
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "implement"
+    assert {"phase": "implement", "n": 1} in payload["discarded_attempts"]
+    assert payload["run_id"] == run_id
+    assert payload["card_id"] == cards["subtask"]
+    assert payload["story_id"] == cards["story"]
+    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
+
+
+@requires_git
+@requires_brd
+def test_the_resumed_dispatch_numbers_past_the_attempt_the_crash_left(project, cards):
+    """`dispatch.next_attempt` scans directories on disk precisely so a resumed
+    run cannot overwrite the prompt and log of the attempt that died -- they are
+    the only record of what the killed process was doing."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    crashed_dir = paths.run_dir(run_id) / cards["subtask"] / "implement.1"
+    prompt_before = (crashed_dir / "prompt.txt").read_bytes()
+
+    cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert (crashed_dir / "prompt.txt").read_bytes() == prompt_before
+    assert (paths.run_dir(run_id) / cards["subtask"] / "implement.2").is_dir()
+    implement = [row for row in _attempt_rows(project) if row[3] == "implement"]
+    assert [(row[4], row[5]) for row in implement] == [(1, "harness_error"), (2, "ok")]
+
+
+@requires_git
+@requires_brd
+def test_resume_launches_no_harness(project, cards, monkeypatch):
+    """§14's adapter rule at the resume seam: the launcher is injected, so a
+    resume that got as far as launching one has already failed."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("resume launched a harness process")
+
+    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_run_killed_in_spec_restarts_at_explore_so_specs_input_is_bound(project, cards):
+    """The back-off rule observed end to end: `spec` declares `explore` as an
+    input, `explore`'s result was only ever in the dead process's memory, so the
+    resumed walk has to produce it again before `spec` can render at all."""
+    run_id = _crash_mid_phase(project, cards, "spec")
+    seen: list[str] = []
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(seen))
+
+    assert payload["resumed_from"] == "explore"
+    assert payload["status"] == "done"
+    assert seen[0] == "explore"
+    assert seen.index("explore") < seen.index("spec")
+
+
+@requires_git
+@requires_brd
+def test_resume_passes_its_own_allow_no_verification_into_the_gate_context(project, cards):
+    """`RunConfig` records neither the suite commands nor §12's opt-out, so the
+    flag is the command's own -- and it has to reach the same four context keys
+    `run_card` supplies (cli.py:438-455)."""
+    run_id = _crash_mid_phase(project, cards, "spec")
+    contexts: list[dict[str, Any]] = []
+
+    def factory(*, workflow, store, run_id, story_id, card_id):
+        def collect(phase, context, rendered):
+            contexts.append(dict(context))
+            if phase.name == "explore":
+                return dict(EXPLORE_RESULT)
+            return {"phase": phase.name, "ok": True}
+
+        return collect
+
+    cli.resume_run(
+        run_id, repo_dir=project, allow_no_verification=True, runner_factory=factory
+    )
+
+    assert contexts[0]["allow_no_verification"] is True
+    assert contexts[0]["suite_cmds"] == []
+    assert contexts[0]["caller_provided"] is False
+    assert contexts[0]["provided_verification"] is None
+
+
+def _record_interrupted(
+    project: Path,
+    cards: dict[str, str],
+    run_id: str,
+    *,
+    workflow: str = "task",
+    done: tuple[str, ...] = (),
+    started: str | None = None,
+) -> None:
+    """A run the projection holds as killed in flight, written row by row.
+
+    The board and the git repo stay the `project` fixture's real ones, so
+    `resume` can re-fetch the cards; only the run state is hand-built, because
+    the two states these tests need -- a stretch a `skip_to` jumped over, and a
+    workflow name no builtin matches -- are not states `run_card` can be driven
+    into. Written through `Store`, which is the only way this program writes
+    rows.
+    """
+    branch = dag.task_branch("m1", board.show(cards["subtask"], repo_dir=project))
+    opened = store_module.Store.open(project, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=workflow,
+                repo_dir=project,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=CRASHED_AT,
+            )
+        )
+        opened.record_story(
+            models.StoryRun(
+                card_id=cards["story"],
+                title="The CLI",
+                level=0,
+                status="started",
+                tip_branch=branch,
+            )
+        )
+        opened.record_subtask(
+            cards["story"],
+            models.SubtaskRun(
+                card_id=cards["subtask"],
+                branch=branch,
+                base_branch="main",
+                status="started",
+                worktree_path=cli.worktree_for(project, branch),
+            ),
+        )
+        for name in done:
+            opened.record_phase(cards["story"], cards["subtask"], _recorded(name, "done"))
+        if started is not None:
+            opened.record_phase(
+                cards["story"], cards["subtask"], _recorded(started, "started")
+            )
+    finally:
+        opened.close()
+
+
+@requires_git
+@requires_brd
+def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_traceback(
+    project, cards
+):
+    """Review Focus: restarting at `plan_check` re-asks its `when`, and a `when`
+    that now says "no validated plan" drops the walk into `spec`, whose `explore`
+    input no fresh context supplies. The honest outcome is the engine's own
+    refusal naming the input -- which `HANDLED` turns into an envelope at exit 3
+    -- and never an unhandled traceback."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    _record_interrupted(
+        project,
+        cards,
+        run_id,
+        done=("explore", "mark_in_progress", "worktree", "plan_check"),
+    )
+
+    with pytest.raises(EngineError) as caught:
+        cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert "explore" in str(caught.value)
+    assert isinstance(caught.value, cli.HANDLED)

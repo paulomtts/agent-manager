@@ -929,3 +929,127 @@ def logs(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+def resume_run(
+    run_id: str,
+    *,
+    repo_dir: Path,
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+) -> dict[str, Any]:
+    """Pick one killed run back up at the phase it died in (§9 lines 370-386).
+
+    The order is the spec's and it is load-bearing in the same way `run_card`'s
+    is, only inverted: every refusal -- unknown run, nothing in flight, a card
+    the board lost, a workflow that will not load -- happens before `Store.open`,
+    because `Store.open` constructs a `Journal` and therefore mints a run
+    directory, and a refusal that left one behind would be this command writing
+    state for a run it declined to touch.
+
+    Branch, base branch and worktree come from the recorded `SubtaskRun` and
+    never from a flag: §9's "the run records what it was started with" is the
+    reason the record exists. The two knobs the record does *not* carry --
+    `models.RunConfig` has no suite commands and no `allow_no_verification` --
+    are taken as arguments here rather than grown onto the model, so a resume
+    means exactly what a fresh `run` with the same flags means.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+        if run is None:
+            raise UnknownRunError(
+                f"run {run_id!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+    finally:
+        conn.close()
+
+    story, subtask = select_resumable(run)
+    card = board.show(subtask.card_id, repo_dir=root)
+    parent = board.show(story.card_id, repo_dir=root)
+    workflow = load_builtin(run.workflow)
+    interrupted = interrupted_phase(subtask, workflow)
+    if interrupted is None:
+        raise NotResumableError(
+            f"every phase of card {subtask.card_id} in run {run.id!r} is recorded"
+            " 'done', so there is no phase to re-run -- only the final status write"
+            " was lost; start a fresh run with `agent-manager run --card` if the card"
+            " still needs work"
+        )
+    start_phase = resume_start_phase(workflow, interrupted)
+    orphans = orphan_attempts(subtask)
+    resumed = subtask.model_copy(update={"status": "started"})
+
+    store = Store.open(root, run.id)
+    try:
+        # Journal first, row after -- `record_attempt`'s own ordering, and the
+        # reason no delete path is needed: the orphan is one more `attempt_upsert`
+        # keyed by (phase, n), so `replay` and `rebuild_from_journal` need to know
+        # nothing about resume. The attempt *directory* is left alone: its prompt
+        # and stdout are the only evidence of what the killed process was doing.
+        for phase, attempt in orphans:
+            store.record_attempt(
+                story.card_id,
+                subtask.card_id,
+                phase.name,
+                attempt.model_copy(update={"status": "harness_error"}),
+            )
+        store.record_run(run.model_copy(update={"status": "started"}))
+        store.record_story(story.model_copy(update={"status": "started"}))
+        store.record_subtask(story.card_id, resumed)
+
+        factory = default_runner_factory if runner_factory is None else runner_factory
+        runner = factory(
+            workflow=workflow,
+            store=store,
+            run_id=run.id,
+            story_id=story.card_id,
+            card_id=subtask.card_id,
+        )
+        summary = engine.run_subtask(
+            workflow,
+            store,
+            story_id=story.card_id,
+            subtask=resumed,
+            repo_dir=root,
+            commands=commands,
+            card=card,
+            parent_story=parent,
+            extra_context=gate_context(commands, allow_no_verification),
+            agent_runner=runner,
+            start_phase=start_phase,
+            clock=clock,
+        )
+
+        store.record_run(run.model_copy(update={"status": summary.status}))
+        store.record_story(story.model_copy(update={"status": summary.status}))
+        store.record_subtask(
+            story.card_id, resumed.model_copy(update={"status": summary.status})
+        )
+
+        warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+        return {
+            "run_id": run.id,
+            "card_id": subtask.card_id,
+            "story_id": story.card_id,
+            "branch": subtask.branch,
+            "base_branch": subtask.base_branch,
+            "worktree": None
+            if subtask.worktree_path is None
+            else str(subtask.worktree_path),
+            "status": summary.status,
+            "failed_phase": summary.failed_phase,
+            "detail": summary.detail,
+            "skipped": list(summary.skipped),
+            "warnings": warnings,
+            "resumed_from": start_phase,
+            "discarded_attempts": [
+                {"phase": phase.name, "n": attempt.n} for phase, attempt in orphans
+            ],
+        }
+    finally:
+        store.close()
