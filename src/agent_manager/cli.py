@@ -423,6 +423,116 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
     )
 
 
+def _skipped_origin(
+    workflow: Workflow, recorded: Mapping[str, models.PhaseRun], index: int
+) -> str | None:
+    """The earlier `skip_to` phase whose jump explains an unrecorded phase.
+
+    A skipped phase leaves no row at all (engine.py:431-433 moves the index and
+    only appends to the in-memory `summary.skipped`), so "not recorded" reads
+    the same as "never reached". The jump is the explanation only when the whole
+    stretch between the jumping phase and its target is unrecorded: one recorded
+    phase in there proves the walk went through rather than over it.
+
+    The `skip_to` phase is returned rather than its target so the document's own
+    `when` decides the jump again -- `plan_check.find_validated_plan` is a
+    read-only directory listing, and re-authoring a spec over a plan Validate
+    already signed is the outcome this exists to prevent.
+    """
+    for candidate_index, candidate in enumerate(workflow.phases[:index]):
+        if candidate.skip_to is None:
+            continue
+        target_index = workflow.phase_names.index(candidate.skip_to)
+        if not candidate_index < index < target_index:
+            continue
+        stretch = workflow.phase_names[candidate_index + 1 : target_index]
+        if all(name not in recorded for name in stretch):
+            return candidate.name
+    return None
+
+
+def interrupted_phase(subtask: models.SubtaskRun, workflow: Workflow) -> str | None:
+    """The phase §9's resume re-runs from the top, or `None` if there is none.
+
+    Pure over the recorded tree plus the document, so the choice is testable
+    without a store. Two readings of a killed process, in order:
+
+    a phase recorded `started` is the crash signature §9 names -- the manager
+    died while that phase was in flight -- and the first such phase wins;
+    otherwise the process died between phases and the first phase not recorded
+    `done` is the one that never ran, corrected by `_skipped_origin` for the
+    stretch a `skip_to` jumped over.
+
+    `None` means every phase of the document is `done`: only the final status
+    write was lost, and `resume_run` refuses rather than re-running `mark_done`.
+    """
+    recorded = {phase.name: phase for phase in subtask.phases}
+    for name in workflow.phase_names:
+        phase = recorded.get(name)
+        if phase is not None and phase.status == "started":
+            return name
+    for index, phase in enumerate(workflow.phases):
+        record = recorded.get(phase.name)
+        if record is not None and record.status == "done":
+            continue
+        origin = _skipped_origin(workflow, recorded, index)
+        return phase.name if origin is None else origin
+    return None
+
+
+def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
+    """`phase_name`, backed off over the earlier phases whose results it binds.
+
+    A phase's declared `inputs` are resolved out of the binding table
+    `engine.run_subtask` builds in memory (`_bind_result`, engine.py:439); the
+    journal never replays it. So an input naming an earlier phase is a hard
+    dependency on that phase having run *in this process*, and starting past it
+    would fail in `prompt.render_prompt` before a single token was billed.
+
+    Only names that are phases of this document count. `card`, `branch`,
+    `spec_path` and the rest come from `subtask_context` / `_document_paths` /
+    `gate_context` and are supplied on every walk, so `RESERVED_CONTEXT_KEYS` is
+    excluded by name -- `_bind_result` skips writing those back anyway, which
+    means a same-named phase's result is never what a later phase reads.
+
+    Transitive by construction, and terminating: each hop moves strictly earlier
+    in `phase_names`. In `builtin/task.yaml` the only edge is `spec` -> `explore`.
+    """
+    order = {name: index for index, name in enumerate(workflow.phase_names)}
+    current = phase_name
+    while True:
+        phase = workflow.phase(current)
+        producers = [
+            name
+            for name in getattr(phase, "inputs", ())
+            if name in order
+            and name not in engine.RESERVED_CONTEXT_KEYS
+            and order[name] < order[current]
+        ]
+        if not producers:
+            return current
+        current = min(producers, key=lambda name: order[name])
+
+
+def orphan_attempts(
+    subtask: models.SubtaskRun,
+) -> list[tuple[models.PhaseRun, models.Attempt]]:
+    """Every attempt recorded `started` with no terminal event, in tree order.
+
+    §9's "in-flight attempt": the manager was killed between the row that says a
+    dispatch began and the row that says how it ended. The owning phase comes
+    back with it because `Store.record_attempt` is keyed by phase name and an
+    `Attempt` carries no back-reference, exactly as `find_subtask` returns the
+    owning story.
+    """
+    return [
+        (phase, attempt)
+        for phase in subtask.phases
+        for attempt in phase.attempts
+        if attempt.status == "started"
+    ]
+
+
 app = typer.Typer(
     add_completion=False,
     help="Drive brd cards through the agent-manager workflow engine.",

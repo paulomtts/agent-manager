@@ -24,9 +24,10 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dag, models, paths, store as store_module
+from agent_manager import board, cli, dag, dispatch, models, paths, store as store_module
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.steps.reducers import verification_gate
+from agent_manager.workflow.loader import load_builtin
 from agent_manager.workflow.registry import WorkflowLoadError
 
 
@@ -419,6 +420,170 @@ def test_select_resumable_refuses_more_than_one_subtask_in_flight():
     message = str(caught.value)
     assert "card-1" in message
     assert "card-2" in message
+
+
+AGENT_PHASE_NAMES = frozenset(
+    {"explore", "spec", "validate_spec", "plan", "validate_plan", "implement", "review"}
+)
+"""Which phases of `builtin/task.yaml` are `kind: agent`. `PhaseRun.kind` is a
+Literal, so a hand-built phase has to name the right one."""
+
+
+def _task_workflow():
+    """The shipped `builtin/task.yaml`, loaded and resolved.
+
+    Still unit tier: the only thing read is a packaged document that ships with
+    the source. No run state, no clock, no subprocess -- and the back-off rule
+    these tests pin is a property of *that* document, so substituting a
+    hand-written one would test the wrong thing.
+    """
+    return load_builtin("task")
+
+
+def _recorded(name: str, status: str, attempts: list[models.Attempt] | None = None):
+    """One `PhaseRun` of the task workflow as the projection would hold it."""
+    return models.PhaseRun(
+        name=name,
+        kind="agent" if name in AGENT_PHASE_NAMES else "deterministic",
+        status=status,
+        attempts=list(attempts or []),
+    )
+
+
+def test_the_interrupted_phase_is_the_one_recorded_started():
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            _recorded("explore", "done", [_pure_attempt(1)]),
+            _recorded("mark_in_progress", "done"),
+            _recorded("worktree", "done"),
+            _recorded("plan_check", "done"),
+            _recorded("spec", "done", [_pure_attempt(1)]),
+            _recorded("validate_spec", "done", [_pure_attempt(1)]),
+            _recorded("plan", "done", [_pure_attempt(1)]),
+            _recorded("validate_plan", "done", [_pure_attempt(1)]),
+            _recorded("implement", "started", [_pure_attempt(1, status="started")]),
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, _task_workflow()) == "implement"
+
+
+def test_a_crash_between_phases_restarts_at_the_first_phase_not_done():
+    """No phase is `started`, so the process died between two of them: the first
+    phase the projection does not hold as `done` is the one that never ran."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            _recorded("explore", "done", [_pure_attempt(1)]),
+            _recorded("mark_in_progress", "done"),
+            _recorded("worktree", "done"),
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
+
+
+def test_a_skipped_stretch_restarts_at_the_phase_whose_when_decided_the_skip():
+    """`plan_check` may `skip_to: implement`, and a skipped phase is never
+    recorded (engine.py:432 only appends to the in-memory summary). Restarting at
+    `spec` would re-author a spec over a plan Validate already signed; restarting
+    at `plan_check` lets its own `when` decide the jump again."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            _recorded("explore", "done", [_pure_attempt(1)]),
+            _recorded("mark_in_progress", "done"),
+            _recorded("worktree", "done"),
+            _recorded("plan_check", "done"),
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
+
+
+def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_check():
+    """The skip-aware branch must stay bounded by the `skip_to` target: with
+    `implement`, `review` and `verify` all recorded `done`, no jump can explain a
+    missing `mark_done`, and re-running the whole tail would be a fresh run."""
+    workflow = _task_workflow()
+    subtask = _pure_subtask(
+        "card-1",
+        [_recorded(name, "done") for name in workflow.phase_names if name != "mark_done"],
+    )
+
+    assert cli.interrupted_phase(subtask, workflow) == "mark_done"
+
+
+def test_a_subtask_with_every_phase_done_has_no_phase_to_resume():
+    """The condition `resume_run` turns into `NotResumableError`: only the final
+    status write was lost, and re-running `mark_done` would not be a resume."""
+    workflow = _task_workflow()
+    subtask = _pure_subtask(
+        "card-1", [_recorded(name, "done") for name in workflow.phase_names]
+    )
+
+    assert cli.interrupted_phase(subtask, workflow) is None
+
+
+def test_an_interrupted_spec_backs_off_to_the_phase_whose_result_it_binds():
+    """`spec` declares `inputs: [card, explore]`, and `explore`'s result lives
+    only in the in-memory binding table `run_subtask` builds -- so a walk started
+    at `spec` could not render its prompt at all."""
+    assert cli.resume_start_phase(_task_workflow(), "spec") == "explore"
+
+
+def test_an_interrupted_implement_stays_at_implement():
+    """`implement` declares `[plan_path, spec_path, branch, base_branch]`, all of
+    which `subtask_context` and `_document_paths` supply from the record."""
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "implement"
+
+
+def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
+    """Review Focus: the process died inside `verify.run_suite`. A deterministic
+    phase dispatches nothing, so there is no attempt to discard, and
+    `verify.run_suite` is read-only -- re-running it is the whole recovery."""
+    workflow = _task_workflow()
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            *[_recorded(name, "done") for name in workflow.phase_names[:10]],
+            _recorded("verify", "started"),
+        ],
+    )
+
+    assert cli.interrupted_phase(subtask, workflow) == "verify"
+    assert cli.resume_start_phase(workflow, "verify") == "verify"
+    assert cli.orphan_attempts(subtask) == []
+
+
+def test_orphan_attempts_are_exactly_the_ones_recorded_started():
+    """`started` with no terminal event is §9's in-flight attempt. A
+    `gate_failed` or `harness_error` attempt is finished history and must not be
+    rewritten."""
+    orphan_spec = _pure_attempt(1, status="started")
+    orphan_implement = _pure_attempt(2, status="started")
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            _recorded(
+                "explore",
+                "done",
+                [_pure_attempt(1, status="gate_failed"), _pure_attempt(2)],
+            ),
+            _recorded("spec", "started", [orphan_spec]),
+            _recorded(
+                "implement",
+                "started",
+                [_pure_attempt(1, status="harness_error"), orphan_implement],
+            ),
+        ],
+    )
+
+    assert cli.orphan_attempts(subtask) == [
+        (subtask.phases[1], orphan_spec),
+        (subtask.phases[2], orphan_implement),
+    ]
 
 
 def _pure_attempt(n: int, status: str = "ok") -> models.Attempt:
