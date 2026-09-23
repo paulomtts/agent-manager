@@ -1,4 +1,9 @@
-"""Pure-functions tier (design §14 lines 477-492) for the fake `claude`'s helpers.
+"""Tests for the fake `claude` of the production-wiring tier.
+
+The parsing and payload-generation tests are pure-functions tier (design §14
+lines 477-492); the four `_run_fake` tests below drive the whole script as a
+child process and belong to the production-wiring tier, like the fixture they
+underwrite.
 
 `tests/e2e/fake_claude.py` is a script, not a package module: it is copied to a
 tmp directory and executed as `claude` by the production-wiring tier. It is
