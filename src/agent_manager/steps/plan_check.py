@@ -142,5 +142,17 @@ def find_validated_plan(
         return {"found": False, "path": "", "validated": False}
 
     path = os.path.join(directory, name)
-    content = read(path)
+    try:
+        content = read(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        # Different from a missing directory: the plan IS there, so the journal
+        # must say why the run re-planned instead of pretending it was not.
+        # UnicodeDecodeError is a ValueError, not an OSError, so a corrupt or
+        # binary plan needs naming here or it escapes as a crash.
+        return {
+            "found": True,
+            "path": path,
+            "validated": False,
+            "error": f"could not read {path}: {exc}",
+        }
     return {"found": True, "path": path, "validated": VALIDATED_MARKER in content}

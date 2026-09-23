@@ -215,3 +215,56 @@ def test_the_repo_dir_default_finds_the_plans_under_dot_claude(tmp_path: Path):
     got = plan_check.find_validated_plan("a32af745", repo_dir=tmp_path)
     assert got["path"] == str(tmp_path / ".claude" / "plans" / "task-rows-a32af745.md")
     assert got["validated"] is True
+
+
+def test_an_unreadable_plan_is_found_but_not_validated_and_says_why(tmp_path: Path):
+    # The one case that fakes `read`: a reliably unreadable regular file cannot
+    # be produced on demand (a test may run as root), exactly why the ported
+    # `plan-check.test.mjs` reaches for its `fakeFs` here and nowhere else.
+    directory = _plans(tmp_path, {"task-rows-a32af745.md": "# plan"})
+
+    def refuse(path: str) -> str:
+        raise PermissionError(13, "EACCES: permission denied")
+
+    got = plan_check.find_validated_plan("a32af745", directory, read=refuse)
+    assert got["found"] is True
+    assert got["validated"] is False
+    assert got["path"] == str(directory / "task-rows-a32af745.md")
+    assert "EACCES" in got["error"]
+    assert str(directory / "task-rows-a32af745.md") in got["error"]
+
+
+def test_a_plan_that_is_not_valid_utf8_is_unreadable_not_a_crash(tmp_path: Path):
+    # Decoding raises UnicodeDecodeError -- a ValueError, not an OSError -- so
+    # catching OSError alone would let a corrupt file crash the run, which spec
+    # §4 forbids ("no raised exceptions from I/O").
+    directory = _plans(tmp_path)
+    (directory / "task-rows-a32af745.md").write_bytes(b"\xff\xfe\x00plan")
+
+    got = plan_check.find_validated_plan("a32af745", directory)
+    assert got["found"] is True
+    assert got["validated"] is False
+    assert "could not read" in got["error"]
+
+
+def test_a_directory_named_like_a_plan_is_unreadable_not_a_crash(tmp_path: Path):
+    directory = _plans(tmp_path)
+    (directory / "task-rows-a32af745.md").mkdir()
+
+    got = plan_check.find_validated_plan("a32af745", directory)
+    assert got["found"] is True
+    assert got["validated"] is False
+    assert "could not read" in got["error"]
+
+
+def test_a_plans_dir_that_is_a_file_reports_no_plan(tmp_path: Path):
+    not_a_directory = tmp_path / "plans"
+    not_a_directory.write_text("this is a file", encoding="utf-8")
+
+    got = plan_check.find_validated_plan("a32af745", not_a_directory)
+    assert got == {"found": False, "path": "", "validated": False}
+
+
+def test_a_successful_read_carries_no_error_key(tmp_path: Path):
+    directory = _plans(tmp_path, {"task-rows-a32af745.md": VALIDATED_MARKER})
+    assert "error" not in plan_check.find_validated_plan("a32af745", directory)
