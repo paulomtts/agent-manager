@@ -17,6 +17,10 @@ there is no shell string and nothing to quote.
 """
 
 import re
+import shlex
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 
 ELLIPSIS = "…"
 """One character, appended to text `plain_text` had to cut."""
@@ -72,3 +76,77 @@ def command_diagnostic(stdout: object, stderr: object, fallback: object) -> str:
         or ("" if fallback is None else str(fallback).strip())
         or NO_OUTPUT
     )
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """One finished command: exit code plus its captured streams.
+
+    A plain dataclass, not a Pydantic model: internal-only state that crosses
+    no process boundary (`CLAUDE.md`).
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+CommandRunner = Callable[[list[str], str], CommandResult]
+"""Takes an argv and a working directory, returns a `CommandResult`.
+
+Raises `FileNotFoundError` or `PermissionError` if the command cannot be
+launched at all; a non-zero exit is a return value, not an exception.
+"""
+
+
+def run_command(argv: list[str], cwd: str) -> CommandResult:
+    """The default `CommandRunner`: really run `argv` in `cwd`.
+
+    `shell=False` (the default) is the whole point -- see the module docstring.
+    `errors="replace"` keeps a command that emits non-UTF-8 bytes from crashing
+    the step; its diagnostic still has to reach a human.
+    """
+    completed = subprocess.run(
+        argv,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    return CommandResult(
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def run_suite(
+    commands: object,
+    worktree: object,
+    *,
+    runner: CommandRunner = run_command,
+) -> dict[str, object]:
+    """Run each verification command in `worktree` and report what happened.
+
+    The deterministic phase's result (design §6) -- a plain dict, since it
+    crosses no process boundary and so needs no Pydantic model (`CLAUDE.md`).
+    `runner` defaults to real execution and exists to be swapped in tests, the
+    same callable-injection seam `worktree.py` uses for git.
+    """
+    worktree_path = str(worktree)
+    result: dict[str, object] = {"passed": False, "verified": [], "detail": ""}
+    verified: list[dict[str, object]] = result["verified"]  # type: ignore[assignment]
+
+    for command in commands:
+        argv = shlex.split(command) if isinstance(command, str) else [str(p) for p in command]
+        completed = runner(argv, worktree_path)
+        verified.append(
+            {
+                "command": command,
+                "ok": True,
+                "tail": plain_text(last_line(completed.stdout)),
+            }
+        )
+
+    result["passed"] = True
+    return result

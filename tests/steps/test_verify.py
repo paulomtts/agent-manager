@@ -13,7 +13,47 @@ The pure helpers ported from `gh.mjs` (`last_line`, `plain_text`) and from
 specification (design §14, Pure-functions tier).
 """
 
-from agent_manager.steps.verify import command_diagnostic, last_line, plain_text
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent_manager.steps import verify
+from agent_manager.steps.verify import (
+    CommandResult,
+    command_diagnostic,
+    last_line,
+    plain_text,
+)
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="the git CLI must be installed for the verify step's read-only test",
+)
+
+
+def _py(script: str) -> str:
+    """A verification command, as a card writes one: a single shell-free string.
+
+    Quoted with `shlex.quote` so `run_suite`'s own `shlex.split` reconstructs
+    exactly this argv -- the round trip a real card's `"uv run pytest"` makes.
+    """
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    """Run one git command in `cwd` for test setup or assertions, failing loudly."""
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
 
 
 def test_last_line_is_the_last_non_empty_trimmed_line():
@@ -76,3 +116,65 @@ def test_command_diagnostic_never_returns_an_empty_string():
     # the outcome this port was written to end.
     assert command_diagnostic("", "", "   ") == "no output"
     assert command_diagnostic(None, None, None) == "no output"
+
+
+def test_a_single_green_command_passes_with_its_last_stdout_line(tmp_path: Path):
+    command = _py("print('banner'); print('7 passed')")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is True
+    assert result["detail"] == ""
+    assert result["verified"] == [{"command": command, "ok": True, "tail": "7 passed"}]
+
+
+def test_every_green_command_runs_in_order(tmp_path: Path):
+    first = _py("print('one')")
+    second = _py("print('two')")
+    third = _py("print('three')")
+    result = verify.run_suite([first, second, third], str(tmp_path))
+    assert result["passed"] is True
+    assert [entry["command"] for entry in result["verified"]] == [first, second, third]
+    assert [entry["tail"] for entry in result["verified"]] == ["one", "two", "three"]
+
+
+def test_commands_run_with_cwd_set_to_the_worktree(tmp_path: Path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    command = _py("import os; print(os.path.realpath(os.getcwd()))")
+    result = verify.run_suite([command], str(worktree))
+    assert result["verified"][0]["tail"] == os.path.realpath(worktree)
+
+
+def test_an_empty_command_list_passes_with_nothing_verified(tmp_path: Path):
+    # Refusing to verify nothing belongs to `verification_gate` (design §5),
+    # not to this step.
+    assert verify.run_suite([], str(tmp_path)) == {
+        "passed": True,
+        "verified": [],
+        "detail": "",
+    }
+
+
+@requires_git
+def test_run_suite_leaves_the_worktree_and_the_repo_untouched(tmp_path: Path):
+    # Design §9: "`verify.run_suite` is read-only."
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(repo, "config", "user.email", "tests@example.com")
+    _git(repo, "config", "user.name", "agent-manager tests")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "README.md").write_text("hello")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+    head_before = _git(repo, "rev-parse", "HEAD").strip()
+
+    result = verify.run_suite([_py("print('green')")], str(repo))
+
+    assert result["passed"] is True
+    assert _git(repo, "status", "--porcelain") == ""
+    assert _git(repo, "rev-parse", "HEAD").strip() == head_before
