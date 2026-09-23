@@ -74,10 +74,19 @@ def _kill_tree(process: subprocess.Popen[bytes]) -> None:
     The group can already be gone -- the child may exit between the timeout
     firing and the signal -- which is not an error. `process.wait()` still
     runs, so the wait status is collected and nothing is left a zombie.
+
+    A process sharing the manager's own group is killed on its own: signalling
+    that group would SIGKILL the manager and every other in-flight worktree
+    with it. `run_direct` never produces one, and this is what keeps that a
+    fact about the timeout path rather than an assumption.
     """
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        group = os.getpgid(process.pid)
     except (ProcessLookupError, PermissionError):
+        group = None
+    if group is not None and group != os.getpgid(0):
+        os.killpg(group, signal.SIGKILL)
+    else:
         process.kill()
     process.wait()
 

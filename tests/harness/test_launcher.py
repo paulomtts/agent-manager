@@ -126,6 +126,32 @@ def test_a_timeout_kills_the_processes_the_child_started(tmp_path):
     pytest.fail(f"process {grandchild} outlived the launcher's timeout kill")
 
 
+class _FakeProcess:
+    """Stands in for a `Popen` whose pid is in the manager's own group."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.killed = False
+        self.waited = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self) -> None:
+        self.waited = True
+
+
+def test_the_timeout_kill_never_signals_the_managers_own_process_group():
+    # `run_direct` puts every child in a session of its own, so the group kill
+    # is safe -- but if that ever stops being true, signalling the group would
+    # SIGKILL the manager, every other in-flight worktree with it. The kill
+    # falls back to the single process instead.
+    fake = _FakeProcess(os.getpid())
+    launcher._kill_tree(fake)
+    assert fake.killed is True
+    assert fake.waited is True
+
+
 def test_the_child_runs_in_the_cwd_it_was_given(tmp_path):
     # D7: cwd pinned to the subtask worktree is the isolation, so a launcher
     # that silently inherited the manager's cwd would run every harness in the
