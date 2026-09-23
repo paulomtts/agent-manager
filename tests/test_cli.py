@@ -1,4 +1,4 @@
-"""Behaviour of the `run --card` command (design §10, spec card cbe34d00).
+"""Behaviour of the `run`, `status`, `runs`, `logs` and `resume` commands (§10).
 
 Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 
@@ -2420,3 +2420,137 @@ def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_tra
 
     assert "explore" in str(caught.value)
     assert isinstance(caught.value, cli.HANDLED)
+
+
+def test_resume_of_an_unknown_run_is_an_envelope(projection):
+    result = runner.invoke(
+        cli.app, ["resume", "no-such-run", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+
+
+@pytest.mark.parametrize("status", ["done", "escalated"])
+def test_resume_of_a_run_with_nothing_in_flight_is_an_envelope(projection, status):
+    """A finished run has nothing to pick up and an escalated one is `retry`'s
+    job; both are the same refusal, and the message is what tells them apart."""
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT, status=status)
+
+    result = runner.invoke(
+        cli.app, ["resume", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "NotResumableError"
+    assert status in envelope["error"]["message"]
+
+
+def test_resume_with_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch):
+    """Review Focus: `--repo-dir` is refused before any projection is opened, the
+    same way it is for every other command."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = runner.invoke(
+        cli.app, ["resume", "any-run", "--repo-dir", str(tmp_path / "missing")]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "RepoDirError"
+    assert "missing" in envelope["error"]["message"]
+
+
+def test_resume_writes_nothing_when_it_refuses(projection):
+    """§9's refusal rule: `Store.open` constructs a `Journal` and mints a run
+    directory, so a command that declined to resume must never have reached it."""
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    refusal = runner.invoke(
+        cli.app, ["resume", "no-such-run", "--repo-dir", str(projection)]
+    )
+
+    assert refusal.exit_code == cli.EXIT_ERROR
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+
+
+@requires_git
+@requires_brd
+def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
+    """The factory is patched on the module rather than passed as an option: the
+    injection seam is `cli.default_runner_factory`, and patching it is what
+    proves the command reaches for that name."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "done"
+    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["discarded_attempts"] == [{"phase": "implement", "n": 1}]
+    assert "\n" not in result.stdout.strip()
+
+
+@requires_git
+@requires_brd
+def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
+    run_id = _crash_mid_phase(project, cards, "implement")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(
+        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
+    )
+
+    assert result.exit_code == 0
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
+    """An escalation is a truthful result, so the envelope stays `ok: true` and
+    the exit code carries the full stop -- exactly as `run` does."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    monkeypatch.setattr(
+        cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
+    )
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ESCALATED
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "escalated"
+    assert envelope["data"]["failed_phase"] == "review"
+    assert envelope["data"]["resumed_from"] == "implement"
+
+
+@requires_git
+@requires_brd
+def test_a_run_recorded_with_an_unknown_workflow_is_an_envelope(project, cards, monkeypatch):
+    """Review Focus: the workflow name comes off the record, and a projection
+    row naming a document no builtin matches has to reach the operator as the
+    loader's own refusal rather than as a traceback."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    _record_interrupted(project, cards, run_id, workflow="nope", started="implement")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "WorkflowLoadError"

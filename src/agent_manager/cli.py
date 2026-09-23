@@ -1053,3 +1053,37 @@ def resume_run(
         }
     finally:
         store.close()
+
+
+@app.command("resume")
+def resume(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to pick back up."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository and brd board to work in."
+    ),
+    allow_no_verification: bool = typer.Option(
+        False,
+        "--allow-no-verification",
+        help="Proceed even when no verification suite is available (§12's opt-out).",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Re-run the phase a killed run died in, and drive the subtask to the end.
+
+    No `--base-branch` and no `--branch-prefix`: both were decided when the run
+    started and are recorded on the subtask (§9). `--allow-no-verification` is
+    offered because `models.RunConfig` does not carry it, so the flag means the
+    same thing here as it does on a fresh `run`.
+    """
+    try:
+        payload = resume_run(
+            run_id,
+            repo_dir=repo_dir,
+            allow_no_verification=allow_no_verification,
+        )
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+    if payload["status"] == "escalated":
+        raise typer.Exit(EXIT_ESCALATED)
