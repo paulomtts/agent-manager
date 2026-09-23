@@ -148,6 +148,10 @@ name: task
 description: Drive one subtask card end to end in its own worktree.
 
 phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.ensure
+
   - name: explore
     kind: agent
     role: explorer
@@ -161,10 +165,6 @@ phases:
     run: rollup.set_status
     args: { status: in_progress }
     best_effort: true
-
-  - name: worktree
-    kind: deterministic
-    run: worktree.ensure
 
   - name: plan_check
     kind: deterministic
