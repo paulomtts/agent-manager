@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 
-from agent_manager import engine, models
+from agent_manager import engine, models, store as store_module
+from agent_manager.workflow.loader import load_workflow
+from agent_manager.workflow.registry import FunctionRegistry
 
 REPO = Path("/repo")
 
@@ -130,3 +132,262 @@ def test_bind_arguments_refuses_a_positional_only_parameter():
 
     assert caught.value.parameter == "card"
     assert "positional-only" in str(caught.value)
+
+
+RUN_ID = "run-2026-09-23-01"
+STORY_ID = "2143808b"
+
+
+@pytest.fixture
+def store(monkeypatch, tmp_path):
+    """A real temp projection plus a real temp journal, writing nowhere real."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    yield opened
+    opened.close()
+
+
+def _registry(functions: dict[str, Any]) -> FunctionRegistry:
+    registry = FunctionRegistry()
+    for name, fn in functions.items():
+        registry.register(name, fn)
+    return registry
+
+
+def _workflow(document: str, functions: dict[str, Any]):
+    return load_workflow(document, _registry(functions))
+
+
+def _journalled_phases(opened) -> list[tuple[str | None, str]]:
+    return [
+        (line.phase, line.payload["status"])
+        for line in opened.journal.read()
+        if line.event == "phase_upsert"
+    ]
+
+
+def _projected_phases(opened) -> list[tuple[str, str]]:
+    return [
+        (row["name"], row["status"])
+        for row in opened.connection.execute(
+            "SELECT name, status FROM phases ORDER BY position"
+        ).fetchall()
+    ]
+
+
+THREE_PHASES = """
+name: three
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+  - name: beta
+    kind: deterministic
+    run: step.beta
+  - name: gamma
+    kind: deterministic
+    run: step.gamma
+"""
+
+
+def test_phases_run_in_document_order(store):
+    calls: list[str] = []
+
+    def make(name: str):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            return {"phase": name}
+
+        return step
+
+    workflow = _workflow(
+        THREE_PHASES,
+        {"step.alpha": make("alpha"), "step.beta": make("beta"), "step.gamma": make("gamma")},
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["alpha", "beta", "gamma"]
+    assert summary.status == "done"
+    assert summary.results == {
+        "alpha": {"phase": "alpha"},
+        "beta": {"phase": "beta"},
+        "gamma": {"phase": "gamma"},
+    }
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
+
+
+def test_a_phase_result_is_bound_into_a_later_phase(store):
+    seen: dict[str, Any] = {}
+
+    def alpha(card: str) -> dict[str, Any]:
+        return {"plan": "docs/plan.md"}
+
+    def beta(alpha: dict[str, Any]) -> dict[str, Any]:
+        seen["alpha"] = alpha
+        return {}
+
+    def gamma(card: str) -> dict[str, Any]:
+        return {}
+
+    workflow = _workflow(
+        THREE_PHASES, {"step.alpha": alpha, "step.beta": beta, "step.gamma": gamma}
+    )
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert seen["alpha"] == {"plan": "docs/plan.md"}
+
+
+def test_declared_args_reach_the_step_as_a_keyword(store):
+    seen: list[str] = []
+
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        seen.append(status)
+        return {"status": status}
+
+    document = """
+name: board
+phases:
+  - name: mark_in_progress
+    kind: deterministic
+    run: rollup.set_status
+    args: { status: in_progress }
+"""
+    workflow = _workflow(document, {"rollup.set_status": set_status})
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert seen == ["in_progress"]
+
+
+def test_a_step_is_called_with_only_the_parameters_it_declares(store):
+    seen: dict[str, Any] = {}
+
+    def ensure(branch: str, base: str) -> dict[str, Any]:
+        seen.update(branch=branch, base=base)
+        return {}
+
+    document = """
+name: one
+phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.ensure
+"""
+    workflow = _workflow(document, {"worktree.ensure": ensure})
+
+    engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+    )
+
+    assert seen == {"branch": "m1/task-ed77a917", "base": "m1/story-base"}
+
+
+def test_every_state_edge_is_journalled_before_the_row_is_written(store):
+    def step(card: str) -> dict[str, Any]:
+        return {}
+
+    document = """
+name: two
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+  - name: beta
+    kind: deterministic
+    run: step.beta
+"""
+    workflow = _workflow(document, {"step.alpha": step, "step.beta": step})
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert _journalled_phases(store) == [
+        ("alpha", "started"),
+        ("alpha", "done"),
+        ("beta", "started"),
+        ("beta", "done"),
+    ]
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
+    assert [line.event for line in store.journal.read()][-1] == "subtask_upsert"
+    assert store.journal.read()[-1].payload["status"] == "done"
+
+
+def test_no_attempt_row_is_written_for_a_deterministic_phase(store):
+    def step(card: str) -> dict[str, Any]:
+        return {}
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": step})
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert store.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+    assert not any(line.event == "attempt_upsert" for line in store.journal.read())
+
+
+def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store):
+    """The `worktree` phase of the shipped `builtin/task.yaml` names itself the
+    same as the context key `subtask_context` binds the real worktree path
+    under. It must still run and record normally; its own result must simply
+    never overwrite the context key later phases bind `worktree` from, or the
+    real `verify` phase would receive `{"created": True}` where it needs a
+    filesystem path.
+    """
+    seen: dict[str, Any] = {}
+
+    def make_worktree(card: str, worktree: Any) -> dict[str, Any]:
+        return {"created": True, "original_worktree_arg": worktree}
+
+    def uses_worktree(worktree: Any) -> dict[str, Any]:
+        seen["worktree"] = worktree
+        return {}
+
+    document = """
+name: collide
+phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.make
+  - name: after
+    kind: deterministic
+    run: step.after
+"""
+    workflow = _workflow(
+        document, {"worktree.make": make_worktree, "step.after": uses_worktree}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    real_worktree = _subtask().worktree_path
+    assert summary.status == "done"
+    assert summary.results["worktree"] == {
+        "created": True,
+        "original_worktree_arg": real_worktree,
+    }
+    assert seen["worktree"] == real_worktree
+    assert _projected_phases(store) == [("worktree", "done"), ("after", "done")]

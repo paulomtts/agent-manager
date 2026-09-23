@@ -16,10 +16,14 @@ YAML is wrong.
 
 import inspect
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_manager import models
+from agent_manager.store import Store
+from agent_manager.workflow.loader import DeterministicPhase, Workflow
 
 _EMPTY = inspect.Parameter.empty
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
@@ -136,3 +140,149 @@ def bind_arguments(
             )
         bound[parameter.name] = supplied[parameter.name]
     return bound
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+Clock = Callable[[], datetime]
+
+
+@dataclass
+class SubtaskSummary:
+    """What the walk did to one subtask.
+
+    Returned rather than raised: a caller must be able to tell a clean `done`
+    from a `done` whose board write silently failed (§12), and an exception
+    carries neither the results nor the warnings.
+    """
+
+    status: Literal["done", "escalated"] = "done"
+    results: dict[str, Any] = field(default_factory=dict)
+    skipped: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    failed_phase: str | None = None
+    detail: str | None = None
+
+
+@dataclass
+class _Outcome:
+    """One deterministic phase's verdict, already recorded."""
+
+    ok: bool
+    result: Any = None
+    detail: str | None = None
+
+
+def run_subtask(
+    workflow: Workflow,
+    store: Store,
+    *,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    start_phase: str | None = None,
+    clock: Clock = _utcnow,
+) -> SubtaskSummary:
+    """Walk `workflow`'s phases for one subtask, running the deterministic ones.
+
+    `story_id` is the caller's: `Store.record_phase` and `Store.record_subtask`
+    are both keyed by it, and nothing in a subtask knows its story.
+    """
+    index = _start_index(workflow, start_phase)
+    context = subtask_context(subtask, repo_dir, commands)
+    summary = SubtaskSummary()
+
+    while index < len(workflow.phases):
+        phase = workflow.phases[index]
+        if not isinstance(phase, DeterministicPhase):
+            raise EngineError(
+                "is an agent phase, but no agent runner was injected",
+                phase=phase.name,
+            )
+        outcome = _run_deterministic(
+            phase, workflow, store, story_id, subtask, context, clock
+        )
+        _bind_result(context, phase.name, outcome.result)
+        summary.results[phase.name] = outcome.result
+        index += 1
+
+    _record_subtask_status(store, story_id, subtask, summary.status)
+    return summary
+
+
+def _bind_result(context: dict[str, Any], phase_name: str, result: Any) -> None:
+    """Fold one phase's result into the binding table under its own name.
+
+    The shipped `builtin/task.yaml` names its worktree-setup phase `worktree`,
+    exactly the key `subtask_context` binds the real worktree path under. Its
+    result is still recorded and returned in the summary either way (see
+    `run_subtask`); it is just never written back here, so the reserved value
+    survives for every later phase that binds `worktree` (or any other
+    reserved key) by name, instead of being silently replaced by a same-named
+    phase's own result.
+    """
+    if phase_name not in RESERVED_CONTEXT_KEYS:
+        context[phase_name] = result
+
+
+def _start_index(workflow: Workflow, start_phase: str | None) -> int:
+    if start_phase is None:
+        return 0
+    for index, phase in enumerate(workflow.phases):
+        if phase.name == start_phase:
+            return index
+    raise EngineError(
+        f"cannot start at {start_phase!r}: workflow {workflow.name!r} has no such phase "
+        f"(phases: {', '.join(workflow.phase_names)})"
+    )
+
+
+def _run_deterministic(
+    phase: DeterministicPhase,
+    workflow: Workflow,
+    store: Store,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    context: Mapping[str, Any],
+    clock: Clock,
+) -> _Outcome:
+    started_at = clock()
+    _record_phase(store, story_id, subtask, phase, "started", started_at, None)
+    function = workflow.function(phase.run)
+    kwargs = bind_arguments(
+        function, context, phase.args, phase=phase.name, function=phase.run
+    )
+    result = function(**kwargs)
+    _record_phase(store, story_id, subtask, phase, "done", started_at, clock())
+    return _Outcome(ok=True, result=result)
+
+
+def _record_phase(
+    store: Store,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    phase: DeterministicPhase,
+    status: models.Status,
+    started_at: datetime,
+    ended_at: datetime | None,
+) -> None:
+    store.record_phase(
+        story_id,
+        subtask.card_id,
+        models.PhaseRun(
+            name=phase.name,
+            kind="deterministic",
+            status=status,
+            started_at=started_at,
+            ended_at=ended_at,
+        ),
+    )
+
+
+def _record_subtask_status(
+    store: Store, story_id: str, subtask: models.SubtaskRun, status: models.Status
+) -> None:
+    store.record_subtask(story_id, subtask.model_copy(update={"status": status}))
