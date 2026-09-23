@@ -515,7 +515,7 @@ def test_two_roles_produce_different_briefs_from_the_same_rendered_prompt():
     assert "# Critic" in critic_brief and "# Coder" not in critic_brief
 
 
-def test_composing_twice_is_byte_identical_and_writes_nothing(tmp_path):
+def test_composing_twice_is_byte_identical():
     role = _role(methodology={"writing-plans.md": PLANS_BODY})
     rendered = _rendered()
 
@@ -523,7 +523,6 @@ def test_composing_twice_is_byte_identical_and_writes_nothing(tmp_path):
     second = prompt.compose_brief(role, rendered)
 
     assert first == second
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_trailing_blank_lines_in_system_text_collapse_to_one_separator():
@@ -572,7 +571,8 @@ def test_the_contract_states_the_absolute_path_and_embeds_the_real_schema():
         result_model=StandInResult,
     )
 
-    assert prompt.RESULT_HEADING in brief
+    assert prompt.RESULT_HEADING == "## Result contract"
+    assert "\n## Result contract\n" in brief
     assert "/var/agent-manager/runs/r1/card/implement.1/result.json" in brief
     assert _fenced_json(brief) == StandInResult.model_json_schema()
     assert "summary" in _fenced_json(brief)["properties"]
