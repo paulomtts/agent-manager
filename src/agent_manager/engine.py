@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_manager import models, prompt
-from agent_manager.errors import EngineError
+from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.store import Store
 from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
 
@@ -362,7 +362,26 @@ def run_subtask(
                     phase=phase.name,
                 )
             rendered = prompt.render_prompt(phase, context)
-            result = agent_runner(phase, dict(context), rendered)
+            try:
+                result = agent_runner(phase, dict(context), rendered)
+            except AgentPhaseFailed as failure:
+                # §6 step 8 / §12 line 429: exhausted retries or a non-retryable
+                # gate failure ends the subtask here. The runner has already
+                # journalled every attempt and the phase's terminal status.
+                return _escalate(
+                    summary, store, story_id, subtask, phase.name, failure.detail
+                )
+            except Exception as error:
+                # Total, for the reason `_run_deterministic` is: the runner is
+                # the one place a harness, a gate and the filesystem all meet,
+                # and an exception escaping the walk would leave the subtask
+                # recorded `started` forever -- which resume reads as work in
+                # flight. `render_prompt` stays outside the try: a document that
+                # declares an unresolvable input is a load-time bug, and its
+                # `EngineError` must still reach the caller.
+                return _escalate(
+                    summary, store, story_id, subtask, phase.name, _render_error(error)
+                )
             _bind_result(context, phase.name, result)
             summary.results[phase.name] = result
             index += 1
@@ -382,11 +401,9 @@ def run_subtask(
                 )
                 index += 1
                 continue
-            summary.status = "escalated"
-            summary.failed_phase = phase.name
-            summary.detail = outcome.detail
-            _record_subtask_status(store, story_id, subtask, "escalated")
-            return summary
+            return _escalate(
+                summary, store, story_id, subtask, phase.name, outcome.detail
+            )
         _bind_result(context, phase.name, outcome.result)
         summary.results[phase.name] = outcome.result
         if outcome.skip_to is None:
@@ -506,3 +523,24 @@ def _record_subtask_status(
     store: Store, story_id: str, subtask: models.SubtaskRun, status: models.Status
 ) -> None:
     store.record_subtask(story_id, subtask.model_copy(update={"status": status}))
+
+
+def _escalate(
+    summary: SubtaskSummary,
+    store: Store,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    phase_name: str,
+    detail: str | None,
+) -> SubtaskSummary:
+    """Record the subtask `escalated` and hand the walk's summary back.
+
+    One helper for both phase kinds, because §12's "escalation stops the run" is
+    one rule: the summary is returned rather than raised so the caller can still
+    read the results and warnings of everything that ran before it.
+    """
+    summary.status = "escalated"
+    summary.failed_phase = phase_name
+    summary.detail = detail
+    _record_subtask_status(store, story_id, subtask, "escalated")
+    return summary

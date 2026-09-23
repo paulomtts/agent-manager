@@ -1783,3 +1783,93 @@ def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
     assert json.loads(sections["parent_story"])["title"] == (
         "The workflow document and the engine"
     )
+
+
+from agent_manager.errors import AgentPhaseFailed
+
+
+def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store):
+    # Spec test 14 (§12 line 429: escalation stops the run -- no later phase is
+    # started, and the subtask is recorded escalated).
+    calls: list[str] = []
+
+    def work(card: str) -> dict[str, Any]:
+        calls.append("work")
+        return {}
+
+    def agent_runner(phase, context, rendered):
+        calls.append(f"agent:{phase.name}")
+        raise AgentPhaseFailed(
+            phase.name,
+            outcome="gate_failed",
+            detail="phase 'explore' gate 'exploration_output_gate' failed: blocked=exploration",
+        )
+
+    workflow = _workflow(MIXED, {"step.work": work})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+    )
+
+    assert calls == ["agent:explore"]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "explore"
+    assert "blocked=exploration" in summary.detail
+    assert summary.results == {}
+    subtasks = [
+        line.payload["status"]
+        for line in store.journal.read()
+        if line.event == "subtask_upsert"
+    ]
+    assert subtasks == ["escalated"]
+
+
+def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashing(store):
+    # Symmetric with `_run_deterministic`'s deliberately total except: an
+    # exception escaping the walk would leave the subtask recorded `started`
+    # forever, which is exactly what resume mistakes for work in flight.
+    def work(card: str) -> dict[str, Any]:
+        raise AssertionError("no phase after the failed one may start")
+
+    def agent_runner(phase, context, rendered):
+        raise OSError("the run directory went away")
+
+    workflow = _workflow(MIXED, {"step.work": work})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "explore"
+    assert "OSError: the run directory went away" in summary.detail
+
+
+def test_a_successful_agent_phase_still_advances_the_walk(store):
+    """The existing happy path must not change shape under the new try/except."""
+    def work(card: str, explore: dict[str, Any]) -> dict[str, Any]:
+        return {"saw": explore["summary"]}
+
+    workflow = _workflow(MIXED, {"step.work": work})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=lambda phase, context, rendered: {"summary": "explored"},
+    )
+
+    assert summary.status == "done"
+    assert summary.results["work"] == {"saw": "explored"}
