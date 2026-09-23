@@ -124,8 +124,10 @@ def test_the_prompt_is_referenced_by_absolute_path_and_never_inlined(tmp_path):
     prompt.write_text("SECRET-PROMPT-BODY\n", encoding="utf-8")
     argv = ClaudeAdapter().build_command(_dispatch(prompt_path=prompt))
     assert str(prompt) in argv[-1]
-    assert Path(str(prompt)).is_absolute()
     assert "SECRET-PROMPT-BODY" not in " ".join(argv)
+    # That the reference is *absolute* is not asserted here: `tmp_path` is
+    # always absolute, so the assertion would hold whatever the adapter did.
+    # `test_build_command_refuses_a_relative_path` is where that is pinned.
 
 
 def test_the_argv_carries_no_cwd_and_no_timeout():
