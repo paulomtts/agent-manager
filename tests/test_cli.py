@@ -360,6 +360,67 @@ def test_find_subtask_takes_the_first_match_when_a_card_id_is_duplicated():
     assert subtask is first
 
 
+def test_not_resumable_is_a_cli_error_and_rides_the_handled_tuple():
+    """A refusal `resume` raises has to reach the operator as an envelope, and
+    `HANDLED` is the only thing that turns an exception into one."""
+    assert issubclass(cli.NotResumableError, cli.CliError)
+    assert isinstance(cli.NotResumableError("nothing in flight"), cli.HANDLED)
+
+
+def test_select_resumable_returns_the_single_started_subtask():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    started = _pure_subtask("card-2", [])
+    run = _pure_run([_pure_story("story-1", [done]), _pure_story("story-2", [started])])
+
+    story, subtask = cli.select_resumable(run)
+
+    assert story.card_id == "story-2"
+    assert subtask is started
+
+
+def test_select_resumable_refuses_a_run_with_nothing_in_flight():
+    """A `done` run has nothing to pick up, and the message has to name the
+    status found: that is what tells an operator to start a fresh run rather
+    than to go looking for a lost process."""
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    run = _pure_run([_pure_story("story-1", [done])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    assert "card-1=done" in str(caught.value)
+    assert "agent-manager status" in str(caught.value)
+
+
+def test_select_resumable_refuses_an_escalated_subtask_by_name():
+    """An escalation is a full stop a human reads (§12). Re-running it is
+    `retry`'s job, not this command's, so the status is named rather than
+    silently resumed."""
+    escalated = _pure_subtask("card-1", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    assert "card-1=escalated" in str(caught.value)
+
+
+def test_select_resumable_refuses_more_than_one_subtask_in_flight():
+    """Review Focus: a milestone-shaped run reaching a command that drives one
+    subtask. Picking one arbitrarily would leave the others recorded `started`
+    forever with nothing driving them."""
+    first = _pure_subtask("card-1", [])
+    second = _pure_subtask("card-2", [])
+    run = _pure_run([_pure_story("story-1", [first, second])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "card-1" in message
+    assert "card-2" in message
+
+
 def _pure_attempt(n: int, status: str = "ok") -> models.Attempt:
     return models.Attempt(n=n, dispatch=_pure_dispatch(), status=status)
 
