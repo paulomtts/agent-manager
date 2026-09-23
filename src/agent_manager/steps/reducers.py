@@ -98,4 +98,17 @@ def exploration_output_gate(
     if not isinstance(full_suite, list):
         return {"detail": "exploration did not return an array for verification.fullSuite"}
 
+    # When the caller already discovered verification commands, the prompt
+    # tells Explore to return them EXACTLY as given — so any deviation, not
+    # just an implausible one, is itself proof the output is not trustworthy.
+    if provided_verification:
+        want = _json(_field(provided_verification, "fullSuite") or [])
+        got = _json(full_suite)
+        if got != want:
+            return {
+                "detail": "exploration did not return the caller-provided "
+                f"verification.fullSuite unchanged (expected {want}, got {got})"
+            }
+        return None
+
     return None

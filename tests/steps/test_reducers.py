@@ -106,6 +106,51 @@ def test_a_verification_mapping_without_full_suite_is_caught_not_raised():
     assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
 
 
+def test_caller_provided_verification_must_come_back_exactly_unchanged():
+    provided = {"fullSuite": ["make test", "make lint"]}
+    explore = {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["make test", "make lint"]}}
+    assert exploration_output_gate(explore, provided) is None
+
+
+def test_any_deviation_from_caller_provided_verification_fails():
+    provided = {"fullSuite": ["make test", "make lint"]}
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["a"]}}, provided
+    )
+    assert "did not return the caller-provided verification" in gate["detail"]
+    assert '(expected ["make test","make lint"], got ["a"])' in gate["detail"]
+
+
+def test_an_implausible_but_exactly_matching_full_suite_passes():
+    # Pins the deliberate early return: in the caller-provided branch the
+    # implausible-command check is NOT applied (task.js line 146).
+    provided = {"fullSuite": ["a"]}
+    explore = {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["a"]}}
+    assert exploration_output_gate(explore, provided) is None
+
+
+def test_a_caller_provided_mapping_without_full_suite_expects_an_empty_list():
+    assert (
+        exploration_output_gate(
+            {"summary": REAL_SUMMARY, "verification": {"fullSuite": []}}, {"note": "none found"}
+        )
+        is None
+    )
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": REAL_VERIFICATION}, {"note": "none found"}
+    )
+    assert "(expected [], got " in gate["detail"]
+
+
+def test_a_python_equal_but_json_different_list_is_still_a_deviation():
+    # JSON renders True as `true` and 1 as `1`; the JS compares the rendered
+    # strings, so [True] is not [1] here even though Python says it is.
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": [True]}}, {"fullSuite": [1]}
+    )
+    assert "(expected [1], got [true])" in gate["detail"]
+
+
 def test_an_explore_with_no_verification_key_at_all_is_caught_not_raised():
     gate = exploration_output_gate({"summary": REAL_SUMMARY}, None)
     assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
