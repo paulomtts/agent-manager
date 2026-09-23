@@ -595,3 +595,114 @@ def test_importing_models_needs_no_environment_and_no_disk():
         finally:
             sys.modules["agent_manager.models"] = models
             agent_manager.models = models
+
+
+def test_card_parses_a_brd_show_payload_and_ignores_unknown_fields():
+    # `brd show`'s data carries blocked_by/children/timestamps too. A brd schema
+    # addition must not break a running milestone, so unknown keys are ignored
+    # rather than forbidden -- the opposite of the _Model journal types above.
+    card = models.Card.model_validate(
+        {
+            "id": "141c96e6-4a08-4905-b7a6-c0c993d1c20d",
+            "title": "Add the brd board adapter",
+            "description": "the only caller of brd",
+            "status": "todo",
+            "parent_id": "492ac463-8d23-4699-847c-31dc0aebd80f",
+            "created_at": "2026-09-23T10:00:00+00:00",
+            "updated_at": "2026-09-23T10:00:00+00:00",
+            "blocked_by": [],
+            "children": [],
+        }
+    )
+    assert card.id == "141c96e6-4a08-4905-b7a6-c0c993d1c20d"
+    assert card.title == "Add the brd board adapter"
+    assert card.status == "todo"
+    assert card.parent_id == "492ac463-8d23-4699-847c-31dc0aebd80f"
+    assert card.description == "the only caller of brd"
+
+
+def test_card_status_is_an_open_string_not_the_run_lifecycle_literal():
+    # Board statuses are brd's to define (todo/in_progress/done/blocked and
+    # whatever it adds next); `Status` here is the *run* lifecycle and is a
+    # different vocabulary.
+    for board_status in ("todo", "in_progress", "done", "blocked", "on_hold"):
+        assert models.Card(id="c1", title="t", status=board_status).status == (
+            board_status
+        )
+
+
+def test_card_defaults_a_top_level_card_to_no_parent():
+    card = models.Card(id="352e955b", title="Milestone 1", status="todo")
+    assert card.parent_id is None
+    assert card.description is None
+
+
+def test_card_requires_id_title_and_status():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Card.model_validate({"description": "no identity at all"})
+    assert {error["loc"] for error in excinfo.value.errors()} == {
+        ("id",),
+        ("title",),
+        ("status",),
+    }
+
+
+def test_card_rejects_empty_id_and_status():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Card(id="", title="t", status="todo")
+    assert [error["loc"] for error in excinfo.value.errors()] == [("id",)]
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.Card(id="c1", title="t", status="")
+    assert [error["loc"] for error in excinfo.value.errors()] == [("status",)]
+
+
+def test_card_node_nests_milestone_story_subtask_depth():
+    node = models.CardNode.model_validate(
+        {
+            "id": "352e955b",
+            "title": "Milestone 1",
+            "description": None,
+            "status": "in_progress",
+            "blocked_by": [],
+            "created_at": "2026-09-23T10:00:00+00:00",
+            "updated_at": "2026-09-23T10:00:00+00:00",
+            "children": [
+                {
+                    "id": "492ac463",
+                    "title": "Naming and the brd board adapter",
+                    "description": None,
+                    "status": "in_progress",
+                    "blocked_by": [],
+                    "children": [
+                        {
+                            "id": "141c96e6",
+                            "title": "Add the brd board adapter",
+                            "description": None,
+                            "status": "todo",
+                            "blocked_by": [],
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert node.id == "352e955b"
+    assert [child.id for child in node.children] == ["492ac463"]
+    assert [grandchild.id for grandchild in node.children[0].children] == ["141c96e6"]
+    assert node.children[0].children[0].title == "Add the brd board adapter"
+
+
+def test_card_node_has_no_parent_id_field():
+    # brd's tree nodes carry no parent_id; nesting under `children` is what
+    # preserves the structure. An accidental parent_id field would be fiction.
+    assert "parent_id" not in models.CardNode.model_fields
+    assert models.CardNode(id="c1", title="t", status="todo").children == []
+
+
+def test_card_node_children_default_is_per_instance():
+    first = models.CardNode(id="c1", title="t", status="todo")
+    second = models.CardNode(id="c2", title="t", status="todo")
+    first.children.append(models.CardNode(id="c3", title="t", status="todo"))
+    assert second.children == []
