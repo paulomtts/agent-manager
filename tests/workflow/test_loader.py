@@ -413,3 +413,36 @@ phases:
     assert caught.value.field == "skip_to"
     assert expected in str(caught.value)
 
+
+@pytest.mark.parametrize(
+    ("document", "expected_phase"),
+    [
+        pytest.param("name: demo\nphases:\n  - kind: wizard\n", "#0", id="unnamed_phase"),
+        pytest.param("name: demo\nphases:\n  - name: ''\n    kind: wizard\n", "#0", id="empty"),
+        pytest.param("name: demo\nphases:\n  - just-a-string\n", "#0", id="not_a_mapping"),
+    ],
+)
+def test_a_phase_with_no_usable_name_is_reported_by_position(
+    document: str, expected_phase: str
+) -> None:
+    """A reader needs *something* to find the entry by; the index is all there
+    is when the entry has no name of its own."""
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(document, registry_with())
+    assert caught.value.phase == expected_phase
+
+
+def test_a_document_that_is_not_utf8_raises_a_workflow_load_error(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.yaml"
+    path.write_bytes(b"name: d\xe9mo\nphases: []\n")
+
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(path, registry_with())
+    assert "UTF-8" in str(caught.value)
+
+
+def test_an_unreadable_document_raises_a_workflow_load_error(tmp_path: Path) -> None:
+    """A directory is the portable stand-in for "open() raised OSError"."""
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(tmp_path, registry_with())
+    assert "unreadable" in str(caught.value)
