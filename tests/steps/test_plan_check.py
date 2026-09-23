@@ -311,3 +311,71 @@ def test_the_gate_is_closed_for_anything_that_is_not_a_result_dict():
     assert plan_check.has_validated_plan(None) is False
     assert plan_check.has_validated_plan({}) is False
     assert plan_check.has_validated_plan("found") is False
+
+
+# ── mark_validated ───────────────────────────────────────────────────────────
+# Steps tier (design §14 line 477): real plan files under `tmp_path`, never a
+# fake filesystem. The engine calls this step with the repo-relative `plan_path`
+# `prompt.expand_writes` produced plus the reserved `worktree` context key.
+
+
+def _plan_file(tmp_path: Path, body: str, name: str = "task-rows-a32af745.md") -> Path:
+    """A real plan file on disk holding exactly `body` (no newline added)."""
+    path = tmp_path / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_marking_an_unmarked_plan_appends_the_marker_as_its_own_last_line(
+    tmp_path: Path,
+):
+    plan = _plan_file(tmp_path, "# plan\n\nstep one\n")
+
+    got = plan_check.mark_validated(plan)
+
+    text = plan.read_text(encoding="utf-8")
+    assert got == {"path": str(plan), "appended": True}
+    assert text == f"# plan\n\nstep one\n{VALIDATED_MARKER}\n"
+    assert text.count(VALIDATED_MARKER) == 1
+
+
+def test_marking_a_plan_twice_leaves_the_bytes_identical(tmp_path: Path):
+    # Re-entrancy (design §9): a resumed run re-enters the phase, and a second
+    # marker would break the sibling's Plan-Hash over the same file.
+    plan = _plan_file(tmp_path, "# plan\n")
+    plan_check.mark_validated(plan)
+    before = plan.read_bytes()
+
+    got = plan_check.mark_validated(plan)
+
+    assert got == {"path": str(plan), "appended": False}
+    assert plan.read_bytes() == before
+    assert plan.read_text(encoding="utf-8").count(VALIDATED_MARKER) == 1
+
+
+def test_a_plan_with_no_trailing_newline_gains_one_before_the_marker(tmp_path: Path):
+    plan = _plan_file(tmp_path, "# plan\nlast line with no newline")
+
+    plan_check.mark_validated(plan)
+
+    text = plan.read_text(encoding="utf-8")
+    assert text == f"# plan\nlast line with no newline\n{VALIDATED_MARKER}\n"
+    # The marker is never glued to the end of the body.
+    assert "newline<!--" not in text
+    assert text.splitlines()[-1] == VALIDATED_MARKER
+
+
+def test_a_marked_plan_reads_back_as_validated_through_find_validated_plan(
+    tmp_path: Path,
+):
+    # The whole point of the step: `plan_check` can now answer `validated: True`
+    # on a re-run and take the `skip_to: implement` shortcut.
+    directory = _plans(tmp_path, {"2026-09-task-rows-a32af745.md": "# plan\n"})
+
+    plan_check.mark_validated(directory / "2026-09-task-rows-a32af745.md")
+
+    assert plan_check.find_validated_plan("a32af745", directory) == {
+        "found": True,
+        "path": str(directory / "2026-09-task-rows-a32af745.md"),
+        "validated": True,
+    }
