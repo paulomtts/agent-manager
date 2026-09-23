@@ -118,3 +118,102 @@ def test_board_never_uses_a_shell():
     source = Path(board.__file__).read_text()
     assert "shell=True" not in source
     assert "os.system" not in source
+
+
+_SHOW_PAYLOAD = {
+    "id": "141c96e6",
+    "title": "Add the brd board adapter",
+    "description": "the only caller of brd",
+    "status": "todo",
+    "parent_id": "492ac463",
+    "created_at": "2026-09-23T10:00:00+00:00",
+    "updated_at": "2026-09-23T10:00:00+00:00",
+    "blocked_by": [],
+    "children": [],
+}
+
+
+def test_decode_returns_the_data_of_an_ok_envelope():
+    data = board._decode(
+        json.dumps({"ok": True, "data": _SHOW_PAYLOAD}),
+        argv=board.show_argv("141c96e6"),
+        exit_code=0,
+    )
+    card = board._validated(models.Card, data, argv=board.show_argv("141c96e6"))
+    assert card.id == "141c96e6"
+    assert card.title == "Add the brd board adapter"
+    assert card.status == "todo"
+    assert card.parent_id == "492ac463"
+
+
+def test_decode_raises_board_error_carrying_brds_own_message():
+    envelope = {
+        "ok": False,
+        "error": {"type": "CardNotFoundError", "message": "no card with id nope"},
+    }
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(
+            json.dumps(envelope), argv=board.show_argv("nope"), exit_code=1
+        )
+    assert excinfo.value.message == "no card with id nope"
+    assert excinfo.value.error_type == "CardNotFoundError"
+    assert excinfo.value.exit_code == 1
+    assert "no card with id nope" in str(excinfo.value)
+
+
+def test_decode_tolerates_an_error_envelope_without_a_message():
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(
+            json.dumps({"ok": False}), argv=board.show_argv("nope"), exit_code=1
+        )
+    assert excinfo.value.error_type is None
+    assert excinfo.value.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "   ", "not json at all", "Traceback (most recent call last):", "{"],
+    ids=["empty", "blank", "prose", "traceback", "truncated"],
+)
+def test_non_json_stdout_raises_board_error_not_a_json_decode_error(stdout):
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(stdout, argv=board.show_argv("141c96e6"), exit_code=0)
+    assert not isinstance(excinfo.value, json.JSONDecodeError)
+    assert "JSON" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "payload", ['["ok"]', '"ok"', "null", '{"data": {}}'], ids=["list", "str", "null", "no-ok"]
+)
+def test_json_that_is_not_an_envelope_raises_board_error(payload):
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(payload, argv=board.show_argv("141c96e6"), exit_code=0)
+    assert "envelope" in str(excinfo.value)
+
+
+def test_a_non_zero_exit_is_an_error_even_behind_an_ok_envelope():
+    # Spec: non-zero exit raises, full stop. An ok envelope from a process that
+    # then failed is not a success.
+    with pytest.raises(board.BoardError) as excinfo:
+        board._decode(
+            json.dumps({"ok": True, "data": _SHOW_PAYLOAD}),
+            argv=board.show_argv("141c96e6"),
+            exit_code=3,
+        )
+    assert excinfo.value.exit_code == 3
+    assert "exited 3" in str(excinfo.value)
+
+
+def test_data_missing_a_required_field_raises_board_error():
+    incomplete = {key: value for key, value in _SHOW_PAYLOAD.items() if key != "title"}
+    with pytest.raises(board.BoardError) as excinfo:
+        board._validated(models.Card, incomplete, argv=board.show_argv("141c96e6"))
+    assert "title" in str(excinfo.value)
+    assert excinfo.value.argv == ["brd", "show", "141c96e6"]
+
+
+def test_unknown_extra_fields_in_data_are_tolerated():
+    generous = {**_SHOW_PAYLOAD, "assignee": "paulo", "labels": ["m1"]}
+    card = board._validated(models.Card, generous, argv=board.show_argv("141c96e6"))
+    assert card.id == "141c96e6"
+    assert not hasattr(card, "assignee")

@@ -14,8 +14,16 @@ element.
 Naming, slugs, branches and ref matching are `dag.py`'s job, not this module's.
 """
 
+import json
 import subprocess
 from pathlib import Path
+from typing import TypeVar
+
+from pydantic import BaseModel, ValidationError
+
+from agent_manager import models
+
+M = TypeVar("M", bound=BaseModel)
 
 BRD = "brd"
 """Executable name, resolved on PATH. Argv element zero of every call."""
@@ -85,3 +93,67 @@ def _run(
         raise BoardError(detail, argv=argv, exit_code=completed.returncode)
 
     return completed
+
+
+def _decode(stdout: str, *, argv: list[str], exit_code: int) -> object:
+    """Pull `data` out of a `{"ok", "data"}` envelope, or raise `BoardError`.
+
+    brd's failure shape is `{"ok": false, "error": {"type", "message"}}` and its
+    message is surfaced verbatim: this module invents no wording and no
+    "not found" semantics of its own.
+    """
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise BoardError(
+            f"brd printed output that is not JSON: {stdout.strip()[:200]!r}",
+            argv=argv,
+            exit_code=exit_code,
+        ) from exc
+
+    if not isinstance(envelope, dict) or "ok" not in envelope:
+        raise BoardError(
+            f"brd printed JSON that is not an {{ok, data}} envelope: "
+            f"{stdout.strip()[:200]!r}",
+            argv=argv,
+            exit_code=exit_code,
+        )
+
+    if not envelope["ok"]:
+        error = envelope.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        raise BoardError(
+            error.get("message", "brd reported a failure with no message"),
+            argv=argv,
+            exit_code=exit_code,
+            error_type=error.get("type"),
+        )
+
+    if exit_code != 0:
+        raise BoardError(
+            f"brd exited {exit_code} despite printing an ok envelope",
+            argv=argv,
+            exit_code=exit_code,
+        )
+
+    if "data" not in envelope:
+        raise BoardError(
+            "brd printed an ok envelope with no data",
+            argv=argv,
+            exit_code=exit_code,
+        )
+
+    return envelope["data"]
+
+
+def _validated(model: type[M], data: object, *, argv: list[str]) -> M:
+    """Validate brd's payload at the process boundary (CLAUDE.md convention)."""
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise BoardError(
+            f"brd's payload did not validate as {model.__name__}: {exc}",
+            argv=argv,
+            exit_code=0,
+        ) from exc
