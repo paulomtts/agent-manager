@@ -1148,9 +1148,18 @@ def test_the_journalled_prompt_path_is_the_file_the_launcher_was_pointed_at(
         for line in store.journal.read()
         if line.event == "attempt_upsert" and line.payload["status"] == "ok"
     ][0]
+    on_disk = pointed.read_text(encoding="utf-8")
     assert pointed == paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "prompt.txt"
     assert terminal["prompt_path"] == str(pointed)
-    assert pointed.read_text(encoding="utf-8") == launcher.prompts[0]
+    # The file itself, not `launcher.prompts[0]` -- the fake launcher read that
+    # string out of this very path, so comparing the two would compare the file
+    # to itself and would hold for any content whatsoever.
+    assert on_disk.startswith("Standing instructions for explorer.")
+    assert f"{prompt.METHODOLOGY_HEADING_PREFIX}test-driven-development.md" in on_disk
+    assert "# phase: explore" in on_disk
+    assert str(pointed.parent / "result.json") in on_disk.split(
+        prompt.RESULT_HEADING, 1
+    )[1]
 
 
 def test_a_role_with_no_methodology_still_composes_a_brief(store, tmp_path, worktree):
@@ -1291,3 +1300,23 @@ def test_a_retry_changes_only_the_result_path_and_the_feedback(
         str(paths.attempt_dir(RUN_ID, CARD, "explore", 1)),
     )
     assert replayed.rstrip("\n") == launcher.prompts[0].rstrip("\n")
+
+
+def test_accumulated_feedback_blocks_keep_the_order_they_were_produced(
+    store, tmp_path, worktree
+):
+    # Spec invariant 5: a third attempt carries both earlier complaints, oldest
+    # first, so the agent reads its own history forwards and not backwards.
+    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[NOT_JSON, INVALID_RESULT, INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    # Only the region below the first heading, so the schema's own "summary"
+    # property in the Result contract cannot stand in for the complaint.
+    blocks = launcher.prompts[2].split(dispatch.FEEDBACK_HEADING, 1)[1]
+    assert launcher.prompts[2].count(dispatch.FEEDBACK_HEADING) == 2
+    assert blocks.index("not valid JSON") < blocks.index("Field required")
