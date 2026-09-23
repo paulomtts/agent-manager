@@ -85,6 +85,25 @@ class UnknownCardError(CliError):
     """
 
 
+class UnknownPhaseError(CliError):
+    """The card has no phase of that name in this run.
+
+    Separate from `UnknownAttemptError` because the two refusals point at
+    different lists: this one can name the phases that exist, and conflating them
+    would cost an operator that list at exactly the moment they mistyped a name.
+    """
+
+
+class UnknownAttemptError(CliError):
+    """The selected phase has no such attempt -- or has none at all.
+
+    One type for both, because they are one fact: the command was asked for an
+    attempt and there is none to report. The message is what tells apart "you
+    asked for attempt 7 of three" from "nothing has run for this card yet", the
+    same way `UnknownRunError` carries two readings of one refusal.
+    """
+
+
 def resolve_repo_dir(repo_dir: Path) -> Path:
     """`--repo-dir` as an existing absolute directory, or `RepoDirError`.
 
@@ -235,6 +254,59 @@ def find_subtask(
             if subtask.card_id == card:
                 return story, subtask
     return None
+
+
+def select_attempt(
+    subtask: models.SubtaskRun,
+    *,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> tuple[models.PhaseRun, models.Attempt]:
+    """The `(phase, attempt)` §10's `logs` should report, or a refusal.
+
+    Pure over the tree, no filesystem: which attempt is meant is a question about
+    recorded state, and answering it before any file is opened is what keeps the
+    artifact reading a single straight-line step.
+
+    With no `phase`, the last phase in position order that actually has attempts
+    wins -- `load_run` preserves position, and a trailing `pending` or
+    deterministic phase has no artifacts to print. With no `attempt`, the highest
+    `n` wins; `max` rather than `attempts[-1]` because the ordering is
+    `load_run`'s promise, not the model's, and this function is also called with
+    trees built by hand.
+    """
+    if phase is None:
+        chosen = next((item for item in reversed(subtask.phases) if item.attempts), None)
+        if chosen is None:
+            raise UnknownAttemptError(
+                f"no attempt has been recorded for card {subtask.card_id!r} yet"
+                " (`agent-manager status` shows which phases exist)"
+            )
+    else:
+        chosen = next((item for item in subtask.phases if item.name == phase), None)
+        if chosen is None:
+            names = ", ".join(item.name for item in subtask.phases) or "none"
+            raise UnknownPhaseError(
+                f"card {subtask.card_id!r} has no phase {phase!r};"
+                f" recorded phases: {names}"
+            )
+
+    if attempt is None:
+        if not chosen.attempts:
+            raise UnknownAttemptError(
+                f"phase {chosen.name!r} of card {subtask.card_id!r} has no recorded"
+                " attempt yet"
+            )
+        return chosen, max(chosen.attempts, key=lambda item: item.n)
+
+    for candidate in chosen.attempts:
+        if candidate.n == attempt:
+            return chosen, candidate
+    numbers = ", ".join(str(item.n) for item in chosen.attempts) or "none"
+    raise UnknownAttemptError(
+        f"phase {chosen.name!r} of card {subtask.card_id!r} has no attempt {attempt};"
+        f" recorded attempts: {numbers}"
+    )
 
 
 app = typer.Typer(

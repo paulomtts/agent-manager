@@ -359,6 +359,132 @@ def test_find_subtask_takes_the_first_match_when_a_card_id_is_duplicated():
     assert subtask is first
 
 
+def _pure_attempt(n: int, status: str = "ok") -> models.Attempt:
+    return models.Attempt(n=n, dispatch=_pure_dispatch(), status=status)
+
+
+def test_select_attempt_defaults_to_the_last_phase_with_attempts_and_its_highest_n():
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(
+                name="explore", kind="agent", status="done", attempts=[_pure_attempt(1)]
+            ),
+            models.PhaseRun(
+                name="implement",
+                kind="agent",
+                status="done",
+                attempts=[_pure_attempt(1, "gate_failed"), _pure_attempt(2)],
+            ),
+        ],
+    )
+
+    phase, attempt = cli.select_attempt(subtask)
+
+    assert phase.name == "implement"
+    assert attempt.n == 2
+
+
+def test_select_attempt_skips_a_trailing_phase_that_has_no_attempts():
+    """A trailing `pending` phase has no artifacts to print, so defaulting to it
+    would make the no-flag common case §10 names useless."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(
+                name="implement", kind="agent", status="done", attempts=[_pure_attempt(1)]
+            ),
+            models.PhaseRun(name="verify", kind="deterministic", status="pending"),
+        ],
+    )
+
+    phase, attempt = cli.select_attempt(subtask)
+
+    assert phase.name == "implement"
+    assert attempt.n == 1
+
+
+def _two_phase_subtask() -> models.SubtaskRun:
+    return _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(
+                name="explore",
+                kind="agent",
+                status="done",
+                attempts=[_pure_attempt(1, "gate_failed"), _pure_attempt(2)],
+            ),
+            models.PhaseRun(
+                name="implement", kind="agent", status="done", attempts=[_pure_attempt(1)]
+            ),
+        ],
+    )
+
+
+def test_an_explicit_phase_wins_over_a_later_phase_that_also_has_attempts():
+    phase, attempt = cli.select_attempt(_two_phase_subtask(), phase="explore")
+
+    assert phase.name == "explore"
+    assert attempt.n == 2
+
+
+def test_an_explicit_attempt_selects_that_n_and_not_the_highest():
+    phase, attempt = cli.select_attempt(_two_phase_subtask(), phase="explore", attempt=1)
+
+    assert phase.name == "explore"
+    assert attempt.n == 1
+    assert attempt.status == "gate_failed"
+
+
+def test_an_unknown_phase_name_is_refused_and_names_the_phases_that_exist():
+    with pytest.raises(cli.UnknownPhaseError) as caught:
+        cli.select_attempt(_two_phase_subtask(), phase="reveiw")
+
+    message = str(caught.value)
+    assert "reveiw" in message
+    assert "explore" in message
+    assert "implement" in message
+
+
+def test_an_unknown_attempt_number_is_refused_and_names_the_attempts_that_exist():
+    with pytest.raises(cli.UnknownAttemptError) as caught:
+        cli.select_attempt(_two_phase_subtask(), phase="implement", attempt=7)
+
+    message = str(caught.value)
+    assert "7" in message
+    assert "implement" in message
+
+
+def test_a_card_with_no_attempts_at_all_is_the_attempt_refusal():
+    """No `--phase` was given and there is nothing to default to. That is the same
+    fact as a missing attempt number, worded for the operator who has not run
+    anything yet."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(name="explore", kind="agent", status="pending"),
+            models.PhaseRun(name="verify", kind="deterministic", status="pending"),
+        ],
+    )
+
+    with pytest.raises(cli.UnknownAttemptError) as caught:
+        cli.select_attempt(subtask)
+
+    assert "no attempt has been recorded" in str(caught.value)
+    assert "card-1" in str(caught.value)
+
+
+@pytest.mark.parametrize("n", [0, -1])
+def test_a_non_positive_attempt_number_is_refused_rather_than_defaulting(n):
+    """Typer will hand over any int, and `models.Attempt.n` is `gt=0`, so no such
+    attempt can exist. `--attempt 0` must refuse, not quietly report the highest
+    attempt as though no flag had been passed."""
+    with pytest.raises(cli.UnknownAttemptError) as caught:
+        cli.select_attempt(_two_phase_subtask(), phase="explore", attempt=n)
+
+    assert str(n) in str(caught.value)
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
