@@ -11,8 +11,9 @@ answer decides one thing: whether the workflow's `plan_check` phase skips
 straight to `implement` (design §5 lines 169-173).
 """
 
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from agent_manager.dag import short_id
@@ -89,3 +90,57 @@ def _plans_dir(plans_dir: object | None, repo_dir: object | None) -> str:
             "plan_check.find_validated_plan needs plans_dir or repo_dir, got neither"
         )
     return str(Path(repo_dir) / ".claude" / "plans")
+
+
+DirLister = Callable[[str], list[str]]
+"""Takes a directory path, returns its entry names, raises `OSError` if it cannot."""
+
+FileReader = Callable[[str], str]
+"""Takes a file path, returns its text, raises `OSError` if it cannot."""
+
+
+def list_dir(path: str) -> list[str]:
+    """The default `DirLister`: the real entry names of a real directory."""
+    return os.listdir(path)
+
+
+def read_file(path: str) -> str:
+    """The default `FileReader`: the real UTF-8 text of a real file."""
+    return Path(path).read_text(encoding="utf-8")
+
+
+def find_validated_plan(
+    card: object,
+    plans_dir: object | None = None,
+    *,
+    repo_dir: object | None = None,
+    list: DirLister = list_dir,
+    read: FileReader = read_file,
+) -> dict[str, object]:
+    """Whether `card` already has a plan on disk, and whether Validate signed it.
+
+    The deterministic phase's result (design §6) -- a plain dict, since it
+    crosses no process boundary and so needs no Pydantic model (`CLAUDE.md`).
+    `path` is `""` and never `None` when nothing was found, so a consumer can
+    format it without a guard.
+
+    `list` and `read` default to the real filesystem and exist to be swapped in
+    tests, the same callable-injection seam `worktree.py` uses for git and the
+    ported `.mjs` uses for `readdir`/`readFile`.
+    """
+    card_id = _card_short_id(card)
+    directory = _plans_dir(plans_dir, repo_dir)
+
+    try:
+        entries = list(directory)
+    except OSError:
+        # No plans directory is a normal answer on a first run, not a failure.
+        return {"found": False, "path": "", "validated": False}
+
+    name = pick_plan(entries, card_id)
+    if name is None:
+        return {"found": False, "path": "", "validated": False}
+
+    path = os.path.join(directory, name)
+    content = read(path)
+    return {"found": True, "path": path, "validated": VALIDATED_MARKER in content}

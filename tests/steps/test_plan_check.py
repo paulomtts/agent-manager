@@ -108,3 +108,110 @@ def test_the_plans_dir_defaults_under_the_repo_and_an_explicit_one_wins():
 def test_neither_plans_dir_nor_repo_dir_is_a_caller_bug_not_a_first_run():
     with pytest.raises(ValueError, match="plans_dir"):
         plan_check._plans_dir(None, None)
+
+
+def _plans(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
+    """A real plans directory on disk holding `files` (filename -> content).
+
+    Takes a plain dict rather than `**kwargs`: plan filenames contain `-` and
+    `.`, neither of which is legal in a Python keyword.
+    """
+    directory = tmp_path / ".claude" / "plans"
+    directory.mkdir(parents=True)
+    for name, body in (files or {}).items():
+        (directory / name).write_text(body, encoding="utf-8")
+    return directory
+
+
+def test_a_missing_plans_directory_is_a_normal_answer_not_a_failure(tmp_path: Path):
+    # First run: nobody has planned anything yet. Real absent directory, no fake.
+    got = plan_check.find_validated_plan("a32af745", repo_dir=tmp_path)
+    assert got == {"found": False, "path": "", "validated": False}
+
+
+def test_a_listable_directory_with_no_matching_plan_finds_nothing(tmp_path: Path):
+    directory = _plans(tmp_path, {"task-rows-deadbeef.md": "# plan"})
+    got = plan_check.find_validated_plan("a32af745", directory)
+    assert got == {"found": False, "path": "", "validated": False}
+
+
+def test_validated_only_when_the_marker_is_literally_present(tmp_path: Path):
+    directory = _plans(
+        tmp_path,
+        {
+            "task-rows-a32af745.md": f"# plan\n{VALIDATED_MARKER}\nsteps",
+            "task-rows-deadbeef.md": "# plan\nno marker",
+        },
+    )
+    validated = plan_check.find_validated_plan("a32af745", directory)
+    assert validated == {
+        "found": True,
+        "path": str(directory / "task-rows-a32af745.md"),
+        "validated": True,
+    }
+    assert plan_check.find_validated_plan("deadbeef", directory) == {
+        "found": True,
+        "path": str(directory / "task-rows-deadbeef.md"),
+        "validated": False,
+    }
+
+
+def test_a_plan_that_merely_discusses_the_marker_still_counts(tmp_path: Path):
+    # Documented deliberately: the check is a substring test, never a regex. A
+    # plan quoting the marker in prose reads as validated. That is the accepted
+    # cost of never mistaking a real marker for prose -- the failure that
+    # matters.
+    directory = _plans(
+        tmp_path,
+        {
+            "task-rows-a32af745.md": (
+                f"explains that {VALIDATED_MARKER} means signed off"
+            )
+        },
+    )
+    assert plan_check.find_validated_plan("a32af745", directory)["validated"] is True
+
+
+def test_a_near_miss_marker_is_not_validated(tmp_path: Path):
+    directory = _plans(
+        tmp_path,
+        {
+            "task-rows-a32af745.md": (
+                "<!-- task-pipeline: Validated -->\n"
+                "<!--task-pipeline: validated-->\n"
+                "<!-- task_pipeline: validated -->\n"
+            )
+        },
+    )
+    assert plan_check.find_validated_plan("a32af745", directory)["validated"] is False
+
+
+def test_the_newest_plan_on_disk_decides(tmp_path: Path):
+    directory = _plans(
+        tmp_path,
+        {
+            "2026-01-task-rows-a32af745.md": f"# old\n{VALIDATED_MARKER}",
+            "2026-08-task-rows-a32af745.md": "# re-planned, not yet signed off",
+        },
+    )
+    got = plan_check.find_validated_plan("a32af745", directory)
+    assert got["path"] == str(directory / "2026-08-task-rows-a32af745.md")
+    assert got["validated"] is False
+
+
+def test_the_card_may_arrive_as_a_uuid_or_a_mapping(tmp_path: Path):
+    directory = _plans(
+        tmp_path, {"task-rows-a32af745.md": f"# plan\n{VALIDATED_MARKER}"}
+    )
+    assert plan_check.find_validated_plan(CARD_UUID, directory)["validated"] is True
+    assert (
+        plan_check.find_validated_plan({"id": CARD_UUID}, directory)["validated"]
+        is True
+    )
+
+
+def test_the_repo_dir_default_finds_the_plans_under_dot_claude(tmp_path: Path):
+    _plans(tmp_path, {"task-rows-a32af745.md": f"{VALIDATED_MARKER}\n"})
+    got = plan_check.find_validated_plan("a32af745", repo_dir=tmp_path)
+    assert got["path"] == str(tmp_path / ".claude" / "plans" / "task-rows-a32af745.md")
+    assert got["validated"] is True
