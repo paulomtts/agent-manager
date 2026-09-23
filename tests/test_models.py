@@ -57,6 +57,49 @@ def test_dispatch_requires_harness_and_role():
     assert "role" in message
 
 
+def test_dispatch_carries_an_explicit_timeout():
+    # §8 line 315: a Dispatch carries the prompt, the role, the cwd, the result
+    # path, the model *and a timeout*. Seconds, because that is what the
+    # launcher hands subprocess.
+    dispatch = models.Dispatch(
+        harness="claude",
+        model="opus",
+        role="coder",
+        cwd=Path("/repo/wt"),
+        prompt_path=Path("/runs/run-1/1535b285/implement.1/prompt.txt"),
+        result_path=Path("/runs/run-1/1535b285/implement.1/result.json"),
+        timeout=90.0,
+    )
+    assert dispatch.timeout == 90.0
+
+
+def test_dispatch_defaults_its_timeout_so_older_journal_lines_still_load():
+    # A journal line written before this field existed has no `timeout` key.
+    # `extra="forbid"` protects against a dropped key; a *new* field has to
+    # carry a default or every stored line stops loading.
+    payload = _dispatch().model_dump(mode="json")
+    del payload["timeout"]
+    restored = models.Dispatch.model_validate(payload)
+    assert restored.timeout == 1800.0
+
+
+def test_dispatch_rejects_a_useless_timeout():
+    # Zero or negative would kill the harness before it started; inf and nan
+    # would sail past a plain lower bound and reach subprocess.wait().
+    for bad in (0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValidationError) as excinfo:
+            models.Dispatch(
+                harness="claude",
+                model="opus",
+                role="coder",
+                cwd=Path("/repo/wt"),
+                prompt_path=Path("/runs/run-1/1535b285/implement.1/prompt.txt"),
+                result_path=Path("/runs/run-1/1535b285/implement.1/result.json"),
+                timeout=bad,
+            )
+        assert [error["loc"] for error in excinfo.value.errors()] == [("timeout",)]
+
+
 def test_attempt_in_flight_has_no_terminal_fields():
     # §9 resume: an attempt the crash caught mid-run is `started` with nothing
     # terminal recorded, and must load back so the engine can discard it.
