@@ -293,3 +293,121 @@ def test_implement_result_keeps_plan_hash_an_unconstrained_string():
         ).plan_hash
         == "nope"
     )
+
+
+def test_review_result_accepts_a_full_payload():
+    review = results.ReviewResult(
+        findings=["the alias only applies on dump"],
+        unresolved_blockers=[],
+        fix_summary="added the serialisation aliases",
+        porcelain="",
+        commit_count=3,
+        tagged_count=3,
+        plan_hash="a1b2c3d4",
+    )
+
+    assert review.findings == ["the alias only applies on dump"]
+    assert review.unresolved_blockers == []
+    assert review.fix_summary == "added the serialisation aliases"
+    assert review.porcelain == ""
+    assert review.commit_count == 3
+    assert review.tagged_count == 3
+    assert review.plan_hash == "a1b2c3d4"
+
+
+def test_review_result_rejects_a_missing_tagged_count():
+    with pytest.raises(ValidationError) as caught:
+        results.ReviewResult(
+            findings=[],
+            unresolved_blockers=[],
+            fix_summary="nothing to fix",
+            porcelain="",
+            commit_count=3,
+            plan_hash="a1b2c3d4",
+        )
+
+    assert "tagged_count" in str(caught.value)
+
+
+def test_review_result_does_not_coerce_a_numeric_string_into_commit_count():
+    with pytest.raises(ValidationError) as caught:
+        results.ReviewResult(
+            findings=[],
+            unresolved_blockers=[],
+            fix_summary="nothing to fix",
+            porcelain="",
+            commit_count="3",
+            tagged_count=3,
+            plan_hash="a1b2c3d4",
+        )
+
+    assert "commit_count" in str(caught.value)
+
+
+def test_review_result_does_not_read_true_as_the_commit_count_one():
+    # bool is an int subclass in Python; a JSON `true` must not become 1 commit.
+    with pytest.raises(ValidationError) as caught:
+        results.ReviewResult(
+            findings=[],
+            unresolved_blockers=[],
+            fix_summary="nothing to fix",
+            porcelain="",
+            commit_count=True,
+            tagged_count=3,
+            plan_hash="a1b2c3d4",
+        )
+
+    assert "commit_count" in str(caught.value)
+
+
+def test_review_result_rejects_a_non_string_inside_findings():
+    with pytest.raises(ValidationError) as caught:
+        results.ReviewResult(
+            findings=["ok", None],
+            unresolved_blockers=[],
+            fix_summary="nothing to fix",
+            porcelain="",
+            commit_count=3,
+            tagged_count=3,
+            plan_hash="a1b2c3d4",
+        )
+
+    assert "findings" in str(caught.value)
+
+
+def test_review_result_rejects_an_unknown_key():
+    with pytest.raises(ValidationError) as caught:
+        results.ReviewResult(
+            findings=[],
+            unresolved_blockers=[],
+            fix_summary="nothing to fix",
+            porcelain="",
+            commit_count=3,
+            tagged_count=3,
+            plan_hash="a1b2c3d4",
+            commitCount=3,
+        )
+
+    assert "commitCount" in str(caught.value)
+
+
+def test_review_result_dumps_the_two_counts_in_camel_case_only_under_by_alias():
+    review = results.ReviewResult(
+        findings=[],
+        unresolved_blockers=[],
+        fix_summary="nothing to fix",
+        porcelain="",
+        commit_count=3,
+        tagged_count=3,
+        plan_hash="a1b2c3d4",
+    )
+
+    aliased = review.model_dump(by_alias=True)
+    assert aliased["commitCount"] == 3
+    assert aliased["taggedCount"] == 3
+    assert "commit_count" not in aliased
+    # Only those two are renamed -- porcelain and plan_hash keep one spelling.
+    assert aliased["porcelain"] == ""
+    assert aliased["plan_hash"] == "a1b2c3d4"
+
+    assert review.model_dump()["commit_count"] == 3

@@ -101,3 +101,22 @@ class ImplementResult(_Result):
     resumed: bool
     plan_hash: str
     report: str
+
+
+class ReviewResult(_Result):
+    """The `review` phase's result file (`builtin/task.yaml` line 66).
+
+    `commit_count` and `tagged_count` carry camelCase serialisation aliases
+    because `reducers.review_gate` reads `commitCount`/`taggedCount` off the
+    dumped mapping (lines 187-188) -- that port is a behavioural specification
+    and does not move. Serialisation only: validation stays snake_case, so the
+    JSON Schema embedded in the agent's prompt names exactly one spelling.
+    """
+
+    findings: list[str]
+    unresolved_blockers: list[str]
+    fix_summary: str
+    porcelain: str
+    commit_count: int = Field(serialization_alias="commitCount")
+    tagged_count: int = Field(serialization_alias="taggedCount")
+    plan_hash: str
