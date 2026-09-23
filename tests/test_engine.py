@@ -7,6 +7,7 @@ git, no `brd`, no harness process, nothing from `default_registry()` -- three of
 its names are placeholders that raise `NotImplementedError`.
 """
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -996,8 +997,10 @@ phases:
 def test_an_agent_phase_goes_to_the_injected_runner(store):
     seen: list[tuple[str, str]] = []
 
-    def agent_runner(phase, context):
+    def agent_runner(phase, context, rendered):
         seen.append((phase.name, phase.role))
+        assert rendered.phase == "explore"
+        assert rendered.inputs == ()
         return {"summary": "explored"}
 
     def work(card: str, explore: dict[str, Any]) -> dict[str, Any]:
@@ -1134,7 +1137,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     }
     assert sorted(functions) == sorted(BUILTIN_FUNCTION_NAMES)
 
-    def agent_runner(phase: AgentPhase, context: dict[str, Any]) -> dict[str, Any]:
+    def agent_runner(phase: AgentPhase, context: dict[str, Any], rendered) -> dict[str, Any]:
         calls.append(f"agent:{phase.name}")
         return {"role": phase.role}
 
@@ -1534,3 +1537,206 @@ def test_a_document_with_no_path_inputs_needs_no_card(store):
     )
 
     assert summary.status == "done"
+
+
+def _recording_runner(recorded: dict[str, Any]):
+    def agent_runner(phase, context, rendered):
+        recorded[phase.name] = rendered
+        return {"role": phase.role}
+
+    return agent_runner
+
+
+def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
+    """The fake registry `builtin/task.yaml` needs, with no git, brd or harness."""
+
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        calls.append(f"rollup.set_status:{status}")
+        return {"card": card, "status": status}
+
+    def ensure(branch: str, base: str, worktree: Any, repo_dir: Any) -> dict[str, Any]:
+        calls.append("worktree.ensure")
+        return {"created": True}
+
+    def find_plan(card: str) -> dict[str, Any]:
+        calls.append("plan_check.find_validated_plan")
+        return {"found": validated, "validated": validated}
+
+    def has_plan(result: dict[str, Any]) -> bool:
+        return bool(result.get("validated"))
+
+    def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
+        calls.append("verify.run_suite")
+        return {"passed": True}
+
+    def passed(result: dict[str, Any]) -> None:
+        return None
+
+    def agent_only_gate(**kwargs: Any) -> None:
+        raise AssertionError("an agent phase's gate is the agent runner's business")
+
+    return {
+        "rollup.set_status": set_status,
+        "worktree.ensure": ensure,
+        "plan_check.find_validated_plan": find_plan,
+        "plan_check.has_validated_plan": has_plan,
+        "verify.run_suite": run_suite,
+        "verification_passed_gate": passed,
+        "critic_blockers_gate": agent_only_gate,
+        "exploration_output_gate": agent_only_gate,
+        "review_gate": agent_only_gate,
+        "plan_hash_gate": agent_only_gate,
+        "verification_gate": agent_only_gate,
+    }
+
+
+def _walk_builtin(store, recorded: dict[str, Any], *, validated: bool) -> Any:
+    calls: list[str] = []
+    workflow = load_builtin("task", _registry(_builtin_functions(calls, validated=validated)))
+    return engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=_recording_runner(recorded),
+    )
+
+
+def test_every_document_path_input_renders_the_expanded_writes_template(store):
+    recorded: dict[str, Any] = {}
+
+    _walk_builtin(store, recorded, validated=False)
+
+    for phase_name in ("validate_spec", "plan", "validate_plan", "implement"):
+        assert dict(recorded[phase_name].sections)["spec_path"] == SPEC_PATH
+    for phase_name in ("validate_plan", "implement", "review"):
+        assert dict(recorded[phase_name].sections)["plan_path"] == PLAN_PATH
+
+
+def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(store):
+    recorded: dict[str, Any] = {}
+
+    summary = _walk_builtin(store, recorded, validated=True)
+
+    assert summary.skipped == ["spec", "validate_spec", "plan", "validate_plan"]
+    assert set(recorded) == {"explore", "implement", "review"}
+    sections = dict(recorded["implement"].sections)
+    assert sections["spec_path"] == SPEC_PATH
+    assert sections["plan_path"] == PLAN_PATH
+
+
+def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
+    """§13: a phase receives its declared inputs and nothing else."""
+    recorded: dict[str, Any] = {}
+
+    _walk_builtin(store, recorded, validated=False)
+
+    assert {name: rendered.inputs for name, rendered in recorded.items()} == {
+        "explore": ("card", "parent_story", "repo_docs", "verification"),
+        "spec": ("card", "explore"),
+        "validate_spec": ("card", "spec_path"),
+        "plan": ("spec_path",),
+        "validate_plan": ("spec_path", "plan_path"),
+        "implement": ("plan_path", "spec_path", "branch", "base_branch"),
+        "review": ("branch", "base_branch", "plan_path"),
+    }
+
+
+def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store):
+    recorded: dict[str, Any] = {}
+
+    _walk_builtin(store, recorded, validated=False)
+
+    sections = dict(recorded["explore"].sections)
+    assert json.loads(sections["card"])["title"] == "Resolve phase inputs"
+    assert json.loads(sections["parent_story"])["title"] == (
+        "The workflow document and the engine"
+    )
+    assert json.loads(sections["verification"]) == ["uv run pytest"]
+
+
+def test_an_unresolvable_input_raises_out_of_the_walk_before_the_runner(store):
+    """The walk does not wrap the runner call, so resolution failures propagate.
+    Journalling them as an outcome is sibling bf8e415b's choice, not this one's.
+    """
+    called: list[str] = []
+
+    def agent_runner(phase, context, rendered):
+        called.append(phase.name)
+        return {}
+
+    document = """
+name: early
+phases:
+  - name: spec
+    kind: agent
+    role: spec_author
+    inputs: [explore]
+"""
+    workflow = _workflow(document, {})
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            card=CARD,
+            agent_runner=agent_runner,
+        )
+
+    assert called == []
+    assert caught.value.phase == "spec"
+    assert caught.value.parameter == "explore"
+
+
+def test_a_phase_named_spec_path_never_clobbers_the_document_path(store):
+    seen: dict[str, Any] = {}
+
+    def collide(card: str) -> dict[str, Any]:
+        return {"not": "a path"}
+
+    def after(spec_path: str) -> dict[str, Any]:
+        seen["spec_path"] = spec_path
+        return {}
+
+    document = """
+name: reserved
+phases:
+  - name: spec
+    kind: agent
+    role: spec_author
+    writes: docs/superpowers/specs/{stem}.md
+  - name: spec_path
+    kind: deterministic
+    run: step.collide
+  - name: implement
+    kind: agent
+    role: coder
+    inputs: [spec_path]
+  - name: after
+    kind: deterministic
+    run: step.after
+"""
+    recorded: dict[str, Any] = {}
+    workflow = _workflow(document, {"step.collide": collide, "step.after": after})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        card=CARD,
+        agent_runner=_recording_runner(recorded),
+    )
+
+    assert summary.status == "done"
+    assert summary.results["spec_path"] == {"not": "a path"}
+    assert dict(recorded["implement"].sections)["spec_path"] == SPEC_PATH
+    assert seen["spec_path"] == SPEC_PATH

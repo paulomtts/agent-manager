@@ -1,8 +1,10 @@
 """Walk one subtask's phases and execute the deterministic ones (design §6).
 
-The walk is the only thing here. Input resolution and prompt rendering belong to
-a sibling, and so does everything about an agent phase past handing it to the
-injected runner: this module treats a `kind: agent` phase as an opaque call.
+The walk is the only thing here. The engine resolves each agent phase's declared
+`inputs` and renders its prompt (§6 step 2, `prompt.py`), then hands phase,
+context and prompt to the injected runner: everything past that call --
+the attempt directory, the dispatch, the result file, the retry -- belongs to a
+sibling, and this module treats it as an opaque call.
 
 §6 says the engine calls `run(ctx) -> dict`, but the real steps take named
 keyword arguments (`worktree.ensure(branch, base, worktree, repo_dir)`,
@@ -199,12 +201,17 @@ def _utcnow() -> datetime:
 
 Clock = Callable[[], datetime]
 
-AgentPhaseRunner = Callable[["AgentPhase", Mapping[str, Any]], Any]
-"""The seam sibling bf8e415b fills: `(phase, context) -> result`.
+AgentPhaseRunner = Callable[
+    ["AgentPhase", Mapping[str, Any], prompt.RenderedPrompt], Any
+]
+"""The seam sibling bf8e415b fills: `(phase, context, rendered) -> result`.
 
-Everything about an agent phase past this call -- prompt rendering, dispatch,
-schema validation, retry, its gates -- belongs to that subtask, not here. This
-module only takes the returned result into the context under the phase's name.
+The engine resolves the phase's declared `inputs` and renders the prompt before
+the call, because that is exactly where §6 puts step 2 -- and because the runner
+cannot dispatch without a prompt it can write to the attempt directory first.
+Everything past this call -- that directory, dispatch, schema validation, retry,
+its gates -- belongs to that subtask, not here. This module only takes the
+returned result into the context under the phase's name.
 """
 
 
@@ -347,7 +354,8 @@ def run_subtask(
                     "is an agent phase, but no agent runner was injected",
                     phase=phase.name,
                 )
-            result = agent_runner(phase, dict(context))
+            rendered = prompt.render_prompt(phase, context)
+            result = agent_runner(phase, dict(context), rendered)
             _bind_result(context, phase.name, result)
             summary.results[phase.name] = result
             index += 1
