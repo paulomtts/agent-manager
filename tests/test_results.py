@@ -33,11 +33,47 @@ def test_an_unknown_result_name_is_a_named_engine_error():
     assert "Canned" in message
 
 
-def test_the_shipped_table_is_empty_and_says_why():
-    # The five names in builtin/task.yaml now have models below, but putting
-    # them in the table is a sibling card's decision, not this one's.
-    # Validating nothing would be worse -- an unknown name fails loudly instead.
-    assert results.RESULT_MODELS == {}
+def test_the_shipped_table_holds_exactly_the_five_declared_names():
+    # An equality, not a superset: a stray sixth key is a name the engine would
+    # happily resolve for a phase that has no business declaring it.
+    assert set(results.RESULT_MODELS) == {
+        "ExploreResult",
+        "CriticResult",
+        "PlanResult",
+        "ImplementResult",
+        "ReviewResult",
+    }
+
+
+def test_every_entry_is_the_class_its_key_names():
+    assert results.RESULT_MODELS  # an empty table would make the loop vacuous
+    for name, model in results.RESULT_MODELS.items():
+        assert model.__name__ == name
+        assert (
+            results.resolve_result_model(name, results.RESULT_MODELS, phase="explore")
+            is model
+        )
+
+
+def test_verification_is_not_registered():
+    # No `result:` name refers to it; it is reachable only as
+    # ExploreResult.verification, so registering it would be dead surface.
+    assert "Verification" not in results.RESULT_MODELS
+
+
+def test_an_unknown_name_now_lists_the_five_registered_names():
+    # The addendum's opening failure ends "(registered: nothing)". That exact
+    # phrasing must be gone, and the five sorted names must be what it offers.
+    with pytest.raises(EngineError) as caught:
+        results.resolve_result_model("SpecResult", results.RESULT_MODELS, phase="spec")
+
+    message = str(caught.value)
+    assert caught.value.phase == "spec"
+    assert "registered: nothing" not in message
+    assert (
+        "CriticResult, ExploreResult, ImplementResult, PlanResult, ReviewResult"
+        in message
+    )
 
 
 # --- The five R1 result models (design §2). Pure tier per design §14 lines

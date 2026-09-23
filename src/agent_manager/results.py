@@ -4,12 +4,13 @@
 to a class is the agent-dispatch sibling's job"). This module is that mapping,
 and nothing more: no validation happens here, and importing it reads no file.
 
-The table ships empty, and that is deliberate. `builtin/task.yaml` names five
-result models -- `ExploreResult`, `CriticResult`, `PlanResult`,
-`ImplementResult`, `ReviewResult` -- and they are defined below, but wiring
-them into the table is a separate card's decision, not this one's. An
-unresolved name fails loudly at dispatch time instead, which is strictly
-better than validating nothing and calling the result `ok`.
+`RESULT_MODELS` is that mapping: every `result:` name `builtin/task.yaml`
+declares -- `ExploreResult`, `CriticResult`, `PlanResult`, `ImplementResult`,
+`ReviewResult` -- against the model that validates that phase's `result.json`.
+`Verification` is not in it; no phase declares it, and it is reachable only as
+`ExploreResult.verification`. A name with no entry still fails loudly at
+dispatch time, which is strictly better than validating nothing and calling
+the result `ok`.
 """
 
 from collections.abc import Mapping
@@ -17,9 +18,6 @@ from collections.abc import Mapping
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_manager.errors import EngineError
-
-RESULT_MODELS: dict[str, type[BaseModel]] = {}
-"""Every `result:` name with a model behind it. Empty on this branch."""
 
 
 class _Result(BaseModel):
@@ -105,6 +103,20 @@ class ReviewResult(_Result):
     commit_count: int = Field(serialization_alias="commitCount")
     tagged_count: int = Field(serialization_alias="taggedCount")
     plan_hash: str
+
+
+RESULT_MODELS: dict[str, type[BaseModel]] = {
+    "ExploreResult": ExploreResult,
+    "CriticResult": CriticResult,
+    "PlanResult": PlanResult,
+    "ImplementResult": ImplementResult,
+    "ReviewResult": ReviewResult,
+}
+"""Every `result:` name `builtin/task.yaml` declares, keyed by class name.
+
+`Verification` is absent on purpose: no phase declares it, and it is reachable
+only as `ExploreResult.verification`.
+"""
 
 
 def resolve_result_model(

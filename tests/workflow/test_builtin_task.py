@@ -12,15 +12,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from agent_manager import cli, dispatch, engine, models
 from agent_manager.results import (
+    RESULT_MODELS,
     CriticResult,
     ExploreResult,
     ImplementResult,
     PlanResult,
     ReviewResult,
     Verification,
+    resolve_result_model,
 )
 from agent_manager.workflow import load_builtin
 from agent_manager.workflow.loader import (
@@ -145,6 +148,44 @@ def test_a_substituted_registry_supplies_the_resolved_callables() -> None:
     workflow = load_builtin("task", substitute)
     for name, fn in workflow.functions.items():
         assert fn is substitute.resolve(name)
+
+
+def test_every_declared_result_name_resolves_through_the_shipped_table() -> None:
+    """Addendum §1 seam 1 closed: renaming a model, or a `result:` name in
+    `task.yaml`, fails here rather than one second into a production run.
+
+    Driven from the loaded phases, never a hardcoded list -- a hardcoded list
+    would keep passing while the document drifted away from it."""
+    checked = 0
+    for phase in load_builtin("task").phases:
+        if not isinstance(phase, AgentPhase) or phase.result is None:
+            continue
+        model = resolve_result_model(phase.result, RESULT_MODELS, phase=phase.name)
+        assert issubclass(model, BaseModel)
+        assert model.__name__ == phase.result
+        checked += 1
+    # Non-vacuity: a loader change that stopped yielding agent phases, or
+    # stopped carrying `result`, would otherwise turn this into a no-op.
+    assert checked == 6  # CriticResult is declared by two phases
+
+
+def test_both_validation_phases_resolve_to_the_same_critic_model() -> None:
+    """`CriticResult` is declared twice (`task.yaml` lines 39 and 53).
+    Resolution is by name, so the duplicate is one shared class, not a clash."""
+    workflow = load_builtin("task")
+    spec_phase = workflow.phase("validate_spec")
+    plan_phase = workflow.phase("validate_plan")
+    assert isinstance(spec_phase, AgentPhase) and isinstance(plan_phase, AgentPhase)
+
+    spec_model = resolve_result_model(
+        spec_phase.result, RESULT_MODELS, phase="validate_spec"
+    )
+    plan_model = resolve_result_model(
+        plan_phase.result, RESULT_MODELS, phase="validate_plan"
+    )
+
+    assert spec_model is plan_model
+    assert spec_model is CriticResult
 
 
 # ── acceptance #2: every gate binds against a real result object ─────────────
