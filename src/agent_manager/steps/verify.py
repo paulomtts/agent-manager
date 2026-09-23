@@ -51,3 +51,24 @@ def plain_text(text: object, max_chars: int = 300) -> str:
     raw = "" if text is None else str(text)
     flat = _CONTROL.sub(" ", _ANSI.sub("", raw)).strip()
     return flat if len(flat) <= max_chars else flat[:max_chars] + ELLIPSIS
+
+
+NO_OUTPUT = "no output"
+"""Last-resort diagnostic, so no reported tail or detail is ever blank."""
+
+
+def command_diagnostic(stdout: object, stderr: object, fallback: object) -> str:
+    """One line saying why a command failed, from whichever stream carries it.
+
+    Ported from `ship.mjs`'s `verifyError`. `gh.mjs`'s `ghError` read only
+    stderr, which is right for `gh` and `git` and wrong here: verification
+    commands are arbitrary repo scripts, and linters and gate scripts routinely
+    print their diagnostic to STDOUT and exit non-zero. So: last non-empty line
+    of stderr, else last non-empty line of stdout, else `fallback`.
+    """
+    return (
+        last_line(stderr)
+        or last_line(stdout)
+        or ("" if fallback is None else str(fallback).strip())
+        or NO_OUTPUT
+    )

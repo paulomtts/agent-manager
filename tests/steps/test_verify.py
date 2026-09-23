@@ -13,7 +13,7 @@ The pure helpers ported from `gh.mjs` (`last_line`, `plain_text`) and from
 specification (design §14, Pure-functions tier).
 """
 
-from agent_manager.steps.verify import last_line, plain_text
+from agent_manager.steps.verify import command_diagnostic, last_line, plain_text
 
 
 def test_last_line_is_the_last_non_empty_trimmed_line():
@@ -44,3 +44,35 @@ def test_plain_text_truncates_past_the_cap_with_one_ellipsis():
 
 def test_plain_text_is_the_empty_string_for_none():
     assert plain_text(None) == ""
+
+
+def test_command_diagnostic_prefers_the_last_stderr_line():
+    assert (
+        command_diagnostic("out line", "boom: failed\n", "fallback")
+        == "boom: failed"
+    )
+
+
+def test_command_diagnostic_falls_back_to_stdout_when_stderr_is_blank():
+    # The reason this card exists: linters and gate scripts print their
+    # diagnostic to stdout and exit non-zero. Reading only stderr produced
+    # seven content-free "Command failed: ./scripts/gate-frontend.sh" failures
+    # in the original (ship.mjs:53-67).
+    assert (
+        command_diagnostic("banner\nERROR: 3 lint problems\n", "  \n", "fallback")
+        == "ERROR: 3 lint problems"
+    )
+
+
+def test_command_diagnostic_falls_back_to_the_bare_message_when_both_are_blank():
+    assert (
+        command_diagnostic("", "", "./gate.sh exited with code 2")
+        == "./gate.sh exited with code 2"
+    )
+
+
+def test_command_diagnostic_never_returns_an_empty_string():
+    # A blank tail reads as "we do not know why it failed", which is exactly
+    # the outcome this port was written to end.
+    assert command_diagnostic("", "", "   ") == "no output"
+    assert command_diagnostic(None, None, None) == "no output"
