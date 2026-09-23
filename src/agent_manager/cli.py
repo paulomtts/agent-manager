@@ -1102,9 +1102,10 @@ def resume(
     """Re-run the phase a killed run died in, and drive the subtask to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
-    started and are recorded on the subtask (§9). `--allow-no-verification` is
-    offered because `models.RunConfig` does not carry it, so the flag means the
-    same thing here as it does on a fresh `run`.
+    started and are recorded on the subtask (§9). `--allow-no-verification` and
+    `--verify` are offered because `models.RunConfig` carries neither the opt-out
+    nor the suite commands, so both mean the same thing here as they do on a
+    fresh `run`.
     """
     try:
         payload = resume_run(

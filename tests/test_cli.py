@@ -2844,7 +2844,6 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["data"]["resumed_from"] == "implement"
 
 
-
 @requires_git
 @requires_brd
 def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
