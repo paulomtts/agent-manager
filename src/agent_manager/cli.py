@@ -309,6 +309,62 @@ def select_attempt(
     )
 
 
+def read_artifact(path: Path | None) -> dict[str, Any]:
+    """One artifact as `{path, present, text}`, never a raised exception.
+
+    `logs` exists to show an operator what the harness produced -- including the
+    half-written or malformed file that made a phase fail -- so a missing path, a
+    missing file and undecodable bytes are all facts to report, not refusals.
+    `is_file()` rather than `exists()`: a recorded path that somehow names a
+    directory must read as absent instead of raising `IsADirectoryError` out of
+    a read-only command. `errors="replace"` for the same reason.
+
+    `path` stays a `Path`; `render`'s `default=str` stringifies it once at the
+    edge, exactly as `status_payload` leaves `worktree_path` alone.
+    """
+    if path is None or not Path(path).is_file():
+        return {"path": path, "present": False, "text": None}
+    return {
+        "path": path,
+        "present": True,
+        "text": Path(path).read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+def logs_payload(
+    run: models.Run,
+    story: models.StoryRun,
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    attempt: models.Attempt,
+) -> dict[str, Any]:
+    """§10's `logs` output: what was selected, and the three artifacts of it.
+
+    The locations come from the `Attempt` row the projection already holds, never
+    from `paths.attempt_dir` -- that helper creates the directory it names, and
+    a read-only command that minted an artifact directory for a run nobody
+    started would be writing state outside `Store`.
+
+    `result.json` is read as text like the other two and is deliberately not
+    parsed: the unparseable result is precisely the one an operator runs `logs`
+    to look at.
+    """
+    return {
+        "run_id": run.id,
+        "story_id": story.card_id,
+        "card": subtask.card_id,
+        "phase": phase.name,
+        "attempt": attempt.n,
+        "status": attempt.status,
+        "exit_code": attempt.exit_code,
+        "artifacts": {
+            "prompt": read_artifact(attempt.prompt_path),
+            "result": read_artifact(attempt.result_path),
+            "stdout": read_artifact(attempt.stdout_path),
+        },
+    }
+
+
 app = typer.Typer(
     add_completion=False,
     help="Drive brd cards through the agent-manager workflow engine.",

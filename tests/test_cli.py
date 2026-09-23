@@ -485,6 +485,135 @@ def test_a_non_positive_attempt_number_is_refused_rather_than_defaulting(n):
     assert str(n) in str(caught.value)
 
 
+def _artifact_attempt(directory: Path, n: int = 1, **overrides) -> models.Attempt:
+    """An attempt whose three recorded paths point into `directory`."""
+    fields: dict[str, Any] = {
+        "prompt_path": directory / "prompt.txt",
+        "result_path": directory / "result.json",
+        "stdout_path": directory / "stdout.log",
+    }
+    fields.update(overrides)
+    return models.Attempt(
+        n=n, dispatch=_pure_dispatch(), status="ok", exit_code=0, **fields
+    )
+
+
+def _payload_for(attempt: models.Attempt) -> dict[str, Any]:
+    phase = models.PhaseRun(
+        name="implement", kind="agent", status="done", attempts=[attempt]
+    )
+    subtask = _pure_subtask("card-1", [phase])
+    story = _pure_story("story-1", [subtask])
+    run = _pure_run([story])
+    return cli.logs_payload(run, story, subtask, phase, attempt)
+
+
+def test_the_payload_reads_the_three_artifacts_off_disk(tmp_path):
+    (tmp_path / "prompt.txt").write_text("you are the coder\n", encoding="utf-8")
+    (tmp_path / "result.json").write_text('{"ok": true}', encoding="utf-8")
+    (tmp_path / "stdout.log").write_text("line one\nline two\n", encoding="utf-8")
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["run_id"] == "20260923T140506Z-cbe34d00"
+    assert payload["story_id"] == "story-1"
+    assert payload["card"] == "card-1"
+    assert payload["phase"] == "implement"
+    assert payload["attempt"] == 1
+    assert payload["status"] == "ok"
+    assert payload["exit_code"] == 0
+    assert payload["artifacts"]["prompt"] == {
+        "path": tmp_path / "prompt.txt",
+        "present": True,
+        "text": "you are the coder\n",
+    }
+    assert payload["artifacts"]["result"]["text"] == '{"ok": true}'
+    assert payload["artifacts"]["stdout"]["text"] == "line one\nline two\n"
+
+
+def test_a_missing_file_and_a_null_path_are_both_absent_not_a_refusal(tmp_path):
+    """`Attempt.prompt_path` and friends are `Path | None`, and a phase can die
+    between recording an attempt and writing its files. Both are facts."""
+    (tmp_path / "prompt.txt").write_text("you are the coder\n", encoding="utf-8")
+    attempt = _artifact_attempt(tmp_path, result_path=None)
+
+    payload = _payload_for(attempt)
+
+    assert payload["artifacts"]["prompt"]["present"] is True
+    assert payload["artifacts"]["result"] == {"path": None, "present": False, "text": None}
+    assert payload["artifacts"]["stdout"] == {
+        "path": tmp_path / "stdout.log",
+        "present": False,
+        "text": None,
+    }
+
+
+def test_an_empty_artifact_is_present_with_empty_text(tmp_path):
+    """`""` is falsy and must not be conflated with the `None` of a missing file:
+    a harness that produced no output at all is a different diagnosis from a
+    harness that never got far enough to write the file."""
+    (tmp_path / "stdout.log").write_text("", encoding="utf-8")
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["artifacts"]["stdout"] == {
+        "path": tmp_path / "stdout.log",
+        "present": True,
+        "text": "",
+    }
+
+
+def test_a_recorded_path_that_names_a_directory_reads_as_absent(tmp_path):
+    """`exists()` would say yes and `read_text` would raise `IsADirectoryError`,
+    turning a read-only report into a traceback."""
+    (tmp_path / "stdout.log").mkdir()
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["artifacts"]["stdout"]["present"] is False
+    assert payload["artifacts"]["stdout"]["text"] is None
+
+
+def test_a_result_json_that_is_not_valid_json_comes_back_as_raw_text(tmp_path):
+    """The malformed result is the one that made the phase fail, and it is exactly
+    what an operator runs `logs` to read. `logs` must never parse it."""
+    (tmp_path / "result.json").write_text('{"summary": "half a fi', encoding="utf-8")
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["artifacts"]["result"]["present"] is True
+    assert payload["artifacts"]["result"]["text"] == '{"summary": "half a fi'
+
+
+def test_undecodable_bytes_in_an_artifact_are_replaced_not_raised(tmp_path):
+    """A harness that dumped raw terminal output is not a reason for a read-only
+    command to die with a `UnicodeDecodeError`."""
+    (tmp_path / "stdout.log").write_bytes(b"ok \xff\xfe done\n")
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["artifacts"]["stdout"]["present"] is True
+    assert payload["artifacts"]["stdout"]["text"].startswith("ok ")
+    assert payload["artifacts"]["stdout"]["text"].endswith(" done\n")
+    assert "�" in payload["artifacts"]["stdout"]["text"]
+
+
+def test_the_logs_payload_survives_render_with_its_paths_and_newlines(tmp_path):
+    """The payload carries three `Path`s that `json.dumps` refuses, and artifact
+    text full of newlines that the one-line default must escape rather than
+    break."""
+    (tmp_path / "prompt.txt").write_text("first\nsecond\n", encoding="utf-8")
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+    text = cli.render(cli.ok_envelope(payload))
+
+    assert "\n" not in text
+    data = json.loads(text)["data"]
+    assert data["artifacts"]["prompt"]["path"] == str(tmp_path / "prompt.txt")
+    assert data["artifacts"]["prompt"]["text"] == "first\nsecond\n"
+    assert data["artifacts"]["result"]["path"] == str(tmp_path / "result.json")
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
