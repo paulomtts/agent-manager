@@ -1872,3 +1872,74 @@ def test_a_successful_agent_phase_still_advances_the_walk(store):
 
     assert summary.status == "done"
     assert summary.results["work"] == {"saw": "explored"}
+
+
+def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path):
+    """The §12 escape hatch's parameters have to arrive somehow: `subtask_context`
+    is a fixed table, and `builtin/task.yaml`'s gates bind names it does not hold.
+    """
+    seen: dict[str, Any] = {}
+
+    def step(suite_cmds: list[str], allow_no_verification: bool) -> dict[str, Any]:
+        seen["suite_cmds"] = suite_cmds
+        seen["allow_no_verification"] = allow_no_verification
+        return {"ok": True}
+
+    registry = FunctionRegistry()
+    registry.register("only.step", step)
+    document = tmp_path / "one.yaml"
+    document.write_text(
+        "name: one\n"
+        "description: one deterministic phase\n"
+        "phases:\n"
+        "  - name: only\n"
+        "    kind: deterministic\n"
+        "    run: only.step\n",
+        encoding="utf-8",
+    )
+    workflow = load_workflow(document, registry)
+    store = store_module.Store.open(tmp_path, "run-extra-1")
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id="story-1",
+        subtask=_subtask(),
+        repo_dir=REPO,
+        extra_context={"suite_cmds": [], "allow_no_verification": True},
+    )
+
+    assert summary.status == "done"
+    assert seen == {"suite_cmds": [], "allow_no_verification": True}
+
+
+def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
+    """`worktree`, `card` and friends are the engine's own: letting a caller
+    overwrite one would point every later step at a path the engine never chose.
+    """
+    registry = FunctionRegistry()
+    registry.register("only.step", lambda: {"ok": True})
+    document = tmp_path / "one.yaml"
+    document.write_text(
+        "name: one\n"
+        "description: one deterministic phase\n"
+        "phases:\n"
+        "  - name: only\n"
+        "    kind: deterministic\n"
+        "    run: only.step\n",
+        encoding="utf-8",
+    )
+    workflow = load_workflow(document, registry)
+    store = store_module.Store.open(tmp_path, "run-extra-2")
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id="story-1",
+            subtask=_subtask(),
+            repo_dir=REPO,
+            extra_context={"worktree": "/somewhere/else"},
+        )
+
+    assert "worktree" in str(caught.value)
