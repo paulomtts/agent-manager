@@ -217,3 +217,89 @@ def test_unknown_extra_fields_in_data_are_tolerated():
     card = board._validated(models.Card, generous, argv=board.show_argv("141c96e6"))
     assert card.id == "141c96e6"
     assert not hasattr(card, "assignee")
+
+
+@pytest.fixture
+def temp_board(tmp_path, monkeypatch):
+    """A real, empty brd board in a throwaway directory.
+
+    brd keys its SQLite files off XDG_DATA_HOME and resolves the board from the
+    nearest `.brd` marker at or above its cwd, so pointing XDG_DATA_HOME at
+    tmp_path and running in a fresh directory isolates these tests completely
+    from the developer's own board. The subprocess inherits the patched
+    environment.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "board-repo"
+    root.mkdir()
+    subprocess.run(
+        ["brd", "init", "--name", "temp-board"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return root
+
+
+def _add_card(root: Path, title: str, parent: str | None = None) -> str:
+    argv = ["brd", "add", "--title", title]
+    if parent is not None:
+        argv += ["--parent", parent]
+    completed = subprocess.run(
+        argv, cwd=root, check=True, capture_output=True, text=True
+    )
+    return json.loads(completed.stdout)["data"]["id"]
+
+
+def _brd_json(root: Path, *args: str) -> object:
+    completed = subprocess.run(
+        ["brd", *args], cwd=root, check=True, capture_output=True, text=True
+    )
+    return json.loads(completed.stdout)["data"]
+
+
+@requires_brd
+def test_show_reads_a_card_from_a_real_board(temp_board):
+    milestone = _add_card(temp_board, "Milestone 1")
+    story = _add_card(temp_board, "Naming and the brd board adapter", milestone)
+    subtask = _add_card(temp_board, "Add the brd board adapter", story)
+
+    card = board.show(subtask, repo_dir=temp_board)
+
+    assert isinstance(card, models.Card)
+    assert card.id == subtask
+    assert card.title == "Add the brd board adapter"
+    assert card.status == "todo"
+    assert card.parent_id == story
+
+
+@requires_brd
+def test_show_reports_a_top_level_card_with_no_parent(temp_board):
+    milestone = _add_card(temp_board, "Milestone 1")
+    card = board.show(milestone, repo_dir=temp_board)
+    assert card.parent_id is None
+
+
+@requires_brd
+def test_show_of_a_nonexistent_card_raises_board_error_with_brds_message(temp_board):
+    with pytest.raises(board.BoardError) as excinfo:
+        board.show("no-such-card", repo_dir=temp_board)
+    assert "no-such-card" in excinfo.value.message
+    assert excinfo.value.error_type == "CardNotFoundError"
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.argv == ["brd", "show", "no-such-card"]
+
+
+@requires_brd
+def test_show_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
+    # No `.brd` marker anywhere above: brd answers with an ok:false
+    # ProjectNotFoundError envelope and exits 1. That must surface as this
+    # module's one error type, message intact.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    not_a_project = tmp_path / "nowhere"
+    not_a_project.mkdir()
+    with pytest.raises(board.BoardError) as excinfo:
+        board.show("141c96e6", repo_dir=not_a_project)
+    assert excinfo.value.error_type == "ProjectNotFoundError"
+    assert excinfo.value.exit_code == 1

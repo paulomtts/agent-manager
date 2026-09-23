@@ -157,3 +157,18 @@ def _validated(model: type[M], data: object, *, argv: list[str]) -> M:
             argv=argv,
             exit_code=0,
         ) from exc
+
+
+def show(card_id: str, *, repo_dir: Path | None = None) -> models.Card:
+    """One card, via `brd show`.
+
+    `repo_dir` is the directory brd runs in; it resolves its board from the
+    nearest `.brd` marker at or above that directory. Nothing is cached here --
+    the engine caches the card at run start (design §7 line 287).
+    """
+    argv = show_argv(card_id)
+    completed = _run(argv, repo_dir)
+    data = _decode(
+        completed.stdout, argv=argv, exit_code=completed.returncode
+    )
+    return _validated(models.Card, data, argv=argv)
