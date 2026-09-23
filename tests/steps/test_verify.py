@@ -25,6 +25,7 @@ import pytest
 from agent_manager.steps import verify
 from agent_manager.steps.verify import (
     CommandResult,
+    VerifyError,
     command_diagnostic,
     last_line,
     plain_text,
@@ -178,3 +179,84 @@ def test_run_suite_leaves_the_worktree_and_the_repo_untouched(tmp_path: Path):
     assert result["passed"] is True
     assert _git(repo, "status", "--porcelain") == ""
     assert _git(repo, "rev-parse", "HEAD").strip() == head_before
+
+
+def test_a_red_command_reports_its_stderr_line(tmp_path: Path):
+    command = _py("import sys; sys.stderr.write('AssertionError: boom\\n'); sys.exit(1)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is False
+    assert result["verified"] == [
+        {"command": command, "ok": False, "tail": "AssertionError: boom"}
+    ]
+    assert result["detail"] == f"verification failed: {command} — AssertionError: boom"
+
+
+def test_a_red_command_with_a_stdout_only_diagnostic_reports_that_stdout_line(
+    tmp_path: Path,
+):
+    # The card's reason to exist, proved against a real process rather than a
+    # fake: the tool prints its diagnostic to stdout and exits non-zero.
+    command = _py("print('ERROR: 3 lint problems'); raise SystemExit(2)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is False
+    assert result["verified"][0]["ok"] is False
+    assert result["verified"][0]["tail"] == "ERROR: 3 lint problems"
+    assert "ERROR: 3 lint problems" in result["detail"]
+
+
+def test_a_red_command_stops_the_commands_after_it(tmp_path: Path):
+    marker = tmp_path / "second-ran.txt"
+    red = _py("raise SystemExit(1)")
+    second = _py(f"open({str(marker)!r}, 'w').write('ran')")
+    result = verify.run_suite([red, second], str(tmp_path))
+    assert result["passed"] is False
+    assert [entry["command"] for entry in result["verified"]] == [red]
+    assert not marker.exists()
+
+
+def test_a_silent_red_command_still_carries_a_tail_and_a_detail(tmp_path: Path):
+    command = _py("raise SystemExit(3)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["verified"][0]["tail"] == f"{command} exited with code 3"
+    assert result["detail"].startswith("verification failed:")
+    assert "exited with code 3" in result["detail"]
+
+
+def test_undecodable_output_is_replaced_rather_than_crashing_the_step(tmp_path: Path):
+    command = _py("import sys; sys.stdout.buffer.write(b'\\xff\\xfe done\\n')")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is True
+    assert result["verified"][0]["tail"].endswith("done")
+
+
+def test_a_huge_real_output_is_capped_at_three_hundred_characters(tmp_path: Path):
+    command = _py("print('z' * 5000)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["verified"][0]["tail"] == "z" * 300 + "…"
+
+
+def test_ansi_colour_and_over_long_lines_are_flattened_in_the_result(tmp_path: Path):
+    # A fake runner, because no real tool can be relied on to emit ANSI on
+    # demand -- and a raw ESC byte in a reported field once failed a milestone.
+    noisy = "\x1b[31m" + "E" * 400 + "\x1b[0m"
+
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=1, stdout="", stderr=noisy)
+
+    result = verify.run_suite(["fake-linter"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["tail"] == "E" * 300 + "…"
+    assert "\x1b" not in result["detail"]
+    assert len(result["detail"]) <= 601
+
+
+def test_a_command_that_cannot_be_launched_raises_verify_error(tmp_path: Path):
+    # A missing binary is a misconfigured card, not a failed test run, and must
+    # not read as an ordinary red suite.
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    with pytest.raises(VerifyError) as excinfo:
+        verify.run_suite(
+            ["definitely-not-a-real-binary --version"], str(tmp_path), runner=runner
+        )
+    assert "definitely-not-a-real-binary" in str(excinfo.value)

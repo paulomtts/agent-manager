@@ -99,6 +99,20 @@ launched at all; a non-zero exit is a return value, not an exception.
 """
 
 
+class VerifyError(RuntimeError):
+    """A verification command that could not be launched at all.
+
+    Distinct from a red suite on purpose: a missing or unrunnable executable is
+    a misconfigured card, and reporting it as `passed: false` would send a
+    human hunting for a test failure that never happened.
+    """
+
+    def __init__(self, message: str, *, argv: list[str]) -> None:
+        self.message = message
+        self.argv = list(argv)
+        super().__init__(f"{message} (argv={self.argv!r})")
+
+
 def run_command(argv: list[str], cwd: str) -> CommandResult:
     """The default `CommandRunner`: really run `argv` in `cwd`.
 
@@ -120,6 +134,15 @@ def run_command(argv: list[str], cwd: str) -> CommandResult:
     )
 
 
+DETAIL_MAX = 600
+"""Cap for `detail`, which names the command as well as the diagnostic."""
+
+
+def _display(command: object, argv: list[str]) -> str:
+    """The command as a human reads it: the original string, else its argv."""
+    return command if isinstance(command, str) else " ".join(argv)
+
+
 def run_suite(
     commands: object,
     worktree: object,
@@ -139,14 +162,37 @@ def run_suite(
 
     for command in commands:
         argv = shlex.split(command) if isinstance(command, str) else [str(p) for p in command]
-        completed = runner(argv, worktree_path)
-        verified.append(
-            {
-                "command": command,
-                "ok": True,
-                "tail": plain_text(last_line(completed.stdout)),
-            }
+        try:
+            completed = runner(argv, worktree_path)
+        except (FileNotFoundError, PermissionError, NotADirectoryError) as exc:
+            raise VerifyError(
+                f"could not run {_display(command, argv)}: {exc}", argv=argv
+            ) from exc
+
+        if completed.exit_code == 0:
+            verified.append(
+                {
+                    "command": command,
+                    "ok": True,
+                    "tail": plain_text(last_line(completed.stdout)),
+                }
+            )
+            continue
+
+        shown = _display(command, argv)
+        diagnostic = command_diagnostic(
+            completed.stdout,
+            completed.stderr,
+            f"{shown} exited with code {completed.exit_code}",
         )
+        verified.append(
+            {"command": command, "ok": False, "tail": plain_text(diagnostic)}
+        )
+        result["detail"] = plain_text(
+            f"verification failed: {shown} — {diagnostic}", DETAIL_MAX
+        )
+        # Nothing is marked done after a red command (ship.mjs:89).
+        return result
 
     result["passed"] = True
     return result
