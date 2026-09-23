@@ -347,6 +347,13 @@ class Store:
     # -- recording ---------------------------------------------------------
 
     def record_run(self, run: models.Run) -> JournalLine:
+        if run.id != self.run_id:
+            raise ValueError(
+                f"store is bound to run {self.run_id!r} but was handed run"
+                f" {run.id!r}: the row is keyed by the store's id while the"
+                " journal payload keeps the model's, so the two stores would"
+                " disagree about which run this is"
+            )
         line = self._journal.append(
             "run_upsert", run.model_dump(mode="json", exclude={"stories"})
         )
@@ -666,6 +673,11 @@ class Store:
             self._journal if self._journal.run_id == run_id else Journal(run_id)
         )
         run = replay(journal.read())
+        if run.id != run_id:
+            raise JournalError(
+                f"journal of run {run_id!r} has a run_upsert naming run"
+                f" {run.id!r}: refusing to key its projection under two ids"
+            )
         self._delete_run(run_id)
         self._write_run_row(run_id, run)
         for story in run.stories:

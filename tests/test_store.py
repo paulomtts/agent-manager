@@ -869,3 +869,41 @@ def test_read_returns_lines_in_sequence_order_not_file_order(repo):
     finally:
         st.close()
     assert run.stories[0].status == "done"
+
+
+def test_recording_a_run_whose_id_is_not_the_stores_run_id_is_refused(repo):
+    # The row is keyed by the store's run id while the journal payload carries
+    # the model's own. Letting the two differ makes `rebuild_from_journal`
+    # return a run that `load_run` can never equal, so it is refused outright.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            st.record_run(_run(repo, run_id="run-somewhere-else"))
+        message = str(excinfo.value)
+        assert RUN_ID in message
+        assert "run-somewhere-else" in message
+        assert st.load_run(RUN_ID) is None
+    finally:
+        st.close()
+    with pytest.raises(store.MissingJournalError):
+        store.Journal(RUN_ID).read()
+
+
+def test_a_journal_whose_run_upsert_names_another_run_raises(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append(
+        "run_upsert",
+        _run(repo, run_id="run-somewhere-else").model_dump(
+            mode="json", exclude={"stories"}
+        ),
+    )
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.JournalError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+        assert st.load_run(RUN_ID) is None
+    finally:
+        st.close()
+    message = str(excinfo.value)
+    assert RUN_ID in message
+    assert "run-somewhere-else" in message
