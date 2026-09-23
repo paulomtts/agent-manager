@@ -24,3 +24,17 @@ def project_db_path(root: Path) -> Path:
     projects_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
     return projects_dir / f"{digest}.db"
+
+
+def run_dir(run_id: str) -> Path:
+    """Root of one run's artifact tree, always outside any repository worktree."""
+    result = data_dir() / "runs" / run_id
+    result.mkdir(parents=True, exist_ok=True)
+    return result
+
+
+def attempt_dir(run_id: str, card: str, phase: str, attempt: int) -> Path:
+    """Directory holding one attempt's prompt.txt, result.json and stdout.log."""
+    result = run_dir(run_id) / card / f"{phase}.{attempt}"
+    result.mkdir(parents=True, exist_ok=True)
+    return result

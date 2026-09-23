@@ -113,3 +113,56 @@ def test_project_db_path_accepts_a_root_that_does_not_exist(monkeypatch, tmp_pat
     assert result.parent == tmp_path / "data" / "agent-manager" / "projects"
     assert result.name.endswith(".db")
     assert not absent.exists()
+
+
+def test_run_dir_is_under_data_dir_and_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    result = paths.run_dir("run-abc")
+    assert result == tmp_path / "agent-manager" / "runs" / "run-abc"
+    assert result.is_dir()
+
+
+def test_run_dir_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    first = paths.run_dir("run-abc")
+    (first / "journal.jsonl").write_text("{}\n")
+    second = paths.run_dir("run-abc")
+    assert first == second
+    assert (second / "journal.jsonl").read_text() == "{}\n"
+
+
+def test_attempt_dir_layout(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    result = paths.attempt_dir("run-abc", "abc123", "implement", 2)
+    assert result == (
+        tmp_path / "agent-manager" / "runs" / "run-abc" / "abc123" / "implement.2"
+    )
+    assert result.is_dir()
+
+
+def test_attempt_dir_separates_attempts_and_phases(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    first = paths.attempt_dir("run-abc", "abc123", "implement", 1)
+    second = paths.attempt_dir("run-abc", "abc123", "implement", 2)
+    review = paths.attempt_dir("run-abc", "abc123", "review", 1)
+
+    assert first != second
+    assert first != review
+    assert first.parent == second.parent == review.parent
+    assert first.parent == paths.run_dir("run-abc") / "abc123"
+
+
+def test_run_tree_never_lands_inside_a_worktree(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+
+    run = paths.run_dir("run-abc")
+    attempt = paths.attempt_dir("run-abc", "abc123", "implement", 1)
+
+    assert run.is_relative_to(paths.data_dir())
+    assert attempt.is_relative_to(paths.data_dir())
+    assert not run.is_relative_to(worktree)
+    assert not attempt.is_relative_to(worktree)
+    assert list(worktree.iterdir()) == []
