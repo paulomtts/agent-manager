@@ -126,6 +126,21 @@ def _is_registered(candidate: str, registered: list[str]) -> bool:
     return any(os.path.realpath(path) == real for path in registered)
 
 
+def _commit_count(git_runner: GitRunner, worktree_path: str, resolved_base: str) -> int:
+    """Commits on HEAD that are not on `resolved_base`, or 0 if unreadable.
+
+    Mirrors the JS `Number(...) || 0`: an empty or non-numeric answer is no
+    reason to fail a worktree that was just prepared successfully.
+    """
+    raw = git_runner(
+        ["-C", worktree_path, "rev-list", "--count", f"{resolved_base}..HEAD"]
+    )
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return 0
+
+
 def ensure(
     branch: str,
     base: str,
@@ -191,5 +206,5 @@ def ensure(
         "branch_existed": branch_existed,
         "worktree_existed": worktree_existed,
         "created": created,
-        "commit_count": 0,
+        "commit_count": _commit_count(git_runner, worktree_path, resolved_base),
     }

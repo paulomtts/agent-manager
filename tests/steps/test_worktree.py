@@ -325,3 +325,100 @@ def test_a_sibling_worktree_at_another_path_does_not_count_as_this_one(
     assert result["worktree_existed"] is False
     assert result["created"] is True
     assert sibling.is_dir()
+
+
+@requires_git
+def test_an_existing_branchs_commits_survive_the_checkout_path(
+    repo: Path, tmp_path: Path
+):
+    # A killed run left a commit on the subtask branch and no worktree. Cutting
+    # the branch again from base would silently discard that commit, so this
+    # call must check the branch out instead.
+    staging = tmp_path / "staging-wt"
+    _git(repo, "worktree", "add", str(staging), "-b", "m1/task-9")
+    _commit(staging, "prior.txt", "work from a killed run\n")
+    prior_head = _head(staging)
+    _git(repo, "worktree", "remove", str(staging))
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    assert result["branch_existed"] is True
+    assert result["created"] is True
+    assert result["commit_count"] == 1
+    assert _head(wt) == prior_head
+    assert (wt / "prior.txt").read_text() == "work from a killed run\n"
+
+
+@requires_git
+def test_commit_count_counts_only_the_commits_on_top_of_the_base(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+    _commit(wt, "one.txt", "1\n")
+    _commit(wt, "two.txt", "2\n")
+
+    result = worktree.ensure(**args)
+
+    assert result["worktree_existed"] is True
+    assert result["created"] is False
+    assert result["commit_count"] == 2
+
+
+@requires_git
+def test_an_unparseable_commit_count_is_zero_rather_than_a_crash(
+    repo: Path, tmp_path: Path
+):
+    # The worktree was created successfully; a count git could not print is no
+    # reason to abort the phase.
+    wt = tmp_path / "wt"
+
+    def runner(argv: list[str]) -> str:
+        if "rev-list" in argv:
+            return "\n"
+        return worktree.run_git(argv)
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+        git_runner=runner,
+    )
+
+    assert result["commit_count"] == 0
+    assert result["created"] is True
+
+
+@requires_git
+def test_a_non_numeric_commit_count_is_zero_rather_than_a_crash(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+
+    def runner(argv: list[str]) -> str:
+        if "rev-list" in argv:
+            return "fatal: bad revision\n"
+        return worktree.run_git(argv)
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+        git_runner=runner,
+    )
+
+    assert result["commit_count"] == 0
