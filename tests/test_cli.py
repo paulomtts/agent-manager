@@ -13,6 +13,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -612,6 +613,23 @@ def test_a_recorded_path_that_names_a_directory_reads_as_absent(tmp_path):
     """`exists()` would say yes and `read_text` would raise `IsADirectoryError`,
     turning a read-only report into a traceback."""
     (tmp_path / "stdout.log").mkdir()
+
+    payload = _payload_for(_artifact_attempt(tmp_path))
+
+    assert payload["artifacts"]["stdout"]["present"] is False
+    assert payload["artifacts"]["stdout"]["text"] is None
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root reads a 0o000 file, so the failure cannot be staged"
+)
+def test_an_unreadable_artifact_reads_as_absent_rather_than_raising(tmp_path):
+    """`is_file()` says yes and `read_text` then raises `PermissionError`, which
+    is outside `HANDLED` -- so a single unreadable artifact would take a
+    read-only report down as a traceback with no envelope at all."""
+    unreadable = tmp_path / "stdout.log"
+    unreadable.write_text("secret\n", encoding="utf-8")
+    unreadable.chmod(0o000)
 
     payload = _payload_for(_artifact_attempt(tmp_path))
 

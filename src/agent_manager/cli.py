@@ -317,18 +317,23 @@ def read_artifact(path: Path | None) -> dict[str, Any]:
     missing file and undecodable bytes are all facts to report, not refusals.
     `is_file()` rather than `exists()`: a recorded path that somehow names a
     directory must read as absent instead of raising `IsADirectoryError` out of
-    a read-only command. `errors="replace"` for the same reason.
+    a read-only command. `errors="replace"` for the same reason. The `OSError`
+    arm closes the same hole for the file that `is_file()` accepts and the read
+    then refuses -- an unreadable mode, a dead symlink target, a file deleted
+    between the two calls: none of those are in `HANDLED`, so any of them would
+    otherwise leave the operator a traceback instead of an envelope.
 
     `path` stays a `Path`; `render`'s `default=str` stringifies it once at the
     edge, exactly as `status_payload` leaves `worktree_path` alone.
     """
+    absent = {"path": path, "present": False, "text": None}
     if path is None or not Path(path).is_file():
-        return {"path": path, "present": False, "text": None}
-    return {
-        "path": path,
-        "present": True,
-        "text": Path(path).read_text(encoding="utf-8", errors="replace"),
-    }
+        return absent
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return absent
+    return {"path": path, "present": True, "text": text}
 
 
 def logs_payload(
