@@ -13,7 +13,7 @@ and both modules raise the same `WorkflowLoadError` base, so a caller catches
 one type for "this workflow could not be loaded".
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from agent_manager.steps import plan_check, reducers, verify, worktree
@@ -171,6 +171,42 @@ def _placeholder(name: str, owner: str) -> Function:
     return _unimplemented
 
 
+def _plan_hash_of(result: object) -> object:
+    """The `plan_hash` field of a dumped phase result, or `None`.
+
+    `None` rather than an error for a missing or non-mapping result: a phase
+    that was skipped, escalated or returned nothing has no hash to compare, and
+    `reducers.plan_hash_gate` already answers `None` (pass) for anything that is
+    not an 8-hex-character string.
+    """
+    return result.get("plan_hash") if isinstance(result, Mapping) else None
+
+
+def plan_hash_gate_adapter(
+    implement: object = None, review: object = None
+) -> dict[str, str] | None:
+    """`reducers.plan_hash_gate` bound to the two phase results it compares.
+
+    The document names this gate on the `review` phase, and
+    `engine.bind_arguments` binds strictly by parameter name out of a table of
+    whole values -- nothing in that table is called `impl_hash` or
+    `review_hash`, and the yaml `args:` map holds literals, so neither could be
+    written there either. This adapter takes the two names the table *does*
+    hold, the phase names `implement` and `review`, and does the one field
+    lookup the binder cannot do for itself. The reducer keeps its signature and
+    its tests; nothing about the comparison moves.
+
+    A module-level function rather than a closure built inside
+    `default_registry()`: `resolve(name) is resolve(name)` must hold across two
+    registries, which is the same invariant `_PLACEHOLDERS` exists to preserve.
+
+    Both parameters default to `None` so a run where `implement` never executed
+    in this process (a `plan_check` skip, or a resume started later) still binds
+    and passes, rather than failing to bind and reading as a document bug.
+    """
+    return reducers.plan_hash_gate(_plan_hash_of(implement), _plan_hash_of(review))
+
+
 BUILTIN_FUNCTION_NAMES = (
     "critic_blockers_gate",
     "exploration_output_gate",
@@ -200,7 +236,10 @@ def default_registry() -> FunctionRegistry:
     callables -- not wrappers -- so `resolve(name) is the_function` holds and a
     sibling's bugfix reaches the engine without touching this table. One name
     still has no implementation on this branch (`steps/rollup.py` does not
-    exist), so `rollup.set_status` resolves to a placeholder.
+    exist), so `rollup.set_status` resolves to a placeholder. `plan_hash_gate`
+    is the single exception to the "no wrappers" rule: see
+    `plan_hash_gate_adapter` above for why the binder cannot reach the two
+    fields that gate compares.
     """
     registry = FunctionRegistry()
 
@@ -208,7 +247,7 @@ def default_registry() -> FunctionRegistry:
     registry.register("exploration_output_gate", reducers.exploration_output_gate)
     registry.register("verification_gate", reducers.verification_gate)
     registry.register("review_gate", reducers.review_gate)
-    registry.register("plan_hash_gate", reducers.plan_hash_gate)
+    registry.register("plan_hash_gate", plan_hash_gate_adapter)
     registry.register("verification_passed_gate", reducers.verification_passed_gate)
     registry.register("critic_blockers_gate", reducers.critic_blockers_gate)
 
