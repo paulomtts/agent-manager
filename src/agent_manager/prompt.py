@@ -28,8 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from pydantic import BaseModel
+
 from agent_manager import dag, models
 from agent_manager.errors import EngineError
+from agent_manager.roles.loader import RoleBundle
 from agent_manager.workflow.loader import AgentPhase
 
 _MISSING = object()
@@ -264,6 +267,51 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
 def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
+
+
+METHODOLOGY_HEADING_PREFIX = "## methodology: "
+"""Heading that introduces one vendored methodology file inside the brief.
+
+The file is a heading in one document rather than a path on disk: the agent is
+handed the text it must follow, so it cannot follow a stale copy or fail to
+open it.
+"""
+
+
+def compose_brief(
+    role: RoleBundle,
+    rendered: RenderedPrompt,
+    *,
+    result_path: Path | str | None = None,
+    result_model: type[BaseModel] | None = None,
+    feedback: str | None = None,
+) -> str:
+    """The whole brief for one dispatch, as one document (addendum R2 §2).
+
+    Order is fixed: the role's standing instructions, its methodology, the
+    phase's rendered inputs, the result contract, the feedback. Feedback comes
+    last and is only ever appended, so the brief without it is a prefix of the
+    brief with it and a retry can append rather than recompose.
+
+    Pure: no disk, no clock, no randomness, no process. The result model is
+    handed in rather than looked up in `results.RESULT_MODELS`, which is what
+    keeps this function testable without the engine's registry.
+    """
+    parts: list[str] = [role.system]
+    for filename, body in role.methodology.items():
+        heading = f"{METHODOLOGY_HEADING_PREFIX}{filename}"
+        parts.append(heading + "\n" + body.strip("\n"))
+    parts.append(rendered.text)
+    return _join_sections(parts)
+
+
+def _join_sections(parts: list[str]) -> str:
+    """One blank line between neighbours, one newline at the end.
+
+    Only the newlines at each section's edges are normalised; interior text is
+    untouched, because a methodology document's own blank lines are part of it.
+    """
+    return "\n\n".join(part.strip("\n") for part in parts) + "\n"
 
 
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")

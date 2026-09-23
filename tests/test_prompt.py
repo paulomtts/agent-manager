@@ -11,9 +11,11 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, Field
 
 from agent_manager import dag, models, prompt
 from agent_manager.errors import EngineError
+from agent_manager.roles import loader as roles_loader
 from agent_manager.workflow.loader import AgentPhase
 
 CARD = models.Card(
@@ -413,3 +415,137 @@ def test_the_feedback_heading_lives_in_prompt_and_dispatch_reuses_it():
 
     assert prompt.FEEDBACK_HEADING == "## feedback on the previous attempt"
     assert dispatch.FEEDBACK_HEADING is prompt.FEEDBACK_HEADING
+
+
+BRIEF_POLICY = roles_loader.Policy(
+    allowed_tools=["Read", "Edit"],
+    default_model={"claude": "sonnet"},
+    max_attempts=2,
+)
+
+TDD_BODY = "# Test-driven development\n\n## Red\n\nWrite the failing test.\n"
+PLANS_BODY = "# Writing plans\n\nBite-sized steps, real code in every step.\n"
+
+
+def _role(
+    name: str = "coder",
+    *,
+    system: str = "# Coder\n\nYou execute an implementation plan under strict TDD.\n",
+    methodology: dict[str, str] | None = None,
+) -> roles_loader.RoleBundle:
+    """A synthetic bundle: the composer only reads `system` and `methodology`."""
+    return roles_loader.RoleBundle(
+        name=name,
+        system=system,
+        policy=BRIEF_POLICY,
+        methodology=dict(methodology or {}),
+    )
+
+
+def _rendered(inputs=("branch", "base_branch")) -> prompt.RenderedPrompt:
+    return prompt.render_prompt(_phase(list(inputs)), _context())
+
+
+def test_the_brief_orders_system_then_methodology_then_the_rendered_prompt():
+    role = _role(
+        methodology={
+            "test-driven-development.md": TDD_BODY,
+            "writing-plans.md": PLANS_BODY,
+        }
+    )
+    rendered = _rendered()
+
+    brief = prompt.compose_brief(role, rendered)
+
+    positions = [
+        brief.index("# Coder"),
+        brief.index("## methodology: test-driven-development.md"),
+        brief.index("## methodology: writing-plans.md"),
+        brief.index("# phase: implement"),
+    ]
+    assert positions == sorted(positions)
+    assert len(set(positions)) == len(positions)
+
+
+def test_each_methodology_file_gets_its_own_heading_and_a_verbatim_body():
+    role = _role(
+        methodology={
+            "test-driven-development.md": TDD_BODY,
+            "writing-plans.md": PLANS_BODY,
+        }
+    )
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert "## methodology: test-driven-development.md\n# Test-driven development" in brief
+    assert "## methodology: writing-plans.md\n# Writing plans" in brief
+    assert TDD_BODY.strip("\n") in brief
+    assert PLANS_BODY.strip("\n") in brief
+
+
+def test_a_role_with_no_methodology_puts_the_rendered_prompt_straight_after_system():
+    role = _role(name="reviewer", system="# Reviewer\n\nYou review finished work.\n")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert prompt.METHODOLOGY_HEADING_PREFIX not in brief
+    assert brief.startswith("# Reviewer\n\nYou review finished work.\n\n# phase: implement\n")
+
+
+def test_the_brief_carries_the_rendered_text_verbatim_and_ends_in_one_newline():
+    rendered = _rendered()
+
+    brief = prompt.compose_brief(_role(), rendered)
+
+    assert rendered.text.strip("\n") in brief
+    assert brief.endswith("\n")
+    assert not brief.endswith("\n\n")
+
+
+def test_two_roles_produce_different_briefs_from_the_same_rendered_prompt():
+    rendered = _rendered()
+    coder = _role(methodology={"test-driven-development.md": TDD_BODY})
+    critic = _role(name="critic", system="# Critic\n\nYou adversarially review.\n")
+
+    coder_brief = prompt.compose_brief(coder, rendered)
+    critic_brief = prompt.compose_brief(critic, rendered)
+
+    assert coder_brief != critic_brief
+    assert "# Coder" in coder_brief and "# Critic" not in coder_brief
+    assert "# Critic" in critic_brief and "# Coder" not in critic_brief
+
+
+def test_composing_twice_is_byte_identical_and_writes_nothing(tmp_path):
+    role = _role(methodology={"writing-plans.md": PLANS_BODY})
+    rendered = _rendered()
+
+    first = prompt.compose_brief(role, rendered)
+    second = prompt.compose_brief(role, rendered)
+
+    assert first == second
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_trailing_blank_lines_in_system_text_collapse_to_one_separator():
+    role = _role(system="# Coder\n\nDo the work.\n\n\n\n")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+
+
+def test_system_text_with_no_trailing_newline_still_gets_one_blank_line():
+    role = _role(system="# Coder\n\nDo the work.")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+
+
+def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
+    body = "# Writing plans\n\n## Step one\n\nWrite the test.\n\n## Step two\n\nRun it.\n"
+    role = _role(methodology={"writing-plans.md": body})
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
