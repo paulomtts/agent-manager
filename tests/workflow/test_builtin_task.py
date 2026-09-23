@@ -9,7 +9,12 @@ from agent_manager.workflow.loader import (
     DeterministicPhase,
     builtin_path,
 )
-from agent_manager.workflow.registry import WorkflowLoadError, default_registry
+from agent_manager.workflow.registry import (
+    FunctionRegistry,
+    UnknownFunctionError,
+    WorkflowLoadError,
+    default_registry,
+)
 
 # Design spec lines 146-225, in file order.
 EXPECTED_PHASES = (
@@ -107,3 +112,17 @@ def test_builtin_path_stays_inside_the_builtin_directory() -> None:
     assert path.name == "task.yaml"
     assert path.parent.name == "builtin"
     assert path.is_file()
+
+
+def test_a_substituted_registry_is_the_one_actually_used() -> None:
+    """`registry=` is the embedder's seam; if it were ignored, the default
+    registry would resolve this document and nothing would ever notice."""
+    with pytest.raises(UnknownFunctionError):
+        load_builtin("task", FunctionRegistry())
+
+
+def test_a_substituted_registry_supplies_the_resolved_callables() -> None:
+    substitute = default_registry()
+    workflow = load_builtin("task", substitute)
+    for name, fn in workflow.functions.items():
+        assert fn is substitute.resolve(name)
