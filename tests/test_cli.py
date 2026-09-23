@@ -457,6 +457,24 @@ def test_an_unknown_attempt_number_is_refused_and_names_the_attempts_that_exist(
     assert "recorded attempts: 1" in message
 
 
+def test_an_empty_list_in_a_refusal_reads_as_none_rather_than_a_dangling_colon():
+    """Both refusals end in a list, and both lists can be empty -- a card whose
+    phases were never recorded, and an explicit `--phase --attempt` pair aimed at
+    a phase with nothing in it. The word beats a trailing `: `."""
+    with pytest.raises(cli.UnknownPhaseError) as no_phases:
+        cli.select_attempt(_pure_subtask("card-1", []), phase="explore")
+
+    assert str(no_phases.value).endswith("recorded phases: none")
+
+    subtask = _pure_subtask(
+        "card-1", [models.PhaseRun(name="verify", kind="deterministic", status="pending")]
+    )
+    with pytest.raises(cli.UnknownAttemptError) as no_attempts:
+        cli.select_attempt(subtask, phase="verify", attempt=1)
+
+    assert str(no_attempts.value).endswith("recorded attempts: none")
+
+
 def test_an_explicit_phase_with_no_attempts_is_the_attempt_refusal():
     """`--phase verify` on a pending deterministic phase is an operator typing a
     real phase name. Without its own guard the default branch would reach `max()`
