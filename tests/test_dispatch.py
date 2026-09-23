@@ -375,26 +375,45 @@ def test_a_result_file_that_is_not_utf8_classifies_schema_invalid(tmp_path):
     assert "UTF-8" in verdict.detail
 
 
-def test_a_phase_with_no_result_model_takes_the_json_object_as_its_result(tmp_path):
+def test_a_result_less_phase_is_ok_with_no_result_at_all(tmp_path):
+    verdict = dispatch.classify(_outcome(tmp_path), None, None)
+
+    assert verdict == dispatch.Verdict("ok", result=None)
+    assert verdict.detail is None
+    assert verdict.fatal is False
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out", "fragment"),
+    [(None, True, "timed out"), (2, False, "exited 2")],
+)
+def test_a_result_less_phase_judges_a_bad_exit_on_status_alone(
+    tmp_path, exit_code, timed_out, fragment
+):
+    outcome = _outcome(tmp_path, exit_code=exit_code, timed_out=timed_out)
+
+    verdict = dispatch.classify(outcome, None, None)
+
+    assert verdict.status == "harness_error"
+    assert fragment in verdict.detail
+    assert verdict.result is None
+
+
+def test_a_result_less_phase_never_reads_a_result_file_that_is_there(tmp_path):
     result = tmp_path / "result.json"
-    result.write_text(json.dumps({"anything": [1, 2]}), encoding="utf-8")
+    result.write_text(json.dumps({"wrote": "docs/spec.md"}), encoding="utf-8")
 
     verdict = dispatch.classify(_outcome(tmp_path), result, None)
 
     assert verdict.status == "ok"
-    assert verdict.result == {"anything": [1, 2]}
+    assert verdict.result is None
 
 
-def test_a_json_array_with_no_result_model_classifies_schema_invalid(tmp_path):
-    # Review Focus: later phases and every gate read a mapping; a list would
-    # bind as a phase result nothing downstream can read.
-    result = tmp_path / "result.json"
-    result.write_text("[1, 2, 3]", encoding="utf-8")
+def test_a_result_less_phase_with_no_file_on_disk_is_still_ok(tmp_path):
+    verdict = dispatch.classify(_outcome(tmp_path), tmp_path / "absent.json", None)
 
-    verdict = dispatch.classify(_outcome(tmp_path), result, None)
-
-    assert verdict.status == "schema_invalid"
-    assert "JSON object" in verdict.detail
+    assert verdict.status == "ok"
+    assert verdict.result is None
 
 
 def test_a_missing_result_file_after_exit_zero_classifies_harness_error(tmp_path):
@@ -889,12 +908,21 @@ phases:
     writes: docs/superpowers/specs/{stem}.md
 """
     workflow = _workflow(document, {})
-    launcher = FakeLauncher(results=[json.dumps({"wrote": "docs/spec.md"})])
+    launcher = FakeLauncher(results=[None])
     runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("spec"), _context(worktree), _rendered())
 
-    assert result == {"wrote": "docs/spec.md"}
+    assert result is None
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+    # The attempt row still records the path the attempt directory would have
+    # used (cli.read_artifact reads it) even though classify was handed None.
+    terminal = [
+        line.payload
+        for line in store.journal.read()
+        if line.event == "attempt_upsert" and line.payload["status"] == "ok"
+    ][0]
+    assert terminal["result_path"].endswith("spec.1/result.json")
 
 
 def test_an_unregistered_result_model_is_a_named_engine_error(store, tmp_path, worktree):
@@ -1118,13 +1146,13 @@ phases:
     writes: docs/superpowers/specs/{stem}.md
 """
     workflow = _workflow(document, {})
-    launcher = FakeLauncher(results=[json.dumps({"wrote": "docs/spec.md"})])
+    launcher = FakeLauncher(results=[None])
     runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("spec"), _context(worktree), _rendered())
 
     brief = launcher.prompts[0]
-    assert result == {"wrote": "docs/spec.md"}
+    assert result is None
     assert prompt.RESULT_HEADING not in brief
     assert "Standing instructions for explorer." in brief
     assert f"{prompt.METHODOLOGY_HEADING_PREFIX}test-driven-development.md" in brief
