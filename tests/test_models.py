@@ -749,3 +749,12 @@ def test_card_node_children_default_is_per_instance():
     second = models.CardNode(id="c2", title="t", status="todo")
     first.children.append(models.CardNode(id="c3", title="t", status="todo"))
     assert second.children == []
+
+
+def test_phase_carries_the_reason_it_failed():
+    assert models.PhaseRun(name="verify", kind="deterministic").detail is None
+    failed = models.PhaseRun(
+        name="verify", kind="deterministic", status="failed", detail="OSError: gone"
+    )
+    assert failed.detail == "OSError: gone"
+    assert failed.model_dump(mode="json")["detail"] == "OSError: gone"

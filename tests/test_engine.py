@@ -1137,3 +1137,124 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "verify",
         "mark_done",
     ]
+
+
+def _journalled_details(opened) -> list[tuple[str | None, str, str | None]]:
+    return [
+        (line.phase, line.payload["status"], line.payload["detail"])
+        for line in opened.journal.read()
+        if line.event == "phase_upsert"
+    ]
+
+
+def test_a_raising_step_writes_why_it_failed_into_the_journal(store):
+    """§9 makes the journal the truth the projection is rebuilt from, so the
+    reason a phase failed has to be *in* it. The returned summary is in-memory
+    only: an operator reading the audit trail after the process is gone would
+    otherwise see `failed` with no cause at all.
+    """
+
+    def alpha(card: str) -> dict[str, Any]:
+        raise OSError("disk went away")
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": alpha})
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    started, failed = _journalled_details(store)
+    assert started == ("alpha", "started", None)
+    assert failed[:2] == ("alpha", "failed")
+    assert "disk went away" in failed[2]
+    assert failed[2] == summary.detail
+
+
+def test_a_failing_gate_writes_its_verdict_into_the_journal(store):
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def alpha_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"blocked": "verification", "detail": "2 of 3 commands failed"}
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    _started, failed = _journalled_details(store)
+    assert failed[:2] == ("alpha", "failed")
+    assert "alpha_gate" in failed[2]
+    assert "2 of 3 commands failed" in failed[2]
+    assert failed[2] == summary.detail
+
+
+def test_a_best_effort_failure_is_journalled_with_its_reason_too(store):
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        raise RuntimeError("brd exited 1: board is locked")
+
+    def work(card: str) -> dict[str, Any]:
+        return {}
+
+    def done(card: str, status: str) -> dict[str, Any]:
+        return {}
+
+    def done_gate(result: dict[str, Any]) -> None:
+        return None
+
+    workflow = _workflow(
+        BEST_EFFORT,
+        {
+            "rollup.set_status": set_status,
+            "step.work": work,
+            "rollup.done": done,
+            "done_gate": done_gate,
+        },
+    )
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    details = dict(
+        (phase, detail)
+        for phase, status, detail in _journalled_details(store)
+        if status == "failed"
+    )
+    assert "board is locked" in details["mark_in_progress"]
+
+
+def test_a_phase_that_succeeds_journals_no_failure_detail(store):
+    def step(card: str) -> dict[str, Any]:
+        return {}
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": step})
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert _journalled_details(store) == [
+        ("alpha", "started", None),
+        ("alpha", "done", None),
+    ]

@@ -377,15 +377,20 @@ def _run_deterministic(
         _evaluate_gates(phase, workflow, _gate_values(context, phase.name, result), warnings)
         skip_to = _skip_target(phase, workflow, _gate_values(context, phase.name, result))
     except _GateFailed as failure:
-        _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
+        _record_phase(
+            store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail
+        )
         return _Outcome(ok=False, detail=failure.detail, warnings=warnings)
     except Exception as error:
         # Deliberately total. A step is other people's code -- GitError, OSError,
         # anything -- and an exception escaping the walk would leave the subtask
         # recorded `started` forever, which is exactly what resume mistakes for
         # work in flight.
-        _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
-        return _Outcome(ok=False, detail=_render_error(error), warnings=warnings)
+        detail = _render_error(error)
+        _record_phase(
+            store, story_id, subtask, phase, "failed", started_at, clock(), detail
+        )
+        return _Outcome(ok=False, detail=detail, warnings=warnings)
     _record_phase(store, story_id, subtask, phase, "done", started_at, clock())
     return _Outcome(ok=True, result=result, warnings=warnings, skip_to=skip_to)
 
@@ -402,6 +407,7 @@ def _record_phase(
     status: models.Status,
     started_at: datetime,
     ended_at: datetime | None,
+    detail: str | None = None,
 ) -> None:
     store.record_phase(
         story_id,
@@ -412,6 +418,7 @@ def _record_phase(
             status=status,
             started_at=started_at,
             ended_at=ended_at,
+            detail=detail,
         ),
     )
 
