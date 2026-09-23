@@ -18,6 +18,23 @@ perfectly good result file.
 from agent_manager.harness.base import Usage
 from agent_manager.models import Dispatch
 
+COMMAND = "claude"
+"""The executable. A bare name, resolved on PATH by the launcher's Popen: the
+adapter has no business knowing where a machine installed its harness."""
+
+PROMPT_INSTRUCTION = (
+    "Read {path} and follow the instructions in it exactly. It is your "
+    "complete brief for this task."
+)
+"""The `-p` argument: a pointer at the materialized prompt, not the prompt.
+
+§7 lines 296-298 pass documents by path rather than inlining them, and D4 puts
+the result path inside that rendered prompt text upstream -- so this one
+sentence is the whole bridge between the file the engine wrote and the process
+the launcher starts. Inlining the file instead would re-bill it, invite a stale
+copy, and make `build_command` read the disk.
+"""
+
 
 class ClaudeAdapter:
     """Turns a `Dispatch` into a `claude -p` argv and reads usage back out."""
@@ -39,7 +56,38 @@ class ClaudeAdapter:
     """
 
     def build_command(self, d: Dispatch) -> list[str]:
-        raise NotImplementedError  # Task 2
+        """The argv for one attempt. Pure: no disk, no clock, no process.
+
+        The two checks are the ones `Dispatch` cannot make for itself. Both are
+        `ValueError` rather than a bespoke class because no retry can fix
+        either, and neither is a harness failure to journal -- they are bugs
+        above the adapter.
+        """
+        if d.harness != self.name:
+            raise ValueError(
+                f"dispatch is routed to harness {d.harness!r}, not "
+                f"{self.name!r}: building a {self.name!r} argv for it would run "
+                f"the wrong program against a real worktree"
+            )
+        for field in ("cwd", "prompt_path", "result_path"):
+            path = getattr(d, field)
+            if not path.is_absolute():
+                raise ValueError(
+                    f"Dispatch.{field} must be absolute, got {str(path)!r}: the "
+                    f"harness starts in the worktree, so a relative path would "
+                    f"resolve inside it -- and a result file written there gets "
+                    f"committed (D4 keeps it outside)"
+                )
+        return [
+            COMMAND,
+            "--model",
+            d.model,
+            # D7: v1 launches full-auto. Confinement is the launcher's seam,
+            # not a flag the adapter negotiates.
+            "--dangerously-skip-permissions",
+            "-p",
+            PROMPT_INSTRUCTION.format(path=d.prompt_path),
+        ]
 
     def parse_usage(self, stdout: str) -> Usage | None:
         raise NotImplementedError  # Task 3
