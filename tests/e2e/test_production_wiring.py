@@ -55,3 +55,27 @@ def test_run_card_drives_every_phase_under_a_fake_claude_and_the_board_says_done
     assert sorted(agent_attempts) == sorted(AGENT_PHASES)
     for name in AGENT_PHASES:
         assert agent_attempts[name].status == "ok", (name, agent_attempts[name])
+
+
+def test_every_agent_ran_in_the_subtask_worktree(fake_log, worktree):
+    """R6 / D7: every agent phase, explore included, is dispatched with the
+    subtask worktree as its cwd. Read off the fake's own log, which is the only
+    witness of where the child process actually stood."""
+    entries = [
+        json.loads(line)
+        for line in fake_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert {entry["phase"] for entry in entries} == set(AGENT_PHASES)
+    for entry in entries:
+        assert Path(entry["cwd"]).resolve() == worktree.resolve(), entry
+
+
+def test_the_worktree_is_clean_after_the_run(worktree):
+    """Design §14 / D4: run state lives under `paths.data_dir()`. A result file,
+    a prompt or a stdout log inside the worktree would show up here."""
+    assert _git(worktree, "status", "--porcelain") == ""
+    assert list(worktree.rglob("result.json")) == []
+    assert list(worktree.rglob("prompt.txt")) == []
+    assert list(worktree.rglob("stdout.log")) == []
