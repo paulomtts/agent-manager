@@ -23,7 +23,7 @@ from typing import Any, Literal
 
 from agent_manager import models
 from agent_manager.store import Store
-from agent_manager.workflow.loader import DeterministicPhase, Workflow
+from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
 
 _EMPTY = inspect.Parameter.empty
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
@@ -148,6 +148,14 @@ def _utcnow() -> datetime:
 
 Clock = Callable[[], datetime]
 
+AgentPhaseRunner = Callable[["AgentPhase", Mapping[str, Any]], Any]
+"""The seam sibling bf8e415b fills: `(phase, context) -> result`.
+
+Everything about an agent phase past this call -- prompt rendering, dispatch,
+schema validation, retry, its gates -- belongs to that subtask, not here. This
+module only takes the returned result into the context under the phase's name.
+"""
+
 
 @dataclass
 class SubtaskSummary:
@@ -254,6 +262,7 @@ def run_subtask(
     subtask: models.SubtaskRun,
     repo_dir: Path,
     commands: Sequence[str] = (),
+    agent_runner: AgentPhaseRunner | None = None,
     start_phase: str | None = None,
     clock: Clock = _utcnow,
 ) -> SubtaskSummary:
@@ -269,10 +278,16 @@ def run_subtask(
     while index < len(workflow.phases):
         phase = workflow.phases[index]
         if not isinstance(phase, DeterministicPhase):
-            raise EngineError(
-                "is an agent phase, but no agent runner was injected",
-                phase=phase.name,
-            )
+            if agent_runner is None:
+                raise EngineError(
+                    "is an agent phase, but no agent runner was injected",
+                    phase=phase.name,
+                )
+            result = agent_runner(phase, dict(context))
+            _bind_result(context, phase.name, result)
+            summary.results[phase.name] = result
+            index += 1
+            continue
         outcome = _run_deterministic(
             phase, workflow, store, story_id, subtask, context, clock
         )

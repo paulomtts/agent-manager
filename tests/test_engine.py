@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 
 from agent_manager import engine, models, store as store_module
-from agent_manager.workflow.loader import load_workflow
-from agent_manager.workflow.registry import FunctionRegistry
+from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
+from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
 REPO = Path("/repo")
 
@@ -941,3 +941,199 @@ def test_a_failed_best_effort_phase_contributes_no_result(store):
     )
 
     assert set(summary.results) == {"work", "mark_done"}
+
+
+MIXED = """
+name: mixed
+phases:
+  - name: explore
+    kind: agent
+    role: explorer
+    result: ExploreResult
+  - name: work
+    kind: deterministic
+    run: step.work
+"""
+
+
+def test_an_agent_phase_goes_to_the_injected_runner(store):
+    seen: list[tuple[str, str]] = []
+
+    def agent_runner(phase, context):
+        seen.append((phase.name, phase.role))
+        return {"summary": "explored"}
+
+    def work(card: str, explore: dict[str, Any]) -> dict[str, Any]:
+        seen.append(("work", explore["summary"]))
+        return {}
+
+    workflow = _workflow(MIXED, {"step.work": work})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+    )
+
+    assert seen == [("explore", "explorer"), ("work", "explored")]
+    assert summary.results["explore"] == {"summary": "explored"}
+    assert _projected_phases(store) == [("work", "done")]
+
+
+def test_an_agent_phase_with_no_runner_is_a_named_engine_error(store):
+    def work(card: str) -> dict[str, Any]:
+        return {}
+
+    workflow = _workflow(MIXED, {"step.work": work})
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+        )
+
+    assert caught.value.phase == "explore"
+    assert "agent runner" in str(caught.value)
+
+
+def test_starting_at_a_named_phase_runs_only_from_there(store):
+    calls: list[str] = []
+
+    def make(name: str):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            return {}
+
+        return step
+
+    workflow = _workflow(
+        THREE_PHASES,
+        {"step.alpha": make("alpha"), "step.beta": make("beta"), "step.gamma": make("gamma")},
+    )
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        start_phase="beta",
+    )
+
+    assert calls == ["beta", "gamma"]
+    assert summary.status == "done"
+    assert _projected_phases(store) == [("beta", "done"), ("gamma", "done")]
+
+
+def test_an_unknown_starting_phase_is_an_error_before_anything_is_recorded(store):
+    calls: list[str] = []
+
+    def step(card: str) -> dict[str, Any]:
+        calls.append("ran")
+        return {}
+
+    workflow = _workflow(
+        THREE_PHASES, {"step.alpha": step, "step.beta": step, "step.gamma": step}
+    )
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            start_phase="beeta",
+        )
+
+    assert calls == []
+    assert "'beeta'" in str(caught.value)
+    assert store.connection.execute("SELECT COUNT(*) FROM phases").fetchone()[0] == 0
+
+
+def test_the_builtin_task_document_walks_against_a_fake_registry(store):
+    calls: list[str] = []
+
+    def set_status(card: str, status: str) -> dict[str, Any]:
+        calls.append(f"rollup.set_status:{status}")
+        return {"card": card, "status": status}
+
+    def ensure(branch: str, base: str, worktree: Any, repo_dir: Any) -> dict[str, Any]:
+        calls.append("worktree.ensure")
+        return {"created": True}
+
+    def find_plan(card: str) -> dict[str, Any]:
+        calls.append("plan_check.find_validated_plan")
+        return {"found": False, "validated": False}
+
+    def has_plan(result: dict[str, Any]) -> bool:
+        return bool(result.get("validated"))
+
+    def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
+        calls.append("verify.run_suite")
+        return {"passed": True}
+
+    def verification_passed_gate(result: dict[str, Any]) -> None:
+        calls.append("verification_passed_gate")
+        return None
+
+    def agent_only_gate(**kwargs: Any) -> None:
+        raise AssertionError("an agent phase's gate is the agent runner's business")
+
+    functions: dict[str, Any] = {
+        "rollup.set_status": set_status,
+        "worktree.ensure": ensure,
+        "plan_check.find_validated_plan": find_plan,
+        "plan_check.has_validated_plan": has_plan,
+        "verify.run_suite": run_suite,
+        "verification_passed_gate": verification_passed_gate,
+        "critic_blockers_gate": agent_only_gate,
+        "exploration_output_gate": agent_only_gate,
+        "review_gate": agent_only_gate,
+        "plan_hash_gate": agent_only_gate,
+        "verification_gate": agent_only_gate,
+    }
+    assert sorted(functions) == sorted(BUILTIN_FUNCTION_NAMES)
+
+    def agent_runner(phase: AgentPhase, context: dict[str, Any]) -> dict[str, Any]:
+        calls.append(f"agent:{phase.name}")
+        return {"role": phase.role}
+
+    workflow = load_builtin("task", _registry(functions))
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        agent_runner=agent_runner,
+    )
+
+    assert calls == [
+        "agent:explore",
+        "rollup.set_status:in_progress",
+        "worktree.ensure",
+        "plan_check.find_validated_plan",
+        "agent:spec",
+        "agent:validate_spec",
+        "agent:plan",
+        "agent:validate_plan",
+        "agent:implement",
+        "agent:review",
+        "verify.run_suite",
+        "verification_passed_gate",
+        "rollup.set_status:done",
+    ]
+    assert summary.status == "done"
+    assert summary.warnings == []
+    assert [name for name, _status in _projected_phases(store)] == [
+        "mark_in_progress",
+        "worktree",
+        "plan_check",
+        "verify",
+        "mark_done",
+    ]
