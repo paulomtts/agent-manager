@@ -268,8 +268,11 @@ def build_result(phase, payload, text, cwd):
         _document(cwd, relative, "plan")
         return override(payload, path=relative, self_reviewed=True, note=None)
     if phase == "implement":
-        relative = _section(found, "plan_path", phase)
-        digest = plan_hash_of(Path(cwd) / relative)
+        # Card f26b377d: the hash comes from the brief's `## plan_hash` section,
+        # never from hashing the plan. A fake that computed it would keep the
+        # wiring test green with the input missing from `builtin/task.yaml`,
+        # which is the one thing this tier exists to catch (R4).
+        digest = _section(found, "plan_hash", phase)
         (Path(cwd) / IMPLEMENTATION_NAME).write_text(
             f"# implementation\n\n{SUMMARY}\n", encoding="utf-8"
         )
