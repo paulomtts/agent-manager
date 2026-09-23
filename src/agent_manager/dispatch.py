@@ -20,18 +20,21 @@ Three rules shape everything here, and none of them is negotiable:
 """
 
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from agent_manager import engine, models, paths, prompt
-from agent_manager.errors import EngineError
-from agent_manager.harness.base import HarnessAdapter, Outcome
-from agent_manager.harness.registry import DEFAULT_HARNESS
-from agent_manager.roles.loader import RoleBundle
+from agent_manager import engine, models, paths, prompt, results
+from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
+from agent_manager.harness.launcher import LauncherFn
+from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
+from agent_manager.roles.loader import RoleBundle, load_role
+from agent_manager.store import Store
 from agent_manager.workflow.loader import AgentPhase, Workflow
 
 RESULT_NAME = "result.json"
@@ -324,3 +327,205 @@ def evaluate_gates(
             ),
         )
     return None
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+Clock = Callable[[], datetime]
+
+
+@dataclass
+class AgentRunner:
+    """One agent phase, run to a terminal outcome: `engine.AgentPhaseRunner`.
+
+    A callable object rather than a function because the seam's signature is
+    `(phase, context, rendered)` and a dispatch needs six more things -- the
+    store to journal into, the run and card ids the attempt directory is keyed
+    by, the injected launcher, the adapter table and the result-model table.
+    They are bound once, at run start, and the walk stays ignorant of all of it.
+
+    `warnings` is the one out-of-band channel: gate warnings have nowhere to go
+    in a signature that returns a result, and dropping them would reproduce the
+    exact failure §12 calls out -- a run that reports success while something it
+    was told about never happened. The caller that constructs the runner reads
+    this list when the walk returns.
+    """
+
+    workflow: Workflow
+    store: Store
+    launcher: LauncherFn
+    run_id: str
+    story_id: str
+    card_id: str
+    adapters: Mapping[str, HarnessAdapter] = field(default_factory=default_adapters)
+    result_models: Mapping[str, type[BaseModel]] = field(
+        default_factory=lambda: dict(results.RESULT_MODELS)
+    )
+    harness_map: Mapping[str, models.HarnessAssignment] = field(default_factory=dict)
+    role_root: Path | None = None
+    timeout: float = DEFAULT_TIMEOUT
+    clock: Clock = _utcnow
+    warnings: list[str] = field(default_factory=list)
+
+    def __call__(
+        self,
+        phase: AgentPhase,
+        context: Mapping[str, Any],
+        rendered: prompt.RenderedPrompt,
+    ) -> Any:
+        """§6 steps 1-8 for one phase. Returns its result, or raises.
+
+        The whole resolution half (role bundle, harness, result model, worktree)
+        happens before the phase is recorded `started`-and-dispatched, so a
+        document bug costs nothing and journals no attempt.
+        """
+        role = load_role(phase.role, root=self.role_root)
+        target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
+        model = (
+            None
+            if phase.result is None
+            else results.resolve_result_model(
+                phase.result, self.result_models, phase=phase.name
+            )
+        )
+        cwd = self._worktree(context, phase.name)
+
+        started_at = self.clock()
+        self._record_phase(phase, "started", started_at, None, None)
+        budget = 1 if phase.retry is None else phase.retry.max_attempts
+        retry_on = () if phase.retry is None else tuple(phase.retry.on)
+        text = rendered
+        verdict = Verdict("harness_error", detail="no attempt was made")
+
+        for _ in range(budget):
+            verdict = self._attempt(phase, context, text, target, role, cwd, model)
+            if verdict.status == "ok":
+                self._record_phase(phase, "done", started_at, self.clock(), None)
+                return verdict.result
+            if verdict.fatal or verdict.status not in retry_on:
+                break
+            text = with_feedback(text, verdict.detail or verdict.status)
+
+        detail = verdict.detail or verdict.status
+        self._record_phase(phase, "failed", started_at, self.clock(), detail)
+        raise AgentPhaseFailed(phase.name, outcome=verdict.status, detail=detail)
+
+    def _attempt(
+        self,
+        phase: AgentPhase,
+        context: Mapping[str, Any],
+        rendered: prompt.RenderedPrompt,
+        target: Target,
+        role: RoleBundle,
+        cwd: Path,
+        model: type[BaseModel] | None,
+    ) -> Verdict:
+        """One dispatch: directory, prompt, argv, launcher, result, gates."""
+        n = next_attempt(self.run_id, self.card_id, phase.name)
+        attempt_dir = paths.attempt_dir(self.run_id, self.card_id, phase.name, n)
+        prompt_path = rendered.write(attempt_dir)
+        stdout_path = attempt_dir / STDOUT_NAME
+        dispatch_record = build_dispatch(
+            target=target,
+            role=role,
+            cwd=cwd,
+            prompt_path=prompt_path,
+            attempt_dir=attempt_dir,
+            timeout=self.timeout,
+        )
+        # Recorded `started` before the launcher runs, because that is the row
+        # resume reads when the manager dies mid-attempt (§9).
+        self._record_attempt(
+            phase,
+            models.Attempt(
+                n=n,
+                dispatch=dispatch_record,
+                status="started",
+                prompt_path=prompt_path,
+                result_path=dispatch_record.result_path,
+                stdout_path=stdout_path,
+            ),
+        )
+        argv = target.adapter.build_command(dispatch_record)
+        outcome = self.launcher(
+            argv, cwd=cwd, timeout=self.timeout, stdout_path=stdout_path
+        )
+        verdict = classify(outcome, dispatch_record.result_path, model)
+        if verdict.status == "ok":
+            failure = evaluate_gates(
+                phase,
+                self.workflow,
+                gate_values(context, phase.name, verdict.result),
+                self.warnings,
+            )
+            if failure is not None:
+                verdict = failure
+        usage = _usage(target.adapter, outcome)
+        self._record_attempt(
+            phase,
+            models.Attempt(
+                n=n,
+                dispatch=dispatch_record,
+                status=verdict.status,
+                exit_code=outcome.exit_code,
+                duration=outcome.duration,
+                tokens_in=None if usage is None else usage.tokens_in,
+                tokens_out=None if usage is None else usage.tokens_out,
+                cost=None if usage is None else usage.cost,
+                prompt_path=prompt_path,
+                result_path=dispatch_record.result_path,
+                stdout_path=stdout_path,
+            ),
+        )
+        return verdict
+
+    def _worktree(self, context: Mapping[str, Any], phase_name: str) -> Path:
+        """The cwd D7 pins the harness to: the subtask's own worktree."""
+        worktree = context.get("worktree")
+        if worktree is None:
+            raise EngineError(
+                "cannot dispatch: the context has no worktree to run the harness in "
+                "(the worktree phase runs before any agent phase that writes)",
+                phase=phase_name,
+            )
+        return Path(worktree)
+
+    def _record_phase(
+        self,
+        phase: AgentPhase,
+        status: models.Status,
+        started_at: datetime,
+        ended_at: datetime | None,
+        detail: str | None,
+    ) -> None:
+        self.store.record_phase(
+            self.story_id,
+            self.card_id,
+            models.PhaseRun(
+                name=phase.name,
+                kind="agent",
+                status=status,
+                started_at=started_at,
+                ended_at=ended_at,
+                detail=detail,
+            ),
+        )
+
+    def _record_attempt(self, phase: AgentPhase, attempt: models.Attempt) -> None:
+        self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
+
+
+def _usage(adapter: HarnessAdapter, outcome: Outcome) -> Usage | None:
+    """What the attempt cost, as far as `stdout.log` says. Never raises.
+
+    The only thing the log is ever read for (D4). `errors="replace"` and the
+    swallowed `OSError` are deliberate: a truncated or unreadable log must not
+    turn an attempt that produced a perfectly good result file into a failure.
+    """
+    try:
+        text = outcome.stdout_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return adapter.parse_usage(text)

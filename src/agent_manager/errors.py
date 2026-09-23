@@ -38,3 +38,24 @@ class EngineError(RuntimeError):
             parts.append(f"parameter {parameter!r}")
         prefix = ", ".join(parts)
         super().__init__(f"{prefix}: {reason}" if prefix else reason)
+
+
+class AgentPhaseFailed(RuntimeError):
+    """An agent phase ended on a terminal failure, with its attempts recorded.
+
+    Raised rather than returned because `engine.AgentPhaseRunner` is typed
+    `(phase, context, rendered) -> result`: there is no second channel in that
+    signature, and returning a sentinel result would be indistinguishable from a
+    phase whose harness genuinely produced one. `run_subtask` catches it and
+    turns it into `summary.status = "escalated"` -- the same edge the
+    deterministic branch reaches through `_Outcome(ok=False, ...)`.
+
+    `outcome` is one of §6 line 277's four journalled names, so an operator
+    reading the message knows whether to fix a prompt, a gate or a harness.
+    """
+
+    def __init__(self, phase: str, *, outcome: str, detail: str) -> None:
+        self.phase = phase
+        self.outcome = outcome
+        self.detail = detail
+        super().__init__(f"phase {phase!r} ended {outcome}: {detail}")
