@@ -340,6 +340,62 @@ def test_story_rejects_a_negative_level():
     assert "level" in str(excinfo.value)
 
 
+_IDENTITY_BASELINES = {
+    "Dispatch": dict(
+        harness="claude",
+        model="opus",
+        role="coder",
+        cwd=Path("/repo/wt"),
+        prompt_path=Path("/runs/run-1/1535b285/implement.1/prompt.txt"),
+        result_path=Path("/runs/run-1/1535b285/implement.1/result.json"),
+    ),
+    "PhaseRun": dict(name="implement", kind="agent"),
+    "SubtaskRun": dict(card_id="1535b285", branch="m1/x-1535b285", base_branch="main"),
+    "StoryRun": dict(card_id="8831189b", title="Foundations", level=0),
+    "HarnessAssignment": dict(harness="claude", model="sonnet"),
+    "Run": dict(
+        id="run-2026-09-23-01",
+        workflow="task",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    ),
+}
+
+_EMPTY_IDENTITY_FIELDS = [
+    ("Dispatch", "harness"),
+    ("Dispatch", "model"),
+    ("Dispatch", "role"),
+    ("PhaseRun", "name"),
+    ("SubtaskRun", "card_id"),
+    ("SubtaskRun", "branch"),
+    ("SubtaskRun", "base_branch"),
+    ("StoryRun", "card_id"),
+    ("HarnessAssignment", "harness"),
+    ("HarnessAssignment", "model"),
+    ("Run", "id"),
+    ("Run", "workflow"),
+    ("Run", "base_branch"),
+    ("Run", "branch_prefix"),
+]
+
+
+@pytest.mark.parametrize(
+    ("model_name", "field"),
+    _EMPTY_IDENTITY_FIELDS,
+    ids=[f"{model}.{field}" for model, field in _EMPTY_IDENTITY_FIELDS],
+)
+def test_empty_identity_strings_are_rejected_everywhere(model_name, field):
+    # Every string that names a thing -- a card, a branch, a phase, a harness --
+    # is a coordinate something downstream resolves. An empty one loses the
+    # coordinate exactly as a missing one does, only later and more quietly, so
+    # each of these fields carries `min_length=1` and each one is pinned here.
+    model = getattr(models, model_name)
+    with pytest.raises(ValidationError) as excinfo:
+        model(**{**_IDENTITY_BASELINES[model_name], field: ""})
+    assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]
+
+
 def _full_run() -> models.Run:
     """A run mid-flight: one story, one finished subtask, one in progress."""
     return models.Run(
