@@ -474,3 +474,16 @@ def test_an_absolute_plan_path_ignores_the_worktree(tmp_path: Path):
 
     assert got == {"path": str(plan), "appended": True}
     assert VALIDATED_MARKER in plan.read_text(encoding="utf-8")
+
+
+# Not `Path("")`: that stringifies to "." and is a relative path like any other,
+# which the worktree branch below resolves and then fails to read as a directory.
+@pytest.mark.parametrize("plan_path", [None, "", "   "])
+def test_an_empty_plan_path_is_a_caller_bug(tmp_path: Path, plan_path: object):
+    # The other half of `_resolved_plan_path`'s guard: with no path at all there
+    # is nothing to root at the worktree either, so it must be named up front
+    # rather than reported later as a read of `<worktree>` itself.
+    with pytest.raises(ValueError, match="needs a plan_path"):
+        plan_check.mark_validated(plan_path, tmp_path)  # type: ignore[arg-type]
+
+    assert list(tmp_path.iterdir()) == []
