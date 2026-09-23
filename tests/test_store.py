@@ -242,3 +242,177 @@ def test_a_run_directory_that_cannot_be_created_propagates_the_os_error(repo, tm
 
     with pytest.raises(OSError):
         store.Journal("run-blocked")
+
+
+def _story() -> models.StoryRun:
+    return models.StoryRun(
+        card_id="8831189b",
+        title="Foundations: paths, run store and journal",
+        level=0,
+        status="started",
+        tip_branch="m1/task-add-the-run-state-models-1535b285",
+    )
+
+
+def _subtask(card_id: str = "ef248597", base: str = "main") -> models.SubtaskRun:
+    return models.SubtaskRun(
+        card_id=card_id,
+        branch=f"m1/task-{card_id}",
+        base_branch=base,
+        status="started",
+        worktree_path=Path(f"/repo/.claude/worktrees/m1/task-{card_id}"),
+    )
+
+
+def test_record_run_writes_the_journal_line_and_the_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        line = st.record_run(_run(repo))
+        assert line.event == "run_upsert"
+        assert line.card is None
+
+        row = st.connection.execute("SELECT * FROM runs WHERE id = ?", (RUN_ID,)).fetchone()
+        assert row["workflow"] == "milestone"
+        assert row["status"] == "started"
+        assert row["repo_dir"] == str(repo)
+        assert json.loads(row["config"])["max_concurrent_stories"] == 2
+    finally:
+        st.close()
+
+    lines = store.Journal(RUN_ID).read()
+    assert [line.event for line in lines] == ["run_upsert"]
+    assert lines[0].payload["workflow"] == "milestone"
+    assert "stories" not in lines[0].payload
+
+
+def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_subtask("8831189b", _subtask())
+        st.record_phase(
+            "8831189b",
+            "ef248597",
+            models.PhaseRun(
+                name="implement",
+                kind="agent",
+                status="started",
+                started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+            ),
+        )
+        attempt_line = st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, cost=0.42),
+        )
+
+        assert attempt_line.story == "8831189b"
+        assert attempt_line.card == "ef248597"
+        assert attempt_line.phase == "implement"
+        assert attempt_line.attempt == 1
+
+        assert st.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 1
+        assert st.connection.execute("SELECT COUNT(*) FROM subtasks").fetchone()[0] == 1
+        phase_row = st.connection.execute("SELECT * FROM phases").fetchone()
+        assert phase_row["kind"] == "agent"
+        assert phase_row["ended_at"] is None
+        attempt_row = st.connection.execute("SELECT * FROM attempts").fetchone()
+        assert attempt_row["status"] == "ok"
+        assert attempt_row["exit_code"] == 0
+        assert attempt_row["cost"] == pytest.approx(0.42)
+        assert json.loads(attempt_row["dispatch"])["role"] == "coder"
+    finally:
+        st.close()
+
+    assert [line.event for line in store.Journal(RUN_ID).read()] == [
+        "run_upsert",
+        "story_upsert",
+        "subtask_upsert",
+        "phase_upsert",
+        "attempt_upsert",
+    ]
+
+
+def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
+    # §9 line 365: the journal is appended first. Closing the connection is a
+    # real SQLite failure -- no mock -- and the line must survive it.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+
+    with pytest.raises(sqlite3.Error):
+        st.record_story(_story())
+
+    lines = store.Journal(RUN_ID).read()
+    assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
+    assert lines[1].story == "8831189b"
+
+    reopened = store.Store.open(repo, RUN_ID)
+    try:
+        assert reopened.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_recording_a_node_again_updates_it_without_duplicating_or_reordering(repo):
+    # Review Focus 5: pending -> started -> done is the same node three times.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        first = _subtask("fdebc746")
+        second = _subtask("1535b285", base="m1/task-fdebc746")
+        st.record_subtask("8831189b", first)
+        st.record_subtask("8831189b", second)
+
+        st.record_subtask("8831189b", first.model_copy(update={"status": "done"}))
+        st.record_subtask("8831189b", second.model_copy(update={"status": "failed"}))
+
+        rows = st.connection.execute(
+            "SELECT card_id, status FROM subtasks WHERE run_id = ? AND story_id = ?"
+            " ORDER BY position",
+            (RUN_ID, "8831189b"),
+        ).fetchall()
+    finally:
+        st.close()
+
+    assert [(row["card_id"], row["status"]) for row in rows] == [
+        ("fdebc746", "done"),
+        ("1535b285", "failed"),
+    ]
+
+
+def test_run_status_transitions_replace_the_single_run_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        run = _run(repo)
+        st.record_run(run)
+        st.record_run(run.model_copy(update={"status": "done"}))
+        rows = st.connection.execute("SELECT id, status FROM runs").fetchall()
+    finally:
+        st.close()
+
+    assert [(row["id"], row["status"]) for row in rows] == [(RUN_ID, "done")]
+    assert len(store.Journal(RUN_ID).read()) == 2
+
+
+def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
+    # D5 and §4: the two stores are independent of the board and of the
+    # worktree. Nothing agent-manager writes may land in the repo.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_subtask("8831189b", _subtask())
+        st.record_phase("8831189b", "ef248597", models.PhaseRun(name="implement", kind="agent"))
+        st.record_attempt(
+            "8831189b", "ef248597", "implement", models.Attempt(n=1, dispatch=_dispatch())
+        )
+    finally:
+        st.close()
+
+    assert list(repo.iterdir()) == []
+    assert paths.project_db_path(repo).is_relative_to(tmp_path / "data")
+    assert store.Journal(RUN_ID).path.is_relative_to(tmp_path / "data")

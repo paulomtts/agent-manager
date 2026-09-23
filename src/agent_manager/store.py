@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_manager import paths
+from agent_manager import models, paths
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -218,3 +218,265 @@ class Journal:
             handle.flush()
             os.fsync(handle.fileno())
         return line
+
+
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _text(value: Path | None) -> str | None:
+    return None if value is None else str(value)
+
+
+class Store:
+    """The two stores of D5, bound together by the write ordering of §9.
+
+    Every `record_*` appends the journal line first and writes the row second.
+    There is deliberately no public method that writes a row on its own.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, journal: Journal) -> None:
+        self._conn = conn
+        self._journal = journal
+
+    @classmethod
+    def open(cls, root: Path, run_id: str) -> "Store":
+        return cls(open_db(root), Journal(run_id))
+
+    @property
+    def run_id(self) -> str:
+        return self._journal.run_id
+
+    @property
+    def journal(self) -> Journal:
+        return self._journal
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # -- recording ---------------------------------------------------------
+
+    def record_run(self, run: models.Run) -> JournalLine:
+        line = self._journal.append(
+            "run_upsert", run.model_dump(mode="json", exclude={"stories"})
+        )
+        self._write_run_row(self.run_id, run)
+        return line
+
+    def record_story(self, story: models.StoryRun) -> JournalLine:
+        line = self._journal.append(
+            "story_upsert",
+            story.model_dump(mode="json", exclude={"subtasks"}),
+            story=story.card_id,
+        )
+        self._write_story_row(self.run_id, story)
+        return line
+
+    def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> JournalLine:
+        line = self._journal.append(
+            "subtask_upsert",
+            subtask.model_dump(mode="json", exclude={"phases"}),
+            story=story_id,
+            card=subtask.card_id,
+        )
+        self._write_subtask_row(self.run_id, story_id, subtask)
+        return line
+
+    def record_phase(
+        self, story_id: str, card_id: str, phase: models.PhaseRun
+    ) -> JournalLine:
+        line = self._journal.append(
+            "phase_upsert",
+            phase.model_dump(mode="json", exclude={"attempts"}),
+            story=story_id,
+            card=card_id,
+            phase=phase.name,
+        )
+        self._write_phase_row(self.run_id, story_id, card_id, phase)
+        return line
+
+    def record_attempt(
+        self, story_id: str, card_id: str, phase_name: str, attempt: models.Attempt
+    ) -> JournalLine:
+        line = self._journal.append(
+            "attempt_upsert",
+            attempt.model_dump(mode="json"),
+            story=story_id,
+            card=card_id,
+            phase=phase_name,
+            attempt=attempt.n,
+        )
+        self._write_attempt_row(self.run_id, story_id, card_id, phase_name, attempt)
+        return line
+
+    # -- row writers -------------------------------------------------------
+    #
+    # `position` is assigned from the sibling count at insert time and is never
+    # touched by the conflict clause, so recording a node twice updates it in
+    # place and leaves the order it was first seen in.
+
+    def _write_run_row(self, run_id: str, run: models.Run) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,
+                              status, started_at, config)
+            VALUES (:id, :workflow, :repo_dir, :base_branch, :branch_prefix,
+                    :status, :started_at, :config)
+            ON CONFLICT(id) DO UPDATE SET
+                workflow=excluded.workflow,
+                repo_dir=excluded.repo_dir,
+                base_branch=excluded.base_branch,
+                branch_prefix=excluded.branch_prefix,
+                status=excluded.status,
+                started_at=excluded.started_at,
+                config=excluded.config
+            """,
+            {
+                "id": run_id,
+                "workflow": run.workflow,
+                "repo_dir": str(run.repo_dir),
+                "base_branch": run.base_branch,
+                "branch_prefix": run.branch_prefix,
+                "status": run.status,
+                "started_at": _iso(run.started_at),
+                "config": json.dumps(run.config.model_dump(mode="json"), sort_keys=True),
+            },
+        )
+        self._conn.commit()
+
+    def _write_story_row(self, run_id: str, story: models.StoryRun) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO stories (run_id, card_id, title, level, status, tip_branch, position)
+            VALUES (:run_id, :card_id, :title, :level, :status, :tip_branch,
+                    (SELECT COUNT(*) FROM stories WHERE run_id = :run_id))
+            ON CONFLICT(run_id, card_id) DO UPDATE SET
+                title=excluded.title,
+                level=excluded.level,
+                status=excluded.status,
+                tip_branch=excluded.tip_branch
+            """,
+            {
+                "run_id": run_id,
+                "card_id": story.card_id,
+                "title": story.title,
+                "level": story.level,
+                "status": story.status,
+                "tip_branch": story.tip_branch,
+            },
+        )
+        self._conn.commit()
+
+    def _write_subtask_row(
+        self, run_id: str, story_id: str, subtask: models.SubtaskRun
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,
+                                  status, worktree_path, position)
+            VALUES (:run_id, :story_id, :card_id, :branch, :base_branch,
+                    :status, :worktree_path,
+                    (SELECT COUNT(*) FROM subtasks
+                      WHERE run_id = :run_id AND story_id = :story_id))
+            ON CONFLICT(run_id, story_id, card_id) DO UPDATE SET
+                branch=excluded.branch,
+                base_branch=excluded.base_branch,
+                status=excluded.status,
+                worktree_path=excluded.worktree_path
+            """,
+            {
+                "run_id": run_id,
+                "story_id": story_id,
+                "card_id": subtask.card_id,
+                "branch": subtask.branch,
+                "base_branch": subtask.base_branch,
+                "status": subtask.status,
+                "worktree_path": _text(subtask.worktree_path),
+            },
+        )
+        self._conn.commit()
+
+    def _write_phase_row(
+        self, run_id: str, story_id: str, card_id: str, phase: models.PhaseRun
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
+                                started_at, ended_at, position)
+            VALUES (:run_id, :story_id, :card_id, :name, :kind, :status,
+                    :started_at, :ended_at,
+                    (SELECT COUNT(*) FROM phases
+                      WHERE run_id = :run_id AND story_id = :story_id
+                        AND card_id = :card_id))
+            ON CONFLICT(run_id, story_id, card_id, name) DO UPDATE SET
+                kind=excluded.kind,
+                status=excluded.status,
+                started_at=excluded.started_at,
+                ended_at=excluded.ended_at
+            """,
+            {
+                "run_id": run_id,
+                "story_id": story_id,
+                "card_id": card_id,
+                "name": phase.name,
+                "kind": phase.kind,
+                "status": phase.status,
+                "started_at": _iso(phase.started_at),
+                "ended_at": _iso(phase.ended_at),
+            },
+        )
+        self._conn.commit()
+
+    def _write_attempt_row(
+        self,
+        run_id: str,
+        story_id: str,
+        card_id: str,
+        phase_name: str,
+        attempt: models.Attempt,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO attempts (run_id, story_id, card_id, phase, n, status,
+                                  exit_code, duration, tokens_in, tokens_out, cost,
+                                  prompt_path, result_path, stdout_path, dispatch)
+            VALUES (:run_id, :story_id, :card_id, :phase, :n, :status,
+                    :exit_code, :duration, :tokens_in, :tokens_out, :cost,
+                    :prompt_path, :result_path, :stdout_path, :dispatch)
+            ON CONFLICT(run_id, story_id, card_id, phase, n) DO UPDATE SET
+                status=excluded.status,
+                exit_code=excluded.exit_code,
+                duration=excluded.duration,
+                tokens_in=excluded.tokens_in,
+                tokens_out=excluded.tokens_out,
+                cost=excluded.cost,
+                prompt_path=excluded.prompt_path,
+                result_path=excluded.result_path,
+                stdout_path=excluded.stdout_path,
+                dispatch=excluded.dispatch
+            """,
+            {
+                "run_id": run_id,
+                "story_id": story_id,
+                "card_id": card_id,
+                "phase": phase_name,
+                "n": attempt.n,
+                "status": attempt.status,
+                "exit_code": attempt.exit_code,
+                "duration": attempt.duration,
+                "tokens_in": attempt.tokens_in,
+                "tokens_out": attempt.tokens_out,
+                "cost": attempt.cost,
+                "prompt_path": _text(attempt.prompt_path),
+                "result_path": _text(attempt.result_path),
+                "stdout_path": _text(attempt.stdout_path),
+                "dispatch": json.dumps(
+                    attempt.dispatch.model_dump(mode="json"), sort_keys=True
+                ),
+            },
+        )
+        self._conn.commit()
