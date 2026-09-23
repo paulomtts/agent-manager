@@ -16,7 +16,7 @@ one type for "this workflow could not be loaded".
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from agent_manager.steps import plan_check, reducers, rollup, verify, worktree
+from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
 
 Function = Callable[..., Any]
 """What a registered name resolves to. The engine, not this module, knows what
@@ -209,6 +209,7 @@ def plan_hash_gate_adapter(
 
 BUILTIN_FUNCTION_NAMES = (
     "critic_blockers_gate",
+    "docs_commit.commit_documents",
     "exploration_output_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
@@ -257,5 +258,6 @@ def default_registry() -> FunctionRegistry:
     registry.register("plan_check.find_validated_plan", plan_check.find_validated_plan)
     registry.register("plan_check.has_validated_plan", plan_check.has_validated_plan)
     registry.register("plan_check.mark_validated", plan_check.mark_validated)
+    registry.register("docs_commit.commit_documents", docs_commit.commit_documents)
     registry.register("rollup.set_status", rollup.set_status)
     return registry

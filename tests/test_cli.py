@@ -528,7 +528,7 @@ def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_chec
 
 
 SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan", "mark_validated")
-"""The phases `plan_check: skip_to implement` jumps over, which the engine
+"""The phases `plan_check: skip_to docs_commit` jumps over, which the engine
 records nowhere at all (engine.py:431-433 only appends to the in-memory
 summary), so an unrecorded stretch reads the same as one that never ran."""
 
@@ -548,6 +548,7 @@ def test_a_skipped_stretch_the_walk_ran_past_does_not_drag_the_restart_back():
                 for name in workflow.phase_names[:4]
                 if name not in SKIPPED_STRETCH
             ],
+            _recorded("docs_commit", "done"),
             _recorded("implement", "done", [_pure_attempt(1)]),
         ],
     )
@@ -1074,8 +1075,14 @@ def _canned_agent_result(phase, context) -> dict[str, Any]:
     """The canned result a faked agent phase returns.
 
     The real Plan agent writes the plan file that the deterministic
-    `mark_validated` phase then stamps, so the fake writes a stand-in there.
+    `mark_validated` phase then stamps, so the fake writes a stand-in there. The
+    real `docs_commit` phase then commits the spec and the plan, so the fake
+    writes a stand-in spec too.
     """
+    if phase.name == "spec":
+        spec = Path(context["worktree"]) / context["spec_path"]
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("# canned spec\n", encoding="utf-8")
     if phase.name == "plan":
         plan = Path(context["worktree"]) / context["plan_path"]
         plan.parent.mkdir(parents=True, exist_ok=True)

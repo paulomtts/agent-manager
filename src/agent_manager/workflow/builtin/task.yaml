@@ -23,7 +23,7 @@ phases:
   - name: plan_check
     kind: deterministic
     run: plan_check.find_validated_plan
-    skip_to: implement
+    skip_to: docs_commit
     when: plan_check.has_validated_plan
 
   - name: spec
@@ -57,6 +57,10 @@ phases:
   - name: mark_validated
     kind: deterministic
     run: plan_check.mark_validated
+
+  - name: docs_commit
+    kind: deterministic
+    run: docs_commit.commit_documents
 
   - name: implement
     kind: agent

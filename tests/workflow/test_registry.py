@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager import models
 from agent_manager.engine import bind_arguments
 from agent_manager.errors import EngineError
-from agent_manager.steps import plan_check, reducers, rollup, verify, worktree
+from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
 from agent_manager.workflow.registry import (
     BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
@@ -83,6 +84,7 @@ def test_names_are_sorted_and_membership_is_cheap() -> None:
 # (design spec lines 146-225).
 TASK_YAML_NAMES = (
     "critic_blockers_gate",
+    "docs_commit.commit_documents",
     "exploration_output_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
@@ -124,6 +126,7 @@ def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> 
     assert registry.resolve("plan_check.find_validated_plan") is plan_check.find_validated_plan
     assert registry.resolve("plan_check.has_validated_plan") is plan_check.has_validated_plan
     assert registry.resolve("plan_check.mark_validated") is plan_check.mark_validated
+    assert registry.resolve("docs_commit.commit_documents") is docs_commit.commit_documents
     assert registry.resolve("rollup.set_status") is rollup.set_status
 
 
@@ -149,6 +152,40 @@ def test_the_engine_can_bind_mark_validated_out_of_the_subtask_context() -> None
     assert bound == {
         "plan_path": "docs/superpowers/plans/task-rows-a32af745.md",
         "worktree": Path("/repo/.claude/worktrees/m2/task-rows-a32af745"),
+    }
+
+
+def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context() -> None:
+    """The phase carries no `args:`, so all four parameters have to come from the
+    context by name -- `card_details` and `worktree` from
+    `engine.subtask_context`, `spec_path` and `plan_path` from
+    `engine._document_paths`. `git_runner` has a default and must NOT be bound
+    out of a context that happens to hold no such key."""
+    card = models.Card(
+        id="6f1a2f2e-1f1c-4f0e-9a6d-0c2f3b4a5d6e",
+        title="Commit the spec and plan with the Plan-Hash trailer",
+        status="todo",
+    )
+    bound = bind_arguments(
+        docs_commit.commit_documents,
+        {
+            "card": "ba15da20",
+            "card_details": card,
+            "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+            "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+            "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+            "commands": ["uv run pytest"],
+        },
+        None,
+        phase="docs_commit",
+        function="docs_commit.commit_documents",
+    )
+
+    assert bound == {
+        "card_details": card,
+        "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+        "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+        "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
     }
 
 

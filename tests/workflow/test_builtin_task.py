@@ -50,6 +50,7 @@ EXPECTED_PHASES = (
     ("plan", "agent"),
     ("validate_plan", "agent"),
     ("mark_validated", "deterministic"),
+    ("docs_commit", "deterministic"),
     ("implement", "agent"),
     ("review", "agent"),
     ("verify", "deterministic"),
@@ -64,7 +65,7 @@ def test_builtin_task_loads_against_the_default_registry() -> None:
     assert workflow.description
 
 
-def test_builtin_task_has_the_thirteen_phases_in_spec_order() -> None:
+def test_builtin_task_has_the_fourteen_phases_in_spec_order() -> None:
     workflow = load_builtin("task")
     assert tuple((phase.name, phase.kind) for phase in workflow.phases) == EXPECTED_PHASES
 
@@ -88,12 +89,36 @@ def test_no_agent_phase_precedes_the_worktree_phase() -> None:
     assert names.index("worktree") < min(agent_indexes)
 
 
-def test_plan_check_skips_forward_to_implement_when_a_plan_exists() -> None:
+def test_plan_check_skips_forward_to_docs_commit_when_a_plan_exists() -> None:
     phase = load_builtin("task").phase("plan_check")
     assert isinstance(phase, DeterministicPhase)
     assert phase.run == "plan_check.find_validated_plan"
     assert phase.when == "plan_check.has_validated_plan"
-    assert phase.skip_to == "implement"
+    assert phase.skip_to == "docs_commit"
+
+
+def test_docs_commit_sits_between_the_marker_and_the_coder() -> None:
+    """The hash this phase stamps is the hash of the plan file WITH the
+    validated marker on it, which is the hash `review` recomputes -- so it has
+    to run after `mark_validated`. It must also run before `implement`, or the
+    coder's own `git add` would sweep the documents into its commit and the
+    docs commit would never exist."""
+    workflow = load_builtin("task")
+    phase = workflow.phase("docs_commit")
+    assert isinstance(phase, DeterministicPhase)
+    assert phase.run == "docs_commit.commit_documents"
+    # No args: `bind_arguments` takes card_details, spec_path, plan_path and
+    # worktree from the context by parameter name. Not best-effort and not
+    # gated: an uncommitted or untagged pair of documents must escalate.
+    assert phase.args == {}
+    assert phase.gates == []
+    assert phase.best_effort is False
+    assert phase.when is None
+    assert phase.skip_to is None
+
+    names = workflow.phase_names
+    assert names.index("mark_validated") < names.index("docs_commit")
+    assert names.index("docs_commit") < names.index("implement")
 
 
 def test_mark_validated_stamps_the_plan_between_validation_and_implement() -> None:
@@ -366,6 +391,7 @@ def _phase_results() -> dict[str, Any]:
         "validate_spec": _critic_result(),
         "plan": _plan_result(),
         "validate_plan": _critic_result(),
+        "docs_commit": {"plan_hash": PLAN_HASH},
         "implement": _implement_result(),
         "review": _review_result(),
         "verify": {"passed": True, "detail": ""},
