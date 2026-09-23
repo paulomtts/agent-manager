@@ -6,6 +6,7 @@ Ported case-by-case from the sibling plugin's `workflows/task.test.mjs`
 
 import pytest
 
+from agent_manager.steps import reducers
 from agent_manager.steps.reducers import exploration_output_gate, verification_gate
 
 
@@ -78,9 +79,47 @@ def test_the_1296_placeholder_output_is_caught_as_a_short_summary():
 
 
 @pytest.mark.parametrize("word", ["todo", "TBD", "n/a", "None", "placeholder"])
-def test_a_summary_that_is_exactly_a_placeholder_word_is_caught_case_insensitively(word):
+def test_a_summary_that_is_exactly_a_placeholder_word_is_caught(word):
+    # These are all far under MIN_SUMMARY_LENGTH, so it is the length half of
+    # the check that fires here; the placeholder set is pinned separately below.
     gate = exploration_output_gate({"summary": word, "verification": REAL_VERIFICATION}, None)
     assert gate is not None
+
+
+def test_the_placeholder_set_is_what_rejects_a_placeholder_once_the_floor_is_lowered(monkeypatch):
+    # Every member of PLACEHOLDER_SUMMARIES is shorter than MIN_SUMMARY_LENGTH,
+    # so the set is unreachable at the shipped floor. Drop the floor and the
+    # set must still do its job case-insensitively — otherwise the second half
+    # of the condition could be deleted with no test noticing.
+    monkeypatch.setattr(reducers, "MIN_SUMMARY_LENGTH", 0)
+    for word in sorted(reducers.PLACEHOLDER_SUMMARIES):
+        for spelling in (word, word.upper(), f"  {word}  "):
+            gate = exploration_output_gate(
+                {"summary": spelling, "verification": REAL_VERIFICATION}, None
+            )
+            assert gate is not None, spelling
+            assert "implausibly short/placeholder" in gate["detail"]
+    assert (
+        exploration_output_gate(
+            {"summary": "not a placeholder", "verification": REAL_VERIFICATION}, None
+        )
+        is None
+    )
+
+
+def test_the_summary_floor_is_exactly_sixty_characters():
+    # Pins MIN_SUMMARY_LENGTH itself: without this, any floor between the
+    # longest placeholder word and the length of REAL_SUMMARY passes the suite.
+    at_floor = "x" * 60
+    below_floor = "x" * 59
+    assert (
+        exploration_output_gate({"summary": at_floor, "verification": REAL_VERIFICATION}, None)
+        is None
+    )
+    gate = exploration_output_gate(
+        {"summary": below_floor, "verification": REAL_VERIFICATION}, None
+    )
+    assert "implausibly short" in gate["detail"]
 
 
 def test_a_padded_placeholder_word_is_stripped_before_the_lookup():
