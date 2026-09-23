@@ -634,8 +634,8 @@ def run_card(
     card_id: str,
     *,
     repo_dir: Path,
+    branch_prefix: str,
     base_branch: str = "master",
-    branch_prefix: str = "m1",
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
@@ -767,7 +767,9 @@ def run(
         "master", "--base-branch", help="The branch this subtask's branch is cut from."
     ),
     branch_prefix: str = typer.Option(
-        "m1", "--branch-prefix", help="Milestone prefix for the derived branch name."
+        ...,
+        "--branch-prefix",
+        help="Milestone prefix for the derived branch name, e.g. `m2`.",
     ),
     allow_no_verification: bool = typer.Option(
         False,
