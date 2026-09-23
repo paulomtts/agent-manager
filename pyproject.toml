@@ -16,7 +16,7 @@ dev = [
 ]
 
 [project.scripts]
-agent-manager = "agent_manager.cli:app"
+am = "agent_manager.cli:app"
 
 [build-system]
 requires = ["hatchling"]
