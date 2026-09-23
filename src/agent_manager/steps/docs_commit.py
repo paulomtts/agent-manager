@@ -14,7 +14,7 @@ shell string and nothing to quote.
 import hashlib
 from pathlib import Path
 
-from agent_manager.steps.worktree import GitRunner, run_git
+from agent_manager.steps.worktree import GitError, GitRunner, run_git
 
 _HASH_LENGTH = 8
 """How many characters of the digest a Plan-Hash is.
@@ -45,6 +45,41 @@ would not be counted by anything downstream.
 """
 
 
+class UntaggedDocumentsError(RuntimeError):
+    """The documents are committed, but no commit on the branch carries this hash.
+
+    Raised rather than returning the hash: `review` counts commits whose message
+    holds a `Plan-Hash` trailer, so answering with a hash nothing corroborates
+    would make a resumed run read a branch as tagged when it is debris
+    (design §9).
+    """
+
+    def __init__(self, *, plan_hash: str, spec_path: str, plan_path: str) -> None:
+        self.plan_hash = plan_hash
+        self.spec_path = spec_path
+        self.plan_path = plan_path
+        super().__init__(
+            f"{spec_path} and {plan_path} have nothing to commit, but no commit on "
+            f"this branch carries the trailer {TRAILER_PREFIX}{plan_hash}. The "
+            "documents are tracked and untagged, so a resumed run would read them "
+            "as debris. Commit them with the trailer, or remove them, by hand."
+        )
+
+
+def _branch_carries(git_runner: GitRunner, worktree_path: str, digest: str) -> bool:
+    """Whether any commit reachable from HEAD carries exactly this trailer.
+
+    Whole-line equality on the stripped line, never substring containment.
+    A `GitError` (an empty repository has no `HEAD` to log) answers `False`.
+    """
+    try:
+        log = git_runner(["-C", worktree_path, "log", "--format=%B"])
+    except GitError:
+        return False
+    wanted = f"{TRAILER_PREFIX}{digest}"
+    return any(line.strip() == wanted for line in log.splitlines())
+
+
 def _document_paths(worktree_path: str, spec_path: str, plan_path: str) -> tuple[Path, Path]:
     """The two documents as absolute paths under the worktree."""
     root = Path(worktree_path)
@@ -72,6 +107,18 @@ def commit_documents(
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
+    staged = git_runner(
+        ["-C", worktree_path, "diff", "--cached", "--name-only", "--", spec_path, plan_path]
+    )
+    if staged.strip() == "":
+        # The resume path (design §9): "these two paths hold no change", so a
+        # plan edited between runs still earns its own commit and hash.
+        if _branch_carries(git_runner, worktree_path, digest):
+            return {"plan_hash": digest}
+        raise UntaggedDocumentsError(
+            plan_hash=digest, spec_path=spec_path, plan_path=plan_path
+        )
+
     # The pathspec on `commit` too, so an unrelated change already in the index
     # is left out of this commit (a partial commit).
     git_runner(

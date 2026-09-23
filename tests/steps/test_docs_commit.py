@@ -208,3 +208,59 @@ def test_the_step_runs_no_forbidden_git_verb(repo: Path) -> None:
             assert "*" not in " ".join(argv), argv
         if "checkout" in argv:
             assert "-f" not in argv, argv
+
+
+@requires_git
+def test_a_second_call_commits_nothing_and_returns_the_same_hash(repo: Path) -> None:
+    """Design §9 resume: re-running the phase after a kill is a no-op, and the
+    commit count does not grow."""
+    _write_documents(repo)
+    first = _run(repo)
+    after_first = _commit_count(repo)
+
+    second = _run(repo)
+
+    assert second == first
+    assert _commit_count(repo) == after_first
+
+
+@requires_git
+def test_a_plan_edited_between_runs_gets_its_own_commit_with_the_new_hash(
+    repo: Path,
+) -> None:
+    """Review focus: the resume path is "nothing staged", not "ran before". A
+    plan whose bytes changed has a different hash and must be committed again,
+    or every trailer on the branch would be stale."""
+    _write_documents(repo)
+    first = _run(repo)
+    (repo / PLAN_RELATIVE).write_text("# plan\n\nrewritten.\n", encoding="utf-8")
+    after_first = _commit_count(repo)
+
+    second = _run(repo)
+
+    assert second["plan_hash"] != first["plan_hash"]
+    assert _commit_count(repo) == after_first + 1
+    assert _message(repo).splitlines()[-1] == f"Plan-Hash: {second['plan_hash']}"
+
+
+@requires_git
+def test_documents_committed_without_a_trailer_raise_instead_of_lying(
+    repo: Path,
+) -> None:
+    """Nothing to commit AND no commit carrying this hash is not a silent
+    success: `review`'s untagged-commit branch would be reading a lie."""
+    _write_documents(repo)
+    _git(repo, "add", "--", SPEC_RELATIVE, PLAN_RELATIVE)
+    _git(repo, "commit", "-m", "docs: committed by a human, untagged")
+    before = _commit_count(repo)
+
+    with pytest.raises(docs_commit.UntaggedDocumentsError) as caught:
+        _run(repo)
+
+    expected = hashlib.sha256((repo / PLAN_RELATIVE).read_bytes()).hexdigest()[:8]
+    assert caught.value.plan_hash == expected
+    message = str(caught.value)
+    assert expected in message
+    assert SPEC_RELATIVE in message
+    assert PLAN_RELATIVE in message
+    assert _commit_count(repo) == before
