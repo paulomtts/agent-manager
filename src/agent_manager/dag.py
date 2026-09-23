@@ -27,3 +27,19 @@ def short_id(card_id: object) -> str:
     if not _HEX32.match(hex_only):
         raise ValueError(f"not a card id: {card_id!r}")
     return hex_only[:8].lower()
+
+
+_NON_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(title: object, max: int = 24) -> str:
+    """Lowercase dash-joined slug of a title, cut at a word boundary."""
+    flat = _NON_SLUG.sub("-", str("" if title is None else title).lower()).strip("-")
+    if len(flat) <= max:
+        return flat
+    # Cut at a word boundary rather than mid-word: a trailing "-uv" fragment
+    # makes a branch name harder to read, not easier.
+    cut = flat[:max]
+    last_dash = cut.rfind("-")
+    kept = cut[:last_dash] if last_dash > 0 else cut
+    return kept.rstrip("-")
