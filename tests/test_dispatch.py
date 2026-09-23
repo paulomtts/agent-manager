@@ -1053,7 +1053,8 @@ def test_the_production_runner_factory_carries_the_shipped_table(store):
     assert isinstance(runner, dispatch.AgentRunner)
     assert runner.result_models == results.RESULT_MODELS
     assert set(runner.result_models) == {
-        "ExploreResult",
+        "CriticResult",
+        "SpecResult",
         "CriticResult",
         "PlanResult",
         "ImplementResult",
