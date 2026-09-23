@@ -201,13 +201,40 @@ def test_a_file_where_a_bundle_should_be_is_an_unknown_role(tmp_path):
     assert "no such role bundle" in excinfo.value.reason
 
 
-@pytest.mark.parametrize("name", ["..", "../coder", "nested/coder", ""])
+@pytest.mark.parametrize("name", ["..", ".", "../coder", "nested/coder", ""])
 def test_a_role_name_that_is_a_path_fragment_is_rejected(tmp_path, name):
-    make_bundle(tmp_path, "coder")
-    (tmp_path.parent / "coder").mkdir(exist_ok=True)
+    """The name is rejected before it is joined, not incidentally afterwards.
 
-    with pytest.raises(RoleBundleError):
-        loader.load_role(name, root=tmp_path)
+    A fully loadable bundle is planted one level above `root`, so a naive join
+    would *succeed* on `"../coder"` rather than fail on a missing file -- the
+    assertion on the reason is what keeps this test honest.
+    """
+    base = tmp_path / "bundles"
+    base.mkdir()
+    make_bundle(base, "coder")
+    make_bundle(tmp_path, "coder", system="Bundle outside the bundles root.\n")
+
+    with pytest.raises(RoleBundleError) as excinfo:
+        loader.load_role(name, root=base)
+
+    assert "not a role name" in excinfo.value.reason
+    assert excinfo.value.role == name
+
+
+def test_an_unreadable_bundle_file_raises_the_loader_error(tmp_path):
+    make_bundle(tmp_path)
+    (tmp_path / "coder" / "system.md").unlink()
+    (tmp_path / "coder" / "system.md").mkdir()
+
+    with pytest.raises(RoleBundleError) as excinfo:
+        loader.load_role("coder", root=tmp_path)
+
+    assert "unreadable" in excinfo.value.reason
+    assert excinfo.value.path.name == "system.md"
+
+
+def test_list_roles_of_a_directory_that_does_not_exist_is_empty(tmp_path):
+    assert loader.list_roles(tmp_path / "nowhere") == []
 
 
 @pytest.mark.parametrize(

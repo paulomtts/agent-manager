@@ -142,8 +142,15 @@ def load_role(name: str, *, root: Path | None = None) -> RoleBundle:
 
     `root` overrides the packaged bundles directory; it exists so tests can
     build synthetic bundles, and so an embedder can ship its own set.
+
+    The name is validated *before* it is joined to `root`: `"../coder"` names a
+    real, loadable bundle one level up on plenty of layouts, and joining first
+    would hand a harness a system prompt from outside the bundles directory
+    (the same escape `_resolve_methodology` refuses for lock entries).
     """
     base = bundles_dir() if root is None else root
+    if name in {"", ".", ".."} or name != Path(name).name:
+        raise RoleBundleError("not a role name", role=name, path=base)
     directory = base / name
     if not directory.is_dir():
         raise RoleBundleError("no such role bundle", role=name, path=directory)
