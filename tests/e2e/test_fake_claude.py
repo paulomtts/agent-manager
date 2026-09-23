@@ -8,6 +8,8 @@ loaded here by path rather than imported by name, because `tests/e2e` is not on
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -182,10 +184,6 @@ def test_overriding_a_field_the_schema_does_not_have_is_refused():
 
     assert "findings" in str(caught.value)
     assert "blockers" in str(caught.value)
-
-
-import subprocess
-import sys
 
 
 def _brief(tmp_path, phase, role, body, schema, result_path):
