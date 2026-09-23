@@ -71,6 +71,12 @@ def test_capabilities_is_a_frozenset_of_non_empty_strings():
     assert ClaudeAdapter.capabilities
     for capability in ClaudeAdapter.capabilities:
         assert isinstance(capability, str) and capability.strip()
+    # What it claims is the engine's routing decision, so the set itself is
+    # pinned. `browser` stays out: Claude Code only drives one through an
+    # extension a headless runner need not have, and claiming it would let the
+    # capability check pass for a phase that then cannot run. Claiming less
+    # than the truth only refuses a phase early, which is the safe direction.
+    assert ClaudeAdapter.capabilities == frozenset({"bash", "edit"})
 
 
 EXPECTED_PROMPT_ARGUMENT = (
