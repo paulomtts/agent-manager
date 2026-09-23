@@ -11,11 +11,13 @@ engine card (§14 line 486); a real harness run is the single opt-in end-to-end
 test (§14 lines 489-490).
 """
 
+import ast
 import tomllib
 from pathlib import Path
 
 import pytest
 
+from agent_manager.harness import claude as claude_module
 from agent_manager.harness.base import HarnessAdapter, Usage
 from agent_manager.harness.claude import ClaudeAdapter
 from agent_manager.models import Dispatch
@@ -284,3 +286,28 @@ def test_crlf_line_endings_and_human_spelling_report_the_same_numbers():
     assert ClaudeAdapter().parse_usage(human) == Usage(
         tokens_in=8123, tokens_out=1544, cost=0.3142
     )
+
+
+def _imports() -> tuple[set[str], set[str]]:
+    source = Path(claude_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    plain: set[str] = set()
+    froms: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            plain.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            froms.add(node.module)
+    return plain, froms
+
+
+def test_the_adapter_launches_nothing_itself():
+    # §14 line 485: the launcher is injected, and one launcher serves every
+    # adapter. The moment this module can start a process, that stops being
+    # true and every test above it starts spawning things.
+    plain, froms = _imports()
+    assert "subprocess" not in plain | froms
+    assert "os" not in plain | froms
+    assert "agent_manager.harness.launcher" not in froms
+    assert not hasattr(claude_module, "subprocess")
+    assert not hasattr(claude_module, "run_direct")
