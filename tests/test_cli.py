@@ -279,6 +279,26 @@ def test_the_status_payload_survives_render_with_its_paths():
     assert data["rows"] == []
 
 
+def test_the_status_header_is_the_runs_identity_and_not_its_config():
+    """The spec's seven identity fields, and `config` is not one of them: the
+    header is what `runs` prints for the same run, and a workflow's whole config
+    blob in it would drown the reading and let the two commands disagree."""
+    run = _pure_run([])
+    run.config = models.RunConfig(max_concurrent_stories=4, dry_run=True)
+
+    payload = cli.status_payload(run)
+
+    assert set(payload["run"]) == {
+        "id",
+        "workflow",
+        "repo_dir",
+        "base_branch",
+        "branch_prefix",
+        "status",
+        "started_at",
+    }
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
