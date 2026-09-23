@@ -125,7 +125,10 @@ def test_spec_declares_the_spec_result_and_still_writes_the_specs_document() -> 
     phase = load_builtin("task").phase("spec")
     assert isinstance(phase, AgentPhase)
     assert phase.role == "spec_author"
-    assert phase.inputs == ["card", "explore"]
+    # `spec_path` is declared as an input as well as a `writes:` template: the
+    # template is how the engine derives the path, and the input is how the
+    # agent is told it (nothing renders `writes:` into a brief).
+    assert phase.inputs == ["card", "explore", "spec_path"]
     assert phase.result == "SpecResult"
     # `writes:` stays: engine._document_paths derives spec_path from this
     # template, not from the result's `path` field.
