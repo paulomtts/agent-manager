@@ -283,3 +283,126 @@ def test_resolution_happens_before_any_function_is_called() -> None:
     load_workflow(MINIMAL, registry)
 
     assert calls == []
+
+
+def test_malformed_yaml_raises_a_workflow_load_error_not_a_yaml_error() -> None:
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow("name: demo\nphases: [ - broken", registry_with())
+    assert "not valid YAML" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param("phases:\n  - name: a\n    kind: agent\n    role: coder\n", id="no_name"),
+        pytest.param("name: demo\n", id="no_phases"),
+        pytest.param("name: demo\nphases: []\n", id="empty_phases"),
+        pytest.param("name: demo\nphases: not-a-list\n", id="phases_not_a_list"),
+        pytest.param("- name: demo\n", id="top_level_list"),
+        pytest.param("just a string\n", id="top_level_scalar"),
+        pytest.param("", id="empty_document"),
+        pytest.param("# only a comment\n", id="comment_only"),
+    ],
+)
+def test_structurally_broken_documents_raise(document: str) -> None:
+    """The last three are the review-focus case: safe_load returns None."""
+    with pytest.raises(WorkflowLoadError):
+        load_workflow(document, registry_with())
+
+
+@pytest.mark.parametrize(
+    "phase_body",
+    [
+        pytest.param("kind: wizard\n    run: demo.run", id="unknown_kind"),
+        pytest.param("run: demo.run", id="no_kind"),
+        pytest.param("kind: deterministic", id="deterministic_without_run"),
+        pytest.param("kind: agent", id="agent_without_role"),
+        pytest.param("kind: agent\n    role: coder\n    run: demo.run", id="run_on_agent"),
+        pytest.param("kind: agent\n    role: coder\n    args: { a: 1 }", id="args_on_agent"),
+        pytest.param(
+            "kind: agent\n    role: coder\n    best_effort: true", id="best_effort_on_agent"
+        ),
+        pytest.param("kind: deterministic\n    run: demo.run\n    role: coder", id="role_on_det"),
+        pytest.param(
+            "kind: deterministic\n    run: demo.run\n    inputs: [card]", id="inputs_on_det"
+        ),
+        pytest.param(
+            "kind: deterministic\n    run: demo.run\n    result: PlanResult", id="result_on_det"
+        ),
+        pytest.param(
+            "kind: deterministic\n    run: demo.run\n    writes: docs/x.md", id="writes_on_det"
+        ),
+        pytest.param(
+            "kind: deterministic\n    run: demo.run\n    retry: { max_attempts: 2, on: [gate_failed] }",
+            id="retry_on_det",
+        ),
+        pytest.param("kind: deterministic\n    run: demo.run\n    typo: 1", id="unknown_field"),
+        pytest.param(
+            "kind: agent\n    role: coder\n    gates: exploration_output_gate", id="gates_bare_str"
+        ),
+        pytest.param(
+            "kind: agent\n    role: coder\n    retry: { max_attempts: 0, on: [gate_failed] }",
+            id="zero_attempts",
+        ),
+        pytest.param(
+            "kind: agent\n    role: coder\n    retry: { max_attempts: 2, on: [harness_error] }",
+            id="unretryable_outcome",
+        ),
+        pytest.param(
+            "kind: agent\n    role: coder\n    retry: { max_attempts: 2, on: [] }",
+            id="empty_retry_on",
+        ),
+    ],
+)
+def test_broken_phases_raise_with_the_phase_named(phase_body: str) -> None:
+    """`gates_bare_str` is the review-focus case: a bare string must be
+    rejected, not iterated character by character."""
+    document = f"name: demo\nphases:\n  - name: broken\n    {phase_body}\n"
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(document, registry_with("demo.run", "exploration_output_gate"))
+    assert caught.value.phase == "broken"
+    assert "broken" in str(caught.value)
+
+
+def test_duplicate_phase_name_raises() -> None:
+    document = """
+name: demo
+phases:
+  - name: twice
+    kind: deterministic
+    run: demo.run
+  - name: twice
+    kind: agent
+    role: coder
+"""
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(document, registry_with("demo.run"))
+    assert caught.value.phase == "twice"
+    assert "duplicate" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        pytest.param("nowhere", "not a phase", id="unknown"),
+        pytest.param("second", "itself", id="self"),
+        pytest.param("first", "earlier", id="backwards"),
+    ],
+)
+def test_bad_skip_to_raises(target: str, expected: str) -> None:
+    document = f"""
+name: demo
+phases:
+  - name: first
+    kind: deterministic
+    run: demo.run
+  - name: second
+    kind: deterministic
+    run: demo.run
+    skip_to: {target}
+"""
+    with pytest.raises(WorkflowLoadError) as caught:
+        load_workflow(document, registry_with("demo.run"))
+    assert caught.value.phase == "second"
+    assert caught.value.field == "skip_to"
+    assert expected in str(caught.value)

@@ -191,9 +191,12 @@ def _parse(text: str, origin: str) -> Mapping[str, Any]:
 
 def _validate(data: Mapping[str, Any], origin: str) -> Workflow:
     try:
-        return Workflow.model_validate(dict(data))
+        workflow = Workflow.model_validate(dict(data))
     except ValidationError as exc:
         raise _load_error_from(exc, origin, data) from exc
+    _check_phase_names(workflow)
+    _check_skip_to(workflow)
+    return workflow
 
 
 def _load_error_from(
@@ -226,6 +229,52 @@ def _phase_name_at(loc: tuple[Any, ...], data: Mapping[str, Any]) -> str | None:
     entry = phases[loc[1]]
     name = entry.get("name") if isinstance(entry, Mapping) else None
     return name if isinstance(name, str) and name else f"#{loc[1]}"
+
+
+def _check_phase_names(workflow: Workflow) -> None:
+    """Phase names are the document's only identifiers.
+
+    Two phases sharing one name makes `skip_to`, the journal and every recorded
+    phase result ambiguous, and the duplicate would silently win or lose
+    depending on which lookup ran.
+    """
+    seen: set[str] = set()
+    for phase in workflow.phases:
+        if phase.name in seen:
+            raise WorkflowLoadError(
+                "duplicate phase name", workflow=workflow.name, phase=phase.name, field="name"
+            )
+        seen.add(phase.name)
+
+
+def _check_skip_to(workflow: Workflow) -> None:
+    """`skip_to` may only jump forward.
+
+    A backwards or self jump is a loop the engine would walk forever, and an
+    unknown target is a typo that would otherwise only surface at the moment
+    the `when` gate first opens -- possibly hours into a run.
+    """
+    order = {phase.name: index for index, phase in enumerate(workflow.phases)}
+    for index, phase in enumerate(workflow.phases):
+        target = phase.skip_to
+        if target is None:
+            continue
+        if target not in order:
+            raise WorkflowLoadError(
+                f"skip_to names {target!r}, which is not a phase in this workflow "
+                f"(phases: {', '.join(workflow.phase_names)})",
+                workflow=workflow.name,
+                phase=phase.name,
+                field="skip_to",
+            )
+        if order[target] <= index:
+            where = "itself" if target == phase.name else "earlier in the document"
+            raise WorkflowLoadError(
+                f"skip_to must name a later phase, but {target!r} is {where}",
+                workflow=workflow.name,
+                phase=phase.name,
+                field="skip_to",
+            )
 
 
 def _function_names(phase: DeterministicPhase | AgentPhase) -> Iterator[tuple[str, str]]:
