@@ -196,12 +196,12 @@ def default_registry() -> FunctionRegistry:
     global state that any importer could rebind a gate in, and the second call
     would then fail on `DuplicateFunctionError`.
 
-    The four reducers and the four implemented steps are the real, imported
+    The five reducers and the four implemented steps are the real, imported
     callables -- not wrappers -- so `resolve(name) is the_function` holds and a
-    sibling's bugfix reaches the engine without touching this table. The three
+    sibling's bugfix reaches the engine without touching this table. The two
     remaining names have no implementation on this branch (`steps/rollup.py`
-    does not exist; `critic_blockers_gate` and `verification_passed_gate` are
-    not in `steps/reducers.py`), so they resolve to placeholders.
+    does not exist; `critic_blockers_gate` is not in `steps/reducers.py`), so
+    they resolve to placeholders.
     """
     registry = FunctionRegistry()
 
@@ -210,6 +210,7 @@ def default_registry() -> FunctionRegistry:
     registry.register("verification_gate", reducers.verification_gate)
     registry.register("review_gate", reducers.review_gate)
     registry.register("plan_hash_gate", reducers.plan_hash_gate)
+    registry.register("verification_passed_gate", reducers.verification_passed_gate)
 
     # Deterministic steps that already ship on this branch.
     registry.register("worktree.ensure", worktree.ensure)
@@ -225,11 +226,5 @@ def default_registry() -> FunctionRegistry:
     registry.register(
         "critic_blockers_gate",
         _placeholder("critic_blockers_gate", "the sibling subtask that adds the agent-phase gates"),
-    )
-    registry.register(
-        "verification_passed_gate",
-        _placeholder(
-            "verification_passed_gate", "the sibling subtask that adds the agent-phase gates"
-        ),
     )
     return registry
