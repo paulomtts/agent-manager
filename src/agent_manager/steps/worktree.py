@@ -14,6 +14,7 @@ Every invocation is an argument list handed to `subprocess` (design §5 line
 252): there is no shell string and nothing to quote.
 """
 
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -111,8 +112,18 @@ def _required_absolute(value: object, field: str) -> str:
 
 
 def _is_registered(candidate: str, registered: list[str]) -> bool:
-    """Whether `candidate` is one of the paths git already has registered."""
-    return candidate in registered
+    """Whether `candidate` is one of the paths git already has registered.
+
+    A plain string match first, as the JS did. Falling back to `realpath`
+    matters because the caller's path and git's recorded path can differ by a
+    trailing slash, a `.` component or a symlinked parent -- and a false
+    negative here would run `worktree add` onto a live directory and abort the
+    run.
+    """
+    if candidate in registered:
+        return True
+    real = os.path.realpath(candidate)
+    return any(os.path.realpath(path) == real for path in registered)
 
 
 def ensure(

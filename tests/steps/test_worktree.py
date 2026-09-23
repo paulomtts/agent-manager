@@ -219,3 +219,109 @@ def test_an_exact_branch_match_is_required_before_checking_out(
     assert result["branch_existed"] is False
     assert result["created"] is True
     assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-"
+
+
+@requires_git
+def test_a_second_identical_call_is_a_no_op(repo: Path, tmp_path: Path):
+    wt = tmp_path / "wt"
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+    head_before = _head(wt)
+
+    result = worktree.ensure(**args)
+
+    assert result["branch_existed"] is True
+    assert result["worktree_existed"] is True
+    assert result["created"] is False
+    assert _head(wt) == head_before
+
+
+@requires_git
+def test_an_existing_worktree_add_is_never_attempted_a_second_time(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+
+    calls: list[list[str]] = []
+    worktree.ensure(**args, git_runner=_recorder(calls, worktree.run_git))
+
+    assert not any("add" in argv for argv in calls)
+
+
+@requires_git
+def test_uncommitted_local_changes_survive_untouched(repo: Path, tmp_path: Path):
+    wt = tmp_path / "wt"
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+    (wt / "README.md").write_text("edited by a killed run\n")
+    (wt / "scratch.txt").write_text("untracked work in progress\n")
+    status_before = _git(wt, "status", "--porcelain")
+
+    worktree.ensure(**args)
+
+    assert (wt / "README.md").read_text() == "edited by a killed run\n"
+    assert (wt / "scratch.txt").read_text() == "untracked work in progress\n"
+    assert _git(wt, "status", "--porcelain") == status_before
+
+
+@requires_git
+def test_a_non_normalized_worktree_path_still_counts_as_existing(
+    repo: Path, tmp_path: Path
+):
+    # The caller's string and git's recorded path routinely differ by a
+    # trailing slash or a `.` component. Treating those as a missing worktree
+    # would send `worktree add` at a live directory and kill the run.
+    wt = tmp_path / "wt"
+    worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=f"{wt}{os.sep}.{os.sep}",
+        repo_dir=str(repo),
+    )
+
+    assert result["worktree_existed"] is True
+    assert result["created"] is False
+
+
+@requires_git
+def test_a_sibling_worktree_at_another_path_does_not_count_as_this_one(
+    repo: Path, tmp_path: Path
+):
+    sibling = tmp_path / "sibling-wt"
+    _git(repo, "worktree", "add", str(sibling), "-b", "m1/task-8")
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    assert result["worktree_existed"] is False
+    assert result["created"] is True
+    assert sibling.is_dir()
