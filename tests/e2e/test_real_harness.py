@@ -75,11 +75,15 @@ def _plan_hashes(message: str) -> list[str]:
     The value, not merely the presence of the string: a commit body that
     mentions the word would satisfy a substring check, and two commits with
     different hashes would satisfy it too.
+
+    Matched at column 0, not after `.strip()`: a git trailer is unindented by
+    definition, so an indented body line that happens to read `Plan-Hash: ...`
+    is exactly the body mention this helper exists to reject.
     """
     return [
         line.split(":", 1)[1].strip()
         for line in message.splitlines()
-        if line.strip().startswith(PLAN_HASH_TRAILER)
+        if line.startswith(PLAN_HASH_TRAILER)
     ]
 
 
