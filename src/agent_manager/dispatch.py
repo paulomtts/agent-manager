@@ -20,7 +20,7 @@ Three rules shape everything here, and none of them is negotiable:
 """
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +81,20 @@ def with_feedback(
         text=f"{rendered.text}\n{FEEDBACK_HEADING}\n{feedback}\n",
         sections=rendered.sections + (("feedback", feedback),),
     )
+
+
+def _append_feedback(brief: str, feedback: Sequence[str]) -> str:
+    """One `FEEDBACK_HEADING` section per accumulated complaint, after the brief.
+
+    `prompt.compose_brief` takes a single feedback string and this loop needs one
+    heading per attempt's complaint, so the sections are appended here instead.
+    The joining matches `prompt._join_sections`: one blank line between
+    neighbours, one newline at the end, interior text untouched.
+    """
+    parts = [brief.strip("\n")]
+    for block in feedback:
+        parts.append(FEEDBACK_HEADING + "\n" + block.strip("\n"))
+    return "\n\n".join(parts) + "\n"
 
 
 @dataclass(frozen=True)
@@ -407,7 +421,9 @@ class AgentRunner:
 
         try:
             for _ in range(budget):
-                verdict = self._attempt(phase, context, text, target, role, cwd, model)
+                verdict = self._attempt(
+                    phase, context, text, (), target, role, cwd, model
+                )
                 if verdict.status == "ok":
                     self._record_phase(phase, "done", started_at, self.clock(), None)
                     return verdict.result
@@ -434,15 +450,32 @@ class AgentRunner:
         phase: AgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
+        feedback: Sequence[str],
         target: Target,
         role: RoleBundle,
         cwd: Path,
         model: type[BaseModel] | None,
     ) -> Verdict:
-        """One dispatch: directory, prompt, argv, launcher, result, gates."""
+        """One dispatch: directory, brief, argv, launcher, result, gates.
+
+        The brief is composed here rather than by the caller because addendum R2
+        puts this attempt's own `result.json` in it, and that path only exists
+        once `next_attempt` and `paths.attempt_dir` have fixed the directory.
+        """
         n = next_attempt(self.run_id, self.card_id, phase.name)
         attempt_dir = paths.attempt_dir(self.run_id, self.card_id, phase.name, n)
-        prompt_path = rendered.write(attempt_dir)
+        brief = prompt.compose_brief(
+            role,
+            rendered,
+            result_path=None if model is None else attempt_dir / RESULT_NAME,
+            result_model=model,
+        )
+        # `replace` rather than a second writer: `RenderedPrompt.write` stays the
+        # one place a prompt write can fail, with the `EngineError` it already
+        # raises, and it keeps the phase name this rendering came from.
+        prompt_path = replace(rendered, text=_append_feedback(brief, feedback)).write(
+            attempt_dir
+        )
         stdout_path = attempt_dir / STDOUT_NAME
         dispatch_record = build_dispatch(
             target=target,
