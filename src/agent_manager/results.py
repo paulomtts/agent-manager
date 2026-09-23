@@ -86,3 +86,18 @@ class PlanResult(_Result):
     path: str
     self_reviewed: bool
     note: str | None
+
+
+class ImplementResult(_Result):
+    """The `implement` phase's result file (`builtin/task.yaml` line 60).
+
+    `plan_hash` carries no format constraint: `reducers.is_plan_hash` owns the
+    "8 lowercase hex characters" judgement, and a malformed hash has to reach
+    that gate as data rather than dying here.
+    """
+
+    blocked: bool
+    blocked_reason: str | None
+    resumed: bool
+    plan_hash: str
+    report: str

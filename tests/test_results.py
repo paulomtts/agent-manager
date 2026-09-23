@@ -226,3 +226,70 @@ def test_plan_result_has_no_skill_invoked_field():
 
     assert "skill_invoked" in str(caught.value)
     assert "skill_invoked" not in results.PlanResult.model_fields
+
+
+def test_implement_result_accepts_a_full_payload():
+    implement = results.ImplementResult(
+        blocked=False,
+        blocked_reason=None,
+        resumed=True,
+        plan_hash="a1b2c3d4",
+        report="tasks 1-3 done, suite green",
+    )
+
+    assert implement.blocked is False
+    assert implement.blocked_reason is None
+    assert implement.resumed is True
+    assert implement.plan_hash == "a1b2c3d4"
+    assert implement.report == "tasks 1-3 done, suite green"
+
+
+def test_implement_result_rejects_a_missing_plan_hash():
+    with pytest.raises(ValidationError) as caught:
+        results.ImplementResult(
+            blocked=False, blocked_reason=None, resumed=False, report="done"
+        )
+
+    assert "plan_hash" in str(caught.value)
+
+
+def test_implement_result_does_not_coerce_a_number_into_plan_hash():
+    with pytest.raises(ValidationError) as caught:
+        results.ImplementResult(
+            blocked=False,
+            blocked_reason=None,
+            resumed=False,
+            plan_hash=12345678,
+            report="done",
+        )
+
+    assert "plan_hash" in str(caught.value)
+
+
+def test_implement_result_rejects_an_unknown_key():
+    with pytest.raises(ValidationError) as caught:
+        results.ImplementResult(
+            blocked=False,
+            blocked_reason=None,
+            resumed=False,
+            plan_hash="a1b2c3d4",
+            report="done",
+            commits=3,
+        )
+
+    assert "commits" in str(caught.value)
+
+
+def test_implement_result_keeps_plan_hash_an_unconstrained_string():
+    # No format constraint here: reducers.is_plan_hash owns that judgement, and
+    # a short hash must reach it as data rather than dying as a ValidationError.
+    assert (
+        results.ImplementResult(
+            blocked=False,
+            blocked_reason=None,
+            resumed=False,
+            plan_hash="nope",
+            report="done",
+        ).plan_hash
+        == "nope"
+    )
