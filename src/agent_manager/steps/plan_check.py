@@ -36,3 +36,17 @@ def matches_card(filename: object, card: str) -> bool:
         return False
     stem = name[: -len(_MD)]
     return stem.split("-")[-1] == card
+
+
+def pick_plan(filenames: object, card: str) -> str | None:
+    """The newest of the plan files matching `card`, or `None`.
+
+    Newest is the lexicographically last name, exactly as the `.mjs` does:
+    plan filenames are date-prefixed in practice, so sorting them is a date
+    order, and no `stat` call is needed. A missing or empty listing is no
+    match rather than an error.
+    """
+    if filenames is None:
+        return None
+    hits = sorted(name for name in filenames if matches_card(name, card))
+    return hits[-1] if hits else None

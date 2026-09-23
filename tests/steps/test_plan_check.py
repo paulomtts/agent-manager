@@ -8,7 +8,7 @@ unreadable file), exactly as the ported `plan-check.test.mjs` uses its `fakeFs`.
 """
 
 from agent_manager.steps import plan_check
-from agent_manager.steps.plan_check import VALIDATED_MARKER, matches_card
+from agent_manager.steps.plan_check import VALIDATED_MARKER, matches_card, pick_plan
 
 
 def test_the_marker_is_the_exact_literal_validate_writes():
@@ -36,3 +36,26 @@ def test_only_md_files_match():
 def test_a_missing_or_non_string_filename_matches_nothing():
     assert matches_card(None, "a32af745") is False
     assert plan_check.matches_card("", "a32af745") is False
+
+
+def test_the_newest_matching_plan_wins():
+    # A re-planned subtask leaves the old file behind; the stale one must not
+    # decide whether Spec/Plan/Validate re-run. "Newest" is lexicographic on
+    # the date-prefixed filename -- no `stat` call is made.
+    assert (
+        pick_plan(
+            [
+                "2026-01-task-rows-a32af745.md",
+                "2026-08-task-rows-a32af745.md",
+                "task-other-deadbeef.md",
+            ],
+            "a32af745",
+        )
+        == "2026-08-task-rows-a32af745.md"
+    )
+
+
+def test_pick_plan_is_none_when_nothing_matches():
+    assert pick_plan(["task-other-deadbeef.md"], "a32af745") is None
+    assert pick_plan([], "a32af745") is None
+    assert pick_plan(None, "a32af745") is None
