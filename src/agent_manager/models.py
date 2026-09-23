@@ -59,6 +59,15 @@ class Dispatch(_Model):
     cwd: Path
     prompt_path: Path
     result_path: Path
+    timeout: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
+    """Wall-clock seconds the harness gets before it is killed (§8 line 315).
+
+    Defaulted rather than required: journal lines written before this field
+    existed carry no `timeout` key, and under `extra="forbid"` a new *required*
+    field would stop every stored line from loading. Thirty minutes is a
+    deliberately generous ceiling -- it exists to stop a wedged process, not to
+    bound a working one.
+    """
 
 
 class Attempt(_Model):
