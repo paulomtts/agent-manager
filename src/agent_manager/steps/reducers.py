@@ -5,9 +5,11 @@ specification.
 
 Each gate exists because a live run got past it once, and the comments here
 record the incident. Every gate is pure — no filesystem, network, model calls
-or module-level mutable state — and total: malformed input produces a verdict,
-never an exception. A gate returns ``None`` to pass, or a verdict ``dict`` to
-fail.
+or module-level mutable state. Malformed *content* produces a verdict rather
+than an exception; the one shape still required of a caller is
+``verification_gate``'s ``suite_cmds``, which must be an actual list (the
+engine always has one, and `task.js` throws here too). A gate returns ``None``
+to pass, or a verdict ``dict`` to fail.
 """
 
 import json
