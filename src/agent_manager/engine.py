@@ -173,6 +173,60 @@ class _Outcome:
     ok: bool
     result: Any = None
     detail: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+class _GateFailed(Exception):
+    """A gate returned a verdict. Private: it never leaves `_run_deterministic`."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+def _gate_values(
+    context: Mapping[str, Any], phase_name: str, result: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The binding table a gate or a `when` predicate sees.
+
+    The result appears twice on purpose: under the phase's name, which is how
+    §6 says later phases read it, and under `result`, which is the parameter
+    name `plan_check.has_validated_plan(result)` and the shipped gates use.
+    """
+    return {**context, phase_name: result, "result": result}
+
+
+def _evaluate_gates(
+    phase: DeterministicPhase,
+    workflow: Workflow,
+    values: Mapping[str, Any],
+    warnings: list[str],
+) -> None:
+    """Run every gate in order; append warnings, raise `_GateFailed` on a verdict."""
+    for name in phase.gates:
+        gate = workflow.function(name)
+        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
+        verdict = gate(**kwargs)
+        if verdict is None:
+            continue
+        if not isinstance(verdict, Mapping):
+            raise EngineError(
+                f"gate returned {type(verdict).__name__}; a gate returns None to pass "
+                "or a mapping verdict to fail, and anything else would be read as a "
+                "pass by accident",
+                phase=phase.name,
+                function=name,
+            )
+        if "warn" in verdict:
+            warnings.append(
+                f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
+            )
+            continue
+        raise _GateFailed(f"phase {phase.name!r} gate {name!r} failed: {_render_verdict(verdict)}")
+
+
+def _render_verdict(verdict: Mapping[str, Any]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
 
 
 def run_subtask(
@@ -205,6 +259,7 @@ def run_subtask(
         outcome = _run_deterministic(
             phase, workflow, store, story_id, subtask, context, clock
         )
+        summary.warnings.extend(outcome.warnings)
         if not outcome.ok:
             summary.status = "escalated"
             summary.failed_phase = phase.name
@@ -257,6 +312,7 @@ def _run_deterministic(
 ) -> _Outcome:
     started_at = clock()
     _record_phase(store, story_id, subtask, phase, "started", started_at, None)
+    warnings: list[str] = []
     try:
         function = workflow.function(phase.run)
         kwargs = bind_arguments(
@@ -271,15 +327,19 @@ def _run_deterministic(
                 phase=phase.name,
                 function=phase.run,
             )
+        _evaluate_gates(phase, workflow, _gate_values(context, phase.name, result), warnings)
+    except _GateFailed as failure:
+        _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
+        return _Outcome(ok=False, detail=failure.detail, warnings=warnings)
     except Exception as error:
         # Deliberately total. A step is other people's code -- GitError, OSError,
         # anything -- and an exception escaping the walk would leave the subtask
         # recorded `started` forever, which is exactly what resume mistakes for
         # work in flight.
         _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
-        return _Outcome(ok=False, detail=_render_error(error))
+        return _Outcome(ok=False, detail=_render_error(error), warnings=warnings)
     _record_phase(store, story_id, subtask, phase, "done", started_at, clock())
-    return _Outcome(ok=True, result=result)
+    return _Outcome(ok=True, result=result, warnings=warnings)
 
 
 def _render_error(error: BaseException) -> str:

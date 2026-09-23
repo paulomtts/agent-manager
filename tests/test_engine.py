@@ -497,3 +497,188 @@ phases:
     )
 
     assert summary.results == {}
+
+
+GATED = """
+name: gated
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+    gates: [alpha_gate]
+  - name: beta
+    kind: deterministic
+    run: step.beta
+"""
+
+
+def test_a_passing_gate_lets_the_walk_continue(store):
+    seen: dict[str, Any] = {}
+
+    def alpha(card: str) -> dict[str, Any]:
+        return {"passed": True}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def alpha_gate(result: dict[str, Any]) -> dict[str, str] | None:
+        seen["result"] = result
+        return None
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert seen["result"] == {"passed": True}
+    assert summary.status == "done"
+    assert summary.warnings == []
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
+
+
+def test_a_warning_gate_continues_and_surfaces_the_warning(store):
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def alpha_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"warn": "the suite reported no tests"}
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "done"
+    assert len(summary.warnings) == 1
+    assert "alpha_gate" in summary.warnings[0]
+    assert "the suite reported no tests" in summary.warnings[0]
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
+
+
+def test_a_failing_gate_escalates_and_stops_the_walk(store):
+    calls: list[str] = []
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {"passed": False}
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        return {}
+
+    def alpha_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"blocked": "verification", "detail": "2 of 3 commands failed"}
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["alpha"]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "alpha"
+    assert "alpha_gate" in summary.detail
+    assert "2 of 3 commands failed" in summary.detail
+    assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
+    assert store.journal.read()[-1].payload["status"] == "escalated"
+
+
+def test_a_warning_before_a_failing_gate_survives_into_the_summary(store):
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def first_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"warn": "looked thin"}
+
+    def second_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"blocked": "review", "detail": "unresolved blocker"}
+
+    document = """
+name: gated
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+    gates: [first_gate, second_gate]
+  - name: beta
+    kind: deterministic
+    run: step.beta
+"""
+    workflow = _workflow(
+        document,
+        {
+            "step.alpha": alpha,
+            "step.beta": beta,
+            "first_gate": first_gate,
+            "second_gate": second_gate,
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "escalated"
+    assert any("looked thin" in warning for warning in summary.warnings)
+
+
+@pytest.mark.parametrize("verdict", [False, True, "blocked", 0])
+def test_a_gate_returning_neither_none_nor_a_mapping_escalates(store, verdict):
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def alpha_gate(result: dict[str, Any]) -> Any:
+        return verdict
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "escalated"
+    assert "mapping" in summary.detail
+
+
+def test_a_gate_binds_the_phase_result_under_the_phase_name_too(store):
+    seen: dict[str, Any] = {}
+
+    def alpha(card: str) -> dict[str, Any]:
+        return {"ok": 1}
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    def alpha_gate(alpha: dict[str, Any], branch: str) -> None:
+        seen.update(alpha=alpha, branch=branch)
+        return None
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert seen == {"alpha": {"ok": 1}, "branch": "m1/task-ed77a917"}
