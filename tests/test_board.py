@@ -377,3 +377,114 @@ def test_tree_requires_exactly_one_root(data, tmp_path, monkeypatch):
     with pytest.raises(board.BoardError) as excinfo:
         board.tree("141c96e6", repo_dir=tmp_path)
     assert "exactly one root" in str(excinfo.value)
+
+
+def _without_volatile(nodes: list[dict]) -> list[dict]:
+    """Every tree field except the two a status write is allowed to move."""
+    return [
+        {
+            "id": node["id"],
+            "title": node["title"],
+            "description": node["description"],
+            "blocked_by": node["blocked_by"],
+            "created_at": node["created_at"],
+            "children": _without_volatile(node["children"]),
+        }
+        for node in nodes
+    ]
+
+
+@requires_brd
+def test_set_status_moves_the_status_and_a_later_show_sees_it(temp_board):
+    subtask = _add_card(temp_board, "Add the brd board adapter")
+
+    returned = board.set_status(subtask, "in_progress", repo_dir=temp_board)
+
+    assert isinstance(returned, models.Card)
+    assert returned.status == "in_progress"
+    assert board.show(subtask, repo_dir=temp_board).status == "in_progress"
+
+
+@requires_brd
+def test_set_status_is_idempotent(temp_board):
+    # Design §9 line 376. Resume discards in-flight attempts and re-runs the
+    # whole phase, so mark_in_progress/mark_done run twice on the same card; a
+    # second call must not raise or move the board.
+    subtask = _add_card(temp_board, "Add the brd board adapter")
+
+    first = board.set_status(subtask, "done", repo_dir=temp_board)
+    second = board.set_status(subtask, "done", repo_dir=temp_board)
+
+    assert first.status == "done"
+    assert second.status == "done"
+    assert second.id == first.id
+    assert board.show(subtask, repo_dir=temp_board).status == "done"
+
+
+@requires_brd
+def test_set_status_round_trips_through_the_model_types(temp_board):
+    story = _add_card(temp_board, "Naming and the brd board adapter")
+    subtask = _add_card(temp_board, "Add the brd board adapter", story)
+
+    written = board.set_status(subtask, "in_progress", repo_dir=temp_board)
+    read_back = board.show(subtask, repo_dir=temp_board)
+
+    assert read_back.id == written.id
+    assert read_back.title == written.title
+    assert read_back.status == written.status
+    assert read_back.parent_id == written.parent_id == story
+    assert read_back.description == written.description
+
+
+@requires_brd
+def test_set_status_of_a_nonexistent_card_raises_board_error(temp_board):
+    with pytest.raises(board.BoardError) as excinfo:
+        board.set_status("no-such-card", "done", repo_dir=temp_board)
+    assert excinfo.value.error_type == "CardNotFoundError"
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.argv == [
+        "brd",
+        "update",
+        "no-such-card",
+        "--status",
+        "done",
+    ]
+
+
+@requires_brd
+def test_set_status_blocked_propagates_brds_own_rejection(temp_board):
+    # brd derives `blocked` and refuses to store it. board.py special-cases
+    # nothing: the ok:false envelope becomes a BoardError like any other.
+    subtask = _add_card(temp_board, "Add the brd board adapter")
+    with pytest.raises(board.BoardError) as excinfo:
+        board.set_status(subtask, "blocked", repo_dir=temp_board)
+    assert excinfo.value.error_type == "InvalidStatusError"
+    assert "blocked" in excinfo.value.message
+
+
+@requires_brd
+def test_nothing_but_status_is_ever_written_to_the_board(temp_board, tmp_path):
+    # Decision D5: the board receives status transitions and nothing else. No
+    # run, phase or attempt artefact may appear on it.
+    milestone = _add_card(temp_board, "Milestone 1")
+    story = _add_card(temp_board, "Naming and the brd board adapter", milestone)
+    subtask = _add_card(temp_board, "Add the brd board adapter", story)
+    before = _brd_json(temp_board, "tree")
+
+    board.set_status(subtask, "in_progress", repo_dir=temp_board)
+    board.set_status(subtask, "done", repo_dir=temp_board)
+
+    after = _brd_json(temp_board, "tree")
+    assert _without_volatile(after) == _without_volatile(before)
+    assert board.show(subtask, repo_dir=temp_board).status == "done"
+    assert board.show(story, repo_dir=temp_board).status == "todo"
+
+    # ...and no new brd storage of any kind was created beyond the one board db.
+    brd_data = tmp_path / "xdg" / "brd"
+    files = sorted(
+        path.relative_to(brd_data).parts[0]
+        for path in brd_data.rglob("*")
+        if path.is_file()
+    )
+    assert files == ["master.db", "projects"]
+    assert len(list((brd_data / "projects").glob("*.db"))) == 1

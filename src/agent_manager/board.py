@@ -193,3 +193,24 @@ def tree(card_id: str, *, repo_dir: Path | None = None) -> models.CardNode:
             exit_code=completed.returncode,
         )
     return _validated(models.CardNode, data[0], argv=argv)
+
+
+def set_status(
+    card_id: str, status: str, *, repo_dir: Path | None = None
+) -> models.Card:
+    """Write a card's board status via `brd update --status`, and return it.
+
+    This is the module's entire write surface: under D5 the board receives
+    status transitions and nothing else, and run state lives in agent-manager's
+    own store.
+
+    Idempotent by construction (design §9 line 376): `brd update` stores the
+    value it is given, so a repeat of the same transition is another successful
+    write of the same value. Resume re-runs whole phases, and the phases that
+    call this are `best_effort`, so a spurious second-call failure would be
+    journalled as a board-write failure for work that actually succeeded.
+    """
+    argv = set_status_argv(card_id, status)
+    completed = _run(argv, repo_dir)
+    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
+    return _validated(models.Card, data, argv=argv)
