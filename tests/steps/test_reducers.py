@@ -4,10 +4,22 @@ Ported case-by-case from the sibling plugin's `workflows/task.test.mjs`
 (lines 30-186), which is the behavioural specification for these gates.
 """
 
+import math
+
 import pytest
 
 from agent_manager.steps import reducers
-from agent_manager.steps.reducers import exploration_output_gate, verification_gate
+from agent_manager.steps.reducers import (
+    _is_integer,
+    _js_text,
+    count_of,
+    exploration_output_gate,
+    is_plan_hash,
+    plan_hash_gate,
+    plan_hash_mismatch,
+    review_gate,
+    verification_gate,
+)
 
 
 def test_a_discovered_suite_proceeds():
@@ -251,11 +263,6 @@ def test_an_empty_caller_provided_mapping_takes_the_plausibility_branch():
 # to zero — a Review that reported no count at all would otherwise be judged as
 # having found ZERO COMMITS and stop the run blaming Implement.
 
-import math
-
-from agent_manager.steps.reducers import count_of
-from agent_manager.steps.reducers import _is_integer, _js_text
-
 
 @pytest.mark.parametrize(("value", "expected"), [(3, 3), (0, 0), (-2, -2), (1.5, 1.5)])
 def test_a_real_number_is_returned_as_is(value, expected):
@@ -325,8 +332,6 @@ def test_js_text_renders_values_the_way_a_template_literal_does():
 # ── review_gate ──────────────────────────────────────────────────────────────
 # Ported from task.test.mjs:59-139. The Review -> Ship boundary: Review REPORTS
 # three facts, this gate judges them, before anything is pushed.
-
-from agent_manager.steps.reducers import review_gate
 
 BRANCH = "task-42"
 BASE = "main"
@@ -461,8 +466,6 @@ def test_a_zero_count_from_a_numeric_string_still_blocks_as_implement():
 # of sha256sum(<plan file>). Implement writes the trailers; Review recomputes
 # the hash independently, so comparing the two catches the plan file changing
 # mid-run — which silently invalidates every trailer already written.
-
-from agent_manager.steps.reducers import is_plan_hash, plan_hash_gate, plan_hash_mismatch
 
 
 @pytest.mark.parametrize("good", ["a1b2c3d4", "00000000", "ffffffff", "0123456789abcdef"[:8]])
