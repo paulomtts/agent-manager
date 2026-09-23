@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, Field
 
-from agent_manager import dag, models, prompt
+from agent_manager import dag, models, prompt, results
 from agent_manager.errors import EngineError
 from agent_manager.roles import loader as roles_loader
 from agent_manager.workflow.loader import AgentPhase
@@ -576,6 +576,33 @@ def test_the_contract_states_the_absolute_path_and_embeds_the_real_schema():
     assert "/var/agent-manager/runs/r1/card/implement.1/result.json" in brief
     assert _fenced_json(brief) == StandInResult.model_json_schema()
     assert "summary" in _fenced_json(brief)["properties"]
+
+
+def test_the_spec_authors_contract_names_its_path_and_embeds_the_real_schema():
+    brief = prompt.compose_brief(
+        _role("spec_author"),
+        _rendered(),
+        result_path=Path("/var/agent-manager/runs/r1/card/spec.1/result.json"),
+        result_model=results.SpecResult,
+    )
+
+    assert "\n## Result contract\n" in brief
+    assert "/var/agent-manager/runs/r1/card/spec.1/result.json" in brief
+    assert _fenced_json(brief) == results.SpecResult.model_json_schema()
+    assert set(_fenced_json(brief)["properties"]) == {"path", "note"}
+
+
+@pytest.mark.parametrize("name", sorted(results.RESULT_MODELS))
+def test_every_shipped_result_model_embeds_its_own_schema_in_the_contract(name):
+    model = results.RESULT_MODELS[name]
+    result_path = f"/var/agent-manager/runs/r1/card/{name}.1/result.json"
+
+    brief = prompt.compose_brief(
+        _role(), _rendered(), result_path=Path(result_path), result_model=model
+    )
+
+    assert result_path in brief
+    assert _fenced_json(brief) == model.model_json_schema()
 
 
 def test_the_contract_says_write_valid_json_and_stay_out_of_the_worktree():

@@ -22,6 +22,7 @@ from agent_manager.results import (
     ImplementResult,
     PlanResult,
     ReviewResult,
+    SpecResult,
     Verification,
     resolve_result_model,
 )
@@ -40,9 +41,9 @@ from agent_manager.workflow.registry import (
 
 # Design spec lines 146-225, in file order.
 EXPECTED_PHASES = (
+    ("worktree", "deterministic"),
     ("explore", "agent"),
     ("mark_in_progress", "deterministic"),
-    ("worktree", "deterministic"),
     ("plan_check", "deterministic"),
     ("spec", "agent"),
     ("validate_spec", "agent"),
@@ -65,6 +66,25 @@ def test_builtin_task_loads_against_the_default_registry() -> None:
 def test_builtin_task_has_the_twelve_phases_in_spec_order() -> None:
     workflow = load_builtin("task")
     assert tuple((phase.name, phase.kind) for phase in workflow.phases) == EXPECTED_PHASES
+
+
+def test_no_agent_phase_precedes_the_worktree_phase() -> None:
+    """R6: every agent phase is dispatched with the subtask's worktree as its
+    cwd (`dispatch.AgentRunner._worktree`), so `worktree.ensure` has to have run
+    before the first of them. Asserted against the loaded document rather than
+    the YAML text, so any future reorder of the file fails right here."""
+    phases = load_builtin("task").phases
+    names = [phase.name for phase in phases]
+    agent_indexes = [
+        index for index, phase in enumerate(phases) if isinstance(phase, AgentPhase)
+    ]
+
+    # Non-vacuity: a loader change that stopped yielding `AgentPhase` instances,
+    # or a rename of the worktree phase, must fail here and not pass emptily.
+    assert "worktree" in names
+    assert len(agent_indexes) == 7
+
+    assert names.index("worktree") < min(agent_indexes)
 
 
 def test_plan_check_skips_forward_to_implement_when_a_plan_exists() -> None:
@@ -99,6 +119,30 @@ def test_explore_carries_both_gates_and_its_retry_policy() -> None:
     assert phase.retry is not None
     assert phase.retry.max_attempts == 2
     assert phase.retry.on == ["schema_invalid", "gate_failed"]
+
+
+def test_spec_declares_the_spec_result_and_still_writes_the_specs_document() -> None:
+    phase = load_builtin("task").phase("spec")
+    assert isinstance(phase, AgentPhase)
+    assert phase.role == "spec_author"
+    assert phase.inputs == ["card", "explore"]
+    assert phase.result == "SpecResult"
+    # `writes:` stays: engine._document_paths derives spec_path from this
+    # template, not from the result's `path` field.
+    assert phase.writes == "docs/superpowers/specs/{stem}.md"
+    assert phase.gates == []
+    assert phase.retry is None
+
+
+def test_every_agent_phase_in_the_shipped_document_declares_a_result() -> None:
+    """The seam this card closes: an agent phase with no `result:` produces no
+    evidence a model ever validates."""
+    agent_phases = [
+        phase for phase in load_builtin("task").phases if isinstance(phase, AgentPhase)
+    ]
+
+    assert len(agent_phases) == 7  # non-vacuity
+    assert [phase.name for phase in agent_phases if phase.result is None] == []
 
 
 def test_review_carries_both_of_its_gates() -> None:
@@ -166,7 +210,7 @@ def test_every_declared_result_name_resolves_through_the_shipped_table() -> None
         checked += 1
     # Non-vacuity: a loader change that stopped yielding agent phases, or
     # stopped carrying `result`, would otherwise turn this into a no-op.
-    assert checked == 6  # CriticResult is declared by two phases
+    assert checked == 7  # CriticResult is declared by two phases
 
 
 def test_both_validation_phases_resolve_to_the_same_critic_model() -> None:
@@ -246,6 +290,10 @@ def _critic_result(blockers: bool = False) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+def _spec_result() -> dict[str, Any]:
+    return SpecResult(path=SPEC_PATH, note=None).model_dump(mode="json")
+
+
 def _plan_result() -> dict[str, Any]:
     return PlanResult(path=PLAN_PATH, self_reviewed=True, note=None).model_dump(
         mode="json"
@@ -287,7 +335,7 @@ def _phase_results() -> dict[str, Any]:
         "explore": _explore_result(),
         "mark_in_progress": {"status": "in_progress"},
         "plan_check": {"found": False},
-        "spec": {"path": SPEC_PATH},
+        "spec": _spec_result(),
         "validate_spec": _critic_result(),
         "plan": _plan_result(),
         "validate_plan": _critic_result(),

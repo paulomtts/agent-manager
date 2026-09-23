@@ -1,8 +1,12 @@
 """Pure-functions tier (design spec §14): no filesystem, no network, no git."""
 
+from pathlib import Path
+
 import pytest
 
-from agent_manager.steps import plan_check, reducers, verify, worktree
+from agent_manager.engine import bind_arguments
+from agent_manager.errors import EngineError
+from agent_manager.steps import plan_check, reducers, rollup, verify, worktree
 from agent_manager.workflow.registry import (
     BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
@@ -118,14 +122,40 @@ def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> 
     assert registry.resolve("verify.run_suite") is verify.run_suite
     assert registry.resolve("plan_check.find_validated_plan") is plan_check.find_validated_plan
     assert registry.resolve("plan_check.has_validated_plan") is plan_check.has_validated_plan
+    assert registry.resolve("rollup.set_status") is rollup.set_status
 
 
-def test_the_one_remaining_placeholder_resolves_and_raises_when_called() -> None:
-    """`steps/rollup.py` is still a sibling's; every other name is real code."""
-    fn = default_registry().resolve("rollup.set_status")
-    with pytest.raises(NotImplementedError) as caught:
-        fn()
-    assert "rollup.set_status" in str(caught.value)
+def test_the_engine_can_bind_the_documents_args_to_the_rollup_step() -> None:
+    """The `card` vs `card_id` trap: the context key is `card`, a bare id."""
+    bound = bind_arguments(
+        rollup.set_status,
+        {
+            "card": "43008688",
+            "card_details": None,
+            "branch": "m2/task-implement-the-rollup-43008688",
+            "repo_dir": Path("/repo"),
+        },
+        {"status": "done"},
+        phase="mark_done",
+        function="rollup.set_status",
+    )
+    assert bound == {
+        "card": "43008688",
+        "status": "done",
+        "repo_dir": Path("/repo"),
+    }
+
+
+def test_binding_rejects_an_args_key_the_rollup_step_does_not_take() -> None:
+    """A document that wrote `args: { card_id: ... }` must fail loudly."""
+    with pytest.raises(EngineError):
+        bind_arguments(
+            rollup.set_status,
+            {"card": "43008688", "repo_dir": Path("/repo")},
+            {"card_id": "43008688", "status": "done"},
+            phase="mark_done",
+            function="rollup.set_status",
+        )
 
 
 def test_the_critic_gate_is_real_code_now_rather_than_a_placeholder() -> None:

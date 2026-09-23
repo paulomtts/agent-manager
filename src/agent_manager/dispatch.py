@@ -196,7 +196,7 @@ def build_dispatch(
 
 
 def classify(
-    outcome: Outcome, result_path: Path, model: type[BaseModel] | None
+    outcome: Outcome, result_path: Path | None, model: type[BaseModel] | None
 ) -> Verdict:
     """One attempt's outcome, from the launcher's report and the result file.
 
@@ -206,6 +206,11 @@ def classify(
     Only past those does the file get read, and from there every failure is
     `schema_invalid`, because a file that exists and cannot be validated is
     exactly what re-dispatching with the validator's text can fix.
+
+    A phase that declares no result model is judged on exit status alone: there
+    is no contract in its brief, so there is nothing to read or validate, and a
+    file the harness wrote anyway is not adopted as a result. `result_path` is
+    never dereferenced on that path, so `None` is accepted and it never raises.
 
     A verdict of `ok` here means "the result file is good"; the gates run after
     and may still turn it into `gate_failed`.
@@ -222,7 +227,9 @@ def classify(
         )
     if outcome.exit_code != 0:
         return Verdict("harness_error", detail=f"the harness exited {outcome.exit_code}")
-    if not result_path.is_file():
+    if model is None:
+        return Verdict("ok", result=None)
+    if result_path is None or not result_path.is_file():
         return Verdict(
             "harness_error", detail=f"the harness wrote no result file at {result_path}"
         )
@@ -241,17 +248,6 @@ def classify(
         data = json.loads(text)
     except json.JSONDecodeError as error:
         return Verdict("schema_invalid", detail=f"{result_path} is not valid JSON: {error}")
-    if model is None:
-        if not isinstance(data, dict):
-            return Verdict(
-                "schema_invalid",
-                detail=(
-                    f"{result_path} must hold a JSON object, got "
-                    f"{type(data).__name__}: later phases and every gate read the "
-                    "result by key"
-                ),
-            )
-        return Verdict("ok", result=data)
     try:
         validated = model.model_validate(data)
     except ValidationError as error:
@@ -505,7 +501,13 @@ class AgentRunner:
         outcome = self.launcher(
             argv, cwd=cwd, timeout=self.timeout, stdout_path=stdout_path
         )
-        verdict = classify(outcome, dispatch_record.result_path, model)
+        # The same `None if model is None` the brief uses: the two halves of
+        # "this phase has no result" must agree. The dispatch and the journalled
+        # attempt keep the concrete path (the adapter builds argv from it and
+        # `cli.read_artifact` reads it).
+        verdict = classify(
+            outcome, None if model is None else dispatch_record.result_path, model
+        )
         if verdict.status == "ok":
             failure = evaluate_gates(
                 phase,

@@ -148,6 +148,10 @@ name: task
 description: Drive one subtask card end to end in its own worktree.
 
 phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.ensure
+
   - name: explore
     kind: agent
     role: explorer
@@ -162,10 +166,6 @@ phases:
     args: { status: in_progress }
     best_effort: true
 
-  - name: worktree
-    kind: deterministic
-    run: worktree.ensure
-
   - name: plan_check
     kind: deterministic
     run: plan_check.find_validated_plan
@@ -176,6 +176,7 @@ phases:
     kind: agent
     role: spec_author
     inputs: [card, explore]
+    result: SpecResult
     writes: docs/superpowers/specs/{stem}.md
 
   - name: validate_spec

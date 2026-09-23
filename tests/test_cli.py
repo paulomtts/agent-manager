@@ -454,9 +454,9 @@ def test_the_interrupted_phase_is_the_one_recorded_started():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
             _recorded("spec", "done", [_pure_attempt(1)]),
             _recorded("validate_spec", "done", [_pure_attempt(1)]),
@@ -475,9 +475,9 @@ def test_a_crash_between_phases_restarts_at_the_first_phase_not_done():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
         ],
     )
 
@@ -492,14 +492,26 @@ def test_a_skipped_stretch_restarts_at_the_phase_whose_when_decided_the_skip():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
         ],
     )
 
     assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
+
+
+def test_a_run_that_lost_everything_after_the_first_phase_restarts_at_explore():
+    """The first phase of the document is `worktree` (R6), so the cheapest real
+    crash there is -- the process dying right after the worktree was created --
+    must restart at `explore` and never re-create the worktree."""
+    workflow = _task_workflow()
+    assert workflow.phase_names[0] == "worktree"
+
+    subtask = _pure_subtask("card-1", [_recorded("worktree", "done")])
+
+    assert cli.interrupted_phase(subtask, workflow) == "explore"
 
 
 def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_check():
@@ -1100,6 +1112,27 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
 
 @requires_git
 @requires_brd
+def test_run_card_really_moves_the_card_on_the_board(project, cards):
+    """§12: a payload saying `done` while the card never moved is the failure
+    this run is supposed to prevent. `mark_in_progress` and `mark_done` are
+    `best_effort`, so a board write that never happened would be a warning at
+    most -- the proof has to come from brd itself, not from the payload."""
+    assert board.show(cards["subtask"], repo_dir=project).status == "todo"
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["warnings"] == []
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
 def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
     card = board.show(cards["subtask"], repo_dir=project)
     payload = cli.run_card(
@@ -1225,12 +1258,22 @@ def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatc
     assert "canned gate failure" in envelope["data"]["detail"]
 
 
+def _fail_board_writes(monkeypatch) -> None:
+    def refuse(*args, **kwargs):
+        raise cli.board.BoardError("simulated board write failure")
+
+    monkeypatch.setattr(cli.board, "set_status", refuse)
+
+
 @requires_git
 @requires_brd
-def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
+def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
+    project, cards, monkeypatch
+):
     """§12: a run that says `done` while the card never moved is the exact
-    failure this list exists to prevent. `rollup.set_status` is still a registry
-    placeholder that raises, which is one honest way for the write to fail."""
+    failure this list exists to prevent. The board write is made to fail by
+    having `board.set_status` raise, which is one honest way for it to fail."""
+    _fail_board_writes(monkeypatch)
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -1246,11 +1289,14 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
 
 @requires_git
 @requires_brd
-def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, cards):
+def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
+    project, cards, monkeypatch
+):
     """`AgentRunner` collects gate warnings on itself (dispatch.py:375) because
     an `AgentPhaseRunner` returns a result and has no second channel. §12 forbids
     a run reporting a clean success while a gate warned, so the payload has to
     carry that list too -- not just `SubtaskSummary.warnings`."""
+    _fail_board_writes(monkeypatch)
 
     class WarningRunner:
         def __init__(self) -> None:
@@ -2697,7 +2743,7 @@ def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_tra
         project,
         cards,
         run_id,
-        done=("explore", "mark_in_progress", "worktree", "plan_check"),
+        done=("worktree", "explore", "mark_in_progress", "plan_check"),
     )
 
     with pytest.raises(EngineError) as caught:

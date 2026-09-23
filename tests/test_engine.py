@@ -1181,9 +1181,9 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     )
 
     assert calls == [
+        "worktree.ensure",
         "agent:explore",
         "rollup.set_status:in_progress",
-        "worktree.ensure",
         "plan_check.find_validated_plan",
         "agent:spec",
         "agent:validate_spec",
@@ -1198,8 +1198,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     assert summary.status == "done"
     assert summary.warnings == []
     assert [name for name, _status in _projected_phases(store)] == [
-        "mark_in_progress",
         "worktree",
+        "mark_in_progress",
         "plan_check",
         "verify",
         "mark_done",
@@ -1628,6 +1628,41 @@ def _walk_builtin(store, recorded: dict[str, Any], *, validated: bool) -> Any:
         parent_story=PARENT,
         agent_runner=_recording_runner(recorded),
     )
+
+
+def test_a_resume_started_at_explore_never_re_runs_the_worktree_phase(store):
+    """R6 moved `worktree` in front of `explore`, which makes it the one phase a
+    resume can legitimately be *behind*. `worktree.ensure` is idempotent, but a
+    walk started at `explore` must not call it at all -- the phase is done."""
+    calls: list[str] = []
+    workflow = load_builtin("task", _registry(_builtin_functions(calls, validated=False)))
+
+    def agent_runner(phase, context, rendered):
+        calls.append(f"agent:{phase.name}")
+        return {"role": phase.role}
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=agent_runner,
+        start_phase="explore",
+    )
+
+    assert "worktree.ensure" not in calls
+    assert calls[0] == "agent:explore"
+    assert summary.status == "done"
+    assert [name for name, _status in _projected_phases(store)] == [
+        "mark_in_progress",
+        "plan_check",
+        "verify",
+        "mark_done",
+    ]
 
 
 def test_every_document_path_input_renders_the_expanded_writes_template(store):

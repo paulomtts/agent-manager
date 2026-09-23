@@ -16,7 +16,7 @@ one type for "this workflow could not be loaded".
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from agent_manager.steps import plan_check, reducers, verify, worktree
+from agent_manager.steps import plan_check, reducers, rollup, verify, worktree
 
 Function = Callable[..., Any]
 """What a registered name resolves to. The engine, not this module, knows what
@@ -232,14 +232,13 @@ def default_registry() -> FunctionRegistry:
     global state that any importer could rebind a gate in, and the second call
     would then fail on `DuplicateFunctionError`.
 
-    The six reducers and the four implemented steps are the real, imported
+    The six reducers and the five implemented steps are the real, imported
     callables -- not wrappers -- so `resolve(name) is the_function` holds and a
-    sibling's bugfix reaches the engine without touching this table. One name
-    still has no implementation on this branch (`steps/rollup.py` does not
-    exist), so `rollup.set_status` resolves to a placeholder. `plan_hash_gate`
-    is the single exception to the "no wrappers" rule: see
-    `plan_hash_gate_adapter` above for why the binder cannot reach the two
-    fields that gate compares.
+    sibling's bugfix reaches the engine without touching this table. No
+    placeholder registrations remain: every name the document uses now has an
+    implementation. `plan_hash_gate` is the single exception to the "no
+    wrappers" rule: see `plan_hash_gate_adapter` above for why the binder cannot
+    reach the two fields that gate compares.
     """
     registry = FunctionRegistry()
 
@@ -251,15 +250,10 @@ def default_registry() -> FunctionRegistry:
     registry.register("verification_passed_gate", reducers.verification_passed_gate)
     registry.register("critic_blockers_gate", reducers.critic_blockers_gate)
 
-    # Deterministic steps that already ship on this branch.
+    # Deterministic steps.
     registry.register("worktree.ensure", worktree.ensure)
     registry.register("verify.run_suite", verify.run_suite)
     registry.register("plan_check.find_validated_plan", plan_check.find_validated_plan)
     registry.register("plan_check.has_validated_plan", plan_check.has_validated_plan)
-
-    # Owned by siblings; registered so the document resolves, not so it runs.
-    registry.register(
-        "rollup.set_status",
-        _placeholder("rollup.set_status", "the sibling subtask that adds steps/rollup.py"),
-    )
+    registry.register("rollup.set_status", rollup.set_status)
     return registry

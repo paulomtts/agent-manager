@@ -5,8 +5,9 @@ to a class is the agent-dispatch sibling's job"). This module is that mapping,
 and nothing more: no validation happens here, and importing it reads no file.
 
 `RESULT_MODELS` is that mapping: every `result:` name `builtin/task.yaml`
-declares -- `ExploreResult`, `CriticResult`, `PlanResult`, `ImplementResult`,
-`ReviewResult` -- against the model that validates that phase's `result.json`.
+declares -- `ExploreResult`, `CriticResult`, `SpecResult`, `PlanResult`,
+`ImplementResult`, `ReviewResult` -- against the model that validates that
+phase's `result.json`.
 `Verification` is not in it; no phase declares it, and it is reachable only as
 `ExploreResult.verification`. A name with no entry still fails loudly at
 dispatch time, which is strictly better than validating nothing and calling
@@ -59,6 +60,22 @@ class CriticResult(_Result):
     summary: str
 
 
+class SpecResult(_Result):
+    """The `spec` phase's result file (`builtin/task.yaml`, the `spec` phase).
+
+    `PlanResult`'s shape minus `self_reviewed`: nothing asks the spec author to
+    self-review, so a result claiming it is an unknown key. `path` is what the
+    agent says it wrote; `engine._document_paths` still derives `spec_path` from
+    the phase's `writes:` template, so this field is the agent's claim on record
+    rather than the engine's input. No `serialization_alias` on either field: no
+    reducer in `steps/reducers.py` reads a spec result, so there is no camelCase
+    port to honour.
+    """
+
+    path: str
+    note: str | None
+
+
 class PlanResult(_Result):
     """The `plan` phase's result file (`builtin/task.yaml` line 46).
 
@@ -108,6 +125,7 @@ class ReviewResult(_Result):
 RESULT_MODELS: dict[str, type[BaseModel]] = {
     "ExploreResult": ExploreResult,
     "CriticResult": CriticResult,
+    "SpecResult": SpecResult,
     "PlanResult": PlanResult,
     "ImplementResult": ImplementResult,
     "ReviewResult": ReviewResult,
