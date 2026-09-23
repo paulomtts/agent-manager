@@ -182,3 +182,141 @@ def test_overriding_a_field_the_schema_does_not_have_is_refused():
 
     assert "findings" in str(caught.value)
     assert "blockers" in str(caught.value)
+
+
+import subprocess
+import sys
+
+
+def _brief(tmp_path, phase, role, body, schema, result_path):
+    """A brief shaped like `prompt.compose_brief`'s output, written to disk."""
+    text = (
+        f"# {role}\n\nstanding instructions\n\n"
+        f"# phase: {phase}\n# role: {role}\n"
+        f"{body}\n"
+        f"{fake_claude.RESULT_HEADING}\n"
+        "When you are done, write your result as valid JSON to exactly this path:\n"
+        "\n"
+        f"{result_path}\n"
+        "\n"
+        "That path is deliberately outside the worktree you are working in.\n"
+        "\n"
+        "The JSON must validate against this schema:\n"
+        "\n"
+        "```json\n"
+        f"{json.dumps(schema, indent=2)}\n"
+        "```\n"
+    )
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(text, encoding="utf-8")
+    return prompt_path
+
+
+CRITIC_SCHEMA = {
+    "properties": {
+        "blockers": {"type": "boolean"},
+        "reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "summary": {"type": "string"},
+    },
+    "type": "object",
+}
+
+
+def _run_fake(prompt_path, cwd):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--model",
+            "sonnet",
+            "--dangerously-skip-permissions",
+            "-p",
+            f"Read {prompt_path} and follow the instructions in it exactly. "
+            "It is your complete brief for this task.",
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_the_fake_writes_a_gate_passing_critic_result_where_the_brief_says(tmp_path):
+    """Production-wiring tier's own fixture check: the script end to end, driven
+    only by a brief on disk."""
+    attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.1"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path,
+        "validate_spec",
+        "critic",
+        "\n## spec_path\ndocs/superpowers/specs/x-00000001.md\n",
+        CRITIC_SCHEMA,
+        result_path,
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["blockers"] is False
+    assert payload["reason"] is None
+    assert len(payload["summary"]) > 60
+
+
+def test_the_fake_logs_its_phase_and_cwd_beside_the_run_directory(tmp_path):
+    attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.1"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path, "validate_spec", "critic", "\n## spec_path\nx.md\n",
+        CRITIC_SCHEMA, result_path,
+    )
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    completed = _run_fake(prompt_path, workdir)
+
+    assert completed.returncode == 0, completed.stderr
+    log = tmp_path / "runs" / "r1" / fake_claude.LOG_NAME
+    entry = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["phase"] == "validate_spec"
+    assert Path(entry["cwd"]).resolve() == workdir.resolve()
+    assert entry["result_path"] == str(result_path)
+
+
+def test_a_brief_without_a_result_contract_makes_the_fake_exit_non_zero(tmp_path):
+    """Review focus / addendum R2: no contract, no run. This is what makes the
+    production-wiring test fail loudly if prompt composition ever regresses."""
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(
+        "# Critic\n\n# phase: validate_spec\n# role: critic\n\n## spec_path\nx.md\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 1
+    assert "Result contract" in completed.stderr
+
+
+def test_a_feedback_block_after_the_contract_does_not_hide_the_contract(tmp_path):
+    """Review focus: `dispatch._append_feedback` appends
+    `## feedback on the previous attempt` AFTER the contract on a retry."""
+    attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.2"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path, "validate_spec", "critic", "\n## spec_path\nx.md\n",
+        CRITIC_SCHEMA, result_path,
+    )
+    prompt_path.write_text(
+        prompt_path.read_text(encoding="utf-8")
+        + "\n## feedback on the previous attempt\nthe result file was missing\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(result_path.read_text(encoding="utf-8"))["blockers"] is False
