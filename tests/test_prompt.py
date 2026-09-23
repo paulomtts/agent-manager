@@ -374,3 +374,35 @@ def test_the_table_carries_exactly_the_nine_names_section_7_fixes():
         "verification",
     )
     assert sorted(prompt._TABLE) == sorted(rendered.inputs)
+
+
+def test_write_puts_utf8_prompt_text_in_the_attempt_directory(tmp_path):
+    rendered = prompt.render_prompt(_phase(["branch"]), _context())
+
+    written = rendered.write(tmp_path)
+
+    assert written == tmp_path / "prompt.txt"
+    assert written.read_text(encoding="utf-8") == rendered.text
+    assert written.read_bytes() == rendered.text.encode("utf-8")
+
+
+def test_write_overwrites_a_prompt_left_by_an_earlier_attempt(tmp_path):
+    (tmp_path / "prompt.txt").write_text("from attempt 1\n", encoding="utf-8")
+    rendered = prompt.render_prompt(_phase(["branch"]), _context())
+
+    written = rendered.write(tmp_path)
+
+    assert written.read_text(encoding="utf-8") == rendered.text
+    assert "from attempt 1" not in written.read_text(encoding="utf-8")
+
+
+def test_write_does_not_create_the_directory_and_says_which_one_was_missing(tmp_path):
+    missing = tmp_path / "runs" / "r1" / "explore.1"
+    rendered = prompt.render_prompt(_phase(["branch"]), _context())
+
+    with pytest.raises(EngineError) as caught:
+        rendered.write(missing)
+
+    assert str(missing) in str(caught.value)
+    assert caught.value.phase == "implement"
+    assert not missing.exists()

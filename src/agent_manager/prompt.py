@@ -53,6 +53,25 @@ class RenderedPrompt:
         """The input names that produced sections, in the order they appear."""
         return tuple(name for name, _body in self.sections)
 
+    def write(self, attempt_dir: Path) -> Path:
+        """Write `prompt.txt` into an existing attempt directory, and return it.
+
+        §6 puts the attempt directory at step 3 and the dispatch at step 4, so
+        the prompt is on disk before any harness runs and every dispatch is
+        reproducible from the run tree alone. This method does not create the
+        directory and knows nothing of the run layout: `paths.attempt_dir` and
+        the caller that makes it are sibling bf8e415b's.
+        """
+        path = Path(attempt_dir) / "prompt.txt"
+        try:
+            path.write_text(self.text, encoding="utf-8")
+        except OSError as error:
+            raise EngineError(
+                f"cannot write the prompt to {path}: {type(error).__name__}: {error}",
+                phase=self.phase,
+            ) from error
+        return path
+
 
 @dataclass(frozen=True)
 class _Request:
