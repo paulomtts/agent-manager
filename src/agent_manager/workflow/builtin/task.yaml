@@ -30,6 +30,7 @@ phases:
     kind: agent
     role: spec_author
     inputs: [card, explore]
+    result: SpecResult
     writes: docs/superpowers/specs/{stem}.md
 
   - name: validate_spec
