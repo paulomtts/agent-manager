@@ -26,6 +26,7 @@ from agent_manager.workflow.registry import (
     FunctionRegistry,
     UnknownFunctionError,
     WorkflowLoadError,
+    default_registry,
 )
 
 
@@ -319,3 +320,39 @@ def _resolve(workflow: Workflow, registry: FunctionRegistry) -> Workflow:
             registered=registry.names(),
         )
     return workflow.model_copy(update={"functions": functions})
+
+
+BUILTIN_DIR = Path(__file__).parent / "builtin"
+"""The packaged workflow documents, resolved relative to this module the same
+way `roles.loader.bundles_dir` resolves role bundles."""
+
+
+def builtin_path(name: str) -> Path:
+    """The path of a shipped workflow document, refusing anything but a name.
+
+    Validated *before* it is joined: `"../coder"` names a real, loadable file
+    one level up on plenty of layouts, and joining first would hand the engine
+    a workflow from outside the package.
+    """
+    if name in {"", ".", ".."} or name != Path(name).name:
+        raise WorkflowLoadError(
+            f"{name!r} is not a builtin workflow name "
+            "(a builtin is named by a plain name, not a path)"
+        )
+    return BUILTIN_DIR / f"{name}.yaml"
+
+
+def load_builtin(name: str, registry: FunctionRegistry | None = None) -> Workflow:
+    """Load a shipped workflow against the default registry.
+
+    The canonical entry point for the engine: `load_builtin("task")` is the
+    12-phase task workflow of design §5, fully resolved. `registry` exists so a
+    test or an embedder can substitute its own table.
+    """
+    path = builtin_path(name)
+    if not path.is_file():
+        raise WorkflowLoadError(
+            f"no builtin workflow named {name!r} ({path}); "
+            f"builtins: {', '.join(sorted(p.stem for p in BUILTIN_DIR.glob('*.yaml'))) or 'none'}"
+        )
+    return load_workflow(path, default_registry() if registry is None else registry)
