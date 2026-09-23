@@ -2,11 +2,14 @@
 
 import pytest
 
+from agent_manager.steps import plan_check, reducers, verify, worktree
 from agent_manager.workflow.registry import (
+    BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
     FunctionRegistry,
     UnknownFunctionError,
     WorkflowLoadError,
+    default_registry,
 )
 
 
@@ -70,9 +73,6 @@ def test_names_are_sorted_and_membership_is_cheap() -> None:
     assert "a.fn" in registry
     assert "c.fn" not in registry
 
-
-from agent_manager.steps import plan_check, reducers, verify, worktree
-from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, default_registry
 
 # Every name that appears in a run/when/gate position of builtin/task.yaml
 # (design spec lines 146-225).
