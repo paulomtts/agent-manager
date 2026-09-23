@@ -201,8 +201,16 @@ def _gate_values(
     The result appears twice on purpose: under the phase's name, which is how
     §6 says later phases read it, and under `result`, which is the parameter
     name `plan_check.has_validated_plan(result)` and the shipped gates use.
+
+    A phase named after a reserved key is the one exception, for the same
+    reason `_bind_result` is: a gate on the `worktree` phase that binds
+    `worktree` wants the path the phase was pointed at, not that phase's
+    return value. `result` still reaches it either way.
     """
-    return {**context, phase_name: result, "result": result}
+    values = {**context, "result": result}
+    if phase_name not in RESERVED_CONTEXT_KEYS:
+        values[phase_name] = result
+    return values
 
 
 def _evaluate_gates(

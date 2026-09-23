@@ -1258,3 +1258,58 @@ phases:
         ("alpha", "started", None),
         ("alpha", "done", None),
     ]
+
+
+def test_a_gate_on_a_phase_named_like_a_context_key_still_sees_the_real_value(store):
+    """The mirror of the `_bind_result` guard, for the phase's own gate and
+    `when`. The shipped `worktree` phase carries neither today, but a gate
+    added to it that asks for `worktree` wants the path `worktree.ensure` was
+    pointed at, not that call's return value -- exactly what the reserved-key
+    guard protects for every *later* phase. The result stays reachable under
+    `result`, which is the name the shipped gates bind by anyway.
+    """
+    seen: dict[str, Any] = {}
+
+    def ensure(card: str) -> dict[str, Any]:
+        return {"created": True}
+
+    def worktree_gate(worktree: Any, result: dict[str, Any]) -> None:
+        seen.update(worktree=worktree, result=result)
+        return None
+
+    def when_worktree(worktree: Any) -> bool:
+        seen["when_worktree"] = worktree
+        return False
+
+    document = """
+name: collide
+phases:
+  - name: worktree
+    kind: deterministic
+    run: worktree.ensure
+    gates: [worktree_gate]
+    when: when_worktree
+    skip_to: after
+  - name: after
+    kind: deterministic
+    run: step.after
+"""
+    workflow = _workflow(
+        document,
+        {
+            "worktree.ensure": ensure,
+            "worktree_gate": worktree_gate,
+            "when_worktree": when_worktree,
+            "step.after": lambda card: {},
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    real_worktree = _subtask().worktree_path
+    assert summary.status == "done"
+    assert seen["worktree"] == real_worktree
+    assert seen["when_worktree"] == real_worktree
+    assert seen["result"] == {"created": True}
