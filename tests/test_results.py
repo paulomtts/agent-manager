@@ -9,6 +9,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from agent_manager import results
+from agent_manager.steps import reducers
 from agent_manager.errors import EngineError
 
 
@@ -411,3 +412,122 @@ def test_review_result_dumps_the_two_counts_in_camel_case_only_under_by_alias():
     assert aliased["plan_hash"] == "a1b2c3d4"
 
     assert review.model_dump()["commit_count"] == 3
+
+
+# --- The one place the snake_case/camelCase mismatch is reconciled (design §3).
+# --- Still pure tier: the reducers are pure functions, called directly.
+
+_CLEAN_REVIEW = {
+    "findings": [],
+    "unresolved_blockers": [],
+    "fix_summary": "nothing to fix",
+    "porcelain": "",
+    "commit_count": 2,
+    "tagged_count": 2,
+    "plan_hash": "a1b2c3d4",
+}
+
+
+def test_a_dumped_clean_review_passes_the_real_review_gate():
+    dumped = results.ReviewResult(**_CLEAN_REVIEW).model_dump(by_alias=True)
+
+    assert reducers.review_gate(dumped, "m2/task-x", "master") is None
+
+
+def test_a_dump_without_by_alias_is_unusable_to_the_review_gate():
+    # Proof the alias is load-bearing: without it the gate finds no counts and
+    # warns (skipping the Plan-Hash half) rather than passing.
+    dumped = results.ReviewResult(**_CLEAN_REVIEW).model_dump()
+
+    verdict = reducers.review_gate(dumped, "m2/task-x", "master")
+    assert verdict is not None
+    assert "Plan-Hash gate skipped" in verdict["warn"]
+
+
+def test_a_dumped_review_with_no_commits_blocks_on_implement():
+    # The gate is reading the real commitCount, not falling through _field's None.
+    dumped = results.ReviewResult(**{**_CLEAN_REVIEW, "commit_count": 0}).model_dump(
+        by_alias=True
+    )
+
+    verdict = reducers.review_gate(dumped, "m2/task-x", "master")
+    assert verdict["blocked"] == "implement"
+    assert "no commits on top of master" in verdict["detail"]
+
+_REAL_SUMMARY = (
+    "results.py holds the result-name table; steps/reducers.py holds the ported "
+    "gates and reads camelCase keys off the dumped result mapping"
+)
+
+
+def test_a_dumped_explore_result_passes_the_real_exploration_output_gate():
+    assert len(_REAL_SUMMARY) > reducers.MIN_SUMMARY_LENGTH
+    dumped = results.ExploreResult(
+        refused=False,
+        reason=None,
+        summary=_REAL_SUMMARY,
+        verification={"full_suite": ["uv run pytest"], "typecheck": "", "lint": []},
+    ).model_dump(by_alias=True)
+
+    assert dumped["verification"]["fullSuite"] == ["uv run pytest"]
+    assert reducers.exploration_output_gate(dumped, None) is None
+
+
+def test_the_models_leave_an_empty_summary_for_the_gate_to_judge():
+    # No min_length on the models on purpose: plausibility is the gate's job,
+    # so an empty summary must validate and then be stopped by the gate.
+    dumped = results.ExploreResult(
+        refused=True,
+        reason="refused to explore",
+        summary="",
+        verification={"full_suite": ["uv run pytest"], "typecheck": "", "lint": []},
+    ).model_dump(by_alias=True)
+
+    verdict = reducers.exploration_output_gate(dumped, None)
+    assert "implausibly short/placeholder" in verdict["detail"]
+
+def test_the_embedded_json_schema_names_snake_case_only():
+    # R2 embeds model_json_schema() in the agent's prompt, and validation
+    # accepts snake_case only -- so the schema must name exactly that spelling.
+    review_schema = results.ReviewResult.model_json_schema()
+    assert "commit_count" in review_schema["properties"]
+    assert "tagged_count" in review_schema["properties"]
+    assert "commitCount" not in review_schema["properties"]
+    assert "commitCount" not in review_schema["required"]
+    assert set(review_schema["required"]) == {
+        "findings",
+        "unresolved_blockers",
+        "fix_summary",
+        "porcelain",
+        "commit_count",
+        "tagged_count",
+        "plan_hash",
+    }
+
+    explore_schema = results.ExploreResult.model_json_schema()
+    assert set(explore_schema["required"]) == {
+        "refused",
+        "reason",
+        "summary",
+        "verification",
+    }
+    verification_schema = explore_schema["$defs"]["Verification"]
+    assert set(verification_schema["required"]) == {"full_suite", "typecheck", "lint"}
+
+    assert set(results.CriticResult.model_json_schema()["required"]) == {
+        "blockers",
+        "reason",
+        "summary",
+    }
+    assert set(results.PlanResult.model_json_schema()["required"]) == {
+        "path",
+        "self_reviewed",
+        "note",
+    }
+    assert set(results.ImplementResult.model_json_schema()["required"]) == {
+        "blocked",
+        "blocked_reason",
+        "resumed",
+        "plan_hash",
+        "report",
+    }

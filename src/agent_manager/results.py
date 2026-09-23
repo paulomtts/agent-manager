@@ -6,10 +6,10 @@ and nothing more: no validation happens here, and importing it reads no file.
 
 The table ships empty, and that is deliberate. `builtin/task.yaml` names five
 result models -- `ExploreResult`, `CriticResult`, `PlanResult`,
-`ImplementResult`, `ReviewResult` -- and the design spec gives a field schema
-for none of them, so inventing one here would be a design decision this card
-was not given. An unresolved name fails loudly at dispatch time instead, which
-is strictly better than validating nothing and calling the result `ok`.
+`ImplementResult`, `ReviewResult` -- and they are defined below, but wiring
+them into the table is a separate card's decision, not this one's. An
+unresolved name fails loudly at dispatch time instead, which is strictly
+better than validating nothing and calling the result `ok`.
 """
 
 from collections.abc import Mapping
