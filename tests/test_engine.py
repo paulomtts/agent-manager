@@ -7,6 +7,7 @@ git, no `brd`, no harness process, nothing from `default_registry()` -- three of
 its names are placeholders that raise `NotImplementedError`.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1313,3 +1314,82 @@ phases:
     assert seen["worktree"] == real_worktree
     assert seen["when_worktree"] == real_worktree
     assert seen["result"] == {"created": True}
+
+
+def test_a_phase_is_timed_with_the_injected_clock(store):
+    """`started_at` is read once, before the call, and reused on the terminal
+    record so the row keeps the moment work began rather than the moment it
+    ended. Both edges come from the injected clock, never from the wall.
+    """
+    ticks = [
+        datetime(2026, 9, 23, 10, minute, tzinfo=timezone.utc)
+        for minute in (0, 5, 9, 30)
+    ]
+    clock = iter(ticks).__next__
+
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        raise OSError("gone")
+
+    document = """
+name: two
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+  - name: beta
+    kind: deterministic
+    run: step.beta
+"""
+    workflow = _workflow(document, {"step.alpha": alpha, "step.beta": beta})
+
+    engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        clock=clock,
+    )
+
+    stamped = [
+        (line.phase, line.payload["status"], line.payload["started_at"], line.payload["ended_at"])
+        for line in store.journal.read()
+        if line.event == "phase_upsert"
+    ]
+    assert stamped == [
+        ("alpha", "started", "2026-09-23T10:00:00Z", None),
+        ("alpha", "done", "2026-09-23T10:00:00Z", "2026-09-23T10:05:00Z"),
+        ("beta", "started", "2026-09-23T10:09:00Z", None),
+        ("beta", "failed", "2026-09-23T10:09:00Z", "2026-09-23T10:30:00Z"),
+    ]
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "failed")]
+
+
+def test_the_default_clock_stamps_an_aware_utc_time(store):
+    def alpha(card: str) -> dict[str, Any]:
+        return {}
+
+    document = """
+name: one
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+"""
+    workflow = _workflow(document, {"step.alpha": alpha})
+    before = datetime.now(timezone.utc)
+
+    engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    after = datetime.now(timezone.utc)
+    done = store.journal.read()[-2]
+    assert done.payload["status"] == "done"
+    started_at = datetime.fromisoformat(done.payload["started_at"])
+    ended_at = datetime.fromisoformat(done.payload["ended_at"])
+    assert started_at.tzinfo is not None
+    assert before <= started_at <= ended_at <= after
