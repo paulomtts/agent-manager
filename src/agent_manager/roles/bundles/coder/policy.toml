@@ -1,0 +1,6 @@
+allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
+max_attempts = 3
+required_capabilities = []
+
+[default_model]
+claude = "sonnet"

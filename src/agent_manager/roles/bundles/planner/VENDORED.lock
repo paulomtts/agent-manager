@@ -1,0 +1,4 @@
+[[vendored]]
+file = "writing-plans.md"
+upstream = "superpowers/6.4.1/skills/writing-plans/SKILL.md"
+sha256 = "0bc3d36590f7b2c323ed3ec18ff77e9f8ed57af42f5680a02b11a2d20de265cf"

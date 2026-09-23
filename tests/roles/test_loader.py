@@ -417,3 +417,82 @@ def test_a_symlinked_methodology_file_is_rejected(tmp_path):
         loader.load_role("coder", root=tmp_path)
 
     assert "resolves outside the bundle" in excinfo.value.reason
+
+
+SHIPPED = ["coder", "critic", "explorer", "planner", "reviewer", "spec_author"]
+
+DEFAULT_MODELS = {
+    "explorer": "sonnet",
+    "spec_author": "opus",
+    "planner": "opus",
+    "critic": "sonnet",
+    "coder": "sonnet",
+    "reviewer": "opus",
+}
+
+
+def shipped_lock(role: str) -> list[dict[str, str]]:
+    """`VENDORED.lock`'s entries for a shipped role, read independently of the
+    loader so the drift check does not depend on the code it guards."""
+    path = loader.bundles_dir() / role / "VENDORED.lock"
+    return tomllib.loads(path.read_text(encoding="utf-8"))["vendored"]
+
+
+def test_list_roles_returns_exactly_the_six_shipped_roles():
+    assert loader.list_roles() == SHIPPED
+
+
+@pytest.mark.parametrize("role", SHIPPED)
+def test_every_shipped_bundle_loads(role):
+    bundle = loader.load_role(role)
+
+    assert bundle.name == role
+    assert bundle.system.strip()
+    assert bundle.policy.allowed_tools
+    assert bundle.policy.max_attempts > 0
+
+
+@pytest.mark.parametrize("role", SHIPPED)
+def test_every_shipped_bundle_pins_its_claude_model(role):
+    assert loader.load_role(role).policy.default_model["claude"] == DEFAULT_MODELS[role]
+
+
+@pytest.mark.parametrize("role", SHIPPED)
+def test_shipped_vendored_files_match_their_recorded_hashes(role):
+    directory = loader.bundles_dir() / role
+
+    for entry in shipped_lock(role):
+        path = directory / "methodology" / entry["file"]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert digest == entry["sha256"], (
+            f"{role}/{entry['file']} no longer matches VENDORED.lock; its "
+            f"upstream is {entry['upstream']} -- re-sync deliberately"
+        )
+
+
+@pytest.mark.parametrize("role", SHIPPED)
+def test_shipped_lock_and_methodology_directory_agree(role):
+    directory = loader.bundles_dir() / role
+
+    recorded = sorted(entry["file"] for entry in shipped_lock(role))
+    present = sorted(path.name for path in (directory / "methodology").glob("*.md"))
+
+    assert recorded == present
+
+
+def test_writing_plans_and_tdd_reach_the_roles_that_need_them():
+    assert "writing-plans.md" in loader.load_role("planner").methodology
+    assert "writing-plans.md" in loader.load_role("spec_author").methodology
+    assert "test-driven-development.md" in loader.load_role("coder").methodology
+    assert loader.load_role("coder").methodology["test-driven-development.md"].strip()
+
+
+@pytest.mark.parametrize("role", SHIPPED)
+def test_a_shipped_bundle_vendors_only_methodology_its_system_prompt_names(role):
+    bundle = loader.load_role(role)
+
+    for filename in bundle.methodology:
+        assert filename in bundle.system, (
+            f"{role}/system.md never references {filename}, so it should not be "
+            "vendored (spec: do not vendor methodology a role does not need)"
+        )
