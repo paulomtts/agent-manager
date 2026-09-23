@@ -324,3 +324,39 @@ def verification_passed_gate(result: object) -> dict[str, str] | None:
             f"(result: {_json(dict(result))})"
         ),
     }
+
+
+# The `validate_spec` / `validate_plan` gate (`builtin/task.yaml` lines 40 and
+# 54), ported from task.js lines 631-638 and 717-721. The critic is asked to
+# REPORT whether the spec or the plan has unresolvable blockers and never to
+# decide what to do about them, for the reason `review_gate` exists: an agent
+# that both measures and judges can talk itself out of the judgement. One
+# callable serves both phases -- the engine's own failure message already names
+# which one stopped (`phase 'validate_plan' gate 'critic_blockers_gate'
+# failed: ...`), so a per-phase `blocked` value would only duplicate it.
+def critic_blockers_gate(result: object) -> dict[str, str] | None:
+    """``None`` when the critic found no blockers, else a blocked verdict.
+
+    ``result`` is the critic phase's own result: both ``engine._gate_values``
+    and ``dispatch.gate_values`` place it under exactly that key, which is why
+    the parameter is not named after either phase.
+
+    A dead validator -- ``None``, or anything that is not a ``Mapping`` -- is
+    itself a block, checked before ``blockers`` rather than falling out of its
+    falsiness. Silence is not consent: a validation phase that produced no
+    judgement has not cleared the spec, and reading that as a pass is how an
+    unvalidated plan reaches ``implement``.
+    """
+    if not isinstance(result, Mapping):
+        return {"blocked": "validation", "detail": "the validator returned nothing"}
+    if not _field(result, "blockers"):
+        return None
+    raw_reason = _field(result, "reason")
+    # Mirrors JS `String(reason || '')`: any falsy value becomes the empty
+    # string, and `_js_text` keeps a non-string readable as the harness JSON it
+    # came from rather than as a Python repr.
+    reason = ("" if not raw_reason else _js_text(raw_reason)).strip()
+    return {
+        "blocked": "validation",
+        "detail": reason or "spec has unresolvable blockers",
+    }

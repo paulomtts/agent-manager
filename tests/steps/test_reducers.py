@@ -13,6 +13,7 @@ from agent_manager.steps.reducers import (
     _is_integer,
     _js_text,
     count_of,
+    critic_blockers_gate,
     exploration_output_gate,
     is_plan_hash,
     plan_hash_gate,
@@ -567,3 +568,90 @@ def test_verification_passed_gate_blocks_anything_that_is_not_a_result_mapping()
     verdict = verification_passed_gate(None)
     assert verdict["blocked"] == "verification"
     assert "no verification result" in verdict["detail"]
+
+
+# ── critic_blockers_gate ─────────────────────────────────────────────────────
+# Ported from task.js lines 631-638 and 717-721. The critic REPORTS blockers on
+# the spec or the plan and never acts on them; this gate is the stop, and it
+# serves both `validate_spec` and `validate_plan` from one callable.
+
+CRITIC_SUMMARY = (
+    "the spec pins the blocked value and the two detail fallbacks, and both "
+    "validation phases share this gate."
+)
+
+
+def test_a_critic_that_found_no_blockers_lets_the_run_continue():
+    result = {"blockers": False, "reason": None, "summary": CRITIC_SUMMARY}
+    assert critic_blockers_gate(result) is None
+
+
+def test_blockers_stop_the_run_at_validation_and_carry_the_critics_reason():
+    result = {
+        "blockers": True,
+        "reason": "the spec contradicts section 4 of the design",
+        "summary": CRITIC_SUMMARY,
+    }
+    assert critic_blockers_gate(result) == {
+        "blocked": "validation",
+        "detail": "the spec contradicts section 4 of the design",
+    }
+
+
+@pytest.mark.parametrize("useless", [None, "", "   ", "\n\t ", False, 0])
+def test_blockers_with_no_usable_reason_fall_back_to_the_js_wording(useless):
+    # JS: `reason || 'spec has unresolvable blockers'`. A blank reason must not
+    # produce an empty detail: the operator would have nothing to act on.
+    assert critic_blockers_gate({"blockers": True, "reason": useless}) == {
+        "blocked": "validation",
+        "detail": "spec has unresolvable blockers",
+    }
+
+
+def test_a_result_with_no_reason_key_at_all_still_blocks():
+    gate = critic_blockers_gate({"blockers": True})
+    assert gate["detail"] == "spec has unresolvable blockers"
+
+
+def test_a_dead_validator_is_itself_a_block():
+    # Silence is not consent: a validation phase that produced no judgement has
+    # not cleared anything, and reading that as a pass is how an unvalidated
+    # plan reaches `implement`.
+    assert critic_blockers_gate(None) == {
+        "blocked": "validation",
+        "detail": "the validator returned nothing",
+    }
+
+
+@pytest.mark.parametrize("dead", ["blockers", ["blockers"], 7, 0, True, object()])
+def test_a_non_mapping_result_is_the_dead_validator_verdict(dead):
+    assert critic_blockers_gate(dead) == {
+        "blocked": "validation",
+        "detail": "the validator returned nothing",
+    }
+
+
+@pytest.mark.parametrize("truthy", [1, "yes", ["one"], {"a": 1}, 0.5, -1])
+def test_any_truthy_blockers_value_blocks_without_raising(truthy):
+    gate = critic_blockers_gate({"blockers": truthy, "reason": None})
+    assert gate["blocked"] == "validation"
+
+
+@pytest.mark.parametrize("falsy", [False, 0, "", None, [], {}])
+def test_any_falsy_blockers_value_passes(falsy):
+    assert critic_blockers_gate({"blockers": falsy, "reason": "ignored"}) is None
+
+
+def test_a_missing_blockers_key_passes_rather_than_blocking():
+    # A mapping that reached the gate at all was schema-validated upstream; the
+    # dead-validator branch is for no mapping, not for a thin one.
+    assert critic_blockers_gate({"summary": CRITIC_SUMMARY}) is None
+
+
+def test_a_non_string_reason_is_rendered_js_style_not_as_a_python_repr():
+    gate = critic_blockers_gate({"blockers": True, "reason": {"missing": ["step 4"]}})
+    assert gate["detail"] == '{"missing":["step 4"]}'
+
+
+def test_a_boolean_reason_renders_as_json_not_as_python():
+    assert critic_blockers_gate({"blockers": True, "reason": True})["detail"] == "true"
