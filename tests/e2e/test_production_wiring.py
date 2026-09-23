@@ -103,3 +103,58 @@ def test_the_brief_carries_the_result_path_and_the_schema(agent_attempts):
         assert prompt.RESULT_HEADING in text, name
         assert str(attempt.result_path) in text, name
         assert schema in text, name
+
+
+def test_the_spec_and_plan_documents_exist_where_the_phases_declared_them(
+    project, completed_run, worktree
+):
+    """The `writes:` templates resolved to real files inside the worktree and
+    were committed. Paths come from the document and `prompt.expand_writes`,
+    never from a convention retyped here."""
+    workflow = load_builtin("task")
+    card = board.show(completed_run["card_id"], repo_dir=project)
+    spec_relative = prompt.expand_writes(
+        workflow.phase("spec").writes, card, phase="spec", input_name="spec_path"
+    )
+    plan_relative = prompt.expand_writes(
+        workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
+    )
+
+    assert (worktree / spec_relative).is_file()
+    assert (worktree / plan_relative).is_file()
+
+    tracked = _git(worktree, "ls-files").split("\n")
+    assert spec_relative in tracked
+    assert plan_relative in tracked
+
+
+def test_the_implement_commit_carries_a_plan_hash_trailer_review_agrees_with(
+    project, completed_run, worktree, agent_attempts
+):
+    """`review_gate` and `plan_hash_gate` passed for a real reason: the branch's
+    commits all carry the trailer, and implement's hash is review's hash is the
+    sha256 of the plan file on disk (`reducers.is_plan_hash`: 8 lowercase hex)."""
+    workflow = load_builtin("task")
+    card = board.show(completed_run["card_id"], repo_dir=project)
+    plan_relative = prompt.expand_writes(
+        workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
+    )
+
+    revisions = _git(worktree, "rev-list", "main..HEAD").split()
+    assert revisions  # non-vacuity: a branch with no commits would pass emptily
+    for revision in revisions:
+        assert "Plan-Hash:" in _git(worktree, "show", "-s", "--format=%B", revision)
+
+    implement = json.loads(
+        Path(agent_attempts["implement"].result_path).read_text(encoding="utf-8")
+    )
+    review = json.loads(
+        Path(agent_attempts["review"].result_path).read_text(encoding="utf-8")
+    )
+    expected = hashlib.sha256((worktree / plan_relative).read_bytes()).hexdigest()[:8]
+
+    assert implement["plan_hash"] == expected
+    assert review["plan_hash"] == expected
+    assert review["porcelain"] == ""
+    assert review["commit_count"] == len(revisions)
+    assert review["tagged_count"] == review["commit_count"]
