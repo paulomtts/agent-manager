@@ -885,3 +885,198 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         is None
     )
     assert payload["status"] == "done"
+
+
+@pytest.fixture
+def projection(tmp_path, monkeypatch) -> Path:
+    """A project root whose SQLite projection is written directly.
+
+    `status` and `runs` read the projection and nothing else -- no board, no git,
+    no worktree -- so this steps-tier fixture is just a directory plus an
+    `XDG_DATA_HOME` in `tmp_path`, and these tests need neither `git` nor `brd`.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "recorded"
+    root.mkdir()
+    return root
+
+
+def _recorded_dispatch(run_id: str) -> models.Dispatch:
+    return models.Dispatch(
+        harness="claude",
+        model="sonnet",
+        role="coder",
+        cwd=Path("/repo"),
+        prompt_path=paths.run_dir(run_id) / "prompt.txt",
+        result_path=paths.run_dir(run_id) / "result.json",
+    )
+
+
+def _record(
+    root: Path,
+    run_id: str,
+    *,
+    started_at: datetime,
+    status: str = "done",
+    with_phases: bool = True,
+) -> None:
+    """One run -- story, subtask, and optionally two phases and two attempts --
+    in `root`'s projection, written the only way this program writes rows."""
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow="task",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status=status,
+                started_at=started_at,
+            )
+        )
+        opened.record_story(
+            models.StoryRun(card_id="story-1", title="The CLI", level=0, status=status)
+        )
+        opened.record_subtask(
+            "story-1",
+            models.SubtaskRun(
+                card_id="card-1",
+                branch="m1/task-x",
+                base_branch="main",
+                status=status,
+                worktree_path=root / ".claude" / "worktrees" / "m1" / "task-x",
+            ),
+        )
+        if not with_phases:
+            return
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="explore", kind="agent", status="done"),
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "explore",
+            models.Attempt(n=1, dispatch=_recorded_dispatch(run_id), status="gate_failed"),
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "explore",
+            models.Attempt(n=2, dispatch=_recorded_dispatch(run_id), status="ok"),
+        )
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="verify", kind="deterministic", status="pending"),
+        )
+    finally:
+        opened.close()
+
+
+RECORDED_AT = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
+
+
+def test_status_prints_a_row_for_every_recorded_attempt(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(
+        cli.app,
+        ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["run"]["id"] == "20260923T090000Z-cbe34d00"
+    assert envelope["data"]["run"]["workflow"] == "task"
+    assert [
+        (row["story"], row["subtask"], row["phase"], row["attempt"], row["state"])
+        for row in envelope["data"]["rows"]
+    ] == [
+        ("story-1", "card-1", "explore", 1, "gate_failed"),
+        ("story-1", "card-1", "explore", 2, "ok"),
+        ("story-1", "card-1", "verify", None, "pending"),
+    ]
+    assert "\n" not in result.stdout.strip()
+
+
+def test_status_with_no_run_id_renders_the_most_recent_run(projection):
+    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["status", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["data"]["run"]["id"] == "20260924T090000Z-cbe34d00"
+
+
+def test_status_for_an_unknown_run_id_is_an_envelope(projection):
+    """And looking a run up must not mint the run directory a `Journal` would."""
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(
+        cli.app, ["status", "no-such-run", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+    assert str(projection.resolve()) in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def test_status_with_no_run_id_against_a_project_with_no_runs_is_an_envelope(projection):
+    result = runner.invoke(cli.app, ["status", "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "most recent" in envelope["error"]["message"]
+
+
+def test_status_of_a_run_that_died_before_its_first_phase_is_ok_with_no_rows(projection):
+    """`run_card` writes the run, story and subtask rows before the walk starts
+    (cli.py:228-230) exactly so `status` can see a run that died on its first
+    dispatch. That reading is a fact, not an error."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        status="escalated",
+        with_phases=False,
+    )
+
+    result = runner.invoke(
+        cli.app, ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["run"]["status"] == "escalated"
+    assert envelope["data"]["rows"] == []
+    assert envelope["data"]["stories"][0]["subtasks"][0]["card_id"] == "card-1"
+
+
+def test_status_pretty_indents_the_same_envelope(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    plain = runner.invoke(
+        cli.app, ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)]
+    )
+    pretty = runner.invoke(
+        cli.app,
+        ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection), "--pretty"],
+    )
+
+    assert pretty.exit_code == 0
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)

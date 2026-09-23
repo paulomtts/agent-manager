@@ -25,7 +25,7 @@ from typing import Any, Protocol
 
 import typer
 
-from agent_manager import board, dag, dispatch, engine, models
+from agent_manager import board, dag, dispatch, engine, models, store as store_module
 from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
 from agent_manager.store import Store
@@ -52,6 +52,17 @@ class CliError(RuntimeError):
 
 class RepoDirError(CliError):
     """`--repo-dir` does not name a directory this tool can work in."""
+
+
+class UnknownRunError(CliError):
+    """`status` was asked for a run this project's projection does not hold.
+
+    A `CliError` so it rides the existing `HANDLED` tuple into an `ok: false`
+    envelope at exit 3 rather than reaching the renderer as a `None` tree. The
+    same class covers "no most-recent run to default to": both are the same
+    refusal -- the command was asked for a run and there is none -- and the
+    message is what tells the two apart.
+    """
 
 
 class ParentlessCardError(CliError):
@@ -441,3 +452,53 @@ def run(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     if payload["status"] == "escalated":
         raise typer.Exit(EXIT_ESCALATED)
+
+
+def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
+    """The §9 tree and §10 table of one run of this project.
+
+    Read-only: no `record_*` is called, and the connection is closed on every
+    path including the refusals, the way `run_card` closes its store. The default
+    run id comes from `store_module.latest_run_id`, which is the head of the very
+    listing `runs` prints, so the two commands cannot disagree about which run is
+    the most recent one.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        wanted = run_id
+        if wanted is None:
+            wanted = store_module.latest_run_id(conn)
+            if wanted is None:
+                raise UnknownRunError(
+                    f"no run has been recorded for {root}, so there is no most recent"
+                    " run to report on; pass a run id or start one with `run --card`"
+                )
+        run = store_module.load_run(conn, wanted)
+        if run is None:
+            raise UnknownRunError(
+                f"run {wanted!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+        return status_payload(run)
+    finally:
+        conn.close()
+
+
+@app.command("status")
+def status(
+    run_id: str | None = typer.Argument(
+        None, metavar="[RUN_ID]", help="The run to report on. Defaults to the most recent."
+    ),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is read."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Report one run as story / subtask / phase / attempt / state."""
+    try:
+        payload = status_for(run_id, repo_dir=repo_dir)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
