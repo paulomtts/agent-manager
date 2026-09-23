@@ -554,6 +554,24 @@ def _payload_for(attempt: models.Attempt) -> dict[str, Any]:
     return cli.logs_payload(run, story, subtask, phase, attempt)
 
 
+def test_the_payload_names_the_story_that_actually_owns_the_card(tmp_path):
+    """`story_id` is the *owning* story, which is why `find_subtask` hands the
+    pair back at all. A tree whose first story is not the match would otherwise
+    report a story the card was never under."""
+    attempt = _artifact_attempt(tmp_path)
+    phase = models.PhaseRun(
+        name="implement", kind="agent", status="done", attempts=[attempt]
+    )
+    subtask = _pure_subtask("card-2", [phase])
+    owner = _pure_story("story-2", [subtask])
+    run = _pure_run([_pure_story("story-1", [_pure_subtask("card-1", [])]), owner])
+
+    payload = cli.logs_payload(run, owner, subtask, phase, attempt)
+
+    assert payload["story_id"] == "story-2"
+    assert payload["card"] == "card-2"
+
+
 def test_the_payload_reads_the_three_artifacts_off_disk(tmp_path):
     (tmp_path / "prompt.txt").write_text("you are the coder\n", encoding="utf-8")
     (tmp_path / "result.json").write_text('{"ok": true}', encoding="utf-8")
