@@ -96,7 +96,7 @@ def test_default_registry_holds_exactly_the_names_task_yaml_uses() -> None:
     assert BUILTIN_FUNCTION_NAMES == TASK_YAML_NAMES
 
 
-def test_default_registry_resolves_the_four_reducers_to_the_real_callables() -> None:
+def test_default_registry_resolves_the_five_reducers_to_the_real_callables() -> None:
     registry = default_registry()
     assert registry.resolve("exploration_output_gate") is reducers.exploration_output_gate
     assert registry.resolve("verification_gate") is reducers.verification_gate

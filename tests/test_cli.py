@@ -13,13 +13,19 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import json
+import shutil
+import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
+from typer.testing import CliRunner
 
-from agent_manager import board, cli
+from agent_manager import board, cli, dag, models, paths, store as store_module
 from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.steps.reducers import verification_gate
 from agent_manager.workflow.registry import WorkflowLoadError
 
 
@@ -88,12 +94,6 @@ def test_resolve_repo_dir_refuses_a_path_that_is_not_a_directory(tmp_path):
         cli.resolve_repo_dir(missing)
     assert "nope" in str(caught.value)
 
-
-import shutil
-import subprocess
-from typing import Any
-
-from agent_manager import dag, models, paths
 
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -266,8 +266,6 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
     assert context["provided_verification"] is None
 
 
-from typer.testing import CliRunner
-
 runner = CliRunner()
 
 
@@ -346,8 +344,6 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
 @requires_git
 @requires_brd
 def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
-    import sqlite3
-
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -399,8 +395,6 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
 @requires_git
 @requires_brd
 def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
-    from agent_manager import store as store_module
-
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -421,7 +415,6 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
 def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards):
     """The guarantee `status` and `resume` are built on: a process that dies on
     its first dispatch still left a run behind."""
-    import sqlite3
 
     def exploding_factory(**kwargs):
         def runner(phase, context, rendered):
@@ -623,8 +616,6 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
     describes. The gate's own truth table is unit-tested in
     `tests/steps/test_reducers.py` and is not re-tested here.
     """
-    from agent_manager.steps.reducers import verification_gate
-
     seen_off: list[tuple[str, dict[str, Any]]] = []
     cli.run_card(
         cards["subtask"],
