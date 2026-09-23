@@ -1089,6 +1089,14 @@ def resume(
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
     ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. The run record does not "
+            "carry the suite, so a resume is told it the way a fresh run was."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Re-run the phase a killed run died in, and drive the subtask to the end.
@@ -1103,6 +1111,7 @@ def resume(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

@@ -2844,6 +2844,49 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["data"]["resumed_from"] == "implement"
 
 
+
+@requires_git
+@requires_brd
+def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
+    project, cards, monkeypatch
+):
+    """`models.RunConfig` carries neither the suite commands nor the opt-out, so
+    a resume has to be told the same things a fresh `run` was told -- and in the
+    same order, since the engine runs the commands in sequence."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    contexts: list[dict[str, Any]] = []
+
+    def collecting_factory(**kwargs):
+        inner = fake_runner()
+
+        def collect(phase, context, rendered):
+            contexts.append(dict(context))
+            return inner(phase, context, rendered)
+
+        return collect
+
+    monkeypatch.setattr(cli, "default_runner_factory", collecting_factory)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            run_id,
+            "--repo-dir",
+            str(project),
+            "--verify",
+            "true",
+            "--verify",
+            "echo checked",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["data"]["resumed_from"] == "implement"
+    assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
+    assert contexts[0]["allow_no_verification"] is False
+
+
 @requires_git
 @requires_brd
 def test_a_run_recorded_with_an_unknown_workflow_is_an_envelope(project, cards, monkeypatch):
