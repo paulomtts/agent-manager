@@ -118,6 +118,19 @@ def test_run_git_raises_git_error_carrying_argv_and_exit_code(tmp_path: Path):
     assert excinfo.value.exit_code not in (None, 0)
 
 
+def test_a_missing_git_executable_becomes_a_git_error(monkeypatch, tmp_path: Path):
+    # git is invoked by name off PATH; when it is not there at all, the phase
+    # must fail as a GitError it can journal, not as a bare OSError.
+    monkeypatch.setattr(worktree, "GIT", str(tmp_path / "no-such-git"))
+    argv = ["-C", str(tmp_path), "rev-parse", "HEAD"]
+
+    with pytest.raises(GitError) as excinfo:
+        worktree.run_git(argv)
+
+    assert excinfo.value.argv == argv
+    assert excinfo.value.exit_code is None
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected"),
     [
@@ -129,6 +142,10 @@ def test_run_git_raises_git_error_carrying_argv_and_exit_code(tmp_path: Path):
         ({"worktree": ""}, "worktree"),
         ({"repo_dir": "relative/repo"}, "repo_dir"),
         ({"repo_dir": ""}, "repo_dir"),
+        ({"branch": None}, "branch"),
+        ({"base": None}, "base"),
+        ({"worktree": None}, "worktree"),
+        ({"repo_dir": 42}, "repo_dir"),
     ],
     ids=[
         "empty-branch",
@@ -139,6 +156,10 @@ def test_run_git_raises_git_error_carrying_argv_and_exit_code(tmp_path: Path):
         "empty-worktree",
         "relative-repo-dir",
         "empty-repo-dir",
+        "none-branch",
+        "none-base",
+        "none-worktree",
+        "non-path-repo-dir",
     ],
 )
 def test_bad_arguments_raise_before_any_git_invocation(kwargs, expected):
