@@ -33,12 +33,13 @@ def test_an_unknown_result_name_is_a_named_engine_error():
     assert "Canned" in message
 
 
-def test_the_shipped_table_holds_exactly_the_five_declared_names():
-    # An equality, not a superset: a stray sixth key is a name the engine would
+def test_the_shipped_table_holds_exactly_the_six_declared_names():
+    # An equality, not a superset: a stray seventh key is a name the engine would
     # happily resolve for a phase that has no business declaring it.
     assert set(results.RESULT_MODELS) == {
         "ExploreResult",
         "CriticResult",
+        "SpecResult",
         "PlanResult",
         "ImplementResult",
         "ReviewResult",
@@ -61,17 +62,18 @@ def test_verification_is_not_registered():
     assert "Verification" not in results.RESULT_MODELS
 
 
-def test_an_unknown_name_now_lists_the_five_registered_names():
+def test_an_unknown_name_now_lists_the_six_registered_names():
     # The addendum's opening failure ends "(registered: nothing)". That exact
-    # phrasing must be gone, and the five sorted names must be what it offers.
+    # phrasing must be gone, and the six sorted names must be what it offers.
     with pytest.raises(EngineError) as caught:
-        results.resolve_result_model("SpecResult", results.RESULT_MODELS, phase="spec")
+        results.resolve_result_model("VerifyResult", results.RESULT_MODELS, phase="verify")
 
     message = str(caught.value)
-    assert caught.value.phase == "spec"
+    assert caught.value.phase == "verify"
     assert "registered: nothing" not in message
     assert (
-        "CriticResult, ExploreResult, ImplementResult, PlanResult, ReviewResult"
+        "CriticResult, ExploreResult, ImplementResult, PlanResult, ReviewResult, "
+        "SpecResult"
         in message
     )
 
@@ -222,6 +224,75 @@ def test_critic_result_rejects_an_unknown_key():
         )
 
     assert "verdict" in str(caught.value)
+
+
+def test_spec_result_accepts_a_full_payload():
+    spec = results.SpecResult(
+        path="docs/superpowers/specs/task-give-the-spec-phase-a-be376902-design.md",
+        note=None,
+    )
+
+    assert spec.path.endswith("be376902-design.md")
+    assert spec.note is None
+
+
+def test_spec_result_dumps_snake_case_keys_and_round_trips():
+    # No serialization_alias on either field: no reducer reads a spec result, so
+    # the dumped mapping and the validated mapping name one spelling each.
+    spec = results.SpecResult(
+        path="docs/superpowers/specs/s.md", note="narrowed the card to three edits"
+    )
+
+    dumped = spec.model_dump(mode="json")
+
+    assert dumped == {
+        "path": "docs/superpowers/specs/s.md",
+        "note": "narrowed the card to three edits",
+    }
+    assert results.SpecResult(**dumped) == spec
+
+
+def test_spec_result_rejects_a_missing_note():
+    # `note` is nullable but required: the agent writes "note": null explicitly,
+    # exactly as PlanResult and CriticResult already demand.
+    with pytest.raises(ValidationError) as caught:
+        results.SpecResult(path="docs/superpowers/specs/s.md")
+
+    assert "note" in str(caught.value)
+
+
+def test_spec_result_rejects_a_missing_path():
+    with pytest.raises(ValidationError) as caught:
+        results.SpecResult(note=None)
+
+    assert "path" in str(caught.value)
+
+
+def test_spec_result_does_not_coerce_a_non_string_path():
+    with pytest.raises(ValidationError) as caught:
+        results.SpecResult(path=["a", "b"], note=None)
+
+    assert "path" in str(caught.value)
+
+
+def test_spec_result_rejects_an_unknown_key():
+    # PlanResult's self_reviewed is the likeliest stray key: nothing asks the
+    # spec author to self-review, so it is an unknown key here.
+    with pytest.raises(ValidationError) as caught:
+        results.SpecResult(
+            path="docs/superpowers/specs/s.md", note=None, self_reviewed=True
+        )
+
+    assert "self_reviewed" in str(caught.value)
+    assert "self_reviewed" not in results.SpecResult.model_fields
+
+
+def test_the_spec_phases_result_name_resolves_to_the_spec_result_class():
+    assert results.RESULT_MODELS["SpecResult"] is results.SpecResult
+    assert (
+        results.resolve_result_model("SpecResult", results.RESULT_MODELS, phase="spec")
+        is results.SpecResult
+    )
 
 
 def test_plan_result_accepts_a_full_payload():
@@ -562,6 +633,10 @@ def test_the_embedded_json_schema_names_snake_case_only():
         "self_reviewed",
         "note",
     }
+    spec_schema = results.SpecResult.model_json_schema()
+    assert set(spec_schema["required"]) == {"path", "note"}
+    assert set(spec_schema["properties"]) == {"path", "note"}
+    assert spec_schema["additionalProperties"] is False
     assert set(results.ImplementResult.model_json_schema()["required"]) == {
         "blocked",
         "blocked_reason",
