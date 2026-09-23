@@ -1080,3 +1080,88 @@ def test_status_pretty_indents_the_same_envelope(projection):
     assert pretty.exit_code == 0
     assert "\n" in pretty.stdout.strip()
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+def test_runs_lists_the_projects_history_newest_first(projection):
+    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert [entry["id"] for entry in envelope["data"]["runs"]] == [
+        "20260924T090000Z-cbe34d00",
+        "20260923T090000Z-cbe34d00",
+        "20260921T090000Z-cbe34d00",
+    ]
+    assert envelope["data"]["runs"][0]["workflow"] == "task"
+    assert envelope["data"]["runs"][0]["status"] == "done"
+    assert "2026-09-24" in envelope["data"]["runs"][0]["started_at"]
+    assert envelope["data"]["runs"][0]["repo_dir"] == str(projection.resolve())
+
+
+def test_runs_on_a_project_that_has_never_been_run_is_ok_and_empty(projection):
+    """A project nobody has run yet is a fact, not a fault."""
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["runs"] == []
+
+
+def test_runs_agrees_with_status_about_the_most_recent_run(projection):
+    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+
+    listed = json.loads(
+        runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)]).stdout
+    )
+    reported = json.loads(
+        runner.invoke(cli.app, ["status", "--repo-dir", str(projection)]).stdout
+    )
+
+    assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
+
+
+def test_runs_pretty_indents_the_same_envelope(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    plain = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+    pretty = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection), "--pretty"])
+
+    assert pretty.exit_code == 0
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    missing = tmp_path / "missing"
+
+    for argv in (["status", "--repo-dir", str(missing)], ["runs", "--repo-dir", str(missing)]):
+        result = runner.invoke(cli.app, argv)
+        assert result.exit_code == cli.EXIT_ERROR, argv
+        envelope = json.loads(result.stdout)
+        assert envelope["ok"] is False
+        assert envelope["error"]["type"] == "RepoDirError"
+        assert "missing" in envelope["error"]["message"]
+
+
+def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, monkeypatch):
+    """`resolve_repo_dir` checks `is_dir`, not `exists`: a file that exists must
+    be refused before `paths.project_db_path` hashes it into a database name."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    not_a_dir = tmp_path / "README.md"
+    not_a_dir.write_text("not a repo\n", encoding="utf-8")
+
+    for argv in (
+        ["status", "--repo-dir", str(not_a_dir)],
+        ["runs", "--repo-dir", str(not_a_dir)],
+    ):
+        result = runner.invoke(cli.app, argv)
+        assert result.exit_code == cli.EXIT_ERROR, argv
+        assert json.loads(result.stdout)["error"]["type"] == "RepoDirError"

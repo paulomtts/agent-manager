@@ -502,3 +502,35 @@ def status(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+def runs_for(*, repo_dir: Path) -> dict[str, Any]:
+    """This project's run history, newest first.
+
+    An empty history is an empty list, not a refusal: a project that has never
+    been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
+    for `render`'s `default=str`, exactly as `status_payload` does, so a run
+    looks the same in both commands.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        return {"runs": [summary.model_dump() for summary in store_module.list_runs(conn)]}
+    finally:
+        conn.close()
+
+
+@app.command("runs")
+def runs(
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is read."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """List this project's run history, newest first."""
+    try:
+        payload = runs_for(repo_dir=repo_dir)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
