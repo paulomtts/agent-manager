@@ -320,3 +320,137 @@ def test_js_text_renders_values_the_way_a_template_literal_does():
     assert _js_text(3.0) == "3"
     assert _js_text(1.5) == "1.5"
     assert _js_text(math.nan) == "NaN"
+
+
+# ── review_gate ──────────────────────────────────────────────────────────────
+# Ported from task.test.mjs:59-139. The Review -> Ship boundary: Review REPORTS
+# three facts, this gate judges them, before anything is pushed.
+
+from agent_manager.steps.reducers import review_gate
+
+BRANCH = "task-42"
+BASE = "main"
+
+
+def clean(**overrides):
+    """A review result that passes every check, with overrides applied."""
+    base = {"porcelain": "", "commitCount": 3, "taggedCount": 3}
+    base.update(overrides)
+    return base
+
+
+def test_a_clean_tree_with_tagged_commits_proceeds_to_ship():
+    assert review_gate(clean(), BRANCH, BASE) is None
+
+
+def test_a_dirty_worktree_stops_the_run_before_anything_is_pushed():
+    gate = review_gate(clean(porcelain=" M src/a.js"), BRANCH, BASE)
+    assert gate["blocked"] == "tests"
+    assert "nothing was pushed" in gate["detail"]
+    # The evidence travels with the verdict.
+    assert "M src/a.js" in gate["detail"]
+
+
+@pytest.mark.parametrize("blank", ["\n", "   ", "\t\n ", ""])
+def test_whitespace_only_porcelain_is_a_clean_tree(blank):
+    # git prints a trailing newline even when it has nothing to say; treating
+    # that as dirt would block every single run.
+    assert review_gate(clean(porcelain=blank), BRANCH, BASE) is None
+
+
+def test_the_dirty_tree_check_runs_before_the_commit_counts():
+    # A dirty tree means the counts describe a branch that is missing work, so
+    # reporting the count problem first would send someone after the wrong bug.
+    gate = review_gate(
+        {"porcelain": "?? new.js", "commitCount": 0, "taggedCount": 0}, BRANCH, BASE
+    )
+    assert gate["blocked"] == "tests"
+
+
+def test_a_non_string_porcelain_is_coerced_not_raised_on():
+    # String(x || '') in JS: falsy becomes "", truthy becomes its text.
+    assert review_gate(clean(porcelain=0), BRANCH, BASE) is None
+    assert review_gate(clean(porcelain=False), BRANCH, BASE) is None
+    assert review_gate(clean(porcelain=None), BRANCH, BASE) is None
+    assert review_gate(clean(porcelain=5), BRANCH, BASE)["blocked"] == "tests"
+    assert review_gate(clean(porcelain=["?? a"]), BRANCH, BASE)["blocked"] == "tests"
+
+
+def test_zero_commits_stops_the_run_as_an_implement_failure():
+    gate = review_gate(clean(commitCount=0, taggedCount=0), BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+    assert "task-42 has no commits on top of main" in gate["detail"]
+
+
+def test_an_untagged_commit_stops_the_run_because_a_later_run_would_hard_reset_it():
+    gate = review_gate(clean(commitCount=3, taggedCount=2), BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+    assert "only 2 of 3 commits" in gate["detail"]
+    # Re-running is the destructive move, so the verdict must say so.
+    assert "Do NOT re-run this subtask" in gate["detail"]
+
+
+def test_more_trailers_than_commits_is_not_a_failure():
+    # A commit can legitimately carry the trailer twice, or a merge can inflate
+    # the count. The gate only cares that nothing is MISSING one.
+    assert review_gate(clean(commitCount=3, taggedCount=4), BRANCH, BASE) is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"commitCount": None},
+        {"commitCount": ""},
+        {"commitCount": "three"},
+        {"commitCount": 1.5},
+        {"taggedCount": None},
+        {"taggedCount": float("nan")},
+        {"taggedCount": True},
+        {"commitCount": True},
+        {"commitCount": "1_0"},
+        {"taggedCount": []},
+    ],
+)
+def test_unusable_counts_warn_and_skip_rather_than_blocking_or_passing(bad):
+    # None and "" are the sharp ones: float() would turn both into 0, which
+    # would read as "zero commits" and stop the run blaming Implement for a
+    # fact nobody ever measured.
+    gate = review_gate(clean(**bad), BRANCH, BASE)
+    assert gate["warn"]
+    assert "blocked" not in gate
+    assert "Plan-Hash gate skipped" in gate["warn"]
+
+
+def test_the_warn_names_both_raw_reported_values_js_style():
+    gate = review_gate({"commitCount": None, "taggedCount": True}, BRANCH, BASE)
+    assert "(null/true)" in gate["warn"]
+
+
+@pytest.mark.parametrize("missing", [None, {}, {"porcelain": ""}, "x", ["x"], 7])
+def test_a_missing_or_non_mapping_review_warns_instead_of_raising(missing):
+    # Reachability is a property of the caller, and the caller is exactly the
+    # thing that changes, so the gate stays independently safe.
+    gate = review_gate(missing, BRANCH, BASE)
+    assert gate["warn"]
+    assert "blocked" not in gate
+
+
+def test_a_numeric_string_count_is_still_usable():
+    # The schema asks for integers, but models do hand back "3". Rejecting that
+    # would skip the gate on a branch that could have been checked.
+    assert review_gate(clean(commitCount="3", taggedCount="3"), BRANCH, BASE) is None
+    gate = review_gate(clean(commitCount="3", taggedCount="2"), BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+
+
+def test_numeric_string_counts_are_rendered_without_a_python_float_tail():
+    # float("3") is 3.0; "only 2.0 of 3.0 commits" would read as a bug report
+    # about the gate rather than about the branch.
+    gate = review_gate(clean(commitCount="3", taggedCount="2"), BRANCH, BASE)
+    assert "only 2 of 3 commits" in gate["detail"]
+
+
+def test_a_zero_count_from_a_numeric_string_still_blocks_as_implement():
+    gate = review_gate(clean(commitCount="0", taggedCount="0"), BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+    assert "no commits on top of" in gate["detail"]

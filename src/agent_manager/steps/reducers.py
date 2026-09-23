@@ -153,6 +153,62 @@ def count_of(value: object) -> float | int:
     return math.nan
 
 
+# The Review -> Ship boundary. Review is asked to REPORT three facts and never
+# to interpret or act on them: an agent that both measures and judges can talk
+# itself out of the judgement. Review is also the last stage that writes, so
+# this is the earliest boundary at which the facts can be judged — and judging
+# here costs no dispatch, because Ship simply never boots.
+#
+# Returns None to proceed, {blocked, detail} to stop, or {warn} when Review's
+# numbers are unusable and the Plan-Hash half of the gate has to be skipped.
+def review_gate(
+    review: object,
+    branch: object,
+    base_branch: object,
+) -> dict[str, str] | None:
+    """``None`` to proceed, a blocked verdict to stop, or a ``warn`` dict."""
+    raw_porcelain = _field(review, "porcelain")
+    # Mirrors JS `String((review && review.porcelain) || '')`: any falsy value
+    # (absent, None, '', 0, False) becomes the empty string.
+    porcelain = ("" if not raw_porcelain else _js_text(raw_porcelain)).strip()
+    if len(porcelain) > 0:
+        return {
+            "blocked": "tests",
+            "detail": "worktree still dirty after review, so this subtask's commit "
+            "would not contain this work (nothing was pushed):\n" + porcelain,
+        }
+
+    # Implement decides RESUME vs RESET by grepping for exactly this trailer, so
+    # an untagged commit reads as stale debris and a later run would
+    # `reset --hard` it away. Catching that here, before anything is pushed, is
+    # the whole point.
+    raw_commit = _field(review, "commitCount")
+    raw_tagged = _field(review, "taggedCount")
+    commit_count = count_of(raw_commit)
+    tagged_count = count_of(raw_tagged)
+    if not _is_integer(commit_count) or not _is_integer(tagged_count):
+        return {
+            "warn": "review did not report usable commit/trailer counts "
+            f"({_js_text(raw_commit)}/{_js_text(raw_tagged)}) — Plan-Hash gate skipped"
+        }
+    if commit_count == 0:
+        return {
+            "blocked": "implement",
+            "detail": f"branch {branch} has no commits on top of {base_branch} — "
+            "implementation produced nothing to ship.",
+        }
+    if tagged_count < commit_count:
+        return {
+            "blocked": "implement",
+            "detail": f"only {_js_text(tagged_count)} of {_js_text(commit_count)} "
+            f"commits on {branch} carry their Plan-Hash trailer, so a future run "
+            "would read this branch as stale and hard-reset it. Nothing was pushed. "
+            "Do NOT re-run this subtask until the trailers are added "
+            "(interactively, by a human) or the work is otherwise preserved.",
+        }
+    return None
+
+
 def exploration_output_gate(
     explore: object,
     provided_verification: object,
