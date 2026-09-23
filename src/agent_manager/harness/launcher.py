@@ -125,3 +125,44 @@ def run_direct(
         duration=time.monotonic() - started,
         stdout_path=stdout_path,
     )
+
+
+LAUNCHERS: dict[str, LauncherFn | None] = {
+    "direct": run_direct,
+    "bwrap": None,
+    "container": None,
+}
+"""Every mode `models.Launcher` names, mapped to its implementation or `None`.
+
+The two `None`s are the seam, spelled out. Leaving `bwrap` and `container` out
+of this dict entirely would make asking for one an "unknown launcher" -- which
+is wrong, they are known, they are simply not built -- and would lose the only
+place in the code where D7's deferred work is visible.
+"""
+
+
+def get_launcher(kind: Launcher) -> LauncherFn:
+    """Resolve a launcher mode to the function the engine will inject.
+
+    Called once, at run start, with `RunConfig.launcher`. Failing here means
+    failing before a single worktree is created, which is the whole reason the
+    unimplemented modes are named rather than omitted.
+    """
+    if kind not in LAUNCHERS:
+        raise UnsupportedLauncherError(
+            kind,
+            reason=(
+                "not a launcher mode; the modes are direct, bwrap and container"
+            ),
+        )
+    implementation = LAUNCHERS[kind]
+    if implementation is None:
+        raise UnsupportedLauncherError(
+            kind,
+            reason=(
+                "is a seam, not an implementation -- v1 implements only "
+                "direct, which launches with permissions bypassed and cwd "
+                "pinned to the subtask worktree (D7)"
+            ),
+        )
+    return implementation

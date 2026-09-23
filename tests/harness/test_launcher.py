@@ -206,3 +206,52 @@ def test_an_existing_log_from_a_previous_attempt_is_truncated(tmp_path):
     text = log.read_text()
     assert "this attempt" in text
     assert "before the crash" not in text
+
+
+def test_get_launcher_direct_returns_the_direct_launcher(tmp_path):
+    fn = launcher.get_launcher("direct")
+    assert fn is launcher.run_direct
+    # It is usable through the injected type's call shape, keyword-only args
+    # and all -- the engine never calls run_direct by name.
+    injected: launcher.LauncherFn = fn
+    outcome = injected(
+        [sys.executable, "-c", "print('injected')"],
+        cwd=tmp_path,
+        timeout=30.0,
+        stdout_path=tmp_path / "stdout.log",
+    )
+    assert outcome.exit_code == 0
+
+
+@pytest.mark.parametrize("kind", ["bwrap", "container"])
+def test_the_unimplemented_modes_are_named_and_refuse(kind):
+    # D7: they are in the mapping on purpose. A deliberate refusal at config
+    # time beats a KeyError surfacing mid-run, and it keeps the two names
+    # discoverable as the seam they are.
+    with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
+        launcher.get_launcher(kind)
+    assert excinfo.value.kind == kind
+    message = str(excinfo.value)
+    assert kind in message
+    assert "direct" in message
+
+
+def test_an_unknown_launcher_name_raises_the_same_error_type():
+    # The Literal catches this at type-check time; the runtime guard exists
+    # because RunConfig.launcher can arrive from a journal line written by an
+    # older or newer build.
+    with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
+        launcher.get_launcher("docker")
+    assert excinfo.value.kind == "docker"
+    for known in ("direct", "bwrap", "container"):
+        assert known in str(excinfo.value)
+
+
+def test_every_launcher_literal_member_is_accounted_for():
+    # If models.Launcher grows a fourth mode, this fails rather than letting it
+    # fall through to "unknown launcher" at run time.
+    from typing import get_args
+
+    from agent_manager.models import Launcher
+
+    assert set(get_args(Launcher)) == set(launcher.LAUNCHERS)
