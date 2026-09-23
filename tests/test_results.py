@@ -434,14 +434,14 @@ def test_a_dumped_clean_review_passes_the_real_review_gate():
     assert reducers.review_gate(dumped, "m2/task-x", "master") is None
 
 
-def test_a_dump_without_by_alias_is_unusable_to_the_review_gate():
-    # Proof the alias is load-bearing: without it the gate finds no counts and
-    # warns (skipping the Plan-Hash half) rather than passing.
+def test_a_dump_without_by_alias_is_judged_by_the_real_review_gate_too():
+    # `dispatch.py` dumps without `by_alias=True`, so the snake_case spelling is
+    # what really reaches the gate. The gate reads both spellings (reducers.
+    # _either_field): the plain dump passes rather than falling to the warn.
     dumped = results.ReviewResult(**_CLEAN_REVIEW).model_dump()
 
-    verdict = reducers.review_gate(dumped, "m2/task-x", "master")
-    assert verdict is not None
-    assert "Plan-Hash gate skipped" in verdict["warn"]
+    assert "commit_count" in dumped and "commitCount" not in dumped
+    assert reducers.review_gate(dumped, "m2/task-x", "master") is None
 
 
 def test_a_dumped_review_with_no_commits_blocks_on_implement():

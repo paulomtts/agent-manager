@@ -85,6 +85,21 @@ def _field(mapping: object, name: str) -> object:
     return mapping.get(name) if isinstance(mapping, Mapping) else None
 
 
+# These gates were ported from task.js and read the camelCase keys the JS
+# harness wrote. `results.py`'s models are snake_case, and `dispatch.py` dumps
+# them without `by_alias=True`, so BOTH spellings genuinely reach a gate: a
+# validated model dump is snake_case, and a hand-written result file (or the
+# ported fixtures in `tests/steps/test_reducers.py`) is camelCase. Reading both
+# is a compatibility shim on the read, not a second rule -- no verdict text,
+# threshold or ordering below depends on which spelling arrived. Doing it here,
+# in one helper, is what keeps the alternative from happening: two registry
+# wrappers that would quietly become a second place gate semantics live.
+def _either_field(mapping: object, snake: str, camel: str) -> object:
+    """``snake``'s value if it has one, else ``camel``'s, else ``None``."""
+    value = _field(mapping, snake)
+    return _field(mapping, camel) if value is None else value
+
+
 # JS `Number()` accepts exactly this grammar for a decimal literal. Python's
 # float() is looser — it takes "1_0", "inf", "nan" and non-ASCII digits like
 # "٣" — so the string is screened first. [0-9] rather than \d on purpose:
@@ -184,8 +199,8 @@ def review_gate(
     # an untagged commit reads as stale debris and a later run would
     # `reset --hard` it away. Catching that here, before anything is pushed, is
     # the whole point.
-    raw_commit = _field(review, "commitCount")
-    raw_tagged = _field(review, "taggedCount")
+    raw_commit = _either_field(review, "commit_count", "commitCount")
+    raw_tagged = _either_field(review, "tagged_count", "taggedCount")
     commit_count = count_of(raw_commit)
     tagged_count = count_of(raw_tagged)
     if not _is_integer(commit_count) or not _is_integer(tagged_count):
@@ -269,7 +284,9 @@ def exploration_output_gate(
             f"findings on a subtask: {_json(summary[:80])}"
         }
 
-    full_suite = _field(_field(explore, "verification"), "fullSuite")
+    full_suite = _either_field(
+        _field(explore, "verification"), "full_suite", "fullSuite"
+    )
     if not isinstance(full_suite, list):
         return {"detail": "exploration did not return an array for verification.fullSuite"}
 
