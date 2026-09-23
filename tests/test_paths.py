@@ -105,6 +105,16 @@ def test_project_db_path_digest_is_sha256_of_resolved_root(monkeypatch, tmp_path
     assert result.name == f"{expected}.db"
 
 
+def test_project_db_path_digest_matches_a_fixed_vector(monkeypatch, tmp_path):
+    # An absolute root resolves to itself, so the on-disk name can be pinned to a
+    # literal digest instead of to one recomputed the way the code computes it.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    assert paths.project_db_path(Path("/nonexistent/repo")).name == (
+        "5b6e8e2d129e523b4fabf8a73dcdc18cb7f253565385fd9e6e5c0888ba865785.db"
+    )
+
+
 def test_project_db_path_accepts_a_root_that_does_not_exist(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     absent = tmp_path / "not-cloned-yet"
