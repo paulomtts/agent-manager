@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import cli
+from agent_manager import board, cli
+from agent_manager.errors import AgentPhaseFailed
 
 
 def test_render_is_one_line_of_json_by_default():
@@ -85,3 +86,175 @@ def test_resolve_repo_dir_refuses_a_path_that_is_not_a_directory(tmp_path):
     with pytest.raises(cli.RepoDirError) as caught:
         cli.resolve_repo_dir(missing)
     assert "nope" in str(caught.value)
+
+
+import shutil
+import subprocess
+from typing import Any
+
+from agent_manager import dag, models, paths
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="the git CLI must be installed for the CLI's steps-tier fixtures",
+)
+requires_brd = pytest.mark.skipif(
+    shutil.which("brd") is None,
+    reason="the brd CLI must be installed for the CLI's steps-tier fixtures",
+)
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True
+    )
+    return completed.stdout
+
+
+def _add_card(root: Path, title: str, parent: str | None = None) -> str:
+    argv = ["brd", "add", "--title", title]
+    if parent is not None:
+        argv += ["--parent", parent]
+    completed = subprocess.run(argv, cwd=root, check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)["data"]["id"]
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch) -> Path:
+    """One directory that is both a real git repo on `main` and a real brd board.
+
+    `--repo-dir` is both at once in production, so the fixture is too.
+    XDG_DATA_HOME points into tmp_path, which isolates brd's own database *and*
+    `paths.data_dir()`, so no run artifact can land in the developer's home.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True
+    )
+    _git(root, "config", "user.email", "tests@example.com")
+    _git(root, "config", "user.name", "agent-manager tests")
+    _git(root, "config", "commit.gpgsign", "false")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-m", "base")
+    subprocess.run(
+        ["brd", "init", "--name", "temp-board"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return root
+
+
+@pytest.fixture
+def cards(project) -> dict[str, str]:
+    """A milestone -> story -> subtask chain, the shape `run --card` requires."""
+    milestone = _add_card(project, "Milestone 1: walking skeleton")
+    story = _add_card(project, "The CLI: run, status, logs, resume", milestone)
+    subtask = _add_card(project, "Add run --card end to end", story)
+    return {"milestone": milestone, "story": story, "subtask": subtask}
+
+
+EXPLORE_RESULT = {
+    "summary": "the CLI composes board, dag, store, loader and engine for one card",
+    "verification": {"fullSuite": ["uv run pytest"]},
+}
+
+
+def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str | None = None):
+    """An `engine.AgentPhaseRunner` that returns canned results and runs nothing.
+
+    §14's Engine tier: the agent phases are faked at the seam `engine.run_subtask`
+    already injects, so no attempt directory, no adapter and no launcher exist in
+    these tests at all.
+    """
+
+    def runner(phase, context, rendered):
+        if seen is not None:
+            seen.append((phase.name, dict(context)))
+        if fail is not None and phase.name == fail:
+            raise AgentPhaseFailed(
+                phase.name, outcome="gate_failed", detail="canned gate failure"
+            )
+        if phase.name == "explore":
+            return dict(EXPLORE_RESULT)
+        return {"phase": phase.name, "ok": True}
+
+    return runner
+
+
+@requires_git
+@requires_brd
+def test_run_card_drives_the_task_workflow_to_done(project, cards):
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["status"] == "done"
+    assert payload["card_id"] == cards["subtask"]
+    assert payload["story_id"] == cards["story"]
+    assert payload["failed_phase"] is None
+    assert payload["detail"] is None
+
+
+@requires_git
+@requires_brd
+def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
+    card = board.show(cards["subtask"], repo_dir=project)
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m7",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["branch"] == dag.task_branch("m7", card)
+    assert payload["base_branch"] == "main"
+    assert Path(payload["worktree"]).is_absolute()
+    assert Path(payload["worktree"]) == project.resolve() / ".claude" / "worktrees" / payload[
+        "branch"
+    ]
+    assert Path(payload["worktree"]).is_dir()
+
+
+@requires_git
+@requires_brd
+def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards, monkeypatch):
+    """The option's default is `.`, and `worktree.ensure` refuses anything
+    relative -- so the resolution has to happen in the CLI, not in the step."""
+    monkeypatch.chdir(project)
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=Path("."),
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+    assert Path(payload["worktree"]).is_absolute()
+    assert payload["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, cards):
+    """§12's escape hatch is bound by name out of the engine's context, and
+    `subtask_context` holds none of these four names."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+    cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(seen),
+    )
+
+    _phase, context = seen[0]
+    assert context["suite_cmds"] == []
+    assert context["allow_no_verification"] is False
+    assert context["caller_provided"] is False
+    assert context["provided_verification"] is None
