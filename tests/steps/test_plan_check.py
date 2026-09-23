@@ -268,3 +268,38 @@ def test_a_plans_dir_that_is_a_file_reports_no_plan(tmp_path: Path):
 def test_a_successful_read_carries_no_error_key(tmp_path: Path):
     directory = _plans(tmp_path, {"task-rows-a32af745.md": VALIDATED_MARKER})
     assert "error" not in plan_check.find_validated_plan("a32af745", directory)
+
+
+def test_the_gate_wants_both_found_and_validated(tmp_path: Path):
+    directory = _plans(
+        tmp_path,
+        {
+            "task-rows-a32af745.md": f"# plan\n{VALIDATED_MARKER}",
+            "task-rows-deadbeef.md": "# plan\nno marker",
+        },
+    )
+    signed_off = plan_check.find_validated_plan("a32af745", directory)
+    unsigned = plan_check.find_validated_plan("deadbeef", directory)
+    absent = plan_check.find_validated_plan("cafed00d", directory)
+
+    assert plan_check.has_validated_plan(signed_off) is True
+    assert plan_check.has_validated_plan(unsigned) is False
+    assert plan_check.has_validated_plan(absent) is False
+
+
+def test_the_gate_is_closed_for_an_unreadable_plan(tmp_path: Path):
+    directory = _plans(tmp_path, {"task-rows-a32af745.md": VALIDATED_MARKER})
+
+    def refuse(path: str) -> str:
+        raise PermissionError(13, "EACCES: permission denied")
+
+    unreadable = plan_check.find_validated_plan("a32af745", directory, read=refuse)
+    assert plan_check.has_validated_plan(unreadable) is False
+
+
+def test_the_gate_is_closed_for_anything_that_is_not_a_result_dict():
+    # A phase that failed before producing a result must not read as "skip to
+    # implement": the gate fails closed, so the pipeline re-plans.
+    assert plan_check.has_validated_plan(None) is False
+    assert plan_check.has_validated_plan({}) is False
+    assert plan_check.has_validated_plan("found") is False

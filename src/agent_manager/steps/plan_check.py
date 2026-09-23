@@ -156,3 +156,15 @@ def find_validated_plan(
             "error": f"could not read {path}: {exc}",
         }
     return {"found": True, "path": path, "validated": VALIDATED_MARKER in content}
+
+
+def has_validated_plan(result: object) -> bool:
+    """The workflow's `when:` gate: skip to `implement` (design §5 lines 169-173).
+
+    Pure -- it only reads the dict `find_validated_plan` returned. Both flags
+    are required, and anything that is not a result mapping reads as closed: a
+    phase that failed before producing a result must re-plan, never skip.
+    """
+    if not isinstance(result, Mapping):
+        return False
+    return bool(result.get("found")) and bool(result.get("validated"))
