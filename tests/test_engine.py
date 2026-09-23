@@ -30,17 +30,53 @@ def _subtask(card: str = "ed77a917") -> models.SubtaskRun:
     )
 
 
+CARD = models.Card(
+    id="968fba15-0971-456a-ae9f-57ff2210f0ce",
+    title="Resolve phase inputs",
+    status="todo",
+    parent_id="2143808b-b236-4cf9-b172-53809bdbc1a1",
+)
+PARENT = models.Card(
+    id="2143808b-b236-4cf9-b172-53809bdbc1a1",
+    title="The workflow document and the engine",
+    status="in_progress",
+)
+SPEC_PATH = "docs/superpowers/specs/resolve-phase-inputs-968fba15.md"
+PLAN_PATH = "docs/superpowers/plans/resolve-phase-inputs-968fba15.md"
+
+
 def test_subtask_context_renames_the_model_fields_the_steps_ask_for():
     context = engine.subtask_context(_subtask(), REPO, ["uv run pytest"])
 
     assert context == {
         "card": "ed77a917",
+        "card_details": None,
+        "parent_story_details": None,
         "branch": "m1/task-ed77a917",
         "base": "m1/story-base",
         "worktree": Path("/repo/.claude/worktrees/m1/task-ed77a917"),
         "repo_dir": REPO,
         "commands": ["uv run pytest"],
     }
+
+
+def test_the_cards_land_under_the_details_keys_and_leave_the_id_string_alone():
+    """§7's `card` input and the steps' `card` parameter are different things:
+    `plan_check.find_validated_plan(card)` binds the bare id string, and turning
+    that key into a `Card` would break every deterministic step at once.
+    """
+    context = engine.subtask_context(
+        _subtask(), REPO, ["uv run pytest"], card=CARD, parent_story=PARENT
+    )
+
+    assert context["card"] == "ed77a917"
+    assert context["card_details"] is CARD
+    assert context["parent_story_details"] is PARENT
+
+
+def test_the_new_context_keys_are_reserved_against_a_same_named_phase():
+    for key in ("card_details", "parent_story_details", "spec_path", "plan_path"):
+        assert key in engine.RESERVED_CONTEXT_KEYS
 
 
 def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
@@ -1111,6 +1147,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         subtask=_subtask(),
         repo_dir=REPO,
         commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
         agent_runner=agent_runner,
     )
 
@@ -1393,3 +1431,106 @@ phases:
     ended_at = datetime.fromisoformat(done.payload["ended_at"])
     assert started_at.tzinfo is not None
     assert before <= started_at <= ended_at <= after
+
+
+DOCUMENT_PATHS = """
+name: paths
+phases:
+  - name: spec
+    kind: agent
+    role: spec_author
+    writes: docs/superpowers/specs/{stem}.md
+  - name: plan
+    kind: agent
+    role: planner
+    writes: docs/superpowers/plans/{stem}.md
+  - name: implement
+    kind: agent
+    role: coder
+    inputs: [spec_path, plan_path]
+  - name: after
+    kind: deterministic
+    run: step.after
+"""
+
+
+def test_document_paths_are_bound_from_the_writes_templates(store):
+    seen: dict[str, Any] = {}
+
+    def after(spec_path: str, plan_path: str) -> dict[str, Any]:
+        seen.update(spec_path=spec_path, plan_path=plan_path)
+        return {}
+
+    workflow = _workflow(DOCUMENT_PATHS, {"step.after": after})
+
+    engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        card=CARD,
+        # `*args` so this test is indifferent to the seam Task 7 widens.
+        agent_runner=lambda *args: {},
+    )
+
+    assert seen == {"spec_path": SPEC_PATH, "plan_path": PLAN_PATH}
+
+
+def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store):
+    document = """
+name: orphan
+phases:
+  - name: implement
+    kind: agent
+    role: coder
+    inputs: [plan_path]
+"""
+    workflow = _workflow(document, {})
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            card=CARD,
+            agent_runner=lambda phase, context, rendered: {},
+        )
+
+    assert caught.value.parameter == "plan_path"
+    assert "'plan'" in str(caught.value)
+    assert "writes" in str(caught.value)
+
+
+def test_a_document_path_input_with_no_card_is_a_named_error(store):
+    workflow = _workflow(DOCUMENT_PATHS, {"step.after": lambda spec_path, plan_path: {}})
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            agent_runner=lambda phase, context, rendered: {},
+        )
+
+    assert caught.value.parameter in {"plan_path", "spec_path"}
+    assert "no card was supplied" in str(caught.value)
+
+
+def test_a_document_with_no_path_inputs_needs_no_card(store):
+    """Every existing walk in this file passes no card; none may start failing."""
+    workflow = _workflow(THREE_PHASES, {
+        "step.alpha": lambda card: {},
+        "step.beta": lambda card: {},
+        "step.gamma": lambda card: {},
+    })
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "done"

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from agent_manager import models
+from agent_manager import models, prompt
 from agent_manager.errors import EngineError
 from agent_manager.store import Store
 from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
@@ -32,19 +32,37 @@ _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 # `EngineError` is imported, not defined, so `prompt.py` can raise it without
 # importing this module back. `engine.EngineError` is still the public name.
 
-RESERVED_CONTEXT_KEYS = ("card", "branch", "base", "worktree", "repo_dir", "commands")
-"""The context keys `subtask_context` always sets.
+RESERVED_CONTEXT_KEYS = (
+    "card",
+    "card_details",
+    "parent_story_details",
+    "branch",
+    "base",
+    "worktree",
+    "repo_dir",
+    "commands",
+    "spec_path",
+    "plan_path",
+)
+"""The context keys the engine itself sets, and no phase result may replace.
 
 Named as a constant because phase results land in the same mapping under the
 phase's name: a phase called `worktree` -- the shipped `builtin/task.yaml`
 has exactly one -- would otherwise overwrite the real worktree path every
-later step binds from. `_bind_result` uses this to skip writing such a
-result back into the table rather than refuse the phase outright.
+later step binds from, and a phase called `spec_path` would overwrite the
+document path `implement` and `review` both declare. `_bind_result` uses this
+to skip writing such a result back into the table rather than refuse the phase
+outright.
 """
 
 
 def subtask_context(
-    subtask: models.SubtaskRun, repo_dir: Path, commands: Sequence[str] = ()
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    *,
+    card: models.Card | None = None,
+    parent_story: models.Card | None = None,
 ) -> dict[str, Any]:
     """The starting binding table for one subtask's phases.
 
@@ -52,15 +70,75 @@ def subtask_context(
     binding is by name, and no deterministic phase in `builtin/task.yaml`
     declares `args` that could bridge the difference. Hence `base` for
     `base_branch` and `worktree` for `worktree_path`.
+
+    `card` stays the bare id string every deterministic step binds by that name
+    (`plan_check.find_validated_plan(card)`). The full cards the §7 `card` and
+    `parent_story` *inputs* render live beside it under `card_details` and
+    `parent_story_details`, supplied by the caller exactly as `commands` is --
+    nothing here reads the board.
     """
     return {
         "card": subtask.card_id,
+        "card_details": card,
+        "parent_story_details": parent_story,
         "branch": subtask.branch,
         "base": subtask.base_branch,
         "worktree": subtask.worktree_path,
         "repo_dir": repo_dir,
         "commands": list(commands),
     }
+
+
+_DOCUMENT_INPUTS = {"spec_path": "spec", "plan_path": "plan"}
+"""Which phase's `writes:` template each §7 document-path input comes from.
+
+Keyed on the phase *name*, not on a guess about the path: `builtin/task.yaml`
+names them `spec` and `plan`, and matching on the template text would make a
+document whose plan phase writes into `docs/specs/` resolve backwards.
+"""
+
+
+def _document_paths(workflow: Workflow, card: models.Card | None) -> dict[str, str]:
+    """`spec_path` / `plan_path` for the whole subtask, computed once, from the document.
+
+    Computed at subtask start rather than when the `spec` and `plan` phases run:
+    `plan_check` may `skip_to: implement`, and `implement` still declares both
+    inputs. §7 calls them "paths in the repo, already committed" -- the path is a
+    property of the card and the document, not of a phase having executed.
+    """
+    declared = {
+        name
+        for phase in workflow.phases
+        if isinstance(phase, AgentPhase)
+        for name in phase.inputs
+        if name in _DOCUMENT_INPUTS
+    }
+    paths: dict[str, str] = {}
+    for name in sorted(declared):
+        source = _writing_phase(workflow, _DOCUMENT_INPUTS[name], name)
+        if card is None:
+            raise EngineError(
+                f"is declared as an input, but no card was supplied to expand "
+                f"{source.writes!r} (the stem comes from the card's id and title)",
+                phase=source.name,
+                parameter=name,
+            )
+        paths[name] = prompt.expand_writes(
+            source.writes, card, phase=source.name, input_name=name
+        )
+    return paths
+
+
+def _writing_phase(workflow: Workflow, phase_name: str, input_name: str) -> AgentPhase:
+    found = next((p for p in workflow.phases if p.name == phase_name), None)
+    if not isinstance(found, AgentPhase) or found.writes is None:
+        raise EngineError(
+            f"is declared as an input, but this workflow has no agent phase named "
+            f"{phase_name!r} with a `writes:` template to take the path from "
+            f"(phases: {', '.join(workflow.phase_names)})",
+            parameter=input_name,
+        )
+    return found
 
 
 def bind_arguments(
@@ -243,6 +321,8 @@ def run_subtask(
     subtask: models.SubtaskRun,
     repo_dir: Path,
     commands: Sequence[str] = (),
+    card: models.Card | None = None,
+    parent_story: models.Card | None = None,
     agent_runner: AgentPhaseRunner | None = None,
     start_phase: str | None = None,
     clock: Clock = _utcnow,
@@ -253,7 +333,10 @@ def run_subtask(
     are both keyed by it, and nothing in a subtask knows its story.
     """
     index = _start_index(workflow, start_phase)
-    context = subtask_context(subtask, repo_dir, commands)
+    context = subtask_context(
+        subtask, repo_dir, commands, card=card, parent_story=parent_story
+    )
+    context.update(_document_paths(workflow, card))
     summary = SubtaskSummary()
 
     while index < len(workflow.phases):
