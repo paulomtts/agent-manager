@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "typer>=0.27.2",
     "pydantic>=2.9",
+    "pyyaml>=6.0.2",
 ]
 
 [dependency-groups]
@@ -15,7 +16,7 @@ dev = [
 ]
 
 [project.scripts]
-agent-manager = "agent_manager.cli:app"
+am = "agent_manager.cli:app"
 
 [build-system]
 requires = ["hatchling"]
@@ -23,3 +24,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_manager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib mode, not the default prepend mode: tests/workflow/test_loader.py and
+# tests/roles/test_loader.py share a basename, and prepend mode names test modules
+# after their basename alone, so collecting both aborts with "import file mismatch".
+addopts = "--import-mode=importlib"
