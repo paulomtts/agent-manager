@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from agent_manager import board, prompt, results
+from agent_manager.steps import docs_commit
 from agent_manager.workflow import load_builtin
 
 AGENT_PHASES = (
@@ -172,3 +173,40 @@ def test_this_module_runs_in_the_default_suite_unmarked(request):
     """
     assert {mark.name for mark in request.node.own_markers} == set()
     assert {mark.name for mark in request.node.parent.own_markers} == set()
+
+
+def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
+    project, completed_run, worktree
+):
+    """R4: the fake harness knows no more than its brief and does no work the
+    engine owes. The spec and the plan are committed by the `docs_commit` step,
+    with the Plan-Hash trailer, before `implement` ever starts -- so the docs
+    commit is OLDER than the fake's implementation commit."""
+    workflow = load_builtin("task")
+    card = board.show(completed_run["card_id"], repo_dir=project)
+    plan_relative = prompt.expand_writes(
+        workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
+    )
+    spec_relative = prompt.expand_writes(
+        workflow.phase("spec").writes, card, phase="spec", input_name="spec_path"
+    )
+    expected_hash = hashlib.sha256(
+        (worktree / plan_relative).read_bytes()
+    ).hexdigest()[:8]
+    subject = docs_commit.SUBJECT_TEMPLATE.format(title=card.title)
+
+    # `rev-list` is newest-first, so the docs commit must come LAST.
+    revisions = _git(worktree, "rev-list", "main..HEAD").split()
+    subjects = [
+        _git(worktree, "show", "-s", "--format=%s", revision).strip()
+        for revision in revisions
+    ]
+    assert subject in subjects, subjects
+    assert subjects.index(subject) == len(subjects) - 1, subjects
+
+    docs_revision = revisions[subjects.index(subject)]
+    message = _git(worktree, "show", "-s", "--format=%B", docs_revision).rstrip("\n")
+    assert message.splitlines()[-1] == f"{docs_commit.TRAILER_PREFIX}{expected_hash}"
+
+    named = _git(worktree, "show", "--name-only", "--format=", docs_revision).split()
+    assert sorted(named) == sorted([spec_relative, plan_relative])

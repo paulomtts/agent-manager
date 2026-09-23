@@ -182,6 +182,16 @@ SUMMARY = (
 """Longer than `reducers.MIN_SUMMARY_LENGTH` (60) and not one of
 `reducers.PLACEHOLDER_SUMMARIES`, so `exploration_output_gate` passes."""
 
+IMPLEMENTATION_NAME = "IMPLEMENTATION.md"
+"""The one file the fake coder writes, so its commit is not empty.
+
+The engine's `docs_commit` phase now commits the spec and the plan before
+`implement` runs (card ba15da20), which is the whole point: the fake must not
+do work the engine owes. A coder that wrote nothing at all would then have an
+empty `git commit` and fail, so this fake writes the one file a real coder
+would have written.
+"""
+
 LOG_NAME = "fake-claude.log"
 """The cwd log, written beside the run directory -- under `paths.data_dir()`,
 never inside the worktree, so the clean-worktree assertion stays meaningful."""
@@ -260,6 +270,9 @@ def build_result(phase, payload, text, cwd):
     if phase == "implement":
         relative = _section(found, "plan_path", phase)
         digest = plan_hash_of(Path(cwd) / relative)
+        (Path(cwd) / IMPLEMENTATION_NAME).write_text(
+            f"# implementation\n\n{SUMMARY}\n", encoding="utf-8"
+        )
         git(cwd, "add", "-A")
         git(cwd, "commit", "-m", f"feat: implement this card\n\nPlan-Hash: {digest}")
         return override(
