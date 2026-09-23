@@ -1112,6 +1112,27 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
 
 @requires_git
 @requires_brd
+def test_run_card_really_moves_the_card_on_the_board(project, cards):
+    """§12: a payload saying `done` while the card never moved is the failure
+    this run is supposed to prevent. `mark_in_progress` and `mark_done` are
+    `best_effort`, so a board write that never happened would be a warning at
+    most -- the proof has to come from brd itself, not from the payload."""
+    assert board.show(cards["subtask"], repo_dir=project).status == "todo"
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["warnings"] == []
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
 def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
     card = board.show(cards["subtask"], repo_dir=project)
     payload = cli.run_card(
