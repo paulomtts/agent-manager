@@ -222,7 +222,9 @@ def test_status_rows_show_a_phase_that_has_no_attempts_yet():
                         base_branch="main",
                         status="started",
                         phases=[
-                            models.PhaseRun(name="verify", kind="deterministic", status="pending")
+                            models.PhaseRun(
+                                name="verify", kind="deterministic", status="pending"
+                            )
                         ],
                     )
                 ],
@@ -1024,8 +1026,16 @@ def test_status_prints_a_row_for_every_recorded_attempt(projection):
 
 
 def test_status_with_no_run_id_renders_the_most_recent_run(projection):
-    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
-    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260924T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc),
+    )
     _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
 
     result = runner.invoke(cli.app, ["status", "--repo-dir", str(projection)])
@@ -1103,8 +1113,16 @@ def test_status_pretty_indents_the_same_envelope(projection):
 
 
 def test_runs_lists_the_projects_history_newest_first(projection):
-    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
-    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260924T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc),
+    )
     _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
 
     result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
@@ -1134,8 +1152,16 @@ def test_runs_on_a_project_that_has_never_been_run_is_ok_and_empty(projection):
 
 
 def test_runs_agrees_with_status_about_the_most_recent_run(projection):
-    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
-    _record(projection, "20260924T090000Z-cbe34d00", started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260924T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc),
+    )
 
     listed = json.loads(
         runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)]).stdout
