@@ -1693,7 +1693,10 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
     project, cards, monkeypatch
 ):
     """The whole chain, not just the call: `--verify` -> `run_card` ->
-    `gate_context` -> the context `builtin/task.yaml` binds its gates out of."""
+    `gate_context` -> the context `builtin/task.yaml` binds its gates out of.
+
+    The real verify step runs these commands in the worktree, so they are ones
+    that pass anywhere."""
     seen: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner(seen))
 
@@ -1701,14 +1704,14 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
         project,
         cards["subtask"],
         "--verify",
-        "uv run pytest",
+        "true",
         "--verify",
-        "uv run ruff check",
+        "echo checked",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     _phase, context = seen[0]
-    assert context["suite_cmds"] == ["uv run pytest", "uv run ruff check"]
+    assert context["suite_cmds"] == ["true", "echo checked"]
     assert context["allow_no_verification"] is False
     assert context["caller_provided"] is False
     assert context["provided_verification"] is None
