@@ -11,9 +11,11 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, Field
 
 from agent_manager import dag, models, prompt
 from agent_manager.errors import EngineError
+from agent_manager.roles import loader as roles_loader
 from agent_manager.workflow.loader import AgentPhase
 
 CARD = models.Card(
@@ -406,3 +408,333 @@ def test_write_does_not_create_the_directory_and_says_which_one_was_missing(tmp_
     assert str(missing) in str(caught.value)
     assert caught.value.phase == "implement"
     assert not missing.exists()
+
+
+def test_the_feedback_heading_lives_in_prompt_and_dispatch_reuses_it():
+    from agent_manager import dispatch
+
+    assert prompt.FEEDBACK_HEADING == "## feedback on the previous attempt"
+    assert dispatch.FEEDBACK_HEADING is prompt.FEEDBACK_HEADING
+
+
+BRIEF_POLICY = roles_loader.Policy(
+    allowed_tools=["Read", "Edit"],
+    default_model={"claude": "sonnet"},
+    max_attempts=2,
+)
+
+TDD_BODY = "# Test-driven development\n\n## Red\n\nWrite the failing test.\n"
+PLANS_BODY = "# Writing plans\n\nBite-sized steps, real code in every step.\n"
+
+
+def _role(
+    name: str = "coder",
+    *,
+    system: str = "# Coder\n\nYou execute an implementation plan under strict TDD.\n",
+    methodology: dict[str, str] | None = None,
+) -> roles_loader.RoleBundle:
+    """A synthetic bundle: the composer only reads `system` and `methodology`."""
+    return roles_loader.RoleBundle(
+        name=name,
+        system=system,
+        policy=BRIEF_POLICY,
+        methodology=dict(methodology or {}),
+    )
+
+
+def _rendered(inputs=("branch", "base_branch")) -> prompt.RenderedPrompt:
+    return prompt.render_prompt(_phase(list(inputs)), _context())
+
+
+def test_the_brief_orders_system_then_methodology_then_the_rendered_prompt():
+    role = _role(
+        methodology={
+            "test-driven-development.md": TDD_BODY,
+            "writing-plans.md": PLANS_BODY,
+        }
+    )
+    rendered = _rendered()
+
+    brief = prompt.compose_brief(role, rendered)
+
+    positions = [
+        brief.index("# Coder"),
+        brief.index("## methodology: test-driven-development.md"),
+        brief.index("## methodology: writing-plans.md"),
+        brief.index("# phase: implement"),
+    ]
+    assert positions == sorted(positions)
+    assert len(set(positions)) == len(positions)
+
+
+def test_each_methodology_file_gets_its_own_heading_and_a_verbatim_body():
+    role = _role(
+        methodology={
+            "test-driven-development.md": TDD_BODY,
+            "writing-plans.md": PLANS_BODY,
+        }
+    )
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert "## methodology: test-driven-development.md\n# Test-driven development" in brief
+    assert "## methodology: writing-plans.md\n# Writing plans" in brief
+    assert TDD_BODY.strip("\n") in brief
+    assert PLANS_BODY.strip("\n") in brief
+
+
+def test_a_role_with_no_methodology_puts_the_rendered_prompt_straight_after_system():
+    role = _role(name="reviewer", system="# Reviewer\n\nYou review finished work.\n")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert prompt.METHODOLOGY_HEADING_PREFIX not in brief
+    assert brief.startswith("# Reviewer\n\nYou review finished work.\n\n# phase: implement\n")
+
+
+def test_the_brief_carries_the_rendered_text_verbatim_and_ends_in_one_newline():
+    rendered = _rendered()
+
+    brief = prompt.compose_brief(_role(), rendered)
+
+    assert rendered.text.strip("\n") in brief
+    assert brief.endswith("\n")
+    assert not brief.endswith("\n\n")
+
+
+def test_two_roles_produce_different_briefs_from_the_same_rendered_prompt():
+    rendered = _rendered()
+    coder = _role(methodology={"test-driven-development.md": TDD_BODY})
+    critic = _role(name="critic", system="# Critic\n\nYou adversarially review.\n")
+
+    coder_brief = prompt.compose_brief(coder, rendered)
+    critic_brief = prompt.compose_brief(critic, rendered)
+
+    assert coder_brief != critic_brief
+    assert "# Coder" in coder_brief and "# Critic" not in coder_brief
+    assert "# Critic" in critic_brief and "# Coder" not in critic_brief
+
+
+def test_composing_twice_is_byte_identical():
+    role = _role(methodology={"writing-plans.md": PLANS_BODY})
+    rendered = _rendered()
+
+    first = prompt.compose_brief(role, rendered)
+    second = prompt.compose_brief(role, rendered)
+
+    assert first == second
+
+
+def test_trailing_blank_lines_in_system_text_collapse_to_one_separator():
+    role = _role(system="# Coder\n\nDo the work.\n\n\n\n")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+
+
+def test_system_text_with_no_trailing_newline_still_gets_one_blank_line():
+    role = _role(system="# Coder\n\nDo the work.")
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+
+
+def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
+    body = "# Writing plans\n\n## Step one\n\nWrite the test.\n\n## Step two\n\nRun it.\n"
+    role = _role(methodology={"writing-plans.md": body})
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
+
+
+class StandInResult(BaseModel):
+    """Stands in for a `results.RESULT_MODELS` entry, which is story 5cc741ec's."""
+
+    summary: str
+    files: list[str] = []
+
+
+def _fenced_json(brief: str) -> dict:
+    """The one ```json block the contract embeds, parsed back."""
+    body = brief.split("```json\n", 1)[1].split("\n```", 1)[0]
+    return json.loads(body)
+
+
+def test_the_contract_states_the_absolute_path_and_embeds_the_real_schema():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=Path("/var/agent-manager/runs/r1/card/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+
+    assert prompt.RESULT_HEADING == "## Result contract"
+    assert "\n## Result contract\n" in brief
+    assert "/var/agent-manager/runs/r1/card/implement.1/result.json" in brief
+    assert _fenced_json(brief) == StandInResult.model_json_schema()
+    assert "summary" in _fenced_json(brief)["properties"]
+
+
+def test_the_contract_says_write_valid_json_and_stay_out_of_the_worktree():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=Path("/var/agent-manager/runs/r1/card/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+    contract = brief.split(prompt.RESULT_HEADING, 1)[1]
+
+    assert "valid JSON" in contract
+    assert "outside the worktree" in contract
+
+
+def test_the_contract_lands_after_the_rendered_prompt():
+    brief = prompt.compose_brief(
+        _role(methodology={"writing-plans.md": PLANS_BODY}),
+        _rendered(),
+        result_path=Path("/runs/r1/implement.1/result.json"),
+        result_model=StandInResult,
+    )
+
+    assert brief.index("# phase: implement") < brief.index(prompt.RESULT_HEADING)
+
+
+def test_a_phase_with_no_result_gets_no_contract_section():
+    brief = prompt.compose_brief(_role(), _rendered())
+
+    assert prompt.RESULT_HEADING not in brief
+    assert "```json" not in brief
+
+
+def test_a_result_path_given_as_a_string_is_accepted_and_rendered():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+    )
+
+    assert "/runs/r1/implement.1/result.json" in brief
+
+
+def test_a_schema_with_non_ascii_prose_is_embedded_unescaped():
+    class Unicode(BaseModel):
+        summary: str = Field(description="the finding — in one line")
+
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=Unicode,
+    )
+
+    assert "the finding — in one line" in brief
+    assert "\\u2014" not in brief
+    assert _fenced_json(brief) == Unicode.model_json_schema()
+
+
+def test_a_result_path_without_a_model_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(
+            _role(), _rendered(), result_path="/runs/r1/implement.1/result.json"
+        )
+
+    assert "implement" in str(error.value)
+    assert error.value.phase == "implement"
+    assert "result_model" in str(error.value)
+
+
+def test_a_result_model_without_a_path_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(_role(), _rendered(), result_model=StandInResult)
+
+    assert error.value.phase == "implement"
+    assert "result_path" in str(error.value)
+
+
+def test_a_relative_result_path_is_refused():
+    with pytest.raises(EngineError) as error:
+        prompt.compose_brief(
+            _role(),
+            _rendered(),
+            result_path="attempts/implement.1/result.json",
+            result_model=StandInResult,
+        )
+
+    assert error.value.phase == "implement"
+    assert "attempts/implement.1/result.json" in str(error.value)
+
+
+def test_composing_a_contract_creates_no_file(tmp_path):
+    prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path=tmp_path / "implement.1" / "result.json",
+        result_model=StandInResult,
+    )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+FEEDBACK = "The verify step failed: two tests error on a missing fixture."
+
+
+def test_feedback_is_the_last_section_and_comes_after_the_contract():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+        feedback=FEEDBACK,
+    )
+
+    assert brief.index(prompt.RESULT_HEADING) < brief.index(prompt.FEEDBACK_HEADING)
+    assert brief.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")
+
+
+def test_without_feedback_the_heading_is_absent():
+    brief = prompt.compose_brief(
+        _role(),
+        _rendered(),
+        result_path="/runs/r1/implement.1/result.json",
+        result_model=StandInResult,
+    )
+
+    assert prompt.FEEDBACK_HEADING not in brief
+
+
+def test_the_brief_without_feedback_is_a_prefix_of_the_brief_with_it():
+    role = _role(methodology={"test-driven-development.md": TDD_BODY})
+    rendered = _rendered()
+    contract = {
+        "result_path": "/runs/r1/implement.1/result.json",
+        "result_model": StandInResult,
+    }
+
+    base = prompt.compose_brief(role, rendered, **contract)
+    retry = prompt.compose_brief(role, rendered, **contract, feedback=FEEDBACK)
+
+    assert retry.startswith(base)
+    assert retry.count(prompt.RESULT_HEADING) == 1
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\n", " \t\n "])
+def test_blank_feedback_produces_no_feedback_section(blank):
+    brief = prompt.compose_brief(_role(), _rendered(), feedback=blank)
+
+    assert prompt.FEEDBACK_HEADING not in brief
+    assert brief == prompt.compose_brief(_role(), _rendered())
+
+
+def test_feedback_that_already_ends_in_newlines_does_not_accumulate_blank_lines():
+    role = _role()
+    rendered = _rendered()
+
+    base = prompt.compose_brief(role, rendered)
+    retry = prompt.compose_brief(role, rendered, feedback=FEEDBACK + "\n\n\n")
+
+    assert retry.startswith(base)
+    assert retry.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")

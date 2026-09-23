@@ -634,8 +634,8 @@ def run_card(
     card_id: str,
     *,
     repo_dir: Path,
+    branch_prefix: str,
     base_branch: str = "master",
-    branch_prefix: str = "m1",
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
@@ -767,12 +767,22 @@ def run(
         "master", "--base-branch", help="The branch this subtask's branch is cut from."
     ),
     branch_prefix: str = typer.Option(
-        "m1", "--branch-prefix", help="Milestone prefix for the derived branch name."
+        ...,
+        "--branch-prefix",
+        help="Milestone prefix for the derived branch name, e.g. `m2`.",
     ),
     allow_no_verification: bool = typer.Option(
         False,
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
+    ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. Passed through verbatim "
+            "and in the order given; the engine runs them in sequence."
+        ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
@@ -784,6 +794,7 @@ def run(
             base_branch=base_branch,
             branch_prefix=branch_prefix,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -1078,20 +1089,30 @@ def resume(
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
     ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. The run record does not "
+            "carry the suite, so a resume is told it the way a fresh run was."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Re-run the phase a killed run died in, and drive the subtask to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
-    started and are recorded on the subtask (§9). `--allow-no-verification` is
-    offered because `models.RunConfig` does not carry it, so the flag means the
-    same thing here as it does on a fresh `run`.
+    started and are recorded on the subtask (§9). `--allow-no-verification` and
+    `--verify` are offered because `models.RunConfig` carries neither the opt-out
+    nor the suite commands, so both mean the same thing here as they do on a
+    fresh `run`.
     """
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

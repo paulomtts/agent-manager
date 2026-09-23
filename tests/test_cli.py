@@ -1087,6 +1087,7 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1128,6 +1129,7 @@ def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards,
         cards["subtask"],
         repo_dir=Path("."),
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
     assert Path(payload["worktree"]).is_absolute()
@@ -1144,6 +1146,7 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(seen),
     )
 
@@ -1167,7 +1170,18 @@ def _invoke(project: Path, card_id: str, *extra: str):
     """
     return runner.invoke(
         cli.app,
-        ["run", "--card", card_id, "--repo-dir", str(project), "--base-branch", "main", *extra],
+        [
+            "run",
+            "--card",
+            card_id,
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            *extra,
+        ],
     )
 
 
@@ -1221,6 +1235,7 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1249,6 +1264,7 @@ def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, card
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: WarningRunner(),
     )
 
@@ -1270,6 +1286,7 @@ def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards)
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         clock=lambda: frozen,
         runner_factory=lambda **kwargs: fake_runner(),
     )
@@ -1289,6 +1306,7 @@ def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1323,6 +1341,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1344,6 +1363,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1371,6 +1391,7 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=exploding_factory,
     )
 
@@ -1449,6 +1470,8 @@ def test_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch
             "cbe34d00-9d8d-4f41-9c94-f99e665771b0",
             "--repo-dir",
             str(tmp_path / "missing"),
+            "--branch-prefix",
+            "m1",
         ],
     )
 
@@ -1543,6 +1566,7 @@ def test_no_harness_is_ever_launched(project, cards, monkeypatch):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
     assert payload["status"] == "done"
@@ -1566,6 +1590,7 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(seen_off),
     )
     off = seen_off[0][1]
@@ -1579,6 +1604,7 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         allow_no_verification=True,
         runner_factory=lambda **kwargs: fake_runner(seen_on),
     )
@@ -1589,6 +1615,220 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         is None
     )
     assert payload["status"] == "done"
+
+
+def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
+    """The exact `run_card` payload shape, for tests that replace `run_card`.
+
+    Spelled out rather than built from a loop so that a key this program stops
+    returning shows up here as a diff, not as a silently absent assertion.
+    """
+    return {
+        "run_id": "20260923T140506Z-cbe34d00",
+        "card_id": card_id,
+        "story_id": story_id,
+        "branch": "m2/task-fake-cbe34d00",
+        "base_branch": "main",
+        "worktree": "/tmp/agent-manager-fake-worktree",
+        "status": "done",
+        "failed_phase": None,
+        "detail": None,
+        "skipped": [],
+        "warnings": [],
+    }
+
+
+@requires_git
+@requires_brd
+def test_repeated_verify_options_reach_run_card_in_command_line_order(
+    project, cards, monkeypatch
+):
+    """§12's suite is the caller's to supply, and the engine runs the commands in
+    sequence -- so the order the operator typed is behaviour, not decoration."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen["card_id"] = card_id
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
+
+
+@requires_git
+@requires_brd
+def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
+    """`gate_context` calls `list(commands)` and `verification_gate` tells an
+    empty suite apart from a missing one, so `None` here would be a crash or a
+    silently different verdict."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    assert seen["commands"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
+    project, cards, monkeypatch
+):
+    """Review Focus: one occurrence is one whole command string. The CLI does no
+    word-splitting, no parsing and no validation -- whether a command is nonsense
+    is the engine's business, not this layer's."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest -k 'not slow'",
+        "--verify",
+        "",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
+
+
+@requires_git
+@requires_brd
+def test_verify_values_reach_the_gate_context_through_the_real_run_card(
+    project, cards, monkeypatch
+):
+    """The whole chain, not just the call: `--verify` -> `run_card` ->
+    `gate_context` -> the context `builtin/task.yaml` binds its gates out of.
+
+    The real verify step runs these commands in the worktree, so they are ones
+    that pass anywhere."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner(seen))
+
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "true",
+        "--verify",
+        "echo checked",
+    )
+
+    assert result.exit_code == 0, result.stdout
+    _phase, context = seen[0]
+    assert context["suite_cmds"] == ["true", "echo checked"]
+    assert context["allow_no_verification"] is False
+    assert context["caller_provided"] is False
+    assert context["provided_verification"] is None
+
+
+@requires_git
+@requires_brd
+def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
+    project, cards, monkeypatch
+):
+    """A missing required option never enters the `HANDLED` try block, so it is
+    Typer's own usage error at exit 2 -- distinct from `EXIT_ERROR`, and with
+    nothing written: no run id is minted because `run_card` is never called."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            cards["subtask"],
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--branch-prefix" in result.output
+    # Not the `ok: false` envelope: a usage error never reaches the try block.
+    assert '"ok"' not in result.stdout
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@requires_git
+@requires_brd
+def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
+    project, cards, monkeypatch
+):
+    """The default is gone, so the only way a prefix reaches the branch name is
+    the option -- and the branch is what every later command keys off."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    card = board.show(cards["subtask"], repo_dir=project)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            cards["subtask"],
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)["data"]
+    assert data["branch"] == dag.task_branch("m2", card)
+    assert data["branch"].startswith("m2/")
+
+
+@requires_git
+@requires_brd
+def test_the_run_success_envelope_keys_are_frozen(project, cards, monkeypatch):
+    """A shape freeze: `status`, `logs` and every downstream consumer read these
+    eleven names, so an added, dropped or renamed key is a contract break."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == {
+        "run_id",
+        "card_id",
+        "story_id",
+        "branch",
+        "base_branch",
+        "worktree",
+        "status",
+        "failed_phase",
+        "detail",
+        "skipped",
+        "warnings",
+    }
 
 
 @pytest.fixture
@@ -2267,6 +2507,7 @@ def _crash_mid_phase(project: Path, cards: dict[str, str], phase: str) -> str:
             cards["subtask"],
             repo_dir=project,
             base_branch="main",
+            branch_prefix="m1",
             clock=lambda: CRASHED_AT,
             runner_factory=_resume_factory(crash_at=phase),
         )
@@ -2601,6 +2842,48 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["data"]["status"] == "escalated"
     assert envelope["data"]["failed_phase"] == "review"
     assert envelope["data"]["resumed_from"] == "implement"
+
+
+@requires_git
+@requires_brd
+def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
+    project, cards, monkeypatch
+):
+    """`models.RunConfig` carries neither the suite commands nor the opt-out, so
+    a resume has to be told the same things a fresh `run` was told -- and in the
+    same order, since the engine runs the commands in sequence."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    contexts: list[dict[str, Any]] = []
+
+    def collecting_factory(**kwargs):
+        inner = fake_runner()
+
+        def collect(phase, context, rendered):
+            contexts.append(dict(context))
+            return inner(phase, context, rendered)
+
+        return collect
+
+    monkeypatch.setattr(cli, "default_runner_factory", collecting_factory)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            run_id,
+            "--repo-dir",
+            str(project),
+            "--verify",
+            "true",
+            "--verify",
+            "echo checked",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["data"]["resumed_from"] == "implement"
+    assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
+    assert contexts[0]["allow_no_verification"] is False
 
 
 @requires_git

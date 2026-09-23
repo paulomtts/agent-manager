@@ -8,6 +8,7 @@ JSONL journal. No process is ever started -- the launcher is injected, and one
 test asserts `subprocess.Popen` is never reached.
 """
 
+import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, field
@@ -120,13 +121,52 @@ fake = "fake-model"
 """
 
 
-def make_role(root: Path, name: str = "explorer", *, policy: str = POLICY) -> Path:
-    """A synthetic role bundle, built the way tests/roles/test_loader.py does."""
+METHODOLOGY = """\
+# Test-driven development
+
+## the loop
+
+Red, green, refactor. Never write implementation code before a failing test.
+"""
+
+
+def make_role(
+    root: Path,
+    name: str = "explorer",
+    *,
+    policy: str = POLICY,
+    methodology: dict[str, str] | None = None,
+) -> Path:
+    """A synthetic role bundle, built the way tests/roles/test_loader.py does.
+
+    `methodology` defaults to one vendored document so a composed brief has a
+    heading and a body to find; `{}` builds a bundle that vendors nothing.
+    """
     directory = root / name
     (directory / "methodology").mkdir(parents=True, exist_ok=True)
-    (directory / "system.md").write_text(f"Standing instructions for {name}.\n", encoding="utf-8")
+    (directory / "system.md").write_text(
+        f"Standing instructions for {name}.\n", encoding="utf-8"
+    )
     (directory / "policy.toml").write_text(policy, encoding="utf-8")
-    (directory / "VENDORED.lock").write_text("vendored = []\n", encoding="utf-8")
+    documents = (
+        {"test-driven-development.md": METHODOLOGY}
+        if methodology is None
+        else methodology
+    )
+    entries = []
+    for filename, text in documents.items():
+        path = directory / "methodology" / filename
+        path.write_text(text, encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        entries.append(
+            "[[vendored]]\n"
+            f'file = "{filename}"\n'
+            f'upstream = "skills/{filename}"\n'
+            f'sha256 = "{digest}"\n'
+        )
+    (directory / "VENDORED.lock").write_text(
+        "".join(entries) or "vendored = []\n", encoding="utf-8"
+    )
     return directory
 
 
@@ -141,7 +181,15 @@ class FakeAdapter:
 
     def build_command(self, d: models.Dispatch) -> list[str]:
         self.dispatches.append(d)
-        return ["fake-harness", "--model", d.model, "--result", str(d.result_path)]
+        return [
+            "fake-harness",
+            "--model",
+            d.model,
+            "--prompt",
+            str(d.prompt_path),
+            "--result",
+            str(d.result_path),
+        ]
 
     def parse_usage(self, stdout: str) -> Usage | None:
         return Usage(tokens_in=11, tokens_out=22, cost=0.5) if "usage" in stdout else None
@@ -226,9 +274,14 @@ class FakeLauncher:
     exit_code: int | None = 0
     timed_out: bool = False
     calls: list[list[str]] = field(default_factory=list)
+    prompts: list[str] = field(default_factory=list)
 
     def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
         self.calls.append(list(argv))
+        if "--prompt" in argv:
+            self.prompts.append(
+                Path(argv[argv.index("--prompt") + 1]).read_text(encoding="utf-8")
+            )
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stdout_path.write_text(self.stdout, encoding="utf-8")
         canned = self.results[min(len(self.calls) - 1, len(self.results) - 1)]
@@ -566,7 +619,7 @@ def _runner(store, workflow, launcher, tmp_path, worktree, **overrides):
     adding a second one, so a test can knock out exactly one seam.
     """
     adapter = overrides.pop("adapter", FakeAdapter())
-    make_role(tmp_path / "bundles")
+    make_role(tmp_path / "bundles", methodology=overrides.pop("methodology", None))
     kwargs = {
         "workflow": workflow,
         "store": store,
@@ -678,7 +731,8 @@ def test_a_persistently_invalid_result_retries_to_max_attempts_then_fails(
     assert len(launcher.calls) == 2
     second = paths.attempt_dir(RUN_ID, CARD, "explore", 2) / "prompt.txt"
     text = second.read_text(encoding="utf-8")
-    assert text.startswith("# phase: explore")
+    assert text.startswith("Standing instructions for explorer.")
+    assert "# phase: explore" in text
     assert dispatch.FEEDBACK_HEADING in text
     assert "summary" in text.split(dispatch.FEEDBACK_HEADING, 1)[1]
     assert _attempt_statuses(store) == [
@@ -1005,3 +1059,264 @@ def test_the_production_runner_factory_carries_the_shipped_table(store):
         "ImplementResult",
         "ReviewResult",
     }
+
+
+# ── the composed brief (addendum R2 §2) ──────────────────────────────────────
+
+
+def _gated_workflow():
+    return _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+
+
+def test_the_prompt_the_launcher_is_pointed_at_is_the_full_brief(
+    store, tmp_path, worktree
+):
+    # Spec test 1: role system text, methodology heading and body, rendered
+    # inputs, then this attempt's own result path, in that order.
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    brief = launcher.prompts[0]
+    heading = f"{prompt.METHODOLOGY_HEADING_PREFIX}test-driven-development.md"
+    result_path = str(paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "result.json")
+    assert brief.index("Standing instructions for explorer.") < brief.index(heading)
+    assert brief.index(heading) < brief.index("Red, green, refactor.")
+    assert brief.index("Red, green, refactor.") < brief.index("# phase: explore")
+    assert brief.index("# phase: explore") < brief.index(prompt.RESULT_HEADING)
+    assert brief.index(prompt.RESULT_HEADING) < brief.index(result_path)
+
+
+def test_the_result_contract_embeds_the_phases_result_schema(store, tmp_path, worktree):
+    # Spec test 2: the schema in the brief is the model the engine validates
+    # against, so instruction and validator cannot drift.
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    contract = launcher.prompts[0].split(prompt.RESULT_HEADING, 1)[1]
+    assert '"summary"' in contract
+    assert '"required"' in contract
+    assert '"additionalProperties": false' in contract
+
+
+def test_a_phase_with_no_declared_result_gets_no_result_contract(
+    store, tmp_path, worktree
+):
+    # Spec test 6 / Review Focus 4: no contract at all, not a half-contract error.
+    document = """
+name: agentic
+phases:
+  - name: spec
+    kind: agent
+    role: explorer
+    writes: docs/superpowers/specs/{stem}.md
+"""
+    workflow = _workflow(document, {})
+    launcher = FakeLauncher(results=[json.dumps({"wrote": "docs/spec.md"})])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    brief = launcher.prompts[0]
+    assert result == {"wrote": "docs/spec.md"}
+    assert prompt.RESULT_HEADING not in brief
+    assert "Standing instructions for explorer." in brief
+    assert f"{prompt.METHODOLOGY_HEADING_PREFIX}test-driven-development.md" in brief
+    assert "# phase: explore" in brief
+
+
+def test_the_journalled_prompt_path_is_the_file_the_launcher_was_pointed_at(
+    store, tmp_path, worktree
+):
+    # Spec test 7: Attempt.prompt_path, the adapter's argv and the composed file
+    # are one and the same thing.
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    argv = launcher.calls[0]
+    pointed = Path(argv[argv.index("--prompt") + 1])
+    terminal = [
+        line.payload
+        for line in store.journal.read()
+        if line.event == "attempt_upsert" and line.payload["status"] == "ok"
+    ][0]
+    on_disk = pointed.read_text(encoding="utf-8")
+    assert pointed == paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "prompt.txt"
+    assert terminal["prompt_path"] == str(pointed)
+    # The file itself, not `launcher.prompts[0]` -- the fake launcher read that
+    # string out of this very path, so comparing the two would compare the file
+    # to itself and would hold for any content whatsoever.
+    assert on_disk.startswith("Standing instructions for explorer.")
+    assert f"{prompt.METHODOLOGY_HEADING_PREFIX}test-driven-development.md" in on_disk
+    assert "# phase: explore" in on_disk
+    assert str(pointed.parent / "result.json") in on_disk.split(
+        prompt.RESULT_HEADING, 1
+    )[1]
+
+
+def test_a_role_with_no_methodology_still_composes_a_brief(store, tmp_path, worktree):
+    # Review Focus 1: RoleBundle.methodology defaults to {} and that is legal.
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree, methodology={})
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    brief = launcher.prompts[0]
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert prompt.METHODOLOGY_HEADING_PREFIX not in brief
+    assert "Standing instructions for explorer." in brief
+    assert "# phase: explore" in brief
+    assert prompt.RESULT_HEADING in brief
+
+
+def test_a_methodology_documents_own_headings_survive_into_the_brief(
+    store, tmp_path, worktree
+):
+    # Review Focus 2: vendored skill files are markdown with their own headings;
+    # the brief hands the agent the text, byte for byte.
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    brief = launcher.prompts[0]
+    assert "# Test-driven development" in brief
+    assert "## the loop" in brief
+    assert METHODOLOGY.strip("\n") in brief
+
+
+def test_a_prompt_that_cannot_be_written_is_a_named_engine_error(
+    store, tmp_path, worktree, monkeypatch
+):
+    # Review Focus 3 / spec error paths: RenderedPrompt.write stays the single
+    # place this can fail, the phase is journalled failed, nothing is launched.
+    real_write_text = Path.write_text
+
+    def refuse(self, *args, **kwargs):
+        if self.name == "prompt.txt":
+            raise OSError("no space left on device")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    workflow = _gated_workflow()
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(EngineError) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.phase == "explore"
+    assert "prompt.txt" in str(caught.value)
+    assert launcher.calls == []
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+
+
+def test_a_retry_prompt_carries_the_feedback_after_exactly_one_contract(
+    store, tmp_path, worktree
+):
+    # Spec test 3: the brief is composed once per attempt from the untouched
+    # base, so the contract cannot be duplicated by a re-composition.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    second = launcher.prompts[1]
+    assert second.count(prompt.RESULT_HEADING) == 1
+    assert second.count("# phase: explore") == 1
+    assert second.count(dispatch.FEEDBACK_HEADING) == 1
+    assert second.index(prompt.RESULT_HEADING) < second.index(dispatch.FEEDBACK_HEADING)
+    assert "summary" in second.split(dispatch.FEEDBACK_HEADING, 1)[1]
+
+
+def test_a_third_attempt_accumulates_both_feedback_blocks_with_one_contract(
+    store, tmp_path, worktree
+):
+    # Spec test 4: §6 step 7's "the prior prompt plus the feedback block",
+    # preserved now that the accumulation lives in the loop rather than in the
+    # RenderedPrompt.
+    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    third = launcher.prompts[2]
+    assert len(launcher.prompts) == 3
+    assert third.count(dispatch.FEEDBACK_HEADING) == 2
+    assert third.count(prompt.RESULT_HEADING) == 1
+    assert third.count("# phase: explore") == 1
+
+
+def test_each_attempts_prompt_names_its_own_result_path(store, tmp_path, worktree):
+    # Spec test 5: attempt 2 must not tell the harness to overwrite attempt 1's
+    # result file -- classify() reads this attempt's path and nothing else.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    first_path = str(paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "result.json")
+    second_path = str(paths.attempt_dir(RUN_ID, CARD, "explore", 2) / "result.json")
+    assert first_path in launcher.prompts[0]
+    assert second_path not in launcher.prompts[0]
+    assert second_path in launcher.prompts[1]
+    assert first_path not in launcher.prompts[1]
+
+
+def test_a_retry_changes_only_the_result_path_and_the_feedback(
+    store, tmp_path, worktree
+):
+    # Review Focus 5: the rendered-inputs body of attempt 2 is byte-identical to
+    # attempt 1's, so a retry is the same brief plus one appended section.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    first_head = launcher.prompts[0].split(prompt.RESULT_HEADING, 1)[0]
+    second_head = launcher.prompts[1].split(prompt.RESULT_HEADING, 1)[0]
+    assert first_head == second_head
+    replayed = launcher.prompts[1].split(dispatch.FEEDBACK_HEADING, 1)[0].replace(
+        str(paths.attempt_dir(RUN_ID, CARD, "explore", 2)),
+        str(paths.attempt_dir(RUN_ID, CARD, "explore", 1)),
+    )
+    assert replayed.rstrip("\n") == launcher.prompts[0].rstrip("\n")
+
+
+def test_accumulated_feedback_blocks_keep_the_order_they_were_produced(
+    store, tmp_path, worktree
+):
+    # Spec invariant 5: a third attempt carries both earlier complaints, oldest
+    # first, so the agent reads its own history forwards and not backwards.
+    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[NOT_JSON, INVALID_RESULT, INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    # Only the region below the first heading, so the schema's own "summary"
+    # property in the Result contract cannot stand in for the complaint.
+    blocks = launcher.prompts[2].split(dispatch.FEEDBACK_HEADING, 1)[1]
+    assert launcher.prompts[2].count(dispatch.FEEDBACK_HEADING) == 2
+    assert blocks.index("not valid JSON") < blocks.index("Field required")
