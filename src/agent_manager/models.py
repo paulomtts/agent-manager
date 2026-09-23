@@ -138,3 +138,39 @@ class Run(_Model):
     started_at: datetime | None = None
     config: RunConfig = Field(default_factory=RunConfig)
     stories: list[StoryRun] = Field(default_factory=list)
+
+
+class Card(BaseModel):
+    """One `brd` card as `brd show` reports it (design §4: board.py's boundary).
+
+    Deliberately not a `_Model`: `extra="forbid"` is right for journal lines we
+    wrote ourselves, and wrong for another program's output. A `brd` schema
+    addition must not break a running milestone, so unknown keys are ignored.
+    `status` is a plain string because the board's vocabulary
+    (`todo`/`in_progress`/`done`/`blocked`) is brd's to define and is not the
+    run lifecycle `Status` above.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1)
+    title: str
+    status: str = Field(min_length=1)
+    parent_id: str | None = None
+    description: str | None = None
+
+
+class CardNode(BaseModel):
+    """One node of `brd tree`'s JSON: a card plus its nested descendants.
+
+    Tree nodes carry no `parent_id` of their own -- the nesting under
+    `children` is what preserves milestone -> story -> subtask depth.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1)
+    title: str
+    status: str = Field(min_length=1)
+    description: str | None = None
+    children: list["CardNode"] = Field(default_factory=list)
