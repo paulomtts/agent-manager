@@ -177,6 +177,7 @@ def _phase_field(phase_key: str, field: str) -> Resolver:
             )
         return str(value)
 
+    resolve.produced_by = phase_key  # type: ignore[attr-defined]
     return resolve
 
 
@@ -276,6 +277,21 @@ _TABLE: dict[str, Resolver] = {
     "plan_hash": _phase_field("docs_commit", "plan_hash"),
 }
 """The fixed §7 resolution table, keyed by the name a document may declare."""
+
+
+INPUT_PRODUCERS: dict[str, str] = {
+    name: resolver.produced_by  # type: ignore[attr-defined]
+    for name, resolver in _TABLE.items()
+    if hasattr(resolver, "produced_by")
+}
+"""Declared input name -> the phase whose result its resolver reads.
+
+Derived from `_TABLE`, never hand-written: `_phase_field` stamps the phase key
+on the resolver it builds, so this map cannot disagree with the lookup it
+describes. `cli.resume_start_phase` reads it, because an input resolved out of
+another phase's result is a dependency on that phase having run in *this*
+process -- the journal never replays the binding table.
+"""
 
 
 def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:

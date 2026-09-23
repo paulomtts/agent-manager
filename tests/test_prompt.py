@@ -459,6 +459,14 @@ def test_the_table_carries_exactly_the_ten_names_section_7_fixes():
     assert sorted(prompt._TABLE) == sorted(rendered.inputs)
 
 
+def test_the_producer_map_is_derived_from_the_table_it_describes():
+    """A resolver that reads another phase's result is a resume dependency:
+    `cli.resume_start_phase` has to back off over that phase. The mapping is
+    published from the table itself, so it cannot disagree with the resolver."""
+    assert prompt.INPUT_PRODUCERS == {"plan_hash": "docs_commit"}
+    assert set(prompt.INPUT_PRODUCERS) <= set(prompt._TABLE)
+
+
 def test_write_puts_utf8_prompt_text_in_the_attempt_directory(tmp_path):
     rendered = prompt.render_prompt(_phase(["branch"]), _context())
 

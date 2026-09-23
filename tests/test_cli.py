@@ -24,7 +24,16 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dag, dispatch, models, paths, store as store_module
+from agent_manager import (
+    board,
+    cli,
+    dag,
+    dispatch,
+    models,
+    paths,
+    prompt,
+    store as store_module,
+)
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.steps.reducers import verification_gate
 from agent_manager.workflow.loader import load_builtin
@@ -599,6 +608,16 @@ def test_an_interrupted_implement_backs_off_to_the_phase_that_binds_its_plan_has
     returns the same digest), so re-running it is the whole recovery. Card
     f26b377d."""
     assert cli.resume_start_phase(_task_workflow(), "implement") == "docs_commit"
+
+
+def test_the_resume_walk_reads_its_producer_map_out_of_the_prompt_table(monkeypatch):
+    """`input name -> producing phase` has one home: the nested resolvers in
+    `prompt._TABLE`, which are what make the dependency real. A second,
+    hand-written copy in `cli.py` would go stale the day a resolver reads a
+    different phase, and the walk would restart somewhere that cannot render."""
+    monkeypatch.setitem(prompt.INPUT_PRODUCERS, "plan_hash", "mark_validated")
+
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "mark_validated"
 
 
 def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
