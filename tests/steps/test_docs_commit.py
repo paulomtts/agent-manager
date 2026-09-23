@@ -274,26 +274,73 @@ def _exploding_runner(argv: list[str]) -> str:
 @pytest.mark.parametrize(
     ("overrides", "needle"),
     [
-        ({"plan_path": "docs/superpowers/plans/absent.md"}, "absent.md"),
-        ({"spec_path": "docs/superpowers/specs/absent.md"}, "absent.md"),
-        ({"spec_path": ""}, "spec_path"),
-        ({"plan_path": "   "}, "plan_path"),
-        ({"plan_path": None}, "plan_path"),
-        ({"worktree": "relative/worktree"}, "worktree"),
-        ({"card_details": None}, "card_details"),
-        ({"card_details": FakeCard(title="  ")}, "title"),
-        ({"spec_path": "../escape.md"}, "escape.md"),
+        (
+            {"plan_path": "docs/superpowers/plans/absent.md"},
+            "cannot find the plan_path document",
+        ),
+        (
+            {"spec_path": "docs/superpowers/specs/absent.md"},
+            "cannot find the spec_path document",
+        ),
+        ({"spec_path": ""}, "needs a non-empty spec_path"),
+        ({"plan_path": "   "}, "needs a non-empty plan_path"),
+        ({"plan_path": None}, "needs a path string for plan_path"),
+        ({"spec_path": "/etc/passwd"}, "needs a worktree-relative spec_path"),
+        (
+            {"plan_path": "/tmp/absolute-plan.md"},
+            "needs a worktree-relative plan_path",
+        ),
+        (
+            {"worktree": "relative/worktree"},
+            "needs an existing absolute worktree directory",
+        ),
+        (
+            {"worktree": "/nonexistent/agent-manager-docs-commit"},
+            "needs an existing absolute worktree directory",
+        ),
+        ({"card_details": None}, "needs card_details carrying a non-blank"),
+        ({"card_details": FakeCard(title="  ")}, "needs card_details carrying a non-blank"),
+        ({"spec_path": "../escape.md"}, "outside the worktree"),
     ],
 )
 def test_a_bad_argument_raises_value_error_before_any_git_runs(
     repo: Path, overrides: dict, needle: str
 ) -> None:
+    """Each needle is the offending guard's OWN wording, never a substring that
+    a later guard would also produce. A loose needle here is how a deleted
+    pre-flight check passes: with `worktree` unvalidated, for instance, the
+    missing-document error still says "worktree" somewhere in the path it
+    prints, so "worktree" alone would never have caught the deletion.
+    """
     _write_documents(repo)
 
     with pytest.raises(ValueError) as caught:
         _run(repo, git_runner=_exploding_runner, **overrides)
 
     assert needle in str(caught.value)
+
+
+@requires_git
+def test_a_document_path_resolving_outside_the_worktree_is_refused(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Review focus: `prompt.expand_writes` already refuses `..`, and the step
+    does not trust that twice over. The escape target EXISTS here, so the
+    missing-document guard cannot fire and only the containment check can
+    refuse it -- without it, `git add -- ../escape.md` would stage a file in
+    the parent repository.
+    """
+    _write_documents(repo)
+    outside = tmp_path / "escape.md"
+    outside.write_text("# not in the worktree\n", encoding="utf-8")
+    assert outside.is_file() and not outside.is_relative_to(repo)
+
+    with pytest.raises(ValueError) as caught:
+        _run(repo, git_runner=_exploding_runner, spec_path="../escape.md")
+
+    message = str(caught.value)
+    assert "outside the worktree" in message
+    assert str(outside) in message
 
 
 @requires_git
