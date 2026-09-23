@@ -59,7 +59,7 @@ def pick_plan(filenames: object, card: str) -> str | None:
     return hits[-1] if hits else None
 
 
-_SHORT_ID = re.compile(r"^[0-9a-f]{8}$")
+_SHORT_ID = re.compile(r"[0-9a-f]{8}")
 
 
 def _card_short_id(card: object) -> str:
@@ -72,7 +72,10 @@ def _card_short_id(card: object) -> str:
     touch: a typo must not read as "no plan found".
     """
     if isinstance(card, str):
-        if _SHORT_ID.match(card):
+        # `fullmatch`, never `match` with a `$`: `$` also matches BEFORE a
+        # trailing newline, so an id read off a file or command output would
+        # pass through carrying it and then match no plan on disk.
+        if _SHORT_ID.fullmatch(card):
             return card
         return short_id(card)
     # The same read `dag._field` performs, reimplemented rather than imported:

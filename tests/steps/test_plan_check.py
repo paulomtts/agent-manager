@@ -35,6 +35,9 @@ def test_one_cards_plan_never_answers_for_another():
 def test_only_md_files_match():
     assert matches_card("task-rows-a32af745.txt", "a32af745") is False
     assert matches_card("task-rows-a32af745", "a32af745") is False
+    # Pins the extension check itself: strip three characters off this name and
+    # the card id IS the final segment, so only the `.md` test rejects it.
+    assert matches_card("task-rows-a32af745tmp", "a32af745") is False
 
 
 def test_a_missing_or_non_string_filename_matches_nothing():
@@ -92,7 +95,12 @@ def test_an_uppercase_or_malformed_card_id_raises_rather_than_matching_nothing()
     # Accepting it would turn a caller's typo into "no plan found" -- a gate
     # failing open in the direction that halts a run for a reason that is not
     # true.
-    for bad in ["A32AF745", "42", "zzzzzzzz", "", "not-a-uuid", None, 42]:
+    # "a32af745\n" is the hazard a `$`-anchored match misses: `$` also matches
+    # before a trailing newline, so an id read off a file or command output
+    # would pass through as a short id nothing on disk can ever match -- the
+    # typo reading as "no plan found" this raise exists to prevent.
+    bad_ids = ["A32AF745", "42", "zzzzzzzz", "", "not-a-uuid", None, 42, "a32af745\n"]
+    for bad in bad_ids:
         with pytest.raises(ValueError):
             plan_check._card_short_id(bad)
     with pytest.raises(ValueError):
