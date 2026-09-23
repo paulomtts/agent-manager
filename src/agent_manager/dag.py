@@ -15,6 +15,7 @@ This module is pure: no I/O, no subprocesses, no ``brd``.
 """
 
 import re
+from collections.abc import Mapping
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -43,3 +44,31 @@ def slugify(title: object, max: int = 24) -> str:
     last_dash = cut.rfind("-")
     kept = cut[:last_dash] if last_dash > 0 else cut
     return kept.rstrip("-")
+
+
+def _field(card: object, name: str) -> object:
+    """Read ``name`` off a card given either as a mapping or as an object."""
+    if isinstance(card, Mapping):
+        return card.get(name)
+    return getattr(card, name, None)
+
+
+def task_stem(card: object) -> str:
+    """Readable slug plus the load-bearing short id, or the short id alone."""
+    slug = slugify(_field(card, "title"))
+    card_short_id = short_id(_field(card, "id"))
+    return f"{slug}-{card_short_id}" if slug else card_short_id
+
+
+def task_branch(prefix: str, card: object) -> str:
+    """Branch name for one card's task worktree."""
+    return f"{prefix}/task-{task_stem(card)}"
+
+
+def ref_matches_card(ref: object, card_id: object) -> bool:
+    """True when a branch or ref carries this card's short id anywhere in it.
+
+    Keys on the id and never on the slug, so editing a card's title cannot
+    orphan the branch that was named from the old title.
+    """
+    return short_id(card_id) in str("" if ref is None else ref)
