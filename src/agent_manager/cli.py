@@ -75,6 +75,16 @@ class ParentlessCardError(CliError):
     """
 
 
+class UnknownCardError(CliError):
+    """The run's tree holds no subtask with that card id.
+
+    Its own type rather than `UnknownRunError`'s: the run was found and the card
+    was not, so the fix an operator needs is `agent-manager status <run-id>` --
+    a different instruction from the one a missing run gets -- and a script can
+    tell the two apart by the `type` field of the envelope.
+    """
+
+
 def resolve_repo_dir(repo_dir: Path) -> Path:
     """`--repo-dir` as an existing absolute directory, or `RepoDirError`.
 
@@ -204,6 +214,27 @@ def status_payload(run: models.Run) -> dict[str, Any]:
         "stories": tree["stories"],
         "rows": status_rows(run),
     }
+
+
+def find_subtask(
+    run: models.Run, card: str
+) -> tuple[models.StoryRun, models.SubtaskRun] | None:
+    """The `(story, subtask)` pair for one card id, or `None`.
+
+    Pure over the tree `load_run` assembled, like `status_rows`. The owning story
+    comes back with the match because `SubtaskRun` carries no back-reference to
+    it and the `logs` payload's `story_id` has nowhere else to come from; a
+    second walk to recover it would be a second source of truth for one match.
+
+    The first match in §9 tree order wins. A card id appears once per run in
+    everything this program writes, so a duplicate is a corrupt projection, and
+    answering deterministically beats answering arbitrarily.
+    """
+    for story in run.stories:
+        for subtask in story.subtasks:
+            if subtask.card_id == card:
+                return story, subtask
+    return None
 
 
 app = typer.Typer(

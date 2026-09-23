@@ -301,6 +301,64 @@ def test_the_status_header_is_the_runs_identity_and_not_its_config():
     }
 
 
+def _pure_subtask(card_id: str, phases: list[models.PhaseRun]) -> models.SubtaskRun:
+    """A subtask carrying hand-built phases: the `logs` selection tests touch no disk."""
+    return models.SubtaskRun(
+        card_id=card_id,
+        branch=f"m1/{card_id}",
+        base_branch="main",
+        status="started",
+        phases=phases,
+    )
+
+
+def _pure_story(card_id: str, subtasks: list[models.SubtaskRun]) -> models.StoryRun:
+    return models.StoryRun(
+        card_id=card_id, title=card_id, level=0, status="started", subtasks=subtasks
+    )
+
+
+def test_find_subtask_looks_past_the_first_story():
+    """`SubtaskRun` has no back-reference to its story, so the lookup returns the
+    pair: `story_id` in the payload has nowhere else to come from."""
+    wanted = _pure_subtask("card-2", [])
+    run = _pure_run(
+        [
+            _pure_story("story-1", [_pure_subtask("card-1", [])]),
+            _pure_story("story-2", [wanted]),
+        ]
+    )
+
+    found = cli.find_subtask(run, "card-2")
+
+    assert found is not None
+    story, subtask = found
+    assert story.card_id == "story-2"
+    assert subtask is wanted
+
+
+def test_find_subtask_returns_none_for_a_card_that_is_not_in_the_tree():
+    run = _pure_run([_pure_story("story-1", [_pure_subtask("card-1", [])])])
+
+    assert cli.find_subtask(run, "card-9") is None
+
+
+def test_find_subtask_takes_the_first_match_when_a_card_id_is_duplicated():
+    """A card id appears once per run in everything this program writes, so a
+    duplicate means the projection is corrupt -- and `logs` must still answer the
+    same way every time rather than picking arbitrarily."""
+    first = _pure_subtask("card-1", [])
+    second = _pure_subtask("card-1", [])
+    run = _pure_run([_pure_story("story-1", [first]), _pure_story("story-2", [second])])
+
+    found = cli.find_subtask(run, "card-1")
+
+    assert found is not None
+    story, subtask = found
+    assert story.card_id == "story-1"
+    assert subtask is first
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
