@@ -682,3 +682,102 @@ def test_a_gate_binds_the_phase_result_under_the_phase_name_too(store):
     )
 
     assert seen == {"alpha": {"ok": 1}, "branch": "m1/task-ed77a917"}
+
+
+SKIPPING = """
+name: skipping
+phases:
+  - name: plan_check
+    kind: deterministic
+    run: plan_check.find
+    when: plan_check.has
+    skip_to: implement
+  - name: spec
+    kind: deterministic
+    run: step.spec
+  - name: plan
+    kind: deterministic
+    run: step.plan
+  - name: implement
+    kind: deterministic
+    run: step.implement
+"""
+
+
+def _skipping_workflow(has: Any, calls: list[str]):
+    def find(card: str) -> dict[str, Any]:
+        calls.append("plan_check")
+        return {"found": True, "validated": True}
+
+    def make(name: str):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            return {}
+
+        return step
+
+    return _workflow(
+        SKIPPING,
+        {
+            "plan_check.find": find,
+            "plan_check.has": has,
+            "step.spec": make("spec"),
+            "step.plan": make("plan"),
+            "step.implement": make("implement"),
+        },
+    )
+
+
+def test_a_truthy_when_jumps_to_skip_to(store):
+    calls: list[str] = []
+
+    def has(result: dict[str, Any]) -> bool:
+        return bool(result.get("validated"))
+
+    workflow = _skipping_workflow(has, calls)
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["plan_check", "implement"]
+    assert summary.status == "done"
+    assert summary.skipped == ["spec", "plan"]
+    assert _projected_phases(store) == [("plan_check", "done"), ("implement", "done")]
+    assert set(summary.results) == {"plan_check", "implement"}
+
+
+def test_a_falsy_when_continues_to_the_next_phase(store):
+    calls: list[str] = []
+
+    def has(result: dict[str, Any]) -> bool:
+        return False
+
+    workflow = _skipping_workflow(has, calls)
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["plan_check", "spec", "plan", "implement"]
+    assert summary.skipped == []
+    assert summary.status == "done"
+
+
+def test_a_raising_when_fails_its_phase_rather_than_not_skipping(store):
+    calls: list[str] = []
+
+    def has(result: dict[str, Any]) -> bool:
+        raise ValueError("unreadable plan front matter")
+
+    workflow = _skipping_workflow(has, calls)
+
+    summary = engine.run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert calls == ["plan_check"]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "plan_check"
+    assert "unreadable plan front matter" in summary.detail
+    assert _projected_phases(store) == [("plan_check", "failed")]

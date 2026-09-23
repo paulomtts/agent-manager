@@ -174,6 +174,7 @@ class _Outcome:
     result: Any = None
     detail: str | None = None
     warnings: list[str] = field(default_factory=list)
+    skip_to: str | None = None
 
 
 class _GateFailed(Exception):
@@ -229,6 +230,22 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
 
 
+def _skip_target(
+    phase: DeterministicPhase, workflow: Workflow, values: Mapping[str, Any]
+) -> str | None:
+    """The phase to jump to, or `None` to fall through to the next one.
+
+    Both `when` and `skip_to` are required for a jump: `when` alone has nowhere
+    to go, and `skip_to` alone would be an unconditional jump the document
+    author did not write.
+    """
+    if phase.when is None or phase.skip_to is None:
+        return None
+    predicate = workflow.function(phase.when)
+    kwargs = bind_arguments(predicate, values, phase=phase.name, function=phase.when)
+    return phase.skip_to if predicate(**kwargs) else None
+
+
 def run_subtask(
     workflow: Workflow,
     store: Store,
@@ -268,7 +285,12 @@ def run_subtask(
             return summary
         _bind_result(context, phase.name, outcome.result)
         summary.results[phase.name] = outcome.result
-        index += 1
+        if outcome.skip_to is None:
+            index += 1
+            continue
+        target = workflow.phase_names.index(outcome.skip_to)
+        summary.skipped.extend(workflow.phase_names[index + 1 : target])
+        index = target
 
     _record_subtask_status(store, story_id, subtask, summary.status)
     return summary
@@ -328,6 +350,7 @@ def _run_deterministic(
                 function=phase.run,
             )
         _evaluate_gates(phase, workflow, _gate_values(context, phase.name, result), warnings)
+        skip_to = _skip_target(phase, workflow, _gate_values(context, phase.name, result))
     except _GateFailed as failure:
         _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
         return _Outcome(ok=False, detail=failure.detail, warnings=warnings)
@@ -339,7 +362,7 @@ def _run_deterministic(
         _record_phase(store, story_id, subtask, phase, "failed", started_at, clock())
         return _Outcome(ok=False, detail=_render_error(error), warnings=warnings)
     _record_phase(store, story_id, subtask, phase, "done", started_at, clock())
-    return _Outcome(ok=True, result=result, warnings=warnings)
+    return _Outcome(ok=True, result=result, warnings=warnings, skip_to=skip_to)
 
 
 def _render_error(error: BaseException) -> str:
