@@ -141,6 +141,24 @@ def _commit_count(git_runner: GitRunner, worktree_path: str, resolved_base: str)
         return 0
 
 
+def _resolve_base(git_runner: GitRunner, repo_path: str, base: str) -> str:
+    """`origin/<base>` when it resolves, else the bare local `<base>`.
+
+    `base` names a real remote branch only when it IS the milestone's own base
+    branch -- every other base is another subtask's or story's local branch,
+    which this run created and never pushes. A missing `origin/<base>` is the
+    expected case, not an error, so the probe's failure is swallowed here and
+    nowhere else.
+    """
+    try:
+        git_runner(
+            ["-C", repo_path, "rev-parse", "--verify", "--quiet", f"origin/{base}"]
+        )
+    except GitError:
+        return base
+    return f"origin/{base}"
+
+
 def ensure(
     branch: str,
     base: str,
@@ -177,7 +195,7 @@ def ensure(
     )
     worktree_existed = _is_registered(worktree_path, registered)
 
-    resolved_base = base
+    resolved_base = _resolve_base(git_runner, repo_path, base)
 
     created = False
     if not worktree_existed:

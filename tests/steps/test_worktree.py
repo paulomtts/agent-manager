@@ -422,3 +422,131 @@ def test_a_non_numeric_commit_count_is_zero_rather_than_a_crash(
     )
 
     assert result["commit_count"] == 0
+
+
+@pytest.fixture
+def repo_with_origin(repo: Path, tmp_path: Path) -> Path:
+    """`repo`, with a local bare `origin` holding main -- no network involved."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(origin)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "origin", "main")
+    _git(repo, "fetch", "origin")
+    return repo
+
+
+@requires_git
+def test_a_base_with_no_origin_falls_back_to_the_local_ref(
+    repo: Path, tmp_path: Path
+):
+    # The common case: every base but the milestone's own is a local branch
+    # this run created and never pushed.
+    local_head = _head(repo)
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+    )
+
+    assert result["created"] is True
+    assert _head(wt) == local_head
+
+
+@requires_git
+def test_origin_is_preferred_over_the_local_ref_when_it_resolves(
+    repo_with_origin: Path, tmp_path: Path
+):
+    origin_head = _git(repo_with_origin, "rev-parse", "origin/main").strip()
+    # Local main now moves ahead of origin/main, so the two disagree.
+    _commit(repo_with_origin, "local-only.txt", "not pushed\n")
+    assert _head(repo_with_origin) != origin_head
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo_with_origin),
+    )
+
+    assert result["created"] is True
+    assert _head(wt) == origin_head
+    assert not (wt / "local-only.txt").exists()
+
+
+@requires_git
+def test_the_origin_probe_is_recorded_and_its_failure_is_not_an_error(
+    repo: Path, tmp_path: Path
+):
+    calls: list[list[str]] = []
+    wt = tmp_path / "wt"
+
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+        git_runner=_recorder(calls, worktree.run_git),
+    )
+
+    assert ["rev-parse", "--verify", "--quiet", "origin/main"] == calls[2][2:]
+    assert result["created"] is True
+
+
+FORBIDDEN_TOKENS = ("reset", "clean", "commit", "push", "prune")
+
+
+def _assert_no_forbidden_git(calls: list[list[str]]) -> None:
+    for argv in calls:
+        for token in FORBIDDEN_TOKENS:
+            assert token not in argv, f"forbidden git operation {token!r} in {argv!r}"
+        assert not ("checkout" in argv and "-f" in argv), argv
+        assert not ("worktree" in argv and "remove" in argv), argv
+
+
+@requires_git
+def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path):
+    # Create path, resume-a-branch path and already-exists path, in one run.
+    staging = tmp_path / "staging-wt"
+    _git(repo, "worktree", "add", str(staging), "-b", "m1/task-8")
+    _commit(staging, "prior.txt", "work from a killed run\n")
+    _git(repo, "worktree", "remove", str(staging))
+
+    calls: list[list[str]] = []
+    runner = _recorder(calls, worktree.run_git)
+
+    fresh = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(tmp_path / "wt-9"),
+        repo_dir=str(repo),
+        git_runner=runner,
+    )
+    resumed = worktree.ensure(
+        branch="m1/task-8",
+        base="main",
+        worktree=str(tmp_path / "wt-8"),
+        repo_dir=str(repo),
+        git_runner=runner,
+    )
+    again = worktree.ensure(
+        branch="m1/task-8",
+        base="main",
+        worktree=str(tmp_path / "wt-8"),
+        repo_dir=str(repo),
+        git_runner=runner,
+    )
+
+    assert fresh["created"] is True
+    assert resumed["branch_existed"] is True
+    assert again["created"] is False
+    _assert_no_forbidden_git(calls)
+    assert (tmp_path / "wt-8" / "prior.txt").is_file()
