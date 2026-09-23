@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from agent_manager import paths
 
 
@@ -32,3 +34,17 @@ def test_data_dir_is_idempotent(monkeypatch, tmp_path):
     second = paths.data_dir()
     assert first == second
     assert second.is_dir()
+
+
+def test_data_dir_raises_key_error_when_home_and_xdg_are_unset(monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", "")
+    monkeypatch.delenv("HOME", raising=False)
+    with pytest.raises(KeyError):
+        paths.data_dir()
+
+
+def test_data_dir_propagates_oserror_when_a_file_is_in_the_way(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    (tmp_path / "agent-manager").write_text("not a directory")
+    with pytest.raises(OSError):
+        paths.data_dir()
