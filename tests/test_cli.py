@@ -95,6 +95,190 @@ def test_resolve_repo_dir_refuses_a_path_that_is_not_a_directory(tmp_path):
     assert "nope" in str(caught.value)
 
 
+def _pure_dispatch() -> models.Dispatch:
+    """A dispatch built by hand: these tests touch no filesystem at all."""
+    return models.Dispatch(
+        harness="claude",
+        model="sonnet",
+        role="coder",
+        cwd=Path("/repo"),
+        prompt_path=Path("/runs/prompt.txt"),
+        result_path=Path("/runs/result.json"),
+    )
+
+
+def _pure_run(stories: list[models.StoryRun]) -> models.Run:
+    return models.Run(
+        id="20260923T140506Z-cbe34d00",
+        workflow="task",
+        repo_dir=Path("/repo"),
+        base_branch="main",
+        branch_prefix="m1",
+        status="started",
+        started_at=datetime(2026, 9, 23, 14, 5, 6, tzinfo=timezone.utc),
+        stories=stories,
+    )
+
+
+def test_status_rows_are_one_row_per_attempt_in_tree_order():
+    run = _pure_run(
+        [
+            models.StoryRun(
+                card_id="story-1",
+                title="One",
+                level=0,
+                status="done",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-1",
+                        branch="m1/a",
+                        base_branch="main",
+                        status="done",
+                        phases=[
+                            models.PhaseRun(
+                                name="explore",
+                                kind="agent",
+                                status="done",
+                                attempts=[
+                                    models.Attempt(
+                                        n=1, dispatch=_pure_dispatch(), status="gate_failed"
+                                    ),
+                                    models.Attempt(n=2, dispatch=_pure_dispatch(), status="ok"),
+                                ],
+                            )
+                        ],
+                    )
+                ],
+            ),
+            models.StoryRun(
+                card_id="story-2",
+                title="Two",
+                level=1,
+                status="started",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-2",
+                        branch="m1/b",
+                        base_branch="main",
+                        status="started",
+                        phases=[
+                            models.PhaseRun(
+                                name="implement",
+                                kind="agent",
+                                status="started",
+                                attempts=[
+                                    models.Attempt(
+                                        n=1, dispatch=_pure_dispatch(), status="started"
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert cli.status_rows(run) == [
+        {
+            "story": "story-1",
+            "subtask": "card-1",
+            "phase": "explore",
+            "attempt": 1,
+            "state": "gate_failed",
+        },
+        {
+            "story": "story-1",
+            "subtask": "card-1",
+            "phase": "explore",
+            "attempt": 2,
+            "state": "ok",
+        },
+        {
+            "story": "story-2",
+            "subtask": "card-2",
+            "phase": "implement",
+            "attempt": 1,
+            "state": "started",
+        },
+    ]
+
+
+def test_status_rows_show_a_phase_that_has_no_attempts_yet():
+    """A pending or in-flight deterministic phase has no attempt row to hang off,
+    and a table that dropped it would hide exactly the phase an operator running
+    `status` is asking about."""
+    run = _pure_run(
+        [
+            models.StoryRun(
+                card_id="story-1",
+                title="One",
+                level=0,
+                status="started",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-1",
+                        branch="m1/a",
+                        base_branch="main",
+                        status="started",
+                        phases=[
+                            models.PhaseRun(name="verify", kind="deterministic", status="pending")
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert cli.status_rows(run) == [
+        {
+            "story": "story-1",
+            "subtask": "card-1",
+            "phase": "verify",
+            "attempt": None,
+            "state": "pending",
+        }
+    ]
+
+
+def test_status_rows_of_a_run_with_no_stories_are_empty():
+    assert cli.status_rows(_pure_run([])) == []
+
+
+def test_the_status_payload_survives_render_with_its_paths():
+    """`repo_dir` and `worktree_path` are `Path`s and `started_at` is a
+    `datetime`; `json.dumps` refuses all three. A renderer that raised would turn
+    a successful read into a traceback with no envelope at all."""
+    run = _pure_run(
+        [
+            models.StoryRun(
+                card_id="story-1",
+                title="One",
+                level=0,
+                status="done",
+                tip_branch="m1/a",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-1",
+                        branch="m1/a",
+                        base_branch="main",
+                        status="done",
+                        worktree_path=Path("/repo/.claude/worktrees/m1/a"),
+                    )
+                ],
+            )
+        ]
+    )
+
+    data = json.loads(cli.render(cli.ok_envelope(cli.status_payload(run))))["data"]
+
+    assert data["run"]["id"] == "20260923T140506Z-cbe34d00"
+    assert data["run"]["repo_dir"] == "/repo"
+    assert "2026-09-23" in data["run"]["started_at"]
+    assert data["stories"][0]["subtasks"][0]["worktree_path"] == "/repo/.claude/worktrees/m1/a"
+    assert data["rows"] == []
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",

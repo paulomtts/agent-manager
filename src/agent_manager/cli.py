@@ -125,6 +125,76 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+RUN_IDENTITY = (
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+)
+"""The run's own fields, without `config` and without the tree below it. §10's
+`status` header and `runs`' entries are the same seven names, so the two
+commands describe a run the same way."""
+
+
+def status_rows(run: models.Run) -> list[dict[str, Any]]:
+    """§10's table as flat rows: one per attempt, in §9 tree order.
+
+    Pure over the tree `load_run` already assembled -- no database, no clock --
+    so the command stays a composition. A phase with no attempts gets a row of
+    its own with `attempt: None`, because a `pending` or `started` phase is
+    precisely what an operator runs `status` to see, and an attempt-keyed table
+    would have nowhere to put it.
+
+    `state` is the attempt's status on an attempt row and the phase's status on a
+    phase row: both are the state of the thing the row is about.
+    """
+    rows: list[dict[str, Any]] = []
+    for story in run.stories:
+        for subtask in story.subtasks:
+            for phase in subtask.phases:
+                if not phase.attempts:
+                    rows.append(
+                        {
+                            "story": story.card_id,
+                            "subtask": subtask.card_id,
+                            "phase": phase.name,
+                            "attempt": None,
+                            "state": phase.status,
+                        }
+                    )
+                    continue
+                for attempt in phase.attempts:
+                    rows.append(
+                        {
+                            "story": story.card_id,
+                            "subtask": subtask.card_id,
+                            "phase": phase.name,
+                            "attempt": attempt.n,
+                            "state": attempt.status,
+                        }
+                    )
+    return rows
+
+
+def status_payload(run: models.Run) -> dict[str, Any]:
+    """The run's identity, the §9 tree, and the flat table over it.
+
+    `model_dump()` rather than `model_dump(mode="json")`: the payload keeps its
+    `Path` and `datetime` objects and `render`'s `default=str` stringifies them
+    once, at the edge, the same way `run_card`'s `worktree` is handled. Field
+    names are `models.py`'s and are not renamed for display.
+    """
+    tree = run.model_dump()
+    return {
+        "run": {field: tree[field] for field in RUN_IDENTITY},
+        "stories": tree["stories"],
+        "rows": status_rows(run),
+    }
+
+
 app = typer.Typer(
     add_completion=False,
     help="Drive brd cards through the agent-manager workflow engine.",
