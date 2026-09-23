@@ -937,3 +937,26 @@ phases:
     assert seen == ["ok", "schema_invalid", "gate_failed", "harness_error"]
     journalled = {status for _n, status in _attempt_statuses(store)}
     assert journalled == {"started", "ok", "schema_invalid", "gate_failed", "harness_error"}
+
+
+def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path, worktree):
+    # §9: every state edge is journalled, and `_run_deterministic` already
+    # records its phase `failed` when a step raises. Without the symmetric
+    # record here a phase stays `started` forever after the walk has escalated
+    # -- which is exactly what resume reads as work still in flight.
+    def explode(argv, *, cwd, timeout, stdout_path):
+        raise OSError("the run directory went away")
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    runner, _ = _runner(store, workflow, explode, tmp_path, worktree)
+
+    with pytest.raises(OSError, match="the run directory went away"):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+    detail = [
+        line.payload["detail"]
+        for line in store.journal.read()
+        if line.event == "phase_upsert"
+    ][-1]
+    assert "OSError: the run directory went away" in detail

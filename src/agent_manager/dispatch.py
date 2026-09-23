@@ -329,6 +329,11 @@ def evaluate_gates(
     return None
 
 
+def _render_error(error: BaseException) -> str:
+    """`engine._render_error`'s format, so both phase kinds fail the same way."""
+    return f"{type(error).__name__}: {error}"
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -399,14 +404,25 @@ class AgentRunner:
         text = rendered
         verdict = Verdict("harness_error", detail="no attempt was made")
 
-        for _ in range(budget):
-            verdict = self._attempt(phase, context, text, target, role, cwd, model)
-            if verdict.status == "ok":
-                self._record_phase(phase, "done", started_at, self.clock(), None)
-                return verdict.result
-            if verdict.fatal or verdict.status not in retry_on:
-                break
-            text = with_feedback(text, verdict.detail or verdict.status)
+        try:
+            for _ in range(budget):
+                verdict = self._attempt(phase, context, text, target, role, cwd, model)
+                if verdict.status == "ok":
+                    self._record_phase(phase, "done", started_at, self.clock(), None)
+                    return verdict.result
+                if verdict.fatal or verdict.status not in retry_on:
+                    break
+                text = with_feedback(text, verdict.detail or verdict.status)
+        except Exception as error:
+            # Symmetric with `engine._run_deterministic`, which records its own
+            # phase `failed` when a step raises: §9's state tree has no edge for
+            # "the process gave up here", so a phase left `started` is what a
+            # resume reads as work still in flight. The exception itself still
+            # propagates -- `run_subtask` is the one that decides to escalate.
+            self._record_phase(
+                phase, "failed", started_at, self.clock(), _render_error(error)
+            )
+            raise
 
         detail = verdict.detail or verdict.status
         self._record_phase(phase, "failed", started_at, self.clock(), detail)
