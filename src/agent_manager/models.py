@@ -35,6 +35,9 @@ AttemptStatus = Literal[
 """`started` (no terminal event yet, §9 resume) plus §6's four journalled
 outcomes."""
 
+Launcher = Literal["direct", "bwrap", "container"]
+"""§4: how a harness process is contained when it runs."""
+
 
 class _Model(BaseModel):
     """Shared base for every state model; Task 4 gives it its `model_config`."""
@@ -87,3 +90,44 @@ class SubtaskRun(_Model):
     status: Status = "pending"
     worktree_path: Path | None = None
     phases: list[PhaseRun] = Field(default_factory=list)
+
+
+class StoryRun(_Model):
+    """One story card. Its subtasks run sequentially, stacked on each other."""
+
+    card_id: str = Field(min_length=1)
+    title: str
+    level: int = Field(ge=0)
+    status: Status = "pending"
+    tip_branch: str | None = None
+    subtasks: list[SubtaskRun] = Field(default_factory=list)
+
+
+class HarnessAssignment(_Model):
+    """One entry of `RunConfig.harness_map`: which harness and model a role gets."""
+
+    harness: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+
+
+class RunConfig(_Model):
+    """The knobs a run was started with, recorded so resume reuses them."""
+
+    max_concurrent_stories: int = Field(default=1, gt=0)
+    dry_run: bool = False
+    launcher: Launcher = "direct"
+    harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)
+
+
+class Run(_Model):
+    """The root of the state tree: one invocation of one workflow."""
+
+    id: str = Field(min_length=1)
+    workflow: str = Field(min_length=1)
+    repo_dir: Path
+    base_branch: str = Field(min_length=1)
+    branch_prefix: str = Field(min_length=1)
+    status: Status = "pending"
+    started_at: datetime | None = None
+    config: RunConfig = Field(default_factory=RunConfig)
+    stories: list[StoryRun] = Field(default_factory=list)

@@ -235,3 +235,196 @@ def test_subtask_rejects_an_empty_card_id():
     with pytest.raises(ValidationError) as excinfo:
         models.SubtaskRun(card_id="", branch="m1/x-1535b285", base_branch="main")
     assert "card_id" in str(excinfo.value)
+
+
+def test_minimal_run_needs_only_its_identity_fields():
+    run = models.Run(
+        id="run-2026-09-23-01",
+        workflow="task",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    )
+    assert run.status == "pending"
+    assert run.started_at is None
+    assert run.stories == []
+    assert run.config.max_concurrent_stories == 1
+    assert run.config.dry_run is False
+    assert run.config.launcher == "direct"
+    assert run.config.harness_map == {}
+
+
+def test_run_requires_an_id():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Run(
+            workflow="task",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m1/",
+        )
+    assert "id" in str(excinfo.value)
+
+
+def test_run_rejects_an_empty_id():
+    # The run id is the first coordinate on every journal line; "" is not one.
+    with pytest.raises(ValidationError) as excinfo:
+        models.Run(
+            id="",
+            workflow="task",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m1/",
+        )
+    assert "id" in str(excinfo.value)
+
+
+def test_run_rejects_a_non_list_stories():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Run(
+            id="run-2026-09-23-01",
+            workflow="task",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m1/",
+            stories="8831189b",
+        )
+    assert "stories" in str(excinfo.value)
+
+
+def test_run_config_accepts_a_populated_harness_map():
+    config = models.RunConfig(
+        max_concurrent_stories=3,
+        dry_run=True,
+        launcher="bwrap",
+        harness_map={
+            "coder": models.HarnessAssignment(harness="claude", model="sonnet"),
+            "reviewer": {"harness": "claude", "model": "opus"},
+        },
+    )
+    assert config.max_concurrent_stories == 3
+    assert config.dry_run is True
+    assert config.launcher == "bwrap"
+    assert config.harness_map["coder"].model == "sonnet"
+    assert config.harness_map["reviewer"].harness == "claude"
+
+
+def test_run_config_rejects_zero_concurrency():
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(max_concurrent_stories=0)
+    assert "max_concurrent_stories" in str(excinfo.value)
+
+
+def test_run_config_rejects_an_unknown_launcher():
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(launcher="docker")
+    message = str(excinfo.value)
+    for allowed in ("direct", "bwrap", "container"):
+        assert allowed in message
+
+
+def test_run_config_rejects_a_harness_map_entry_missing_its_model():
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_map={"coder": {"harness": "claude"}})
+    assert "model" in str(excinfo.value)
+
+
+def test_story_rejects_a_negative_level():
+    with pytest.raises(ValidationError) as excinfo:
+        models.StoryRun(card_id="8831189b", title="Foundations", level=-1)
+    assert "level" in str(excinfo.value)
+
+
+def _full_run() -> models.Run:
+    """A run mid-flight: one story, one finished subtask, one in progress."""
+    return models.Run(
+        id="run-2026-09-23-01",
+        workflow="milestone",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+        status="started",
+        started_at=datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc),
+        config=models.RunConfig(
+            max_concurrent_stories=2,
+            harness_map={
+                "coder": models.HarnessAssignment(harness="claude", model="sonnet")
+            },
+        ),
+        stories=[
+            models.StoryRun(
+                card_id="8831189b",
+                title="Foundations: paths, run store and journal",
+                level=0,
+                status="started",
+                tip_branch="m1/task-add-paths-and-the-run-fdebc746",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="fdebc746",
+                        branch="m1/task-add-paths-and-the-run-fdebc746",
+                        base_branch="main",
+                        worktree_path=Path("/repo/.claude/worktrees/m1/task-add-paths-and-the-run-fdebc746"),
+                        status="done",
+                        phases=[
+                            models.PhaseRun(
+                                name="verify",
+                                kind="deterministic",
+                                status="done",
+                                started_at=datetime(2026, 9, 23, 10, 5, tzinfo=timezone.utc),
+                                ended_at=datetime(2026, 9, 23, 10, 6, tzinfo=timezone.utc),
+                            )
+                        ],
+                    ),
+                    models.SubtaskRun(
+                        card_id="1535b285",
+                        branch="m1/task-add-the-run-state-models-1535b285",
+                        base_branch="m1/task-add-paths-and-the-run-fdebc746",
+                        worktree_path=Path("/repo/.claude/worktrees/m1/task-add-the-run-state-models-1535b285"),
+                        status="started",
+                        phases=[
+                            models.PhaseRun(
+                                name="explore",
+                                kind="agent",
+                                status="done",
+                                started_at=datetime(2026, 9, 23, 10, 10, tzinfo=timezone.utc),
+                                ended_at=datetime(2026, 9, 23, 10, 12, tzinfo=timezone.utc),
+                                attempts=[
+                                    models.Attempt(
+                                        n=1,
+                                        dispatch=_dispatch(),
+                                        status="ok",
+                                        exit_code=0,
+                                        duration=31.25,
+                                        tokens_in=8000,
+                                        tokens_out=1500,
+                                        cost=0.31,
+                                        prompt_path=Path("/runs/run-1/1535b285/explore.1/prompt.txt"),
+                                        result_path=Path("/runs/run-1/1535b285/explore.1/result.json"),
+                                        stdout_path=Path("/runs/run-1/1535b285/explore.1/stdout.log"),
+                                    )
+                                ],
+                            ),
+                            models.PhaseRun(
+                                name="implement",
+                                kind="agent",
+                                status="started",
+                                started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+                                attempts=[models.Attempt(n=1, dispatch=_dispatch())],
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+def test_full_tree_preserves_nesting_and_subtask_order():
+    run = _full_run()
+    assert [story.card_id for story in run.stories] == ["8831189b"]
+    story = run.stories[0]
+    assert story.level == 0
+    assert [subtask.card_id for subtask in story.subtasks] == ["fdebc746", "1535b285"]
+    in_progress = story.subtasks[1]
+    assert [phase.name for phase in in_progress.phases] == ["explore", "implement"]
+    assert in_progress.phases[1].attempts[0].dispatch.role == "coder"
+    assert in_progress.phases[1].ended_at is None
