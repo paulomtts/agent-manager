@@ -260,3 +260,83 @@ def test_a_command_that_cannot_be_launched_raises_verify_error(tmp_path: Path):
             ["definitely-not-a-real-binary --version"], str(tmp_path), runner=runner
         )
     assert "definitely-not-a-real-binary" in str(excinfo.value)
+
+
+def _recorder() -> tuple[list[tuple[list[str], str]], verify.CommandRunner]:
+    """A runner that records every call and always reports green."""
+    calls: list[tuple[list[str], str]] = []
+
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        calls.append((argv, cwd))
+        return CommandResult(exit_code=0, stdout="fine\n", stderr="")
+
+    return calls, runner
+
+
+def test_blank_and_empty_command_entries_are_skipped(tmp_path: Path):
+    # `verify.filter(Boolean)` in the original: a card with a blank slot in its
+    # fullSuite is not a broken card.
+    calls, runner = _recorder()
+    result = verify.run_suite(["", "   ", "echo hi", []], str(tmp_path), runner=runner)
+    assert [argv for argv, _ in calls] == [["echo", "hi"]]
+    assert result["passed"] is True
+    assert [entry["command"] for entry in result["verified"]] == ["echo hi"]
+
+
+def test_a_command_of_the_wrong_type_raises_before_anything_runs(tmp_path: Path):
+    calls, runner = _recorder()
+    with pytest.raises(ValueError):
+        verify.run_suite(["echo hi", 7], str(tmp_path), runner=runner)
+    with pytest.raises(ValueError):
+        verify.run_suite([["echo", 7]], str(tmp_path), runner=runner)
+    assert calls == []
+
+
+def test_commands_that_are_not_iterable_raise_value_error(tmp_path: Path):
+    with pytest.raises(ValueError):
+        verify.run_suite(7, str(tmp_path))
+
+
+def test_a_missing_relative_or_non_directory_worktree_raises(tmp_path: Path):
+    calls, runner = _recorder()
+    with pytest.raises(ValueError):
+        verify.run_suite(["echo hi"], "relative/path", runner=runner)
+    with pytest.raises(ValueError):
+        verify.run_suite(["echo hi"], str(tmp_path / "missing"), runner=runner)
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("not a directory")
+    with pytest.raises(ValueError):
+        verify.run_suite(["echo hi"], str(a_file), runner=runner)
+    assert calls == []
+
+
+def test_a_command_string_is_split_into_argv_and_never_handed_to_a_shell(
+    tmp_path: Path,
+):
+    calls, runner = _recorder()
+    verify.run_suite(
+        ["uv run pytest -k 'not slow' > /tmp/out"], str(tmp_path), runner=runner
+    )
+    # Quoted arguments survive as one element; the redirection is literal argv,
+    # not something a shell will act on.
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest", "-k", "not slow", ">", "/tmp/out"]
+    ]
+
+
+def test_shell_metacharacters_are_not_interpreted_by_a_real_process(tmp_path: Path):
+    marker = tmp_path / "shell-ran.txt"
+    command = (
+        f"{_py('print(1)')} ; touch {shlex.quote(str(marker))}"
+    )
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is True
+    assert not marker.exists()
+
+
+def test_argv_sequences_and_a_path_worktree_are_accepted(tmp_path: Path):
+    calls, runner = _recorder()
+    result = verify.run_suite((("echo", "hi"),), tmp_path, runner=runner)
+    assert calls == [(["echo", "hi"], str(tmp_path))]
+    assert result["verified"][0]["command"] == ("echo", "hi")
+    assert result["passed"] is True

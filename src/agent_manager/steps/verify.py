@@ -19,8 +19,9 @@ there is no shell string and nothing to quote.
 import re
 import shlex
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 ELLIPSIS = "…"
 """One character, appended to text `plain_text` had to cut."""
@@ -143,6 +144,81 @@ def _display(command: object, argv: list[str]) -> str:
     return command if isinstance(command, str) else " ".join(argv)
 
 
+def _argv_for(command: object) -> list[str] | None:
+    """`command` as an argv, or `None` if it is a blank entry to skip.
+
+    A string is split with `shlex.split` -- never handed to a shell, so a `>`
+    or `;` inside it stays a literal argument. An already-split sequence is
+    used as given. Anything else is a malformed card, raised before a single
+    process starts so a typo can never read as a passing suite.
+    """
+    if isinstance(command, str):
+        if command.strip() == "":
+            return None
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise ValueError(
+                f"verify.run_suite could not split command {command!r}: {exc}"
+            ) from exc
+    elif isinstance(command, Sequence) and not isinstance(
+        command, (bytes, bytearray)
+    ):
+        parts = list(command)
+        if not parts:
+            return None
+        if not all(isinstance(part, str) for part in parts):
+            raise ValueError(
+                f"verify.run_suite needs a command of strings, got {command!r}"
+            )
+        argv = [str(part) for part in parts]
+    else:
+        raise ValueError(
+            f"verify.run_suite needs a command string or argv, got {command!r}"
+        )
+
+    if not argv:
+        raise ValueError(
+            f"verify.run_suite got a command that splits to nothing: {command!r}"
+        )
+    return argv
+
+
+def _plan_commands(commands: object) -> list[tuple[object, list[str]]]:
+    """Every runnable command paired with its argv, validated up front."""
+    if isinstance(commands, (str, bytes, bytearray)) or not isinstance(
+        commands, Iterable
+    ):
+        raise ValueError(
+            f"verify.run_suite needs a sequence of commands, got {commands!r}"
+        )
+    planned: list[tuple[object, list[str]]] = []
+    for command in commands:
+        argv = _argv_for(command)
+        if argv is not None:
+            planned.append((command, argv))
+    return planned
+
+
+def _required_worktree(worktree: object) -> str:
+    """An existing absolute directory as a string, or `ValueError` up front.
+
+    The same pre-flight shape `worktree.ensure` uses: a bad path must fail
+    loudly here, not as a confusing failure from every command in the suite.
+    """
+    if not isinstance(worktree, (str, Path)):
+        raise ValueError(
+            f"verify.run_suite needs an absolute worktree path, got {worktree!r}"
+        )
+    text = str(worktree).strip()
+    if text == "" or not Path(text).is_absolute() or not Path(text).is_dir():
+        raise ValueError(
+            f"verify.run_suite needs an existing absolute worktree directory, "
+            f"got {worktree!r}"
+        )
+    return text
+
+
 def run_suite(
     commands: object,
     worktree: object,
@@ -156,12 +232,12 @@ def run_suite(
     `runner` defaults to real execution and exists to be swapped in tests, the
     same callable-injection seam `worktree.py` uses for git.
     """
-    worktree_path = str(worktree)
+    planned = _plan_commands(commands)
+    worktree_path = _required_worktree(worktree)
     result: dict[str, object] = {"passed": False, "verified": [], "detail": ""}
     verified: list[dict[str, object]] = result["verified"]  # type: ignore[assignment]
 
-    for command in commands:
-        argv = shlex.split(command) if isinstance(command, str) else [str(p) for p in command]
+    for command, argv in planned:
         try:
             completed = runner(argv, worktree_path)
         except (FileNotFoundError, PermissionError, NotADirectoryError) as exc:
