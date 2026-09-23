@@ -522,3 +522,267 @@ def test_load_run_returns_none_for_an_unknown_run(repo):
         assert st.load_run("run-never-started") is None
     finally:
         st.close()
+
+
+def _truncate_db(repo: Path) -> Path:
+    """Wipe the projection the way a crashed or corrupted disk would.
+
+    The WAL sidecars are removed too: zeroing the main file while a populated
+    `-wal` survives would not actually lose the rows.
+    """
+    db_path = paths.project_db_path(repo)
+    db_path.write_bytes(b"")
+    for suffix in ("-wal", "-shm"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+    return db_path
+
+
+def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    _record_full_run(st, repo)
+    before = st.load_run(RUN_ID)
+    st.close()
+
+    db_path = _truncate_db(repo)
+    assert db_path.stat().st_size == 0
+
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        assert rebuilt.load_run(RUN_ID) is None
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert after == before
+    assert returned == before
+
+
+def test_rebuilding_twice_changes_nothing_and_duplicates_nothing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        once = st.rebuild_from_journal(RUN_ID)
+        first = st.load_run(RUN_ID)
+        twice = st.rebuild_from_journal(RUN_ID)
+        second = st.load_run(RUN_ID)
+        counts = {
+            table: st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("runs", "stories", "subtasks", "phases", "attempts")
+        }
+    finally:
+        st.close()
+
+    assert once == twice
+    assert first == second
+    assert counts == {"runs": 1, "stories": 1, "subtasks": 2, "phases": 3, "attempts": 2}
+
+
+def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
+    # §9 lines 370-373: the store preserves `started` with nothing terminal.
+    # Discarding it is the engine's job, not the store's.
+    st = store.Store.open(repo, RUN_ID)
+    _record_full_run(st, repo)
+    st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        run = rebuilt.rebuild_from_journal(RUN_ID)
+        row = rebuilt.connection.execute(
+            "SELECT * FROM attempts WHERE phase = 'implement'"
+        ).fetchone()
+    finally:
+        rebuilt.close()
+
+    attempt = run.stories[0].subtasks[1].phases[1].attempts[0]
+    assert attempt.status == "started"
+    assert attempt.exit_code is None
+    assert attempt.duration is None
+    assert attempt.tokens_in is None
+    assert attempt.tokens_out is None
+    assert attempt.cost is None
+    assert row["status"] == "started"
+    assert row["exit_code"] is None
+
+    terminal = run.stories[0].subtasks[1].phases[0].attempts[0]
+    assert terminal.status == "ok"
+    assert terminal.exit_code == 0
+
+
+def test_rebuild_picks_up_a_journal_line_whose_row_never_landed(repo):
+    # The other half of the ordering guarantee: the row the failed SQLite write
+    # never produced is materialised by the rebuild.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+    with pytest.raises(sqlite3.Error):
+        st.record_story(_story())
+
+    reopened = store.Store.open(repo, RUN_ID)
+    try:
+        run = reopened.rebuild_from_journal(RUN_ID)
+        row = reopened.connection.execute("SELECT * FROM stories").fetchone()
+    finally:
+        reopened.close()
+
+    assert [story.card_id for story in run.stories] == ["8831189b"]
+    assert row["card_id"] == "8831189b"
+    assert row["status"] == "started"
+
+
+def _append_raw(journal: store.Journal, record: dict) -> None:
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        journal = st.journal
+        _append_raw(
+            journal,
+            {
+                "seq": journal.last_seq() + 1,
+                "ts": "2026-09-23T10:20:00+00:00",
+                "run_id": RUN_ID,
+                "event": "attempt_upsert",
+                "story": "8831189b",
+                "card": "ef248597",
+                "phase": "implement",
+                "attempt": 1,
+                "payload": {
+                    "n": 1,
+                    "dispatch": _dispatch().model_dump(mode="json"),
+                    "tokens": 10,
+                },
+            },
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+    assert "tokens" in str(excinfo.value)
+
+
+def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        journal = st.journal
+        _append_raw(
+            journal,
+            {
+                "seq": journal.last_seq() + 1,
+                "ts": "2026-09-23T10:20:00+00:00",
+                "run_id": RUN_ID,
+                "event": "story_upsert",
+                "story": "8831189b",
+                "card": None,
+                "phase": None,
+                "attempt": None,
+                "payload": {
+                    "card_id": "8831189b",
+                    "title": "Foundations",
+                    "level": 0,
+                    "status": "finished",
+                    "tip_branch": None,
+                },
+            },
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+    message = str(excinfo.value)
+    for allowed in ("pending", "started", "done", "failed", "escalated"):
+        assert allowed in message
+
+
+def test_a_corrupt_line_raises_out_of_rebuild_naming_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        with st.journal.path.open("a", encoding="utf-8") as handle:
+            handle.write("{not json at all\n")
+        with pytest.raises(store.CorruptJournalError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+        message = str(excinfo.value)
+        assert str(st.journal.path) in message
+    finally:
+        st.close()
+
+
+def test_rebuilding_a_run_with_no_journal_raises(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.MissingJournalError) as excinfo:
+            st.rebuild_from_journal("run-never-started")
+        assert st.load_run("run-never-started") is None
+    finally:
+        st.close()
+    assert "run-never-started" in str(excinfo.value)
+
+
+def test_a_journal_whose_head_is_missing_raises_a_journal_error(repo):
+    # Review Focus 1: a story event with no run_upsert before it must name the
+    # problem, not fail with an AttributeError on None.
+    journal = store.Journal(RUN_ID)
+    journal.append(
+        "story_upsert",
+        _story().model_dump(mode="json", exclude={"subtasks"}),
+        story="8831189b",
+    )
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.JournalError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+    assert "run_upsert" in str(excinfo.value)
+
+
+def test_a_line_naming_an_unknown_parent_raises_a_journal_error(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}))
+    journal.append(
+        "subtask_upsert",
+        _subtask().model_dump(mode="json", exclude={"phases"}),
+        story="never-recorded",
+        card="ef248597",
+    )
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.JournalError) as excinfo:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+    assert "never-recorded" in str(excinfo.value)
+
+
+def test_rebuilding_one_run_leaves_another_runs_rows_alone(repo):
+    # Review Focus 4: one project DB holds every run. A rebuild is scoped.
+    other_id = "run-2026-09-22-07"
+    first = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(first, repo)
+    finally:
+        first.close()
+
+    second = store.Store.open(repo, other_id)
+    try:
+        second.record_run(_run(repo, run_id=other_id))
+        second.record_story(_story())
+        second.record_subtask("8831189b", _subtask("aaaa1111"))
+        untouched = second.load_run(other_id)
+    finally:
+        second.close()
+
+    rebuilding = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilding.rebuild_from_journal(RUN_ID)
+        assert rebuilding.load_run(other_id) == untouched
+        assert rebuilding.load_run(RUN_ID) is not None
+    finally:
+        rebuilding.close()

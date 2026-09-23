@@ -14,6 +14,7 @@ attempt belongs to the engine.
 import json
 import os
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -226,6 +227,91 @@ def _iso(value: datetime | None) -> str | None:
 
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _upsert(
+    items: list[Any], key: str, node: Any, children: str | None
+) -> Any:
+    """Replace the sibling with the same key, keeping its children, or append."""
+    for index, existing in enumerate(items):
+        if getattr(existing, key) == getattr(node, key):
+            if children is not None:
+                node = node.model_copy(update={children: getattr(existing, children)})
+            items[index] = node
+            return node
+    items.append(node)
+    return node
+
+
+def _find(items: list[Any], key: str, value: str | None, what: str, seq: int) -> Any:
+    for existing in items:
+        if getattr(existing, key) == value:
+            return existing
+    raise JournalError(
+        f"journal line {seq} names {what} {value!r}, which no earlier line created"
+    )
+
+
+def replay(lines: Iterable[JournalLine]) -> models.Run:
+    """Fold journal lines, in sequence order, back into the §9 tree.
+
+    Nothing here is defensive: a line that fails `models` validation raises the
+    `pydantic.ValidationError` straight out, because an old-schema line has to
+    fail loudly rather than quietly drop a field from the projection.
+    """
+    run: models.Run | None = None
+
+    for line in sorted(lines, key=lambda item: item.seq):
+        if line.event == "run_upsert":
+            fresh = models.Run.model_validate(line.payload)
+            run = fresh if run is None else fresh.model_copy(
+                update={"stories": run.stories}
+            )
+            continue
+
+        if run is None:
+            raise JournalError(
+                f"journal line {line.seq} is a {line.event} but no run_upsert"
+                " preceded it: the head of the journal is missing"
+            )
+
+        if line.event == "story_upsert":
+            _upsert(
+                run.stories,
+                "card_id",
+                models.StoryRun.model_validate(line.payload),
+                "subtasks",
+            )
+            continue
+
+        story = _find(run.stories, "card_id", line.story, "story", line.seq)
+
+        if line.event == "subtask_upsert":
+            _upsert(
+                story.subtasks,
+                "card_id",
+                models.SubtaskRun.model_validate(line.payload),
+                "phases",
+            )
+            continue
+
+        subtask = _find(story.subtasks, "card_id", line.card, "subtask", line.seq)
+
+        if line.event == "phase_upsert":
+            _upsert(
+                subtask.phases,
+                "name",
+                models.PhaseRun.model_validate(line.payload),
+                "attempts",
+            )
+            continue
+
+        phase = _find(subtask.phases, "name", line.phase, "phase", line.seq)
+        _upsert(phase.attempts, "n", models.Attempt.model_validate(line.payload), None)
+
+    if run is None:
+        raise JournalError("journal contains no run_upsert line")
+    return run
 
 
 class Store:
@@ -566,3 +652,38 @@ class Store:
                         )
 
         return run
+
+    # -- rebuild -------------------------------------------------------------
+
+    def rebuild_from_journal(self, run_id: str) -> models.Run:
+        """Replace this run's projection with what its journal says (D5).
+
+        The journal wins: every row for `run_id` is deleted and rewritten from
+        the replayed tree, so the result is the same whether the projection was
+        stale, truncated or already correct.
+        """
+        journal = (
+            self._journal if self._journal.run_id == run_id else Journal(run_id)
+        )
+        run = replay(journal.read())
+        self._delete_run(run_id)
+        self._write_run_row(run_id, run)
+        for story in run.stories:
+            self._write_story_row(run_id, story)
+            for subtask in story.subtasks:
+                self._write_subtask_row(run_id, story.card_id, subtask)
+                for phase in subtask.phases:
+                    self._write_phase_row(run_id, story.card_id, subtask.card_id, phase)
+                    for attempt in phase.attempts:
+                        self._write_attempt_row(
+                            run_id, story.card_id, subtask.card_id, phase.name, attempt
+                        )
+        return run
+
+    def _delete_run(self, run_id: str) -> None:
+        self._conn.execute("DELETE FROM attempts WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM phases WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM subtasks WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM stories WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        self._conn.commit()
