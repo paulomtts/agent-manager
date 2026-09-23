@@ -925,6 +925,79 @@ phases:
     assert terminal["result_path"].endswith("spec.1/result.json")
 
 
+SPEC_DOCUMENT = """
+name: agentic
+phases:
+  - name: spec
+    kind: agent
+    role: explorer
+    result: SpecResult
+    writes: docs/superpowers/specs/{stem}.md
+"""
+
+VALID_SPEC_RESULT = json.dumps({"path": "docs/superpowers/specs/task-x.md", "note": None})
+SPEC_RESULT_WITHOUT_PATH = json.dumps({"note": None})
+
+
+def _spec_runner(store, workflow, launcher, tmp_path, worktree):
+    return _runner(
+        store,
+        workflow,
+        launcher,
+        tmp_path,
+        worktree,
+        result_models={"FakeResult": FakeResult, "SpecResult": results.SpecResult},
+    )
+
+
+def test_a_spec_phase_validates_its_result_and_returns_the_json_dump(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(SPEC_DOCUMENT, {})
+    launcher = FakeLauncher(results=[VALID_SPEC_RESULT])
+    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    assert result == {"path": "docs/superpowers/specs/task-x.md", "note": None}
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+    contract = launcher.prompts[0].split(prompt.RESULT_HEADING, 1)[1]
+    assert '"path"' in contract
+    assert '"note"' in contract
+    assert '"additionalProperties": false' in contract
+
+
+def test_a_spec_result_missing_path_is_schema_invalid_and_fails_the_phase(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(SPEC_DOCUMENT, {})
+    launcher = FakeLauncher(results=[SPEC_RESULT_WITHOUT_PATH])
+    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    assert caught.value.phase == "spec"
+    assert caught.value.outcome == "schema_invalid"
+    assert "path" in caught.value.detail
+    assert len(launcher.calls) == 1
+    assert _attempt_statuses(store) == [(1, "started"), (1, "schema_invalid")]
+
+
+def test_a_spec_attempt_that_writes_no_result_file_is_a_harness_error(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(SPEC_DOCUMENT, {})
+    launcher = FakeLauncher(results=[None])
+    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "harness_error"
+    assert "no result file" in caught.value.detail
+
+
 def test_an_unregistered_result_model_is_a_named_engine_error(store, tmp_path, worktree):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
