@@ -16,10 +16,18 @@ recorded as `started` with no exit code, duration, tokens or cost, and resume ha
 to load that row back before discarding it and re-running the phase.
 """
 
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+Status = Literal["pending", "started", "done", "failed", "escalated"]
+"""Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
+state resume keys off (§9)."""
+
+PhaseKind = Literal["agent", "deterministic"]
+"""§5: a phase either dispatches a harness or runs a registered function."""
 
 AttemptStatus = Literal[
     "started", "ok", "schema_invalid", "gate_failed", "harness_error"
@@ -57,3 +65,25 @@ class Attempt(_Model):
     prompt_path: Path | None = None
     result_path: Path | None = None
     stdout_path: Path | None = None
+
+
+class PhaseRun(_Model):
+    """One phase of one subtask, with every attempt made at it."""
+
+    name: str = Field(min_length=1)
+    kind: PhaseKind
+    status: Status = "pending"
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    attempts: list[Attempt] = Field(default_factory=list)
+
+
+class SubtaskRun(_Model):
+    """One subtask card, driven on its own branch in its own worktree."""
+
+    card_id: str = Field(min_length=1)
+    branch: str = Field(min_length=1)
+    base_branch: str = Field(min_length=1)
+    status: Status = "pending"
+    worktree_path: Path | None = None
+    phases: list[PhaseRun] = Field(default_factory=list)

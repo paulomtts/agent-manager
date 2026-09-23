@@ -9,6 +9,7 @@ that it raised: the validation error is what a retrying agent reads, so a status
 typo has to name the statuses that would have worked.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -145,3 +146,92 @@ def test_attempt_rejects_an_unknown_status_naming_the_allowed_set():
     message = str(excinfo.value)
     for allowed in ("started", "ok", "schema_invalid", "gate_failed", "harness_error"):
         assert allowed in message
+
+
+def test_phase_in_flight_has_no_end_time():
+    phase = models.PhaseRun(
+        name="implement",
+        kind="agent",
+        status="started",
+        started_at=datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc),
+        attempts=[models.Attempt(n=1, dispatch=_dispatch())],
+    )
+    assert phase.ended_at is None
+    assert phase.attempts[0].status == "started"
+    assert phase.attempts[0].exit_code is None
+
+
+def test_phase_defaults_to_pending_with_no_attempts():
+    phase = models.PhaseRun(name="verify", kind="deterministic")
+    assert phase.status == "pending"
+    assert phase.started_at is None
+    assert phase.ended_at is None
+    assert phase.attempts == []
+
+
+def test_phase_rejects_an_unknown_status_naming_the_allowed_set():
+    with pytest.raises(ValidationError) as excinfo:
+        models.PhaseRun(name="implement", kind="agent", status="in_flight")
+    message = str(excinfo.value)
+    for allowed in ("pending", "started", "done", "failed", "escalated"):
+        assert allowed in message
+
+
+def test_phase_rejects_an_unknown_kind():
+    with pytest.raises(ValidationError) as excinfo:
+        models.PhaseRun(name="implement", kind="wizard")
+    message = str(excinfo.value)
+    assert "agent" in message
+    assert "deterministic" in message
+
+
+def test_phase_requires_a_name():
+    with pytest.raises(ValidationError) as excinfo:
+        models.PhaseRun(kind="agent")
+    assert "name" in str(excinfo.value)
+
+
+def test_subtask_holds_its_phases_in_order():
+    subtask = models.SubtaskRun(
+        card_id="1535b285",
+        branch="m1/task-add-the-run-state-models-1535b285",
+        base_branch="m1/task-add-paths-and-the-run-fdebc746",
+        worktree_path=Path("/repo/.claude/worktrees/m1/task-add-the-run-state-models-1535b285"),
+        status="started",
+        phases=[
+            models.PhaseRun(name="explore", kind="agent", status="done"),
+            models.PhaseRun(name="implement", kind="agent", status="started"),
+            models.PhaseRun(name="verify", kind="deterministic"),
+        ],
+    )
+    assert [phase.name for phase in subtask.phases] == [
+        "explore",
+        "implement",
+        "verify",
+    ]
+    assert subtask.base_branch == "m1/task-add-paths-and-the-run-fdebc746"
+
+
+def test_subtask_defaults_to_pending_with_no_worktree_yet():
+    subtask = models.SubtaskRun(
+        card_id="1535b285",
+        branch="m1/task-add-the-run-state-models-1535b285",
+        base_branch="main",
+    )
+    assert subtask.status == "pending"
+    assert subtask.worktree_path is None
+    assert subtask.phases == []
+
+
+def test_subtask_requires_a_card_id():
+    with pytest.raises(ValidationError) as excinfo:
+        models.SubtaskRun(branch="m1/x-1535b285", base_branch="main")
+    assert "card_id" in str(excinfo.value)
+
+
+def test_subtask_rejects_an_empty_card_id():
+    # An empty id loses the journal coordinate just as thoroughly as a missing
+    # one, and fails further downstream.
+    with pytest.raises(ValidationError) as excinfo:
+        models.SubtaskRun(card_id="", branch="m1/x-1535b285", base_branch="main")
+    assert "card_id" in str(excinfo.value)
