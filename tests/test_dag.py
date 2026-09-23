@@ -49,6 +49,14 @@ def test_slugify_truncates_at_a_word_boundary_without_a_trailing_dash():
     assert slugify("abcdefghij klmnopqrst uvwxyz", 24) == "abcdefghij-klmnopqrst"
 
 
+def test_slugify_keeps_a_slug_exactly_max_long_whole():
+    assert slugify("abcdefghij klmnopqrst", 21) == "abcdefghij-klmnopqrst"
+
+
+def test_slugify_defaults_to_a_max_of_twenty_four():
+    assert slugify("abcdefghij klmnopqrst uvwxyz") == "abcdefghij-klmnopqrst"
+
+
 def test_slugify_hard_cuts_a_single_long_word_with_no_dash_to_fall_back_to():
     assert slugify("a" * 30, 24) == "a" * 24
 
