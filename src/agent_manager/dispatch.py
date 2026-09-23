@@ -416,20 +416,23 @@ class AgentRunner:
         self._record_phase(phase, "started", started_at, None, None)
         budget = 1 if phase.retry is None else phase.retry.max_attempts
         retry_on = () if phase.retry is None else tuple(phase.retry.on)
-        text = rendered
+        feedback: list[str] = []
         verdict = Verdict("harness_error", detail="no attempt was made")
 
         try:
             for _ in range(budget):
                 verdict = self._attempt(
-                    phase, context, text, (), target, role, cwd, model
+                    phase, context, rendered, tuple(feedback), target, role, cwd, model
                 )
                 if verdict.status == "ok":
                     self._record_phase(phase, "done", started_at, self.clock(), None)
                     return verdict.result
                 if verdict.fatal or verdict.status not in retry_on:
                     break
-                text = with_feedback(text, verdict.detail or verdict.status)
+                # Carried as data, not folded into `rendered`: `_attempt` composes
+                # the whole brief from the base prompt every time, so re-feeding a
+                # composed brief would duplicate the result contract.
+                feedback.append(verdict.detail or verdict.status)
         except Exception as error:
             # Symmetric with `engine._run_deterministic`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for

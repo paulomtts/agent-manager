@@ -1210,3 +1210,84 @@ def test_a_prompt_that_cannot_be_written_is_a_named_engine_error(
     assert "prompt.txt" in str(caught.value)
     assert launcher.calls == []
     assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+
+
+def test_a_retry_prompt_carries_the_feedback_after_exactly_one_contract(
+    store, tmp_path, worktree
+):
+    # Spec test 3: the brief is composed once per attempt from the untouched
+    # base, so the contract cannot be duplicated by a re-composition.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    second = launcher.prompts[1]
+    assert second.count(prompt.RESULT_HEADING) == 1
+    assert second.count("# phase: explore") == 1
+    assert second.count(dispatch.FEEDBACK_HEADING) == 1
+    assert second.index(prompt.RESULT_HEADING) < second.index(dispatch.FEEDBACK_HEADING)
+    assert "summary" in second.split(dispatch.FEEDBACK_HEADING, 1)[1]
+
+
+def test_a_third_attempt_accumulates_both_feedback_blocks_with_one_contract(
+    store, tmp_path, worktree
+):
+    # Spec test 4: §6 step 7's "the prior prompt plus the feedback block",
+    # preserved now that the accumulation lives in the loop rather than in the
+    # RenderedPrompt.
+    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    third = launcher.prompts[2]
+    assert len(launcher.prompts) == 3
+    assert third.count(dispatch.FEEDBACK_HEADING) == 2
+    assert third.count(prompt.RESULT_HEADING) == 1
+    assert third.count("# phase: explore") == 1
+
+
+def test_each_attempts_prompt_names_its_own_result_path(store, tmp_path, worktree):
+    # Spec test 5: attempt 2 must not tell the harness to overwrite attempt 1's
+    # result file -- classify() reads this attempt's path and nothing else.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    first_path = str(paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "result.json")
+    second_path = str(paths.attempt_dir(RUN_ID, CARD, "explore", 2) / "result.json")
+    assert first_path in launcher.prompts[0]
+    assert second_path not in launcher.prompts[0]
+    assert second_path in launcher.prompts[1]
+    assert first_path not in launcher.prompts[1]
+
+
+def test_a_retry_changes_only_the_result_path_and_the_feedback(
+    store, tmp_path, worktree
+):
+    # Review Focus 5: the rendered-inputs body of attempt 2 is byte-identical to
+    # attempt 1's, so a retry is the same brief plus one appended section.
+    workflow = _gated_workflow()
+    launcher = FakeLauncher(results=[INVALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    first_head = launcher.prompts[0].split(prompt.RESULT_HEADING, 1)[0]
+    second_head = launcher.prompts[1].split(prompt.RESULT_HEADING, 1)[0]
+    assert first_head == second_head
+    replayed = launcher.prompts[1].split(dispatch.FEEDBACK_HEADING, 1)[0].replace(
+        str(paths.attempt_dir(RUN_ID, CARD, "explore", 2)),
+        str(paths.attempt_dir(RUN_ID, CARD, "explore", 1)),
+    )
+    assert replayed.rstrip("\n") == launcher.prompts[0].rstrip("\n")
