@@ -454,3 +454,86 @@ def test_a_zero_count_from_a_numeric_string_still_blocks_as_implement():
     gate = review_gate(clean(commitCount="0", taggedCount="0"), BRANCH, BASE)
     assert gate["blocked"] == "implement"
     assert "no commits on top of" in gate["detail"]
+
+
+# ── is_plan_hash / plan_hash_mismatch ────────────────────────────────────────
+# Ported from task.test.mjs:189-220. A Plan-Hash is the first 8 hex characters
+# of sha256sum(<plan file>). Implement writes the trailers; Review recomputes
+# the hash independently, so comparing the two catches the plan file changing
+# mid-run — which silently invalidates every trailer already written.
+
+from agent_manager.steps.reducers import is_plan_hash, plan_hash_gate, plan_hash_mismatch
+
+
+@pytest.mark.parametrize("good", ["a1b2c3d4", "00000000", "ffffffff", "0123456789abcdef"[:8]])
+def test_a_plan_hash_is_exactly_eight_lowercase_hex_characters(good):
+    assert is_plan_hash(good) is True
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "A1B2C3D4",
+        "a1b2c3d",
+        "a1b2c3d4e",
+        "a1b2c3g4",
+        "",
+        "  a1b2c3d4",
+        "a1b2c3d4 ",
+        None,
+        12345678,
+        b"a1b2c3d4",
+        ["a1b2c3d4"],
+    ],
+)
+def test_anything_else_is_not_a_plan_hash(bad):
+    assert is_plan_hash(bad) is False
+
+
+def test_a_trailing_newline_does_not_sneak_a_hash_through():
+    # Python's `$` also matches before a final newline, so the pattern must be
+    # anchored with fullmatch (or \Z). A hash read straight off a command's
+    # stdout is exactly how this gets hit.
+    assert is_plan_hash("a1b2c3d4\n") is False
+
+
+def test_matching_hashes_report_no_drift():
+    assert plan_hash_mismatch("a1b2c3d4", "a1b2c3d4") is None
+
+
+def test_a_hash_that_changed_mid_run_is_named_as_a_modified_plan():
+    # The gate downstream will say "0 of 3 commits carry their trailer", which
+    # reads as an implementation failure. It is not: the plan moved underneath
+    # commits that were correct when written. Only this comparison can say so.
+    drift = plan_hash_mismatch("a1b2c3d4", "ffffffff")
+    assert "a1b2c3d4" in drift
+    assert "ffffffff" in drift
+    assert "modified after implementation" in drift
+    assert "hard-reset" in drift
+
+
+@pytest.mark.parametrize(
+    ("impl", "review"),
+    [
+        (None, "a1b2c3d4"),
+        ("a1b2c3d4", None),
+        ("a1b2c3d4", ""),
+        ("not-a-hash", "a1b2c3d4"),
+        ("a1b2c3d4", "A1B2C3D4"),
+        (None, None),
+        (12345678, "a1b2c3d4"),
+    ],
+)
+def test_drift_is_not_claimed_when_either_hash_is_unusable(impl, review):
+    # A stage that failed to report its hash tells us nothing about the other
+    # one; inventing a mismatch there would send someone after a phantom.
+    assert plan_hash_mismatch(impl, review) is None
+
+
+def test_the_wrapper_returns_none_or_a_detail_verdict():
+    assert plan_hash_gate("a1b2c3d4", "a1b2c3d4") is None
+    assert plan_hash_gate(None, "a1b2c3d4") is None
+    gate = plan_hash_gate("a1b2c3d4", "ffffffff")
+    assert gate["detail"] == plan_hash_mismatch("a1b2c3d4", "ffffffff")
+    # task.js only logs the drift (line 833); the stop is review_gate's.
+    assert "blocked" not in gate

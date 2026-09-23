@@ -209,6 +209,49 @@ def review_gate(
     return None
 
 
+# A Plan-Hash is the first 8 hex characters of sha256sum(<plan file>).
+# fullmatch, not match/search with `$`: Python's `$` also matches just before a
+# final newline, so `"a1b2c3d4\n"` would slip through a `^...$` pattern.
+_PLAN_HASH = re.compile(r"[0-9a-f]{8}")
+
+
+def is_plan_hash(value: object) -> bool:
+    """``True`` only for a ``str`` of exactly 8 lowercase hex characters."""
+    return isinstance(value, str) and _PLAN_HASH.fullmatch(value) is not None
+
+
+# Implement writes the trailers; Review recomputes the hash from the plan file
+# independently, which is deliberate — Review is the ground truth a FUTURE run
+# will reproduce, so it must never just echo what Implement claimed. Comparing
+# the two costs no command and catches the one thing neither stage can see on
+# its own: the plan file changing mid-run (ticked checkboxes are the usual
+# culprit), which silently invalidates every trailer already written.
+def plan_hash_mismatch(impl_hash: object, review_hash: object) -> str | None:
+    """The drift diagnosis, or ``None`` when there is nothing trustworthy to say."""
+    if not is_plan_hash(impl_hash) or not is_plan_hash(review_hash):
+        return None
+    if impl_hash == review_hash:
+        return None
+    return (
+        f"plan hash CHANGED mid-run: implement committed trailers as {impl_hash}, "
+        f"review recomputed {review_hash} from the same plan file. "
+        "The plan's bytes were modified after implementation, so every trailer on "
+        "this branch is now stale and a future resume would hard-reset the work. "
+        "The Plan-Hash gate below will stop the run; this is why."
+    )
+
+
+def plan_hash_gate(impl_hash: object, review_hash: object) -> dict[str, str] | None:
+    """Verdict form of :func:`plan_hash_mismatch`, for the card's singular name.
+
+    Carries no ``blocked`` key on purpose: in `task.js` the drift is *logged*
+    as a diagnosis (line 833) and the stop itself comes from
+    :func:`review_gate`'s untagged-commit branch.
+    """
+    detail = plan_hash_mismatch(impl_hash, review_hash)
+    return None if detail is None else {"detail": detail}
+
+
 def exploration_output_gate(
     explore: object,
     provided_verification: object,
