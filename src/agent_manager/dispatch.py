@@ -19,9 +19,14 @@ Three rules shape everything here, and none of them is negotiable:
   clean-tree check or be swept into a commit.
 """
 
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
-from agent_manager import paths, prompt
+from agent_manager import models, paths, prompt
+from agent_manager.errors import EngineError
+from agent_manager.harness.base import HarnessAdapter
+from agent_manager.harness.registry import DEFAULT_HARNESS
+from agent_manager.roles.loader import RoleBundle
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -66,3 +71,51 @@ def with_feedback(
         text=f"{rendered.text}\n{FEEDBACK_HEADING}\n{feedback}\n",
         sections=rendered.sections + (("feedback", feedback),),
     )
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where one phase's dispatch is going: which adapter, which model."""
+
+    adapter: HarnessAdapter
+    model: str
+
+
+def resolve_target(
+    role: RoleBundle,
+    harness_map: Mapping[str, models.HarnessAssignment],
+    adapters: Mapping[str, HarnessAdapter],
+    *,
+    phase: str,
+) -> Target:
+    """§6 step 1: the harness and model assigned to this phase's role.
+
+    `RunConfig.harness_map` is the run's explicit answer and wins outright. With
+    no entry, the role falls back to `DEFAULT_HARNESS` and to the model its own
+    `policy.toml` records for that harness -- D6 puts the default model in the
+    bundle precisely so a run that configures nothing still dispatches.
+
+    Both failures are `EngineError` naming the phase rather than a retryable
+    outcome: no re-dispatch fixes a missing adapter or a missing default model.
+    """
+    assignment = harness_map.get(role.name)
+    harness = DEFAULT_HARNESS if assignment is None else assignment.harness
+    adapter = adapters.get(harness)
+    if adapter is None:
+        raise EngineError(
+            f"role {role.name!r} is routed to harness {harness!r}, which has no "
+            f"adapter (adapters: {', '.join(sorted(adapters)) or 'none'})",
+            phase=phase,
+        )
+    if assignment is not None:
+        return Target(adapter=adapter, model=assignment.model)
+    model = role.policy.default_model.get(harness)
+    if model is None:
+        raise EngineError(
+            f"role {role.name!r} has no default model for harness {harness!r} in its "
+            f"policy.toml (it has: "
+            f"{', '.join(sorted(role.policy.default_model)) or 'nothing'}) and the "
+            "run's harness_map assigns none",
+            phase=phase,
+        )
+    return Target(adapter=adapter, model=model)

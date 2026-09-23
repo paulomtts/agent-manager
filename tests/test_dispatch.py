@@ -89,3 +89,97 @@ def test_a_written_prompt_lands_in_the_attempt_directory(data_home):
 
     assert written == attempt / "prompt.txt"
     assert "try again" in written.read_text(encoding="utf-8")
+
+
+from agent_manager import models
+from agent_manager.errors import EngineError
+from agent_manager.harness.base import Usage
+from agent_manager.roles.loader import load_role
+
+POLICY = """\
+allowed_tools = ["Read"]
+max_attempts = 2
+required_capabilities = []
+
+[default_model]
+claude = "sonnet"
+fake = "fake-model"
+"""
+
+
+def make_role(root: Path, name: str = "explorer", *, policy: str = POLICY) -> Path:
+    """A synthetic role bundle, built the way tests/roles/test_loader.py does."""
+    directory = root / name
+    (directory / "methodology").mkdir(parents=True, exist_ok=True)
+    (directory / "system.md").write_text(f"Standing instructions for {name}.\n", encoding="utf-8")
+    (directory / "policy.toml").write_text(policy, encoding="utf-8")
+    (directory / "VENDORED.lock").write_text("vendored = []\n", encoding="utf-8")
+    return directory
+
+
+class FakeAdapter:
+    """A `HarnessAdapter` by shape, whose argv names a program nothing runs."""
+
+    capabilities = frozenset({"bash", "edit"})
+
+    def __init__(self, name: str = "fake") -> None:
+        self.name = name
+        self.dispatches: list[models.Dispatch] = []
+
+    def build_command(self, d: models.Dispatch) -> list[str]:
+        self.dispatches.append(d)
+        return ["fake-harness", "--model", d.model, "--result", str(d.result_path)]
+
+    def parse_usage(self, stdout: str) -> Usage | None:
+        return Usage(tokens_in=11, tokens_out=22, cost=0.5) if "usage" in stdout else None
+
+
+def test_an_explicit_harness_assignment_wins(tmp_path):
+    role = load_role("explorer", root=make_role(tmp_path).parent)
+    adapter = FakeAdapter()
+
+    target = dispatch.resolve_target(
+        role,
+        {"explorer": models.HarnessAssignment(harness="fake", model="chosen-model")},
+        {"fake": adapter},
+        phase="explore",
+    )
+
+    assert target.adapter is adapter
+    assert target.model == "chosen-model"
+
+
+def test_an_unassigned_role_falls_back_to_the_default_harness_and_its_policy_model(tmp_path):
+    role = load_role("explorer", root=make_role(tmp_path).parent)
+    adapter = FakeAdapter(name="claude")
+
+    target = dispatch.resolve_target(role, {}, {"claude": adapter}, phase="explore")
+
+    assert target.adapter is adapter
+    assert target.model == "sonnet"
+
+
+def test_a_harness_with_no_adapter_is_a_named_engine_error(tmp_path):
+    role = load_role("explorer", root=make_role(tmp_path).parent)
+
+    with pytest.raises(EngineError) as caught:
+        dispatch.resolve_target(
+            role,
+            {"explorer": models.HarnessAssignment(harness="codex", model="o-whatever")},
+            {"fake": FakeAdapter()},
+            phase="explore",
+        )
+
+    assert caught.value.phase == "explore"
+    assert "'codex'" in str(caught.value)
+
+
+def test_a_role_with_no_default_model_for_the_harness_is_a_named_engine_error(tmp_path):
+    policy = POLICY.replace('claude = "sonnet"\n', "")
+    role = load_role("explorer", root=make_role(tmp_path, policy=policy).parent)
+
+    with pytest.raises(EngineError) as caught:
+        dispatch.resolve_target(role, {}, {"claude": FakeAdapter(name="claude")}, phase="explore")
+
+    assert caught.value.phase == "explore"
+    assert "default model" in str(caught.value)
