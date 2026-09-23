@@ -1,5 +1,5 @@
 """The gates ported faithfully from the `PURE:BEGIN`/`PURE:END` region of
-`task.js` (lines 58-153 of the sibling leave-me-alone plugin's
+`task.js` (lines 58-194 of the sibling leave-me-alone plugin's
 `workflows/task.js`), with its `task.test.mjs` as the behavioural
 specification.
 
@@ -9,7 +9,9 @@ or module-level mutable state. Malformed *content* produces a verdict rather
 than an exception; the one shape still required of a caller is
 ``verification_gate``'s ``suite_cmds``, which must be an actual list (the
 engine always has one, and `task.js` throws here too). A gate returns ``None``
-to pass, or a verdict ``dict`` to fail.
+to pass, or a verdict ``dict`` to fail — with one exception: ``review_gate``
+also returns ``{"warn": ...}`` when Review's counts are unusable, which
+proceeds but skips the Plan-Hash half of the check.
 """
 
 import json
