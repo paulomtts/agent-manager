@@ -314,6 +314,145 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
     return run
 
 
+class RunSummary(BaseModel):
+    """One row of the shared `runs` table, without the tree hanging off it.
+
+    A `models.Run` would be a lie here: its `stories` list would always be empty
+    because `runs` is the only table read. The fields are the run's identity and
+    nothing else, and they go through pydantic for the same reason `load_run`
+    does -- a projection that drifted from `models` must fail loudly rather than
+    print half a history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    workflow: str
+    repo_dir: Path
+    base_branch: str
+    branch_prefix: str
+    status: models.Status
+    started_at: datetime | None = None
+
+
+def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
+    """Every run recorded in this project's projection, newest first.
+
+    Takes a connection rather than a root so one caller can list the history and
+    then load a run's tree over the same connection, and close it once. The
+    connection comes from `open_db(root)`; there is no second database.
+
+    `started_at DESC` puts a NULL start time last (SQLite orders NULL below every
+    value, so descending sends it to the end) and the id breaks a tie, which run
+    ids minted at second resolution really do produce.
+    """
+    rows = conn.execute(
+        "SELECT id, workflow, repo_dir, base_branch, branch_prefix, status, started_at"
+        " FROM runs ORDER BY started_at DESC, id DESC"
+    ).fetchall()
+    return [RunSummary.model_validate(dict(row)) for row in rows]
+
+
+def latest_run_id(conn: sqlite3.Connection) -> str | None:
+    """The most recent run of this project, or `None` if it has never been run.
+
+    Derived from `list_runs` rather than from a second `ORDER BY`, so "most
+    recent" can never mean two different things in two commands.
+    """
+    summaries = list_runs(conn)
+    return summaries[0].id if summaries else None
+
+
+def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
+    """Assemble one run's projection back into the §9 tree, or `None` if absent.
+
+    A free function over a connection, because the reader that needs it -- the
+    `status` command -- has no `Journal` and must not create one: `Journal`
+    derives its path from `paths.run_dir`, which creates the directory, so
+    looking up a run that does not exist through `Store.open` would leave an
+    artifact directory behind for a run nobody ever started.
+
+    Every value goes back through the `models` validators, so a projection that
+    drifted from the schema fails here rather than downstream.
+    """
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None
+
+    run = models.Run(
+        id=row["id"],
+        workflow=row["workflow"],
+        repo_dir=row["repo_dir"],
+        base_branch=row["base_branch"],
+        branch_prefix=row["branch_prefix"],
+        status=row["status"],
+        started_at=row["started_at"],
+        config=json.loads(row["config"]),
+    )
+
+    for story_row in conn.execute(
+        "SELECT * FROM stories WHERE run_id = ? ORDER BY position", (run_id,)
+    ).fetchall():
+        story = models.StoryRun(
+            card_id=story_row["card_id"],
+            title=story_row["title"],
+            level=story_row["level"],
+            status=story_row["status"],
+            tip_branch=story_row["tip_branch"],
+        )
+        run.stories.append(story)
+
+        for subtask_row in conn.execute(
+            "SELECT * FROM subtasks WHERE run_id = ? AND story_id = ? ORDER BY position",
+            (run_id, story.card_id),
+        ).fetchall():
+            subtask = models.SubtaskRun(
+                card_id=subtask_row["card_id"],
+                branch=subtask_row["branch"],
+                base_branch=subtask_row["base_branch"],
+                status=subtask_row["status"],
+                worktree_path=subtask_row["worktree_path"],
+            )
+            story.subtasks.append(subtask)
+
+            for phase_row in conn.execute(
+                "SELECT * FROM phases WHERE run_id = ? AND story_id = ?"
+                " AND card_id = ? ORDER BY position",
+                (run_id, story.card_id, subtask.card_id),
+            ).fetchall():
+                phase = models.PhaseRun(
+                    name=phase_row["name"],
+                    kind=phase_row["kind"],
+                    status=phase_row["status"],
+                    started_at=phase_row["started_at"],
+                    ended_at=phase_row["ended_at"],
+                )
+                subtask.phases.append(phase)
+
+                for attempt_row in conn.execute(
+                    "SELECT * FROM attempts WHERE run_id = ? AND story_id = ?"
+                    " AND card_id = ? AND phase = ? ORDER BY n",
+                    (run_id, story.card_id, subtask.card_id, phase.name),
+                ).fetchall():
+                    phase.attempts.append(
+                        models.Attempt(
+                            n=attempt_row["n"],
+                            dispatch=json.loads(attempt_row["dispatch"]),
+                            status=attempt_row["status"],
+                            exit_code=attempt_row["exit_code"],
+                            duration=attempt_row["duration"],
+                            tokens_in=attempt_row["tokens_in"],
+                            tokens_out=attempt_row["tokens_out"],
+                            cost=attempt_row["cost"],
+                            prompt_path=attempt_row["prompt_path"],
+                            result_path=attempt_row["result_path"],
+                            stdout_path=attempt_row["stdout_path"],
+                        )
+                    )
+
+    return run
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
@@ -577,88 +716,13 @@ class Store:
     # -- reading -------------------------------------------------------------
 
     def load_run(self, run_id: str) -> models.Run | None:
-        """Assemble the projection back into the §9 tree, or `None` if absent.
+        """The module-level `load_run` over this store's own connection.
 
-        Every value goes back through the `models` validators, so a projection
-        that drifted from the schema fails here rather than downstream.
+        Kept as a method because `rebuild_from_journal` and every existing caller
+        already hold a `Store`; the free function is what a reader without a run
+        id uses.
         """
-        row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            return None
-
-        run = models.Run(
-            id=row["id"],
-            workflow=row["workflow"],
-            repo_dir=row["repo_dir"],
-            base_branch=row["base_branch"],
-            branch_prefix=row["branch_prefix"],
-            status=row["status"],
-            started_at=row["started_at"],
-            config=json.loads(row["config"]),
-        )
-
-        for story_row in self._conn.execute(
-            "SELECT * FROM stories WHERE run_id = ? ORDER BY position", (run_id,)
-        ).fetchall():
-            story = models.StoryRun(
-                card_id=story_row["card_id"],
-                title=story_row["title"],
-                level=story_row["level"],
-                status=story_row["status"],
-                tip_branch=story_row["tip_branch"],
-            )
-            run.stories.append(story)
-
-            for subtask_row in self._conn.execute(
-                "SELECT * FROM subtasks WHERE run_id = ? AND story_id = ?"
-                " ORDER BY position",
-                (run_id, story.card_id),
-            ).fetchall():
-                subtask = models.SubtaskRun(
-                    card_id=subtask_row["card_id"],
-                    branch=subtask_row["branch"],
-                    base_branch=subtask_row["base_branch"],
-                    status=subtask_row["status"],
-                    worktree_path=subtask_row["worktree_path"],
-                )
-                story.subtasks.append(subtask)
-
-                for phase_row in self._conn.execute(
-                    "SELECT * FROM phases WHERE run_id = ? AND story_id = ?"
-                    " AND card_id = ? ORDER BY position",
-                    (run_id, story.card_id, subtask.card_id),
-                ).fetchall():
-                    phase = models.PhaseRun(
-                        name=phase_row["name"],
-                        kind=phase_row["kind"],
-                        status=phase_row["status"],
-                        started_at=phase_row["started_at"],
-                        ended_at=phase_row["ended_at"],
-                    )
-                    subtask.phases.append(phase)
-
-                    for attempt_row in self._conn.execute(
-                        "SELECT * FROM attempts WHERE run_id = ? AND story_id = ?"
-                        " AND card_id = ? AND phase = ? ORDER BY n",
-                        (run_id, story.card_id, subtask.card_id, phase.name),
-                    ).fetchall():
-                        phase.attempts.append(
-                            models.Attempt(
-                                n=attempt_row["n"],
-                                dispatch=json.loads(attempt_row["dispatch"]),
-                                status=attempt_row["status"],
-                                exit_code=attempt_row["exit_code"],
-                                duration=attempt_row["duration"],
-                                tokens_in=attempt_row["tokens_in"],
-                                tokens_out=attempt_row["tokens_out"],
-                                cost=attempt_row["cost"],
-                                prompt_path=attempt_row["prompt_path"],
-                                result_path=attempt_row["result_path"],
-                                stdout_path=attempt_row["stdout_path"],
-                            )
-                        )
-
-        return run
+        return load_run(self._conn, run_id)
 
     # -- rebuild -------------------------------------------------------------
 

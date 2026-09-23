@@ -907,3 +907,133 @@ def test_a_journal_whose_run_upsert_names_another_run_raises(repo):
     message = str(excinfo.value)
     assert RUN_ID in message
     assert "run-somewhere-else" in message
+
+
+def _record_summary(root: Path, run_id: str, started_at: datetime | None) -> None:
+    """One run row in `root`'s projection, with nothing below it."""
+    opened = store.Store.open(root, run_id)
+    try:
+        opened.record_run(_run(root, run_id).model_copy(update={"started_at": started_at}))
+    finally:
+        opened.close()
+
+
+def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
+    """The `runs` table is shared by every run of one project, so the listing is
+    a read of that table alone -- and a second project is a second database file,
+    which this one must not see."""
+    _record_summary(repo, "run-a", datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record_summary(repo, "run-b", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    _record_summary(other, "run-elsewhere", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+
+    conn = store.open_db(repo)
+    try:
+        summaries = store.list_runs(conn)
+    finally:
+        conn.close()
+
+    assert [summary.id for summary in summaries] == ["run-b", "run-a"]
+    assert summaries[0].workflow == "milestone"
+    assert summaries[0].status == "started"
+    assert summaries[0].started_at == datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
+
+
+def test_list_runs_on_a_project_with_no_runs_is_empty(repo):
+    conn = store.open_db(repo)
+    try:
+        assert store.list_runs(conn) == []
+    finally:
+        conn.close()
+
+
+def test_list_runs_puts_a_run_with_no_start_time_last(repo):
+    """`runs.started_at` is nullable, so a row without one must still be listed."""
+    _record_summary(repo, "run-dated", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
+    _record_summary(repo, "run-undated", None)
+
+    conn = store.open_db(repo)
+    try:
+        summaries = store.list_runs(conn)
+    finally:
+        conn.close()
+
+    assert [summary.id for summary in summaries] == ["run-dated", "run-undated"]
+    assert summaries[-1].started_at is None
+
+
+def test_list_runs_breaks_a_started_at_tie_with_the_run_id(repo):
+    """Run ids are minted at second resolution, so two runs of one project can
+    share a `started_at` and the order must still be total."""
+    same = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
+    _record_summary(repo, "run-a", same)
+    _record_summary(repo, "run-b", same)
+
+    conn = store.open_db(repo)
+    try:
+        assert [summary.id for summary in store.list_runs(conn)] == ["run-b", "run-a"]
+    finally:
+        conn.close()
+
+
+def test_latest_run_id_is_the_newest_recorded_run(repo):
+    _record_summary(repo, "run-a", datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record_summary(repo, "run-c", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    _record_summary(repo, "run-b", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
+
+    conn = store.open_db(repo)
+    try:
+        assert store.latest_run_id(conn) == "run-c"
+        assert store.latest_run_id(conn) == store.list_runs(conn)[0].id
+    finally:
+        conn.close()
+
+
+def test_latest_run_id_is_none_for_a_project_with_no_runs(repo):
+    conn = store.open_db(repo)
+    try:
+        assert store.latest_run_id(conn) is None
+    finally:
+        conn.close()
+
+
+def test_load_run_reads_the_tree_from_a_bare_connection(repo):
+    """`status` has no run id until it has read the database, so it cannot use
+    `Store.open(root, run_id)` -- and must not, since a `Journal` mkdirs a run
+    directory for a run that may not exist."""
+    opened = store.Store.open(repo, RUN_ID)
+    try:
+        opened.record_run(_run(repo))
+        opened.record_story(
+            models.StoryRun(card_id="story-1", title="A story", level=0, status="started")
+        )
+        opened.record_subtask(
+            "story-1",
+            models.SubtaskRun(
+                card_id="card-1", branch="m1/task-x", base_branch="main", status="started"
+            ),
+        )
+    finally:
+        opened.close()
+
+    conn = store.open_db(repo)
+    try:
+        run = store.load_run(conn, RUN_ID)
+    finally:
+        conn.close()
+
+    assert run is not None
+    assert run.id == RUN_ID
+    assert [story.card_id for story in run.stories] == ["story-1"]
+    assert [subtask.card_id for subtask in run.stories[0].subtasks] == ["card-1"]
+
+
+def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
+    conn = store.open_db(repo)
+    try:
+        assert store.load_run(conn, "run-that-never-was") is None
+    finally:
+        conn.close()
+
+    assert not (paths.data_dir() / "runs" / "run-that-never-was").exists()
