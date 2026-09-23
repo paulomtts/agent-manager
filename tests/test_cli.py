@@ -146,6 +146,11 @@ def project(tmp_path, monkeypatch) -> Path:
         capture_output=True,
         text=True,
     )
+    # `brd init` leaves its own `.gitignore`/`.brd` marker untracked; committing
+    # them here keeps the fixture's baseline clean so a later porcelain check
+    # reflects only what `run_card` itself adds to the repo.
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "brd init")
     return root
 
 
@@ -258,3 +263,187 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
     assert context["allow_no_verification"] is False
     assert context["caller_provided"] is False
     assert context["provided_verification"] is None
+
+
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+def _invoke(project: Path, card_id: str, *extra: str):
+    """Run the Typer command with the agent runner faked out.
+
+    The factory is patched on the module rather than passed as an option: the
+    injection seam is `cli.default_runner_factory`, and patching it is what
+    proves the command reaches for that name instead of building an
+    `AgentRunner` inline.
+    """
+    return runner.invoke(
+        cli.app,
+        ["run", "--card", card_id, "--repo-dir", str(project), "--base-branch", "main", *extra],
+    )
+
+
+@requires_git
+@requires_brd
+def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "done"
+    assert "\n" not in result.stdout.strip()
+
+
+@requires_git
+@requires_brd
+def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"], "--pretty")
+
+    assert result.exit_code == 0
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatch):
+    monkeypatch.setattr(
+        cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
+    )
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ESCALATED
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "escalated"
+    assert envelope["data"]["failed_phase"] == "review"
+    assert "canned gate failure" in envelope["data"]["detail"]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
+    """§12: a run that says `done` while the card never moved is the exact
+    failure this list exists to prevent. `rollup.set_status` is still a registry
+    placeholder that raises, which is one honest way for the write to fail."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["status"] == "done"
+    assert any("mark_in_progress" in warning for warning in payload["warnings"])
+    assert any("mark_done" in warning for warning in payload["warnings"])
+
+
+@requires_git
+@requires_brd
+def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
+    import sqlite3
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    conn = sqlite3.connect(paths.project_db_path(project))
+    try:
+        run_row = conn.execute(
+            "SELECT status, base_branch, branch_prefix FROM runs WHERE id = ?",
+            (payload["run_id"],),
+        ).fetchone()
+        story_row = conn.execute(
+            "SELECT card_id, status FROM stories WHERE run_id = ?", (payload["run_id"],)
+        ).fetchone()
+        subtask_row = conn.execute(
+            "SELECT card_id, branch, base_branch, status FROM subtasks WHERE run_id = ?",
+            (payload["run_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert run_row == ("done", "main", "m1")
+    assert story_row == (cards["story"], "done")
+    assert subtask_row == (cards["subtask"], payload["branch"], "main", "done")
+
+
+@requires_git
+@requires_brd
+def test_no_run_artifact_is_written_inside_the_repository(project, cards):
+    """D4/§9: every artifact path comes from `paths.py`, which roots under
+    `data_dir()`. The only thing this run may add to the repo is the worktree
+    git itself registered."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert list(project.rglob("journal.jsonl")) == []
+    assert list(project.rglob("*.db")) == []
+    porcelain = _git(project, "status", "--porcelain").splitlines()
+    assert all(".claude" in line or ".brd" in line for line in porcelain), porcelain
+    assert (paths.run_dir(payload["run_id"]) / "journal.jsonl").is_file()
+
+
+@requires_git
+@requires_brd
+def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
+    from agent_manager import store as store_module
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    lines = store_module.Journal(payload["run_id"]).read()
+    assert [line.event for line in lines[:3]] == [
+        "run_upsert",
+        "story_upsert",
+        "subtask_upsert",
+    ]
+
+
+@requires_git
+@requires_brd
+def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards):
+    """The guarantee `status` and `resume` are built on: a process that dies on
+    its first dispatch still left a run behind."""
+    import sqlite3
+
+    def exploding_factory(**kwargs):
+        def runner(phase, context, rendered):
+            raise RuntimeError("the runner died on its first call")
+
+        return runner
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=exploding_factory,
+    )
+
+    assert payload["status"] == "escalated"
+    assert payload["failed_phase"] == "explore"
+    conn = sqlite3.connect(paths.project_db_path(project))
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM runs WHERE id = ?", (payload["run_id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM subtasks WHERE run_id = ?", (payload["run_id"],)
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()

@@ -26,9 +26,11 @@ from typing import Any, Protocol
 import typer
 
 from agent_manager import board, dag, dispatch, engine, models
+from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
 from agent_manager.store import Store
 from agent_manager.workflow.loader import Workflow, load_builtin
+from agent_manager.workflow.registry import WorkflowLoadError
 
 EXIT_ESCALATED = 1
 """The subtask escalated. §12: a full stop a human has to read."""
@@ -317,3 +319,55 @@ def run_card(
         }
     finally:
         store.close()
+
+
+HANDLED: tuple[type[BaseException], ...] = (
+    CliError,
+    board.BoardError,
+    WorkflowLoadError,
+    EngineError,
+    ValueError,
+)
+"""Everything the command turns into an `ok: false` envelope and exit 3.
+
+`ValueError` is in the list for one concrete reason: `dag.short_id` raises a
+bare one for a card id that is not a UUID, and a typed `--card` must not come
+back as a traceback. Anything outside this tuple is a bug in this program and
+should crash loudly with its stack intact.
+"""
+
+
+@app.command("run")
+def run(
+    card: str = typer.Option(..., "--card", help="The subtask card id to drive."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository and brd board to work in."
+    ),
+    base_branch: str = typer.Option(
+        "master", "--base-branch", help="The branch this subtask's branch is cut from."
+    ),
+    branch_prefix: str = typer.Option(
+        "m1", "--branch-prefix", help="Milestone prefix for the derived branch name."
+    ),
+    allow_no_verification: bool = typer.Option(
+        False,
+        "--allow-no-verification",
+        help="Proceed even when no verification suite is available (§12's opt-out).",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Drive one subtask card through the task workflow, end to end."""
+    try:
+        payload = run_card(
+            card,
+            repo_dir=repo_dir,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            allow_no_verification=allow_no_verification,
+        )
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+    if payload["status"] == "escalated":
+        raise typer.Exit(EXIT_ESCALATED)
