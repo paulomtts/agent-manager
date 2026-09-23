@@ -96,13 +96,14 @@ def test_default_registry_holds_exactly_the_names_task_yaml_uses() -> None:
     assert BUILTIN_FUNCTION_NAMES == TASK_YAML_NAMES
 
 
-def test_default_registry_resolves_the_five_reducers_to_the_real_callables() -> None:
+def test_default_registry_resolves_the_ported_reducers_to_the_real_callables() -> None:
     registry = default_registry()
     assert registry.resolve("exploration_output_gate") is reducers.exploration_output_gate
     assert registry.resolve("verification_gate") is reducers.verification_gate
     assert registry.resolve("review_gate") is reducers.review_gate
     assert registry.resolve("plan_hash_gate") is reducers.plan_hash_gate
     assert registry.resolve("verification_passed_gate") is reducers.verification_passed_gate
+    assert registry.resolve("critic_blockers_gate") is reducers.critic_blockers_gate
 
 
 def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> None:
@@ -114,13 +115,21 @@ def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> 
     assert registry.resolve("plan_check.has_validated_plan") is plan_check.has_validated_plan
 
 
-def test_placeholders_resolve_at_load_time_and_raise_when_called() -> None:
-    registry = default_registry()
-    for name in ("rollup.set_status", "critic_blockers_gate"):
-        fn = registry.resolve(name)
-        with pytest.raises(NotImplementedError) as caught:
-            fn()
-        assert name in str(caught.value)
+def test_the_one_remaining_placeholder_resolves_and_raises_when_called() -> None:
+    """`steps/rollup.py` is still a sibling's; every other name is real code."""
+    fn = default_registry().resolve("rollup.set_status")
+    with pytest.raises(NotImplementedError) as caught:
+        fn()
+    assert "rollup.set_status" in str(caught.value)
+
+
+def test_the_critic_gate_is_real_code_now_rather_than_a_placeholder() -> None:
+    gate = default_registry().resolve("critic_blockers_gate")
+    assert gate({"blockers": False, "reason": None, "summary": "explored"}) is None
+    assert gate(None) == {
+        "blocked": "validation",
+        "detail": "the validator returned nothing",
+    }
 
 
 def test_default_registry_does_not_register_shell_quote() -> None:
