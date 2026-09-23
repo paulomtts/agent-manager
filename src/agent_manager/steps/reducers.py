@@ -10,6 +10,9 @@ never an exception. A gate returns ``None`` to pass, or a verdict ``dict`` to
 fail.
 """
 
+import json
+from collections.abc import Mapping
+
 
 # An empty suite makes every downstream gate vacuous: Ship runs nothing and
 # reports passed=true, Review has no red/green to work against, and the card
@@ -48,3 +51,47 @@ def verification_gate(
             "allowNoVerification: true to proceed unverified on purpose."
         ),
     }
+
+
+# A degenerate Explore result is schema-valid but carries no real findings.
+# Seen live on #1296: the explore agent did the actual work, but its
+# StructuredOutput call omitted the required `verification` field three times
+# in a row, and it then submitted summary="test", fullSuite=["a"] — which Spec
+# correctly refused to design from, reading as a Spec-stage bug when the real
+# defect was that nothing checked Explore's output was real.
+MIN_SUMMARY_LENGTH = 60
+PLACEHOLDER_SUMMARIES = frozenset(
+    {"test", "todo", "tbd", "n/a", "na", "none", "placeholder", "unknown"}
+)
+
+
+def _json(value: object) -> str:
+    """Render ``value`` the way ``JSON.stringify`` does: no spaces after separators.
+
+    ``default=str`` keeps the gate total — a value the encoder cannot handle
+    becomes text in the detail message rather than a ``TypeError``.
+    """
+    return json.dumps(value, separators=(",", ":"), default=str)
+
+
+def _field(mapping: object, name: str) -> object:
+    """Read ``name`` off a mapping, or ``None`` if it is not a mapping at all."""
+    return mapping.get(name) if isinstance(mapping, Mapping) else None
+
+
+def exploration_output_gate(
+    explore: object,
+    provided_verification: object,
+) -> dict[str, str] | None:
+    """``None`` when the Explore output is plausible, else a verdict with a detail."""
+    raw_summary = _field(explore, "summary")
+    # Mirrors JS `String((explore && explore.summary) || '')`: any falsy value
+    # (absent, None, '', 0) becomes the empty string.
+    summary = ("" if not raw_summary else str(raw_summary)).strip()
+    if len(summary) < MIN_SUMMARY_LENGTH or summary.lower() in PLACEHOLDER_SUMMARIES:
+        return {
+            "detail": "exploration summary is implausibly short/placeholder for real "
+            f"findings on a subtask: {_json(summary[:80])}"
+        }
+
+    return None

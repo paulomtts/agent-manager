@@ -6,7 +6,7 @@ Ported case-by-case from the sibling plugin's `workflows/task.test.mjs`
 
 import pytest
 
-from agent_manager.steps.reducers import verification_gate
+from agent_manager.steps.reducers import exploration_output_gate, verification_gate
 
 
 def test_a_discovered_suite_proceeds():
@@ -50,3 +50,52 @@ def test_the_blocked_detail_always_offers_the_three_remedies(caller_provided):
         " Document the command, pass verification.fullSuite explicitly, or set "
         "allowNoVerification: true to proceed unverified on purpose."
     )
+
+
+# ── exploration_output_gate ──────────────────────────────────────────────────
+# Ported from task.test.mjs:151-187. Added upstream after a live run (#1296)
+# where the explore agent did real work, then gave up and submitted a
+# placeholder that trivially satisfies the schema: summary="test",
+# verification.fullSuite=["a"].
+
+REAL_SUMMARY = (
+    "graph_canvas.js renderEdges (lines 228-253) needs a transparent hit-path emitted "
+    "before the visible path, per issue #1296; graph_shell.css needs the matching "
+    "cursor rule."
+)
+REAL_VERIFICATION = {"fullSuite": ["uv run pytest tests/unit -q", "uv run ruff check ."]}
+
+
+def test_a_real_summary_and_plausible_verification_pass_the_gate():
+    explore = {"summary": REAL_SUMMARY, "verification": REAL_VERIFICATION}
+    assert exploration_output_gate(explore, None) is None
+
+
+def test_the_1296_placeholder_output_is_caught_as_a_short_summary():
+    gate = exploration_output_gate({"summary": "test", "verification": {"fullSuite": ["a"]}}, None)
+    assert "implausibly short" in gate["detail"]
+    assert "blocked" not in gate
+
+
+@pytest.mark.parametrize("word", ["todo", "TBD", "n/a", "None", "placeholder"])
+def test_a_summary_that_is_exactly_a_placeholder_word_is_caught_case_insensitively(word):
+    gate = exploration_output_gate({"summary": word, "verification": REAL_VERIFICATION}, None)
+    assert gate is not None
+
+
+def test_a_padded_placeholder_word_is_stripped_before_the_lookup():
+    gate = exploration_output_gate({"summary": "  todo  ", "verification": REAL_VERIFICATION}, None)
+    assert "implausibly short" in gate["detail"]
+    # The detail carries the STRIPPED summary, JSON-quoted.
+    assert '"todo"' in gate["detail"]
+
+
+def test_a_long_whitespace_only_summary_is_short_once_stripped():
+    gate = exploration_output_gate({"summary": " " * 100, "verification": REAL_VERIFICATION}, None)
+    assert gate["detail"].endswith('subtask: ""')
+
+
+@pytest.mark.parametrize("explore", [None, {}, {"summary": None}, {"summary": 7}])
+def test_a_missing_or_non_string_summary_returns_a_verdict_instead_of_raising(explore):
+    gate = exploration_output_gate(explore, None)
+    assert "implausibly short" in gate["detail"]
