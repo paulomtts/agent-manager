@@ -27,11 +27,12 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from agent_manager import models, paths, prompt
+from agent_manager import engine, models, paths, prompt
 from agent_manager.errors import EngineError
 from agent_manager.harness.base import HarnessAdapter, Outcome
 from agent_manager.harness.registry import DEFAULT_HARNESS
 from agent_manager.roles.loader import RoleBundle
+from agent_manager.workflow.loader import AgentPhase, Workflow
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -238,3 +239,88 @@ def classify(
     except ValidationError as error:
         return Verdict("schema_invalid", detail=str(error))
     return Verdict("ok", result=validated.model_dump(mode="json"))
+
+
+def gate_values(
+    context: Mapping[str, Any], phase_name: str, result: Any
+) -> dict[str, Any]:
+    """The binding table this phase's gates see.
+
+    The same table `engine._gate_values` builds for a deterministic phase, and
+    for the same two reasons: the result appears under `result` (the parameter
+    name the ported gates in `steps/reducers.py` declare) and under the phase's
+    own name (how §6 says later phases read it), except where that name is one
+    of the keys the engine owns.
+    """
+    values = {**context, "result": result}
+    if phase_name not in engine.RESERVED_CONTEXT_KEYS:
+        values[phase_name] = result
+    return values
+
+
+def _render_verdict(verdict: Mapping[str, Any]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
+
+
+def evaluate_gates(
+    phase: AgentPhase,
+    workflow: Workflow,
+    values: Mapping[str, Any],
+    warnings: list[str],
+) -> Verdict | None:
+    """`None` when every gate passes, else the `gate_failed` verdict (§6 step 6).
+
+    A gate returns `None` to pass, a mapping with `warn` to warn, or any other
+    mapping to fail -- the contract `_evaluate_gates` already applies to
+    deterministic phases. No per-gate retryable flag exists and this subtask
+    does not add one: whether a `gate_failed` is retried is `retry.on`'s answer
+    alone.
+
+    The two ways a gate can be *wrong* rather than unhappy -- raising, or
+    returning something that is not a mapping -- come back `fatal`, so no
+    `retry.on` list can re-dispatch into a situation the harness cannot change.
+    A binding failure is different again and propagates as `EngineError`: it
+    means the document names a gate whose parameters nothing supplies, which is
+    a bug in the document, not in the attempt.
+    """
+    for name in phase.gates:
+        gate = workflow.function(name)
+        kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
+        try:
+            verdict = gate(**kwargs)
+        except Exception as error:
+            return Verdict(
+                "gate_failed",
+                detail=(
+                    f"phase {phase.name!r} gate {name!r} raised "
+                    f"{type(error).__name__}: {error}; a gate returns None to pass or "
+                    "a mapping verdict to fail, so this is a broken gate rather than a "
+                    "failed attempt"
+                ),
+                fatal=True,
+            )
+        if verdict is None:
+            continue
+        if not isinstance(verdict, Mapping):
+            return Verdict(
+                "gate_failed",
+                detail=(
+                    f"phase {phase.name!r} gate {name!r} returned "
+                    f"{type(verdict).__name__}; a gate returns None to pass or a "
+                    "mapping verdict to fail, and anything else would be read as a "
+                    "pass by accident"
+                ),
+                fatal=True,
+            )
+        if "warn" in verdict:
+            warnings.append(
+                f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
+            )
+            continue
+        return Verdict(
+            "gate_failed",
+            detail=(
+                f"phase {phase.name!r} gate {name!r} failed: {_render_verdict(verdict)}"
+            ),
+        )
+    return None

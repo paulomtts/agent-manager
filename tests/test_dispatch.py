@@ -379,3 +379,161 @@ def test_stdout_is_never_the_channel(tmp_path):
     verdict = dispatch.classify(outcome, result, FakeResult)
 
     assert verdict.status == "schema_invalid"
+
+
+from agent_manager import engine
+from agent_manager.workflow.loader import load_workflow
+from agent_manager.workflow.registry import FunctionRegistry
+
+AGENT_DOCUMENT = """
+name: agentic
+phases:
+  - name: explore
+    kind: agent
+    role: explorer
+    result: FakeResult
+    gates: [output_gate]
+    retry: { max_attempts: 2, on: [schema_invalid, gate_failed] }
+"""
+
+
+def _workflow(document: str, functions: dict[str, object]):
+    registry = FunctionRegistry()
+    for name, fn in functions.items():
+        registry.register(name, fn)
+    return load_workflow(document, registry)
+
+
+def test_a_passing_gate_returns_no_verdict():
+    seen: list[object] = []
+
+    def output_gate(result):
+        seen.append(result)
+        return None
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+    phase = workflow.phase("explore")
+    warnings: list[str] = []
+
+    verdict = dispatch.evaluate_gates(
+        phase,
+        workflow,
+        dispatch.gate_values({"card": CARD}, "explore", {"summary": "ok"}),
+        warnings,
+    )
+
+    assert verdict is None
+    assert seen == [{"summary": "ok"}]
+    assert warnings == []
+
+
+def test_the_result_is_bound_under_both_result_and_the_phase_name():
+    values = dispatch.gate_values({"card": CARD}, "explore", {"summary": "ok"})
+
+    assert values["result"] == {"summary": "ok"}
+    assert values["explore"] == {"summary": "ok"}
+    assert values["card"] == CARD
+
+
+def test_a_reserved_key_is_not_overwritten_by_a_same_named_phase():
+    values = dispatch.gate_values({"worktree": Path("/repo/wt")}, "worktree", {"created": True})
+
+    assert values["worktree"] == Path("/repo/wt")
+    assert values["result"] == {"created": True}
+    assert "worktree" in engine.RESERVED_CONTEXT_KEYS
+
+
+def test_a_failing_gate_returns_a_retryable_gate_failed_verdict():
+    def output_gate(result):
+        return {"blocked": "exploration", "detail": "summary is a placeholder"}
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+
+    verdict = dispatch.evaluate_gates(
+        workflow.phase("explore"),
+        workflow,
+        dispatch.gate_values({}, "explore", {"summary": "test"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is False
+    assert "summary is a placeholder" in verdict.detail
+    assert "'output_gate'" in verdict.detail
+
+
+def test_a_warning_gate_is_recorded_and_does_not_fail_the_attempt():
+    def output_gate(result):
+        return {"warn": "counts unusable, plan-hash check skipped"}
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+    warnings: list[str] = []
+
+    verdict = dispatch.evaluate_gates(
+        workflow.phase("explore"),
+        workflow,
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        warnings,
+    )
+
+    assert verdict is None
+    assert warnings == [
+        "phase 'explore' gate 'output_gate' warned: counts unusable, plan-hash check skipped"
+    ]
+
+
+def test_a_gate_that_raises_is_a_fatal_gate_failure():
+    # Review Focus / spec error paths: never swallowed, never retried, even
+    # though this phase lists gate_failed in retry.on.
+    def output_gate(result):
+        raise RuntimeError("the gate itself is broken")
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+
+    verdict = dispatch.evaluate_gates(
+        workflow.phase("explore"),
+        workflow,
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is True
+    assert "RuntimeError" in verdict.detail
+    assert "the gate itself is broken" in verdict.detail
+
+
+def test_a_gate_returning_a_non_mapping_is_a_fatal_gate_failure():
+    def output_gate(result):
+        return "looks fine to me"
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+
+    verdict = dispatch.evaluate_gates(
+        workflow.phase("explore"),
+        workflow,
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is True
+    assert "str" in verdict.detail
+
+
+def test_a_gate_whose_parameter_nothing_supplies_is_a_named_engine_error():
+    def output_gate(result, provided_verification):
+        return None
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+
+    with pytest.raises(EngineError) as caught:
+        dispatch.evaluate_gates(
+            workflow.phase("explore"),
+            workflow,
+            dispatch.gate_values({}, "explore", {"summary": "ok"}),
+            [],
+        )
+
+    assert caught.value.parameter == "provided_verification"
+    assert caught.value.function == "output_gate"
