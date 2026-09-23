@@ -48,3 +48,47 @@ def test_data_dir_propagates_oserror_when_a_file_is_in_the_way(monkeypatch, tmp_
     (tmp_path / "agent-manager").write_text("not a directory")
     with pytest.raises(OSError):
         paths.data_dir()
+
+
+def test_project_db_path_is_deterministic_per_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    result = paths.project_db_path(project_root)
+    assert result == paths.project_db_path(project_root)
+    assert result.parent == tmp_path / "data" / "agent-manager" / "projects"
+    assert result.parent.is_dir()
+    assert not result.exists()
+
+
+def test_project_db_path_differs_per_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+
+    assert paths.project_db_path(repo1) != paths.project_db_path(repo2)
+
+
+def test_project_db_path_resolves_relative_spelling(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert paths.project_db_path(Path("repo")) == paths.project_db_path(project_root)
+    assert paths.project_db_path(project_root / "sub" / "..") == paths.project_db_path(
+        project_root
+    )
+
+
+def test_project_db_path_resolves_symlinked_spelling(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(project_root)
+
+    assert paths.project_db_path(link) == paths.project_db_path(project_root)

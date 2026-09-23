@@ -6,6 +6,7 @@ out of the worktree, where they would break the verify step's clean-tree check
 or be swept into a commit.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -16,3 +17,10 @@ def data_dir() -> Path:
     result = base / "agent-manager"
     result.mkdir(parents=True, exist_ok=True)
     return result
+
+
+def project_db_path(root: Path) -> Path:
+    projects_dir = data_dir() / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+    return projects_dir / f"{digest}.db"
