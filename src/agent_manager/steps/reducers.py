@@ -85,6 +85,21 @@ def _field(mapping: object, name: str) -> object:
     return mapping.get(name) if isinstance(mapping, Mapping) else None
 
 
+# These gates were ported from task.js and read the camelCase keys the JS
+# harness wrote. `results.py`'s models are snake_case, and `dispatch.py` dumps
+# them without `by_alias=True`, so BOTH spellings genuinely reach a gate: a
+# validated model dump is snake_case, and a hand-written result file (or the
+# ported fixtures in `tests/steps/test_reducers.py`) is camelCase. Reading both
+# is a compatibility shim on the read, not a second rule -- no verdict text,
+# threshold or ordering below depends on which spelling arrived. Doing it here,
+# in one helper, is what keeps the alternative from happening: two registry
+# wrappers that would quietly become a second place gate semantics live.
+def _either_field(mapping: object, snake: str, camel: str) -> object:
+    """``snake``'s value if it has one, else ``camel``'s, else ``None``."""
+    value = _field(mapping, snake)
+    return _field(mapping, camel) if value is None else value
+
+
 # JS `Number()` accepts exactly this grammar for a decimal literal. Python's
 # float() is looser — it takes "1_0", "inf", "nan" and non-ASCII digits like
 # "٣" — so the string is screened first. [0-9] rather than \d on purpose:
@@ -184,8 +199,8 @@ def review_gate(
     # an untagged commit reads as stale debris and a later run would
     # `reset --hard` it away. Catching that here, before anything is pushed, is
     # the whole point.
-    raw_commit = _field(review, "commitCount")
-    raw_tagged = _field(review, "taggedCount")
+    raw_commit = _either_field(review, "commit_count", "commitCount")
+    raw_tagged = _either_field(review, "tagged_count", "taggedCount")
     commit_count = count_of(raw_commit)
     tagged_count = count_of(raw_tagged)
     if not _is_integer(commit_count) or not _is_integer(tagged_count):
@@ -269,7 +284,9 @@ def exploration_output_gate(
             f"findings on a subtask: {_json(summary[:80])}"
         }
 
-    full_suite = _field(_field(explore, "verification"), "fullSuite")
+    full_suite = _either_field(
+        _field(explore, "verification"), "full_suite", "fullSuite"
+    )
     if not isinstance(full_suite, list):
         return {"detail": "exploration did not return an array for verification.fullSuite"}
 
@@ -323,4 +340,40 @@ def verification_passed_gate(result: object) -> dict[str, str] | None:
             "the verification suite did not pass and reported no detail "
             f"(result: {_json(dict(result))})"
         ),
+    }
+
+
+# The `validate_spec` / `validate_plan` gate (`builtin/task.yaml` lines 40 and
+# 54), ported from task.js lines 631-638 and 717-721. The critic is asked to
+# REPORT whether the spec or the plan has unresolvable blockers and never to
+# decide what to do about them, for the reason `review_gate` exists: an agent
+# that both measures and judges can talk itself out of the judgement. One
+# callable serves both phases -- the engine's own failure message already names
+# which one stopped (`phase 'validate_plan' gate 'critic_blockers_gate'
+# failed: ...`), so a per-phase `blocked` value would only duplicate it.
+def critic_blockers_gate(result: object) -> dict[str, str] | None:
+    """``None`` when the critic found no blockers, else a blocked verdict.
+
+    ``result`` is the critic phase's own result: both ``engine._gate_values``
+    and ``dispatch.gate_values`` place it under exactly that key, which is why
+    the parameter is not named after either phase.
+
+    A dead validator -- ``None``, or anything that is not a ``Mapping`` -- is
+    itself a block, checked before ``blockers`` rather than falling out of its
+    falsiness. Silence is not consent: a validation phase that produced no
+    judgement has not cleared the spec, and reading that as a pass is how an
+    unvalidated plan reaches ``implement``.
+    """
+    if not isinstance(result, Mapping):
+        return {"blocked": "validation", "detail": "the validator returned nothing"}
+    if not _field(result, "blockers"):
+        return None
+    raw_reason = _field(result, "reason")
+    # Mirrors JS `String(reason || '')`: any falsy value becomes the empty
+    # string, and `_js_text` keeps a non-string readable as the harness JSON it
+    # came from rather than as a Python repr.
+    reason = ("" if not raw_reason else _js_text(raw_reason)).strip()
+    return {
+        "blocked": "validation",
+        "detail": reason or "spec has unresolvable blockers",
     }

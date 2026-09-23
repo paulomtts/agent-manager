@@ -56,6 +56,7 @@ def test_subtask_context_renames_the_model_fields_the_steps_ask_for():
         "parent_story_details": None,
         "branch": "m1/task-ed77a917",
         "base": "m1/story-base",
+        "base_branch": "m1/story-base",
         "worktree": Path("/repo/.claude/worktrees/m1/task-ed77a917"),
         "repo_dir": REPO,
         "commands": ["uv run pytest"],
@@ -77,8 +78,31 @@ def test_the_cards_land_under_the_details_keys_and_leave_the_id_string_alone():
 
 
 def test_the_new_context_keys_are_reserved_against_a_same_named_phase():
-    for key in ("card_details", "parent_story_details", "spec_path", "plan_path"):
+    for key in (
+        "card_details",
+        "parent_story_details",
+        "spec_path",
+        "plan_path",
+        "base_branch",
+    ):
         assert key in engine.RESERVED_CONTEXT_KEYS
+
+
+def test_the_base_branch_alias_is_the_same_string_the_steps_bind_as_base():
+    """`review_gate(review, branch, base_branch)` binds by parameter name, and
+    the deterministic steps bind the same value as `base`. One value, two keys,
+    rather than a second source of truth for the base branch."""
+    context = engine.subtask_context(_subtask(), REPO)
+    assert context["base_branch"] == context["base"] == "m1/story-base"
+
+
+def test_a_phase_named_base_branch_cannot_overwrite_the_alias():
+    """Same rule as the `worktree` phase: a result must never replace a key a
+    later gate binds from. `_bind_result` is called directly here because the
+    rule is a property of that function, not of any particular document."""
+    context = engine.subtask_context(_subtask(), REPO)
+    engine._bind_result(context, "base_branch", {"branch": "somewhere/else"})
+    assert context["base_branch"] == "m1/story-base"
 
 
 def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
@@ -1943,3 +1967,34 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
         )
 
     assert "worktree" in str(caught.value)
+
+
+def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path):
+    """A caller that could set `base_branch` would point `review_gate` at a base
+    the engine never derived, while every step still used the real one."""
+    registry = FunctionRegistry()
+    registry.register("only.step", lambda: {"ok": True})
+    document = tmp_path / "one.yaml"
+    document.write_text(
+        "name: one\n"
+        "description: one deterministic phase\n"
+        "phases:\n"
+        "  - name: only\n"
+        "    kind: deterministic\n"
+        "    run: only.step\n",
+        encoding="utf-8",
+    )
+    workflow = load_workflow(document, registry)
+    store = store_module.Store.open(tmp_path, "run-extra-3")
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id="story-1",
+            subtask=_subtask(),
+            repo_dir=REPO,
+            extra_context={"base_branch": "somewhere/else"},
+        )
+
+    assert "base_branch" in str(caught.value)

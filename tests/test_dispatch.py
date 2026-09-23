@@ -16,7 +16,16 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from agent_manager import dispatch, engine, models, paths, prompt, store as store_module
+from agent_manager import (
+    cli,
+    dispatch,
+    engine,
+    models,
+    paths,
+    prompt,
+    results,
+    store as store_module,
+)
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
@@ -948,3 +957,51 @@ def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path,
         if line.event == "phase_upsert"
     ][-1]
     assert "OSError: the run directory went away" in detail
+
+
+# ── the production default, which no other test in this file can see ─────────
+# `_runner` always injects `result_models={"FakeResult": FakeResult}` and
+# `overrides` can only replace that key, never omit it -- so these two
+# construct their runners directly. Neither dispatches: construction is the
+# whole assertion.
+
+
+def test_a_default_runner_carries_the_shipped_result_model_table(store):
+    runner = dispatch.AgentRunner(
+        workflow=_workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None}),
+        store=store,
+        launcher=FakeLauncher(results=[VALID_RESULT]),
+        run_id=RUN_ID,
+        story_id=STORY_ID,
+        card_id=CARD,
+    )
+
+    assert runner.result_models == results.RESULT_MODELS
+    # A copy, not the module object: one runner must not be able to corrupt the
+    # table every later runner in this process will be built from.
+    assert runner.result_models is not results.RESULT_MODELS
+    assert isinstance(runner.result_models, dict)
+    runner.result_models.pop("ExploreResult")
+    assert "ExploreResult" in results.RESULT_MODELS
+
+
+def test_the_production_runner_factory_carries_the_shipped_table(store):
+    # `cli.default_runner_factory` omits `result_models` on purpose. This is the
+    # path the addendum section 1 smoke takes, and the only test that walks it.
+    runner = cli.default_runner_factory(
+        workflow=_workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None}),
+        store=store,
+        run_id=RUN_ID,
+        story_id=STORY_ID,
+        card_id=CARD,
+    )
+
+    assert isinstance(runner, dispatch.AgentRunner)
+    assert runner.result_models == results.RESULT_MODELS
+    assert set(runner.result_models) == {
+        "ExploreResult",
+        "CriticResult",
+        "PlanResult",
+        "ImplementResult",
+        "ReviewResult",
+    }
