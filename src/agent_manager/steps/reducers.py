@@ -111,4 +111,9 @@ def exploration_output_gate(
             }
         return None
 
+    if any(not isinstance(cmd, str) or len(cmd.strip()) < 3 for cmd in full_suite):
+        return {
+            "detail": "exploration's verification.fullSuite contains an implausible "
+            f"command: {_json(full_suite)}"
+        }
     return None

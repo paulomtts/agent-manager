@@ -164,3 +164,43 @@ def test_a_non_array_full_suite_is_caught(not_a_list):
         {"summary": REAL_SUMMARY, "verification": {"fullSuite": not_a_list}}, None
     )
     assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
+
+
+def test_a_single_letter_full_suite_command_is_caught():
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["a"]}}, None
+    )
+    assert "implausible command" in gate["detail"]
+    assert gate["detail"].endswith('["a"]')
+
+
+@pytest.mark.parametrize("bad", [3, None, ["uv run pytest"], "  x  ", ""])
+def test_a_non_string_or_too_short_entry_is_caught_not_raised(bad):
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["uv run pytest", bad]}}, None
+    )
+    assert "implausible command" in gate["detail"]
+
+
+def test_an_entry_json_cannot_serialise_still_produces_a_verdict():
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"fullSuite": [object()]}}, None
+    )
+    assert "implausible command" in gate["detail"]
+
+
+def test_an_empty_full_suite_is_not_an_implausible_command():
+    # Emptiness is verification_gate's business, not this gate's.
+    assert (
+        exploration_output_gate({"summary": REAL_SUMMARY, "verification": {"fullSuite": []}}, None)
+        is None
+    )
+
+
+def test_an_empty_caller_provided_mapping_takes_the_plausibility_branch():
+    # {} is truthy in JS but falsy in Python, so the port checks plausibility
+    # here rather than exact equality. Recorded deliberately.
+    explore_ok = {"summary": REAL_SUMMARY, "verification": REAL_VERIFICATION}
+    assert exploration_output_gate(explore_ok, {}) is None
+    explore_bad = {"summary": REAL_SUMMARY, "verification": {"fullSuite": ["a"]}}
+    assert "implausible command" in exploration_output_gate(explore_bad, {})["detail"]
