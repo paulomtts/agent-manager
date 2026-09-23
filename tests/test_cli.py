@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, cli
-from agent_manager.errors import AgentPhaseFailed
+from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.workflow.registry import WorkflowLoadError
 
 
 def test_render_is_one_line_of_json_by_default():
@@ -447,3 +448,208 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
         ).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+@requires_git
+@requires_brd
+def test_an_unknown_card_is_an_envelope_with_brds_own_message(project, cards, monkeypatch):
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, "no-such-card")
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "BoardError"
+    assert "no-such-card" in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@requires_git
+@requires_brd
+def test_a_parentless_card_is_refused_before_a_run_exists(project, cards, monkeypatch):
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["milestone"])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "ParentlessCardError"
+    assert cards["milestone"] in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@requires_git
+@requires_brd
+def test_a_failing_parent_lookup_is_an_envelope_and_leaves_no_run_directory(
+    project, cards, monkeypatch
+):
+    """`board.show` runs twice, and the second call can fail on its own."""
+    real_show = board.show
+
+    def show(card_id, *, repo_dir=None):
+        if card_id == cards["story"]:
+            raise board.BoardError(
+                "card not found", argv=["brd", "show", card_id], exit_code=1
+            )
+        return real_show(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(cli.board, "show", show)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    assert json.loads(result.stdout)["error"]["type"] == "BoardError"
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def test_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            "cbe34d00-9d8d-4f41-9c94-f99e665771b0",
+            "--repo-dir",
+            str(tmp_path / "missing"),
+        ],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "RepoDirError"
+    assert "missing" in envelope["error"]["message"]
+
+
+@requires_git
+@requires_brd
+def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
+    project, cards, monkeypatch
+):
+    """`dag.short_id` raises a bare ValueError, and the run id is minted from the
+    card id brd returned. A board that answers with a non-UUID id must not take
+    the tool down with a stack trace."""
+
+    def show(card_id, *, repo_dir=None):
+        if card_id == cards["subtask"]:
+            return models.Card(
+                id="not-a-uuid", title="Odd card", status="todo", parent_id=cards["story"]
+            )
+        return models.Card(id=cards["story"], title="A story", status="todo")
+
+    monkeypatch.setattr(cli.board, "show", show)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "ValueError"
+    assert "not a card id" in envelope["error"]["message"]
+
+
+@requires_git
+@requires_brd
+def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, monkeypatch):
+    """`run_subtask` deliberately lets `EngineError` out rather than journalling
+    it as a phase failure: an unbindable gate is a document bug, not an attempt."""
+
+    def exploding(*args, **kwargs):
+        raise EngineError("no value for a required parameter", phase="explore")
+
+    monkeypatch.setattr(cli.engine, "run_subtask", exploding)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "EngineError"
+    assert "explore" in envelope["error"]["message"]
+
+
+@requires_git
+@requires_brd
+def test_a_workflow_that_will_not_load_reaches_the_operator_unchanged(
+    project, cards, monkeypatch
+):
+    """A broken document is a load-time bug: the loader's own message names the
+    workflow, the phase and the field, and the CLI must not paraphrase it."""
+
+    def exploding(name, registry=None):
+        raise WorkflowLoadError(
+            "names 1 function(s) nobody registered", workflow="task", phase="verify"
+        )
+
+    monkeypatch.setattr(cli, "load_builtin", exploding)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["error"]["type"] == "WorkflowLoadError"
+    assert "verify" in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@requires_git
+@requires_brd
+def test_no_harness_is_ever_launched(project, cards, monkeypatch):
+    """§14's adapter rule at the CLI seam: the launcher is injected, so a test
+    that gets as far as launching one has already failed. `run_direct` is the
+    only thing `default_runner_factory` would hand to a real `AgentRunner`."""
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the CLI launched a harness process")
+
+    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+    assert payload["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
+    project, cards
+):
+    """§12's escape hatch, asserted at the seam this card owns.
+
+    The gate itself runs inside `dispatch.AgentRunner`, which these tests replace
+    with a fake -- so the honest assertion is that the context the CLI hands the
+    engine drives the *real* `verification_gate` to the two verdicts §12
+    describes. The gate's own truth table is unit-tested in
+    `tests/steps/test_reducers.py` and is not re-tested here.
+    """
+    from agent_manager.steps.reducers import verification_gate
+
+    seen_off: list[tuple[str, dict[str, Any]]] = []
+    cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        runner_factory=lambda **kwargs: fake_runner(seen_off),
+    )
+    off = seen_off[0][1]
+    blocked = verification_gate(
+        off["suite_cmds"], off["allow_no_verification"], off["caller_provided"]
+    )
+    assert blocked["blocked"] == "verification"
+
+    seen_on: list[tuple[str, dict[str, Any]]] = []
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        allow_no_verification=True,
+        runner_factory=lambda **kwargs: fake_runner(seen_on),
+    )
+    on = seen_on[0][1]
+    assert on["allow_no_verification"] is True
+    assert (
+        verification_gate(on["suite_cmds"], on["allow_no_verification"], on["caller_provided"])
+        is None
+    )
+    assert payload["status"] == "done"
