@@ -453,6 +453,51 @@ def test_an_unknown_attempt_number_is_refused_and_names_the_attempts_that_exist(
     message = str(caught.value)
     assert "7" in message
     assert "implement" in message
+    assert "recorded attempts: 1" in message
+
+
+def test_an_explicit_phase_with_no_attempts_is_the_attempt_refusal():
+    """`--phase verify` on a pending deterministic phase is an operator typing a
+    real phase name. Without its own guard the default branch would reach `max()`
+    over an empty list and surface a bare `ValueError` instead of the refusal
+    that names the phase."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(
+                name="implement", kind="agent", status="done", attempts=[_pure_attempt(1)]
+            ),
+            models.PhaseRun(name="verify", kind="deterministic", status="pending"),
+        ],
+    )
+
+    with pytest.raises(cli.UnknownAttemptError) as caught:
+        cli.select_attempt(subtask, phase="verify")
+
+    message = str(caught.value)
+    assert "verify" in message
+    assert "card-1" in message
+
+
+def test_the_default_attempt_is_the_highest_n_not_the_last_recorded():
+    """Ordering by `n` is `load_run`'s promise, not the model's, and this function
+    is also called with trees built by hand -- so the selection is `max`, and a
+    tree whose attempts arrive out of order still reports the newest one."""
+    subtask = _pure_subtask(
+        "card-1",
+        [
+            models.PhaseRun(
+                name="implement",
+                kind="agent",
+                status="done",
+                attempts=[_pure_attempt(2), _pure_attempt(1, "gate_failed")],
+            )
+        ],
+    )
+
+    _, attempt = cli.select_attempt(subtask)
+
+    assert attempt.n == 2
 
 
 def test_a_card_with_no_attempts_at_all_is_the_attempt_refusal():
