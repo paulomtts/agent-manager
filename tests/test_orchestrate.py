@@ -24,6 +24,7 @@ import pytest
 from agent_manager import board, census, cli, dag, engine, models, orchestrate, paths
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
+from agent_manager.workflow.registry import WorkflowLoadError
 
 
 # ── pure plans ──────────────────────────────────────────────────────────────
@@ -548,6 +549,27 @@ def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project
     assert list(paths.data_dir().iterdir()) == []
     assert not (project / ".claude").exists()
     assert _git(project, "status", "--porcelain") == porcelain_before
+
+
+@requires_git
+@requires_brd
+def test_a_workflow_that_will_not_load_is_refused_before_anything_is_written(
+    project, monkeypatch
+):
+    """The preflight `run_card` does: a workflow that will not load refuses the
+    run before the fetch, the prune, the store or the first subtask."""
+    shape = _milestone(project, {"A": 1})
+    monkeypatch.setattr(cli, "WORKFLOW_NAME", "no-such-workflow")
+    git_calls = _record_git(monkeypatch)
+    driver = FakeDriver()
+
+    with pytest.raises(WorkflowLoadError) as caught:
+        _run(project, shape["milestone"], driver)
+
+    assert "no-such-workflow" in str(caught.value)
+    assert driver.calls == []
+    assert git_calls == []
+    assert list(paths.data_dir().iterdir()) == []
 
 
 @requires_git
