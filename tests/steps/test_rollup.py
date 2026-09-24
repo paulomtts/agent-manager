@@ -114,3 +114,42 @@ def test_an_empty_card_id_raises_board_error(temp_board):
     # A context key that was never populated must fail loudly, not write nothing.
     with pytest.raises(board.BoardError):
         rollup.set_status("", "done", repo_dir=temp_board)
+
+
+# --- Pure-function tier (design §14): the status computation, no board. ---
+
+
+def test_stored_status_flattens_blocked_to_todo():
+    assert rollup.stored_status("blocked") == "todo"
+    assert rollup.stored_status("todo") == "todo"
+    assert rollup.stored_status("in_progress") == "in_progress"
+    assert rollup.stored_status("done") == "done"
+
+
+def test_rollup_status_is_none_without_children():
+    assert rollup.rollup_status([]) is None
+
+
+def test_rollup_status_is_todo_when_every_child_is_todo():
+    assert rollup.rollup_status(["todo", "todo"]) == "todo"
+
+
+def test_rollup_status_counts_blocked_children_as_todo():
+    assert rollup.rollup_status(["todo", "blocked"]) == "todo"
+    assert rollup.rollup_status(["blocked"]) == "todo"
+
+
+def test_rollup_status_is_done_when_every_child_is_done():
+    assert rollup.rollup_status(["done", "done"]) == "done"
+
+
+def test_rollup_status_is_in_progress_by_progress_not_least_advanced():
+    # One done child among unstarted ones means the parent is under way.
+    assert rollup.rollup_status(["done", "todo"]) == "in_progress"
+    assert rollup.rollup_status(["done", "blocked"]) == "in_progress"
+    assert rollup.rollup_status(["in_progress"]) == "in_progress"
+    assert rollup.rollup_status(["todo", "in_progress", "done"]) == "in_progress"
+
+
+def test_rollup_status_accepts_a_generator():
+    assert rollup.rollup_status(s for s in ["done", "done"]) == "done"

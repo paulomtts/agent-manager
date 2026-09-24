@@ -18,9 +18,40 @@ the bare id string is `card` (`engine.py:98`, `bind_arguments` at
 would fail to bind and the engine would report a missing required parameter.
 """
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from agent_manager import board
+
+MAX_ANCESTRY_DEPTH = 16
+"""Most ancestors the walk will visit; a guard against a corrupted parent chain."""
+
+
+def stored_status(status: str) -> str:
+    """The status as brd would store it: `blocked` is derived, so it reads as `todo`.
+
+    brd computes `blocked` at read time from the dependency graph and refuses
+    to store it, so every comparison flattens it here, in one place.
+    """
+    return "todo" if status == "blocked" else status
+
+
+def rollup_status(children_statuses: Iterable[str]) -> str | None:
+    """A parent's status computed from its direct children, by progress.
+
+    `None` when there are no children (the parent is not written); `todo` when
+    every child is unstarted; `done` when every child is done; otherwise
+    `in_progress` -- one finished child among unstarted ones means the parent
+    is under way, not unstarted. A port of leave-me-alone's `rollupStatus`.
+    """
+    statuses = [stored_status(status) for status in children_statuses]
+    if not statuses:
+        return None
+    if all(status == "todo" for status in statuses):
+        return "todo"
+    if all(status == "done" for status in statuses):
+        return "done"
+    return "in_progress"
 
 
 def set_status(
