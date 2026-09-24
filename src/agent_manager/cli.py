@@ -123,6 +123,16 @@ class NotResumableError(CliError):
     """
 
 
+class MilestoneRunNotImplementedError(CliError):
+    """`run --milestone` without `--dry-run`: the real milestone run is not built yet.
+
+    A `CliError` so it rides `HANDLED` into an `ok: false` envelope at exit 3.
+    It is raised before the repo dir is resolved or the board is read, so a
+    refusal reads nothing and writes nothing. The next story replaces it with
+    the real run.
+    """
+
+
 def resolve_repo_dir(repo_dir: Path) -> Path:
     """`--repo-dir` as an existing absolute directory, or `RepoDirError`.
 
@@ -865,6 +875,37 @@ should crash loudly with its stack intact.
 """
 
 
+def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool) -> None:
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` combination as a usage error.
+
+    `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
+    reserves. It is raised before the `HANDLED` try block, so nothing is read
+    or dispatched. A blank `--milestone` is refused here too: the census strips
+    the needle, and an empty needle is a substring of every title, so on a
+    one-milestone board it would silently pick that milestone.
+    """
+    if card is not None and milestone is not None:
+        raise typer.BadParameter(
+            "give --card or --milestone, not both",
+            param_hint="'--card' / '--milestone'",
+        )
+    if card is None and milestone is None:
+        raise typer.BadParameter(
+            "one of --card or --milestone is required",
+            param_hint="'--card' / '--milestone'",
+        )
+    if milestone is not None and not milestone.strip():
+        raise typer.BadParameter(
+            "--milestone needs a card id or a title substring, not a blank string",
+            param_hint="'--milestone'",
+        )
+    if dry_run and card is not None:
+        raise typer.BadParameter(
+            "--dry-run previews a milestone and does not apply to --card",
+            param_hint="'--dry-run'",
+        )
+
+
 @app.command("run")
 def run(
     card: str | None = typer.Option(
@@ -907,8 +948,14 @@ def run(
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card end to end, or preview a milestone with --dry-run."""
+    _check_run_targets(card=card, milestone=milestone, dry_run=dry_run)
     try:
-        if milestone is not None and dry_run:
+        if milestone is not None and not dry_run:
+            raise MilestoneRunNotImplementedError(
+                f"milestone runs are not implemented yet; `run --milestone {milestone}"
+                " --dry-run` previews the levels and stack bases without writing anything"
+            )
+        if milestone is not None:
             payload = dry_run_milestone(
                 milestone,
                 repo_dir=repo_dir,

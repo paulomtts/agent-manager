@@ -2462,6 +2462,75 @@ def test_a_milestone_dry_run_outside_a_brd_project_is_a_board_error(tmp_path, mo
     assert list(paths.data_dir().iterdir()) == []
 
 
+SOME_CARD = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
+
+
+@pytest.mark.parametrize(
+    "targets, word",
+    [
+        (["--card", SOME_CARD, "--milestone", "2"], "both"),
+        (["--card", SOME_CARD, "--milestone", "2", "--dry-run"], "both"),
+        ([], "required"),
+        (["--dry-run"], "required"),
+        (["--card", SOME_CARD, "--dry-run"], "previews"),
+        (["--milestone", "", "--dry-run"], "blank"),
+        (["--milestone", "   ", "--dry-run"], "blank"),
+    ],
+)
+def test_bad_run_targets_are_usage_errors_that_start_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    """Validation happens before the `HANDLED` try block, so these are Typer's
+    exit 2 and never an envelope. Nothing is dispatched: `run_card` and
+    `dry_run_milestone` are both forbidden here."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+
+    result = runner.invoke(
+        cli.app,
+        ["run", *targets, "--repo-dir", str(tmp_path), "--branch-prefix", "m2"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_a_milestone_run_without_dry_run_is_a_not_implemented_envelope(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+
+    error = _refusal(
+        runner.invoke(
+            cli.app,
+            [
+                "run",
+                "--milestone",
+                "2",
+                "--repo-dir",
+                str(tmp_path),
+                "--branch-prefix",
+                "m2",
+            ],
+        )
+    )
+
+    assert error["type"] == "MilestoneRunNotImplementedError"
+    assert "not implemented" in error["message"]
+    assert "--dry-run" in error["message"]
+    assert not (paths.data_dir() / "runs").exists()
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_the_not_implemented_refusal_is_a_cli_error():
+    assert issubclass(cli.MilestoneRunNotImplementedError, cli.CliError)
+
+
 @pytest.fixture
 def projection(tmp_path, monkeypatch) -> Path:
     """A project root whose SQLite projection is written directly.
