@@ -1187,6 +1187,10 @@ def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
     }
 
 
+def test_the_not_implemented_refusal_is_a_cli_error():
+    assert issubclass(cli.MilestoneRunNotImplementedError, cli.CliError)
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
@@ -2525,10 +2529,6 @@ def test_a_milestone_run_without_dry_run_is_a_not_implemented_envelope(
     assert "--dry-run" in error["message"]
     assert not (paths.data_dir() / "runs").exists()
     assert list(paths.data_dir().iterdir()) == []
-
-
-def test_the_not_implemented_refusal_is_a_cli_error():
-    assert issubclass(cli.MilestoneRunNotImplementedError, cli.CliError)
 
 
 @pytest.fixture
