@@ -1,7 +1,11 @@
 import pytest
 
+from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
+    is_story_closed,
+    is_subtask_done,
     ref_matches_card,
+    remaining_subtasks,
     short_id,
     slugify,
     task_branch,
@@ -134,3 +138,52 @@ def test_ref_matches_card_treats_a_none_ref_as_the_empty_string():
 def test_ref_matches_card_still_validates_the_card_id_for_an_empty_ref():
     with pytest.raises(ValueError, match="not a card id"):
         ref_matches_card("", "nope")
+
+
+# ── doneness, levels and cycles ─────────────────────────────────────────────
+
+
+def _sub(id: str, status: str = "todo") -> SubtaskPlan:
+    return SubtaskPlan(id=id, title=f"subtask {id}", status=status)
+
+
+def _story(
+    id: str,
+    blocked_by: list[str] | None = None,
+    status: str = "todo",
+    subtasks: list[SubtaskPlan] | None = None,
+) -> StoryPlan:
+    """A story; by default open with one todo subtask, so it is pending."""
+    return StoryPlan(
+        id=id,
+        title=f"story {id}",
+        status=status,
+        blocked_by=list(blocked_by or []),
+        subtasks=[_sub(f"{id}1")] if subtasks is None else subtasks,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("done", True), ("DONE", True), ("Done", True), ("todo", False), ("in_progress", False)],
+)
+def test_doneness_is_case_insensitive_for_subtasks_and_stories(status, expected):
+    assert is_subtask_done(_sub("s", status)) is expected
+    assert is_story_closed(_story("a", status=status)) is expected
+
+
+def test_doneness_treats_a_missing_status_as_not_done():
+    assert is_subtask_done(SubtaskPlan(id="s", title="s", status=None)) is False
+    story = StoryPlan(id="a", title="a", status=None, blocked_by=[], subtasks=[])
+    assert is_story_closed(story) is False
+
+
+def test_a_closed_story_has_no_remaining_subtasks_even_if_they_are_todo():
+    story = _story("a", status="done", subtasks=[_sub("a1"), _sub("a2", "in_progress")])
+    assert remaining_subtasks(story) == []
+
+
+def test_an_open_story_keeps_its_not_done_subtasks_in_order():
+    a1, a2, a3, a4 = _sub("a1", "done"), _sub("a2"), _sub("a3", "DONE"), _sub("a4", "in_progress")
+    story = _story("a", subtasks=[a1, a2, a3, a4])
+    assert remaining_subtasks(story) == [a2, a4]

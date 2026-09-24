@@ -17,6 +17,8 @@ This module is pure: no I/O, no subprocesses, no ``brd``.
 import re
 from collections.abc import Mapping
 
+from agent_manager.census import StoryPlan, SubtaskPlan
+
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
@@ -72,3 +74,36 @@ def ref_matches_card(ref: object, card_id: object) -> bool:
     orphan the branch that was named from the old title.
     """
     return short_id(card_id) in str("" if ref is None else ref)
+
+
+# ── doneness ────────────────────────────────────────────────────────────────
+# Port of orchestrator.js:84-101. brd `status` is the only source of truth for
+# doneness; there is no other field to consult.
+
+
+def is_subtask_done(subtask: SubtaskPlan) -> bool:
+    """True when the subtask's brd status is ``done``, in any case."""
+    return (subtask.status or "").lower() == "done"
+
+
+def is_story_closed(story: StoryPlan) -> bool:
+    """True when the story's own brd status is ``done``, in any case.
+
+    A story marked done is finished, full stop: its subtasks are never
+    re-dispatched. During the 2026-08-17 outage per-subtask lookups returned
+    null and closed stories were re-implemented. The story's single status
+    field cannot be corrupted piecemeal, so it is the safer gate; a story
+    closed by mistake is reopened by hand.
+    """
+    return (story.status or "").lower() == "done"
+
+
+def remaining_subtasks(story: StoryPlan) -> list[SubtaskPlan]:
+    """The story's not-done subtasks in census order; none if the story is closed.
+
+    The census already ordered the subtasks by their ``blocked_by`` chain, so
+    nothing is re-sorted here.
+    """
+    if is_story_closed(story):
+        return []
+    return [subtask for subtask in story.subtasks if not is_subtask_done(subtask)]
