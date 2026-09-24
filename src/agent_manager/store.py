@@ -154,6 +154,7 @@ class Journal:
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         self.path = paths.run_dir(run_id) / JOURNAL_NAME
+        self._seq = self.last_seq()
 
     def last_seq(self) -> int:
         """Highest sequence number already on disk, or 0 for a fresh journal."""
@@ -198,12 +199,14 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        The sequence number is read from disk on every call rather than cached,
-        so a second writer attached to the same run continues the sequence
-        instead of reusing a number.
+        One process writes a given run (P2). The sequence number is read from
+        disk once, when the journal is opened, and cached; appending never
+        re-reads the file. The cached number advances only once the line is
+        on disk.
         """
+        seq = self._seq + 1
         line = JournalLine(
-            seq=self.last_seq() + 1,
+            seq=seq,
             ts=datetime.now(timezone.utc),
             run_id=self.run_id,
             event=event,
@@ -218,6 +221,7 @@ class Journal:
             handle.write(text + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        self._seq = seq
         return line
 
 

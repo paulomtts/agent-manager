@@ -159,19 +159,109 @@ def test_a_reopened_journal_continues_the_sequence(repo):
     assert [line.payload["i"] for line in second.read()] == [0, 1, 2]
 
 
-def test_two_writers_on_one_run_never_reuse_a_sequence_number(repo):
-    # Review Focus 3: the sequence is derived from what is on disk at append
-    # time, not cached at construction, so a second writer cannot collide.
-    first = store.Journal(RUN_ID)
-    second = store.Journal(RUN_ID)
-    seqs = [
-        first.append("run_upsert", {"w": "a"}).seq,
-        second.append("run_upsert", {"w": "b"}).seq,
-        first.append("run_upsert", {"w": "a"}).seq,
-    ]
-    assert seqs == [1, 2, 3]
-    assert len({line.seq for line in first.read()}) == 3
+def test_appending_reads_nothing_from_disk_once_the_journal_is_open(repo, monkeypatch):
+    # P2: one process writes a run, so the counter is read once, at open, and
+    # appending never re-reads the file. Counted, not timed (P7).
+    calls = {"read": 0, "last_seq": 0}
+    real_read = store.Journal.read
+    real_last_seq = store.Journal.last_seq
 
+    def counting_read(self):
+        calls["read"] += 1
+        return real_read(self)
+
+    def counting_last_seq(self):
+        calls["last_seq"] += 1
+        return real_last_seq(self)
+
+    monkeypatch.setattr(store.Journal, "read", counting_read)
+    monkeypatch.setattr(store.Journal, "last_seq", counting_last_seq)
+
+    journal = store.Journal(RUN_ID)
+    calls["read"] = 0
+    calls["last_seq"] = 0
+
+    seqs = [journal.append("run_upsert", {"i": i}).seq for i in range(50)]
+
+    assert calls == {"read": 0, "last_seq": 0}
+    assert seqs == list(range(1, 51))
+
+
+def test_a_fresh_journal_on_an_existing_run_continues_after_the_last_line(repo):
+    first = store.Journal(RUN_ID)
+    for i in range(3):
+        first.append("run_upsert", {"i": i})
+
+    resumed = store.Journal(RUN_ID)
+    assert resumed.append("run_upsert", {"i": 3}).seq == 4
+    assert resumed.append("run_upsert", {"i": 4}).seq == 5
+    assert [line.seq for line in resumed.read()] == [1, 2, 3, 4, 5]
+
+
+def test_a_resumed_store_continues_the_journal_sequence(repo):
+    # Review Focus 5: `Store.open` builds the journal, so a resumed run
+    # numbers its next record after the last line already on disk.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    reopened = store.Store.open(repo, RUN_ID)
+    try:
+        line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
+    finally:
+        reopened.close()
+
+    assert line.seq == 2
+    assert [line.seq for line in store.Journal(RUN_ID).read()] == [1, 2]
+
+
+def test_a_journal_of_only_blank_lines_opens_at_zero(repo):
+    # Review Focus 1: a crash between write and flush can leave blank lines
+    # and nothing else. That is an empty journal, not a corrupt one.
+    first = store.Journal(RUN_ID)
+    first.path.write_text("\n\n", encoding="utf-8")
+
+    journal = store.Journal(RUN_ID)
+    assert journal.append("run_upsert", {"i": 0}).seq == 1
+
+
+def test_a_journal_opened_on_out_of_order_lines_continues_after_the_highest(repo):
+    # Review Focus 2: the counter is the highest seq on disk, not the seq of
+    # the last line in file order.
+    first = store.Journal(RUN_ID)
+    first.append("run_upsert", {"i": 1})
+    for seq in (3, 2):
+        _append_raw(
+            first,
+            {
+                "seq": seq,
+                "ts": "2026-09-23T10:00:00+00:00",
+                "run_id": RUN_ID,
+                "event": "run_upsert",
+                "payload": {"i": seq},
+            },
+        )
+
+    journal = store.Journal(RUN_ID)
+    assert journal.append("run_upsert", {"i": 4}).seq == 4
+    assert [line.seq for line in journal.read()] == [1, 2, 3, 4]
+
+
+def test_opening_a_corrupt_journal_raises_at_open(repo):
+    # The counter is read at open, so a corrupt journal is reported there
+    # rather than at the first append.
+    first = store.Journal(RUN_ID)
+    first.append("run_upsert", {"i": 0})
+    with first.path.open("a", encoding="utf-8") as handle:
+        handle.write("this is not json\n")
+
+    with pytest.raises(store.CorruptJournalError) as excinfo:
+        store.Journal(RUN_ID)
+    message = str(excinfo.value)
+    assert str(first.path) in message
+    assert ":2:" in message
 
 def test_reading_a_journal_that_does_not_exist_raises(repo):
     journal = store.Journal("run-never-started")
