@@ -2,7 +2,7 @@
 
 Date: 2026-09-23
 Amends: `2026-09-23-agent-manager-design.md` (§6 step 2, §8, §14)
-Status: derived from a failed smoke test; decisions R1–R4 follow from D4 and D6 of the main spec
+Status: implemented and merged (milestone 2). R1–R4 follow from D4 and D6 of the main spec; R5–R10 were found by running it (section 5)
 
 ## 1. Why this exists
 
@@ -52,6 +52,7 @@ reads `reducers.py` first and reconciles the spelling in one place, with a test.
 |---|---|
 | `ExploreResult` | `refused: bool`, `reason: str \| None`, `summary: str`, `verification: {full_suite: list[str], typecheck: str, lint: list[str]}` |
 | `CriticResult` | `blockers: bool`, `reason: str \| None`, `summary: str` |
+| `SpecResult` | `path: str`, `note: str \| None` (added by R5) |
 | `PlanResult` | `path: str`, `self_reviewed: bool`, `note: str \| None` |
 | `ImplementResult` | `blocked: bool`, `blocked_reason: str \| None`, `resumed: bool`, `plan_hash: str`, `report: str` |
 | `ReviewResult` | `findings: list[str]`, `unresolved_blockers: list[str]`, `fix_summary: str`, `porcelain: str`, `commit_count: int`, `tagged_count: int`, `plan_hash: str` |
@@ -116,3 +117,42 @@ Found while scoping, none of it needed here:
   `tagged_count` are measurements an agent is asked to run and report verbatim.
   A deterministic step can measure them with `git`, which removes an agent's
   chance to misreport them. Not in scope here; worth doing.
+
+## 5. Amendments found by running it
+
+The wiring test and two real-harness runs on a toy repo found six more open
+seams after R1–R4 shipped. Each was verified against the code before it was
+fixed, and each is now built.
+
+- **R5 — Every agent phase has a result contract**, `spec` included, via
+  `SpecResult`. `dispatch._attempt` used to pass `result_path=None` for a phase
+  with no model, and `classify` called `.is_file()` on it. A phase with no
+  result model is now judged on exit status alone and cannot crash the runner.
+- **R6 — The worktree exists before any agent phase.** `task.yaml` ran
+  `explore` first, but the runner refuses to dispatch without a worktree, and
+  an explore in the main checkout would read the wrong code for a subtask
+  stacked on another branch.
+- **R7 — `rollup.set_status` is a real step** calling `board.set_status`. It was
+  a registry placeholder, and both status phases are `best_effort`, so a run
+  would have reported success while the board never moved. Ancestor roll-up is
+  still deferred (section 4).
+- **R8 — The engine commits the spec and plan.** Nobody did: the old pipeline's
+  implement agent did it through a prompt that was never ported, so the tree
+  was dirty and `review_gate` blocked.
+- **R9 — The coder is told the plan hash and must tag every commit.** Its first
+  real commit carried no trailer, so the every-commit-tagged check could not
+  pass even with the docs committed.
+- **R10 — The plan gets its `<!-- task-pipeline: validated -->` marker** from a
+  deterministic step, so `plan_check` can reuse a plan on resume.
+
+The plan hash is the first 8 hex characters of sha256 of the plan file,
+computed after the marker is appended, because the marker changes the bytes.
+
+**Lesson, and the rule to keep:** a fake harness must never know more than the
+brief tells it. The first wiring test passed while the real agent failed
+because its fake computed the plan hash and committed the docs itself. The
+plan hash, the docs commit and the marker are mechanism, so the engine does
+them; agents only write code and tag commits.
+
+**Acceptance, met:** a real `claude -p` took a toy card to `done` on the board
+through `am run` (all 14 phases; two commits, both tagged; clean tree).
