@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_manager import board, census, cli, dag, models
-from agent_manager.steps import worktree
+from agent_manager.steps import rollup, worktree
 from agent_manager.store import Store
 from agent_manager.workflow.loader import load_builtin
 
@@ -150,6 +150,47 @@ def refresh_git(root: Path) -> None:
     worktree.run_git(["-C", str(root), "worktree", "prune"])
 
 
+def stale_story_anchors(
+    stories: Sequence[census.StoryPlan],
+) -> list[tuple[census.StoryPlan, census.SubtaskPlan]]:
+    """Each stale story paired with the subtask its rollup is re-run through.
+
+    A port of `storyRollupAnchor`. A story is stale when it is not closed but
+    has no remaining subtasks: every subtask is done and the story card never
+    caught up, for example because an earlier run died between the last
+    `mark_done` and its rollup. The anchor is its last individually done
+    subtask in census order. A story with no done subtask, such as one with no
+    subtasks at all, has no anchor and is skipped.
+    """
+    anchors: list[tuple[census.StoryPlan, census.SubtaskPlan]] = []
+    for story in stories:
+        if dag.is_story_closed(story) or dag.remaining_subtasks(story):
+            continue
+        done = [subtask for subtask in story.subtasks if dag.is_subtask_done(subtask)]
+        if done:
+            anchors.append((story, done[-1]))
+    return anchors
+
+
+def reroll_stale_stories(stories: Sequence[census.StoryPlan], root: Path) -> list[str]:
+    """Re-run the rollup through each stale story's anchor, and return warnings.
+
+    Writing `done` to a subtask that is already done is harmless, and the
+    rollup's walk to the root repairs the story and the milestone above it.
+    Best effort, like `mark_done` in `task.yaml`: a `BoardError` becomes a
+    warning naming the story and its anchor, and the run goes on.
+    """
+    warnings: list[str] = []
+    for story, anchor in stale_story_anchors(stories):
+        try:
+            rollup.set_status(anchor.id, "done", repo_dir=root)
+        except board.BoardError as error:
+            warnings.append(
+                f"could not re-roll stale story {story.id} through subtask {anchor.id}: {error}"
+            )
+    return warnings
+
+
 def record_plan(
     store: Store,
     levels: list[list[PlannedStory]],
@@ -242,7 +283,7 @@ def run_milestone(
         )
         store.record_run(run_record)
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
-        warnings: list[str] = []
+        warnings = reroll_stale_stories(plan.stories, root)
         completed: list[str] = []
 
         for level in levels:

@@ -716,3 +716,67 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
 
     assert driver.calls == []
     assert list(paths.data_dir().iterdir()) == []
+
+
+def test_only_a_stale_story_is_anchored_and_on_its_last_done_subtask():
+    """Port of `storyRollupAnchor`: a story that is not closed and has nothing
+    left to run is re-rolled through its last individually done subtask. A
+    closed story, a story with work left and a story with no subtasks are not."""
+    stale = _plan_story(
+        1, [_plan_subtask(11, "done"), _plan_subtask(12, "done")], status="in_progress"
+    )
+    closed = _plan_story(2, [_plan_subtask(21, "done")], status="done")
+    pending = _plan_story(3, [_plan_subtask(31, "done"), _plan_subtask(32)])
+    empty = _plan_story(4, [])
+
+    anchors = orchestrate.stale_story_anchors([stale, closed, pending, empty])
+
+    assert [(story.id, anchor.id) for story, anchor in anchors] == [(stale.id, _plan_id(12))]
+
+
+@requires_git
+@requires_brd
+def test_a_stale_story_is_rolled_up_to_done_and_so_is_the_milestone(project):
+    shape = _milestone(project, {"A": 2})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    board.set_status(a1, "done", repo_dir=project)
+    board.set_status(a2, "done", repo_dir=project)
+    assert board.show(story_a, repo_dir=project).status == "todo"
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert driver.calls == []
+    assert result["done"] is True
+    assert result["levels"] == []
+    assert result["warnings"] == []
+    assert board.show(story_a, repo_dir=project).status == "done"
+    assert board.show(shape["milestone"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_failed_stale_rollup_is_a_warning_and_the_run_goes_on(project, monkeypatch):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    board.set_status(a1, "done", repo_dir=project)
+    board.set_status(a2, "done", repo_dir=project)
+
+    def failing(card: str, status: str, repo_dir: Any = None) -> dict[str, object]:
+        raise board.BoardError("brd is down", argv=["brd", "update", card])
+
+    monkeypatch.setattr(rollup, "set_status", failing)
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert [call["card"] for call in driver.calls] == [b1]
+    assert result["done"] is True
+    assert len(result["warnings"]) == 1
+    warning = result["warnings"][0]
+    assert story_a in warning
+    assert a2 in warning
+    assert "brd is down" in warning
