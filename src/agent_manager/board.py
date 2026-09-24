@@ -1,9 +1,10 @@
 """The only caller of the `brd` CLI (design §4 line 119).
 
 Four operations cross this seam: read one card, read a card subtree, read
-every root of the board, write a card status. Nothing about a *run* is ever written to the board (decision D5,
-design §9) -- run state lives in agent-manager's own SQLite projection and
-journal, so `set_status` is the module's entire write surface.
+every root of the board, write a card status. Nothing about a *run* is ever
+written to the board (decision D5, design §9) -- run state lives in
+agent-manager's own SQLite projection and journal, so `set_status` is the
+module's entire write surface.
 
 Every invocation is an argument list handed to `subprocess`. Design §5 line 252
 is explicit that the program runs commands itself with argument lists, so
