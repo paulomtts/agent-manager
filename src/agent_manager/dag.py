@@ -16,10 +16,13 @@ leave-me-alone orchestrator: doneness read from brd ``status`` alone
 (``is_subtask_done``, ``is_story_closed``, ``remaining_subtasks``), stories
 grouped into dependency levels for dispatch and for integrate
 (``topological_levels``, ``compute_levels``, ``compute_integrate_levels``),
-and a blocker-cycle check that must run before any stack geometry
-(``assert_no_blocker_cycles``). All of them read ``census.StoryPlan`` and
-``census.SubtaskPlan`` by attribute, keep census order, and ignore blockers
-outside the milestone.
+a blocker-cycle check that must run before any stack geometry
+(``assert_no_blocker_cycles``), and the stack geometry itself: where each
+story's stack roots and ends and what each subtask's branch stacks on
+(``subtask_branch``, ``story_tip``, ``story_root``, ``stack_bases``), all
+derived from the census and never discovered. All of them read
+``census.StoryPlan`` and ``census.SubtaskPlan`` by attribute, keep census
+order, and ignore blockers outside the milestone.
 
 This module is pure: no I/O, no subprocesses, no ``brd``.
 """
@@ -310,3 +313,25 @@ def story_root(
             "a single blocker."
         )
     return story_tip(stories_by_id[blockers[0]], stories_by_id, prefix, base_branch, seen)
+
+
+def stack_bases(
+    story: StoryPlan,
+    stories_by_id: Mapping[str, StoryPlan],
+    prefix: str,
+    base_branch: str,
+) -> dict[str, str]:
+    """Each subtask id mapped to the branch it stacks on, in census order.
+
+    The first subtask stacks on the story's root; every other one on the
+    previous subtask in the FULL list, never ``remaining_subtasks``, so a done
+    first subtask still anchors the second. The root is computed even for a
+    story with no subtasks, so its errors surface. Run
+    ``assert_no_blocker_cycles`` first.
+    """
+    root = story_root(story, stories_by_id, prefix, base_branch)
+    ordered = story.subtasks
+    return {
+        subtask.id: root if index == 0 else subtask_branch(prefix, ordered[index - 1])
+        for index, subtask in enumerate(ordered)
+    }

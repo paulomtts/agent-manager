@@ -13,6 +13,7 @@ from agent_manager.dag import (
     remaining_subtasks,
     short_id,
     slugify,
+    stack_bases,
     story_root,
     story_tip,
     subtask_branch,
@@ -482,3 +483,74 @@ def test_a_blocker_listed_twice_counts_once():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
     b = _story("b", ["a", "a"], subtasks=[_gsub("b1", "bbbb0001")])
     assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_stack_bases_anchor_on_the_full_list_even_past_a_done_first_subtask():
+    a1 = _gsub("a1", "aaaa0001", "done")
+    a2 = _gsub("a2", "aaaa0002")
+    a3 = _gsub("a3", "aaaa0003")
+    a = _story("a", subtasks=[a1, a2, a3])
+    bases = stack_bases(a, _by_id(a), PREFIX, BASE)
+    assert bases == {
+        a1.id: "main",
+        a2.id: "m3/task-a1-aaaa0001",
+        a3.id: "m3/task-a2-aaaa0002",
+    }
+    assert list(bases) == [a1.id, a2.id, a3.id]
+
+
+def test_stack_bases_of_a_closed_story_still_maps_every_subtask():
+    a1 = _gsub("a1", "aaaa0001", "done")
+    a2 = _gsub("a2", "aaaa0002", "done")
+    a = _story("a", status="done", subtasks=[a1, a2])
+    assert stack_bases(a, _by_id(a), PREFIX, BASE) == {
+        a1.id: "main",
+        a2.id: "m3/task-a1-aaaa0001",
+    }
+
+
+def test_stack_bases_of_a_story_with_no_subtasks_is_empty():
+    a = _story("a", subtasks=[])
+    assert stack_bases(a, _by_id(a), PREFIX, BASE) == {}
+
+
+def test_stack_bases_of_a_subtask_less_story_still_surfaces_a_root_error():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story("c", ["a", "b"], subtasks=[])
+    with pytest.raises(StackRootError, match="#c"):
+        stack_bases(c, _by_id(a, b, c), PREFIX, BASE)
+
+
+def test_stack_bases_surfaces_a_malformed_subtask_id():
+    a = _story(
+        "a",
+        subtasks=[SubtaskPlan(id="nope", title="bad", status="todo"), _gsub("a2", "aaaa0002")],
+    )
+    with pytest.raises(ValueError, match="not a card id"):
+        stack_bases(a, _by_id(a), PREFIX, BASE)
+
+
+def test_the_milestone_two_board_stacks_each_story_on_the_previous_ones_tip():
+    s1a, s1b = _gsub("s1a", "11110001"), _gsub("s1b", "11110002")
+    s2a, s2b, s2c = _gsub("s2a", "22220001"), _gsub("s2b", "22220002"), _gsub("s2c", "22220003")
+    s3a, s3b = _gsub("s3a", "33330001"), _gsub("s3b", "33330002")
+    s1 = _story("s1", subtasks=[s1a, s1b])
+    s2 = _story("s2", ["s1"], subtasks=[s2a, s2b, s2c])
+    s3 = _story("s3", ["s2"], subtasks=[s3a, s3b])
+    stories = _by_id(s1, s2, s3)
+    assert_no_blocker_cycles([s1, s2, s3])
+
+    assert stack_bases(s1, stories, PREFIX, BASE) == {
+        s1a.id: "main",
+        s1b.id: "m3/task-s1a-11110001",
+    }
+    assert stack_bases(s2, stories, PREFIX, BASE) == {
+        s2a.id: "m3/task-s1b-11110002",
+        s2b.id: "m3/task-s2a-22220001",
+        s2c.id: "m3/task-s2b-22220002",
+    }
+    assert stack_bases(s3, stories, PREFIX, BASE) == {
+        s3a.id: "m3/task-s2c-22220003",
+        s3b.id: "m3/task-s3a-33330001",
+    }
