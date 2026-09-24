@@ -210,8 +210,10 @@ class Journal:
         the journal is opened, not re-read from disk, and the lock is held from
         numbering the line until it is fsynced, so the threads of that process
         never share a number or interleave their bytes. The cached number
-        advances only once the line is on disk; if anything here raises, the
-        lock is released and the next append retries the same number.
+        advances once the line has been written and flushed to the file; if
+        validation, the open or the write raises, the next append retries the
+        same number, and if only the fsync raises the number stays spent, so
+        no seq is ever repeated on disk. The lock is released either way.
         """
         with self._lock:
             seq = self._seq + 1
@@ -230,8 +232,10 @@ class Journal:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(text + "\n")
                 handle.flush()
+                # The line is in the file now, fsynced or not: spend its number
+                # so a retry after a failed fsync cannot repeat it on disk.
+                self._seq = seq
                 os.fsync(handle.fileno())
-            self._seq = seq
             return line
 
 

@@ -349,6 +349,27 @@ def test_a_failed_write_releases_the_lock_and_does_not_spend_a_number(repo, tmp_
     assert [line.seq for line in journal.read()] == [1, 2]
 
 
+def test_a_failed_fsync_after_the_write_spends_the_number_so_no_seq_repeats(repo, monkeypatch):
+    # Once write and flush succeed the line is in the file, fsynced or not, so
+    # retrying its number would put a duplicate seq on disk.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+
+    real_fsync = store.os.fsync
+
+    def failing_fsync(fd):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(store.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        journal.append("run_upsert", {"i": "unsynced"})
+    assert journal._lock.locked() is False
+
+    monkeypatch.setattr(store.os, "fsync", real_fsync)
+    assert journal.append("run_upsert", {"i": 2}).seq == 3
+    assert [line.seq for line in journal.read()] == [1, 2, 3]
+
+
 def test_an_invalid_line_releases_the_lock_and_does_not_spend_a_number(repo):
     # Review Focus 4: JournalLine validation runs inside the lock.
     journal = store.Journal(RUN_ID)

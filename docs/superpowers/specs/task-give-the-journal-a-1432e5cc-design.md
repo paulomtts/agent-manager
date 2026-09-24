@@ -19,7 +19,7 @@ Out of scope, owned by sibling 5657f0d4 "Make the SQLite projection thread-safe"
 ## Error paths
 
 - If `__init__` finds a corrupt existing journal, it raises `CorruptJournalError`, as `last_seq()` does today. This error now happens when the journal is opened, not at the first append.
-- If the write or fsync fails inside `append`, the exception propagates and the lock is released. The cached counter does not advance, so the next append retries the same number.
+- If validation, the open or the write fails inside `append`, the exception propagates and the lock is released. The cached counter does not advance, so the next append retries the same number. If only the fsync fails, the line is already in the file, so the counter does advance: retrying the number would put a duplicate seq on disk (resolved at review).
 
 ## Deliberate change: an obsolete test
 
