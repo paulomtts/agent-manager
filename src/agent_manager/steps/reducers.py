@@ -343,6 +343,32 @@ def verification_passed_gate(result: object) -> dict[str, str] | None:
     }
 
 
+# The `implement` phase's gate (`builtin/task.yaml`), decision O7. The coder is
+# told to REPORT `blocked: true` with a reason when it cannot proceed (a red
+# baseline, a plan hash it could not compute) and never to decide what happens
+# next. Without this gate `review` ran anyway and a subtask could reach `done`
+# on partial work. Identity on `True`, as in `verification_passed_gate`:
+# `ImplementResult` is validated upstream, so a real bool is guaranteed.
+def implement_blocked_gate(result: object) -> dict[str, str] | None:
+    """``None`` when the coder was not blocked, else a blocked verdict."""
+    if not isinstance(result, Mapping):
+        return {
+            "blocked": "implement",
+            "detail": (
+                "no implement result to judge: the implement phase returned "
+                f"{_js_text(result)} instead of a result mapping, so nothing "
+                "established that the coder finished its work."
+            ),
+        }
+    if result.get("blocked") is not True:
+        return None
+    detail = str(result.get("blocked_reason") or "").strip()
+    return {
+        "blocked": "implement",
+        "detail": detail or "the coder reported blocked: true but gave no reason",
+    }
+
+
 # The `validate_spec` / `validate_plan` gate (`builtin/task.yaml` lines 40 and
 # 54), ported from task.js lines 631-638 and 717-721. The critic is asked to
 # REPORT whether the spec or the plan has unresolvable blockers and never to
