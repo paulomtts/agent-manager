@@ -207,3 +207,10 @@ def test_numeric_needle_still_picks_the_single_standalone_run():
     twelve = node(8, "Milestone 12: CSV export")
     two = node(9, "Milestone 2: JSON export")
     assert find_milestone([twelve, two], "2").id == ID(9)
+
+
+def test_non_numeric_needle_skips_the_digit_run_guard():
+    # Spec rule 4: the guard applies only when the needle is all digits.
+    # "milestone 1" is not numeric, so its hit inside "12" still counts.
+    assert find_milestone([TREE], "milestone 1").id == ID(1)
+
