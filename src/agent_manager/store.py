@@ -93,14 +93,33 @@ CREATE TABLE IF NOT EXISTS attempts (
 """
 
 
+BUSY_TIMEOUT_SECONDS = 30.0
+"""How long a statement on the projection waits for a lock held by another
+connection before raising `sqlite3.OperationalError: database is locked`.
+
+It exists for a reader in another process, such as `am status`, holding the
+database briefly. It is not a licence for two `am` processes to write one run:
+that is still unsupported (P2)."""
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the per-project projection, applying the schema idempotently.
 
     WAL mode is set before the schema so a reader never blocks the writer. Every
     `CREATE` is `IF NOT EXISTS`, so reopening an existing database neither
     destroys nor migrates what is already there.
+
+    The connection may be used from any thread of the one process that writes a
+    run (P2), so `check_same_thread` is off; `Store` serialises that use behind
+    its own lock. `BUSY_TIMEOUT_SECONDS` covers a reader in another process,
+    such as `am status`, holding the database briefly. Two `am` processes
+    writing one run remain unsupported.
     """
-    conn = sqlite3.connect(paths.project_db_path(root))
+    conn = sqlite3.connect(
+        paths.project_db_path(root),
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)

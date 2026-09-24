@@ -71,6 +71,35 @@ def test_open_db_creates_the_project_file_in_wal_mode(repo):
         conn.close()
 
 
+def test_open_db_connection_can_be_used_from_another_thread(repo):
+    # P2: the threads of one process share one connection, so open_db must not
+    # pin it to the thread that opened it. The busy timeout is explicit and
+    # WAL mode is kept.
+    conn = store.open_db(repo)
+    try:
+        counts: list[int] = []
+        errors: list[BaseException] = []
+
+        def query() -> None:
+            try:
+                counts.append(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
+            except BaseException as error:  # surfaced by the assertion below
+                errors.append(error)
+
+        worker = threading.Thread(target=query)
+        worker.start()
+        worker.join()
+
+        assert errors == []
+        assert counts == [0]
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(
+            store.BUSY_TIMEOUT_SECONDS * 1000
+        )
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+
+
 def test_open_db_creates_every_projection_table(repo):
     conn = store.open_db(repo)
     try:
