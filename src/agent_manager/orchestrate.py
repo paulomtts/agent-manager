@@ -22,10 +22,46 @@ The module holds no mutable state of its own (O4).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Protocol
 
-from agent_manager import census, dag
+from agent_manager import board, census, cli, dag, models
+from agent_manager.store import Store
+from agent_manager.workflow.loader import load_builtin
+
+MILESTONE_WORKFLOW = "milestone"
+"""The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
+
+
+def _utcnow() -> datetime:
+    """This module's own clock default. `cli._utcnow` is private, and binding a
+    `cli` name at definition time would break under the circular import."""
+    return datetime.now(timezone.utc)
+
+
+class Driver(Protocol):
+    """`cli.drive_subtask`'s keyword signature: drive one subtask, report the result.
+
+    The seam the tests replace. Annotations are strings (`from __future__ import
+    annotations`), so no `cli` name is resolved when this module is imported.
+    """
+
+    def __call__(
+        self,
+        *,
+        store: Store,
+        run_id: str,
+        card: models.Card,
+        parent: models.Card,
+        subtask: models.SubtaskRun,
+        repo_dir: Path,
+        commands: Sequence[str] = (),
+        allow_no_verification: bool = False,
+        runner_factory: cli.RunnerFactory | None = None,
+    ) -> cli.SubtaskDrive: ...
 
 
 @dataclass(frozen=True)
@@ -97,3 +133,137 @@ def story_tips(
         for story in stories
         if story.subtasks
     ]
+
+
+def record_plan(
+    store: Store,
+    levels: list[list[PlannedStory]],
+    *,
+    root: Path,
+    branch_prefix: str,
+) -> dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]:
+    """Record every pending story and its remaining subtasks `pending`, and return the rows.
+
+    Written before the walk so `status` shows the whole plan even for a run
+    that dies on its first phase. The rows come back keyed by story id, each
+    with its subtask rows keyed by subtask id, so the walk records transitions
+    as copies of exactly what was planned.
+    """
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]] = {}
+    for level in levels:
+        for planned in level:
+            story_row = models.StoryRun(
+                card_id=planned.story.id,
+                title=planned.story.title,
+                level=planned.level,
+                status="pending",
+                tip_branch=planned.tip,
+            )
+            store.record_story(story_row)
+            subtask_rows: dict[str, models.SubtaskRun] = {}
+            for subtask in planned.remaining:
+                branch = dag.subtask_branch(branch_prefix, subtask)
+                subtask_row = models.SubtaskRun(
+                    card_id=subtask.id,
+                    branch=branch,
+                    base_branch=planned.bases[subtask.id],
+                    status="pending",
+                    worktree_path=cli.worktree_for(root, branch),
+                )
+                store.record_subtask(planned.story.id, subtask_row)
+                subtask_rows[subtask.id] = subtask_row
+            rows[planned.story.id] = (story_row, subtask_rows)
+    return rows
+
+
+def run_milestone(
+    milestone: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: cli.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+) -> dict[str, Any]:
+    """Drive every remaining subtask of `milestone`, one at a time, and report (O6).
+
+    `milestone` is a card id or a title needle (O1). Everything that can refuse
+    runs before the store is opened. Then one `milestone` run is recorded with
+    its whole plan `pending`, and levels, stories and subtasks are walked in
+    order. A subtask already `done` on the board is never driven, but its
+    branch still anchors the next subtask's base. The card and its story are
+    read fresh from the board before each subtask.
+    """
+    root = cli.resolve_repo_dir(repo_dir)
+    milestone_card = census.find_milestone(board.roots(repo_dir=root), milestone)
+    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    # Fail-fast preflight, as `run_card` does: a workflow that will not load
+    # must leave no run directory. The driver loads its own copy.
+    load_builtin(cli.WORKFLOW_NAME)
+    drive = cli.drive_subtask if driver is None else driver
+
+    started_at = clock()
+    run_id = cli.mint_run_id(milestone_card.id, started_at)
+    store = Store.open(root, run_id)
+    try:
+        run_record = models.Run(
+            id=run_id,
+            workflow=MILESTONE_WORKFLOW,
+            repo_dir=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            status="started",
+            started_at=started_at,
+            config=models.RunConfig(),
+        )
+        store.record_run(run_record)
+        rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
+        warnings: list[str] = []
+        completed: list[str] = []
+
+        for level in levels:
+            for planned in level:
+                story_id = planned.story.id
+                story_row, subtask_rows = rows[story_id]
+                for position, subtask in enumerate(planned.remaining):
+                    card = board.show(subtask.id, repo_dir=root)
+                    parent = board.show(story_id, repo_dir=root)
+                    started = subtask_rows[subtask.id].model_copy(update={"status": "started"})
+                    store.record_subtask(story_id, started)
+                    if position == 0:
+                        store.record_story(story_row.model_copy(update={"status": "started"}))
+                    result = drive(
+                        store=store,
+                        run_id=run_id,
+                        card=card,
+                        parent=parent,
+                        subtask=started,
+                        repo_dir=root,
+                        commands=list(commands),
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                    )
+                    warnings.extend(result.warnings)
+                    store.record_subtask(story_id, started.model_copy(update={"status": "done"}))
+                    completed.append(subtask.id)
+                store.record_story(story_row.model_copy(update={"status": "done"}))
+
+        store.record_run(run_record.model_copy(update={"status": "done"}))
+        return {
+            "done": True,
+            "run_id": run_id,
+            "levels": [
+                {"level": index, "stories": [planned.story.id for planned in level]}
+                for index, level in enumerate(levels)
+            ],
+            "completed": completed,
+            "tips": tips,
+            "warnings": warnings,
+        }
+    finally:
+        store.close()
