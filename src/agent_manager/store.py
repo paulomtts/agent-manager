@@ -14,6 +14,7 @@ attempt belongs to the engine.
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,11 +150,17 @@ class JournalLine(BaseModel):
 
 
 class Journal:
-    """Append-only JSONL log for one run: the truth the projection is built from."""
+    """Append-only JSONL log for one run: the truth the projection is built from.
+
+    One process writes a given run (P2), and its threads share one `Journal`.
+    The highest sequence number on disk is read once, when the journal is
+    opened, and cached; a lock serialises appends from those threads.
+    """
 
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         self.path = paths.run_dir(run_id) / JOURNAL_NAME
+        self._lock = threading.Lock()
         self._seq = self.last_seq()
 
     def last_seq(self) -> int:
@@ -199,30 +206,33 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        One process writes a given run (P2). The sequence number is read from
-        disk once, when the journal is opened, and cached; appending never
-        re-reads the file. The cached number advances only once the line is
-        on disk.
+        One process writes a given run (P2). The sequence number is cached when
+        the journal is opened, not re-read from disk, and the lock is held from
+        numbering the line until it is fsynced, so the threads of that process
+        never share a number or interleave their bytes. The cached number
+        advances only once the line is on disk; if anything here raises, the
+        lock is released and the next append retries the same number.
         """
-        seq = self._seq + 1
-        line = JournalLine(
-            seq=seq,
-            ts=datetime.now(timezone.utc),
-            run_id=self.run_id,
-            event=event,
-            story=story,
-            card=card,
-            phase=phase,
-            attempt=attempt,
-            payload=payload,
-        )
-        text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(text + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        self._seq = seq
-        return line
+        with self._lock:
+            seq = self._seq + 1
+            line = JournalLine(
+                seq=seq,
+                ts=datetime.now(timezone.utc),
+                run_id=self.run_id,
+                event=event,
+                story=story,
+                card=card,
+                phase=phase,
+                attempt=attempt,
+                payload=payload,
+            )
+            text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._seq = seq
+            return line
 
 
 def _iso(value: datetime | None) -> str | None:

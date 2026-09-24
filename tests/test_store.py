@@ -13,6 +13,7 @@ writes nowhere real.
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -269,6 +270,96 @@ def test_reading_a_journal_that_does_not_exist_raises(repo):
         journal.read()
     assert "run-never-started" in str(excinfo.value)
     assert str(journal.path) in str(excinfo.value)
+
+
+def test_append_holds_the_lock_across_the_write_and_the_fsync(repo, monkeypatch):
+    # Deterministic (P7): rather than racing threads and hoping to catch an
+    # overlap, check the lock is held at the moment the line is fsynced.
+    journal = store.Journal(RUN_ID)
+    held_during_fsync: list[bool] = []
+    real_fsync = store.os.fsync
+
+    def spying_fsync(fd):
+        held_during_fsync.append(journal._lock.locked())
+        real_fsync(fd)
+
+    monkeypatch.setattr(store.os, "fsync", spying_fsync)
+
+    journal.append("run_upsert", {"i": 0})
+    journal.append("run_upsert", {"i": 1})
+
+    assert held_during_fsync == [True, True]
+    assert journal._lock.locked() is False
+
+
+def test_eight_threads_sharing_one_journal_write_800_whole_lines_numbered_1_to_800(repo):
+    workers, per_worker = 8, 100
+    journal = store.Journal(RUN_ID)
+    start = threading.Barrier(workers)
+    errors: list[BaseException] = []
+
+    def work(worker: int) -> None:
+        try:
+            start.wait()
+            for i in range(per_worker):
+                journal.append("run_upsert", {"w": worker, "i": i})
+        except BaseException as error:  # surfaced by the assertion below
+            errors.append(error)
+
+    threads = [threading.Thread(target=work, args=(w,)) for w in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    raw = [
+        text
+        for text in journal.path.read_text(encoding="utf-8").splitlines()
+        if text.strip()
+    ]
+    assert len(raw) == workers * per_worker
+    records = [json.loads(text) for text in raw]  # a torn line fails here
+    assert sorted(record["seq"] for record in records) == list(
+        range(1, workers * per_worker + 1)
+    )
+    for worker in range(workers):
+        own = [record for record in records if record["payload"]["w"] == worker]
+        assert [record["payload"]["i"] for record in sorted(own, key=lambda r: r["seq"])] == list(
+            range(per_worker)
+        )
+
+
+def test_a_failed_write_releases_the_lock_and_does_not_spend_a_number(repo, tmp_path):
+    # Review Focus 3: the path cannot be opened for appending, so nothing
+    # lands on disk. The lock is released and the next append reuses the number.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+
+    real_path = journal.path
+    directory = tmp_path / "a-directory-not-a-file"
+    directory.mkdir()
+    journal.path = directory
+    with pytest.raises(OSError):
+        journal.append("run_upsert", {"i": "lost"})
+    assert journal._lock.locked() is False
+
+    journal.path = real_path
+    assert journal.append("run_upsert", {"i": 1}).seq == 2
+    assert [line.seq for line in journal.read()] == [1, 2]
+
+
+def test_an_invalid_line_releases_the_lock_and_does_not_spend_a_number(repo):
+    # Review Focus 4: JournalLine validation runs inside the lock.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+
+    with pytest.raises(ValidationError):
+        journal.append("not_an_event", {})  # type: ignore[arg-type]
+    assert journal._lock.locked() is False
+
+    assert journal.append("run_upsert", {"i": 1}).seq == 2
+    assert [line.seq for line in journal.read()] == [1, 2]
 
 
 def test_a_non_json_line_names_the_file_and_the_line_number(repo):
