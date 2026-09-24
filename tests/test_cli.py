@@ -26,6 +26,7 @@ from typer.testing import CliRunner
 
 from agent_manager import (
     board,
+    census,
     cli,
     dag,
     dispatch,
@@ -1020,6 +1021,176 @@ def test_the_logs_payload_survives_render_with_its_paths_and_newlines(tmp_path):
     assert data["artifacts"]["result"]["path"] == str(tmp_path / "result.json")
 
 
+def _plan_id(n: int) -> str:
+    """A UUID-shaped card id whose short id is `n` in eight hex digits.
+
+    `dag.subtask_branch` goes through `dag.short_id`, which refuses anything
+    that is not 32 hex characters, so the pure plans need real-shaped ids.
+    """
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def _plan_subtask(n: int, status: str = "todo") -> census.SubtaskPlan:
+    return census.SubtaskPlan(id=_plan_id(n), title=f"subtask {n}", status=status)
+
+
+def _plan_story(
+    n: int,
+    subtasks: list[census.SubtaskPlan],
+    *,
+    status: str = "todo",
+    blocked_by: tuple[str, ...] | list[str] = (),
+) -> census.StoryPlan:
+    return census.StoryPlan(
+        id=_plan_id(n),
+        title=f"story {n}",
+        status=status,
+        blocked_by=list(blocked_by),
+        subtasks=list(subtasks),
+    )
+
+
+def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
+    """A done story is `already_done` and roots its dependent. A pending story
+    lists only its remaining subtasks, and a done first subtask still anchors
+    the second one's base."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12, "done")], status="done")
+    b = _plan_story(
+        2,
+        [_plan_subtask(21, "done"), _plan_subtask(22), _plan_subtask(23, "in_progress")],
+        status="in_progress",
+        blocked_by=[a.id],
+    )
+
+    payload = cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+
+    def branch(subtask: census.SubtaskPlan) -> str:
+        return dag.subtask_branch("m3", subtask)
+
+    assert payload == {
+        "levels": [
+            {
+                "level": 0,
+                "stories": [
+                    {
+                        "story": b.id,
+                        "title": "story 2",
+                        "root": branch(a.subtasks[-1]),
+                        "subtasks": [
+                            {
+                                "id": _plan_id(22),
+                                "title": "subtask 22",
+                                "status": "todo",
+                                "branch": branch(b.subtasks[1]),
+                                "base": branch(b.subtasks[0]),
+                            },
+                            {
+                                "id": _plan_id(23),
+                                "title": "subtask 23",
+                                "status": "in_progress",
+                                "branch": branch(b.subtasks[2]),
+                                "base": branch(b.subtasks[1]),
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "already_done": [
+            {"kind": "story", "id": a.id, "title": "story 1"},
+            {"kind": "subtask", "id": _plan_id(21), "title": "subtask 21", "story": b.id},
+        ],
+    }
+
+
+def test_the_dry_run_payload_keeps_census_order_across_and_within_levels():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id])
+
+    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    assert [level["level"] for level in payload["levels"]] == [0, 1]
+    assert [[story["story"] for story in level["stories"]] for level in payload["levels"]] == [
+        [a.id, b.id],
+        [c.id],
+    ]
+    assert payload["levels"][0]["stories"][0]["root"] == "main"
+    assert payload["levels"][0]["stories"][1]["root"] == "main"
+    assert payload["levels"][1]["stories"][0]["root"] == dag.subtask_branch("m3", a.subtasks[-1])
+
+
+def test_the_dry_run_checks_for_blocker_cycles_before_any_geometry():
+    """`compute_levels` would also refuse, but with a comma list. The arrow
+    trail is `assert_no_blocker_cycles`'s, which proves it ran first."""
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+
+    with pytest.raises(dag.DependencyCycleError) as caught:
+        cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+
+    assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
+
+
+def test_the_dry_run_refuses_a_story_with_two_in_milestone_blockers():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+
+    with pytest.raises(dag.StackRootError) as caught:
+        cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    assert f"#{a.id}" in str(caught.value)
+    assert f"#{b.id}" in str(caught.value)
+
+
+def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_done():
+    """Review focus: a closed story, a story whose subtasks are all done, and a
+    story with no subtasks at all each become one `kind: "story"` entry, in
+    census order, with their subtasks not listed separately."""
+    closed = _plan_story(1, [_plan_subtask(11)], status="done")
+    finished = _plan_story(2, [_plan_subtask(21, "done"), _plan_subtask(22, "Done")])
+    empty = _plan_story(3, [])
+
+    payload = cli.dry_run_payload(
+        [closed, finished, empty], branch_prefix="m3", base_branch="main"
+    )
+
+    assert payload == {
+        "levels": [],
+        "already_done": [
+            {"kind": "story", "id": closed.id, "title": "story 1"},
+            {"kind": "story", "id": finished.id, "title": "story 2"},
+            {"kind": "story", "id": empty.id, "title": "story 3"},
+        ],
+    }
+
+
+def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
+    """Review focus: one foreign blocker plus one in-milestone blocker is ONE
+    in-milestone blocker, not a two-blocker refusal."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=["not-in-this-milestone"])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=["not-in-this-milestone", a.id])
+
+    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    roots = {
+        story["story"]: story["root"]
+        for level in payload["levels"]
+        for story in level["stories"]
+    }
+    assert roots == {
+        a.id: "main",
+        b.id: "main",
+        c.id: dag.subtask_branch("m3", a.subtasks[-1]),
+    }
+
+
+def test_the_not_implemented_refusal_is_a_cli_error():
+    assert issubclass(cli.MilestoneRunNotImplementedError, cli.CliError)
+
+
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
@@ -1919,6 +2090,445 @@ def test_the_run_success_envelope_keys_are_frozen(project, cards, monkeypatch):
         "skipped",
         "warnings",
     }
+
+
+def _block(root: Path, card_id: str, blocker: str) -> None:
+    subprocess.run(
+        ["brd", "block", card_id, "--by", blocker],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+M2_SHAPE = (
+    ("A", "Story A: the board adapter", ("a1: read one card", "a2: read a subtree")),
+    ("B", "Story B: the store", ("b1: the schema", "b2: the journal", "b3: replay")),
+    ("C", "Story C: the CLI", ("c1: run --card", "c2: status")),
+)
+"""Milestone 2's shape: three chained stories with two or three subtasks each."""
+
+
+@pytest.fixture
+def milestone_board(project) -> dict[str, Any]:
+    """A real brd board shaped like milestone 2, next to a decoy milestone.
+
+    B is blocked by A and C by B. Each story's subtasks are chained with
+    `brd block` so the census order does not depend on creation timestamps.
+    The decoy root shares the word "skeleton", so only a longer substring
+    names milestone 2.
+    """
+    _add_card(project, "Milestone 1: walking skeleton")
+    milestone = _add_card(project, "Milestone 2: make the skeleton real")
+    stories: dict[str, str] = {}
+    subtasks: dict[str, list[str]] = {}
+    titles: dict[str, str] = {}
+    previous_story: str | None = None
+    for key, story_title, subtask_titles in M2_SHAPE:
+        story = _add_card(project, story_title, milestone)
+        titles[story] = story_title
+        if previous_story is not None:
+            _block(project, story, previous_story)
+        chain: list[str] = []
+        for subtask_title in subtask_titles:
+            subtask = _add_card(project, subtask_title, story)
+            titles[subtask] = subtask_title
+            if chain:
+                _block(project, subtask, chain[-1])
+            chain.append(subtask)
+        stories[key] = story
+        subtasks[key] = chain
+        previous_story = story
+    return {"milestone": milestone, "stories": stories, "subtasks": subtasks, "titles": titles}
+
+
+def _m2_branch(project: Path, card_id: str) -> str:
+    return dag.task_branch("m2", board.show(card_id, repo_dir=project))
+
+
+def _dry_run(project: Path, needle: str, *extra: str):
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--milestone",
+            needle,
+            "--dry-run",
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m2",
+            *extra,
+        ],
+    )
+
+
+class _Forbidden:
+    """Stands in for anything the dry path must never reach, and fails loudly.
+
+    `pytest.fail` raises a `BaseException`, which `CliRunner` does not swallow
+    and `HANDLED` does not catch, so reaching one of these fails the test
+    instead of turning into an envelope.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        pytest.fail(f"the milestone dry run reached cli.{self._name}")
+
+    def __getattr__(self, attr: str) -> Any:
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        pytest.fail(f"the milestone dry run reached cli.{self._name}.{attr}")
+
+
+def _forbid_writes(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+    monkeypatch.setattr(cli.board, "set_status", _Forbidden("board.set_status"))
+
+
+def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
+    """No run dir or projection, no worktree, no branch, no repo change."""
+    assert list(paths.data_dir().iterdir()) == []
+    worktrees = [
+        line
+        for line in _git(project, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    ]
+    assert len(worktrees) == 1, worktrees
+    assert _git(project, "branch", "--format=%(refname:short)").split() == ["main"]
+    assert not (project / ".claude").exists()
+    assert _git(project, "status", "--porcelain") == porcelain_before
+
+
+@requires_git
+@requires_brd
+def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
+    project, milestone_board, monkeypatch
+):
+    stories = milestone_board["stories"]
+    subtasks = milestone_board["subtasks"]
+    titles = milestone_board["titles"]
+    board_before = board.roots(repo_dir=project)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+
+    result = _dry_run(project, milestone_board["milestone"])
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"levels", "already_done"}
+    assert data["already_done"] == []
+    assert [level["level"] for level in data["levels"]] == [0, 1, 2]
+    assert [
+        [story["story"] for story in level["stories"]] for level in data["levels"]
+    ] == [[stories["A"]], [stories["B"]], [stories["C"]]]
+
+    previous_tip = "main"
+    for level, key in zip(data["levels"], "ABC"):
+        (story,) = level["stories"]
+        branches = [_m2_branch(project, subtask) for subtask in subtasks[key]]
+        assert story["title"] == titles[stories[key]]
+        assert story["root"] == previous_tip
+        assert [row["id"] for row in story["subtasks"]] == subtasks[key]
+        assert [row["title"] for row in story["subtasks"]] == [
+            titles[subtask] for subtask in subtasks[key]
+        ]
+        assert [row["status"] for row in story["subtasks"]] == ["todo"] * len(subtasks[key])
+        assert [row["branch"] for row in story["subtasks"]] == branches
+        # The base column: the first subtask on the previous story's tip (or
+        # the base branch), every later one on the subtask before it.
+        assert [row["base"] for row in story["subtasks"]] == [previous_tip, *branches[:-1]]
+        assert story["root"] == story["subtasks"][0]["base"]
+        previous_tip = branches[-1]
+
+    _assert_nothing_written(project, porcelain_before)
+    assert board.roots(repo_dir=project) == board_before
+
+
+@requires_git
+@requires_brd
+def test_done_work_is_already_done_and_still_anchors_the_stack(
+    project, milestone_board, monkeypatch
+):
+    stories = milestone_board["stories"]
+    subtasks = milestone_board["subtasks"]
+    titles = milestone_board["titles"]
+    for subtask in subtasks["A"]:
+        board.set_status(subtask, "done", repo_dir=project)
+    board.set_status(stories["A"], "done", repo_dir=project)
+    board.set_status(subtasks["B"][0], "done", repo_dir=project)
+    board_before = board.roots(repo_dir=project)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+
+    result = _dry_run(project, milestone_board["milestone"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_done"] == [
+        {"kind": "story", "id": stories["A"], "title": titles[stories["A"]]},
+        {
+            "kind": "subtask",
+            "id": subtasks["B"][0],
+            "title": titles[subtasks["B"][0]],
+            "story": stories["B"],
+        },
+    ]
+    assert [
+        [story["story"] for story in level["stories"]] for level in data["levels"]
+    ] == [[stories["B"]], [stories["C"]]]
+
+    a_tip = _m2_branch(project, subtasks["A"][-1])
+    b_branches = [_m2_branch(project, subtask) for subtask in subtasks["B"]]
+    (b_row,) = data["levels"][0]["stories"]
+    assert b_row["root"] == a_tip
+    assert [row["id"] for row in b_row["subtasks"]] == subtasks["B"][1:]
+    assert [row["base"] for row in b_row["subtasks"]] == b_branches[:2]
+    (c_row,) = data["levels"][1]["stories"]
+    assert c_row["root"] == b_branches[-1]
+
+    _assert_nothing_written(project, porcelain_before)
+    assert board.roots(repo_dir=project) == board_before
+
+
+@requires_git
+@requires_brd
+def test_a_title_substring_names_the_same_milestone_as_its_id(
+    project, milestone_board, monkeypatch
+):
+    _forbid_writes(monkeypatch)
+
+    by_id = _dry_run(project, milestone_board["milestone"])
+    by_title = _dry_run(project, "skeleton real")
+
+    assert by_id.exit_code == 0, by_id.output
+    assert by_title.exit_code == 0, by_title.output
+    assert json.loads(by_title.stdout) == json.loads(by_id.stdout)
+
+
+@requires_git
+@requires_brd
+def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
+    project, milestone_board, monkeypatch
+):
+    _forbid_writes(monkeypatch)
+
+    plain = _dry_run(project, milestone_board["milestone"])
+    pretty = _dry_run(project, milestone_board["milestone"], "--pretty")
+
+    assert pretty.exit_code == 0, pretty.output
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+def _refusal(result) -> dict[str, Any]:
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    return envelope["error"]
+
+
+@requires_git
+@requires_brd
+def test_a_story_cycle_from_the_board_is_an_envelope_naming_both_stories(
+    project, monkeypatch
+):
+    """brd refuses to store a cycle, so the tree is served by hand. The census
+    orders sibling stories by `blocked_by` and meets the cycle first, so the
+    refusal is `CensusOrderError`, before any geometry."""
+    milestone = _add_card(project, "Milestone 9: cyclic")
+    a, b = _plan_id(1), _plan_id(2)
+
+    def tree(card_id, *, repo_dir=None):
+        return models.CardNode(
+            id=milestone,
+            title="Milestone 9: cyclic",
+            status="todo",
+            children=[
+                models.CardNode(
+                    id=a,
+                    title="story a",
+                    status="todo",
+                    blocked_by=[b],
+                    children=[models.CardNode(id=_plan_id(11), title="a1", status="todo")],
+                ),
+                models.CardNode(
+                    id=b,
+                    title="story b",
+                    status="todo",
+                    blocked_by=[a],
+                    children=[models.CardNode(id=_plan_id(21), title="b1", status="todo")],
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(cli.board, "tree", tree)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(project, milestone))
+
+    assert error["type"] == "CensusOrderError"
+    assert a in error["message"]
+    assert b in error["message"]
+    _assert_nothing_written(project, porcelain_before)
+
+
+@requires_git
+@requires_brd
+def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
+    project, monkeypatch
+):
+    """The spec's `DependencyCycleError` path: a cyclic census that got past
+    ordering is refused by `assert_no_blocker_cycles`, through the envelope."""
+    milestone = _add_card(project, "Milestone 9: cyclic")
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    monkeypatch.setattr(
+        cli.census,
+        "flatten_milestone",
+        lambda root: census.Census(milestone_title=root.title, stories=[a, b]),
+    )
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(project, milestone))
+
+    assert error["type"] == "DependencyCycleError"
+    assert f"#{a.id} -> #{b.id} -> #{a.id}" in error["message"]
+    _assert_nothing_written(project, porcelain_before)
+
+
+@requires_git
+@requires_brd
+def test_a_story_blocked_by_two_stories_is_an_envelope_naming_both(project, monkeypatch):
+    milestone = _add_card(project, "Milestone 8: diamond")
+    first = _add_card(project, "Story one", milestone)
+    second = _add_card(project, "Story two", milestone)
+    joined = _add_card(project, "Story three", milestone)
+    for story in (first, second, joined):
+        _add_card(project, f"only subtask of {story}", story)
+    _block(project, joined, first)
+    _block(project, joined, second)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(project, milestone))
+
+    assert error["type"] == "StackRootError"
+    assert f"#{first}" in error["message"]
+    assert f"#{second}" in error["message"]
+    _assert_nothing_written(project, porcelain_before)
+
+
+@requires_git
+@requires_brd
+def test_an_unknown_milestone_is_an_envelope(project, milestone_board, monkeypatch):
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(project, "Milestone 404"))
+
+    assert error["type"] == "MilestoneNotFoundError"
+    assert "Milestone 404" in error["message"]
+
+
+def test_a_milestone_dry_run_with_a_missing_repo_dir_is_an_envelope(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(tmp_path / "missing", "2"))
+
+    assert error["type"] == "RepoDirError"
+    assert "missing" in error["message"]
+
+
+@requires_brd
+def test_a_milestone_dry_run_outside_a_brd_project_is_a_board_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _forbid_writes(monkeypatch)
+
+    error = _refusal(_dry_run(plain, "2"))
+
+    assert error["type"] == "BoardError"
+    assert list(paths.data_dir().iterdir()) == []
+
+
+SOME_CARD = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
+
+
+@pytest.mark.parametrize(
+    "targets, word",
+    [
+        (["--card", SOME_CARD, "--milestone", "2"], "both"),
+        (["--card", SOME_CARD, "--milestone", "2", "--dry-run"], "both"),
+        ([], "required"),
+        (["--dry-run"], "required"),
+        (["--card", SOME_CARD, "--dry-run"], "previews"),
+        (["--milestone", "", "--dry-run"], "blank"),
+        (["--milestone", "   ", "--dry-run"], "blank"),
+    ],
+)
+def test_bad_run_targets_are_usage_errors_that_start_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    """Validation happens before the `HANDLED` try block, so these are Typer's
+    exit 2 and never an envelope. Nothing is dispatched: `run_card` and
+    `dry_run_milestone` are both forbidden here."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+
+    result = runner.invoke(
+        cli.app,
+        ["run", *targets, "--repo-dir", str(tmp_path), "--branch-prefix", "m2"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_a_milestone_run_without_dry_run_is_a_not_implemented_envelope(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+
+    error = _refusal(
+        runner.invoke(
+            cli.app,
+            [
+                "run",
+                "--milestone",
+                "2",
+                "--repo-dir",
+                str(tmp_path),
+                "--branch-prefix",
+                "m2",
+            ],
+        )
+    )
+
+    assert error["type"] == "MilestoneRunNotImplementedError"
+    assert "not implemented" in error["message"]
+    assert "--dry-run" in error["message"]
+    assert not (paths.data_dir() / "runs").exists()
+    assert list(paths.data_dir().iterdir()) == []
 
 
 @pytest.fixture

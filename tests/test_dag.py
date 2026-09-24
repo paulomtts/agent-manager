@@ -1,11 +1,25 @@
 import pytest
 
+from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
+    DependencyCycleError,
+    StackRootError,
+    assert_no_blocker_cycles,
+    compute_integrate_levels,
+    compute_levels,
+    is_story_closed,
+    is_subtask_done,
     ref_matches_card,
+    remaining_subtasks,
     short_id,
     slugify,
+    stack_bases,
+    story_root,
+    story_tip,
+    subtask_branch,
     task_branch,
     task_stem,
+    topological_levels,
 )
 
 CARD = {"id": "a32af745-15ef-45cd-b52c-64c19ae82c17", "title": "40.1 feat: write rows"}
@@ -134,3 +148,409 @@ def test_ref_matches_card_treats_a_none_ref_as_the_empty_string():
 def test_ref_matches_card_still_validates_the_card_id_for_an_empty_ref():
     with pytest.raises(ValueError, match="not a card id"):
         ref_matches_card("", "nope")
+
+
+# ── doneness, levels and cycles ─────────────────────────────────────────────
+
+
+def _sub(id: str, status: str = "todo") -> SubtaskPlan:
+    return SubtaskPlan(id=id, title=f"subtask {id}", status=status)
+
+
+def _story(
+    id: str,
+    blocked_by: list[str] | None = None,
+    status: str = "todo",
+    subtasks: list[SubtaskPlan] | None = None,
+) -> StoryPlan:
+    """A story; by default open with one todo subtask, so it is pending."""
+    return StoryPlan(
+        id=id,
+        title=f"story {id}",
+        status=status,
+        blocked_by=list(blocked_by or []),
+        subtasks=[_sub(f"{id}1")] if subtasks is None else subtasks,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("done", True), ("DONE", True), ("Done", True), ("todo", False), ("in_progress", False)],
+)
+def test_doneness_is_case_insensitive_for_subtasks_and_stories(status, expected):
+    assert is_subtask_done(_sub("s", status)) is expected
+    assert is_story_closed(_story("a", status=status)) is expected
+
+
+def test_doneness_treats_a_missing_status_as_not_done():
+    assert is_subtask_done(SubtaskPlan(id="s", title="s", status=None)) is False
+    story = StoryPlan(id="a", title="a", status=None, blocked_by=[], subtasks=[])
+    assert is_story_closed(story) is False
+
+
+def test_a_closed_story_has_no_remaining_subtasks_even_if_they_are_todo():
+    story = _story("a", status="done", subtasks=[_sub("a1"), _sub("a2", "in_progress")])
+    assert remaining_subtasks(story) == []
+
+
+def test_an_open_story_keeps_its_not_done_subtasks_in_order():
+    a1, a2, a3, a4 = _sub("a1", "done"), _sub("a2"), _sub("a3", "DONE"), _sub("a4", "in_progress")
+    story = _story("a", subtasks=[a1, a2, a3, a4])
+    assert remaining_subtasks(story) == [a2, a4]
+
+
+def _ids(levels: list[list[StoryPlan]]) -> list[list[str]]:
+    return [[story.id for story in level] for level in levels]
+
+
+def _diamond() -> list[StoryPlan]:
+    return [
+        _story("a"),
+        _story("b", ["a"]),
+        _story("c", ["a"]),
+        _story("d", ["b", "c"]),
+    ]
+
+
+def test_linear_chain_is_one_story_per_level():
+    stories = [_story("a"), _story("b", ["a"]), _story("c", ["b"])]
+    assert _ids(compute_levels(stories)) == [["a"], ["b"], ["c"]]
+
+
+def test_diamond_groups_the_two_middle_stories_in_input_order():
+    assert _ids(compute_levels(_diamond())) == [["a"], ["b", "c"], ["d"]]
+
+
+def test_diamond_keeps_census_order_not_id_order_in_a_shared_level():
+    stories = [_story("a"), _story("c", ["a"]), _story("b", ["a"]), _story("d", ["b", "c"])]
+    assert _ids(compute_levels(stories)) == [["a"], ["c", "b"], ["d"]]
+
+
+def test_independent_roots_share_level_zero_in_input_order():
+    assert _ids(compute_levels([_story("y"), _story("x")])) == [["y", "x"]]
+
+
+def test_a_done_story_is_dropped_from_dispatch_but_kept_for_integrate():
+    stories = [_story("a", status="done"), _story("b", ["a"])]
+    assert _ids(compute_levels(stories)) == [["b"]]
+    assert _ids(compute_integrate_levels(stories)) == [["a"], ["b"]]
+
+
+def test_an_open_story_whose_subtasks_are_all_done_is_dropped_from_dispatch():
+    stories = [
+        _story("a", subtasks=[_sub("a1", "done"), _sub("a2", "DONE")]),
+        _story("b", ["a"]),
+    ]
+    assert _ids(compute_levels(stories)) == [["b"]]
+    assert _ids(compute_integrate_levels(stories)) == [["a"], ["b"]]
+
+
+def test_an_open_story_with_no_subtasks_is_dropped_from_dispatch():
+    stories = [_story("a", subtasks=[]), _story("b")]
+    assert _ids(compute_levels(stories)) == [["b"]]
+
+
+def test_blocked_by_a_finished_story_and_an_external_id_lands_in_level_zero():
+    stories = [_story("a", status="done"), _story("b", ["a", "outside"])]
+    assert _ids(compute_levels(stories)) == [["b"]]
+
+
+def test_an_external_blocker_is_ignored_by_the_level_engine():
+    stories = [_story("a", ["not-in-this-milestone"]), _story("b", ["a"])]
+    assert _ids(topological_levels(stories)) == [["a"], ["b"]]
+
+
+def test_levels_return_the_same_objects_and_leave_the_input_list_alone():
+    stories = _diamond()
+    before = list(stories)
+    levels = topological_levels(stories)
+    assert stories == before
+    assert [id(story) for level in levels for story in level] == [id(s) for s in stories]
+
+
+def test_empty_input_has_no_levels():
+    assert topological_levels([]) == []
+    assert compute_levels([]) == []
+    assert compute_integrate_levels([]) == []
+
+
+def test_a_two_story_cycle_stops_the_level_engine_naming_both():
+    stories = [_story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError, match="dependency cycle among stories #a, #b"):
+        topological_levels(stories)
+
+
+def test_the_level_engine_lists_a_cycle_in_input_order_not_id_order():
+    stories = [_story("b", ["a"]), _story("a", ["b"])]
+    with pytest.raises(DependencyCycleError, match="dependency cycle among stories #b, #a"):
+        topological_levels(stories)
+
+
+def test_the_level_engine_names_only_the_unplaced_stories_of_a_cycle():
+    stories = [_story("root"), _story("a", ["root", "b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        compute_integrate_levels(stories)
+    message = str(caught.value)
+    assert "#a, #b" in message
+    assert "#root" not in message
+
+
+def test_a_self_blocking_story_stops_the_level_engine():
+    with pytest.raises(DependencyCycleError, match="#a"):
+        topological_levels([_story("a", ["a"])])
+
+
+def test_a_dependency_cycle_error_is_a_value_error():
+    assert issubclass(DependencyCycleError, ValueError)
+
+
+def test_a_two_story_cycle_is_reported_as_a_trail_from_the_first_story_walked():
+    stories = [_story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        assert_no_blocker_cycles(stories)
+    assert "dependency cycle among stories #a -> #b -> #a" in str(caught.value)
+
+
+def test_the_cycle_trail_follows_input_order_for_where_it_starts():
+    stories = [_story("b", ["a"]), _story("a", ["b"])]
+    with pytest.raises(DependencyCycleError, match="#b -> #a -> #b"):
+        assert_no_blocker_cycles(stories)
+
+
+def test_the_cycle_trail_omits_a_non_cyclic_story_that_led_into_it():
+    stories = [_story("c", ["a"]), _story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        assert_no_blocker_cycles(stories)
+    message = str(caught.value)
+    assert "dependency cycle among stories #a -> #b -> #a" in message
+    assert "#c" not in message
+
+
+def test_a_self_blocking_story_is_a_one_story_cycle():
+    with pytest.raises(DependencyCycleError, match="#a -> #a"):
+        assert_no_blocker_cycles([_story("a", ["a"])])
+
+
+def test_a_cycle_between_finished_stories_is_still_caught():
+    stories = [_story("a", ["b"], status="done"), _story("b", ["a"], status="done")]
+    with pytest.raises(DependencyCycleError, match="#a -> #b -> #a"):
+        assert_no_blocker_cycles(stories)
+
+
+def test_an_external_blocker_does_not_trip_the_cycle_check():
+    stories = [_story("a", ["not-in-this-milestone"]), _story("b", ["a"])]
+    assert assert_no_blocker_cycles(stories) is None
+
+
+def test_an_acyclic_milestone_passes_the_cycle_check():
+    assert assert_no_blocker_cycles(_diamond()) is None
+    assert assert_no_blocker_cycles([]) is None
+
+
+# ── stack geometry ──────────────────────────────────────────────────────────
+
+PREFIX = "m3"
+BASE = "main"
+
+
+def _gsub(title: str, hex8: str, status: str = "todo") -> SubtaskPlan:
+    """A subtask with a real card id, so ``task_branch`` accepts it.
+
+    Its short id is ``hex8`` and its branch is ``m3/task-<title>-<hex8>``.
+    """
+    return SubtaskPlan(id=f"{hex8}-0000-4000-8000-000000000000", title=title, status=status)
+
+
+def _by_id(*stories: StoryPlan) -> dict[str, StoryPlan]:
+    return {story.id: story for story in stories}
+
+
+def test_subtask_branch_is_task_branch_so_names_have_one_source():
+    sub = _gsub("a1", "aaaa0001")
+    assert subtask_branch(PREFIX, sub) == task_branch(PREFIX, sub) == "m3/task-a1-aaaa0001"
+
+
+def test_subtask_branch_passes_task_branchs_bad_id_error_through():
+    with pytest.raises(ValueError, match="not a card id"):
+        subtask_branch(PREFIX, SubtaskPlan(id="nope", title="bad", status="todo"))
+
+
+def test_a_story_with_no_blockers_roots_on_the_base_branch():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_story_blocked_only_outside_the_milestone_roots_on_the_base_branch():
+    a = _story("a", ["not-in-this-milestone"], subtasks=[_gsub("a1", "aaaa0001")])
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_missing_blocked_by_is_read_as_no_blockers():
+    a = StoryPlan(
+        id="a", title="a", status="todo", blocked_by=None, subtasks=[_gsub("a1", "aaaa0001")]
+    )
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_story_tip_is_the_branch_of_its_last_subtask():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    assert story_tip(a, _by_id(a), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_one_in_milestone_blocker_roots_on_that_blockers_last_subtask():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_external_blockers_beside_one_in_milestone_blocker_are_ignored():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["outside-1", "a", "outside-2"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_a_done_blocker_still_yields_its_tip_because_done_is_not_landed():
+    a = _story(
+        "a",
+        status="done",
+        subtasks=[_gsub("a1", "aaaa0001", "done"), _gsub("a2", "aaaa0002", "done")],
+    )
+    b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_tip(a, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_a_subtask_less_blocker_falls_through_to_its_own_root():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    b = _story("b", ["a"], subtasks=[])
+    c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
+    stories = _by_id(a, b, c)
+    assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(c, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_a_subtask_less_story_with_no_blockers_has_the_base_as_its_tip():
+    d = _story("d", subtasks=[])
+    assert story_tip(d, _by_id(d), PREFIX, BASE) == "main"
+
+
+def test_the_seen_guard_stops_a_cycle_between_subtask_less_stories():
+    a = _story("a", ["b"], subtasks=[])
+    b = _story("b", ["a"], subtasks=[])
+    with pytest.raises(
+        DependencyCycleError,
+        match="dependency cycle reached story #a while computing its stack root",
+    ):
+        story_root(a, _by_id(a, b), PREFIX, BASE)
+
+
+def test_a_pre_populated_seen_containing_the_story_raises():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    with pytest.raises(DependencyCycleError, match="#a"):
+        story_root(a, _by_id(a), PREFIX, BASE, seen={"a"})
+
+
+def test_repeated_top_level_calls_each_get_a_fresh_seen():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["a"], subtasks=[])
+    c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
+    stories = _by_id(a, b, c)
+    for _ in range(2):
+        assert story_root(c, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
+        assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_two_in_milestone_blockers_refuse_to_guess_a_root():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story("c", ["a", "outside", "b"], subtasks=[_gsub("c1", "cccc0001")])
+    with pytest.raises(StackRootError) as caught:
+        story_root(c, _by_id(a, b, c), PREFIX, BASE)
+    message = str(caught.value)
+    assert "story #c is blocked by 2 stories (#a, #b)" in message
+    assert "ONE parent branch" in message
+    assert "Merge those blockers into main first" in message
+    assert "single blocker" in message
+    assert "#outside" not in message
+    assert isinstance(caught.value, ValueError)
+
+
+def test_a_stack_root_error_is_a_value_error():
+    assert issubclass(StackRootError, ValueError)
+
+
+def test_a_blocker_listed_twice_counts_once():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["a", "a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_stack_bases_anchor_on_the_full_list_even_past_a_done_first_subtask():
+    a1 = _gsub("a1", "aaaa0001", "done")
+    a2 = _gsub("a2", "aaaa0002")
+    a3 = _gsub("a3", "aaaa0003")
+    a = _story("a", subtasks=[a1, a2, a3])
+    bases = stack_bases(a, _by_id(a), PREFIX, BASE)
+    assert bases == {
+        a1.id: "main",
+        a2.id: "m3/task-a1-aaaa0001",
+        a3.id: "m3/task-a2-aaaa0002",
+    }
+    assert list(bases) == [a1.id, a2.id, a3.id]
+
+
+def test_stack_bases_of_a_closed_story_still_maps_every_subtask():
+    a1 = _gsub("a1", "aaaa0001", "done")
+    a2 = _gsub("a2", "aaaa0002", "done")
+    a = _story("a", status="done", subtasks=[a1, a2])
+    assert stack_bases(a, _by_id(a), PREFIX, BASE) == {
+        a1.id: "main",
+        a2.id: "m3/task-a1-aaaa0001",
+    }
+
+
+def test_stack_bases_of_a_story_with_no_subtasks_is_empty():
+    a = _story("a", subtasks=[])
+    assert stack_bases(a, _by_id(a), PREFIX, BASE) == {}
+
+
+def test_stack_bases_of_a_subtask_less_story_still_surfaces_a_root_error():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story("c", ["a", "b"], subtasks=[])
+    with pytest.raises(StackRootError, match="#c"):
+        stack_bases(c, _by_id(a, b, c), PREFIX, BASE)
+
+
+def test_stack_bases_surfaces_a_malformed_subtask_id():
+    a = _story(
+        "a",
+        subtasks=[SubtaskPlan(id="nope", title="bad", status="todo"), _gsub("a2", "aaaa0002")],
+    )
+    with pytest.raises(ValueError, match="not a card id"):
+        stack_bases(a, _by_id(a), PREFIX, BASE)
+
+
+def test_the_milestone_two_board_stacks_each_story_on_the_previous_ones_tip():
+    s1a, s1b = _gsub("s1a", "11110001"), _gsub("s1b", "11110002")
+    s2a, s2b, s2c = _gsub("s2a", "22220001"), _gsub("s2b", "22220002"), _gsub("s2c", "22220003")
+    s3a, s3b = _gsub("s3a", "33330001"), _gsub("s3b", "33330002")
+    s1 = _story("s1", subtasks=[s1a, s1b])
+    s2 = _story("s2", ["s1"], subtasks=[s2a, s2b, s2c])
+    s3 = _story("s3", ["s2"], subtasks=[s3a, s3b])
+    stories = _by_id(s1, s2, s3)
+    assert_no_blocker_cycles([s1, s2, s3])
+
+    assert stack_bases(s1, stories, PREFIX, BASE) == {
+        s1a.id: "main",
+        s1b.id: "m3/task-s1a-11110001",
+    }
+    assert stack_bases(s2, stories, PREFIX, BASE) == {
+        s2a.id: "m3/task-s1b-11110002",
+        s2b.id: "m3/task-s2a-22220001",
+        s2c.id: "m3/task-s2b-22220002",
+    }
+    assert stack_bases(s3, stories, PREFIX, BASE) == {
+        s3a.id: "m3/task-s2c-22220003",
+        s3b.id: "m3/task-s3a-33330001",
+    }
