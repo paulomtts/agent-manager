@@ -167,6 +167,9 @@ class Card(BaseModel):
     `status` is a plain string because the board's vocabulary
     (`todo`/`in_progress`/`done`/`blocked`) is brd's to define and is not the
     run lifecycle `Status` above.
+
+    `blocked_by` (ids this card waits on) and `created_at` (brd's ISO string,
+    kept as printed) are carried for the census.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -176,6 +179,8 @@ class Card(BaseModel):
     status: str = Field(min_length=1)
     parent_id: str | None = None
     description: str | None = None
+    blocked_by: list[str] = Field(default_factory=list)
+    created_at: str | None = None
 
 
 class CardNode(BaseModel):
@@ -191,4 +196,6 @@ class CardNode(BaseModel):
     title: str
     status: str = Field(min_length=1)
     description: str | None = None
+    blocked_by: list[str] = Field(default_factory=list)
+    created_at: str | None = None
     children: list["CardNode"] = Field(default_factory=list)

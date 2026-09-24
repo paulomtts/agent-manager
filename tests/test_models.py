@@ -758,3 +758,100 @@ def test_phase_carries_the_reason_it_failed():
     )
     assert failed.detail == "OSError: gone"
     assert failed.model_dump(mode="json")["detail"] == "OSError: gone"
+
+
+_BRD_MODELS = (models.Card, models.CardNode)
+
+
+@pytest.mark.parametrize("model", _BRD_MODELS, ids=["Card", "CardNode"])
+def test_brd_models_default_blocked_by_to_empty_and_created_at_to_none(model):
+    # Existing callers build cards without these keys; the defaults keep them working.
+    instance = model(id="c1", title="t", status="todo")
+    assert instance.blocked_by == []
+    assert instance.created_at is None
+
+
+@pytest.mark.parametrize("model", _BRD_MODELS, ids=["Card", "CardNode"])
+def test_brd_models_blocked_by_default_is_per_instance(model):
+    first = model(id="c1", title="t", status="todo")
+    second = model(id="c2", title="t", status="todo")
+    first.blocked_by.append("c9")
+    assert second.blocked_by == []
+
+
+def test_card_parses_blocked_by_and_created_at_from_a_brd_show_payload():
+    card = models.Card.model_validate(
+        {
+            "id": "c1",
+            "title": "t",
+            "status": "blocked",
+            "parent_id": "p1",
+            "description": None,
+            "blocked_by": ["b1", "b2"],
+            "created_at": "2026-09-23T10:00:00+00:00",
+            "updated_at": "2026-09-23T11:00:00+00:00",
+        }
+    )
+    assert card.blocked_by == ["b1", "b2"]
+    # brd's ISO string, kept as a string: not parsed into a datetime.
+    assert card.created_at == "2026-09-23T10:00:00+00:00"
+    assert isinstance(card.created_at, str)
+
+
+def test_card_node_parses_blocked_by_and_created_at_at_every_depth():
+    node = models.CardNode.model_validate(
+        {
+            "id": "m1",
+            "title": "Milestone 1",
+            "status": "todo",
+            "blocked_by": [],
+            "created_at": "2026-09-23T10:00:00+00:00",
+            "children": [
+                {
+                    "id": "s1",
+                    "title": "story",
+                    "status": "blocked",
+                    "blocked_by": ["s0"],
+                    "created_at": "2026-09-23T10:01:00+00:00",
+                    "children": [
+                        {
+                            "id": "t1",
+                            "title": "subtask",
+                            "status": "blocked",
+                            "blocked_by": ["t0", "x9"],
+                            "created_at": "2026-09-23T10:02:00+00:00",
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert node.blocked_by == []
+    assert node.created_at == "2026-09-23T10:00:00+00:00"
+    story = node.children[0]
+    assert story.blocked_by == ["s0"]
+    assert story.created_at == "2026-09-23T10:01:00+00:00"
+    subtask = story.children[0]
+    assert subtask.blocked_by == ["t0", "x9"]
+    assert subtask.created_at == "2026-09-23T10:02:00+00:00"
+
+
+@pytest.mark.parametrize("model", _BRD_MODELS, ids=["Card", "CardNode"])
+def test_brd_models_still_ignore_unknown_keys_alongside_the_new_fields(model):
+    instance = model.model_validate(
+        {
+            "id": "c1",
+            "title": "t",
+            "status": "todo",
+            "blocked_by": ["b1"],
+            "created_at": "2026-09-23T10:00:00+00:00",
+            "updated_at": "2026-09-23T11:00:00+00:00",
+            "assignee": "paulo",
+        }
+    )
+    assert instance.blocked_by == ["b1"]
+    assert instance.created_at == "2026-09-23T10:00:00+00:00"
+    assert not hasattr(instance, "assignee")
+    assert "updated_at" not in instance.model_dump()
+    assert "assignee" not in instance.model_dump()

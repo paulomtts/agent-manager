@@ -503,3 +503,80 @@ def test_nothing_but_status_is_ever_written_to_the_board(temp_board, tmp_path):
     )
     assert files == ["master.db", "projects"]
     assert len(list((brd_data / "projects").glob("*.db"))) == 1
+
+
+def _node_by_id(nodes: list[models.CardNode], card_id: str) -> models.CardNode:
+    """Depth-first lookup of one node in a parsed tree, wherever it nests."""
+    for node in nodes:
+        if node.id == card_id:
+            return node
+        try:
+            return _node_by_id(node.children, card_id)
+        except LookupError:
+            continue
+    raise LookupError(card_id)
+
+
+def _raw_by_id(nodes: list[dict], card_id: str) -> dict:
+    """Depth-first lookup of one node in brd's raw tree JSON."""
+    for node in nodes:
+        if node["id"] == card_id:
+            return node
+        try:
+            return _raw_by_id(node["children"], card_id)
+        except LookupError:
+            continue
+    raise LookupError(card_id)
+
+
+@requires_brd
+def test_show_and_tree_carry_blocked_by_and_created_at_from_a_real_board(temp_board):
+    milestone = _add_card(temp_board, "Milestone 1")
+    first = _add_card(temp_board, "story a", milestone)
+    second = _add_card(temp_board, "story b", milestone)
+    blocked = _add_card(temp_board, "story c", milestone)
+    _brd_json(temp_board, "block", blocked, "--by", first)
+    _brd_json(temp_board, "block", blocked, "--by", second)
+
+    raw_show = _brd_json(temp_board, "show", blocked)
+    card = board.show(blocked, repo_dir=temp_board)
+
+    # Every blocker, in brd's order -- not just the first.
+    assert sorted(card.blocked_by) == sorted([first, second])
+    assert card.blocked_by == raw_show["blocked_by"]
+    assert isinstance(card.created_at, str) and card.created_at
+    assert card.created_at == raw_show["created_at"]
+    # brd derives `blocked`; the adapter passes it through verbatim.
+    assert card.status == "blocked"
+
+    unblocked = board.show(first, repo_dir=temp_board)
+    assert unblocked.blocked_by == []
+    assert unblocked.created_at == _brd_json(temp_board, "show", first)["created_at"]
+
+    raw_tree = _brd_json(temp_board, "tree", milestone)
+    node = board.tree(milestone, repo_dir=temp_board)
+
+    for card_id in (milestone, first, second, blocked):
+        parsed = _node_by_id([node], card_id)
+        raw = _raw_by_id(raw_tree, card_id)
+        assert parsed.blocked_by == raw["blocked_by"]
+        assert isinstance(parsed.created_at, str) and parsed.created_at
+        assert parsed.created_at == raw["created_at"]
+    blocked_node = _node_by_id([node], blocked)
+    assert sorted(blocked_node.blocked_by) == sorted([first, second])
+    assert blocked_node.status == "blocked"
+
+
+@requires_brd
+def test_show_passes_status_and_blocked_by_through_after_the_blocker_is_done(temp_board):
+    # Whatever brd decides a done blocker means, the adapter must not second-guess it.
+    blocker = _add_card(temp_board, "blocker")
+    blocked = _add_card(temp_board, "blocked")
+    _brd_json(temp_board, "block", blocked, "--by", blocker)
+
+    board.set_status(blocker, "done", repo_dir=temp_board)
+
+    raw = _brd_json(temp_board, "show", blocked)
+    card = board.show(blocked, repo_dir=temp_board)
+    assert card.status == raw["status"]
+    assert card.blocked_by == raw["blocked_by"]
