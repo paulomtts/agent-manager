@@ -9,6 +9,9 @@ except where a test must force an output git itself would never print.
 import os
 import shutil
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -571,3 +574,42 @@ def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path)
     assert again["created"] is False
     _assert_no_forbidden_git(calls)
     assert (tmp_path / "wt-8" / "prior.txt").is_file()
+
+
+@requires_git
+def test_every_spelling_of_one_repository_shares_one_lock(repo: Path, tmp_path: Path):
+    # Trailing slash, a `..` hop and a symlinked path all name the same
+    # repository, so they must serialize on the same lock.
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo, target_is_directory=True)
+
+    lock = worktree._repo_lock(str(repo))
+
+    assert worktree._repo_lock(f"{repo}{os.sep}") is lock
+    assert worktree._repo_lock(str(repo / ".git" / "..")) is lock
+    assert worktree._repo_lock(str(link)) is lock
+
+
+def test_different_repositories_get_different_locks(tmp_path: Path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    assert worktree._repo_lock(str(a)) is not worktree._repo_lock(str(b))
+
+
+def test_concurrent_first_lookups_all_get_the_same_lock(tmp_path: Path):
+    fresh = tmp_path / "fresh-repo"
+    fresh.mkdir()
+    lanes = 8
+    barrier = threading.Barrier(lanes)
+
+    def lookup(_: int) -> threading.Lock:
+        barrier.wait(timeout=30)
+        return worktree._repo_lock(str(fresh))
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        locks = list(pool.map(lookup, range(lanes)))
+
+    assert all(lock is locks[0] for lock in locks)

@@ -16,6 +16,7 @@ Every invocation is an argument list handed to `subprocess` (design §5 line
 
 import os
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -157,6 +158,29 @@ def _resolve_base(git_runner: GitRunner, repo_path: str, base: str) -> str:
     except GitError:
         return base
     return f"origin/{base}"
+
+
+_REPO_LOCKS: dict[str, threading.Lock] = {}
+"""One lock per repository, keyed by its resolved path, created on first use."""
+
+_REPO_LOCKS_GUARD = threading.Lock()
+"""Guards lookup-or-create in `_REPO_LOCKS`, so one repository never gets two locks."""
+
+
+def _repo_lock(repo_path: str) -> threading.Lock:
+    """The lock serializing `git worktree add` on the repository at `repo_path`.
+
+    Keyed by the resolved path, so a trailing slash, a `..` hop or a symlinked
+    spelling of the same repository all share one lock. In-process threads
+    only: two `am` processes on one repository are not supported.
+    """
+    key = str(Path(repo_path).resolve())
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _REPO_LOCKS[key] = lock
+        return lock
 
 
 def ensure(
