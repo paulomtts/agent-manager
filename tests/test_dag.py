@@ -2,6 +2,9 @@ import pytest
 
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
+    DependencyCycleError,
+    compute_integrate_levels,
+    compute_levels,
     is_story_closed,
     is_subtask_done,
     ref_matches_card,
@@ -10,6 +13,7 @@ from agent_manager.dag import (
     slugify,
     task_branch,
     task_stem,
+    topological_levels,
 )
 
 CARD = {"id": "a32af745-15ef-45cd-b52c-64c19ae82c17", "title": "40.1 feat: write rows"}
@@ -187,3 +191,102 @@ def test_an_open_story_keeps_its_not_done_subtasks_in_order():
     a1, a2, a3, a4 = _sub("a1", "done"), _sub("a2"), _sub("a3", "DONE"), _sub("a4", "in_progress")
     story = _story("a", subtasks=[a1, a2, a3, a4])
     assert remaining_subtasks(story) == [a2, a4]
+
+
+def _ids(levels: list[list[StoryPlan]]) -> list[list[str]]:
+    return [[story.id for story in level] for level in levels]
+
+
+def _diamond() -> list[StoryPlan]:
+    return [
+        _story("a"),
+        _story("b", ["a"]),
+        _story("c", ["a"]),
+        _story("d", ["b", "c"]),
+    ]
+
+
+def test_linear_chain_is_one_story_per_level():
+    stories = [_story("a"), _story("b", ["a"]), _story("c", ["b"])]
+    assert _ids(compute_levels(stories)) == [["a"], ["b"], ["c"]]
+
+
+def test_diamond_groups_the_two_middle_stories_in_input_order():
+    assert _ids(compute_levels(_diamond())) == [["a"], ["b", "c"], ["d"]]
+
+
+def test_diamond_keeps_census_order_not_id_order_in_a_shared_level():
+    stories = [_story("a"), _story("c", ["a"]), _story("b", ["a"]), _story("d", ["b", "c"])]
+    assert _ids(compute_levels(stories)) == [["a"], ["c", "b"], ["d"]]
+
+
+def test_independent_roots_share_level_zero_in_input_order():
+    assert _ids(compute_levels([_story("y"), _story("x")])) == [["y", "x"]]
+
+
+def test_a_done_story_is_dropped_from_dispatch_but_kept_for_integrate():
+    stories = [_story("a", status="done"), _story("b", ["a"])]
+    assert _ids(compute_levels(stories)) == [["b"]]
+    assert _ids(compute_integrate_levels(stories)) == [["a"], ["b"]]
+
+
+def test_an_open_story_whose_subtasks_are_all_done_is_dropped_from_dispatch():
+    stories = [
+        _story("a", subtasks=[_sub("a1", "done"), _sub("a2", "DONE")]),
+        _story("b", ["a"]),
+    ]
+    assert _ids(compute_levels(stories)) == [["b"]]
+    assert _ids(compute_integrate_levels(stories)) == [["a"], ["b"]]
+
+
+def test_an_open_story_with_no_subtasks_is_dropped_from_dispatch():
+    stories = [_story("a", subtasks=[]), _story("b")]
+    assert _ids(compute_levels(stories)) == [["b"]]
+
+
+def test_blocked_by_a_finished_story_and_an_external_id_lands_in_level_zero():
+    stories = [_story("a", status="done"), _story("b", ["a", "outside"])]
+    assert _ids(compute_levels(stories)) == [["b"]]
+
+
+def test_an_external_blocker_is_ignored_by_the_level_engine():
+    stories = [_story("a", ["not-in-this-milestone"]), _story("b", ["a"])]
+    assert _ids(topological_levels(stories)) == [["a"], ["b"]]
+
+
+def test_levels_return_the_same_objects_and_leave_the_input_list_alone():
+    stories = _diamond()
+    before = list(stories)
+    levels = topological_levels(stories)
+    assert stories == before
+    assert [id(story) for level in levels for story in level] == [id(s) for s in stories]
+
+
+def test_empty_input_has_no_levels():
+    assert topological_levels([]) == []
+    assert compute_levels([]) == []
+    assert compute_integrate_levels([]) == []
+
+
+def test_a_two_story_cycle_stops_the_level_engine_naming_both():
+    stories = [_story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError, match="dependency cycle among stories #a, #b"):
+        topological_levels(stories)
+
+
+def test_the_level_engine_names_only_the_unplaced_stories_of_a_cycle():
+    stories = [_story("root"), _story("a", ["root", "b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        compute_integrate_levels(stories)
+    message = str(caught.value)
+    assert "#a, #b" in message
+    assert "#root" not in message
+
+
+def test_a_self_blocking_story_stops_the_level_engine():
+    with pytest.raises(DependencyCycleError, match="#a"):
+        topological_levels([_story("a", ["a"])])
+
+
+def test_a_dependency_cycle_error_is_a_value_error():
+    assert issubclass(DependencyCycleError, ValueError)

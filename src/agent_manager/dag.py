@@ -107,3 +107,71 @@ def remaining_subtasks(story: StoryPlan) -> list[SubtaskPlan]:
     if is_story_closed(story):
         return []
     return [subtask for subtask in story.subtasks if not is_subtask_done(subtask)]
+
+
+# ── dependency levels ───────────────────────────────────────────────────────
+# Port of orchestrator.js:131-165. One topological engine groups stories into
+# levels by their ``blocked_by`` edges; dispatch and integrate differ only in
+# which stories they feed it.
+
+
+class DependencyCycleError(ValueError):
+    """Stories' ``blocked_by`` edges form a cycle, so no order exists.
+
+    Subclasses ``ValueError`` because ``ValueError`` is already in
+    ``cli.HANDLED``: a CLI caller turns it into an ``ok: false`` envelope
+    without this module importing ``cli``.
+    """
+
+
+def topological_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
+    """``stories`` grouped into dependency levels, each level in input order.
+
+    A story is ready once every blocker is either outside ``stories`` (ignored:
+    it is not this milestone's to order) or already placed. The same
+    ``StoryPlan`` objects come back; the input list is not touched.
+    """
+    ids = {story.id for story in stories}
+    placed: set[str] = set()
+    levels: list[list[StoryPlan]] = []
+    rest = list(stories)
+    while rest:
+        ready = [
+            story
+            for story in rest
+            if all(dep not in ids or dep in placed for dep in story.blocked_by or [])
+        ]
+        if not ready:
+            listed = ", ".join(f"#{story.id}" for story in rest)
+            raise DependencyCycleError(f"dag: dependency cycle among stories {listed}")
+        levels.append(ready)
+        placed.update(story.id for story in ready)
+        rest = [story for story in rest if story.id not in placed]
+    return levels
+
+
+def compute_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
+    """Dispatch levels: only stories that still have subtasks to run.
+
+    A closed story, or one with no remaining subtasks, is dropped. Its id then
+    sits outside the pending set, so a story it blocked lands in level 0.
+
+    Card ids are opaque strings with no inherent order, so the census's own
+    order is the only stable one: pending stories keep it, never re-sorted.
+    """
+    pending = [
+        story
+        for story in stories
+        if not is_story_closed(story) and remaining_subtasks(story)
+    ]
+    return topological_levels(pending)
+
+
+def compute_integrate_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
+    """Integrate levels: every story, finished or not.
+
+    A story finished in an earlier run still needs its tip folded in, or a
+    resumed milestone's Integrate would report only its own slice as the
+    whole milestone.
+    """
+    return topological_levels(stories)
