@@ -548,3 +548,98 @@ def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project
     assert list(paths.data_dir().iterdir()) == []
     assert not (project / ".claude").exists()
     assert _git(project, "status", "--porcelain") == porcelain_before
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_stops_the_run_before_the_next_story(project):
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    driver = FakeDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        warnings={a1: ["gate warned before the escalation"]},
+    )
+
+    result = _run(project, shape["milestone"], driver)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_a,
+        "subtask": a1,
+        "failed_phase": "review",
+        "detail": "reviewer found a blocker",
+        "warnings": ["gate warned before the escalation"],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        a2: "pending",
+        story_b: "pending",
+        b1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_in_a_later_level_reports_that_level(project):
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    driver = FakeDriver(outcomes={b1: ("verify", "suite red")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert (result["level"], result["story"], result["subtask"]) == (1, story_b, b1)
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "escalated",
+        b1: "escalated",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_driver_that_raises_is_recorded_as_an_escalation(project):
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    driver = FakeDriver(outcomes={a1: RuntimeError("harness vanished")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result["escalated"] is True
+    assert (result["story"], result["subtask"]) == (story_a, a1)
+    assert result["failed_phase"] is None
+    assert result["detail"] == "RuntimeError: harness vanished"
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "pending",
+        b1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_keyboard_interrupt_from_the_driver_is_not_swallowed(project):
+    """The catch is `Exception`, not `BaseException`: Ctrl-C stops the process,
+    it is not an escalation a human should go and read."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    driver = FakeDriver(outcomes={a1: KeyboardInterrupt()})
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(project, shape["milestone"], driver)

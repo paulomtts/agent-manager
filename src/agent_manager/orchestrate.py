@@ -237,18 +237,45 @@ def run_milestone(
                     store.record_subtask(story_id, started)
                     if position == 0:
                         store.record_story(story_row.model_copy(update={"status": "started"}))
-                    result = drive(
-                        store=store,
-                        run_id=run_id,
-                        card=card,
-                        parent=parent,
-                        subtask=started,
-                        repo_dir=root,
-                        commands=list(commands),
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                    )
-                    warnings.extend(result.warnings)
+                    try:
+                        result = drive(
+                            store=store,
+                            run_id=run_id,
+                            card=card,
+                            parent=parent,
+                            subtask=started,
+                            repo_dir=root,
+                            commands=list(commands),
+                            allow_no_verification=allow_no_verification,
+                            runner_factory=runner_factory,
+                        )
+                    except Exception as error:  # not BaseException: Ctrl-C must still stop
+                        status = "escalated"
+                        failed_phase: str | None = None
+                        detail: str | None = f"{type(error).__name__}: {error}"
+                    else:
+                        warnings.extend(result.warnings)
+                        status = result.summary.status
+                        failed_phase = result.summary.failed_phase
+                        detail = result.summary.detail
+
+                    if status != "done":
+                        store.record_subtask(
+                            story_id, started.model_copy(update={"status": "escalated"})
+                        )
+                        store.record_story(story_row.model_copy(update={"status": "escalated"}))
+                        store.record_run(run_record.model_copy(update={"status": "escalated"}))
+                        return {
+                            "escalated": True,
+                            "run_id": run_id,
+                            "level": planned.level,
+                            "story": story_id,
+                            "subtask": subtask.id,
+                            "failed_phase": failed_phase,
+                            "detail": detail,
+                            "warnings": warnings,
+                        }
+
                     store.record_subtask(story_id, started.model_copy(update={"status": "done"}))
                     completed.append(subtask.id)
                 store.record_story(story_row.model_copy(update={"status": "done"}))
