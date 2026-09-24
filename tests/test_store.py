@@ -1527,3 +1527,129 @@ def test_recording_on_a_store_closed_by_another_thread_raises_and_frees_the_lock
     assert len(errors) == 1
     assert isinstance(errors[0], sqlite3.Error)
     assert _held_elsewhere(st._lock) is False
+
+
+STRESS_WORKERS = 8
+STRESS_STORIES = 4
+STRESS_SUBTASKS_PER_WORKER = 3
+STRESS_PHASES = ("explore", "implement")
+STRESS_ATTEMPTS_PER_PHASE = 2
+
+
+def _record_one_subtask(st: store.Store, story_id: str, card_id: str) -> int:
+    """Record one subtask's whole life, each parent before its children.
+
+    Returns how many `record_*` calls it made, so the caller can check the
+    journal holds exactly that many lines. `PhaseRun.detail` is left unset on
+    purpose: the projection has no column for it, so setting it would make the
+    rebuilt tree differ from the rows for a reason unrelated to threading.
+    """
+    calls = 0
+    subtask = _subtask(card_id)
+    st.record_subtask(story_id, subtask)
+    calls += 1
+    for name in STRESS_PHASES:
+        phase = models.PhaseRun(name=name, kind="agent", status="started")
+        st.record_phase(story_id, card_id, phase)
+        calls += 1
+        for n in range(1, STRESS_ATTEMPTS_PER_PHASE + 1):
+            attempt = models.Attempt(n=n, dispatch=_dispatch(card_id, name, n))
+            st.record_attempt(story_id, card_id, name, attempt)
+            calls += 1
+            st.record_attempt(
+                story_id,
+                card_id,
+                name,
+                attempt.model_copy(update={"status": "ok", "exit_code": 0}),
+            )
+            calls += 1
+        st.record_phase(story_id, card_id, phase.model_copy(update={"status": "done"}))
+        calls += 1
+    st.record_subtask(story_id, subtask.model_copy(update={"status": "done"}))
+    calls += 1
+    return calls
+
+
+def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journal(repo):
+    # P2: the threads of one process share one Store. Deterministic (P7): the
+    # assertions are on results only -- the journal's numbering and the tree
+    # the rows and the journal each produce -- never on timing.
+    st = store.Store.open(repo, RUN_ID)
+    story_ids = [f"story-{i}" for i in range(STRESS_STORIES)]
+    try:
+        # A child needs its parent: the run and every story exist before any
+        # thread starts.
+        st.record_run(_run(repo))
+        for story_id in story_ids:
+            st.record_story(_story().model_copy(update={"card_id": story_id}))
+        setup_calls = 1 + STRESS_STORIES
+
+        start = threading.Barrier(STRESS_WORKERS)
+        errors: list[BaseException] = []
+        calls = [0] * STRESS_WORKERS
+
+        def work(worker: int) -> None:
+            try:
+                start.wait(timeout=30)
+                for t in range(STRESS_SUBTASKS_PER_WORKER):
+                    # Spread each worker's subtasks across the stories, so every
+                    # story gets siblings recorded by several threads at once.
+                    index = worker * STRESS_SUBTASKS_PER_WORKER + t
+                    story_id = story_ids[index % STRESS_STORIES]
+                    calls[worker] += _record_one_subtask(st, story_id, f"w{worker}-t{t}")
+            except BaseException as error:  # surfaced by the assertion below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=work, args=(worker,))
+            for worker in range(STRESS_WORKERS)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+
+        assert [thread.is_alive() for thread in threads] == [False] * STRESS_WORKERS
+        assert errors == []
+
+        per_subtask = (
+            1 + len(STRESS_PHASES) * (1 + 2 * STRESS_ATTEMPTS_PER_PHASE + 1) + 1
+        )
+        total = setup_calls + sum(calls)
+        assert total == setup_calls + (
+            STRESS_WORKERS * STRESS_SUBTASKS_PER_WORKER * per_subtask
+        )
+        assert [line.seq for line in st.journal.read()] == list(range(1, total + 1))
+
+        # Read the rows BEFORE rebuilding: the rebuild rewrites them.
+        before = st.load_run(RUN_ID)
+        assert before is not None
+        assert [story.card_id for story in before.stories] == story_ids
+        recorded = [subtask for story in before.stories for subtask in story.subtasks]
+        assert sorted(subtask.card_id for subtask in recorded) == sorted(
+            f"w{worker}-t{t}"
+            for worker in range(STRESS_WORKERS)
+            for t in range(STRESS_SUBTASKS_PER_WORKER)
+        )
+        for subtask in recorded:
+            assert subtask.status == "done"
+            assert [phase.name for phase in subtask.phases] == list(STRESS_PHASES)
+            for phase in subtask.phases:
+                assert phase.status == "done"
+                assert [a.n for a in phase.attempts] == list(
+                    range(1, STRESS_ATTEMPTS_PER_PHASE + 1)
+                )
+                assert all(a.status == "ok" and a.exit_code == 0 for a in phase.attempts)
+
+        # Review Focus 4: a separate reader connection, as `am status` opens,
+        # sees exactly what the threads committed.
+        reader = store.open_db(repo)
+        try:
+            assert store.load_run(reader, RUN_ID) == before
+        finally:
+            reader.close()
+
+        assert st.rebuild_from_journal(RUN_ID) == before
+        assert st.load_run(RUN_ID) == before
+    finally:
+        st.close()
