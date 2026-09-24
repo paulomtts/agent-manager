@@ -661,11 +661,18 @@ def test_census_from_a_real_board(temp_board):
 
     roots = board.roots(repo_dir=temp_board)
 
-    # Preconditions on brd's own output, so the assertions below mean something.
-    assert (
-        _node_by_id(roots, docs_story).created_at
-        <= _node_by_id(roots, writer_story).created_at
-    )
+    # Preconditions on brd's own output, so the assertions below mean something:
+    # each dependent is strictly older than its blocker, so creation order (or
+    # an id tie-break) alone could never put the blocker first.
+    for dependent, blocker in [
+        (docs_story, writer_story),
+        (quoting, rows),
+        (examples, usage),
+    ]:
+        assert (
+            _node_by_id(roots, dependent).created_at
+            < _node_by_id(roots, blocker).created_at
+        )
     assert _node_by_id(roots, docs_story).status == "blocked"
     assert _node_by_id(roots, examples).status == "blocked"
 
