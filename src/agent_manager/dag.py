@@ -232,6 +232,15 @@ def assert_no_blocker_cycles(stories: list[StoryPlan]) -> None:
 # run before any of these functions.
 
 
+class StackRootError(ValueError):
+    """A story has no single parent branch for its stack to root on.
+
+    Subclasses ``ValueError`` because ``ValueError`` is already in
+    ``cli.HANDLED``: a CLI caller turns it into an ``ok: false`` envelope
+    without this module importing ``cli``.
+    """
+
+
 def subtask_branch(prefix: str, subtask: SubtaskPlan) -> str:
     """The branch a subtask's work lives on: exactly ``task_branch``.
 
@@ -285,7 +294,19 @@ def story_root(
     seen.add(story.id)
     # Only blockers inside this milestone can be stacked on; anything else is
     # external work whose branch this run knows nothing about.
-    blockers = [dep for dep in story.blocked_by or [] if dep in stories_by_id]
+    # A blocker listed twice is still one blocker.
+    blockers = [dep for dep in dict.fromkeys(story.blocked_by or []) if dep in stories_by_id]
     if not blockers:
         return base_branch
+    if len(blockers) > 1:
+        # Deliberately not guessing. Rooting on one blocker silently builds
+        # this story without the others' code, and an octopus base would need
+        # a merge, which stacking never does. A human picks.
+        listed = ", ".join(f"#{dep}" for dep in blockers)
+        raise StackRootError(
+            f"dag: story #{story.id} is blocked by {len(blockers)} stories ({listed}), "
+            "and a stack can only root on ONE parent branch. Merge those blockers into "
+            f"{base_branch} first, or restructure the dependencies so this story has "
+            "a single blocker."
+        )
     return story_tip(stories_by_id[blockers[0]], stories_by_id, prefix, base_branch, seen)

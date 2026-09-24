@@ -3,6 +3,7 @@ import pytest
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
     DependencyCycleError,
+    StackRootError,
     assert_no_blocker_cycles,
     compute_integrate_levels,
     compute_levels,
@@ -456,3 +457,28 @@ def test_repeated_top_level_calls_each_get_a_fresh_seen():
     for _ in range(2):
         assert story_root(c, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
         assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_two_in_milestone_blockers_refuse_to_guess_a_root():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story("c", ["a", "outside", "b"], subtasks=[_gsub("c1", "cccc0001")])
+    with pytest.raises(StackRootError) as caught:
+        story_root(c, _by_id(a, b, c), PREFIX, BASE)
+    message = str(caught.value)
+    assert "story #c is blocked by 2 stories (#a, #b)" in message
+    assert "ONE parent branch" in message
+    assert "Merge those blockers into main first" in message
+    assert "single blocker" in message
+    assert "#outside" not in message
+    assert isinstance(caught.value, ValueError)
+
+
+def test_a_stack_root_error_is_a_value_error():
+    assert issubclass(StackRootError, ValueError)
+
+
+def test_a_blocker_listed_twice_counts_once():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["a", "a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
