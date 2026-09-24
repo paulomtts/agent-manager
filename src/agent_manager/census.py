@@ -1,16 +1,27 @@
-"""Find one milestone among the board's root cards.
+"""Find one milestone among the board's root cards, and order card siblings.
 
-`--milestone` used to be a small integer. A UUID is not typeable, so a title
-substring is accepted too -- but never guessed at: zero matches or two matches
-is an error naming what was on the board, and the caller decides what to type
-next. Ported exactly from `census.mjs:62-98` in the leave-me-alone plugin,
-including its messages, so the two tools refuse in the same words.
+Both are ported exactly from the leave-me-alone plugin's `census.mjs`,
+including their messages, so the two tools refuse in the same words.
 
-`MilestoneNotFoundError` subclasses `ValueError` on purpose: `ValueError` is
-already in `cli.HANDLED`, so a CLI caller turns it into an `ok: false`
-envelope without this module importing `cli` (which will import this module).
+`find_milestone` (`census.mjs:62-98`): `--milestone` used to be a small
+integer. A UUID is not typeable, so a title substring is accepted too -- but
+never guessed at: zero matches or two matches is an error naming what was on
+the board, and the caller decides what to type next.
 
-This module is pure: no I/O, no subprocesses, no ``brd``.
+`order_siblings` (`census.mjs:12-49`): execution order for one card's
+children comes from the `blocked_by` edges between the siblings themselves, so
+the board states the order rather than encoding it in titles. Edges pointing
+outside the sibling set are ignored -- a subtask blocked by another story's
+card is a dispatch concern, not a sibling-ordering one. Independent siblings
+keep creation order. A cycle is an error; cards are never silently dropped.
+
+`MilestoneNotFoundError` and `CensusOrderError` subclass `ValueError` on
+purpose: `ValueError` is already in `cli.HANDLED`, so a CLI caller turns them
+into an `ok: false` envelope without this module importing `cli` (which will
+import this module).
+
+This module is pure: no I/O, no subprocesses, no ``brd``. It imports
+`agent_manager.models` and nothing from `cli` or `board`.
 """
 
 import re
@@ -87,3 +98,56 @@ def find_milestone(roots: list[CardNode] | None, needle: str | int) -> CardNode:
     raise MilestoneNotFoundError(
         f'ambiguous milestone "{wanted}" — matches: {listed}'
     )
+
+
+class CensusOrderError(ValueError):
+    """Some siblings could not be ordered: their `blocked_by` edges form a cycle."""
+
+
+def order_siblings(cards: list[CardNode] | None) -> list[CardNode]:
+    """`cards` in execution order, by the `blocked_by` edges among them.
+
+    Kahn's algorithm, as `census.mjs:12-49`. Only edges whose blocker is in
+    `cards` count. Ready cards go earliest-created first (`created_at or ""`,
+    then id), and the ready queue is re-sorted after every pop. The same
+    `CardNode` objects come back, reordered; the input list is not touched.
+    """
+    pool = list(cards or [])
+    if not pool:
+        return []
+
+    by_id = {card.id: card for card in pool}
+    indegree = {card.id: 0 for card in pool}
+    unlocks: dict[str, list[str]] = {card.id: [] for card in pool}
+
+    for card in pool:
+        for blocker_id in card.blocked_by:
+            if blocker_id not in by_id:
+                continue
+            unlocks[blocker_id].append(card.id)
+            indegree[card.id] += 1
+
+    def earliest_first(card_id: str) -> tuple[str, str]:
+        return (by_id[card_id].created_at or "", card_id)
+
+    ready = sorted(
+        (card.id for card in pool if indegree[card.id] == 0), key=earliest_first
+    )
+    ordered: list[CardNode] = []
+    while ready:
+        card_id = ready.pop(0)
+        ordered.append(by_id[card_id])
+        for unlocked in unlocks[card_id]:
+            indegree[unlocked] -= 1
+            if indegree[unlocked] == 0:
+                ready.append(unlocked)
+        ready.sort(key=earliest_first)
+
+    if len(ordered) != len(pool):
+        placed = {id(card) for card in ordered}
+        stuck = [card.id for card in pool if id(card) not in placed]
+        raise CensusOrderError(
+            f"census: {len(stuck)} card(s) could not be ordered — "
+            f"cyclic blocked_by among siblings: {', '.join(stuck)}"
+        )
+    return ordered
