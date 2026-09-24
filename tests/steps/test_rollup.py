@@ -1,8 +1,10 @@
-"""Behaviour of the roll-up step (design §4 `steps/`, subtask card 43008688).
+"""Behaviour of the roll-up step (design §4 `steps/`, subtask cards 43008688, bf26f482).
 
-Placement follows design §14: `rollup.py` is a Steps component whose entire
-behaviour is a brd write, so it is exercised against a real temporary brd board
-over subprocess -- brd is not mocked, and neither is `board.set_status`.
+Placement follows design §14: `rollup.py` is a Steps component whose behaviour
+is brd reads and writes -- write the card, then walk its ancestors -- so it is
+exercised against a real temporary brd board over subprocess. brd is not
+mocked, and neither is any `board` function. The pure status computation
+(`stored_status`, `rollup_status`) gets plain unit tests at the end of the file.
 
 `tests/steps/` has no `conftest.py` (`test_verify.py` defines its own
 `requires_git` marker locally), so the brd helpers are lifted from
@@ -78,7 +80,16 @@ def test_set_status_really_changes_the_card_on_the_board(temp_board):
     stored = _brd_json(temp_board, "show", subtask)
     assert stored["status"] == "in_progress"
     # The mapping reports what brd stored, not the literal that was requested.
-    assert result == {"card": subtask, "status": stored["status"]}
+    assert result == {
+        "card": subtask,
+        "status": stored["status"],
+        "rolled_up": [
+            {"card": story, "status": "in_progress"},
+            {"card": milestone, "status": "in_progress"},
+        ],
+    }
+    assert _brd_json(temp_board, "show", story)["status"] == "in_progress"
+    assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
 
 
 @requires_brd
@@ -88,7 +99,7 @@ def test_a_second_identical_call_is_a_harmless_no_op(temp_board):
     first = rollup.set_status(subtask, "done", repo_dir=temp_board)
     second = rollup.set_status(subtask, "done", repo_dir=temp_board)
 
-    assert second == first
+    assert second == first == {"card": subtask, "status": "done", "rolled_up": []}
     assert _brd_json(temp_board, "show", subtask)["status"] == "done"
 
 
@@ -99,7 +110,7 @@ def test_a_later_call_with_a_different_status_overwrites(temp_board):
     rollup.set_status(subtask, "in_progress", repo_dir=temp_board)
     result = rollup.set_status(subtask, "done", repo_dir=temp_board)
 
-    assert result == {"card": subtask, "status": "done"}
+    assert result == {"card": subtask, "status": "done", "rolled_up": []}
     assert _brd_json(temp_board, "show", subtask)["status"] == "done"
 
 
@@ -114,6 +125,128 @@ def test_an_empty_card_id_raises_board_error(temp_board):
     # A context key that was never populated must fail loudly, not write nothing.
     with pytest.raises(board.BoardError):
         rollup.set_status("", "done", repo_dir=temp_board)
+
+
+@requires_brd
+def test_the_first_subtask_going_in_progress_starts_story_and_milestone(temp_board):
+    milestone = _add_card(temp_board, "Milestone 3")
+    story = _add_card(temp_board, "Run a milestone", milestone)
+    first = _add_card(temp_board, "Extract the shared driver", story)
+    _add_card(temp_board, "Roll status up the ancestors", story)
+
+    result = rollup.set_status(first, "in_progress", repo_dir=temp_board)
+
+    assert result["rolled_up"] == [
+        {"card": story, "status": "in_progress"},
+        {"card": milestone, "status": "in_progress"},
+    ]
+    assert _brd_json(temp_board, "show", story)["status"] == "in_progress"
+    assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
+
+
+@requires_brd
+def test_the_last_subtask_going_done_marks_story_and_milestone_done(temp_board):
+    milestone = _add_card(temp_board, "Milestone 3")
+    story = _add_card(temp_board, "Run a milestone", milestone)
+    earlier = _add_card(temp_board, "Extract the shared driver", story)
+    last = _add_card(temp_board, "Roll status up the ancestors", story)
+    # The state a real run leaves behind before the last subtask finishes.
+    _brd_json(temp_board, "update", earlier, "--status", "done")
+    _brd_json(temp_board, "update", last, "--status", "in_progress")
+    _brd_json(temp_board, "update", story, "--status", "in_progress")
+    _brd_json(temp_board, "update", milestone, "--status", "in_progress")
+
+    result = rollup.set_status(last, "done", repo_dir=temp_board)
+
+    assert result == {
+        "card": last,
+        "status": "done",
+        "rolled_up": [
+            {"card": story, "status": "done"},
+            {"card": milestone, "status": "done"},
+        ],
+    }
+    assert _brd_json(temp_board, "show", story)["status"] == "done"
+    assert _brd_json(temp_board, "show", milestone)["status"] == "done"
+
+    # Resume re-runs whole phases: the same transition again changes nothing.
+    again = rollup.set_status(last, "done", repo_dir=temp_board)
+    assert again == {"card": last, "status": "done", "rolled_up": []}
+
+
+@requires_brd
+def test_a_stale_grandparent_is_repaired_past_a_correct_parent(temp_board):
+    milestone = _add_card(temp_board, "Milestone 3")
+    story = _add_card(temp_board, "Run a milestone", milestone)
+    first = _add_card(temp_board, "Extract the shared driver", story)
+    _add_card(temp_board, "Roll status up the ancestors", story)
+    # An interrupted earlier run: the story was rolled up, the milestone never was.
+    _brd_json(temp_board, "update", first, "--status", "in_progress")
+    _brd_json(temp_board, "update", story, "--status", "in_progress")
+    assert _brd_json(temp_board, "show", milestone)["status"] == "todo"
+
+    result = rollup.set_status(first, "in_progress", repo_dir=temp_board)
+
+    assert result["rolled_up"] == [{"card": milestone, "status": "in_progress"}]
+    assert _brd_json(temp_board, "show", story)["status"] == "in_progress"
+    assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
+
+
+@requires_brd
+def test_a_card_with_no_parent_rolls_nothing_up(temp_board):
+    lone = _add_card(temp_board, "A card with no parent")
+
+    result = rollup.set_status(lone, "in_progress", repo_dir=temp_board)
+
+    assert result == {"card": lone, "status": "in_progress", "rolled_up": []}
+
+
+@requires_brd
+def test_a_blocked_sibling_counts_as_todo_when_rolling_up(temp_board):
+    story = _add_card(temp_board, "Run a milestone")
+    first = _add_card(temp_board, "Extract the shared driver", story)
+    second = _brd_json(
+        temp_board,
+        "add",
+        "--title",
+        "Roll status up the ancestors",
+        "--parent",
+        story,
+        "--blocked-by",
+        first,
+    )["id"]
+    assert _brd_json(temp_board, "show", second)["status"] == "blocked"
+    # A stale story: nothing under it has actually started.
+    _brd_json(temp_board, "update", story, "--status", "in_progress")
+
+    result = rollup.set_status(first, "todo", repo_dir=temp_board)
+
+    # Children read ["todo", "blocked"]; blocked is todo, so the story is todo.
+    assert result["rolled_up"] == [{"card": story, "status": "todo"}]
+    assert _brd_json(temp_board, "show", story)["status"] == "todo"
+
+
+@requires_brd
+def test_a_parent_reported_blocked_is_not_rewritten_to_todo(temp_board):
+    milestone = _add_card(temp_board, "Milestone 3")
+    before = _add_card(temp_board, "An earlier story", milestone)
+    story = _brd_json(
+        temp_board,
+        "add",
+        "--title",
+        "A story waiting on the earlier one",
+        "--parent",
+        milestone,
+        "--blocked-by",
+        before,
+    )["id"]
+    subtask = _add_card(temp_board, "A subtask of the waiting story", story)
+    assert _brd_json(temp_board, "show", story)["status"] == "blocked"
+
+    result = rollup.set_status(subtask, "todo", repo_dir=temp_board)
+
+    # The story reads `blocked` but is stored `todo`, which is already the target.
+    assert result["rolled_up"] == []
 
 
 # --- Pure-function tier (design §14): the status computation, no board. ---
