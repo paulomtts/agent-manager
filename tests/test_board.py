@@ -580,3 +580,82 @@ def test_show_passes_status_and_blocked_by_through_after_the_blocker_is_done(tem
     card = board.show(blocked, repo_dir=temp_board)
     assert card.status == raw["status"]
     assert card.blocked_by == raw["blocked_by"]
+
+
+@requires_brd
+def test_roots_of_an_empty_board_is_an_empty_list(temp_board):
+    # brd tree with no id on an empty board answers {"ok": true, "data": []}.
+    assert board.roots(repo_dir=temp_board) == []
+
+
+@requires_brd
+def test_roots_returns_every_milestone_with_children_nested(temp_board):
+    first = _add_card(temp_board, "Milestone 1")
+    first_story = _add_card(temp_board, "story one", first)
+    first_subtask = _add_card(temp_board, "subtask one", first_story)
+    second = _add_card(temp_board, "Milestone 2")
+    second_story = _add_card(temp_board, "story two", second)
+
+    raw = _brd_json(temp_board, "tree")
+    nodes = board.roots(repo_dir=temp_board)
+
+    assert all(isinstance(node, models.CardNode) for node in nodes)
+    # brd's order, untouched.
+    assert [node.id for node in nodes] == [node["id"] for node in raw]
+    assert sorted(node.id for node in nodes) == sorted([first, second])
+
+    first_node = _node_by_id(nodes, first)
+    assert [child.id for child in first_node.children] == [first_story]
+    assert [grand.id for grand in first_node.children[0].children] == [first_subtask]
+    assert first_node.children[0].children[0].children == []
+
+    second_node = _node_by_id(nodes, second)
+    assert [child.id for child in second_node.children] == [second_story]
+    assert second_node.children[0].children == []
+
+    for card_id in (first, first_story, first_subtask, second, second_story):
+        parsed = _node_by_id(nodes, card_id)
+        assert parsed.created_at == _raw_by_id(raw, card_id)["created_at"]
+        assert parsed.blocked_by == []
+
+
+@requires_brd
+def test_roots_carries_a_cross_milestone_blocked_by_edge(temp_board):
+    first = _add_card(temp_board, "Milestone 1")
+    blocker = _add_card(temp_board, "story a", first)
+    second = _add_card(temp_board, "Milestone 2")
+    blocked = _add_card(temp_board, "story b", second)
+    _brd_json(temp_board, "block", blocked, "--by", blocker)
+
+    raw = _brd_json(temp_board, "tree")
+    nodes = board.roots(repo_dir=temp_board)
+
+    blocked_node = _node_by_id(nodes, blocked)
+    # The foreign id rides along untouched, and the node stays under its own milestone.
+    assert blocked_node.blocked_by == [blocker]
+    assert blocked_node.status == "blocked"
+    assert [child.id for child in _node_by_id(nodes, second).children] == [blocked]
+    assert blocked_node.created_at == _raw_by_id(raw, blocked)["created_at"]
+    assert isinstance(blocked_node.created_at, str) and blocked_node.created_at
+    assert _node_by_id(nodes, blocker).blocked_by == []
+
+
+@requires_brd
+def test_roots_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
+    # No `.brd` marker anywhere above: brd's ok:false ProjectNotFoundError must
+    # surface as BoardError, not as an empty board.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    not_a_project = tmp_path / "nowhere"
+    not_a_project.mkdir()
+    with pytest.raises(board.BoardError) as excinfo:
+        board.roots(repo_dir=not_a_project)
+    assert excinfo.value.error_type == "ProjectNotFoundError"
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.argv == ["brd", "tree"]
+
+
+# Pure checks: no board needed.
+
+
+def test_roots_argv_is_brd_tree_with_no_id():
+    assert board.roots_argv() == ["brd", "tree"]

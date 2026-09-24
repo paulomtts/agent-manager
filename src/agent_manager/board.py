@@ -1,7 +1,7 @@
 """The only caller of the `brd` CLI (design §4 line 119).
 
-Three operations cross this seam: read one card, read a card subtree, write a
-card status. Nothing about a *run* is ever written to the board (decision D5,
+Four operations cross this seam: read one card, read a card subtree, read
+every root of the board, write a card status. Nothing about a *run* is ever written to the board (decision D5,
 design §9) -- run state lives in agent-manager's own SQLite projection and
 journal, so `set_status` is the module's entire write surface.
 
@@ -60,6 +60,11 @@ def show_argv(card_id: str) -> list[str]:
 
 def tree_argv(card_id: str) -> list[str]:
     return [BRD, "tree", card_id]
+
+
+def roots_argv() -> list[str]:
+    # No id: brd answers with every top-level card, descendants nested.
+    return [BRD, "tree"]
 
 
 def set_status_argv(card_id: str, status: str) -> list[str]:
@@ -193,6 +198,26 @@ def tree(card_id: str, *, repo_dir: Path | None = None) -> models.CardNode:
             exit_code=completed.returncode,
         )
     return _validated(models.CardNode, data[0], argv=argv)
+
+
+def roots(*, repo_dir: Path | None = None) -> list[models.CardNode]:
+    """Every top-level card on the board, via `brd tree` with no id.
+
+    Each root nests its descendants under `children`. An empty board is an
+    empty list, not an error. Ordering and depth come from brd -- nothing is
+    re-sorted or re-parented here.
+    """
+    argv = roots_argv()
+    completed = _run(argv, repo_dir)
+    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
+    if not isinstance(data, list):
+        raise BoardError(
+            f"brd tree returned {type(data).__name__} where a list of roots "
+            "was expected",
+            argv=argv,
+            exit_code=completed.returncode,
+        )
+    return [_validated(models.CardNode, item, argv=argv) for item in data]
 
 
 def set_status(
