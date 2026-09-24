@@ -11,6 +11,16 @@ milestone. The check is deliberately strict: a card id is a UUID, and anything
 else is a bug worth surfacing loudly rather than inventing a plausible short
 id.
 
+The rest of the module is the milestone's dependency graph, ported from the
+leave-me-alone orchestrator: doneness read from brd ``status`` alone
+(``is_subtask_done``, ``is_story_closed``, ``remaining_subtasks``), stories
+grouped into dependency levels for dispatch and for integrate
+(``topological_levels``, ``compute_levels``, ``compute_integrate_levels``),
+and a blocker-cycle check that must run before any stack geometry
+(``assert_no_blocker_cycles``). All of them read ``census.StoryPlan`` and
+``census.SubtaskPlan`` by attribute, keep census order, and ignore blockers
+outside the milestone.
+
 This module is pure: no I/O, no subprocesses, no ``brd``.
 """
 
@@ -175,3 +185,42 @@ def compute_integrate_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
     whole milestone.
     """
     return topological_levels(stories)
+
+
+# ── cycle detection ─────────────────────────────────────────────────────────
+# Port of orchestrator.js:185-208.
+
+
+def assert_no_blocker_cycles(stories: list[StoryPlan]) -> None:
+    """Raise ``DependencyCycleError`` if the stories' ``blocked_by`` edges cycle.
+
+    This must run before any stack geometry. ``compute_levels`` also refuses
+    a cycle, but the geometry has to be sound first, and a cycle is exactly
+    what breaks it. ``story_root``'s own guard is not enough either:
+    ``story_tip`` returns a branch immediately for a story with subtasks, so a
+    cycle between two populated stories never recurses back to trip it.
+
+    Depth-first from each story in input order; only blockers that are stories
+    in ``stories`` are followed, so blockers outside the milestone are ignored.
+    """
+    by_id = {story.id: story for story in stories}
+    state: dict[str, str] = {}  # id -> "visiting" | "done"
+
+    def walk(story_id: str, trail: list[str]) -> None:
+        if state.get(story_id) == "done":
+            return
+        if state.get(story_id) == "visiting":
+            cycle = trail[trail.index(story_id):] + [story_id]
+            joined = " -> ".join(f"#{node}" for node in cycle)
+            raise DependencyCycleError(
+                f"dag: dependency cycle among stories {joined}"
+                " — no stack can be rooted until it is broken"
+            )
+        state[story_id] = "visiting"
+        for dep in by_id[story_id].blocked_by or []:
+            if dep in by_id:
+                walk(dep, [*trail, story_id])
+        state[story_id] = "done"
+
+    for story in stories:
+        walk(story.id, [])

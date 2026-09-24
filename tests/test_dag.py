@@ -3,6 +3,7 @@ import pytest
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
     DependencyCycleError,
+    assert_no_blocker_cycles,
     compute_integrate_levels,
     compute_levels,
     is_story_closed,
@@ -290,3 +291,46 @@ def test_a_self_blocking_story_stops_the_level_engine():
 
 def test_a_dependency_cycle_error_is_a_value_error():
     assert issubclass(DependencyCycleError, ValueError)
+
+
+def test_a_two_story_cycle_is_reported_as_a_trail_from_the_first_story_walked():
+    stories = [_story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        assert_no_blocker_cycles(stories)
+    assert "dependency cycle among stories #a -> #b -> #a" in str(caught.value)
+
+
+def test_the_cycle_trail_follows_input_order_for_where_it_starts():
+    stories = [_story("b", ["a"]), _story("a", ["b"])]
+    with pytest.raises(DependencyCycleError, match="#b -> #a -> #b"):
+        assert_no_blocker_cycles(stories)
+
+
+def test_the_cycle_trail_omits_a_non_cyclic_story_that_led_into_it():
+    stories = [_story("c", ["a"]), _story("a", ["b"]), _story("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        assert_no_blocker_cycles(stories)
+    message = str(caught.value)
+    assert "dependency cycle among stories #a -> #b -> #a" in message
+    assert "#c" not in message
+
+
+def test_a_self_blocking_story_is_a_one_story_cycle():
+    with pytest.raises(DependencyCycleError, match="#a -> #a"):
+        assert_no_blocker_cycles([_story("a", ["a"])])
+
+
+def test_a_cycle_between_finished_stories_is_still_caught():
+    stories = [_story("a", ["b"], status="done"), _story("b", ["a"], status="done")]
+    with pytest.raises(DependencyCycleError, match="#a -> #b -> #a"):
+        assert_no_blocker_cycles(stories)
+
+
+def test_an_external_blocker_does_not_trip_the_cycle_check():
+    stories = [_story("a", ["not-in-this-milestone"]), _story("b", ["a"])]
+    assert assert_no_blocker_cycles(stories) is None
+
+
+def test_an_acyclic_milestone_passes_the_cycle_check():
+    assert assert_no_blocker_cycles(_diamond()) is None
+    assert assert_no_blocker_cycles([]) is None
