@@ -13,7 +13,38 @@ envelope without this module importing `cli` (which will import this module).
 This module is pure: no I/O, no subprocesses, no ``brd``.
 """
 
+import re
+
 from agent_manager.models import CardNode
+
+_NUMERIC = re.compile(r"[0-9]+")
+
+
+def _is_digit(ch: str) -> bool:
+    """ASCII 0-9 only, as the JS `/[0-9]/`; `str.isdigit` also takes e.g. '٢'."""
+    return "0" <= ch <= "9"
+
+
+def _substring_hit(title: str, lowered: str, is_numeric: bool) -> bool:
+    """Whether `lowered` is a usable substring of the lowercased `title`.
+
+    A numeric needle ("2") must not resolve via a longer digit run it merely
+    sits inside ("Milestone 12") -- that is not the milestone the caller typed,
+    and silently resolving it turns a wrong READ into wrong branches, PRs and
+    status writes. So a numeric needle only matches a digit run of its own
+    length. Only the first occurrence is inspected, exactly as the JS does.
+    """
+    start = title.find(lowered)
+    if start == -1:
+        return False
+    if not is_numeric:
+        return True
+    end = start + len(lowered)
+    while start > 0 and _is_digit(title[start - 1]):
+        start -= 1
+    while end < len(title) and _is_digit(title[end]):
+        end += 1
+    return end - start <= len(lowered)
 
 
 class MilestoneNotFoundError(ValueError):
@@ -39,7 +70,12 @@ def find_milestone(roots: list[CardNode] | None, needle: str | int) -> CardNode:
         if root.title.lower() == lowered:
             return root
 
-    matches = [root for root in pool if lowered in root.title.lower()]
+    is_numeric = _NUMERIC.fullmatch(wanted) is not None
+    matches = [
+        root
+        for root in pool
+        if _substring_hit(root.title.lower(), lowered, is_numeric)
+    ]
     if len(matches) == 1:
         return matches[0]
     if not matches:
