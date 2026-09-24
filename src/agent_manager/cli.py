@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -655,6 +656,66 @@ def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[s
         "caller_provided": False,
         "provided_verification": None,
     }
+
+
+@dataclass(frozen=True)
+class SubtaskDrive:
+    """What one `drive_subtask` call did: the engine's summary, plus every warning.
+
+    `warnings` is the summary's own list followed by the runner's out-of-band
+    list. Internal state, so a dataclass rather than a pydantic model.
+    """
+
+    summary: engine.SubtaskSummary
+    warnings: list[str]
+
+
+def drive_subtask(
+    *,
+    store: Store,
+    run_id: str,
+    card: models.Card,
+    parent: models.Card,
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+) -> SubtaskDrive:
+    """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
+
+    Addendum O4's shared driver. `run_card` calls it once, and a milestone runner
+    calls it once per subtask against one store and one run id. The caller owns
+    everything around the walk: the board reads, the run id, opening and
+    closing the store, and the run/story/subtask rows. This function catches
+    nothing. An escalation is `summary.status == "escalated"`, not an exception.
+    """
+    workflow = load_builtin(WORKFLOW_NAME)
+    factory = default_runner_factory if runner_factory is None else runner_factory
+    runner = factory(
+        workflow=workflow,
+        store=store,
+        run_id=run_id,
+        story_id=parent.id,
+        card_id=card.id,
+    )
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=parent.id,
+        subtask=subtask,
+        repo_dir=repo_dir,
+        commands=commands,
+        card=card,
+        parent_story=parent,
+        extra_context=gate_context(commands, allow_no_verification),
+        agent_runner=runner,
+    )
+    # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
+    # its signature returns a result, so a warning has nowhere else to go,
+    # and dropping them is the §12 failure this whole list exists to prevent.
+    warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+    return SubtaskDrive(summary=summary, warnings=warnings)
 
 
 def run_card(
