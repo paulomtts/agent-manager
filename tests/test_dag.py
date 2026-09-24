@@ -12,6 +12,8 @@ from agent_manager.dag import (
     remaining_subtasks,
     short_id,
     slugify,
+    story_root,
+    story_tip,
     subtask_branch,
     task_branch,
     task_stem,
@@ -369,3 +371,88 @@ def test_subtask_branch_is_task_branch_so_names_have_one_source():
 def test_subtask_branch_passes_task_branchs_bad_id_error_through():
     with pytest.raises(ValueError, match="not a card id"):
         subtask_branch(PREFIX, SubtaskPlan(id="nope", title="bad", status="todo"))
+
+
+def test_a_story_with_no_blockers_roots_on_the_base_branch():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_story_blocked_only_outside_the_milestone_roots_on_the_base_branch():
+    a = _story("a", ["not-in-this-milestone"], subtasks=[_gsub("a1", "aaaa0001")])
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_missing_blocked_by_is_read_as_no_blockers():
+    a = StoryPlan(
+        id="a", title="a", status="todo", blocked_by=None, subtasks=[_gsub("a1", "aaaa0001")]
+    )
+    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+
+
+def test_a_story_tip_is_the_branch_of_its_last_subtask():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    assert story_tip(a, _by_id(a), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_one_in_milestone_blocker_roots_on_that_blockers_last_subtask():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_external_blockers_beside_one_in_milestone_blocker_are_ignored():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["outside-1", "a", "outside-2"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+
+
+def test_a_done_blocker_still_yields_its_tip_because_done_is_not_landed():
+    a = _story(
+        "a",
+        status="done",
+        subtasks=[_gsub("a1", "aaaa0001", "done"), _gsub("a2", "aaaa0002", "done")],
+    )
+    b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
+    assert story_tip(a, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_a_subtask_less_blocker_falls_through_to_its_own_root():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
+    b = _story("b", ["a"], subtasks=[])
+    c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
+    stories = _by_id(a, b, c)
+    assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(c, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
+
+
+def test_a_subtask_less_story_with_no_blockers_has_the_base_as_its_tip():
+    d = _story("d", subtasks=[])
+    assert story_tip(d, _by_id(d), PREFIX, BASE) == "main"
+
+
+def test_the_seen_guard_stops_a_cycle_between_subtask_less_stories():
+    a = _story("a", ["b"], subtasks=[])
+    b = _story("b", ["a"], subtasks=[])
+    with pytest.raises(
+        DependencyCycleError,
+        match="dependency cycle reached story #a while computing its stack root",
+    ):
+        story_root(a, _by_id(a, b), PREFIX, BASE)
+
+
+def test_a_pre_populated_seen_containing_the_story_raises():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    with pytest.raises(DependencyCycleError, match="#a"):
+        story_root(a, _by_id(a), PREFIX, BASE, seen={"a"})
+
+
+def test_repeated_top_level_calls_each_get_a_fresh_seen():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", ["a"], subtasks=[])
+    c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
+    stories = _by_id(a, b, c)
+    for _ in range(2):
+        assert story_root(c, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
+        assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"

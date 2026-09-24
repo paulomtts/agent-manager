@@ -242,3 +242,50 @@ def subtask_branch(prefix: str, subtask: SubtaskPlan) -> str:
     the prefix is part of the milestone's identity, full stop.
     """
     return task_branch(prefix, subtask)
+
+
+def story_tip(
+    story: StoryPlan,
+    stories_by_id: Mapping[str, StoryPlan],
+    prefix: str,
+    base_branch: str,
+    seen: set[str] | None = None,
+) -> str:
+    """The branch a story's stack ends on — what a dependent story roots from.
+
+    The last subtask of the FULL ordered list, whatever its status. A story
+    with no subtasks contributes no branch, so it falls through to its own
+    root with the same ``seen``. Run ``assert_no_blocker_cycles`` first.
+    """
+    if story.subtasks:
+        return subtask_branch(prefix, story.subtasks[-1])
+    return story_root(story, stories_by_id, prefix, base_branch, seen)
+
+
+def story_root(
+    story: StoryPlan,
+    stories_by_id: Mapping[str, StoryPlan],
+    prefix: str,
+    base_branch: str,
+    seen: set[str] | None = None,
+) -> str:
+    """Where a story's stack starts: ``base_branch`` or one blocker's tip.
+
+    A blocker marked ``done`` still yields its tip: done does not mean its
+    code landed anywhere. ``assert_no_blocker_cycles`` must run first; the
+    ``seen`` guard here is only a backstop, because ``story_tip`` returns
+    immediately for a story with subtasks, so a cycle between two populated
+    stories never recurses back to trip it.
+    """
+    seen = set() if seen is None else seen
+    if story.id in seen:
+        raise DependencyCycleError(
+            f"dag: dependency cycle reached story #{story.id} while computing its stack root"
+        )
+    seen.add(story.id)
+    # Only blockers inside this milestone can be stacked on; anything else is
+    # external work whose branch this run knows nothing about.
+    blockers = [dep for dep in story.blocked_by or [] if dep in stories_by_id]
+    if not blockers:
+        return base_branch
+    return story_tip(stories_by_id[blockers[0]], stories_by_id, prefix, base_branch, seen)
