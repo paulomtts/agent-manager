@@ -25,7 +25,15 @@ from typing import Any, Protocol
 
 import typer
 
-from agent_manager import board, dag, dispatch, engine, models, store as store_module
+from agent_manager import (
+    board,
+    dag,
+    dispatch,
+    engine,
+    models,
+    prompt,
+    store as store_module,
+)
 from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
 from agent_manager.store import Store
@@ -507,19 +515,27 @@ def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
     excluded by name -- `_bind_result` skips writing those back anyway, which
     means a same-named phase's result is never what a later phase reads.
 
+    An input whose name is not itself a phase can still name one: `plan_hash` is
+    resolved out of `docs_commit`'s result. `prompt.INPUT_PRODUCERS`, derived
+    from the resolution table, is the one place that mapping lives.
+
     Transitive by construction, and terminating: each hop moves strictly earlier
-    in `phase_names`. In `builtin/task.yaml` the only edge is `spec` -> `explore`.
+    in `phase_names`. In `builtin/task.yaml` the edges are `spec` -> `explore`
+    and `implement` -> `docs_commit`.
     """
     order = {name: index for index, name in enumerate(workflow.phase_names)}
     current = phase_name
     while True:
         phase = workflow.phase(current)
         producers = [
-            name
+            prompt.INPUT_PRODUCERS.get(name, name)
             for name in getattr(phase, "inputs", ())
-            if name in order
-            and name not in engine.RESERVED_CONTEXT_KEYS
-            and order[name] < order[current]
+            if name not in engine.RESERVED_CONTEXT_KEYS
+        ]
+        producers = [
+            name
+            for name in producers
+            if order.get(name, order[current]) < order[current]
         ]
         if not producers:
             return current
@@ -634,8 +650,8 @@ def run_card(
     card_id: str,
     *,
     repo_dir: Path,
+    branch_prefix: str,
     base_branch: str = "master",
-    branch_prefix: str = "m1",
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
@@ -767,12 +783,22 @@ def run(
         "master", "--base-branch", help="The branch this subtask's branch is cut from."
     ),
     branch_prefix: str = typer.Option(
-        "m1", "--branch-prefix", help="Milestone prefix for the derived branch name."
+        ...,
+        "--branch-prefix",
+        help="Milestone prefix for the derived branch name, e.g. `m2`.",
     ),
     allow_no_verification: bool = typer.Option(
         False,
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
+    ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. Passed through verbatim "
+            "and in the order given; the engine runs them in sequence."
+        ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
@@ -784,6 +810,7 @@ def run(
             base_branch=base_branch,
             branch_prefix=branch_prefix,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -1078,20 +1105,30 @@ def resume(
         "--allow-no-verification",
         help="Proceed even when no verification suite is available (§12's opt-out).",
     ),
+    verify: list[str] = typer.Option(
+        [],
+        "--verify",
+        help=(
+            "One whole verification command, repeatable. The run record does not "
+            "carry the suite, so a resume is told it the way a fresh run was."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Re-run the phase a killed run died in, and drive the subtask to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
-    started and are recorded on the subtask (§9). `--allow-no-verification` is
-    offered because `models.RunConfig` does not carry it, so the flag means the
-    same thing here as it does on a fresh `run`.
+    started and are recorded on the subtask (§9). `--allow-no-verification` and
+    `--verify` are offered because `models.RunConfig` carries neither the opt-out
+    nor the suite commands, so both mean the same thing here as they do on a
+    fresh `run`.
     """
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
+            commands=list(verify),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

@@ -24,7 +24,16 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dag, dispatch, models, paths, store as store_module
+from agent_manager import (
+    board,
+    cli,
+    dag,
+    dispatch,
+    models,
+    paths,
+    prompt,
+    store as store_module,
+)
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.steps.reducers import verification_gate
 from agent_manager.workflow.loader import load_builtin
@@ -454,9 +463,9 @@ def test_the_interrupted_phase_is_the_one_recorded_started():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
             _recorded("spec", "done", [_pure_attempt(1)]),
             _recorded("validate_spec", "done", [_pure_attempt(1)]),
@@ -475,9 +484,9 @@ def test_a_crash_between_phases_restarts_at_the_first_phase_not_done():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
         ],
     )
 
@@ -492,14 +501,26 @@ def test_a_skipped_stretch_restarts_at_the_phase_whose_when_decided_the_skip():
     subtask = _pure_subtask(
         "card-1",
         [
+            _recorded("worktree", "done"),
             _recorded("explore", "done", [_pure_attempt(1)]),
             _recorded("mark_in_progress", "done"),
-            _recorded("worktree", "done"),
             _recorded("plan_check", "done"),
         ],
     )
 
     assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
+
+
+def test_a_run_that_lost_everything_after_the_first_phase_restarts_at_explore():
+    """The first phase of the document is `worktree` (R6), so the cheapest real
+    crash there is -- the process dying right after the worktree was created --
+    must restart at `explore` and never re-create the worktree."""
+    workflow = _task_workflow()
+    assert workflow.phase_names[0] == "worktree"
+
+    subtask = _pure_subtask("card-1", [_recorded("worktree", "done")])
+
+    assert cli.interrupted_phase(subtask, workflow) == "explore"
 
 
 def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_check():
@@ -515,8 +536,8 @@ def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_chec
     assert cli.interrupted_phase(subtask, workflow) == "mark_done"
 
 
-SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan")
-"""The phases `plan_check: skip_to implement` jumps over, which the engine
+SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan", "mark_validated")
+"""The phases `plan_check: skip_to docs_commit` jumps over, which the engine
 records nowhere at all (engine.py:431-433 only appends to the in-memory
 summary), so an unrecorded stretch reads the same as one that never ran."""
 
@@ -536,6 +557,7 @@ def test_a_skipped_stretch_the_walk_ran_past_does_not_drag_the_restart_back():
                 for name in workflow.phase_names[:4]
                 if name not in SKIPPED_STRETCH
             ],
+            _recorded("docs_commit", "done"),
             _recorded("implement", "done", [_pure_attempt(1)]),
         ],
     )
@@ -577,10 +599,25 @@ def test_an_interrupted_spec_backs_off_to_the_phase_whose_result_it_binds():
     assert cli.resume_start_phase(_task_workflow(), "spec") == "explore"
 
 
-def test_an_interrupted_implement_stays_at_implement():
-    """`implement` declares `[plan_path, spec_path, branch, base_branch]`, all of
-    which `subtask_context` and `_document_paths` supply from the record."""
-    assert cli.resume_start_phase(_task_workflow(), "implement") == "implement"
+def test_an_interrupted_implement_backs_off_to_the_phase_that_binds_its_plan_hash():
+    """`implement` declares `[plan_path, spec_path, branch, base_branch,
+    plan_hash]`. The first four come from the record; `plan_hash` is
+    `docs_commit`'s result, which lives only in the in-memory binding table, so
+    a walk started at `implement` could not render its brief. `docs_commit` is
+    idempotent (nothing to commit and the branch already carries the hash
+    returns the same digest), so re-running it is the whole recovery. Card
+    f26b377d."""
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "docs_commit"
+
+
+def test_the_resume_walk_reads_its_producer_map_out_of_the_prompt_table(monkeypatch):
+    """`input name -> producing phase` has one home: the nested resolvers in
+    `prompt._TABLE`, which are what make the dependency real. A second,
+    hand-written copy in `cli.py` would go stale the day a resolver reads a
+    different phase, and the walk would restart somewhere that cannot render."""
+    monkeypatch.setitem(prompt.INPUT_PRODUCERS, "plan_hash", "mark_validated")
+
+    assert cli.resume_start_phase(_task_workflow(), "implement") == "mark_validated"
 
 
 def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
@@ -591,7 +628,7 @@ def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orpha
     subtask = _pure_subtask(
         "card-1",
         [
-            *[_recorded(name, "done") for name in workflow.phase_names[:10]],
+            *[_recorded(name, "done") for name in workflow.phase_names[:11]],
             _recorded("verify", "started"),
         ],
     )
@@ -1058,6 +1095,25 @@ EXPLORE_RESULT = {
 }
 
 
+def _canned_agent_result(phase, context) -> dict[str, Any]:
+    """The canned result a faked agent phase returns.
+
+    The real Plan agent writes the plan file that the deterministic
+    `mark_validated` phase then stamps, so the fake writes a stand-in there. The
+    real `docs_commit` phase then commits the spec and the plan, so the fake
+    writes a stand-in spec too.
+    """
+    if phase.name == "spec":
+        spec = Path(context["worktree"]) / context["spec_path"]
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("# canned spec\n", encoding="utf-8")
+    if phase.name == "plan":
+        plan = Path(context["worktree"]) / context["plan_path"]
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("# canned plan\n", encoding="utf-8")
+    return {"phase": phase.name, "ok": True}
+
+
 def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str | None = None):
     """An `engine.AgentPhaseRunner` that returns canned results and runs nothing.
 
@@ -1075,7 +1131,7 @@ def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str 
             )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -1087,6 +1143,7 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1095,6 +1152,27 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
     assert payload["story_id"] == cards["story"]
     assert payload["failed_phase"] is None
     assert payload["detail"] is None
+
+
+@requires_git
+@requires_brd
+def test_run_card_really_moves_the_card_on_the_board(project, cards):
+    """§12: a payload saying `done` while the card never moved is the failure
+    this run is supposed to prevent. `mark_in_progress` and `mark_done` are
+    `best_effort`, so a board write that never happened would be a warning at
+    most -- the proof has to come from brd itself, not from the payload."""
+    assert board.show(cards["subtask"], repo_dir=project).status == "todo"
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["warnings"] == []
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
 @requires_git
@@ -1128,6 +1206,7 @@ def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards,
         cards["subtask"],
         repo_dir=Path("."),
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
     assert Path(payload["worktree"]).is_absolute()
@@ -1144,6 +1223,7 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(seen),
     )
 
@@ -1167,7 +1247,18 @@ def _invoke(project: Path, card_id: str, *extra: str):
     """
     return runner.invoke(
         cli.app,
-        ["run", "--card", card_id, "--repo-dir", str(project), "--base-branch", "main", *extra],
+        [
+            "run",
+            "--card",
+            card_id,
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            *extra,
+        ],
     )
 
 
@@ -1211,16 +1302,27 @@ def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatc
     assert "canned gate failure" in envelope["data"]["detail"]
 
 
+def _fail_board_writes(monkeypatch) -> None:
+    def refuse(*args, **kwargs):
+        raise cli.board.BoardError("simulated board write failure")
+
+    monkeypatch.setattr(cli.board, "set_status", refuse)
+
+
 @requires_git
 @requires_brd
-def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
+def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
+    project, cards, monkeypatch
+):
     """§12: a run that says `done` while the card never moved is the exact
-    failure this list exists to prevent. `rollup.set_status` is still a registry
-    placeholder that raises, which is one honest way for the write to fail."""
+    failure this list exists to prevent. The board write is made to fail by
+    having `board.set_status` raise, which is one honest way for it to fail."""
+    _fail_board_writes(monkeypatch)
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1231,11 +1333,14 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(project, cards):
 
 @requires_git
 @requires_brd
-def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, cards):
+def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
+    project, cards, monkeypatch
+):
     """`AgentRunner` collects gate warnings on itself (dispatch.py:375) because
     an `AgentPhaseRunner` returns a result and has no second channel. §12 forbids
     a run reporting a clean success while a gate warned, so the payload has to
     carry that list too -- not just `SubtaskSummary.warnings`."""
+    _fail_board_writes(monkeypatch)
 
     class WarningRunner:
         def __init__(self) -> None:
@@ -1249,6 +1354,7 @@ def test_the_runners_own_warnings_join_the_summarys_in_the_payload(project, card
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: WarningRunner(),
     )
 
@@ -1270,6 +1376,7 @@ def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards)
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         clock=lambda: frozen,
         runner_factory=lambda **kwargs: fake_runner(),
     )
@@ -1289,6 +1396,7 @@ def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1323,6 +1431,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1344,6 +1453,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
@@ -1371,6 +1481,7 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=exploding_factory,
     )
 
@@ -1449,6 +1560,8 @@ def test_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch
             "cbe34d00-9d8d-4f41-9c94-f99e665771b0",
             "--repo-dir",
             str(tmp_path / "missing"),
+            "--branch-prefix",
+            "m1",
         ],
     )
 
@@ -1543,6 +1656,7 @@ def test_no_harness_is_ever_launched(project, cards, monkeypatch):
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(),
     )
     assert payload["status"] == "done"
@@ -1566,6 +1680,7 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         runner_factory=lambda **kwargs: fake_runner(seen_off),
     )
     off = seen_off[0][1]
@@ -1579,6 +1694,7 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         cards["subtask"],
         repo_dir=project,
         base_branch="main",
+        branch_prefix="m1",
         allow_no_verification=True,
         runner_factory=lambda **kwargs: fake_runner(seen_on),
     )
@@ -1589,6 +1705,220 @@ def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
         is None
     )
     assert payload["status"] == "done"
+
+
+def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
+    """The exact `run_card` payload shape, for tests that replace `run_card`.
+
+    Spelled out rather than built from a loop so that a key this program stops
+    returning shows up here as a diff, not as a silently absent assertion.
+    """
+    return {
+        "run_id": "20260923T140506Z-cbe34d00",
+        "card_id": card_id,
+        "story_id": story_id,
+        "branch": "m2/task-fake-cbe34d00",
+        "base_branch": "main",
+        "worktree": "/tmp/agent-manager-fake-worktree",
+        "status": "done",
+        "failed_phase": None,
+        "detail": None,
+        "skipped": [],
+        "warnings": [],
+    }
+
+
+@requires_git
+@requires_brd
+def test_repeated_verify_options_reach_run_card_in_command_line_order(
+    project, cards, monkeypatch
+):
+    """§12's suite is the caller's to supply, and the engine runs the commands in
+    sequence -- so the order the operator typed is behaviour, not decoration."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen["card_id"] = card_id
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
+
+
+@requires_git
+@requires_brd
+def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
+    """`gate_context` calls `list(commands)` and `verification_gate` tells an
+    empty suite apart from a missing one, so `None` here would be a crash or a
+    silently different verdict."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    assert seen["commands"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
+    project, cards, monkeypatch
+):
+    """Review Focus: one occurrence is one whole command string. The CLI does no
+    word-splitting, no parsing and no validation -- whether a command is nonsense
+    is the engine's business, not this layer's."""
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, cards["story"])
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "uv run pytest -k 'not slow'",
+        "--verify",
+        "",
+    )
+
+    assert result.exit_code == 0
+    assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
+
+
+@requires_git
+@requires_brd
+def test_verify_values_reach_the_gate_context_through_the_real_run_card(
+    project, cards, monkeypatch
+):
+    """The whole chain, not just the call: `--verify` -> `run_card` ->
+    `gate_context` -> the context `builtin/task.yaml` binds its gates out of.
+
+    The real verify step runs these commands in the worktree, so they are ones
+    that pass anywhere."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner(seen))
+
+    result = _invoke(
+        project,
+        cards["subtask"],
+        "--verify",
+        "true",
+        "--verify",
+        "echo checked",
+    )
+
+    assert result.exit_code == 0, result.stdout
+    _phase, context = seen[0]
+    assert context["suite_cmds"] == ["true", "echo checked"]
+    assert context["allow_no_verification"] is False
+    assert context["caller_provided"] is False
+    assert context["provided_verification"] is None
+
+
+@requires_git
+@requires_brd
+def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
+    project, cards, monkeypatch
+):
+    """A missing required option never enters the `HANDLED` try block, so it is
+    Typer's own usage error at exit 2 -- distinct from `EXIT_ERROR`, and with
+    nothing written: no run id is minted because `run_card` is never called."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            cards["subtask"],
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--branch-prefix" in result.output
+    # Not the `ok: false` envelope: a usage error never reaches the try block.
+    assert '"ok"' not in result.stdout
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@requires_git
+@requires_brd
+def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
+    project, cards, monkeypatch
+):
+    """The default is gone, so the only way a prefix reaches the branch name is
+    the option -- and the branch is what every later command keys off."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    card = board.show(cards["subtask"], repo_dir=project)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            cards["subtask"],
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)["data"]
+    assert data["branch"] == dag.task_branch("m2", card)
+    assert data["branch"].startswith("m2/")
+
+
+@requires_git
+@requires_brd
+def test_the_run_success_envelope_keys_are_frozen(project, cards, monkeypatch):
+    """A shape freeze: `status`, `logs` and every downstream consumer read these
+    eleven names, so an added, dropped or renamed key is a contract break."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == 0
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == {
+        "run_id",
+        "card_id",
+        "story_id",
+        "branch",
+        "base_branch",
+        "worktree",
+        "status",
+        "failed_phase",
+        "detail",
+        "skipped",
+        "warnings",
+    }
 
 
 @pytest.fixture
@@ -2238,7 +2568,7 @@ def recording_runner(
         )
         if phase.name == "explore":
             return dict(EXPLORE_RESULT)
-        return {"phase": phase.name, "ok": True}
+        return _canned_agent_result(phase, context)
 
     return runner
 
@@ -2267,6 +2597,7 @@ def _crash_mid_phase(project: Path, cards: dict[str, str], phase: str) -> str:
             cards["subtask"],
             repo_dir=project,
             base_branch="main",
+            branch_prefix="m1",
             clock=lambda: CRASHED_AT,
             runner_factory=_resume_factory(crash_at=phase),
         )
@@ -2291,7 +2622,7 @@ def test_a_run_killed_mid_implement_resumes_and_leaves_no_started_attempt(projec
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
 
     assert payload["status"] == "done"
-    assert payload["resumed_from"] == "implement"
+    assert payload["resumed_from"] == "docs_commit"
     assert {"phase": "implement", "n": 1} in payload["discarded_attempts"]
     assert payload["run_id"] == run_id
     assert payload["card_id"] == cards["subtask"]
@@ -2366,7 +2697,7 @@ def test_resume_passes_its_own_allow_no_verification_into_the_gate_context(proje
             contexts.append(dict(context))
             if phase.name == "explore":
                 return dict(EXPLORE_RESULT)
-            return {"phase": phase.name, "ok": True}
+            return _canned_agent_result(phase, context)
 
         return collect
 
@@ -2456,7 +2787,7 @@ def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_tra
         project,
         cards,
         run_id,
-        done=("explore", "mark_in_progress", "worktree", "plan_check"),
+        done=("worktree", "explore", "mark_in_progress", "plan_check"),
     )
 
     with pytest.raises(EngineError) as caught:
@@ -2563,7 +2894,7 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "done"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
     assert envelope["data"]["discarded_attempts"] == [{"phase": "implement", "n": 1}]
     assert "\n" not in result.stdout.strip()
 
@@ -2600,7 +2931,49 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "escalated"
     assert envelope["data"]["failed_phase"] == "review"
-    assert envelope["data"]["resumed_from"] == "implement"
+    assert envelope["data"]["resumed_from"] == "docs_commit"
+
+
+@requires_git
+@requires_brd
+def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
+    project, cards, monkeypatch
+):
+    """`models.RunConfig` carries neither the suite commands nor the opt-out, so
+    a resume has to be told the same things a fresh `run` was told -- and in the
+    same order, since the engine runs the commands in sequence."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    contexts: list[dict[str, Any]] = []
+
+    def collecting_factory(**kwargs):
+        inner = fake_runner()
+
+        def collect(phase, context, rendered):
+            contexts.append(dict(context))
+            return inner(phase, context, rendered)
+
+        return collect
+
+    monkeypatch.setattr(cli, "default_runner_factory", collecting_factory)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            run_id,
+            "--repo-dir",
+            str(project),
+            "--verify",
+            "true",
+            "--verify",
+            "echo checked",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["data"]["resumed_from"] == "docs_commit"
+    assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
+    assert contexts[0]["allow_no_verification"] is False
 
 
 @requires_git

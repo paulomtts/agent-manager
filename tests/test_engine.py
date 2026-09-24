@@ -56,6 +56,7 @@ def test_subtask_context_renames_the_model_fields_the_steps_ask_for():
         "parent_story_details": None,
         "branch": "m1/task-ed77a917",
         "base": "m1/story-base",
+        "base_branch": "m1/story-base",
         "worktree": Path("/repo/.claude/worktrees/m1/task-ed77a917"),
         "repo_dir": REPO,
         "commands": ["uv run pytest"],
@@ -77,8 +78,31 @@ def test_the_cards_land_under_the_details_keys_and_leave_the_id_string_alone():
 
 
 def test_the_new_context_keys_are_reserved_against_a_same_named_phase():
-    for key in ("card_details", "parent_story_details", "spec_path", "plan_path"):
+    for key in (
+        "card_details",
+        "parent_story_details",
+        "spec_path",
+        "plan_path",
+        "base_branch",
+    ):
         assert key in engine.RESERVED_CONTEXT_KEYS
+
+
+def test_the_base_branch_alias_is_the_same_string_the_steps_bind_as_base():
+    """`review_gate(review, branch, base_branch)` binds by parameter name, and
+    the deterministic steps bind the same value as `base`. One value, two keys,
+    rather than a second source of truth for the base branch."""
+    context = engine.subtask_context(_subtask(), REPO)
+    assert context["base_branch"] == context["base"] == "m1/story-base"
+
+
+def test_a_phase_named_base_branch_cannot_overwrite_the_alias():
+    """Same rule as the `worktree` phase: a result must never replace a key a
+    later gate binds from. `_bind_result` is called directly here because the
+    rule is a property of that function, not of any particular document."""
+    context = engine.subtask_context(_subtask(), REPO)
+    engine._bind_result(context, "base_branch", {"branch": "somewhere/else"})
+    assert context["base_branch"] == "m1/story-base"
 
 
 def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
@@ -1112,6 +1136,16 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     def has_plan(result: dict[str, Any]) -> bool:
         return bool(result.get("validated"))
 
+    def mark_validated(plan_path: str, worktree: Any) -> dict[str, Any]:
+        calls.append("plan_check.mark_validated")
+        return {"path": plan_path, "appended": True}
+
+    def commit_documents(
+        card_details: Any, spec_path: str, plan_path: str, worktree: Any
+    ) -> dict[str, Any]:
+        calls.append("docs_commit.commit_documents")
+        return {"plan_hash": "a1b2c3d4"}
+
     def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
@@ -1128,6 +1162,8 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "worktree.ensure": ensure,
         "plan_check.find_validated_plan": find_plan,
         "plan_check.has_validated_plan": has_plan,
+        "plan_check.mark_validated": mark_validated,
+        "docs_commit.commit_documents": commit_documents,
         "verify.run_suite": run_suite,
         "verification_passed_gate": verification_passed_gate,
         "critic_blockers_gate": agent_only_gate,
@@ -1157,14 +1193,16 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     )
 
     assert calls == [
+        "worktree.ensure",
         "agent:explore",
         "rollup.set_status:in_progress",
-        "worktree.ensure",
         "plan_check.find_validated_plan",
         "agent:spec",
         "agent:validate_spec",
         "agent:plan",
         "agent:validate_plan",
+        "plan_check.mark_validated",
+        "docs_commit.commit_documents",
         "agent:implement",
         "agent:review",
         "verify.run_suite",
@@ -1174,9 +1212,11 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     assert summary.status == "done"
     assert summary.warnings == []
     assert [name for name, _status in _projected_phases(store)] == [
-        "mark_in_progress",
         "worktree",
+        "mark_in_progress",
         "plan_check",
+        "mark_validated",
+        "docs_commit",
         "verify",
         "mark_done",
     ]
@@ -1565,6 +1605,16 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
     def has_plan(result: dict[str, Any]) -> bool:
         return bool(result.get("validated"))
 
+    def mark_validated(plan_path: str, worktree: Any) -> dict[str, Any]:
+        calls.append("plan_check.mark_validated")
+        return {"path": plan_path, "appended": True}
+
+    def commit_documents(
+        card_details: Any, spec_path: str, plan_path: str, worktree: Any
+    ) -> dict[str, Any]:
+        calls.append("docs_commit.commit_documents")
+        return {"plan_hash": "a1b2c3d4"}
+
     def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
@@ -1580,6 +1630,8 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         "worktree.ensure": ensure,
         "plan_check.find_validated_plan": find_plan,
         "plan_check.has_validated_plan": has_plan,
+        "plan_check.mark_validated": mark_validated,
+        "docs_commit.commit_documents": commit_documents,
         "verify.run_suite": run_suite,
         "verification_passed_gate": passed,
         "critic_blockers_gate": agent_only_gate,
@@ -1606,6 +1658,43 @@ def _walk_builtin(store, recorded: dict[str, Any], *, validated: bool) -> Any:
     )
 
 
+def test_a_resume_started_at_explore_never_re_runs_the_worktree_phase(store):
+    """R6 moved `worktree` in front of `explore`, which makes it the one phase a
+    resume can legitimately be *behind*. `worktree.ensure` is idempotent, but a
+    walk started at `explore` must not call it at all -- the phase is done."""
+    calls: list[str] = []
+    workflow = load_builtin("task", _registry(_builtin_functions(calls, validated=False)))
+
+    def agent_runner(phase, context, rendered):
+        calls.append(f"agent:{phase.name}")
+        return {"role": phase.role}
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=agent_runner,
+        start_phase="explore",
+    )
+
+    assert "worktree.ensure" not in calls
+    assert calls[0] == "agent:explore"
+    assert summary.status == "done"
+    assert [name for name, _status in _projected_phases(store)] == [
+        "mark_in_progress",
+        "plan_check",
+        "mark_validated",
+        "docs_commit",
+        "verify",
+        "mark_done",
+    ]
+
+
 def test_every_document_path_input_renders_the_expanded_writes_template(store):
     recorded: dict[str, Any] = {}
 
@@ -1622,7 +1711,13 @@ def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(st
 
     summary = _walk_builtin(store, recorded, validated=True)
 
-    assert summary.skipped == ["spec", "validate_spec", "plan", "validate_plan"]
+    assert summary.skipped == [
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "mark_validated",
+    ]
     assert set(recorded) == {"explore", "implement", "review"}
     sections = dict(recorded["implement"].sections)
     assert sections["spec_path"] == SPEC_PATH
@@ -1637,11 +1732,11 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
 
     assert {name: rendered.inputs for name, rendered in recorded.items()} == {
         "explore": ("card", "parent_story", "repo_docs", "verification"),
-        "spec": ("card", "explore"),
+        "spec": ("card", "explore", "spec_path"),
         "validate_spec": ("card", "spec_path"),
-        "plan": ("spec_path",),
+        "plan": ("spec_path", "plan_path"),
         "validate_plan": ("spec_path", "plan_path"),
-        "implement": ("plan_path", "spec_path", "branch", "base_branch"),
+        "implement": ("plan_path", "spec_path", "branch", "base_branch", "plan_hash"),
         "review": ("branch", "base_branch", "plan_path"),
     }
 
@@ -1943,3 +2038,34 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
         )
 
     assert "worktree" in str(caught.value)
+
+
+def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path):
+    """A caller that could set `base_branch` would point `review_gate` at a base
+    the engine never derived, while every step still used the real one."""
+    registry = FunctionRegistry()
+    registry.register("only.step", lambda: {"ok": True})
+    document = tmp_path / "one.yaml"
+    document.write_text(
+        "name: one\n"
+        "description: one deterministic phase\n"
+        "phases:\n"
+        "  - name: only\n"
+        "    kind: deterministic\n"
+        "    run: only.step\n",
+        encoding="utf-8",
+    )
+    workflow = load_workflow(document, registry)
+    store = store_module.Store.open(tmp_path, "run-extra-3")
+
+    with pytest.raises(engine.EngineError) as caught:
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id="story-1",
+            subtask=_subtask(),
+            repo_dir=REPO,
+            extra_context={"base_branch": "somewhere/else"},
+        )
+
+    assert "base_branch" in str(caught.value)

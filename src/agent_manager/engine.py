@@ -40,6 +40,7 @@ RESERVED_CONTEXT_KEYS = (
     "parent_story_details",
     "branch",
     "base",
+    "base_branch",
     "worktree",
     "repo_dir",
     "commands",
@@ -80,6 +81,14 @@ def subtask_context(
     declares `args` that could bridge the difference. Hence `base` for
     `base_branch` and `worktree` for `worktree_path`.
 
+    `base_branch` is that same string under a second key, because the two sides
+    of the document disagree about the name: `worktree.ensure(branch, base,
+    ...)` asks for `base`, and `reducers.review_gate(review, branch,
+    base_branch)` asks for `base_branch`. An `args:` entry cannot bridge it --
+    yaml `args` are literals and the base branch is per-run -- and renaming
+    either parameter would change a shipped step or a ported gate. Both keys are
+    reserved, so no phase result can make them disagree.
+
     `card` stays the bare id string every deterministic step binds by that name
     (`plan_check.find_validated_plan(card)`). The full cards the §7 `card` and
     `parent_story` *inputs* render live beside it under `card_details` and
@@ -92,6 +101,7 @@ def subtask_context(
         "parent_story_details": parent_story,
         "branch": subtask.branch,
         "base": subtask.base_branch,
+        "base_branch": subtask.base_branch,
         "worktree": subtask.worktree_path,
         "repo_dir": repo_dir,
         "commands": list(commands),

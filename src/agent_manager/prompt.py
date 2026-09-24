@@ -28,11 +28,23 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from pydantic import BaseModel
+
 from agent_manager import dag, models
 from agent_manager.errors import EngineError
+from agent_manager.roles.loader import RoleBundle
 from agent_manager.workflow.loader import AgentPhase
 
 _MISSING = object()
+
+FEEDBACK_HEADING = "## feedback on the previous attempt"
+"""Heading of the block §6 step 7 appends before a re-dispatch.
+
+A `##` section, matching `_assemble`'s section format, so the retry block reads
+as one more section rather than as a stray paragraph. It lives here, not in
+`dispatch`, because `dispatch` imports `prompt` and never the reverse: the
+composer needs the same heading and a second copy of the string could drift.
+"""
 
 
 @dataclass(frozen=True)
@@ -124,6 +136,48 @@ def _verbatim(key: str) -> Resolver:
     def resolve(request: _Request) -> str:
         return str(_required(request, key))
 
+    return resolve
+
+
+def _phase_field(phase_key: str, field: str) -> Resolver:
+    """One field of an earlier phase's result, inlined as its own string.
+
+    `engine._bind_result` stores a phase's result in the context under the
+    phase's own name, so `docs_commit`'s `{"plan_hash": digest}` lands at
+    `context["docs_commit"]["plan_hash"]`. Input names are the document's
+    vocabulary and context keys are the callees' names, so the declared input
+    stays `plan_hash` while the lookup is nested -- the same split
+    `base_branch` -> `base` already has.
+
+    Two failures, deliberately distinguished. The phase never ran, so its key
+    is absent: `_required` reports that, and it is the case a document hits by
+    declaring the input on a phase that precedes the producer. The phase ran
+    but its result does not carry the field: that is a step-contract breach,
+    which no reordering of the document fixes.
+    """
+
+    def resolve(request: _Request) -> str:
+        result = _required(request, phase_key)
+        if not isinstance(result, Mapping):
+            raise EngineError(
+                f"is declared as an input, but the {phase_key!r} entry in the "
+                f"context is a {type(result).__name__}, not a mapping, so it can "
+                f"supply no {field!r}",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        value = result.get(field)
+        if value is None or not str(value).strip():
+            raise EngineError(
+                f"is declared as an input, but the {phase_key!r} result supplied "
+                f"no {field!r} (that result carries: "
+                f"{', '.join(sorted(str(key) for key in result)) or 'nothing'})",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        return str(value)
+
+    resolve.produced_by = phase_key  # type: ignore[attr-defined]
     return resolve
 
 
@@ -220,8 +274,24 @@ _TABLE: dict[str, Resolver] = {
     "plan_path": _verbatim("plan_path"),
     "branch": _verbatim("branch"),
     "base_branch": _verbatim("base"),
+    "plan_hash": _phase_field("docs_commit", "plan_hash"),
 }
 """The fixed §7 resolution table, keyed by the name a document may declare."""
+
+
+INPUT_PRODUCERS: dict[str, str] = {
+    name: resolver.produced_by  # type: ignore[attr-defined]
+    for name, resolver in _TABLE.items()
+    if hasattr(resolver, "produced_by")
+}
+"""Declared input name -> the phase whose result its resolver reads.
+
+Derived from `_TABLE`, never hand-written: `_phase_field` stamps the phase key
+on the resolver it builds, so this map cannot disagree with the lookup it
+describes. `cli.resume_start_phase` reads it, because an input resolved out of
+another phase's result is a dependency on that phase having run in *this*
+process -- the journal never replays the binding table.
+"""
 
 
 def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:
@@ -255,6 +325,111 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
 def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
+
+
+METHODOLOGY_HEADING_PREFIX = "## methodology: "
+"""Heading that introduces one vendored methodology file inside the brief.
+
+The file is a heading in one document rather than a path on disk: the agent is
+handed the text it must follow, so it cannot follow a stale copy or fail to
+open it.
+"""
+
+
+RESULT_HEADING = "## Result contract"
+"""Heading of the section that tells the agent where its `result.json` goes.
+
+Only present when the phase asks for a result. The schema in it comes from the
+model the engine will validate against, so the instruction and the validator
+cannot drift (addendum R2 §2).
+"""
+
+
+def compose_brief(
+    role: RoleBundle,
+    rendered: RenderedPrompt,
+    *,
+    result_path: Path | str | None = None,
+    result_model: type[BaseModel] | None = None,
+    feedback: str | None = None,
+) -> str:
+    """The whole brief for one dispatch, as one document (addendum R2 §2).
+
+    Order is fixed: the role's standing instructions, its methodology, the
+    phase's rendered inputs, the result contract, the feedback. Feedback comes
+    last and is only ever appended, so the brief without it is a prefix of the
+    brief with it and a retry can append rather than recompose.
+
+    Pure: no disk, no clock, no randomness, no process. The result model is
+    handed in rather than looked up in `results.RESULT_MODELS`, which is what
+    keeps this function testable without the engine's registry.
+    """
+    parts: list[str] = [role.system]
+    for filename, body in role.methodology.items():
+        heading = f"{METHODOLOGY_HEADING_PREFIX}{filename}"
+        parts.append(heading + "\n" + body.strip("\n"))
+    parts.append(rendered.text)
+    contract = _result_contract(rendered.phase, result_path, result_model)
+    if contract is not None:
+        parts.append(contract)
+    if feedback is not None and feedback.strip():
+        parts.append(FEEDBACK_HEADING + "\n" + feedback.strip("\n"))
+    return _join_sections(parts)
+
+
+def _join_sections(parts: list[str]) -> str:
+    """One blank line between neighbours, one newline at the end.
+
+    Only the newlines at each section's edges are normalised; interior text is
+    untouched, because a methodology document's own blank lines are part of it.
+    """
+    return "\n\n".join(part.strip("\n") for part in parts) + "\n"
+
+
+def _result_contract(
+    phase: str, result_path: Path | str | None, result_model: type[BaseModel] | None
+) -> str | None:
+    """The contract section, or `None` when this phase asks for no result.
+
+    Half a contract is a caller bug, not something to render partially. A
+    relative path is refused because it would resolve inside the worktree the
+    agent is `cd`'d into. `model_json_schema()` is called straight through: a
+    model that cannot describe itself is a defect in the result models.
+    """
+    if result_path is None and result_model is None:
+        return None
+    if result_path is None or result_model is None:
+        raise EngineError(
+            "a result contract needs both result_path and result_model; got "
+            f"result_path={None if result_path is None else str(result_path)!r} and "
+            f"result_model={getattr(result_model, '__name__', None)!r}",
+            phase=phase,
+        )
+    path = Path(result_path)
+    if not path.is_absolute():
+        raise EngineError(
+            f"the result path {str(result_path)!r} is not absolute; the brief has to "
+            "name one unambiguous location outside the worktree the agent runs in, "
+            "and a relative path would resolve inside it",
+            phase=phase,
+        )
+    schema = json.dumps(result_model.model_json_schema(), indent=2, ensure_ascii=False)
+    return (
+        f"{RESULT_HEADING}\n"
+        "When you are done, write your result as valid JSON to exactly this path:\n"
+        "\n"
+        f"{path}\n"
+        "\n"
+        "That path is deliberately outside the worktree you are working in. Do not "
+        "create the file inside the worktree, and do not write it anywhere else -- "
+        "nothing else is read as your result.\n"
+        "\n"
+        "The JSON must validate against this schema:\n"
+        "\n"
+        "```json\n"
+        f"{schema}\n"
+        "```"
+    )
 
 
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")

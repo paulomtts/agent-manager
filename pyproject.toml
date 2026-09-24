@@ -27,7 +27,12 @@ packages = ["src/agent_manager"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "e2e: slow, opt-in, costs real money -- drives the toy card against the real `claude` on PATH. Excluded by the `-m \"not e2e\"` in addopts; run it with `uv run pytest -m e2e` (a bare path invocation is still deselected, so pass `-m e2e` alongside any path).",
+]
 # importlib mode, not the default prepend mode: tests/workflow/test_loader.py and
 # tests/roles/test_loader.py share a basename, and prepend mode names test modules
 # after their basename alone, so collecting both aborts with "import file mismatch".
-addopts = "--import-mode=importlib"
+# `-m "not e2e"` keeps the paid real-harness test out of the default suite; a `-m`
+# passed on the command line overrides this one, which is how `-m e2e` selects it.
+addopts = "--import-mode=importlib -m \"not e2e\""

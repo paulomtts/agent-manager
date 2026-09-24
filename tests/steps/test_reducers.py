@@ -13,6 +13,7 @@ from agent_manager.steps.reducers import (
     _is_integer,
     _js_text,
     count_of,
+    critic_blockers_gate,
     exploration_output_gate,
     is_plan_hash,
     plan_hash_gate,
@@ -567,3 +568,148 @@ def test_verification_passed_gate_blocks_anything_that_is_not_a_result_mapping()
     verdict = verification_passed_gate(None)
     assert verdict["blocked"] == "verification"
     assert "no verification result" in verdict["detail"]
+
+
+# ── critic_blockers_gate ─────────────────────────────────────────────────────
+# Ported from task.js lines 631-638 and 717-721. The critic REPORTS blockers on
+# the spec or the plan and never acts on them; this gate is the stop, and it
+# serves both `validate_spec` and `validate_plan` from one callable.
+
+CRITIC_SUMMARY = (
+    "the spec pins the blocked value and the two detail fallbacks, and both "
+    "validation phases share this gate."
+)
+
+
+def test_a_critic_that_found_no_blockers_lets_the_run_continue():
+    result = {"blockers": False, "reason": None, "summary": CRITIC_SUMMARY}
+    assert critic_blockers_gate(result) is None
+
+
+def test_blockers_stop_the_run_at_validation_and_carry_the_critics_reason():
+    result = {
+        "blockers": True,
+        "reason": "the spec contradicts section 4 of the design",
+        "summary": CRITIC_SUMMARY,
+    }
+    assert critic_blockers_gate(result) == {
+        "blocked": "validation",
+        "detail": "the spec contradicts section 4 of the design",
+    }
+
+
+@pytest.mark.parametrize("useless", [None, "", "   ", "\n\t ", False, 0])
+def test_blockers_with_no_usable_reason_fall_back_to_the_js_wording(useless):
+    # JS: `reason || 'spec has unresolvable blockers'`. A blank reason must not
+    # produce an empty detail: the operator would have nothing to act on.
+    assert critic_blockers_gate({"blockers": True, "reason": useless}) == {
+        "blocked": "validation",
+        "detail": "spec has unresolvable blockers",
+    }
+
+
+def test_a_result_with_no_reason_key_at_all_still_blocks():
+    gate = critic_blockers_gate({"blockers": True})
+    assert gate["detail"] == "spec has unresolvable blockers"
+
+
+def test_a_dead_validator_is_itself_a_block():
+    # Silence is not consent: a validation phase that produced no judgement has
+    # not cleared anything, and reading that as a pass is how an unvalidated
+    # plan reaches `implement`.
+    assert critic_blockers_gate(None) == {
+        "blocked": "validation",
+        "detail": "the validator returned nothing",
+    }
+
+
+@pytest.mark.parametrize("dead", ["blockers", ["blockers"], 7, 0, True, object()])
+def test_a_non_mapping_result_is_the_dead_validator_verdict(dead):
+    assert critic_blockers_gate(dead) == {
+        "blocked": "validation",
+        "detail": "the validator returned nothing",
+    }
+
+
+@pytest.mark.parametrize("truthy", [1, "yes", ["one"], {"a": 1}, 0.5, -1])
+def test_any_truthy_blockers_value_blocks_without_raising(truthy):
+    gate = critic_blockers_gate({"blockers": truthy, "reason": None})
+    assert gate["blocked"] == "validation"
+
+
+@pytest.mark.parametrize("falsy", [False, 0, "", None, [], {}])
+def test_any_falsy_blockers_value_passes(falsy):
+    assert critic_blockers_gate({"blockers": falsy, "reason": "ignored"}) is None
+
+
+def test_a_missing_blockers_key_passes_rather_than_blocking():
+    # A mapping that reached the gate at all was schema-validated upstream; the
+    # dead-validator branch is for no mapping, not for a thin one.
+    assert critic_blockers_gate({"summary": CRITIC_SUMMARY}) is None
+
+
+def test_a_non_string_reason_is_rendered_js_style_not_as_a_python_repr():
+    gate = critic_blockers_gate({"blockers": True, "reason": {"missing": ["step 4"]}})
+    assert gate["detail"] == '{"missing":["step 4"]}'
+
+
+def test_a_boolean_reason_renders_as_json_not_as_python():
+    assert critic_blockers_gate({"blockers": True, "reason": True})["detail"] == "true"
+
+
+# ── snake_case results meet camelCase gates ──────────────────────────────────
+# `results.ReviewResult` / `results.Verification` are snake_case and
+# `dispatch.py` dumps them without `by_alias=True`, so a validated result
+# reaches these gates spelled `commit_count` and `verification.full_suite`,
+# while task.js wrote `commitCount` and `fullSuite`. Both spellings are read;
+# no verdict, threshold or ordering depends on which one arrived.
+
+
+def test_review_gate_reads_the_snake_case_counts_a_dumped_result_carries():
+    assert (
+        review_gate({"porcelain": "", "commit_count": 3, "tagged_count": 3}, BRANCH, BASE)
+        is None
+    )
+
+
+def test_a_snake_case_zero_commit_count_blocks_instead_of_warning():
+    # Before the shim this returned a warn: both camelCase reads were None, so
+    # the no-commits stop could never fire against a real result.
+    gate = review_gate({"porcelain": "", "commit_count": 0, "tagged_count": 0}, BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+    assert "task-42 has no commits on top of main" in gate["detail"]
+
+
+def test_snake_case_untagged_commits_still_block():
+    gate = review_gate({"porcelain": "", "commit_count": 3, "tagged_count": 2}, BRANCH, BASE)
+    assert gate["blocked"] == "implement"
+    assert "only 2 of 3 commits" in gate["detail"]
+
+
+def test_a_review_that_reports_neither_spelling_still_warns():
+    gate = review_gate({"porcelain": ""}, BRANCH, BASE)
+    assert gate["warn"]
+    assert "blocked" not in gate
+
+
+def test_exploration_output_gate_accepts_the_snake_case_suite_a_model_dumps():
+    explore = {
+        "summary": REAL_SUMMARY,
+        "verification": {"full_suite": ["uv run pytest", "uv run ruff check ."]},
+    }
+    assert exploration_output_gate(explore, None) is None
+
+
+@pytest.mark.parametrize("not_a_list", ["uv run pytest", {"0": "uv run pytest"}, 3, None])
+def test_a_snake_case_suite_that_is_not_a_list_still_returns_the_array_verdict(not_a_list):
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"full_suite": not_a_list}}, None
+    )
+    assert gate["detail"] == "exploration did not return an array for verification.fullSuite"
+
+
+def test_an_implausible_snake_case_command_is_still_caught():
+    gate = exploration_output_gate(
+        {"summary": REAL_SUMMARY, "verification": {"full_suite": ["a"]}}, None
+    )
+    assert "implausible command" in gate["detail"]
