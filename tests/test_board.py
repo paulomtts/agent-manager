@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import board, models
+from agent_manager import board, census, models
 
 requires_brd = pytest.mark.skipif(
     shutil.which("brd") is None,
@@ -638,6 +638,58 @@ def test_roots_carries_a_cross_milestone_blocked_by_edge(temp_board):
     assert blocked_node.created_at == _raw_by_id(raw, blocked)["created_at"]
     assert isinstance(blocked_node.created_at, str) and blocked_node.created_at
     assert _node_by_id(nodes, blocker).blocked_by == []
+
+
+@requires_brd
+def test_census_from_a_real_board(temp_board):
+    # Steps tier (design §14): board.roots -> find_milestone -> flatten_milestone
+    # over real `brd tree` output. Every dependent card is created BEFORE its
+    # blocker, so creation order alone would never put it second; only the
+    # blocked_by edge can.
+    milestone = _add_card(temp_board, "Milestone 7: census")
+    docs_story = _add_card(temp_board, "Story: document it", milestone)
+    writer_story = _add_card(temp_board, "Story: CSV writer", milestone)
+    quoting = _add_card(temp_board, "feat: quoting", writer_story)
+    rows = _add_card(temp_board, "feat: write rows", writer_story)
+    examples = _add_card(temp_board, "docs: examples", docs_story)
+    usage = _add_card(temp_board, "docs: usage", docs_story)
+    _brd_json(temp_board, "block", docs_story, "--by", writer_story)
+    _brd_json(temp_board, "block", quoting, "--by", rows)
+    _brd_json(temp_board, "block", examples, "--by", usage)
+    board.set_status(writer_story, "in_progress", repo_dir=temp_board)
+    board.set_status(rows, "done", repo_dir=temp_board)
+
+    roots = board.roots(repo_dir=temp_board)
+
+    # Preconditions on brd's own output, so the assertions below mean something.
+    assert (
+        _node_by_id(roots, docs_story).created_at
+        <= _node_by_id(roots, writer_story).created_at
+    )
+    assert _node_by_id(roots, docs_story).status == "blocked"
+    assert _node_by_id(roots, examples).status == "blocked"
+
+    plan = census.flatten_milestone(census.find_milestone(roots, "census"))
+
+    assert plan.milestone_title == "Milestone 7: census"
+    assert [story.id for story in plan.stories] == [writer_story, docs_story]
+    writer, docs = plan.stories
+    assert writer.title == "Story: CSV writer"
+    assert [subtask.id for subtask in writer.subtasks] == [rows, quoting]
+    assert [subtask.id for subtask in docs.subtasks] == [usage, examples]
+
+    assert writer.blocked_by == []
+    assert docs.blocked_by == [writer_story]
+
+    # brd's derived `blocked` reads as `todo`; stored statuses pass through.
+    assert docs.status == "todo"
+    assert [subtask.status for subtask in docs.subtasks] == ["todo", "todo"]
+    assert writer.status == "in_progress"
+    assert [subtask.status for subtask in writer.subtasks] == ["done", "todo"]
+    every_status = [story.status for story in plan.stories] + [
+        subtask.status for story in plan.stories for subtask in story.subtasks
+    ]
+    assert "blocked" not in every_status
 
 
 @requires_brd

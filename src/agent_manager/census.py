@@ -1,7 +1,8 @@
-"""Find one milestone among the board's root cards, and order card siblings.
+"""Read one milestone off the board's root cards and flatten it into a census.
 
-Both are ported exactly from the leave-me-alone plugin's `census.mjs`,
-including their messages, so the two tools refuse in the same words.
+Three pure functions, each ported exactly from the leave-me-alone plugin's
+`census.mjs`, including its messages, so the two tools refuse in the same
+words.
 
 `find_milestone` (`census.mjs:62-98`): `--milestone` used to be a small
 integer. A UUID is not typeable, so a title substring is accepted too -- but
@@ -15,6 +16,12 @@ outside the sibling set are ignored -- a subtask blocked by another story's
 card is a dispatch concern, not a sibling-ordering one. Independent siblings
 keep creation order. A cycle is an error; cards are never silently dropped.
 
+`flatten_milestone` (`census.mjs:51-58` and `census.mjs:100-113`): the
+milestone's tree becomes ordered stories, each with ordered subtasks. brd
+derives `blocked` at read time, while the orchestrator decides readiness with
+its own DAG walk, so `blocked` is read as `todo` here, in one place, rather
+than checked for everywhere.
+
 `MilestoneNotFoundError` and `CensusOrderError` subclass `ValueError` on
 purpose: `ValueError` is already in `cli.HANDLED`, so a CLI caller turns them
 into an `ok: false` envelope without this module importing `cli` (which will
@@ -25,6 +32,7 @@ This module is pure: no I/O, no subprocesses, no ``brd``. It imports
 """
 
 import re
+from dataclasses import dataclass
 
 from agent_manager.models import CardNode
 
@@ -151,3 +159,63 @@ def order_siblings(cards: list[CardNode] | None) -> list[CardNode]:
             f"cyclic blocked_by among siblings: {', '.join(stuck)}"
         )
     return ordered
+
+
+@dataclass(frozen=True)
+class SubtaskPlan:
+    """One subtask of a story, as the census reports it."""
+
+    id: str
+    title: str
+    status: str
+
+
+@dataclass(frozen=True)
+class StoryPlan:
+    """One story of the milestone, with its subtasks in execution order."""
+
+    id: str
+    title: str
+    status: str
+    blocked_by: list[str]
+    subtasks: list[SubtaskPlan]
+
+
+@dataclass(frozen=True)
+class Census:
+    """A milestone flattened: its title and its stories in execution order."""
+
+    milestone_title: str
+    stories: list[StoryPlan]
+
+
+def _stored_status(status: str) -> str:
+    """brd's derived `blocked` read as `todo` (`census.mjs:51-58`)."""
+    return "todo" if status == "blocked" else status
+
+
+def flatten_milestone(root: CardNode) -> Census:
+    """`root`'s stories and each story's subtasks, ordered by `order_siblings`.
+
+    Port of `census.mjs:100-113`. A story's `blocked_by` is copied through
+    unchanged, ids outside the milestone included. A cycle among the stories
+    or among one story's subtasks raises `CensusOrderError`.
+    """
+    stories = [
+        StoryPlan(
+            id=story.id,
+            title=story.title,
+            status=_stored_status(story.status),
+            blocked_by=list(story.blocked_by),
+            subtasks=[
+                SubtaskPlan(
+                    id=subtask.id,
+                    title=subtask.title,
+                    status=_stored_status(subtask.status),
+                )
+                for subtask in order_siblings(story.children)
+            ],
+        )
+        for story in order_siblings(root.children)
+    ]
+    return Census(milestone_title=root.title, stories=stories)

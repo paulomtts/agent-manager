@@ -18,9 +18,13 @@ import pytest
 
 from agent_manager import census
 from agent_manager.census import (
+    Census,
     CensusOrderError,
     MilestoneNotFoundError,
+    StoryPlan,
+    SubtaskPlan,
     find_milestone,
+    flatten_milestone,
     order_siblings,
 )
 from agent_manager.models import CardNode
@@ -346,3 +350,149 @@ def test_cycle_message_names_only_stuck_ids_in_input_order():
         "census: 2 card(s) could not be ordered — "
         f"cyclic blocked_by among siblings: {ID(2)}, {ID(1)}"
     )
+
+
+# --- flatten_milestone: census.test.mjs:106-131, one for one -------------
+
+
+def test_flatten_produces_stories_with_ordered_subtasks():
+    plan = flatten_milestone(TREE)
+    assert plan.milestone_title == "Milestone 12: CSV export"
+    assert [story.title for story in plan.stories] == [
+        "Story: CSV writer",
+        "Story: Document it",
+    ]
+    assert [subtask.title for subtask in plan.stories[0].subtasks] == [
+        "feat: write rows",
+        "feat: quoting",
+    ]
+
+
+def test_story_blocked_by_carries_ids_through():
+    assert flatten_milestone(TREE).stories[1].blocked_by == [ID(2)]
+
+
+def test_derived_blocked_reads_as_todo():
+    # brd projects blocked at read time; readiness is the orchestrator's DAG
+    # walk, so blocked must not survive into the census as a distinct state.
+    plan = flatten_milestone(TREE)
+    assert plan.stories[1].status == "todo"
+    assert plan.stories[1].subtasks[0].status == "todo"
+
+
+def test_in_progress_and_done_pass_through():
+    tree = node(
+        1,
+        "M",
+        children=[
+            node(2, "S", status="done", children=[node(3, "T", status="in_progress")])
+        ],
+    )
+    story = flatten_milestone(tree).stories[0]
+    assert story.status == "done"
+    assert story.subtasks[0].status == "in_progress"
+
+
+# --- flatten_milestone: spec additions and review focus -------------------
+
+
+def test_flatten_builds_exactly_the_frozen_census_shape():
+    assert flatten_milestone(TREE) == Census(
+        milestone_title="Milestone 12: CSV export",
+        stories=[
+            StoryPlan(
+                id=ID(2),
+                title="Story: CSV writer",
+                status="todo",
+                blocked_by=[],
+                subtasks=[
+                    SubtaskPlan(id=ID(4), title="feat: write rows", status="todo"),
+                    SubtaskPlan(id=ID(5), title="feat: quoting", status="todo"),
+                ],
+            ),
+            StoryPlan(
+                id=ID(3),
+                title="Story: Document it",
+                status="todo",
+                blocked_by=[ID(2)],
+                subtasks=[
+                    SubtaskPlan(id=ID(6), title="docs: usage", status="todo"),
+                ],
+            ),
+        ],
+    )
+
+
+def test_census_values_are_frozen():
+    plan = flatten_milestone(TREE)
+    with pytest.raises(AttributeError):
+        plan.milestone_title = "other"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        plan.stories[0].status = "done"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        plan.stories[0].subtasks[0].title = "other"  # type: ignore[misc]
+
+
+def test_stories_are_ordered_by_blocked_by_not_by_tree_order():
+    later_story = node(
+        2, "Story: second", created_at="2026-01-01T00:00:00Z", blocked_by=[ID(3)]
+    )
+    first_story = node(3, "Story: first", created_at="2026-01-02T00:00:00Z")
+    tree = node(1, "M", children=[later_story, first_story])
+    assert [story.id for story in flatten_milestone(tree).stories] == [ID(3), ID(2)]
+
+
+def test_story_blocked_by_keeps_ids_outside_the_milestone():
+    foreign = "ffffffff-0000-4000-8000-000000000000"
+    tree = node(1, "M", children=[node(2, "S", blocked_by=[foreign])])
+    assert flatten_milestone(tree).stories[0].blocked_by == [foreign]
+
+
+def test_story_blocked_by_is_a_copy_not_the_nodes_list():
+    story_node = TREE.children[1]
+    plan = flatten_milestone(TREE)
+    assert plan.stories[1].blocked_by == story_node.blocked_by
+    assert plan.stories[1].blocked_by is not story_node.blocked_by
+
+
+def test_other_statuses_pass_through_unchanged():
+    tree = node(1, "M", children=[node(2, "S", status="review")])
+    assert flatten_milestone(tree).stories[0].status == "review"
+
+
+def test_milestone_with_no_stories_is_an_empty_census():
+    plan = flatten_milestone(node(1, "Milestone 0: empty"))
+    assert plan == Census(milestone_title="Milestone 0: empty", stories=[])
+
+
+def test_subtask_cycle_propagates_from_flatten_milestone():
+    tree = node(
+        1,
+        "M",
+        children=[
+            node(
+                2,
+                "S",
+                children=[
+                    node(4, "a", blocked_by=[ID(5)]),
+                    node(5, "b", blocked_by=[ID(4)]),
+                ],
+            )
+        ],
+    )
+    with pytest.raises(CensusOrderError, match="could not be ordered") as caught:
+        flatten_milestone(tree)
+    assert isinstance(caught.value, ValueError)
+
+
+def test_story_cycle_propagates_from_flatten_milestone():
+    tree = node(
+        1,
+        "M",
+        children=[
+            node(2, "S1", blocked_by=[ID(3)]),
+            node(3, "S2", blocked_by=[ID(2)]),
+        ],
+    )
+    with pytest.raises(CensusOrderError, match="could not be ordered"):
+        flatten_milestone(tree)
