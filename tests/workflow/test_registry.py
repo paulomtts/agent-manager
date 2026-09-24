@@ -86,6 +86,7 @@ TASK_YAML_NAMES = (
     "critic_blockers_gate",
     "docs_commit.commit_documents",
     "exploration_output_gate",
+    "implement_blocked_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
     "plan_check.mark_validated",
@@ -116,6 +117,7 @@ def test_default_registry_resolves_the_ported_reducers_to_the_real_callables() -
     assert plan_hash_gate_adapter is not reducers.plan_hash_gate
     assert registry.resolve("verification_passed_gate") is reducers.verification_passed_gate
     assert registry.resolve("critic_blockers_gate") is reducers.critic_blockers_gate
+    assert registry.resolve("implement_blocked_gate") is reducers.implement_blocked_gate
 
 
 def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> None:

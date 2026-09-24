@@ -211,6 +211,7 @@ BUILTIN_FUNCTION_NAMES = (
     "critic_blockers_gate",
     "docs_commit.commit_documents",
     "exploration_output_gate",
+    "implement_blocked_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
     "plan_check.mark_validated",
@@ -234,7 +235,7 @@ def default_registry() -> FunctionRegistry:
     global state that any importer could rebind a gate in, and the second call
     would then fail on `DuplicateFunctionError`.
 
-    The six reducers and the five implemented steps are the real, imported
+    The seven reducers and the five implemented steps are the real, imported
     callables -- not wrappers -- so `resolve(name) is the_function` holds and a
     sibling's bugfix reaches the engine without touching this table. No
     placeholder registrations remain: every name the document uses now has an
@@ -251,6 +252,8 @@ def default_registry() -> FunctionRegistry:
     registry.register("plan_hash_gate", plan_hash_gate_adapter)
     registry.register("verification_passed_gate", reducers.verification_passed_gate)
     registry.register("critic_blockers_gate", reducers.critic_blockers_gate)
+    # Decision O7: a coder that reports blocked stops the subtask at implement.
+    registry.register("implement_blocked_gate", reducers.implement_blocked_gate)
 
     # Deterministic steps.
     registry.register("worktree.ensure", worktree.ensure)

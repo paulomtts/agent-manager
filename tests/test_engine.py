@@ -14,8 +14,10 @@ from typing import Any
 
 import pytest
 
-from agent_manager import engine, models, store as store_module
+from agent_manager import dispatch, engine, models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
+from agent_manager.harness.base import Outcome
+from agent_manager.steps import reducers
 from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
 from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
@@ -1168,6 +1170,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "verification_passed_gate": verification_passed_gate,
         "critic_blockers_gate": agent_only_gate,
         "exploration_output_gate": agent_only_gate,
+        "implement_blocked_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
         "verification_gate": agent_only_gate,
@@ -1636,6 +1639,7 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         "verification_passed_gate": passed,
         "critic_blockers_gate": agent_only_gate,
         "exploration_output_gate": agent_only_gate,
+        "implement_blocked_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
         "verification_gate": agent_only_gate,
@@ -2069,3 +2073,114 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path):
         )
 
     assert "base_branch" in str(caught.value)
+
+
+# ── decision O7: a blocked coder stops the subtask ───────────────────────────
+# Engine tier per design 14: the real `task.yaml`, the real gate, the real
+# `dispatch.AgentRunner` for the two phases under test, and a fake adapter plus
+# a fake launcher that writes a canned result file. No process is started.
+
+
+class _FakeAdapter:
+    """A `HarnessAdapter` by shape, whose argv names a program nothing runs."""
+
+    name = "fake"
+    capabilities = frozenset({"bash", "edit"})
+
+    def build_command(self, d: models.Dispatch) -> list[str]:
+        return ["fake-harness", "--role", d.role, "--result", str(d.result_path)]
+
+    def parse_usage(self, stdout: str) -> None:
+        return None
+
+
+class _CannedLauncher:
+    """A `LauncherFn` double: writes `results[role]` as the result file and
+    records every role it was asked to run."""
+
+    def __init__(self, results: dict[str, str]) -> None:
+        self.results = results
+        self.roles: list[str] = []
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        role = argv[argv.index("--role") + 1]
+        self.roles.append(role)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_text("", encoding="utf-8")
+        canned = self.results.get(role)
+        if canned is not None:
+            Path(argv[argv.index("--result") + 1]).write_text(canned, encoding="utf-8")
+        return Outcome(
+            argv=list(argv),
+            exit_code=0,
+            timed_out=False,
+            duration=0.5,
+            stdout_path=stdout_path,
+        )
+
+
+BLOCKED_REASON = "the baseline suite was already red: 3 failed before any change"
+BLOCKED_IMPLEMENT = json.dumps(
+    {
+        "blocked": True,
+        "blocked_reason": BLOCKED_REASON,
+        "resumed": False,
+        "plan_hash": "a1b2c3d4",
+        "report": "stopped before writing any code",
+    }
+)
+
+
+def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_runs(store):
+    calls: list[str] = []
+    functions = _builtin_functions(calls, validated=True)
+    functions["implement_blocked_gate"] = reducers.implement_blocked_gate
+    workflow = load_builtin("task", _registry(functions))
+
+    launcher = _CannedLauncher({"coder": BLOCKED_IMPLEMENT})
+    adapter = _FakeAdapter()
+    subtask = _subtask()
+    dispatching = dispatch.AgentRunner(
+        workflow=workflow,
+        store=store,
+        launcher=launcher,
+        run_id=RUN_ID,
+        story_id=STORY_ID,
+        card_id=subtask.card_id,
+        adapters={adapter.name: adapter},
+        harness_map={
+            "coder": models.HarnessAssignment(harness=adapter.name, model="fake-model"),
+            "reviewer": models.HarnessAssignment(harness=adapter.name, model="fake-model"),
+        },
+    )
+
+    def agent_runner(phase, context, rendered):
+        if phase.name in ("implement", "review"):
+            return dispatching(phase, context, rendered)
+        calls.append(f"agent:{phase.name}")
+        return {"role": phase.role}
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=subtask,
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=agent_runner,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "implement"
+    assert BLOCKED_REASON in summary.detail
+    assert "implement_blocked_gate" in summary.detail
+    assert "blocked=implement" in summary.detail
+    assert launcher.roles == ["coder"]
+    attempts = store.connection.execute(
+        "SELECT phase, status FROM attempts ORDER BY phase, n"
+    ).fetchall()
+    assert [tuple(row) for row in attempts] == [("implement", "gate_failed")]
+    assert "verify.run_suite" not in calls
+    assert "rollup.set_status:done" not in calls

@@ -222,7 +222,10 @@ def test_implement_is_handed_the_plan_hash_last_after_the_documents() -> None:
         "base_branch",
         "plan_hash",
     ]
-    assert phase.gates == []
+    # Decision O7: a coder that reports `blocked: true` stops the subtask here.
+    assert phase.gates == ["implement_blocked_gate"]
+    # Not retryable on purpose: re-dispatching the same brief repeats the answer.
+    assert phase.retry is None
 
 
 def test_no_phase_declares_plan_hash_before_docs_commit_runs() -> None:
@@ -475,6 +478,7 @@ def test_the_document_still_names_exactly_the_gates_this_suite_covers() -> None:
         ("explore", "verification_gate"),
         ("validate_spec", "critic_blockers_gate"),
         ("validate_plan", "critic_blockers_gate"),
+        ("implement", "implement_blocked_gate"),
         ("review", "review_gate"),
         ("review", "plan_hash_gate"),
         ("verify", "verification_passed_gate"),
@@ -583,3 +587,26 @@ def test_verification_passed_gate_blocks_a_red_suite_on_the_verify_phase() -> No
         gate, values, phase="verify", function="verification_passed_gate"
     )
     assert gate(**bound) == {"blocked": "verification", "detail": "2 failed, 0 passed"}
+
+
+def test_implement_blocked_gate_reads_a_real_dumped_blocked_result_and_blocks() -> None:
+    """Binding alone would not catch a gate that reads the wrong key: this feeds
+    it the snake_case dump of a real `ImplementResult`, as `dispatch.py` does."""
+    gate = load_builtin("task").function("implement_blocked_gate")
+    blocked = ImplementResult(
+        blocked=True,
+        blocked_reason="the baseline suite was already red: 3 failed",
+        resumed=False,
+        plan_hash=PLAN_HASH,
+        report=REAL_SUMMARY,
+    ).model_dump(mode="json")
+    values = _values_for("implement", blocked)
+    verdict = gate(
+        **engine.bind_arguments(
+            gate, values, phase="implement", function="implement_blocked_gate"
+        )
+    )
+    assert verdict == {
+        "blocked": "implement",
+        "detail": "the baseline suite was already red: 3 failed",
+    }

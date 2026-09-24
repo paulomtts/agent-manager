@@ -15,6 +15,7 @@ from agent_manager.steps.reducers import (
     count_of,
     critic_blockers_gate,
     exploration_output_gate,
+    implement_blocked_gate,
     is_plan_hash,
     plan_hash_gate,
     plan_hash_mismatch,
@@ -713,3 +714,72 @@ def test_an_implausible_snake_case_command_is_still_caught():
         {"summary": REAL_SUMMARY, "verification": {"full_suite": ["a"]}}, None
     )
     assert "implausible command" in gate["detail"]
+
+
+# ── implement_blocked_gate ───────────────────────────────────────────────────
+# Decision O7: the coder REPORTS that it cannot proceed and never decides what
+# happens next; this gate is the stop. The input is the snake_case
+# `model_dump(mode="json")` of a validated `ImplementResult`.
+
+IMPLEMENT_REPORT = "stopped before writing any code; see blocked_reason"
+
+
+def _implement(blocked, blocked_reason=None, **extra):
+    return {
+        "blocked": blocked,
+        "blocked_reason": blocked_reason,
+        "resumed": False,
+        "plan_hash": "a1b2c3d4",
+        "report": IMPLEMENT_REPORT,
+        **extra,
+    }
+
+
+def test_implement_blocked_gate_passes_a_coder_that_was_not_blocked():
+    assert implement_blocked_gate(_implement(False)) is None
+
+
+def test_implement_blocked_gate_blocks_at_implement_with_the_coders_reason():
+    verdict = implement_blocked_gate(
+        _implement(True, "the baseline suite was already red: 3 failed")
+    )
+    assert verdict == {
+        "blocked": "implement",
+        "detail": "the baseline suite was already red: 3 failed",
+    }
+
+
+def test_implement_blocked_gate_strips_the_reason_it_carries():
+    verdict = implement_blocked_gate(_implement(True, "  plan hash unavailable \n"))
+    assert verdict == {"blocked": "implement", "detail": "plan hash unavailable"}
+
+
+@pytest.mark.parametrize("useless", [None, "", "   ", "\n\t "])
+def test_implement_blocked_gate_still_blocks_when_the_coder_gave_no_reason(useless):
+    verdict = implement_blocked_gate(_implement(True, useless))
+    assert verdict["blocked"] == "implement"
+    assert "gave no reason" in verdict["detail"]
+
+
+def test_implement_blocked_gate_still_blocks_when_the_reason_key_is_absent():
+    verdict = implement_blocked_gate({"blocked": True})
+    assert verdict["blocked"] == "implement"
+    assert "gave no reason" in verdict["detail"]
+
+
+@pytest.mark.parametrize("truthy", ["true", 1, "yes", ["x"]])
+def test_implement_blocked_gate_passes_a_truthy_stand_in_for_blocked(truthy):
+    """Strict identity, like `verification_passed_gate`: Pydantic validation of
+    `ImplementResult` upstream guarantees a real bool, so only `True` blocks."""
+    assert implement_blocked_gate(_implement(truthy, "ignored")) is None
+
+
+def test_implement_blocked_gate_ignores_a_reason_when_not_blocked():
+    assert implement_blocked_gate(_implement(False, "was blocked earlier")) is None
+
+
+@pytest.mark.parametrize("dead", [None, "blocked", ["blocked"], 7, True])
+def test_implement_blocked_gate_blocks_anything_that_is_not_a_result_mapping(dead):
+    verdict = implement_blocked_gate(dead)
+    assert verdict["blocked"] == "implement"
+    assert "no implement result to judge" in verdict["detail"]
