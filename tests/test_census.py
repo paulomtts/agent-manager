@@ -214,3 +214,9 @@ def test_non_numeric_needle_skips_the_digit_run_guard():
     # "milestone 1" is not numeric, so its hit inside "12" still counts.
     assert find_milestone([TREE], "milestone 1").id == ID(1)
 
+
+def test_digit_run_guard_widens_over_ascii_digits_only():
+    # The JS guard's /[0-9]/ is ASCII-only; a non-ASCII digit such as the
+    # Arabic-Indic two beside the hit does not widen the run.
+    card = node(9, "Milestone ٢2")
+    assert find_milestone([card], "2").id == ID(9)
