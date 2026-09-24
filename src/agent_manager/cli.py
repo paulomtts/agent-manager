@@ -831,6 +831,24 @@ def dry_run_payload(
     return {"levels": level_rows, "already_done": already_done_entries(stories)}
 
 
+def dry_run_milestone(
+    needle: str, *, repo_dir: Path, branch_prefix: str, base_branch: str
+) -> dict[str, Any]:
+    """O3's order: repo dir, roots, milestone, tree, census, then the payload.
+
+    Read-only by construction. The two `brd` reads are its only I/O. No
+    `Store` is opened (that would mint a run directory), no runner is built,
+    and nothing is fetched, pruned, branched or written to the board. Every
+    refusal is a type already in `HANDLED`.
+    """
+    root = resolve_repo_dir(repo_dir)
+    milestone = census.find_milestone(board.roots(repo_dir=root), needle)
+    plan = census.flatten_milestone(board.tree(milestone.id, repo_dir=root))
+    return dry_run_payload(
+        plan.stories, branch_prefix=branch_prefix, base_branch=base_branch
+    )
+
+
 HANDLED: tuple[type[BaseException], ...] = (
     CliError,
     board.BoardError,
@@ -849,7 +867,19 @@ should crash loudly with its stack intact.
 
 @app.command("run")
 def run(
-    card: str = typer.Option(..., "--card", help="The subtask card id to drive."),
+    card: str | None = typer.Option(
+        None, "--card", help="The subtask card id to drive. Exclusive with --milestone."
+    ),
+    milestone: str | None = typer.Option(
+        None,
+        "--milestone",
+        help="A milestone card id or title substring. Needs --dry-run for now.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="With --milestone: print the levels and stack bases, and write nothing.",
+    ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
     ),
@@ -876,21 +906,29 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card through the task workflow, end to end."""
+    """Drive one subtask card end to end, or preview a milestone with --dry-run."""
     try:
-        payload = run_card(
-            card,
-            repo_dir=repo_dir,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            allow_no_verification=allow_no_verification,
-            commands=list(verify),
-        )
+        if milestone is not None and dry_run:
+            payload = dry_run_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+            )
+        else:
+            payload = run_card(
+                card,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                allow_no_verification=allow_no_verification,
+                commands=list(verify),
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
-    if payload["status"] == "escalated":
+    if milestone is None and payload["status"] == "escalated":
         raise typer.Exit(EXIT_ESCALATED)
 
 
