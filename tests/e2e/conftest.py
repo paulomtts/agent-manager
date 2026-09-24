@@ -310,3 +310,14 @@ def read_fake_log() -> Callable[[str], list[dict[str, Any]]]:
         ]
 
     return read
+
+
+@pytest.fixture
+def review_fail_marker(milestone_board) -> Path:
+    """Where the fake looks for branches whose review must fail.
+
+    The repo's git common dir, which the fake reaches from any worktree's cwd
+    through `git rev-parse --git-common-dir`. Inside `.git`, so it is in no
+    worktree's tree and never in `git status`. The test writes it and removes it.
+    """
+    return milestone_board["root"] / ".git" / FAKE_REVIEW_FAIL_MARKER
