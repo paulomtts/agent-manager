@@ -133,6 +133,7 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     (c1,) = milestone_board["subtasks"]["C"]
     c_worktree = cli.worktree_for(root, branches[c1])
     b_worktree = cli.worktree_for(root, branches[b1])
+    c_status_before = board.show(c1, repo_dir=root).status
     review_fail_marker.write_text(f"{branches[b1]}\n", encoding="utf-8")
 
     # First launch: B's review fails through the production review gate.
@@ -163,9 +164,12 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     first_entries = read_fake_log(stopped["run_id"])
     assert first_entries  # non-vacuity: agents did run in this run
     assert c_worktree.resolve() not in _cwds(first_entries)
-    # Never started: brd reports it `blocked` (its story is blocked by B) or
-    # `todo`, never `in-progress` or `done`.
-    assert board.show(c1, repo_dir=root).status in ("todo", "blocked")
+    # Never started: the run wrote no status to it. brd derives `blocked` (its
+    # story is blocked by B) or reports `todo`, never `in-progress` or `done`,
+    # and whichever it is, it is the status C had before the launch.
+    c_status_after = board.show(c1, repo_dir=root).status
+    assert c_status_after in ("todo", "blocked")
+    assert c_status_after == c_status_before
 
     # Fix the fake, then relaunch the same command.
     review_fail_marker.unlink()
