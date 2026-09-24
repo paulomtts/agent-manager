@@ -12,6 +12,7 @@ from agent_manager.dag import (
     remaining_subtasks,
     short_id,
     slugify,
+    subtask_branch,
     task_branch,
     task_stem,
     topological_levels,
@@ -340,3 +341,31 @@ def test_an_external_blocker_does_not_trip_the_cycle_check():
 def test_an_acyclic_milestone_passes_the_cycle_check():
     assert assert_no_blocker_cycles(_diamond()) is None
     assert assert_no_blocker_cycles([]) is None
+
+
+# ── stack geometry ──────────────────────────────────────────────────────────
+
+PREFIX = "m3"
+BASE = "main"
+
+
+def _gsub(title: str, hex8: str, status: str = "todo") -> SubtaskPlan:
+    """A subtask with a real card id, so ``task_branch`` accepts it.
+
+    Its short id is ``hex8`` and its branch is ``m3/task-<title>-<hex8>``.
+    """
+    return SubtaskPlan(id=f"{hex8}-0000-4000-8000-000000000000", title=title, status=status)
+
+
+def _by_id(*stories: StoryPlan) -> dict[str, StoryPlan]:
+    return {story.id: story for story in stories}
+
+
+def test_subtask_branch_is_task_branch_so_names_have_one_source():
+    sub = _gsub("a1", "aaaa0001")
+    assert subtask_branch(PREFIX, sub) == task_branch(PREFIX, sub) == "m3/task-a1-aaaa0001"
+
+
+def test_subtask_branch_passes_task_branchs_bad_id_error_through():
+    with pytest.raises(ValueError, match="not a card id"):
+        subtask_branch(PREFIX, SubtaskPlan(id="nope", title="bad", status="todo"))

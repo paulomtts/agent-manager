@@ -224,3 +224,21 @@ def assert_no_blocker_cycles(stories: list[StoryPlan]) -> None:
 
     for story in stories:
         walk(story.id, [])
+
+
+# ── stack geometry ──────────────────────────────────────────────────────────
+# Port of orchestrator.js:211-268. Where each subtask's branch stacks is
+# DERIVED from the census, never discovered. ``assert_no_blocker_cycles`` must
+# run before any of these functions.
+
+
+def subtask_branch(prefix: str, subtask: SubtaskPlan) -> str:
+    """The branch a subtask's work lives on: exactly ``task_branch``.
+
+    Derived, never looked up. An earlier orchestrator preferred a PR's real
+    head ref, which made the geometry depend on the PRs and the PR matching
+    depend on the geometry — a circularity that bred two bugs in one
+    afternoon. Determinism beats reconciling against an external system, so
+    the prefix is part of the milestone's identity, full stop.
+    """
+    return task_branch(prefix, subtask)
