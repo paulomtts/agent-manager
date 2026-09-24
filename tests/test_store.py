@@ -1268,3 +1268,262 @@ def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
         conn.close()
 
     assert not (paths.data_dir() / "runs" / "run-that-never-was").exists()
+
+
+def _held_elsewhere(lock) -> bool:
+    """True when a different thread cannot take `lock` right now.
+
+    Probing from a second thread is what makes this meaningful for an RLock:
+    the owning thread could always re-acquire it. Deterministic (P7): a
+    non-blocking acquire either succeeds or it does not.
+    """
+    result: list[bool] = []
+
+    def probe() -> None:
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+        result.append(not acquired)
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    prober.join()
+    return result[0]
+
+
+class _SpyingConnection:
+    """Wraps a real connection so a test can observe the moment it is closed.
+
+    `sqlite3.Connection.close` is read-only on the instance, so it cannot be
+    monkeypatched directly; everything else is forwarded to the real one.
+    """
+
+    def __init__(self, real: sqlite3.Connection, on_close) -> None:
+        self._real = real
+        self._on_close = on_close
+
+    def close(self) -> None:
+        try:
+            self._on_close()
+        finally:
+            self._real.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row_write(
+    repo, monkeypatch
+):
+    # P2: the journal append and the row write are one critical section, so
+    # journal order equals row order. Checked at the moment each happens.
+    st = store.Store.open(repo, RUN_ID)
+    seen: list[tuple[str, bool]] = []
+
+    real_append = st.journal.append
+
+    def spying_append(*args, **kwargs):
+        seen.append(("journal", _held_elsewhere(st._lock)))
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(st.journal, "append", spying_append)
+
+    for writer in (
+        "_write_run_row",
+        "_write_story_row",
+        "_write_subtask_row",
+        "_write_phase_row",
+        "_write_attempt_row",
+    ):
+        real_writer = getattr(st, writer)
+
+        def spying_writer(*args, _real=real_writer, _name=writer, **kwargs):
+            seen.append((_name, _held_elsewhere(st._lock)))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(st, writer, spying_writer)
+
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_subtask("8831189b", _subtask())
+        st.record_phase("8831189b", "ef248597", models.PhaseRun(name="implement", kind="agent"))
+        st.record_attempt(
+            "8831189b", "ef248597", "implement", models.Attempt(n=1, dispatch=_dispatch())
+        )
+        assert _held_elsewhere(st._lock) is False
+    finally:
+        st.close()
+
+    assert seen == [
+        ("journal", True),
+        ("_write_run_row", True),
+        ("journal", True),
+        ("_write_story_row", True),
+        ("journal", True),
+        ("_write_subtask_row", True),
+        ("journal", True),
+        ("_write_phase_row", True),
+        ("journal", True),
+        ("_write_attempt_row", True),
+    ]
+
+
+def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
+    repo, monkeypatch
+):
+    # Deliberate extension beyond the record_* methods: rebuild deletes and
+    # rewrites rows on the shared connection, and load_run reads on it.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        seen: list[tuple[str, bool]] = []
+
+        real_read = st.journal.read
+
+        def spying_read():
+            seen.append(("read", _held_elsewhere(st._lock)))
+            return real_read()
+
+        monkeypatch.setattr(st.journal, "read", spying_read)
+
+        real_delete = st._delete_run
+
+        def spying_delete(run_id):
+            seen.append(("_delete_run", _held_elsewhere(st._lock)))
+            return real_delete(run_id)
+
+        monkeypatch.setattr(st, "_delete_run", spying_delete)
+
+        real_attempt_writer = st._write_attempt_row
+
+        def spying_attempt_writer(*args, **kwargs):
+            seen.append(("_write_attempt_row", _held_elsewhere(st._lock)))
+            return real_attempt_writer(*args, **kwargs)
+
+        monkeypatch.setattr(st, "_write_attempt_row", spying_attempt_writer)
+
+        real_load_run = store.load_run
+
+        def spying_load_run(conn, run_id):
+            seen.append(("load_run", _held_elsewhere(st._lock)))
+            return real_load_run(conn, run_id)
+
+        monkeypatch.setattr(store, "load_run", spying_load_run)
+
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+        assert _held_elsewhere(st._lock) is False
+    finally:
+        st.close()
+
+    assert rebuilt == loaded
+    assert seen == [
+        ("read", True),
+        ("_delete_run", True),
+        ("_write_attempt_row", True),
+        ("_write_attempt_row", True),
+        ("load_run", True),
+    ]
+
+
+def test_close_holds_the_store_lock(repo):
+    # The connection is never closed under an in-flight record.
+    st = store.Store.open(repo, RUN_ID)
+    held: list[bool] = []
+    st._conn = _SpyingConnection(st._conn, lambda: held.append(_held_elsewhere(st._lock)))
+
+    st.close()
+
+    assert held == [True]
+    assert _held_elsewhere(st._lock) is False
+
+
+def test_a_failed_row_write_releases_the_store_lock(repo):
+    # §9: the journal line survives the failed row write, and the `with` block
+    # releases the lock so the next record is not deadlocked.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+
+    with pytest.raises(sqlite3.Error):
+        st.record_story(_story())
+
+    assert _held_elsewhere(st._lock) is False
+    lines = store.Journal(RUN_ID).read()
+    assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
+
+
+def test_a_failed_journal_append_releases_the_store_lock_and_writes_no_row(
+    repo, monkeypatch
+):
+    # Review Focus 1: the journal is written first, so when it fails there is
+    # no row, the same exception propagates, and the lock is free.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+
+        def failing_append(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(st.journal, "append", failing_append)
+
+        with pytest.raises(OSError, match="disk full"):
+            st.record_story(_story())
+
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+    finally:
+        st.close()
+
+
+def test_a_refused_record_run_releases_the_store_lock(repo):
+    # Review Focus 2: the run-id check now runs inside the lock.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(ValueError):
+            st.record_run(_run(repo, run_id="run-somewhere-else"))
+        assert _held_elsewhere(st._lock) is False
+    finally:
+        st.close()
+
+
+def test_a_failed_rebuild_releases_the_store_lock(repo):
+    # Review Focus 3: a rebuild that raises must not leave every later record
+    # deadlocked behind it.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        with st.journal.path.open("a", encoding="utf-8") as handle:
+            handle.write("{not json at all\n")
+
+        with pytest.raises(store.CorruptJournalError):
+            st.rebuild_from_journal(RUN_ID)
+
+        assert _held_elsewhere(st._lock) is False
+    finally:
+        st.close()
+
+
+def test_recording_on_a_store_closed_by_another_thread_raises_and_frees_the_lock(repo):
+    # Review Focus 5: a worker that records after another thread closed the
+    # store gets a sqlite3.Error, not a hang or a silent success.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            st.record_story(_story())
+        except BaseException as error:  # inspected below
+            errors.append(error)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    worker.join()
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], sqlite3.Error)
+    assert _held_elsewhere(st._lock) is False
