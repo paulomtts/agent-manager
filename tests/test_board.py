@@ -654,6 +654,24 @@ def test_roots_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
     assert excinfo.value.argv == ["brd", "tree"]
 
 
+@pytest.mark.parametrize("data", [{}, "nope", None])
+def test_roots_requires_a_list_of_roots(data, tmp_path, monkeypatch):
+    # Same shape guard as tree: a non-list payload must be a BoardError, not a
+    # TypeError or a silently-wrong board.
+    fake_brd = tmp_path / "brd"
+    fake_brd.write_text(
+        "#!/bin/sh\ncat <<'EOF'\n"
+        + json.dumps({"ok": True, "data": data})
+        + "\nEOF\n"
+    )
+    fake_brd.chmod(0o755)
+    monkeypatch.setattr(board, "BRD", str(fake_brd))
+    with pytest.raises(board.BoardError) as excinfo:
+        board.roots(repo_dir=tmp_path)
+    assert "a list of roots" in str(excinfo.value)
+    assert excinfo.value.argv == [str(fake_brd), "tree"]
+
+
 # Pure checks: no board needed.
 
 
