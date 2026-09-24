@@ -275,6 +275,12 @@ def test_a_two_story_cycle_stops_the_level_engine_naming_both():
         topological_levels(stories)
 
 
+def test_the_level_engine_lists_a_cycle_in_input_order_not_id_order():
+    stories = [_story("b", ["a"]), _story("a", ["b"])]
+    with pytest.raises(DependencyCycleError, match="dependency cycle among stories #b, #a"):
+        topological_levels(stories)
+
+
 def test_the_level_engine_names_only_the_unplaced_stories_of_a_cycle():
     stories = [_story("root"), _story("a", ["root", "b"]), _story("b", ["a"])]
     with pytest.raises(DependencyCycleError) as caught:
