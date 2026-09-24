@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,6 +28,7 @@ import typer
 
 from agent_manager import (
     board,
+    census,
     dag,
     dispatch,
     engine,
@@ -646,6 +648,66 @@ def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[s
     }
 
 
+@dataclass(frozen=True)
+class SubtaskDrive:
+    """What one `drive_subtask` call did: the engine's summary, plus every warning.
+
+    `warnings` is the summary's own list followed by the runner's out-of-band
+    list. Internal state, so a dataclass rather than a pydantic model.
+    """
+
+    summary: engine.SubtaskSummary
+    warnings: list[str]
+
+
+def drive_subtask(
+    *,
+    store: Store,
+    run_id: str,
+    card: models.Card,
+    parent: models.Card,
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+) -> SubtaskDrive:
+    """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
+
+    Addendum O4's shared driver. `run_card` calls it once, and a milestone runner
+    calls it once per subtask against one store and one run id. The caller owns
+    everything around the walk: the board reads, the run id, opening and
+    closing the store, and the run/story/subtask rows. This function catches
+    nothing. An escalation is `summary.status == "escalated"`, not an exception.
+    """
+    workflow = load_builtin(WORKFLOW_NAME)
+    factory = default_runner_factory if runner_factory is None else runner_factory
+    runner = factory(
+        workflow=workflow,
+        store=store,
+        run_id=run_id,
+        story_id=parent.id,
+        card_id=card.id,
+    )
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=parent.id,
+        subtask=subtask,
+        repo_dir=repo_dir,
+        commands=commands,
+        card=card,
+        parent_story=parent,
+        extra_context=gate_context(commands, allow_no_verification),
+        agent_runner=runner,
+    )
+    # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
+    # its signature returns a result, so a warning has nowhere else to go,
+    # and dropping them is the §12 failure this whole list exists to prevent.
+    warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+    return SubtaskDrive(summary=summary, warnings=warnings)
+
+
 def run_card(
     card_id: str,
     *,
@@ -677,7 +739,9 @@ def run_card(
     worktree = worktree_for(root, branch)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-    workflow = load_builtin(WORKFLOW_NAME)
+    # Fail-fast preflight: a workflow that will not load must leave no run
+    # directory, so it is checked before `Store.open`. `drive_subtask` loads its own.
+    load_builtin(WORKFLOW_NAME)
 
     store = Store.open(root, run_id)
     try:
@@ -709,26 +773,18 @@ def run_card(
         store.record_story(story)
         store.record_subtask(story.card_id, subtask)
 
-        factory = default_runner_factory if runner_factory is None else runner_factory
-        runner = factory(
-            workflow=workflow,
+        drive = drive_subtask(
             store=store,
             run_id=run_id,
-            story_id=parent.id,
-            card_id=card.id,
-        )
-        summary = engine.run_subtask(
-            workflow,
-            store,
-            story_id=parent.id,
+            card=card,
+            parent=parent,
             subtask=subtask,
             repo_dir=root,
             commands=commands,
-            card=card,
-            parent_story=parent,
-            extra_context=gate_context(commands, allow_no_verification),
-            agent_runner=runner,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
         )
+        summary = drive.summary
 
         store.record_run(run_record.model_copy(update={"status": summary.status}))
         store.record_story(story.model_copy(update={"status": summary.status}))
@@ -736,10 +792,7 @@ def run_card(
             story.card_id, subtask.model_copy(update={"status": summary.status})
         )
 
-        # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
-        # its signature returns a result, so a warning has nowhere else to go,
-        # and dropping them is the §12 failure this whole list exists to prevent.
-        warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+        warnings = drive.warnings
         return {
             "run_id": run_id,
             "card_id": card.id,
@@ -755,6 +808,97 @@ def run_card(
         }
     finally:
         store.close()
+
+
+def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, str]]:
+    """Everything in the census that never enters a dispatch level, in census order.
+
+    A story that is closed, or that has no remaining subtasks, is one
+    `kind: "story"` entry, and its subtasks are not listed on their own: the
+    story is the unit that is skipped. A done subtask of a story that is still
+    pending is a `kind: "subtask"` entry naming its story, because that story
+    shows up in a level without it.
+    """
+    entries: list[dict[str, str]] = []
+    for story in stories:
+        if dag.is_story_closed(story) or not dag.remaining_subtasks(story):
+            entries.append({"kind": "story", "id": story.id, "title": story.title})
+            continue
+        for subtask in story.subtasks:
+            if dag.is_subtask_done(subtask):
+                entries.append(
+                    {
+                        "kind": "subtask",
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "story": story.id,
+                    }
+                )
+    return entries
+
+
+def dry_run_payload(
+    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+) -> dict[str, Any]:
+    """O3's preview: dispatch levels with each subtask's branch and base.
+
+    Pure over the census, and every derivation belongs to `dag`. The cycle
+    check runs first because a cycle is what breaks the geometry, and
+    `story_root`'s own guard misses a cycle between two populated stories.
+    `stories_by_id` covers every story, closed ones included, so a story
+    blocked by a done story still roots on that story's tip. A story's
+    `subtasks` lists only what would be dispatched, but each `base` comes
+    from `stack_bases` over the full ordered list, so a done first subtask
+    still anchors the second.
+    """
+    stories = list(stories)
+    dag.assert_no_blocker_cycles(stories)
+    levels = dag.compute_levels(stories)
+    stories_by_id = {story.id: story for story in stories}
+    level_rows: list[dict[str, Any]] = []
+    for index, level in enumerate(levels):
+        story_rows: list[dict[str, Any]] = []
+        for story in level:
+            bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
+            story_rows.append(
+                {
+                    "story": story.id,
+                    "title": story.title,
+                    "root": dag.story_root(
+                        story, stories_by_id, branch_prefix, base_branch
+                    ),
+                    "subtasks": [
+                        {
+                            "id": subtask.id,
+                            "title": subtask.title,
+                            "status": subtask.status,
+                            "branch": dag.subtask_branch(branch_prefix, subtask),
+                            "base": bases[subtask.id],
+                        }
+                        for subtask in dag.remaining_subtasks(story)
+                    ],
+                }
+            )
+        level_rows.append({"level": index, "stories": story_rows})
+    return {"levels": level_rows, "already_done": already_done_entries(stories)}
+
+
+def dry_run_milestone(
+    needle: str, *, repo_dir: Path, branch_prefix: str, base_branch: str
+) -> dict[str, Any]:
+    """O3's order: repo dir, roots, milestone, tree, census, then the payload.
+
+    Read-only by construction. The two `brd` reads are its only I/O. No
+    `Store` is opened (that would mint a run directory), no runner is built,
+    and nothing is fetched, pruned, branched or written to the board. Every
+    refusal is a type already in `HANDLED`.
+    """
+    root = resolve_repo_dir(repo_dir)
+    milestone = census.find_milestone(board.roots(repo_dir=root), needle)
+    plan = census.flatten_milestone(board.tree(milestone.id, repo_dir=root))
+    return dry_run_payload(
+        plan.stories, branch_prefix=branch_prefix, base_branch=base_branch
+    )
 
 
 HANDLED: tuple[type[BaseException], ...] = (
@@ -773,9 +917,55 @@ should crash loudly with its stack intact.
 """
 
 
+def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool) -> None:
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` combination as a usage error.
+
+    `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
+    reserves. It is raised before the `HANDLED` try block, so nothing is read
+    or dispatched. A blank `--milestone` is refused here too: the census strips
+    the needle, and an empty needle is a substring of every title, so on a
+    one-milestone board it would silently pick that milestone.
+    """
+    if card is not None and milestone is not None:
+        raise typer.BadParameter(
+            "give --card or --milestone, not both",
+            param_hint="'--card' / '--milestone'",
+        )
+    if card is None and milestone is None:
+        raise typer.BadParameter(
+            "one of --card or --milestone is required",
+            param_hint="'--card' / '--milestone'",
+        )
+    if milestone is not None and not milestone.strip():
+        raise typer.BadParameter(
+            "--milestone needs a card id or a title substring, not a blank string",
+            param_hint="'--milestone'",
+        )
+    if dry_run and card is not None:
+        raise typer.BadParameter(
+            "--dry-run previews a milestone and does not apply to --card",
+            param_hint="'--dry-run'",
+        )
+
+
 @app.command("run")
 def run(
-    card: str = typer.Option(..., "--card", help="The subtask card id to drive."),
+    card: str | None = typer.Option(
+        None, "--card", help="The subtask card id to drive. Exclusive with --milestone."
+    ),
+    milestone: str | None = typer.Option(
+        None,
+        "--milestone",
+        help=(
+            "A milestone card id or title substring: drive every remaining subtask. "
+            "Exclusive with --card."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="With --milestone: print the levels and stack bases, and write nothing.",
+    ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
     ),
@@ -802,21 +992,55 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card through the task workflow, end to end."""
+    """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
+    _check_run_targets(card=card, milestone=milestone, dry_run=dry_run)
     try:
-        payload = run_card(
-            card,
-            repo_dir=repo_dir,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            allow_no_verification=allow_no_verification,
-            commands=list(verify),
-        )
+        if milestone is not None and dry_run:
+            payload = dry_run_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+            )
+        elif milestone is not None:
+            # `orchestrate` imports this module at load time and reads its names
+            # at call time, so importing it at the top of this module would be
+            # circular. By the time a command runs, both are fully loaded. Read
+            # as `orchestrate.run_milestone` so a test can patch it there. No
+            # runner_factory and no driver: production gets
+            # `default_runner_factory` and `drive_subtask`.
+            from agent_manager import orchestrate
+
+            payload = orchestrate.run_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+            )
+        else:
+            payload = run_card(
+                card,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                allow_no_verification=allow_no_verification,
+                commands=list(verify),
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
-    if payload["status"] == "escalated":
+    # A card payload reports `status`. A milestone payload has no `status` key:
+    # it carries `escalated: true` only when it stopped, a clean one carries
+    # `done: true`, and a dry-run preview carries neither. So the flag is read
+    # with `.get`, never indexed.
+    if milestone is None:
+        escalated = payload["status"] == "escalated"
+    else:
+        escalated = payload.get("escalated") is True
+    if escalated:
         raise typer.Exit(EXIT_ESCALATED)
 
 

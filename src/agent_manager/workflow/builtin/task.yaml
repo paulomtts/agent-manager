@@ -67,6 +67,7 @@ phases:
     role: coder
     inputs: [plan_path, spec_path, branch, base_branch, plan_hash]
     result: ImplementResult
+    gates: [implement_blocked_gate]
 
   - name: review
     kind: agent

@@ -11,6 +11,9 @@ plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no environment variable, no extra
 argv flag and no import of `agent_manager` -- a brief that omits the contract
 must make this script fail, because that failure is the test's whole point.
+The one test-controlled input is `REVIEW_FAIL_MARKER`, a file in the repo's git
+common dir that the fake finds from its own cwd and compares with the brief's
+`## branch`.
 
 Standard library only: it runs under a bare `#!<python>` line.
 """
@@ -196,6 +199,36 @@ LOG_NAME = "fake-claude.log"
 """The cwd log, written beside the run directory -- under `paths.data_dir()`,
 never inside the worktree, so the clean-worktree assertion stays meaningful."""
 
+REVIEW_FAIL_MARKER = "fake-claude-review-fail"
+"""A file, in the repo's git common dir, naming branches whose review must fail.
+
+One branch per line. It is test-controlled and found from this process's own
+cwd through `git rev-parse --git-common-dir`, so it sits inside `.git`: it is
+in no worktree's tree and never shows in `git status`. It is compared with
+the review brief's `## branch` section, so the brief is still what picks the
+subtask. This is not an env var or an argv flag, and the fake computes nothing
+it could not read.
+"""
+
+REVIEW_FAIL_PORCELAIN = "?? fake-claude: the review-fail marker names this branch"
+"""What a failing review reports as `porcelain`. Non-empty, so the production
+`review_gate` blocks on it, and worded so the escalation detail says why."""
+
+
+def review_fail_branches(cwd):
+    """The branches the review-fail marker names, or an empty set when there is none."""
+    common = git(cwd, "rev-parse", "--git-common-dir").strip()
+    # Relative (`.git`) in a main checkout, absolute in a linked worktree;
+    # joining onto the cwd handles both.
+    marker = Path(cwd) / common / REVIEW_FAIL_MARKER
+    if not marker.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in marker.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
 
 def log_path(result_path):
     """`<run dir>/fake-claude.log`, derived from the result path alone.
@@ -273,34 +306,52 @@ def build_result(phase, payload, text, cwd):
         # wiring test green with the input missing from `builtin/task.yaml`,
         # which is the one thing this tier exists to catch (R4).
         digest = _section(found, "plan_hash", phase)
+        relative = _section(found, "plan_path", phase)
+        # The content names this card's plan, so a subtask stacked on another's
+        # branch (where the file already exists) still has a change to commit.
         (Path(cwd) / IMPLEMENTATION_NAME).write_text(
-            f"# implementation\n\n{SUMMARY}\n", encoding="utf-8"
+            f"# implementation of {relative}\n\n{SUMMARY}\n", encoding="utf-8"
         )
         git(cwd, "add", "-A")
-        git(cwd, "commit", "-m", f"feat: implement this card\n\nPlan-Hash: {digest}")
+        # A relaunched subtask's implementation is already committed: nothing
+        # changed, so there is nothing to commit, and the honest answer is
+        # `resumed`, not a failed `git commit`.
+        resumed = git(cwd, "status", "--porcelain").strip() == ""
+        if not resumed:
+            git(cwd, "commit", "-m", f"feat: implement this card\n\nPlan-Hash: {digest}")
         return override(
             payload,
             blocked=False,
             blocked_reason=None,
-            resumed=False,
+            resumed=resumed,
             plan_hash=digest,
             report=SUMMARY,
         )
     if phase == "review":
         relative = _section(found, "plan_path", phase)
         base = _section(found, "base_branch", phase)
+        branch = _section(found, "branch", phase)
         revisions = git(cwd, "rev-list", f"{base}..HEAD").split()
         tagged = [
             revision
             for revision in revisions
             if "Plan-Hash:" in git(cwd, "show", "-s", "--format=%B", revision)
         ]
+        if branch in review_fail_branches(cwd):
+            # A review the production `review_gate` blocks: a non-empty
+            # `porcelain`. `unresolved_blockers` alone would fail nothing,
+            # because no gate reads it.
+            findings = [f"the review-fail marker names {branch}"]
+            porcelain = REVIEW_FAIL_PORCELAIN
+        else:
+            findings = []
+            porcelain = git(cwd, "status", "--porcelain").strip()
         return override(
             payload,
-            findings=[],
-            unresolved_blockers=[],
+            findings=findings,
+            unresolved_blockers=list(findings),
             fix_summary=SUMMARY,
-            porcelain=git(cwd, "status", "--porcelain").strip(),
+            porcelain=porcelain,
             commit_count=len(revisions),
             tagged_count=len(tagged),
             plan_hash=plan_hash_of(Path(cwd) / relative),
