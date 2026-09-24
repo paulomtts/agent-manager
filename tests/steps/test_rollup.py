@@ -249,6 +249,27 @@ def test_a_parent_reported_blocked_is_not_rewritten_to_todo(temp_board):
     assert result["rolled_up"] == []
 
 
+@requires_brd
+def test_the_walk_is_capped_at_sixteen_ancestors(temp_board):
+    # chain[0] is the root; chain[i] has exactly i ancestors.
+    chain = [_add_card(temp_board, "Level 0")]
+    for level in range(1, rollup.MAX_ANCESTRY_DEPTH + 2):
+        chain.append(_add_card(temp_board, f"Level {level}", chain[-1]))
+    at_the_cap = chain[rollup.MAX_ANCESTRY_DEPTH]
+    past_the_cap = chain[rollup.MAX_ANCESTRY_DEPTH + 1]
+
+    # Exactly 16 ancestors is allowed: every one of them is rolled up.
+    result = rollup.set_status(at_the_cap, "in_progress", repo_dir=temp_board)
+    assert [entry["card"] for entry in result["rolled_up"]] == list(
+        reversed(chain[: rollup.MAX_ANCESTRY_DEPTH])
+    )
+
+    # A 17th ancestor raises -- and the card's own write is not undone.
+    with pytest.raises(board.BoardError, match="exceeded maximum ancestry depth"):
+        rollup.set_status(past_the_cap, "done", repo_dir=temp_board)
+    assert _brd_json(temp_board, "show", past_the_cap)["status"] == "done"
+
+
 # --- Pure-function tier (design §14): the status computation, no board. ---
 
 
