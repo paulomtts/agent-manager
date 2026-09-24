@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_manager import board, census, cli, dag, models
+from agent_manager.steps import worktree
 from agent_manager.store import Store
 from agent_manager.workflow.loader import load_builtin
 
@@ -135,6 +136,20 @@ def story_tips(
     ]
 
 
+def refresh_git(root: Path) -> None:
+    """Once per run: `git fetch origin` if an `origin` remote exists, then `git worktree prune`.
+
+    A repo with no `origin` skips the fetch silently. The name must equal
+    `origin` exactly: `upstream` or `origin-mirror` is not it. Both calls go
+    through `worktree.run_git`, read at call time, and a `GitError` from any
+    of them propagates.
+    """
+    remotes = worktree.run_git(["-C", str(root), "remote"]).split()
+    if "origin" in remotes:
+        worktree.run_git(["-C", str(root), "fetch", "origin"])
+    worktree.run_git(["-C", str(root), "worktree", "prune"])
+
+
 def record_plan(
     store: Store,
     levels: list[list[PlannedStory]],
@@ -206,6 +221,10 @@ def run_milestone(
     # must leave no run directory. The driver loads its own copy.
     load_builtin(cli.WORKFLOW_NAME)
     drive = cli.drive_subtask if driver is None else driver
+
+    # The first side effect. It runs after every refusal and before the store
+    # is opened, so a failed fetch leaves no run directory behind.
+    refresh_git(root)
 
     started_at = clock()
     run_id = cli.mint_run_id(milestone_card.id, started_at)

@@ -643,3 +643,76 @@ def test_a_keyboard_interrupt_from_the_driver_is_not_swallowed(project):
 
     with pytest.raises(KeyboardInterrupt):
         _run(project, shape["milestone"], driver)
+
+
+@requires_git
+@requires_brd
+def test_a_repo_with_no_origin_prunes_worktrees_and_never_fetches(project, monkeypatch):
+    shape = _milestone(project, {"A": 1})
+    root = cli.resolve_repo_dir(project)
+    calls = _record_git(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True
+    assert [argv[2:] for argv in calls] == [["remote"], ["worktree", "prune"]]
+    assert all(argv[:2] == ["-C", str(root)] for argv in calls)
+
+
+@requires_git
+@requires_brd
+def test_an_origin_remote_is_fetched_exactly_once_before_the_prune(
+    project, tmp_path, monkeypatch
+):
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True
+    )
+    _git(project, "remote", "add", "origin", str(origin))
+    shape = _milestone(project, {"A": 2})
+    calls = _record_git(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True
+    assert [argv[2:] for argv in calls] == [
+        ["remote"],
+        ["fetch", "origin"],
+        ["worktree", "prune"],
+    ]
+
+
+@requires_git
+@requires_brd
+def test_a_remote_that_is_not_literally_origin_is_not_fetched(project, tmp_path, monkeypatch):
+    other = tmp_path / "other.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(other)], check=True, capture_output=True, text=True
+    )
+    _git(project, "remote", "add", "upstream", str(other))
+    _git(project, "remote", "add", "origin-mirror", str(other))
+    shape = _milestone(project, {"A": 1})
+    calls = _record_git(monkeypatch)
+
+    _run(project, shape["milestone"], FakeDriver())
+
+    assert [argv[2:] for argv in calls] == [["remote"], ["worktree", "prune"]]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, monkeypatch):
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True
+    )
+    _git(project, "remote", "add", "origin", str(origin))
+    shape = _milestone(project, {"A": 1})
+    _record_git(monkeypatch, fail_on="fetch")
+    driver = FakeDriver()
+
+    with pytest.raises(worktree.GitError):
+        _run(project, shape["milestone"], driver)
+
+    assert driver.calls == []
+    assert list(paths.data_dir().iterdir()) == []
