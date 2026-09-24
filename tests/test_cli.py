@@ -26,6 +26,7 @@ from typer.testing import CliRunner
 
 from agent_manager import (
     board,
+    census,
     cli,
     dag,
     dispatch,
@@ -1018,6 +1019,172 @@ def test_the_logs_payload_survives_render_with_its_paths_and_newlines(tmp_path):
     assert data["artifacts"]["prompt"]["path"] == str(tmp_path / "prompt.txt")
     assert data["artifacts"]["prompt"]["text"] == "first\nsecond\n"
     assert data["artifacts"]["result"]["path"] == str(tmp_path / "result.json")
+
+
+def _plan_id(n: int) -> str:
+    """A UUID-shaped card id whose short id is `n` in eight hex digits.
+
+    `dag.subtask_branch` goes through `dag.short_id`, which refuses anything
+    that is not 32 hex characters, so the pure plans need real-shaped ids.
+    """
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def _plan_subtask(n: int, status: str = "todo") -> census.SubtaskPlan:
+    return census.SubtaskPlan(id=_plan_id(n), title=f"subtask {n}", status=status)
+
+
+def _plan_story(
+    n: int,
+    subtasks: list[census.SubtaskPlan],
+    *,
+    status: str = "todo",
+    blocked_by: tuple[str, ...] | list[str] = (),
+) -> census.StoryPlan:
+    return census.StoryPlan(
+        id=_plan_id(n),
+        title=f"story {n}",
+        status=status,
+        blocked_by=list(blocked_by),
+        subtasks=list(subtasks),
+    )
+
+
+def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
+    """A done story is `already_done` and roots its dependent. A pending story
+    lists only its remaining subtasks, and a done first subtask still anchors
+    the second one's base."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12, "done")], status="done")
+    b = _plan_story(
+        2,
+        [_plan_subtask(21, "done"), _plan_subtask(22), _plan_subtask(23, "in_progress")],
+        status="in_progress",
+        blocked_by=[a.id],
+    )
+
+    payload = cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+
+    def branch(subtask: census.SubtaskPlan) -> str:
+        return dag.subtask_branch("m3", subtask)
+
+    assert payload == {
+        "levels": [
+            {
+                "level": 0,
+                "stories": [
+                    {
+                        "story": b.id,
+                        "title": "story 2",
+                        "root": branch(a.subtasks[-1]),
+                        "subtasks": [
+                            {
+                                "id": _plan_id(22),
+                                "title": "subtask 22",
+                                "status": "todo",
+                                "branch": branch(b.subtasks[1]),
+                                "base": branch(b.subtasks[0]),
+                            },
+                            {
+                                "id": _plan_id(23),
+                                "title": "subtask 23",
+                                "status": "in_progress",
+                                "branch": branch(b.subtasks[2]),
+                                "base": branch(b.subtasks[1]),
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "already_done": [
+            {"kind": "story", "id": a.id, "title": "story 1"},
+            {"kind": "subtask", "id": _plan_id(21), "title": "subtask 21", "story": b.id},
+        ],
+    }
+
+
+def test_the_dry_run_payload_keeps_census_order_across_and_within_levels():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id])
+
+    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    assert [level["level"] for level in payload["levels"]] == [0, 1]
+    assert [[story["story"] for story in level["stories"]] for level in payload["levels"]] == [
+        [a.id, b.id],
+        [c.id],
+    ]
+    assert payload["levels"][0]["stories"][0]["root"] == "main"
+    assert payload["levels"][0]["stories"][1]["root"] == "main"
+    assert payload["levels"][1]["stories"][0]["root"] == dag.subtask_branch("m3", a.subtasks[-1])
+
+
+def test_the_dry_run_checks_for_blocker_cycles_before_any_geometry():
+    """`compute_levels` would also refuse, but with a comma list. The arrow
+    trail is `assert_no_blocker_cycles`'s, which proves it ran first."""
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+
+    with pytest.raises(dag.DependencyCycleError) as caught:
+        cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+
+    assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
+
+
+def test_the_dry_run_refuses_a_story_with_two_in_milestone_blockers():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+
+    with pytest.raises(dag.StackRootError) as caught:
+        cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    assert f"#{a.id}" in str(caught.value)
+    assert f"#{b.id}" in str(caught.value)
+
+
+def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_done():
+    """Review focus: a closed story, a story whose subtasks are all done, and a
+    story with no subtasks at all each become one `kind: "story"` entry, in
+    census order, with their subtasks not listed separately."""
+    closed = _plan_story(1, [_plan_subtask(11)], status="done")
+    finished = _plan_story(2, [_plan_subtask(21, "done"), _plan_subtask(22, "Done")])
+    empty = _plan_story(3, [])
+
+    payload = cli.dry_run_payload(
+        [closed, finished, empty], branch_prefix="m3", base_branch="main"
+    )
+
+    assert payload == {
+        "levels": [],
+        "already_done": [
+            {"kind": "story", "id": closed.id, "title": "story 1"},
+            {"kind": "story", "id": finished.id, "title": "story 2"},
+            {"kind": "story", "id": empty.id, "title": "story 3"},
+        ],
+    }
+
+
+def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
+    """Review focus: one foreign blocker plus one in-milestone blocker is ONE
+    in-milestone blocker, not a two-blocker refusal."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=["not-in-this-milestone"])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=["not-in-this-milestone", a.id])
+
+    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+
+    roots = {
+        story["story"]: story["root"]
+        for level in payload["levels"]
+        for story in level["stories"]
+    }
+    assert roots == {
+        a.id: "main",
+        b.id: "main",
+        c.id: dag.subtask_branch("m3", a.subtasks[-1]),
+    }
 
 
 requires_git = pytest.mark.skipif(

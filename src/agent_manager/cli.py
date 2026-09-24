@@ -27,6 +27,7 @@ import typer
 
 from agent_manager import (
     board,
+    census,
     dag,
     dispatch,
     engine,
@@ -755,6 +756,79 @@ def run_card(
         }
     finally:
         store.close()
+
+
+def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, str]]:
+    """Everything in the census that never enters a dispatch level, in census order.
+
+    A story that is closed, or that has no remaining subtasks, is one
+    `kind: "story"` entry, and its subtasks are not listed on their own: the
+    story is the unit that is skipped. A done subtask of a story that is still
+    pending is a `kind: "subtask"` entry naming its story, because that story
+    shows up in a level without it.
+    """
+    entries: list[dict[str, str]] = []
+    for story in stories:
+        if dag.is_story_closed(story) or not dag.remaining_subtasks(story):
+            entries.append({"kind": "story", "id": story.id, "title": story.title})
+            continue
+        for subtask in story.subtasks:
+            if dag.is_subtask_done(subtask):
+                entries.append(
+                    {
+                        "kind": "subtask",
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "story": story.id,
+                    }
+                )
+    return entries
+
+
+def dry_run_payload(
+    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+) -> dict[str, Any]:
+    """O3's preview: dispatch levels with each subtask's branch and base.
+
+    Pure over the census, and every derivation belongs to `dag`. The cycle
+    check runs first because a cycle is what breaks the geometry, and
+    `story_root`'s own guard misses a cycle between two populated stories.
+    `stories_by_id` covers every story, closed ones included, so a story
+    blocked by a done story still roots on that story's tip. A story's
+    `subtasks` lists only what would be dispatched, but each `base` comes
+    from `stack_bases` over the full ordered list, so a done first subtask
+    still anchors the second.
+    """
+    stories = list(stories)
+    dag.assert_no_blocker_cycles(stories)
+    levels = dag.compute_levels(stories)
+    stories_by_id = {story.id: story for story in stories}
+    level_rows: list[dict[str, Any]] = []
+    for index, level in enumerate(levels):
+        story_rows: list[dict[str, Any]] = []
+        for story in level:
+            bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
+            story_rows.append(
+                {
+                    "story": story.id,
+                    "title": story.title,
+                    "root": dag.story_root(
+                        story, stories_by_id, branch_prefix, base_branch
+                    ),
+                    "subtasks": [
+                        {
+                            "id": subtask.id,
+                            "title": subtask.title,
+                            "status": subtask.status,
+                            "branch": dag.subtask_branch(branch_prefix, subtask),
+                            "base": bases[subtask.id],
+                        }
+                        for subtask in dag.remaining_subtasks(story)
+                    ],
+                }
+            )
+        level_rows.append({"level": index, "stories": story_rows})
+    return {"levels": level_rows, "already_done": already_done_entries(stories)}
 
 
 HANDLED: tuple[type[BaseException], ...] = (
