@@ -412,8 +412,8 @@ blocker's tip. A blocked story rooted at the milestone base means a missing
 `blockedBy` edge.
 
 **Status (milestone 3).** The synopsis above is the target surface, not what
-exists today. Exists: `run` (with `--card`, or `--milestone` with `--dry-run`,
-plus `--repo-dir`, `--base-branch`, `--branch-prefix`, `--verify` and
+exists today. Exists: `run` (with `--card`, or `--milestone` and an optional
+`--dry-run`, plus `--repo-dir`, `--base-branch`, `--branch-prefix`, `--verify` and
 `--allow-no-verification`), `status`, `runs`, `logs`, and `resume` for a
 single-card run. Deferred: `watch`, `retry`, `cancel`, `--workflow`,
 `--harness`, `--max-concurrent` (runs are sequential, one story at a time), and
