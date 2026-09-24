@@ -749,7 +749,9 @@ def run_card(
     worktree = worktree_for(root, branch)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-    workflow = load_builtin(WORKFLOW_NAME)
+    # Fail-fast preflight: a workflow that will not load must leave no run
+    # directory, so it is checked before `Store.open`. `drive_subtask` loads its own.
+    load_builtin(WORKFLOW_NAME)
 
     store = Store.open(root, run_id)
     try:
@@ -781,26 +783,18 @@ def run_card(
         store.record_story(story)
         store.record_subtask(story.card_id, subtask)
 
-        factory = default_runner_factory if runner_factory is None else runner_factory
-        runner = factory(
-            workflow=workflow,
+        drive = drive_subtask(
             store=store,
             run_id=run_id,
-            story_id=parent.id,
-            card_id=card.id,
-        )
-        summary = engine.run_subtask(
-            workflow,
-            store,
-            story_id=parent.id,
+            card=card,
+            parent=parent,
             subtask=subtask,
             repo_dir=root,
             commands=commands,
-            card=card,
-            parent_story=parent,
-            extra_context=gate_context(commands, allow_no_verification),
-            agent_runner=runner,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
         )
+        summary = drive.summary
 
         store.record_run(run_record.model_copy(update={"status": summary.status}))
         store.record_story(story.model_copy(update={"status": summary.status}))
@@ -808,10 +802,7 @@ def run_card(
             story.card_id, subtask.model_copy(update={"status": summary.status})
         )
 
-        # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
-        # its signature returns a result, so a warning has nowhere else to go,
-        # and dropping them is the §12 failure this whole list exists to prevent.
-        warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+        warnings = drive.warnings
         return {
             "run_id": run_id,
             "card_id": card.id,
