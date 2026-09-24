@@ -17,6 +17,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from agent_manager import (
     dag,
     dispatch,
     models,
+    orchestrate,
     paths,
     prompt,
     store as store_module,
@@ -1187,10 +1189,6 @@ def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
     }
 
 
-def test_the_not_implemented_refusal_is_a_cli_error():
-    assert issubclass(cli.MilestoneRunNotImplementedError, cli.CliError)
-
-
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
     reason="the git CLI must be installed for the CLI's steps-tier fixtures",
@@ -1403,6 +1401,87 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
     assert context["allow_no_verification"] is False
     assert context["caller_provided"] is False
     assert context["provided_verification"] is None
+
+
+@requires_git
+@requires_brd
+def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
+    """Addendum O4: the driver runs against a store and run id its caller already
+    holds, so a milestone runner can drive every subtask of a story under one
+    run. Two subtasks, one store, one run id -- and both must land `done`."""
+    milestone = _add_card(project, "Milestone 3: orchestration")
+    story_id = _add_card(project, "Run a milestone", milestone)
+    first_id = _add_card(project, "First subtask", story_id)
+    second_id = _add_card(project, "Second subtask", story_id)
+
+    root = cli.resolve_repo_dir(project)
+    parent = board.show(story_id, repo_dir=root)
+    subtask_cards = [
+        board.show(first_id, repo_dir=root),
+        board.show(second_id, repo_dir=root),
+    ]
+
+    started_at = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+    run_id = cli.mint_run_id(first_id, started_at)
+    store = store_module.Store.open(root, run_id)
+    try:
+        store.record_run(
+            models.Run(
+                id=run_id,
+                workflow=cli.WORKFLOW_NAME,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m3",
+                status="started",
+                started_at=started_at,
+                config=models.RunConfig(),
+            )
+        )
+        store.record_story(
+            models.StoryRun(
+                card_id=parent.id,
+                title=parent.title,
+                level=0,
+                status="started",
+                tip_branch=dag.task_branch("m3", subtask_cards[-1]),
+            )
+        )
+
+        drives = []
+        for card in subtask_cards:
+            branch = dag.task_branch("m3", card)
+            subtask = models.SubtaskRun(
+                card_id=card.id,
+                branch=branch,
+                base_branch="main",
+                status="started",
+                worktree_path=cli.worktree_for(root, branch),
+            )
+            store.record_subtask(parent.id, subtask)
+            drives.append(
+                cli.drive_subtask(
+                    store=store,
+                    run_id=run_id,
+                    card=card,
+                    parent=parent,
+                    subtask=subtask,
+                    repo_dir=root,
+                    runner_factory=lambda **kwargs: fake_runner(),
+                )
+            )
+
+        run = store.load_run(run_id)
+    finally:
+        store.close()
+
+    assert [drive.summary.status for drive in drives] == ["done", "done"]
+    assert [drive.warnings for drive in drives] == [[], []]
+    assert run is not None
+    assert [story.card_id for story in run.stories] == [story_id]
+    assert {sub.card_id: sub.status for sub in run.stories[0].subtasks} == {
+        first_id: "done",
+        second_id: "done",
+    }
 
 
 runner = CliRunner()
@@ -2502,33 +2581,180 @@ def test_bad_run_targets_are_usage_errors_that_start_nothing(
     assert list(paths.data_dir().iterdir()) == []
 
 
-def test_a_milestone_run_without_dry_run_is_a_not_implemented_envelope(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _forbid_writes(monkeypatch)
-    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+CLEAN_MILESTONE = {
+    "done": True,
+    "run_id": "20260924T000000Z-0badcafe",
+    "levels": [{"level": 0, "stories": ["story-a"]}],
+    "completed": ["subtask-a1"],
+    "tips": [{"story": "story-a", "tip": "m3/task-a1"}],
+    "warnings": [],
+}
+"""`run_milestone`'s clean payload shape: `done: true` and no `status` or `escalated` key."""
 
-    error = _refusal(
-        runner.invoke(
-            cli.app,
-            [
-                "run",
-                "--milestone",
-                "2",
-                "--repo-dir",
-                str(tmp_path),
-                "--branch-prefix",
-                "m2",
-            ],
-        )
+ESCALATED_MILESTONE = {
+    "escalated": True,
+    "run_id": "20260924T000000Z-0badcafe",
+    "level": 1,
+    "story": "story-b",
+    "subtask": "subtask-b1",
+    "failed_phase": "review",
+    "detail": "phase 'review' gate 'review_gate' failed",
+    "warnings": [],
+}
+"""`run_milestone`'s escalation payload shape: no `status` key either."""
+
+
+def _milestone_run(tmp_path: Path, *extra: str):
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--milestone",
+            "Milestone 3",
+            "--repo-dir",
+            str(tmp_path),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m3",
+            *extra,
+        ],
     )
 
-    assert error["type"] == "MilestoneRunNotImplementedError"
-    assert "not implemented" in error["message"]
-    assert "--dry-run" in error["message"]
-    assert not (paths.data_dir() / "runs").exists()
-    assert list(paths.data_dir().iterdir()) == []
+
+def _patch_run_milestone(monkeypatch, outcome: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Replace `orchestrate.run_milestone`, forbid every other run path, record calls.
+
+    `outcome` is returned, or raised when it is an exception instance.
+    """
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append((milestone, kwargs))
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    return calls
+
+
+def test_a_milestone_run_calls_run_milestone_once_with_the_run_options(
+    tmp_path, monkeypatch
+):
+    """Spec test 3: the same options as `--card`, the verify order kept, and no
+    `runner_factory` or `driver`, so production gets `cli.default_runner_factory`
+    and `cli.drive_subtask`. The kwargs are compared whole, so an extra key fails."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_milestone(monkeypatch, CLEAN_MILESTONE)
+
+    result = _milestone_run(
+        tmp_path,
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+        "--allow-no-verification",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    assert json.loads(result.stdout) == cli.ok_envelope(CLEAN_MILESTONE)
+    assert calls == [
+        (
+            "Milestone 3",
+            {
+                "repo_dir": tmp_path,
+                "base_branch": "main",
+                "branch_prefix": "m3",
+                "commands": ["uv run pytest", "uv run ruff check"],
+                "allow_no_verification": True,
+            },
+        )
+    ]
+
+
+def test_a_milestone_run_without_verify_passes_an_empty_list_and_no_opt_out(
+    tmp_path, monkeypatch
+):
+    """Review focus: `gate_context` calls `list(commands)`, so `None` would crash,
+    and the opt-out must stay closed unless the flag is given."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_milestone(monkeypatch, CLEAN_MILESTONE)
+
+    result = _milestone_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    ((_, kwargs),) = calls
+    assert kwargs["commands"] == []
+    assert kwargs["allow_no_verification"] is False
+
+
+def test_an_escalated_milestone_exits_one_with_an_ok_envelope(tmp_path, monkeypatch):
+    """Spec test 4: an escalation is a truthful result. The payload has no
+    `status` key, so the exit code must come from its `escalated` flag."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_milestone(monkeypatch, ESCALATED_MILESTONE)
+
+    plain = _milestone_run(tmp_path)
+    pretty = _milestone_run(tmp_path, "--pretty")
+
+    assert plain.exit_code == cli.EXIT_ESCALATED, plain.output
+    assert json.loads(plain.stdout) == cli.ok_envelope(ESCALATED_MILESTONE)
+    assert pretty.exit_code == cli.EXIT_ESCALATED, pretty.output
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        cli.CliError("no milestone matches 'Milestone 3'"),
+        board.BoardError("brd refused", argv=["brd", "tree"]),
+        ValueError("not a card id: 'x'"),
+    ],
+    ids=["CliError", "BoardError", "ValueError"],
+)
+def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
+    """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_milestone(monkeypatch, error)
+
+    refusal = _refusal(_milestone_run(tmp_path))
+
+    assert refusal["type"] == type(error).__name__
+    assert refusal["message"] == str(error)
+
+
+def test_an_unhandled_error_from_a_milestone_run_crashes_loudly(tmp_path, monkeypatch):
+    """Review focus: anything outside `HANDLED` is a bug and keeps its traceback."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_milestone(monkeypatch, RuntimeError("boom"))
+
+    result = _milestone_run(tmp_path)
+
+    assert isinstance(result.exception, RuntimeError)
+    assert '"ok"' not in result.stdout
+
+
+@pytest.mark.parametrize("first", ["agent_manager.cli", "agent_manager.orchestrate"])
+def test_cli_and_orchestrate_import_cleanly_in_either_order(first):
+    """Review focus: `orchestrate` imports `cli` at module level, so `cli` must
+    not import `orchestrate` at load time. A fresh interpreter, so this test
+    does not depend on what earlier tests already imported."""
+    code = (
+        f"import {first}\n"
+        "from agent_manager import cli, orchestrate\n"
+        "assert orchestrate.cli is cli\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.fixture

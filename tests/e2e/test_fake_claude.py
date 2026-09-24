@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager.steps.reducers import review_gate
+
 _SOURCE = Path(__file__).with_name("fake_claude.py")
 _spec = importlib.util.spec_from_file_location("e2e_fake_claude", _SOURCE)
 assert _spec is not None and _spec.loader is not None
@@ -373,13 +375,13 @@ def _implement_repo(tmp_path):
     return root
 
 
-def _implement_brief_text(digest=None):
+def _implement_brief_text(digest=None, plan=PLAN_RELATIVE):
     """An `implement` brief, optionally without its `## plan_hash` section."""
     section = "" if digest is None else f"\n## plan_hash\n{digest}\n"
     return (
         "# Coder\n\nstanding instructions\n\n"
         "# phase: implement\n# role: coder\n"
-        f"\n## plan_path\n{PLAN_RELATIVE}\n"
+        f"\n## plan_path\n{plan}\n"
         f"{section}"
     )
 
@@ -447,3 +449,165 @@ def test_a_padded_plan_hash_section_still_produces_a_single_line_trailer(tmp_pat
     assert _head_message(repo).rstrip("\n").splitlines()[-1] == (
         f"Plan-Hash: {BRIEF_HASH}"
     )
+
+
+def _head(repo):
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _porcelain(repo):
+    return subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _implement(repo, plan=PLAN_RELATIVE):
+    return fake_claude.build_result(
+        "implement",
+        fake_claude.payload_from_schema(IMPLEMENT_SCHEMA),
+        _implement_brief_text(BRIEF_HASH, plan),
+        repo,
+    )
+
+
+def test_a_stacked_subtask_with_its_own_plan_commits_its_own_implementation(tmp_path):
+    """Review focus: a milestone stacks a2 on a1's branch, so a2's worktree already
+    holds a1's implementation file. The file's content names the brief's plan
+    path, so a2's coder still has something to commit."""
+    repo = _implement_repo(tmp_path)
+    first = _implement(repo)
+    after_first = _head(repo)
+
+    second = _implement(repo, plan="docs/superpowers/plans/y-00000002.md")
+
+    assert first["resumed"] is False
+    assert second["resumed"] is False
+    assert _head(repo) != after_first
+    assert _head_message(repo).rstrip("\n").endswith(f"Plan-Hash: {BRIEF_HASH}")
+    assert _porcelain(repo) == ""
+
+
+def test_a_second_implement_on_the_same_plan_resumes_instead_of_failing(tmp_path):
+    """Review focus / spec "Re-entering B": a relaunched subtask's implementation
+    is already committed. The fake reports `resumed` rather than dying on
+    "nothing to commit", and it still takes its hash from the brief."""
+    repo = _implement_repo(tmp_path)
+    _implement(repo)
+    committed = _head(repo)
+
+    again = _implement(repo)
+
+    assert again["resumed"] is True
+    assert again["plan_hash"] == BRIEF_HASH
+    assert _head(repo) == committed
+    assert _porcelain(repo) == ""
+
+
+REVIEW_SCHEMA = {
+    "properties": {
+        "findings": {"items": {"type": "string"}, "type": "array"},
+        "unresolved_blockers": {"items": {"type": "string"}, "type": "array"},
+        "fix_summary": {"type": "string"},
+        "porcelain": {"type": "string"},
+        "commit_count": {"type": "integer"},
+        "tagged_count": {"type": "integer"},
+        "plan_hash": {"type": "string"},
+    },
+    "type": "object",
+}
+"""`results.ReviewResult`'s shape, written out for the same reason as
+`IMPLEMENT_SCHEMA`."""
+
+REVIEW_BRANCH = "m3/task-b1-00000003"
+
+
+def _review_worktree(tmp_path):
+    """A linked worktree on `REVIEW_BRANCH` with one tagged commit, as review finds it.
+
+    Linked, not the main checkout, because a subtask's agents run in
+    `<repo>/.claude/worktrees/<branch>`, where `.git` is a file and not the
+    directory the marker lives in.
+    """
+    repo = _implement_repo(tmp_path)
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(worktree), "-b", REVIEW_BRANCH],
+        check=True,
+        capture_output=True,
+    )
+    _implement(worktree)
+    return repo, worktree
+
+
+def _review(worktree, branch=REVIEW_BRANCH):
+    text = (
+        "# Reviewer\n\nstanding instructions\n\n"
+        "# phase: review\n# role: reviewer\n"
+        f"\n## branch\n{branch}\n"
+        "\n## base_branch\nmain\n"
+        f"\n## plan_path\n{PLAN_RELATIVE}\n"
+    )
+    return fake_claude.build_result(
+        "review", fake_claude.payload_from_schema(REVIEW_SCHEMA), text, worktree
+    )
+
+
+def test_the_review_fail_marker_name_is_the_one_the_e2e_fixtures_write():
+    """`tests/e2e/conftest.py` writes `FAKE_REVIEW_FAIL_MARKER`; the script and the
+    fixture meet across a process boundary, like `LOG_NAME`."""
+    assert fake_claude.REVIEW_FAIL_MARKER == "fake-claude-review-fail"
+
+
+def test_without_a_marker_the_review_passes_the_real_review_gate(tmp_path):
+    _, worktree = _review_worktree(tmp_path)
+
+    payload = _review(worktree)
+
+    assert payload["findings"] == []
+    assert payload["unresolved_blockers"] == []
+    assert payload["porcelain"] == ""
+    assert payload["commit_count"] == payload["tagged_count"] == 1
+    assert review_gate(payload, REVIEW_BRANCH, "main") is None
+
+
+def test_a_marker_naming_the_briefs_branch_makes_a_review_the_real_gate_blocks(tmp_path):
+    """Spec: the trigger is the brief's `## branch` matched against a marker in the
+    repo's git common dir. The failing result is schema-shaped (every field went
+    through `override`) and `review_gate` blocks it on `porcelain`."""
+    repo, worktree = _review_worktree(tmp_path)
+    marker = repo / ".git" / fake_claude.REVIEW_FAIL_MARKER
+    marker.write_text(f"m3/task-other-00000009\n{REVIEW_BRANCH}\n", encoding="utf-8")
+
+    payload = _review(worktree)
+
+    assert sorted(payload) == sorted(REVIEW_SCHEMA["properties"])
+    assert payload["porcelain"] == fake_claude.REVIEW_FAIL_PORCELAIN
+    assert "review-fail marker" in payload["porcelain"]
+    assert payload["unresolved_blockers"]
+    verdict = review_gate(payload, REVIEW_BRANCH, "main")
+    assert verdict is not None and "blocked" in verdict
+    # The marker lives outside every worktree's tree.
+    assert _porcelain(worktree) == ""
+    assert _porcelain(repo) == ""
+
+
+def test_a_marker_naming_only_other_branches_does_not_fail_this_review(tmp_path):
+    """Whole-line equality, never a prefix test: a branch that merely starts with
+    this one's name must not fail it."""
+    repo, worktree = _review_worktree(tmp_path)
+    (repo / ".git" / fake_claude.REVIEW_FAIL_MARKER).write_text(
+        f"{REVIEW_BRANCH}-later\n", encoding="utf-8"
+    )
+
+    payload = _review(worktree)
+
+    assert payload["porcelain"] == ""
+    assert review_gate(payload, REVIEW_BRANCH, "main") is None

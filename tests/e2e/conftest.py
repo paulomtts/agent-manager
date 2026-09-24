@@ -13,12 +13,14 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from typer.testing import CliRunner
 
-from agent_manager import cli, models, paths, store
+from agent_manager import board, cli, dag, models, paths, store
 
 FAKE_CLAUDE_SOURCE = Path(__file__).with_name("fake_claude.py")
 """The script copied to a tmp dir as the `claude` the adapter will find."""
@@ -43,6 +45,12 @@ AGENT_PHASES = (
 )
 """`builtin/task.yaml`'s seven agent phases, in document order."""
 
+MILESTONE_PREFIX = "m3"
+"""The `--branch-prefix` every milestone-run test uses."""
+
+FAKE_REVIEW_FAIL_MARKER = "fake-claude-review-fail"
+"""Must equal `fake_claude.REVIEW_FAIL_MARKER`, which `test_fake_claude.py` pins."""
+
 
 def git(cwd: Path, *args: str) -> str:
     """Run one git command for fixture setup or assertion, failing loudly."""
@@ -52,14 +60,33 @@ def git(cwd: Path, *args: str) -> str:
     return completed.stdout
 
 
-def _add_card(root: Path, title: str, parent: str | None = None) -> str:
+def _block(root: Path, card_id: str, blocker: str) -> None:
+    """`brd block <id> --by <blocker>`, as `tests/test_orchestrate.py::_block` does."""
+    subprocess.run(
+        ["brd", "block", card_id, "--by", blocker],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _add_card(
+    root: Path,
+    title: str,
+    parent: str | None = None,
+    blocked_by: Sequence[str] = (),
+) -> str:
     argv = ["brd", "add", "--title", title]
     if parent is not None:
         argv += ["--parent", parent]
     completed = subprocess.run(
         argv, cwd=root, check=True, capture_output=True, text=True
     )
-    return json.loads(completed.stdout)["data"]["id"]
+    card_id = json.loads(completed.stdout)["data"]["id"]
+    for blocker in blocked_by:
+        _block(root, card_id, blocker)
+    return card_id
 
 
 @pytest.fixture(scope="module")
@@ -77,12 +104,13 @@ def toolchain() -> None:
             pytest.skip(f"the {tool} CLI must be installed for the e2e tier")
 
 
-@pytest.fixture(scope="module")
-def project(tmp_path_factory, module_monkeypatch, toolchain) -> Path:
-    """One directory that is both a real git repo on `main` and a real brd board."""
-    base = tmp_path_factory.mktemp("e2e")
-    module_monkeypatch.setenv("XDG_DATA_HOME", str(base / "xdg"))
-    root = base / "project"
+def _init_project(root: Path, board_name: str) -> Path:
+    """Make `root` both a real git repo on `main` and a real brd board.
+
+    Shared by the module-scoped `project` and the per-test `fresh_project`, so
+    the two tiers' repos cannot drift apart. The caller points `XDG_DATA_HOME`
+    into tmp first.
+    """
     root.mkdir()
     subprocess.run(
         ["git", "init", "-b", "main", str(root)],
@@ -97,7 +125,7 @@ def project(tmp_path_factory, module_monkeypatch, toolchain) -> Path:
     git(root, "add", "README.md")
     git(root, "commit", "-m", "base")
     subprocess.run(
-        ["brd", "init", "--name", "e2e-board"],
+        ["brd", "init", "--name", board_name],
         cwd=root,
         check=True,
         capture_output=True,
@@ -108,6 +136,14 @@ def project(tmp_path_factory, module_monkeypatch, toolchain) -> Path:
     git(root, "add", "-A")
     git(root, "commit", "-m", "brd init")
     return root
+
+
+@pytest.fixture(scope="module")
+def project(tmp_path_factory, module_monkeypatch, toolchain) -> Path:
+    """One directory that is both a real git repo on `main` and a real brd board."""
+    base = tmp_path_factory.mktemp("e2e")
+    module_monkeypatch.setenv("XDG_DATA_HOME", str(base / "xdg"))
+    return _init_project(base / "project", "e2e-board")
 
 
 @pytest.fixture(scope="module")
@@ -187,3 +223,101 @@ def worktree(project, completed_run) -> Path:
 def fake_log(completed_run) -> Path:
     """The fake's cwd log, under the run directory and outside every worktree."""
     return paths.run_dir(completed_run["run_id"]) / FAKE_LOG_NAME
+
+
+@pytest.fixture
+def fresh_project(tmp_path, monkeypatch, toolchain) -> Path:
+    """A new repo+board per test, with its own `XDG_DATA_HOME`.
+
+    Function-scoped because a milestone run moves every card and branch it
+    touches, so two scenarios cannot share one board.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    return _init_project(tmp_path / "project", "e2e-milestone-board")
+
+
+@pytest.fixture
+def milestone_board(fresh_project) -> dict[str, Any]:
+    """One milestone and three stories: A (a1 -> a2), B blocked by A (b1), C blocked by B (c1).
+
+    A's subtasks are chained with `brd block`, so the census order does not
+    depend on timestamps. Branch names come from `dag`, never retyped here.
+    """
+    root = fresh_project
+    milestone = _add_card(root, "Milestone 3: run a milestone under a fake claude")
+    a = _add_card(root, "Story A: the first level", milestone)
+    b = _add_card(root, "Story B: blocked by story A", milestone, blocked_by=[a])
+    c = _add_card(root, "Story C: blocked by story B", milestone, blocked_by=[b])
+    a1 = _add_card(root, "a1: first subtask of story A", a)
+    a2 = _add_card(root, "a2: second subtask of story A", a, blocked_by=[a1])
+    b1 = _add_card(root, "b1: only subtask of story B", b)
+    c1 = _add_card(root, "c1: only subtask of story C", c)
+    subtasks = {"A": [a1, a2], "B": [b1], "C": [c1]}
+    branches = {
+        card_id: dag.task_branch(MILESTONE_PREFIX, board.show(card_id, repo_dir=root))
+        for chain in subtasks.values()
+        for card_id in chain
+    }
+    return {
+        "root": root,
+        "milestone": milestone,
+        "stories": {"A": a, "B": b, "C": c},
+        "subtasks": subtasks,
+        "branches": branches,
+    }
+
+
+@pytest.fixture
+def run_milestone_cli(fake_claude_bin) -> Callable[[Path, str], Any]:
+    """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
+
+    Depends on `fake_claude_bin` so the fake is first on `PATH`: the real
+    `ClaudeAdapter` resolves `claude` to it through the real `run_direct`.
+    """
+    runner = CliRunner()
+
+    def invoke(root: Path, milestone: str):
+        argv = [
+            "run",
+            "--milestone",
+            milestone,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            MILESTONE_PREFIX,
+        ]
+        for command in VERIFY_COMMANDS:
+            argv += ["--verify", command]
+        return runner.invoke(cli.app, argv)
+
+    return invoke
+
+
+@pytest.fixture
+def read_fake_log() -> Callable[[str], list[dict[str, Any]]]:
+    """The fake's cwd log for one run id, or `[]` for a run that launched no agent."""
+
+    def read(run_id: str) -> list[dict[str, Any]]:
+        log = paths.run_dir(run_id) / FAKE_LOG_NAME
+        if not log.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    return read
+
+
+@pytest.fixture
+def review_fail_marker(milestone_board) -> Path:
+    """Where the fake looks for branches whose review must fail.
+
+    The repo's git common dir, which the fake reaches from any worktree's cwd
+    through `git rev-parse --git-common-dir`. Inside `.git`, so it is in no
+    worktree's tree and never in `git status`. The test writes it and removes it.
+    """
+    return milestone_board["root"] / ".git" / FAKE_REVIEW_FAIL_MARKER

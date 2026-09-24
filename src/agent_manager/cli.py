@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -120,16 +121,6 @@ class NotResumableError(CliError):
     fine, so what an operator does next -- start a fresh `run --card`, wait for
     `retry`, or drive the subtasks one at a time -- depends entirely on the
     status this message names, and a script can branch on the `type` field.
-    """
-
-
-class MilestoneRunNotImplementedError(CliError):
-    """`run --milestone` without `--dry-run`: the real milestone run is not built yet.
-
-    A `CliError` so it rides `HANDLED` into an `ok: false` envelope at exit 3.
-    It is raised before the repo dir is resolved or the board is read, so a
-    refusal reads nothing and writes nothing. The next story replaces it with
-    the real run.
     """
 
 
@@ -657,6 +648,66 @@ def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[s
     }
 
 
+@dataclass(frozen=True)
+class SubtaskDrive:
+    """What one `drive_subtask` call did: the engine's summary, plus every warning.
+
+    `warnings` is the summary's own list followed by the runner's out-of-band
+    list. Internal state, so a dataclass rather than a pydantic model.
+    """
+
+    summary: engine.SubtaskSummary
+    warnings: list[str]
+
+
+def drive_subtask(
+    *,
+    store: Store,
+    run_id: str,
+    card: models.Card,
+    parent: models.Card,
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+) -> SubtaskDrive:
+    """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
+
+    Addendum O4's shared driver. `run_card` calls it once, and a milestone runner
+    calls it once per subtask against one store and one run id. The caller owns
+    everything around the walk: the board reads, the run id, opening and
+    closing the store, and the run/story/subtask rows. This function catches
+    nothing. An escalation is `summary.status == "escalated"`, not an exception.
+    """
+    workflow = load_builtin(WORKFLOW_NAME)
+    factory = default_runner_factory if runner_factory is None else runner_factory
+    runner = factory(
+        workflow=workflow,
+        store=store,
+        run_id=run_id,
+        story_id=parent.id,
+        card_id=card.id,
+    )
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=parent.id,
+        subtask=subtask,
+        repo_dir=repo_dir,
+        commands=commands,
+        card=card,
+        parent_story=parent,
+        extra_context=gate_context(commands, allow_no_verification),
+        agent_runner=runner,
+    )
+    # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
+    # its signature returns a result, so a warning has nowhere else to go,
+    # and dropping them is the §12 failure this whole list exists to prevent.
+    warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+    return SubtaskDrive(summary=summary, warnings=warnings)
+
+
 def run_card(
     card_id: str,
     *,
@@ -688,7 +739,9 @@ def run_card(
     worktree = worktree_for(root, branch)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-    workflow = load_builtin(WORKFLOW_NAME)
+    # Fail-fast preflight: a workflow that will not load must leave no run
+    # directory, so it is checked before `Store.open`. `drive_subtask` loads its own.
+    load_builtin(WORKFLOW_NAME)
 
     store = Store.open(root, run_id)
     try:
@@ -720,26 +773,18 @@ def run_card(
         store.record_story(story)
         store.record_subtask(story.card_id, subtask)
 
-        factory = default_runner_factory if runner_factory is None else runner_factory
-        runner = factory(
-            workflow=workflow,
+        drive = drive_subtask(
             store=store,
             run_id=run_id,
-            story_id=parent.id,
-            card_id=card.id,
-        )
-        summary = engine.run_subtask(
-            workflow,
-            store,
-            story_id=parent.id,
+            card=card,
+            parent=parent,
             subtask=subtask,
             repo_dir=root,
             commands=commands,
-            card=card,
-            parent_story=parent,
-            extra_context=gate_context(commands, allow_no_verification),
-            agent_runner=runner,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
         )
+        summary = drive.summary
 
         store.record_run(run_record.model_copy(update={"status": summary.status}))
         store.record_story(story.model_copy(update={"status": summary.status}))
@@ -747,10 +792,7 @@ def run_card(
             story.card_id, subtask.model_copy(update={"status": summary.status})
         )
 
-        # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
-        # its signature returns a result, so a warning has nowhere else to go,
-        # and dropping them is the §12 failure this whole list exists to prevent.
-        warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+        warnings = drive.warnings
         return {
             "run_id": run_id,
             "card_id": card.id,
@@ -914,7 +956,10 @@ def run(
     milestone: str | None = typer.Option(
         None,
         "--milestone",
-        help="A milestone card id or title substring. Needs --dry-run for now.",
+        help=(
+            "A milestone card id or title substring: drive every remaining subtask. "
+            "Exclusive with --card."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -947,20 +992,32 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card end to end, or preview a milestone with --dry-run."""
+    """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
     _check_run_targets(card=card, milestone=milestone, dry_run=dry_run)
     try:
-        if milestone is not None and not dry_run:
-            raise MilestoneRunNotImplementedError(
-                f"milestone runs are not implemented yet; `run --milestone {milestone}"
-                " --dry-run` previews the levels and stack bases without writing anything"
-            )
-        if milestone is not None:
+        if milestone is not None and dry_run:
             payload = dry_run_milestone(
                 milestone,
                 repo_dir=repo_dir,
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
+            )
+        elif milestone is not None:
+            # `orchestrate` imports this module at load time and reads its names
+            # at call time, so importing it at the top of this module would be
+            # circular. By the time a command runs, both are fully loaded. Read
+            # as `orchestrate.run_milestone` so a test can patch it there. No
+            # runner_factory and no driver: production gets
+            # `default_runner_factory` and `drive_subtask`.
+            from agent_manager import orchestrate
+
+            payload = orchestrate.run_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
             )
         else:
             payload = run_card(
@@ -975,7 +1032,15 @@ def run(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
-    if milestone is None and payload["status"] == "escalated":
+    # A card payload reports `status`. A milestone payload has no `status` key:
+    # it carries `escalated: true` only when it stopped, a clean one carries
+    # `done: true`, and a dry-run preview carries neither. So the flag is read
+    # with `.get`, never indexed.
+    if milestone is None:
+        escalated = payload["status"] == "escalated"
+    else:
+        escalated = payload.get("escalated") is True
+    if escalated:
         raise typer.Exit(EXIT_ESCALATED)
 
 
