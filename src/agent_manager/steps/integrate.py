@@ -17,6 +17,11 @@ because that is exactly the state a resolver needs. So this module never runs
 `merge --abort`, `reset`, `checkout -f`, `clean`, `commit` or `push`, and never
 writes the base branch; the tests assert all of it.
 
+`measure_merge` and `merge_completed_gate` (Integrate addendum I3) judge a
+merge the resolver says it finished. They only ask git questions -- `rev-parse`,
+`status`, `diff` -- and read the touched files as bytes; the resolver's own
+`resolved` flag is never consulted.
+
 Every invocation is an argument list handed to the git runner: there is no
 shell string and nothing to quote.
 """
@@ -189,3 +194,88 @@ def merge_tip(
     if _says_already_up_to_date(output):
         return _result(created=created, merged=tip, already_merged=True)
     return _result(created=created, merged=tip)
+
+
+_MARKER_OPEN = b"<<<<<<< "
+_MARKER_CLOSE = b">>>>>>> "
+"""Conflict-marker line prefixes: seven characters and a space. `=======` alone
+is a markdown or rst underline as often as a marker, so it never counts."""
+
+
+def _ref_exists(git_runner: GitRunner, worktree_path: str, ref: str) -> bool:
+    """Whether `ref` resolves in `worktree_path`.
+
+    `rev-parse --verify --quiet` exits 1 when the ref is absent; any other
+    failure is not an answer and propagates.
+    """
+    try:
+        git_runner(["-C", worktree_path, "rev-parse", "--verify", "--quiet", ref])
+    except GitError as error:
+        if error.exit_code == 1:
+            return False
+        raise
+    return True
+
+
+def _nul_separated(output: str) -> list[str]:
+    """Paths from a `-z` listing: NUL-separated and never quoted by git."""
+    return [name for name in output.split("\0") if name]
+
+
+def _touched_files(
+    git_runner: GitRunner, worktree_path: str, merge_in_progress: bool
+) -> list[str]:
+    """The files the merge touched: those that differ from its first parent.
+
+    While MERGE_HEAD exists the first parent is HEAD itself, so the set is
+    what differs between HEAD and the index/working tree, plus any unmerged
+    path. Once committed it is HEAD^1..HEAD. A root commit touched nothing.
+    """
+    if merge_in_progress:
+        touched = _nul_separated(
+            git_runner(["-C", worktree_path, "diff", "--name-only", "-z", "HEAD"])
+        )
+        unmerged = _nul_separated(
+            git_runner(
+                ["-C", worktree_path, "diff", "--name-only", "-z", "--diff-filter=U"]
+            )
+        )
+        return touched + [name for name in unmerged if name not in touched]
+    if not _ref_exists(git_runner, worktree_path, "HEAD^1"):
+        return []
+    return _nul_separated(
+        git_runner(["-C", worktree_path, "diff", "--name-only", "-z", "HEAD^1", "HEAD"])
+    )
+
+
+def _has_conflict_markers(path: Path) -> bool:
+    """Both an opening and a closing marker line, read as bytes."""
+    lines = path.read_bytes().splitlines()
+    return any(line.startswith(_MARKER_OPEN) for line in lines) and any(
+        line.startswith(_MARKER_CLOSE) for line in lines
+    )
+
+
+def measure_merge(
+    worktree: str | Path, git_runner: GitRunner = run_git
+) -> dict[str, object]:
+    """What git says about the merge in `worktree`, without changing anything.
+
+    `merge_in_progress` is whether MERGE_HEAD exists, `status` is the raw
+    `git status --porcelain` text (untracked files included), and
+    `marked_files` lists the touched files that still hold both conflict
+    marker lines, in git's order. A touched path that no longer exists (a
+    deletion) is skipped. Every git failure other than an absent ref raises.
+    """
+    worktree_path = str(worktree)
+    in_progress = _ref_exists(git_runner, worktree_path, "MERGE_HEAD")
+    status = git_runner(
+        ["-C", worktree_path, "status", "--porcelain", "--untracked-files=all"]
+    )
+    marked = [
+        name
+        for name in _touched_files(git_runner, worktree_path, in_progress)
+        if (Path(worktree_path) / name).is_file()
+        and _has_conflict_markers(Path(worktree_path) / name)
+    ]
+    return {"merge_in_progress": in_progress, "status": status, "marked_files": marked}

@@ -16,7 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager.steps.integrate import MergeInProgressError, merge_tip
+from agent_manager.steps.integrate import (
+    MergeInProgressError,
+    measure_merge,
+    merge_tip,
+)
 from agent_manager.steps.worktree import GitError, run_git
 
 requires_git = pytest.mark.skipif(
@@ -640,3 +644,185 @@ def test_no_forbidden_git_operation_runs_on_any_path(
     assert conflict["conflict"] is True
     _assert_no_forbidden_git(calls)
     assert _base_state(repo) == before
+
+
+# --- measure_merge / merge_completed_gate (card 9c6741b0, Integrate addendum I3) ---
+#
+# git judges whether a merge is complete. Every test below measures a real temp
+# repo, records the git calls the measurement made, and asserts the base is
+# untouched.
+
+MARKED = "<<<<<<< ours\nkept\n=======\ntheirs\n>>>>>>> m5/story-b\n"
+"""A file body holding both conflict-marker lines."""
+
+READ_ONLY_SUBCOMMANDS = ("rev-parse", "status", "diff")
+
+
+def _assert_read_only_git(calls: list[list[str]], wt: Path) -> None:
+    """Measuring a merge only asks git questions, and only about `wt`."""
+    assert calls, "git must be asked: nothing here may be judged without it"
+    for argv in calls:
+        assert argv[:2] == ["-C", str(wt)], argv
+        assert argv[2] in READ_ONLY_SUBCOMMANDS, f"not a read-only git call: {argv!r}"
+    _assert_no_forbidden_git(calls)
+
+
+def _porcelain(wt: Path) -> str:
+    return _git(wt, "status", "--porcelain", "--untracked-files=all")
+
+
+def _merged_cleanly(repo: Path, wt: Path, tmp_path: Path, files: dict[str, str]) -> None:
+    """Merge a story-a tip carrying `files` into a fresh integration worktree."""
+    _make_tip(repo, tmp_path, "m5/story-a", files)
+    result = _merge(repo, wt, "m5/story-a")
+    assert result["conflict"] is False
+    assert result["already_merged"] is False
+
+
+@requires_git
+def test_measure_merge_reports_a_merge_left_in_progress(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _leave_a_conflict(repo, wt, tmp_path)
+
+    calls: list[list[str]] = []
+    measured = measure_merge(str(wt), git_runner=_recorder(calls))
+
+    assert measured == {
+        "merge_in_progress": True,
+        "status": _porcelain(wt),
+        "marked_files": ["a.js"],
+    }
+    assert "a.js" in measured["status"]
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_measure_merge_reports_a_finished_merge(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+
+    calls: list[list[str]] = []
+    # A Path is accepted as well as a str: the engine's context holds a Path.
+    measured = measure_merge(wt, git_runner=_recorder(calls))
+
+    assert measured == {"merge_in_progress": False, "status": "", "marked_files": []}
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@pytest.mark.parametrize(
+    ("body", "marked"),
+    [
+        (MARKED, True),
+        ("<<<<<<< ours\r\nkept\r\n>>>>>>> theirs\r\n", True),
+        ("Title\n=======\n\nBody text.\n", False),
+        ("<<<<<<< only the opening marker\n", False),
+        (">>>>>>> only the closing marker\n", False),
+        ("text <<<<<<< mid-line\ntext >>>>>>> mid-line\n", False),
+        ("<<<<<<<no-space\n>>>>>>>no-space\n", False),
+    ],
+    ids=[
+        "both-markers",
+        "both-markers-crlf",
+        "markdown-underline-only",
+        "opening-only",
+        "closing-only",
+        "markers-mid-line",
+        "markers-without-the-space",
+    ],
+)
+@requires_git
+def test_a_touched_file_is_marked_only_with_both_marker_lines(
+    repo: Path, wt: Path, tmp_path: Path, body: str, marked: bool
+):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"notes.md": body})
+
+    measured = measure_merge(str(wt))
+
+    assert measured["marked_files"] == (["notes.md"] if marked else [])
+    assert measured["merge_in_progress"] is False
+    assert measured["status"] == ""
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_markers_in_a_file_the_merge_did_not_touch_are_ignored(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # Committed on the base before the tip: every merge carries it, none touched it.
+    _commit(repo, "legacy.md", MARKED)
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+    assert (wt / "legacy.md").read_text() == MARKED  # non-vacuity
+
+    assert measure_merge(str(wt))["marked_files"] == []
+    assert _base_state(repo) == before
+
+
+@pytest.mark.parametrize("name", ["my notes.md", "café.md", 'say "hi".md'])
+@requires_git
+def test_a_touched_file_with_an_unusual_name_is_read_by_its_real_name(
+    repo: Path, wt: Path, tmp_path: Path, name: str
+):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {name: MARKED})
+
+    assert measure_merge(str(wt))["marked_files"] == [name]
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_touched_binary_file_is_scanned_as_bytes(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+    # Not valid UTF-8: a text read would raise UnicodeDecodeError.
+    (wt / "blob.bin").write_bytes(b"<<<<<<< \xff\xfe\n\x00\x80\n>>>>>>> \xfe\n")
+    _git(wt, "add", "blob.bin")
+    _git(wt, "commit", "-m", "add a binary")
+
+    assert measure_merge(str(wt)) == {
+        "merge_in_progress": False,
+        "status": "",
+        "marked_files": ["blob.bin"],
+    }
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_touched_file_that_was_deleted_is_skipped(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+    _git(wt, "rm", "-q", "b.js")
+    _git(wt, "commit", "-m", "drop b.js")
+
+    assert measure_merge(str(wt)) == {
+        "merge_in_progress": False,
+        "status": "",
+        "marked_files": [],
+    }
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_head_with_no_parent_has_nothing_touched(tmp_path: Path):
+    solo = tmp_path / "solo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(solo)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(solo, "config", "user.email", "tests@example.com")
+    _git(solo, "config", "user.name", "agent-manager tests")
+    _git(solo, "config", "commit.gpgsign", "false")
+    _commit(solo, "notes.md", MARKED)
+
+    assert measure_merge(str(solo)) == {
+        "merge_in_progress": False,
+        "status": "",
+        "marked_files": [],
+    }
