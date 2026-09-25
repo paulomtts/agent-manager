@@ -1,19 +1,26 @@
-"""Behaviour of the sequential milestone runner (orchestration addendum O6).
+"""Behaviour of the milestone runner (orchestration addendum O6, Integrate I6).
 
 Two tiers, per design §14:
 
-- `plan_levels`, `story_tips` and `stale_story_anchors` are pure over the
-  census and get unit tests on hand-built plans;
+- `plan_levels`, `story_tips`, `stale_story_anchors` and the payload helpers
+  are pure and get unit tests on hand-built plans or outcomes;
 - `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
   real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
   `paths.data_dir()` never touches the developer's own -- with the harness
   replaced at the injected `driver` seam. No runner, adapter or `claude` is
   involved; production wiring under a fake `claude` belongs to tests/e2e.
+
+`FakeDriver` makes no branches, so by default (`integrate_recorder`, autouse)
+Integrate is replaced at its own call-time seam, `integration.integrate_milestone`,
+by a recorder. Tests that request `real_integrate` run the real Integrate over
+branches `BranchingDriver` or `_commit_branch` really commit.
 """
 
 import json
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -290,6 +297,17 @@ requires_brd = pytest.mark.skipif(
 STARTED_AT = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
 PREFIX = "m3"
 
+LATER = datetime(2026, 9, 24, 13, 0, 0, tzinfo=timezone.utc)
+"""A relaunch's clock: a second run needs its own run id."""
+
+INTEGRATION_BRANCH = "m3-integrate"
+"""`integration.integration_branch(PREFIX)`, spelled out so a rename is caught."""
+
+PASS_CMD = shlex.join([sys.executable, "-c", "print('suite green')"])
+FAIL_CMD = shlex.join(
+    [sys.executable, "-c", "import sys; print('suite is red'); sys.exit(3)"]
+)
+
 
 def _git(cwd: Path, *args: str) -> str:
     completed = subprocess.run(
@@ -297,6 +315,24 @@ def _git(cwd: Path, *args: str) -> str:
     )
     return completed.stdout
 
+
+def _sha(cwd: Path, ref: str) -> str:
+    return _git(cwd, "rev-parse", ref).strip()
+
+
+def _is_ancestor(cwd: Path, earlier: str, later: str) -> bool:
+    """`git merge-base --is-ancestor`: exit 0 yes, exit 1 no, anything else fails."""
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), "merge-base", "--is-ancestor", earlier, later],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode in (0, 1), completed.stderr
+    return completed.returncode == 0
+
+
+def _local_branches(cwd: Path) -> list[str]:
+    return _git(cwd, "branch", "--format=%(refname:short)").split()
 
 def _add_card(root: Path, title: str, parent: str | None = None) -> str:
     argv = ["brd", "add", "--title", title]
@@ -451,6 +487,134 @@ def _run(project: Path, milestone: str, driver: Any, **overrides: Any) -> dict[s
     kwargs.update(overrides)
     return orchestrate.run_milestone(milestone, **kwargs)
 
+
+REAL_INTEGRATE = integration.integrate_milestone
+"""Captured at import, before `integrate_recorder` swaps it."""
+
+
+@dataclass
+class IntegrateRecorder:
+    """Stands in for `integration.integrate_milestone`, read by `run_milestone` at call time.
+
+    Every call is recorded with the run's status at that moment, which is how
+    a test sees that Integrate ran before the run was recorded. `outcome`
+    scripts the result: `None` is a success shaped by the real `merge_order`,
+    an `IntegrateEscalation` is returned, an exception instance is raised.
+    """
+
+    outcome: Any = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        stories,
+        repo_dir,
+        base_branch,
+        branch_prefix,
+        commands,
+        allow_no_verification,
+        store,
+        run_id,
+        runner_factory,
+    ):
+        stories = list(stories)
+        self.calls.append(
+            {
+                "stories": [story.id for story in stories],
+                "repo_dir": repo_dir,
+                "base_branch": base_branch,
+                "branch_prefix": branch_prefix,
+                "commands": list(commands),
+                "allow_no_verification": allow_no_verification,
+                "store": store,
+                "run_id": run_id,
+                "runner_factory": runner_factory,
+                "run_status": store.load_run(run_id).status,
+            }
+        )
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        if self.outcome is not None:
+            return self.outcome
+        branch = integration.integration_branch(branch_prefix)
+        return integration.IntegrateSuccess(
+            branch=branch,
+            worktree=cli.worktree_for(repo_dir, branch),
+            merged=[
+                story.id
+                for story, _ in integration.merge_order(stories, branch_prefix, base_branch)
+            ],
+        )
+
+
+@pytest.fixture(autouse=True)
+def integrate_recorder(monkeypatch) -> IntegrateRecorder:
+    recorder = IntegrateRecorder()
+    monkeypatch.setattr(integration, "integrate_milestone", recorder)
+    return recorder
+
+
+@pytest.fixture
+def real_integrate(monkeypatch, integrate_recorder) -> None:
+    """Undo `integrate_recorder`: this test runs the real Integrate."""
+    monkeypatch.setattr(integration, "integrate_milestone", REAL_INTEGRATE)
+
+
+def _integrated(root: Path, merged: list[str]) -> dict[str, Any]:
+    """The `integrated` key a clean run reports when no tip needed a resolver."""
+    return {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(cli.worktree_for(root, INTEGRATION_BRANCH)),
+        "merged": merged,
+        "resolved": [],
+    }
+
+
+def _no_resolver(**kwargs: Any) -> Any:
+    """A runner factory for tests whose tips never conflict: a resolver is a failure."""
+    pytest.fail("Integrate dispatched a resolver, but no tip in this test conflicts")
+
+
+def _commit_branch(root: Path, branch: str, base: str, card_id: str) -> None:
+    """Cut `branch` from `base` in its own worktree and commit one file named for the card.
+
+    Each card writes its own file, so no two story tips ever conflict.
+    """
+    path = cli.worktree_for(root, branch)
+    _git(root, "worktree", "add", "-b", branch, str(path), base)
+    (path / f"{dag.short_id(card_id)}.txt").write_text(f"work of {card_id}\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-m", f"work of {card_id}")
+
+
+@dataclass
+class BranchingDriver(FakeDriver):
+    """A `FakeDriver` whose `done` subtask leaves what the real one does.
+
+    A branch with one commit on the subtask's base, and the card `done` on the
+    board through the rollup, as `mark_done` does. Sequential runs only.
+    """
+
+    def __call__(self, *, store, run_id, card, parent, subtask, repo_dir, **kwargs):
+        drive = super().__call__(
+            store=store,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=repo_dir,
+            **kwargs,
+        )
+        if drive.summary.status == "done":
+            _commit_branch(repo_dir, subtask.branch, subtask.base_branch, card.id)
+            rollup.set_status(card.id, "done", repo_dir=repo_dir)
+        return drive
+
+
+def _census_stories(project: Path, milestone: str) -> list[str]:
+    """Story ids in census order: siblings made in one second are ordered by id."""
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
+    return [story.id for story in plan.stories]
 
 def _load(project: Path, run_id: str) -> models.Run:
     conn = store_module.open_db(cli.resolve_repo_dir(project))
@@ -620,7 +784,7 @@ class GatedDriver:
 
 @requires_git
 @requires_brd
-def test_subtasks_run_in_order_each_stacked_on_the_one_before(project):
+def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate_recorder):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     a1, a2 = shape["subtasks"]["A"]
@@ -665,6 +829,20 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project):
             {"story": story_b, "tip": branches[b1]},
         ],
         "warnings": [],
+        "integrated": _integrated(root, [story_a, story_b]),
+    }
+    (integrate_call,) = integrate_recorder.calls
+    assert isinstance(integrate_call.pop("store"), store_module.Store)
+    assert integrate_call == {
+        "stories": [story_a, story_b],
+        "repo_dir": root,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "commands": ["uv run pytest"],
+        "allow_no_verification": True,
+        "run_id": run_id,
+        "runner_factory": factory,
+        "run_status": "started",
     }
 
     run = _load(project, run_id)
@@ -784,13 +962,304 @@ def test_no_driver_resolves_to_cli_drive_subtask_at_call_time(project, monkeypat
 
 @requires_git
 @requires_brd
-def test_a_milestone_with_nothing_pending_still_records_a_done_run(project):
+def test_no_runner_factory_gives_integrate_cli_default_runner_factory_at_call_time(
+    project, monkeypatch, integrate_recorder
+):
+    """Integrate needs a factory for a conflict. `None` is production's, read
+    off `cli` when Integrate runs, while the lanes still get `None` and resolve
+    it in `drive_subtask` as before."""
+    shape = _milestone(project, {"A": 1})
+
+    def sentinel_factory(**kwargs: Any) -> Any:
+        pytest.fail("the sentinel factory is only compared, never called")
+
+    monkeypatch.setattr(cli, "default_runner_factory", sentinel_factory)
+    driver = FakeDriver()
+
+    _run(project, shape["milestone"], driver)
+
+    assert [call["runner_factory"] for call in driver.calls] == [None]
+    (integrate_call,) = integrate_recorder.calls
+    assert integrate_call["runner_factory"] is sentinel_factory
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_is_recorded_and_reported_with_its_story_and_files(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=story_b, files=["shared.txt"], detail="the resolver did not finish"
+    )
+    driver = FakeDriver(warnings={a1: ["a1 warned"]})
+
+    result = _run(project, shape["milestone"], driver)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "phase": "integrate",
+        "story": story_b,
+        "files": ["shared.txt"],
+        "detail": "the resolver did not finish",
+        "run_id": run_id,
+        "warnings": ["a1 warned"],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+    }
+    assert [call["run_status"] for call in integrate_recorder.calls] == ["started"]
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_that_raises_propagates_and_the_run_is_never_recorded_done(
+    project, integrate_recorder
+):
+    """Error path: a git failure that is not a conflict is not reclassified."""
+    shape = _milestone(project, {"A": 1})
+    integrate_recorder.outcome = worktree.GitError(
+        "fatal: not a valid object name", argv=["git", "merge"], exit_code=128
+    )
+
+    with pytest.raises(worktree.GitError):
+        _run(project, shape["milestone"], FakeDriver())
+
+    run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
+    assert run.status == "started"
+
+
+@requires_git
+@requires_brd
+def test_a_clean_milestone_is_integrated_before_the_run_is_recorded_done(
+    project, real_integrate
+):
+    """Spec test 1."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    root = cli.resolve_repo_dir(project)
+    order = _census_stories(project, shape["milestone"])
+    by_story = _subtasks_by_story(shape)
+    main_before = _sha(project, "main")
+
+    result = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(),
+        commands=[PASS_CMD],
+        runner_factory=_no_resolver,
+    )
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": order}],
+        "completed": [card for story in order for card in by_story[story]],
+        "tips": [
+            {"story": story, "tip": _branch(project, by_story[story][-1])} for story in order
+        ],
+        "warnings": [],
+        "integrated": _integrated(root, order),
+    }
+    assert _load(project, run_id).status == "done"
+    for story in order:
+        assert _is_ancestor(project, _branch(project, by_story[story][-1]), INTEGRATION_BRANCH)
+    assert cli.worktree_for(root, INTEGRATION_BRANCH).is_dir()
+    assert _sha(project, "main") == main_before
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_records_the_run_escalated_and_leaves_the_branch(
+    project, real_integrate
+):
+    """Spec test 2: the final verification fails."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    root = cli.resolve_repo_dir(project)
+    order = _census_stories(project, shape["milestone"])
+    by_story = _subtasks_by_story(shape)
+    integrate_worktree = cli.worktree_for(root, INTEGRATION_BRANCH)
+    main_before = _sha(project, "main")
+
+    result = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(),
+        commands=[FAIL_CMD],
+        runner_factory=_no_resolver,
+    )
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert set(result) == {
+        "escalated", "phase", "story", "files", "detail", "run_id", "warnings"
+    }
+    assert result["escalated"] is True
+    assert result["phase"] == "integrate"
+    assert result["story"] is None
+    assert result["files"] == []
+    assert result["detail"].startswith(
+        f"the integrated branch failed its final verification in {integrate_worktree}"
+    )
+    assert result["run_id"] == run_id
+    assert result["warnings"] == []
+    expected = {"run": "escalated"}
+    for story in order:
+        expected[story] = "done"
+        for card in by_story[story]:
+            expected[card] = "done"
+    assert _statuses(_load(project, run_id)) == expected
+    # Left exactly as Integrate left it: both tips merged, a clean worktree.
+    assert integrate_worktree.is_dir()
+    assert _git(integrate_worktree, "rev-parse", "--abbrev-ref", "HEAD").strip() == (
+        INTEGRATION_BRANCH
+    )
+    assert _git(integrate_worktree, "status", "--porcelain") == ""
+    for story in order:
+        assert _is_ancestor(project, _branch(project, by_story[story][-1]), INTEGRATION_BRANCH)
+    assert _sha(project, "main") == main_before
+
+
+@requires_git
+@requires_brd
+def test_an_all_done_milestone_runs_no_lane_and_still_integrates(project, real_integrate):
+    """Spec test 4."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    root = cli.resolve_repo_dir(project)
+    order = _census_stories(project, shape["milestone"])
+    by_story = _subtasks_by_story(shape)
+    for story in order:
+        (card,) = by_story[story]
+        _commit_branch(root, _branch(project, card), "main", card)
+        rollup.set_status(card, "done", repo_dir=project)
+    main_before = _sha(project, "main")
+    assert INTEGRATION_BRANCH not in _local_branches(project)
+    driver = FakeDriver()
+
+    result = _run(
+        project, shape["milestone"], driver, commands=[PASS_CMD], runner_factory=_no_resolver
+    )
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert driver.calls == []
+    assert result == {
+        "done": True,
+        "run_id": run_id,
+        "levels": [],
+        "completed": [],
+        "tips": [
+            {"story": story, "tip": _branch(project, by_story[story][-1])} for story in order
+        ],
+        "warnings": [],
+        "integrated": _integrated(root, order),
+    }
+    assert _statuses(_load(project, run_id)) == {"run": "done"}
+    for story in order:
+        assert _is_ancestor(project, _branch(project, by_story[story][-1]), INTEGRATION_BRANCH)
+    assert _sha(project, "main") == main_before
+
+
+@requires_git
+@requires_brd
+def test_a_relaunch_after_an_integrate_escalation_retries_integrate(project, real_integrate):
+    """Spec test 5: the cause is fixed (the suite made green) and the same
+    milestone is relaunched with nothing left to drive."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    root = cli.resolve_repo_dir(project)
+    order = _census_stories(project, shape["milestone"])
+    by_story = _subtasks_by_story(shape)
+    main_before = _sha(project, "main")
+
+    first = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(),
+        commands=[FAIL_CMD],
+        runner_factory=_no_resolver,
+    )
+    assert first["escalated"] is True
+    assert first["phase"] == "integrate"
+
+    driver = FakeDriver()
+    second = _run(
+        project,
+        shape["milestone"],
+        driver,
+        commands=[PASS_CMD],
+        runner_factory=_no_resolver,
+        clock=lambda: LATER,
+    )
+
+    second_id = cli.mint_run_id(shape["milestone"], LATER)
+    assert driver.calls == []
+    assert second == {
+        "done": True,
+        "run_id": second_id,
+        "levels": [],
+        "completed": [],
+        "tips": [
+            {"story": story, "tip": _branch(project, by_story[story][-1])} for story in order
+        ],
+        "warnings": [],
+        "integrated": _integrated(root, order),
+    }
+    assert _load(project, first["run_id"]).status == "escalated"
+    assert _load(project, second_id).status == "done"
+    assert _sha(project, "main") == main_before
+
+
+@requires_git
+@requires_brd
+def test_relaunching_a_finished_integrated_milestone_leaves_the_integration_tip(
+    project, real_integrate
+):
+    """Spec test 6."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    main_before = _sha(project, "main")
+    first = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(),
+        commands=[PASS_CMD],
+        runner_factory=_no_resolver,
+    )
+    assert first["done"] is True
+    tip_after_first = _sha(project, INTEGRATION_BRANCH)
+    driver = FakeDriver()
+
+    second = _run(
+        project,
+        shape["milestone"],
+        driver,
+        commands=[PASS_CMD],
+        runner_factory=_no_resolver,
+        clock=lambda: LATER,
+    )
+
+    assert driver.calls == []
+    assert second["done"] is True
+    assert second["integrated"] == first["integrated"]
+    assert _sha(project, INTEGRATION_BRANCH) == tip_after_first
+    assert _sha(project, "main") == main_before
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
     story_a = shape["stories"]["A"]
     (a1,) = shape["subtasks"]["A"]
     for card in (a1, story_a):
         board.set_status(card, "done", repo_dir=project)
     driver = FakeDriver()
+    root = cli.resolve_repo_dir(project)
 
     result = _run(project, shape["milestone"], driver)
 
@@ -802,7 +1271,10 @@ def test_a_milestone_with_nothing_pending_still_records_a_done_run(project):
         "completed": [],
         "tips": [{"story": story_a, "tip": _branch(project, a1)}],
         "warnings": [],
+        "integrated": _integrated(root, [story_a]),
     }
+    # Nothing left to run still integrates, so a relaunch can retry it.
+    assert [call["stories"] for call in integrate_recorder.calls] == [[story_a]]
     run = _load(project, result["run_id"])
     assert _statuses(run) == {"run": "done"}
 
@@ -857,7 +1329,7 @@ def test_a_workflow_that_will_not_load_is_refused_before_anything_is_written(
 
 @requires_git
 @requires_brd
-def test_an_escalation_stops_the_run_before_the_next_story(project):
+def test_an_escalation_stops_the_run_before_the_next_story(project, integrate_recorder):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     a1, a2 = shape["subtasks"]["A"]
@@ -889,7 +1361,9 @@ def test_an_escalation_stops_the_run_before_the_next_story(project):
         story_b: "pending",
         b1: "pending",
     }
-
+    # Spec test 3: a lane escalation never reaches Integrate.
+    assert integrate_recorder.calls == []
+    assert INTEGRATION_BRANCH not in _local_branches(project)
 
 @requires_git
 @requires_brd
@@ -1235,7 +1709,7 @@ def test_in_flight_lanes_never_exceed_the_bound(project):
 
 @requires_git
 @requires_brd
-def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project):
+def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, integrate_recorder):
     shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
@@ -1272,7 +1746,7 @@ def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project):
         story_c: "pending",
         c1: "pending",
     }
-
+    assert integrate_recorder.calls == []
 
 @requires_git
 @requires_brd

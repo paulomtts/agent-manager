@@ -2852,8 +2852,14 @@ CLEAN_MILESTONE = {
     "completed": ["subtask-a1"],
     "tips": [{"story": "story-a", "tip": "m3/task-a1"}],
     "warnings": [],
+    "integrated": {
+        "branch": "m3-integrate",
+        "worktree": "/repo/.claude/worktrees/m3-integrate",
+        "merged": ["story-a"],
+        "resolved": [],
+    },
 }
-"""`run_milestone`'s clean payload shape: `done: true` and no `status` or `escalated` key."""
+"""`run_milestone`'s clean payload shape: `done: true`, `integrated`, and no `status` or `escalated` key."""
 
 ESCALATED_MILESTONE = {
     "escalated": True,
@@ -2866,6 +2872,20 @@ ESCALATED_MILESTONE = {
     "warnings": [],
 }
 """`run_milestone`'s escalation payload shape: no `status` key either."""
+
+INTEGRATE_ESCALATED_MILESTONE = {
+    "escalated": True,
+    "phase": "integrate",
+    "story": None,
+    "files": [],
+    "detail": (
+        "the integrated branch failed its final verification in "
+        "/repo/.claude/worktrees/m3-integrate: suite red"
+    ),
+    "run_id": "20260924T000000Z-0badcafe",
+    "warnings": [],
+}
+"""`run_milestone`'s payload when it stopped at Integrate (addendum I5)."""
 
 
 def _milestone_run(tmp_path: Path, *extra: str):
@@ -2996,6 +3016,18 @@ def test_an_escalated_milestone_exits_one_with_an_ok_envelope(tmp_path, monkeypa
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
+def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeypatch):
+    """Spec test 9: the existing `escalated is True` check covers the
+    Integrate payload with no change of its own."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_milestone(monkeypatch, INTEGRATE_ESCALATED_MILESTONE)
+
+    result = _milestone_run(tmp_path)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(INTEGRATE_ESCALATED_MILESTONE)
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -3027,15 +3059,18 @@ def test_an_unhandled_error_from_a_milestone_run_crashes_loudly(tmp_path, monkey
     assert '"ok"' not in result.stdout
 
 
-@pytest.mark.parametrize("first", ["agent_manager.cli", "agent_manager.orchestrate"])
+@pytest.mark.parametrize(
+    "first", ["agent_manager.cli", "agent_manager.orchestrate", "agent_manager.integration"]
+)
 def test_cli_and_orchestrate_import_cleanly_in_either_order(first):
     """Review focus: `orchestrate` imports `cli` at module level, so `cli` must
     not import `orchestrate` at load time. A fresh interpreter, so this test
     does not depend on what earlier tests already imported."""
     code = (
         f"import {first}\n"
-        "from agent_manager import cli, orchestrate\n"
+        "from agent_manager import cli, integration, orchestrate\n"
         "assert orchestrate.cli is cli\n"
+        "assert orchestrate.integration is integration\n"
     )
 
     completed = subprocess.run(
