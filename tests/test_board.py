@@ -9,6 +9,7 @@ parts (argv construction, envelope decoding) that need no board at all.
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -475,6 +476,66 @@ def test_set_status_blocked_propagates_brds_own_rejection(temp_board):
         board.set_status(subtask, "blocked", repo_dir=temp_board)
     assert excinfo.value.error_type == "InvalidStatusError"
     assert "blocked" in excinfo.value.message
+
+
+def test_write_lock_is_reentrant():
+    # rollup.set_status holds it and then calls board.set_status on the same
+    # thread, so a plain Lock would deadlock.
+    assert board.WRITE_LOCK.acquire(blocking=False)
+    try:
+        assert board.WRITE_LOCK.acquire(blocking=False)
+        board.WRITE_LOCK.release()
+    finally:
+        board.WRITE_LOCK.release()
+
+
+@requires_brd
+def test_set_status_waits_for_the_board_write_lock(temp_board):
+    subtask = _add_card(temp_board, "Serialize board writes")
+    outcome: dict[str, object] = {}
+
+    def write() -> None:
+        try:
+            outcome["card"] = board.set_status(
+                subtask, "in_progress", repo_dir=temp_board
+            )
+        except BaseException as exc:  # surfaced by the assertions below
+            outcome["error"] = exc
+
+    with board.WRITE_LOCK:
+        writer = threading.Thread(target=write)
+        writer.start()
+        writer.join(timeout=1.0)
+        # Held by this thread: the writer must still be waiting, and brd untouched.
+        assert writer.is_alive()
+        assert _brd_json(temp_board, "show", subtask)["status"] == "todo"
+
+    writer.join(timeout=30)
+    assert not writer.is_alive()
+    assert "error" not in outcome
+    assert outcome["card"].status == "in_progress"
+    assert _brd_json(temp_board, "show", subtask)["status"] == "in_progress"
+
+
+@requires_brd
+def test_reads_do_not_wait_for_the_board_write_lock(temp_board):
+    subtask = _add_card(temp_board, "Serialize board writes")
+    outcome: dict[str, object] = {}
+
+    def read() -> None:
+        outcome["card"] = board.show(subtask, repo_dir=temp_board)
+        outcome["node"] = board.tree(subtask, repo_dir=temp_board)
+        outcome["roots"] = board.roots(repo_dir=temp_board)
+
+    with board.WRITE_LOCK:
+        reader = threading.Thread(target=read)
+        reader.start()
+        reader.join(timeout=30)
+        assert not reader.is_alive()
+
+    assert outcome["card"].id == subtask
+    assert outcome["node"].id == subtask
+    assert [node.id for node in outcome["roots"]] == [subtask]
 
 
 @requires_brd
