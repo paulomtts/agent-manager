@@ -14,6 +14,7 @@ attempt belongs to the engine.
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,14 +93,33 @@ CREATE TABLE IF NOT EXISTS attempts (
 """
 
 
+BUSY_TIMEOUT_SECONDS = 30.0
+"""How long a statement on the projection waits for a lock held by another
+connection before raising `sqlite3.OperationalError: database is locked`.
+
+It exists for a reader in another process, such as `am status`, holding the
+database briefly. It is not a licence for two `am` processes to write one run:
+that is still unsupported (P2)."""
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the per-project projection, applying the schema idempotently.
 
     WAL mode is set before the schema so a reader never blocks the writer. Every
     `CREATE` is `IF NOT EXISTS`, so reopening an existing database neither
     destroys nor migrates what is already there.
+
+    The connection may be used from any thread of the one process that writes a
+    run (P2), so `check_same_thread` is off; `Store` serialises that use behind
+    its own lock. `BUSY_TIMEOUT_SECONDS` covers a reader in another process,
+    such as `am status`, holding the database briefly. Two `am` processes
+    writing one run remain unsupported.
     """
-    conn = sqlite3.connect(paths.project_db_path(root))
+    conn = sqlite3.connect(
+        paths.project_db_path(root),
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
@@ -149,11 +169,18 @@ class JournalLine(BaseModel):
 
 
 class Journal:
-    """Append-only JSONL log for one run: the truth the projection is built from."""
+    """Append-only JSONL log for one run: the truth the projection is built from.
+
+    One process writes a given run (P2), and its threads share one `Journal`.
+    The highest sequence number on disk is read once, when the journal is
+    opened, and cached; a lock serialises appends from those threads.
+    """
 
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         self.path = paths.run_dir(run_id) / JOURNAL_NAME
+        self._lock = threading.Lock()
+        self._seq = self.last_seq()
 
     def last_seq(self) -> int:
         """Highest sequence number already on disk, or 0 for a fresh journal."""
@@ -198,27 +225,37 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        The sequence number is read from disk on every call rather than cached,
-        so a second writer attached to the same run continues the sequence
-        instead of reusing a number.
+        One process writes a given run (P2). The sequence number is cached when
+        the journal is opened, not re-read from disk, and the lock is held from
+        numbering the line until it is fsynced, so the threads of that process
+        never share a number or interleave their bytes. The cached number
+        advances once the line has been written and flushed to the file; if
+        validation, the open or the write raises, the next append retries the
+        same number, and if only the fsync raises the number stays spent, so
+        no seq is ever repeated on disk. The lock is released either way.
         """
-        line = JournalLine(
-            seq=self.last_seq() + 1,
-            ts=datetime.now(timezone.utc),
-            run_id=self.run_id,
-            event=event,
-            story=story,
-            card=card,
-            phase=phase,
-            attempt=attempt,
-            payload=payload,
-        )
-        text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(text + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return line
+        with self._lock:
+            seq = self._seq + 1
+            line = JournalLine(
+                seq=seq,
+                ts=datetime.now(timezone.utc),
+                run_id=self.run_id,
+                event=event,
+                story=story,
+                card=card,
+                phase=phase,
+                attempt=attempt,
+                payload=payload,
+            )
+            text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+                handle.flush()
+                # The line is in the file now, fsynced or not: spend its number
+                # so a retry after a failed fsync cannot repeat it on disk.
+                self._seq = seq
+                os.fsync(handle.fileno())
+            return line
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -458,11 +495,19 @@ class Store:
 
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a row on its own.
+
+    One process writes a given run (P2), and its threads share one `Store`. A
+    single re-entrant lock serialises every use of the shared connection. Each
+    `record_*` holds it across the journal append and the row write, so the two
+    are one critical section and journal order equals row order; `close`,
+    `load_run` and `rebuild_from_journal` hold it too. The lock never covers the
+    caller's own work, only the append and the row write.
     """
 
     def __init__(self, conn: sqlite3.Connection, journal: Journal) -> None:
         self._conn = conn
         self._journal = journal
+        self._lock = threading.RLock()
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
@@ -481,69 +526,82 @@ class Store:
         return self._conn
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- recording ---------------------------------------------------------
+    #
+    # Each method holds the store lock across its whole body: the journal line
+    # is appended first and the row written second (§9), with no other record
+    # able to land in between. If the row write raises, the line stays on disk,
+    # the exception propagates unchanged and the `with` block releases the lock.
 
     def record_run(self, run: models.Run) -> JournalLine:
-        if run.id != self.run_id:
-            raise ValueError(
-                f"store is bound to run {self.run_id!r} but was handed run"
-                f" {run.id!r}: the row is keyed by the store's id while the"
-                " journal payload keeps the model's, so the two stores would"
-                " disagree about which run this is"
+        with self._lock:
+            if run.id != self.run_id:
+                raise ValueError(
+                    f"store is bound to run {self.run_id!r} but was handed run"
+                    f" {run.id!r}: the row is keyed by the store's id while the"
+                    " journal payload keeps the model's, so the two stores would"
+                    " disagree about which run this is"
+                )
+            line = self._journal.append(
+                "run_upsert", run.model_dump(mode="json", exclude={"stories"})
             )
-        line = self._journal.append(
-            "run_upsert", run.model_dump(mode="json", exclude={"stories"})
-        )
-        self._write_run_row(self.run_id, run)
-        return line
+            self._write_run_row(self.run_id, run)
+            return line
 
     def record_story(self, story: models.StoryRun) -> JournalLine:
-        line = self._journal.append(
-            "story_upsert",
-            story.model_dump(mode="json", exclude={"subtasks"}),
-            story=story.card_id,
-        )
-        self._write_story_row(self.run_id, story)
-        return line
+        with self._lock:
+            line = self._journal.append(
+                "story_upsert",
+                story.model_dump(mode="json", exclude={"subtasks"}),
+                story=story.card_id,
+            )
+            self._write_story_row(self.run_id, story)
+            return line
 
     def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> JournalLine:
-        line = self._journal.append(
-            "subtask_upsert",
-            subtask.model_dump(mode="json", exclude={"phases"}),
-            story=story_id,
-            card=subtask.card_id,
-        )
-        self._write_subtask_row(self.run_id, story_id, subtask)
-        return line
+        with self._lock:
+            line = self._journal.append(
+                "subtask_upsert",
+                subtask.model_dump(mode="json", exclude={"phases"}),
+                story=story_id,
+                card=subtask.card_id,
+            )
+            self._write_subtask_row(self.run_id, story_id, subtask)
+            return line
 
     def record_phase(
         self, story_id: str, card_id: str, phase: models.PhaseRun
     ) -> JournalLine:
-        line = self._journal.append(
-            "phase_upsert",
-            phase.model_dump(mode="json", exclude={"attempts"}),
-            story=story_id,
-            card=card_id,
-            phase=phase.name,
-        )
-        self._write_phase_row(self.run_id, story_id, card_id, phase)
-        return line
+        with self._lock:
+            line = self._journal.append(
+                "phase_upsert",
+                phase.model_dump(mode="json", exclude={"attempts"}),
+                story=story_id,
+                card=card_id,
+                phase=phase.name,
+            )
+            self._write_phase_row(self.run_id, story_id, card_id, phase)
+            return line
 
     def record_attempt(
         self, story_id: str, card_id: str, phase_name: str, attempt: models.Attempt
     ) -> JournalLine:
-        line = self._journal.append(
-            "attempt_upsert",
-            attempt.model_dump(mode="json"),
-            story=story_id,
-            card=card_id,
-            phase=phase_name,
-            attempt=attempt.n,
-        )
-        self._write_attempt_row(self.run_id, story_id, card_id, phase_name, attempt)
-        return line
+        with self._lock:
+            line = self._journal.append(
+                "attempt_upsert",
+                attempt.model_dump(mode="json"),
+                story=story_id,
+                card=card_id,
+                phase=phase_name,
+                attempt=attempt.n,
+            )
+            self._write_attempt_row(
+                self.run_id, story_id, card_id, phase_name, attempt
+            )
+            return line
 
     # -- row writers -------------------------------------------------------
     #
@@ -720,9 +778,11 @@ class Store:
 
         Kept as a method because `rebuild_from_journal` and every existing caller
         already hold a `Store`; the free function is what a reader without a run
-        id uses.
+        id uses. Holds the store lock so a read on the shared connection never
+        interleaves with a write's execute or commit.
         """
-        return load_run(self._conn, run_id)
+        with self._lock:
+            return load_run(self._conn, run_id)
 
     # -- rebuild -------------------------------------------------------------
 
@@ -732,29 +792,41 @@ class Store:
         The journal wins: every row for `run_id` is deleted and rewritten from
         the replayed tree, so the result is the same whether the projection was
         stale, truncated or already correct.
+
+        The store lock is held from reading the journal through the delete and
+        every rewrite, so no `record_*` lands between the delete and the
+        rewrite. `_delete_run` is only called from here and takes no lock of
+        its own.
         """
-        journal = (
-            self._journal if self._journal.run_id == run_id else Journal(run_id)
-        )
-        run = replay(journal.read())
-        if run.id != run_id:
-            raise JournalError(
-                f"journal of run {run_id!r} has a run_upsert naming run"
-                f" {run.id!r}: refusing to key its projection under two ids"
+        with self._lock:
+            journal = (
+                self._journal if self._journal.run_id == run_id else Journal(run_id)
             )
-        self._delete_run(run_id)
-        self._write_run_row(run_id, run)
-        for story in run.stories:
-            self._write_story_row(run_id, story)
-            for subtask in story.subtasks:
-                self._write_subtask_row(run_id, story.card_id, subtask)
-                for phase in subtask.phases:
-                    self._write_phase_row(run_id, story.card_id, subtask.card_id, phase)
-                    for attempt in phase.attempts:
-                        self._write_attempt_row(
-                            run_id, story.card_id, subtask.card_id, phase.name, attempt
+            run = replay(journal.read())
+            if run.id != run_id:
+                raise JournalError(
+                    f"journal of run {run_id!r} has a run_upsert naming run"
+                    f" {run.id!r}: refusing to key its projection under two ids"
+                )
+            self._delete_run(run_id)
+            self._write_run_row(run_id, run)
+            for story in run.stories:
+                self._write_story_row(run_id, story)
+                for subtask in story.subtasks:
+                    self._write_subtask_row(run_id, story.card_id, subtask)
+                    for phase in subtask.phases:
+                        self._write_phase_row(
+                            run_id, story.card_id, subtask.card_id, phase
                         )
-        return run
+                        for attempt in phase.attempts:
+                            self._write_attempt_row(
+                                run_id,
+                                story.card_id,
+                                subtask.card_id,
+                                phase.name,
+                                attempt,
+                            )
+            return run
 
     def _delete_run(self, run_id: str) -> None:
         self._conn.execute("DELETE FROM attempts WHERE run_id = ?", (run_id,))
