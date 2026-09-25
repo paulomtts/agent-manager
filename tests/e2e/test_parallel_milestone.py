@@ -13,10 +13,12 @@ Each test builds its own repo and board (`parallel_board`): A (a1 -> a2) and B
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from agent_manager import board, cli, models, store
+from agent_manager.workflow.loader import load_builtin
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -196,3 +198,166 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
     assert projection is not None
     assert rebuilt == projection
     assert after == projection
+
+
+def _launch_with_a1_review_failing(parallel_board, rendezvous, run_milestone_cli):
+    """Two lanes, count 2, and a1's review failing through the production gate.
+
+    The rendezvous makes a1 and b1 leave implement together. Lane A then runs
+    one fake process (a1's review) before it escalates; lane B would need b1's
+    review, verify and mark_done plus every phase of b2 to finish, so it is
+    parked by the stop at some phase boundary. Which boundary is not fixed, so
+    the assertions read it out of the report (see the plan's determinism note).
+    """
+    a1 = parallel_board["subtasks"]["A"][0]
+    parallel_board["review_fail_marker"].write_text(
+        f"{parallel_board['branches'][a1]}\n", encoding="utf-8"
+    )
+    rendezvous.arm(2)
+    return run_milestone_cli(
+        parallel_board["root"], parallel_board["milestone"], max_concurrent=2
+    )
+
+
+def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_starts(
+    parallel_board, rendezvous, run_milestone_cli, read_fake_log
+):
+    """Spec test 4 (P4, P5)."""
+    root = parallel_board["root"]
+    stories = parallel_board["stories"]
+    branches = parallel_board["branches"]
+    a1, a2 = parallel_board["subtasks"]["A"]
+    b1, b2 = parallel_board["subtasks"]["B"]
+    (c1,) = parallel_board["subtasks"]["C"]
+    c_worktree = cli.worktree_for(root, branches[c1])
+    c_status_before = board.show(c1, repo_dir=root).status
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    result = _launch_with_a1_review_failing(parallel_board, rendezvous, run_milestone_cli)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["escalated"] is True, data
+    assert data["story"] == stories["A"]
+    assert data["subtask"] == a1
+    assert data["failed_phase"] == "review"
+    assert "review-fail marker" in data["detail"]
+    assert "also_escalated" not in data, data
+    assert "stopped" in data, (
+        "lane B finished before lane A escalated, so nothing was stopped; the "
+        "ordering margin this test relies on was lost",
+        data,
+    )
+    (parked,) = data["stopped"]
+    assert parked["story"] == stories["B"]
+    assert parked["subtask"] in (b1, b2)
+    phase_names = load_builtin(cli.WORKFLOW_NAME).phase_names
+    before = parked["before_phase"]
+    assert before in phase_names, parked
+    later = set(phase_names[phase_names.index(before):])
+
+    run = _load_run(root, data["run_id"])
+    rows = _subtask_rows(run)
+    story_status = {story.card_id: story.status for story in run.stories}
+    assert story_status == {
+        stories["A"]: "escalated",
+        stories["B"]: "stopped",
+        stories["C"]: "pending",
+    }
+    assert rows[a1].status == "escalated"
+    assert rows[a2].status == "pending" and rows[a2].phases == []
+    stopped_row = rows[parked["subtask"]]
+    assert stopped_row.status == "stopped"
+    # Nothing ran at or after the phase it was parked before: no phase row, so
+    # no attempt, and no fake process in its worktree for any such phase.
+    assert not ({phase.name for phase in stopped_row.phases} & later), (
+        before,
+        [phase.name for phase in stopped_row.phases],
+    )
+    entries = read_fake_log(data["run_id"])
+    assert entries  # non-vacuity: agents did run in this run
+    stopped_worktree = cli.worktree_for(root, branches[parked["subtask"]]).resolve()
+    assert not {
+        entry["phase"]
+        for entry in entries
+        if Path(entry["cwd"]).resolve() == stopped_worktree
+    } & later
+    if parked["subtask"] == b2:
+        assert rows[b1].status == "done"
+
+    # Story C never started: no worktree, no branch, no phase, no agent.
+    assert not c_worktree.exists()
+    assert branches[c1] not in _git(root, "branch", "--format=%(refname:short)").split()
+    assert rows[c1].status == "pending"
+    assert rows[c1].phases == []
+    assert c_worktree.resolve() not in _cwds(entries)
+    assert board.show(c1, repo_dir=root).status == c_status_before
+
+    assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def test_a_relaunch_after_the_escalation_finishes_and_skips_done_subtasks(
+    parallel_board, rendezvous, run_milestone_cli, read_fake_log
+):
+    """Spec test 5: continues spec test 4's scenario on a board of its own."""
+    root = parallel_board["root"]
+    milestone = parallel_board["milestone"]
+    stories = parallel_board["stories"]
+    subtasks = parallel_board["subtasks"]
+    branches = parallel_board["branches"]
+    a1, a2 = subtasks["A"]
+    b1, b2 = subtasks["B"]
+    (c1,) = subtasks["C"]
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    first = _launch_with_a1_review_failing(parallel_board, rendezvous, run_milestone_cli)
+
+    assert first.exit_code == cli.EXIT_ESCALATED, (first.output, first.exception)
+    stopped = _envelope(first)
+    every_subtask = [card for chain in subtasks.values() for card in chain]
+    done_first = [
+        card for card in every_subtask
+        if board.show(card, repo_dir=root).status == "done"
+    ]
+    assert a1 not in done_first and c1 not in done_first, done_first
+
+    # Fix the fake and drop the rendezvous, then relaunch the same command.
+    parallel_board["review_fail_marker"].unlink()
+    rendezvous.disarm()
+    second = run_milestone_cli(root, milestone, max_concurrent=2)
+
+    assert second.exit_code == 0, (second.output, second.exception)
+    finished = _envelope(second)
+    assert finished["done"] is True, finished
+    assert finished["run_id"] != stopped["run_id"]
+    assert [level["stories"] for level in finished["levels"]] == [
+        [stories["A"], stories["B"]],
+        [stories["C"]],
+    ]
+    expected = [
+        card
+        for key in ("A", "B", "C")
+        for card in subtasks[key]
+        if card not in done_first
+    ]
+    assert finished["completed"] == expected
+    second_entries = read_fake_log(finished["run_id"])
+    assert second_entries
+    done_worktrees = {cli.worktree_for(root, branches[card]).resolve() for card in done_first}
+    assert not (_cwds(second_entries) & done_worktrees)
+    assert cli.worktree_for(root, branches[c1]).resolve() in _cwds(second_entries)
+
+    for card_id in _all_cards(parallel_board):
+        assert board.show(card_id, repo_dir=root).status == "done", card_id
+    assert _is_ancestor(root, branches[a1], branches[a2])
+    assert _is_ancestor(root, branches[b1], branches[b2])
+    assert _is_ancestor(root, branches[a2], branches[c1])
+    assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def test_no_rendezvous_is_left_armed_for_later_tests():
+    """Review focus: the tests above arm the rendezvous through the
+    function-scoped `monkeypatch`; it must be gone once they end, or every later
+    fake in the session would wait on a stale dir. Kept last in the module."""
+    assert "FAKE_CLAUDE_RENDEZVOUS_DIR" not in os.environ
+    assert "FAKE_CLAUDE_RENDEZVOUS_COUNT" not in os.environ
