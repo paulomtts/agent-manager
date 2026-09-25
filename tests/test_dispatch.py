@@ -1160,6 +1160,7 @@ def test_the_production_runner_factory_carries_the_shipped_table(store):
         "PlanResult",
         "ImplementResult",
         "ReviewResult",
+        "ResolveResult",
     }
 
 
