@@ -22,9 +22,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-Status = Literal["pending", "started", "done", "failed", "escalated"]
+Status = Literal["pending", "started", "done", "failed", "escalated", "stopped"]
 """Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
-state resume keys off (§9)."""
+state resume keys off (§9). `stopped` (addendum P4) is a clean stop on request
+between phases: it is not `failed`, and relaunching the same command continues
+it."""
 
 PhaseKind = Literal["agent", "deterministic"]
 """§5: a phase either dispatches a harness or runs a registered function."""

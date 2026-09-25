@@ -1653,3 +1653,76 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
         assert st.load_run(RUN_ID) == before
     finally:
         st.close()
+
+
+def _record_stopped_run(st: store.Store, repo: Path) -> None:
+    """One run stopped cleanly mid-subtask: `stopped` at every level that uses `Status`."""
+    st.record_run(models.Run.model_validate({**_run(repo).model_dump(), "status": "stopped"}))
+    st.record_story(
+        models.StoryRun(
+            card_id="8831189b",
+            title="Foundations: paths, run store and journal",
+            level=0,
+            status="stopped",
+            tip_branch="m1/task-ef248597",
+        )
+    )
+    st.record_subtask(
+        "8831189b",
+        models.SubtaskRun(
+            card_id="ef248597",
+            branch="m1/task-ef248597",
+            base_branch="main",
+            status="stopped",
+            worktree_path=Path("/repo/.claude/worktrees/m1/task-ef248597"),
+        ),
+    )
+    st.record_phase(
+        "8831189b",
+        "ef248597",
+        models.PhaseRun(
+            name="implement",
+            kind="agent",
+            status="stopped",
+            started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+        ),
+    )
+
+
+def _stopped_levels(run: models.Run) -> tuple[str, str, str, str]:
+    story = run.stories[0]
+    subtask = story.subtasks[0]
+    return run.status, story.status, subtask.status, subtask.phases[0].status
+
+
+def test_a_stopped_run_loads_back_as_stopped_from_the_rows(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_stopped_run(st, repo)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert loaded is not None
+    assert _stopped_levels(loaded) == ("stopped", "stopped", "stopped", "stopped")
+
+
+def test_a_stopped_run_survives_a_rebuild_from_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    _record_stopped_run(st, repo)
+    st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+        row = rebuilt.connection.execute(
+            "SELECT status FROM subtasks WHERE run_id = ?", (RUN_ID,)
+        ).fetchone()
+    finally:
+        rebuilt.close()
+
+    assert _stopped_levels(returned) == ("stopped", "stopped", "stopped", "stopped")
+    assert after == returned
+    assert row["status"] == "stopped"
