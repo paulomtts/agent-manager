@@ -124,6 +124,14 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
     ]
 
 
+def test_the_before_phase_is_read_out_of_a_stopped_detail():
+    """`engine._stop` writes "stopped before <phase>"; the summary has no field
+    of its own for that phase, so the helper reads it out of `detail`."""
+    assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
+    assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
+    assert orchestrate.stopped_before_phase(None) is None
+
+
 # ── the runner, on a real repo and a real board ─────────────────────────────
 
 

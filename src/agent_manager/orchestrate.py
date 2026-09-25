@@ -37,6 +37,22 @@ MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
 
 
+STOPPED_PREFIX = "stopped before "
+"""How `engine._stop` opens a stopped subtask's `detail` (addendum P4)."""
+
+
+def stopped_before_phase(detail: str | None) -> str | None:
+    """The phase a stopped subtask would have run next, read out of its detail.
+
+    `engine._stop` writes `"stopped before <phase>"` and the summary has no
+    field of its own for the phase, so this strips the prefix. A detail without
+    the prefix, or no detail at all, gives None.
+    """
+    if detail is None or not detail.startswith(STOPPED_PREFIX):
+        return None
+    return detail[len(STOPPED_PREFIX):]
+
+
 def _utcnow() -> datetime:
     """This module's own clock default. `cli._utcnow` is private, and binding a
     `cli` name at definition time would break under the circular import."""
