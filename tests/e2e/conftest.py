@@ -58,6 +58,21 @@ FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 FAKE_RENDEZVOUS_COUNT_ENV = "FAKE_CLAUDE_RENDEZVOUS_COUNT"
 """Must equal `fake_claude.RENDEZVOUS_COUNT_ENV`, which `test_fake_claude.py` pins."""
 
+FAKE_IMPLEMENTATION_NAME = "IMPLEMENTATION.md"
+"""Must equal `fake_claude.IMPLEMENTATION_NAME`: the one file the fake coder writes."""
+
+UNION_ATTRIBUTE = f"{FAKE_IMPLEMENTATION_NAME} merge=union\n"
+"""Git's built-in union merge driver for the fake coder's file.
+
+Integrate (card a74f2cd6) merges every story tip into one branch. On
+`parallel_board`, A and B are independent roots and the fake coder writes
+`IMPLEMENTATION.md` on both, so their tips would conflict and need a resolver
+the fake does not have (its `resolve` phase is sibling a37460b9's, as are the
+conflict scenarios). Written to the git common dir's `info/attributes`, it
+applies in every linked worktree, is in no tree and never shows in
+`git status`, and it tells the fake nothing: it only lets git fold the two
+versions, so these lane tests stay about lanes."""
+
 
 def git(cwd: Path, *args: str) -> str:
     """Run one git command for fixture setup or assertion, failing loudly."""
@@ -317,8 +332,12 @@ def parallel_board(fresh_project) -> dict[str, Any]:
     the census order does not depend on timestamps. Branch names come from
     `dag`, never retyped here. `review_fail_marker` is where the fake looks for
     branches whose review must fail; the test writes it and removes it.
+    The union attribute (`UNION_ATTRIBUTE`) lets Integrate fold A's and B's `IMPLEMENTATION.md` without a resolver.
     """
     root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
     milestone = _add_card(root, "Milestone 4: parallel stories under a fake claude")
     a = _add_card(root, "Story A: an independent root story", milestone)
     b = _add_card(root, "Story B: independent of story A", milestone)
