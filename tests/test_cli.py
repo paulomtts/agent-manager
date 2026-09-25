@@ -1484,6 +1484,75 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
     }
 
 
+@requires_git
+@requires_brd
+def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
+    """Addendum P4: the driver passes the stop check straight through. With a
+    stop already requested, the first phase of `builtin/task.yaml` never
+    starts, so the fake runner is never called and no worktree is made."""
+    root = cli.resolve_repo_dir(project)
+    parent = board.show(cards["story"], repo_dir=root)
+    card = board.show(cards["subtask"], repo_dir=root)
+
+    started_at = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+    run_id = cli.mint_run_id(card.id, started_at)
+    branch = dag.task_branch("m1", card)
+    subtask = models.SubtaskRun(
+        card_id=card.id,
+        branch=branch,
+        base_branch="main",
+        status="started",
+        worktree_path=cli.worktree_for(root, branch),
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+    store = store_module.Store.open(root, run_id)
+    try:
+        store.record_run(
+            models.Run(
+                id=run_id,
+                workflow=cli.WORKFLOW_NAME,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=started_at,
+                config=models.RunConfig(),
+            )
+        )
+        store.record_story(
+            models.StoryRun(
+                card_id=parent.id,
+                title=parent.title,
+                level=0,
+                status="started",
+                tip_branch=branch,
+            )
+        )
+        store.record_subtask(parent.id, subtask)
+
+        drive = cli.drive_subtask(
+            store=store,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=root,
+            runner_factory=lambda **kwargs: fake_runner(seen),
+            should_stop=lambda: True,
+        )
+        run = store.load_run(run_id)
+    finally:
+        store.close()
+
+    assert drive.summary.status == "stopped"
+    assert drive.summary.failed_phase is None
+    assert drive.summary.detail == "stopped before worktree"
+    assert seen == []
+    assert not subtask.worktree_path.exists()
+    assert run is not None
+    assert [sub.status for sub in run.stories[0].subtasks] == ["stopped"]
+
+
 runner = CliRunner()
 
 

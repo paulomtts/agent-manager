@@ -687,6 +687,7 @@ def drive_subtask(
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
 
@@ -695,6 +696,8 @@ def drive_subtask(
     everything around the walk: the board reads, the run id, opening and
     closing the store, and the run/story/subtask rows. This function catches
     nothing. An escalation is `summary.status == "escalated"`, not an exception.
+    `should_stop` goes straight to `engine.run_subtask`; a stop is
+    `summary.status == "stopped"`.
     """
     workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
@@ -716,6 +719,7 @@ def drive_subtask(
         parent_story=parent,
         extra_context=gate_context(commands, allow_no_verification),
         agent_runner=runner,
+        should_stop=should_stop,
     )
     # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
     # its signature returns a result, so a warning has nowhere else to go,

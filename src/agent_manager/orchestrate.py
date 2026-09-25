@@ -62,6 +62,7 @@ class Driver(Protocol):
         commands: Sequence[str] = (),
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> cli.SubtaskDrive: ...
 
 
