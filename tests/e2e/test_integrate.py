@@ -216,3 +216,61 @@ def test_a_same_line_conflict_is_resolved_verified_and_left_on_the_integration_b
     assert {phase.status for phase in resolver_row.phases} == {"done"}
 
     _assert_base_untouched(root, main_before)
+
+
+def test_a_resolver_that_does_not_finish_escalates_and_a_human_finish_lets_the_relaunch_complete(
+    two_story_board, fake_resolver, run_milestone_cli, read_fake_log
+):
+    """Scenario 2: git, not the resolver's `resolved` flag, decides."""
+    root = two_story_board["root"]
+    milestone = two_story_board["milestone"]
+    stories = two_story_board["stories"]
+    main_before = _same_line_setup(two_story_board)
+    worktree = _integration_worktree(root)
+    fake_resolver.refuse()
+
+    first = run_milestone_cli(root, milestone)
+
+    assert first.exit_code == cli.EXIT_ESCALATED, (first.output, first.exception)
+    data = _envelope(first)
+    assert data["escalated"] is True, data
+    assert data["phase"] == "integrate"
+    assert data["story"] == stories["B"]
+    assert SHARED in data["files"]
+    assert data["run_id"]
+    assert str(worktree) in data["detail"]
+    assert "integrated" not in data
+    assert _merge_in_progress(worktree)
+    resolves = [entry for entry in read_fake_log(data["run_id"]) if entry["phase"] == "resolve"]
+    assert resolves  # non-vacuity: the resolver really was dispatched
+    assert {Path(entry["cwd"]).resolve() for entry in resolves} == {worktree.resolve()}
+    run = _load_run(root, data["run_id"])
+    assert run.status == "escalated"
+    (integrate_story,) = [story for story in run.stories if story.card_id == "integrate"]
+    assert integrate_story.status == "escalated"
+    _assert_base_untouched(root, main_before)
+
+    # A human finishes the merge the resolver left, where the detail says to.
+    (worktree / SHARED).write_text(A_LINE + B_LINE, encoding="utf-8")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "--no-edit")
+    fake_resolver.reset()
+    finished_tip = _git(root, "rev-parse", INTEGRATION_BRANCH).strip()
+
+    second = run_milestone_cli(root, milestone)
+
+    assert second.exit_code == 0, (second.output, second.exception)
+    done = _envelope(second)
+    assert done["done"] is True, done
+    assert done["run_id"] != data["run_id"]
+    assert done["integrated"] == {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(worktree),
+        "merged": [stories["A"], stories["B"]],
+        "resolved": [],
+    }
+    assert not _merge_in_progress(worktree)
+    assert _git(root, "rev-parse", INTEGRATION_BRANCH).strip() == finished_tip
+    assert "resolve" not in _phases(read_fake_log(done["run_id"]))
+    assert _load_run(root, done["run_id"]).status == "done"
+    _assert_base_untouched(root, main_before)

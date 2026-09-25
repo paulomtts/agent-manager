@@ -58,6 +58,9 @@ FAKE_IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
 A JSON file in the repo's git common dir mapping a branch to
 `{relative path: full file content}`: what that branch's implement writes."""
 
+FAKE_RESOLVER_ENV = "FAKE_CLAUDE_RESOLVER"
+"""Must equal `fake_claude.RESOLVER_ENV`, which `test_fake_claude.py` pins."""
+
 FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 """Must equal `fake_claude.RENDEZVOUS_DIR_ENV`, which `test_fake_claude.py` pins."""
 
@@ -328,6 +331,32 @@ class Rendezvous:
 def rendezvous(tmp_path, monkeypatch) -> Rendezvous:
     """The test's rendezvous, unarmed. Its dir is beside the repo, never inside it."""
     return Rendezvous(directory=tmp_path / "rendezvous", monkeypatch=monkeypatch)
+
+
+@dataclass
+class FakeResolver:
+    """Switches the fake's resolve phase between resolving and refusing for one test.
+
+    The env var goes through the test's own function-scoped `monkeypatch`, so it
+    is undone when the test ends. Child processes inherit it: `run_direct`
+    calls `Popen` with no `env=` (`harness/launcher.py:132`).
+    """
+
+    monkeypatch: pytest.MonkeyPatch
+
+    def refuse(self) -> None:
+        self.monkeypatch.setenv(FAKE_RESOLVER_ENV, "refuse")
+
+    def reset(self) -> None:
+        self.monkeypatch.delenv(FAKE_RESOLVER_ENV, raising=False)
+
+
+@pytest.fixture
+def fake_resolver(monkeypatch) -> FakeResolver:
+    """The test's resolver switch, starting in resolve mode."""
+    resolver = FakeResolver(monkeypatch=monkeypatch)
+    resolver.reset()
+    return resolver
 
 
 @pytest.fixture

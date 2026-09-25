@@ -1166,3 +1166,8 @@ def test_a_listed_conflict_file_that_is_not_there_fails_before_any_write(
     assert "missing.txt" in str(caught.value)
     assert (repo / "shared.txt").read_bytes() == before
     assert _merge_head_exists(repo)
+
+
+def test_the_resolver_env_var_is_the_conftest_twin():
+    """The fixture sets `FAKE_RESOLVER_ENV`; the script reads `RESOLVER_ENV`."""
+    assert fake_claude.RESOLVER_ENV == _conftest_constant("FAKE_RESOLVER_ENV")
