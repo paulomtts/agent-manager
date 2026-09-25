@@ -334,6 +334,7 @@ def _is_ancestor(cwd: Path, earlier: str, later: str) -> bool:
 def _local_branches(cwd: Path) -> list[str]:
     return _git(cwd, "branch", "--format=%(refname:short)").split()
 
+
 def _add_card(root: Path, title: str, parent: str | None = None) -> str:
     argv = ["brd", "add", "--title", title]
     if parent is not None:
@@ -615,6 +616,7 @@ def _census_stories(project: Path, milestone: str) -> list[str]:
     """Story ids in census order: siblings made in one second are ordered by id."""
     plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
     return [story.id for story in plan.stories]
+
 
 def _load(project: Path, run_id: str) -> models.Run:
     conn = store_module.open_db(cli.resolve_repo_dir(project))
@@ -1365,6 +1367,7 @@ def test_an_escalation_stops_the_run_before_the_next_story(project, integrate_re
     assert integrate_recorder.calls == []
     assert INTEGRATION_BRANCH not in _local_branches(project)
 
+
 @requires_git
 @requires_brd
 def test_an_escalation_in_a_later_level_reports_that_level(project):
@@ -1747,6 +1750,7 @@ def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, i
         c1: "pending",
     }
     assert integrate_recorder.calls == []
+
 
 @requires_git
 @requires_brd
