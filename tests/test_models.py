@@ -297,7 +297,7 @@ def test_minimal_run_needs_only_its_identity_fields():
     assert run.status == "pending"
     assert run.started_at is None
     assert run.stories == []
-    assert run.config.max_concurrent_stories == 1
+    assert run.config.max_concurrent_stories == 4
     assert run.config.dry_run is False
     assert run.config.launcher == "direct"
     assert run.config.harness_map == {}

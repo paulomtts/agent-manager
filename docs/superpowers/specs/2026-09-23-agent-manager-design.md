@@ -415,9 +415,10 @@ blocker's tip. A blocked story rooted at the milestone base means a missing
 exists today. Exists: `run` (with `--card`, or `--milestone` and an optional
 `--dry-run`, plus `--repo-dir`, `--base-branch`, `--branch-prefix`, `--verify` and
 `--allow-no-verification`), `status`, `runs`, `logs`, and `resume` for a
-single-card run. Deferred: `watch`, `retry`, `cancel`, `--workflow`,
-`--harness`, `--max-concurrent` (runs are sequential, one story at a time), and
-a milestone-aware `resume`. See section 4 of the orchestration addendum,
+single-card run. With `--milestone`, a level's stories run on up to
+`--max-concurrent` lanes (default 4); see P1 of the parallel-stories addendum,
+`2026-09-24-parallel-stories-design.md`. Deferred: `watch`, `retry`, `cancel`,
+`--workflow`, `--harness`, and a milestone-aware `resume`. See section 4 of the orchestration addendum,
 `2026-09-24-orchestration-design.md`.
 
 ## 11. Concurrency

@@ -830,6 +830,12 @@ def run_card(
         store.close()
 
 
+DEFAULT_MAX_CONCURRENT = 4
+"""How many of a level's stories a milestone run drives at once when
+`--max-concurrent` is not given (main spec section 11, addendum P1). It matches
+`models.RunConfig.max_concurrent_stories`'s default."""
+
+
 def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, str]]:
     """Everything in the census that never enters a dispatch level, in census order.
 
@@ -858,7 +864,11 @@ def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, 
 
 
 def dry_run_payload(
-    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+    stories: Sequence[census.StoryPlan],
+    *,
+    branch_prefix: str,
+    base_branch: str,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
     """O3's preview: dispatch levels with each subtask's branch and base.
 
@@ -869,7 +879,9 @@ def dry_run_payload(
     blocked by a done story still roots on that story's tip. A story's
     `subtasks` lists only what would be dispatched, but each `base` comes
     from `stack_bases` over the full ordered list, so a done first subtask
-    still anchors the second.
+    still anchors the second. `max_concurrent` is echoed at the top, and each
+    level row says how many of its stories would run together:
+    `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
     """
     stories = list(stories)
     dag.assert_no_blocker_cycles(stories)
@@ -899,12 +911,27 @@ def dry_run_payload(
                     ],
                 }
             )
-        level_rows.append({"level": index, "stories": story_rows})
-    return {"levels": level_rows, "already_done": already_done_entries(stories)}
+        level_rows.append(
+            {
+                "level": index,
+                "concurrent": min(len(level), max_concurrent),
+                "stories": story_rows,
+            }
+        )
+    return {
+        "max_concurrent": max_concurrent,
+        "levels": level_rows,
+        "already_done": already_done_entries(stories),
+    }
 
 
 def dry_run_milestone(
-    needle: str, *, repo_dir: Path, branch_prefix: str, base_branch: str
+    needle: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
     """O3's order: repo dir, roots, milestone, tree, census, then the payload.
 
@@ -917,7 +944,10 @@ def dry_run_milestone(
     milestone = census.find_milestone(board.roots(repo_dir=root), needle)
     plan = census.flatten_milestone(board.tree(milestone.id, repo_dir=root))
     return dry_run_payload(
-        plan.stories, branch_prefix=branch_prefix, base_branch=base_branch
+        plan.stories,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        max_concurrent=max_concurrent,
     )
 
 
@@ -937,14 +967,24 @@ should crash loudly with its stack intact.
 """
 
 
-def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--dry-run` combination as a usage error.
+def _check_run_targets(
+    *,
+    card: str | None,
+    milestone: str | None,
+    dry_run: bool,
+    max_concurrent: int | None = None,
+) -> None:
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
     or dispatched. A blank `--milestone` is refused here too: the census strips
     the needle, and an empty needle is a substring of every title, so on a
     one-milestone board it would silently pick that milestone.
+    `--max-concurrent` is `None` when not given, so giving it with `--card` is
+    refused whatever its value, the default included. The Option has no
+    `min=1`, so a value below 1 is refused here, worded and routed like every
+    other run-target refusal.
     """
     if card is not None and milestone is not None:
         raise typer.BadParameter(
@@ -966,6 +1006,16 @@ def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool
             "--dry-run previews a milestone and does not apply to --card",
             param_hint="'--dry-run'",
         )
+    if max_concurrent is not None and max_concurrent < 1:
+        raise typer.BadParameter(
+            f"--max-concurrent must be at least 1, got {max_concurrent}",
+            param_hint="'--max-concurrent'",
+        )
+    if card is not None and max_concurrent is not None:
+        raise typer.BadParameter(
+            "--max-concurrent applies only to --milestone",
+            param_hint="'--max-concurrent'",
+        )
 
 
 @app.command("run")
@@ -985,6 +1035,14 @@ def run(
         False,
         "--dry-run",
         help="With --milestone: print the levels and stack bases, and write nothing.",
+    ),
+    max_concurrent: int | None = typer.Option(
+        None,
+        "--max-concurrent",
+        help=(
+            "With --milestone: how many of a level's stories run at once "
+            f"(default {DEFAULT_MAX_CONCURRENT}). 1 runs them one at a time."
+        ),
     ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
@@ -1013,7 +1071,10 @@ def run(
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
-    _check_run_targets(card=card, milestone=milestone, dry_run=dry_run)
+    _check_run_targets(
+        card=card, milestone=milestone, dry_run=dry_run, max_concurrent=max_concurrent
+    )
+    lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
         if milestone is not None and dry_run:
             payload = dry_run_milestone(
@@ -1021,6 +1082,7 @@ def run(
                 repo_dir=repo_dir,
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
+                max_concurrent=lanes,
             )
         elif milestone is not None:
             # `orchestrate` imports this module at load time and reads its names
@@ -1038,6 +1100,7 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
             )
         else:
             payload = run_card(

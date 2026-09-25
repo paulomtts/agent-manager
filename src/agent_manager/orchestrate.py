@@ -1,10 +1,12 @@
-"""The sequential milestone runner (orchestration addendum O6).
+"""The milestone runner (orchestration addendum O6, parallel-stories P1/P4/P6).
 
-`run_milestone` drives every remaining subtask of one milestone, one at a time,
-through the shared per-subtask driver (O4). Every derivation belongs to a
-collaborator: the milestone and its census to `census`, levels, stack bases and
-tips to `dag`, board reads to `board`, rollup to `steps.rollup`, git to
-`steps.worktree.run_git`, run state to `Store`. This module decides only the
+`run_milestone` drives every remaining subtask of one milestone through the
+shared per-subtask driver (O4). Each dependency level's stories run as lanes on
+a pool bounded by `max_concurrent`; a story's subtasks stay strictly sequential
+and level N+1 starts only after every lane of level N returns. Every derivation
+belongs to a collaborator: the milestone and its census to `census`, levels,
+stack bases and tips to `dag`, board reads to `board`, rollup to
+`steps.rollup`, git to `steps.worktree.run_git`, run state to `Store`. This module decides only the
 order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
@@ -17,16 +19,19 @@ CLI wiring card makes `cli` import this module, and binding a `cli` name at
 import or definition time would break under that circular import. The clock
 default is this module's own `_utcnow` for the same reason.
 
-The module holds no mutable state of its own (O4).
+The module holds no mutable state of its own (O4). A run's lock and stop event
+live in a `RunStop` that `run_milestone` creates for that run.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from agent_manager import board, census, cli, dag, models
 from agent_manager.steps import rollup, worktree
@@ -35,6 +40,122 @@ from agent_manager.workflow.loader import load_builtin
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
+
+
+STOPPED_PREFIX = "stopped before "
+"""How `engine._stop` opens a stopped subtask's `detail` (addendum P4)."""
+
+
+def stopped_before_phase(detail: str | None) -> str | None:
+    """The phase a stopped subtask would have run next, read out of its detail.
+
+    `engine._stop` writes `"stopped before <phase>"` and the summary has no
+    field of its own for the phase, so this strips the prefix. A detail without
+    the prefix, or no detail at all, gives None.
+    """
+    if detail is None or not detail.startswith(STOPPED_PREFIX):
+        return None
+    return detail[len(STOPPED_PREFIX):]
+
+
+LaneKind = Literal["done", "escalated", "stopped", "not_started"]
+"""How one story's lane ended: finished, escalated, parked by the stop after it
+had started, or never started because the stop was already set."""
+
+
+@dataclass(frozen=True)
+class LaneOutcome:
+    """What one story's lane did. Internal state, so a dataclass (CLAUDE.md).
+
+    `subtask` is the subtask that escalated or was parked. `failed_phase` and
+    `detail` describe an escalation, `before_phase` a stop. `completed` and
+    `warnings` are this lane's own, in the order they arrived; `run_milestone`
+    merges them across lanes in census order.
+    """
+
+    kind: LaneKind
+    story: str
+    level: int
+    subtask: str | None = None
+    failed_phase: str | None = None
+    detail: str | None = None
+    before_phase: str | None = None
+    completed: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass
+class RunStop:
+    """One run's cooperative stop, shared by every lane of that run (P4, P6).
+
+    `run_milestone` creates one per run, so this module still holds no mutable
+    state of its own. Each lane hands `event.is_set` to the driver as
+    `should_stop`. `lock` decides which escalation came first, so `primary` is
+    well defined however the lanes interleave.
+    """
+
+    event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    primary: str | None = None
+
+    def escalate(self, story_id: str) -> None:
+        """Set the stop, and name `story_id` the primary escalation if none is yet."""
+        with self.lock:
+            if self.primary is None:
+                self.primary = story_id
+            self.event.set()
+
+
+def escalated_payload(
+    run_id: str,
+    primary_story: str | None,
+    outcomes: Sequence[LaneOutcome],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The escalated result for one level's lane outcomes, given in census order.
+
+    The top-level keys describe the primary escalation, as the sequential
+    runner always did. `also_escalated` lists the other escalations and
+    `stopped` the parked lanes, both in census order, and each key is present
+    only when its list is non-empty. A `primary_story` that names no escalated
+    outcome falls back to the first escalation in census order.
+    """
+    escalations = [outcome for outcome in outcomes if outcome.kind == "escalated"]
+    primary = next(
+        (outcome for outcome in escalations if outcome.story == primary_story),
+        escalations[0],
+    )
+    payload: dict[str, Any] = {
+        "escalated": True,
+        "run_id": run_id,
+        "level": primary.level,
+        "story": primary.story,
+        "subtask": primary.subtask,
+        "failed_phase": primary.failed_phase,
+        "detail": primary.detail,
+        "warnings": warnings,
+    }
+    also = [
+        {
+            "level": outcome.level,
+            "story": outcome.story,
+            "subtask": outcome.subtask,
+            "failed_phase": outcome.failed_phase,
+            "detail": outcome.detail,
+        }
+        for outcome in escalations
+        if outcome is not primary
+    ]
+    stopped = [
+        {"story": outcome.story, "subtask": outcome.subtask, "before_phase": outcome.before_phase}
+        for outcome in outcomes
+        if outcome.kind == "stopped"
+    ]
+    if also:
+        payload["also_escalated"] = also
+    if stopped:
+        payload["stopped"] = stopped
+    return payload
 
 
 def _utcnow() -> datetime:
@@ -233,6 +354,114 @@ def record_plan(
     return rows
 
 
+def run_story_lane(
+    planned: PlannedStory,
+    *,
+    store: Store,
+    run_id: str,
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]],
+    root: Path,
+    drive: Driver,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: cli.RunnerFactory | None,
+    stop: RunStop,
+) -> LaneOutcome:
+    """Drive one story's remaining subtasks in order, and say how the lane ended.
+
+    The stop is checked here once, before the story's first subtask: if it is
+    already set the story never starts and its rows stay `pending`. After that
+    the lane never checks it itself; it hands `stop.event.is_set` to the driver
+    and the engine parks between phases (P4), so a running phase is never
+    interrupted. A `stopped` summary records the subtask and story `stopped`.
+    Any other non-`done` result, or an `Exception` raised while handling a
+    subtask, escalates through `stop.escalate`. A `BaseException` sets the stop
+    so sibling lanes park, and propagates.
+    """
+    story_id = planned.story.id
+    level = planned.level
+    if stop.event.is_set():
+        return LaneOutcome(kind="not_started", story=story_id, level=level)
+
+    story_row, subtask_rows = rows[story_id]
+    completed: list[str] = []
+    warnings: list[str] = []
+    for position, subtask in enumerate(planned.remaining):
+        row = subtask_rows[subtask.id]
+        try:
+            card = board.show(subtask.id, repo_dir=root)
+            parent = board.show(story_id, repo_dir=root)
+            row = row.model_copy(update={"status": "started"})
+            store.record_subtask(story_id, row)
+            if position == 0:
+                store.record_story(story_row.model_copy(update={"status": "started"}))
+            result = drive(
+                store=store,
+                run_id=run_id,
+                card=card,
+                parent=parent,
+                subtask=row,
+                repo_dir=root,
+                commands=list(commands),
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                should_stop=stop.event.is_set,
+            )
+        except Exception as error:  # not BaseException: Ctrl-C must still stop
+            status = "escalated"
+            failed_phase: str | None = None
+            detail: str | None = f"{type(error).__name__}: {error}"
+        except BaseException:
+            stop.event.set()
+            raise
+        else:
+            warnings.extend(result.warnings)
+            status = result.summary.status
+            failed_phase = result.summary.failed_phase
+            detail = result.summary.detail
+
+        # A `stopped` summary is handled before the non-`done` branch: a stop
+        # is not an escalation (P4).
+        if status == "stopped":
+            store.record_subtask(story_id, row.model_copy(update={"status": "stopped"}))
+            store.record_story(story_row.model_copy(update={"status": "stopped"}))
+            return LaneOutcome(
+                kind="stopped",
+                story=story_id,
+                level=level,
+                subtask=subtask.id,
+                before_phase=stopped_before_phase(detail),
+                completed=tuple(completed),
+                warnings=tuple(warnings),
+            )
+        if status != "done":
+            stop.escalate(story_id)
+            store.record_subtask(story_id, row.model_copy(update={"status": "escalated"}))
+            store.record_story(story_row.model_copy(update={"status": "escalated"}))
+            return LaneOutcome(
+                kind="escalated",
+                story=story_id,
+                level=level,
+                subtask=subtask.id,
+                failed_phase=failed_phase,
+                detail=detail,
+                completed=tuple(completed),
+                warnings=tuple(warnings),
+            )
+
+        store.record_subtask(story_id, row.model_copy(update={"status": "done"}))
+        completed.append(subtask.id)
+
+    store.record_story(story_row.model_copy(update={"status": "done"}))
+    return LaneOutcome(
+        kind="done",
+        story=story_id,
+        level=level,
+        completed=tuple(completed),
+        warnings=tuple(warnings),
+    )
+
+
 def run_milestone(
     milestone: str,
     *,
@@ -244,16 +473,25 @@ def run_milestone(
     runner_factory: cli.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    max_concurrent: int = 1,
 ) -> dict[str, Any]:
-    """Drive every remaining subtask of `milestone`, one at a time, and report (O6).
+    """Drive every remaining subtask of `milestone`, level by level, and report (O6).
 
-    `milestone` is a card id or a title needle (O1). Everything that can refuse
-    runs before the store is opened. Then one `milestone` run is recorded with
-    its whole plan `pending`, and levels, stories and subtasks are walked in
-    order. A subtask already `done` on the board is never driven, but its
-    branch still anchors the next subtask's base. The card and its story are
-    read fresh from the board before each subtask.
+    `milestone` is a card id or a title needle (O1). Everything that can refuse,
+    `max_concurrent < 1` included, runs before the store is opened. Then one
+    `milestone` run is recorded with its whole plan `pending`, and each level's
+    stories run as lanes on a pool of `max_concurrent` threads, with a barrier
+    between levels. A subtask already `done` on the board is never driven, but
+    its branch still anchors the next subtask's base. The card and its story
+    are read fresh from the board before each subtask.
+
+    The first escalation sets the run's stop: lanes already running park at
+    their next phase boundary and are recorded `stopped`, lanes not yet started
+    leave their story `pending`, and no later level is scheduled. At
+    `max_concurrent=1` the result is exactly the sequential runner's.
     """
+    if max_concurrent < 1:
+        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
     root = cli.resolve_repo_dir(repo_dir)
     milestone_card = census.find_milestone(board.roots(repo_dir=root), milestone)
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
@@ -280,70 +518,45 @@ def run_milestone(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(max_concurrent_stories=max_concurrent),
         )
         store.record_run(run_record)
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
         warnings = reroll_stale_stories(plan.stories, root)
         completed: list[str] = []
+        stop = RunStop()
 
         for level in levels:
-            for planned in level:
-                story_id = planned.story.id
-                story_row, subtask_rows = rows[story_id]
-                for position, subtask in enumerate(planned.remaining):
-                    card = board.show(subtask.id, repo_dir=root)
-                    parent = board.show(story_id, repo_dir=root)
-                    started = subtask_rows[subtask.id].model_copy(update={"status": "started"})
-                    store.record_subtask(story_id, started)
-                    if position == 0:
-                        store.record_story(story_row.model_copy(update={"status": "started"}))
-                    try:
-                        result = drive(
-                            store=store,
-                            run_id=run_id,
-                            card=card,
-                            parent=parent,
-                            subtask=started,
-                            repo_dir=root,
-                            commands=list(commands),
-                            allow_no_verification=allow_no_verification,
-                            runner_factory=runner_factory,
-                        )
-                    except Exception as error:  # not BaseException: Ctrl-C must still stop
-                        status = "escalated"
-                        failed_phase: str | None = None
-                        detail: str | None = f"{type(error).__name__}: {error}"
-                    else:
-                        warnings.extend(result.warnings)
-                        status = result.summary.status
-                        failed_phase = result.summary.failed_phase
-                        detail = result.summary.detail
-
-                    # Every non-`done` result is recorded `escalated` here. Nothing
-                    # returns `stopped` yet; once the engine can (card 0d8b7c9a), a
-                    # `stopped` summary must be handled before this branch rather
-                    # than fall into it, because `stopped` is not an escalation (P4).
-                    if status != "done":
-                        store.record_subtask(
-                            story_id, started.model_copy(update={"status": "escalated"})
-                        )
-                        store.record_story(story_row.model_copy(update={"status": "escalated"}))
-                        store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                        return {
-                            "escalated": True,
-                            "run_id": run_id,
-                            "level": planned.level,
-                            "story": story_id,
-                            "subtask": subtask.id,
-                            "failed_phase": failed_phase,
-                            "detail": detail,
-                            "warnings": warnings,
-                        }
-
-                    store.record_subtask(story_id, started.model_copy(update={"status": "done"}))
-                    completed.append(subtask.id)
-                store.record_story(story_row.model_copy(update={"status": "done"}))
+            with ThreadPoolExecutor(
+                max_workers=max_concurrent, thread_name_prefix="am-lane"
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        run_story_lane,
+                        planned,
+                        store=store,
+                        run_id=run_id,
+                        rows=rows,
+                        root=root,
+                        drive=drive,
+                        commands=list(commands),
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                    )
+                    for planned in level
+                ]
+            # Leaving the `with` block is the level barrier: every lane has
+            # returned. `result()` re-raises a lane's BaseException here, after
+            # the pool has shut down, in census order.
+            outcomes = [future.result() for future in futures]
+            # Census order, never completion order: deterministic at any bound.
+            for outcome in outcomes:
+                completed.extend(outcome.completed)
+                warnings.extend(outcome.warnings)
+            if any(outcome.kind == "escalated" for outcome in outcomes):
+                store.record_run(run_record.model_copy(update={"status": "escalated"}))
+                return escalated_payload(run_id, stop.primary, outcomes, warnings)
 
         store.record_run(run_record.model_copy(update={"status": "done"}))
         return {
