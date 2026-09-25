@@ -22,9 +22,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-Status = Literal["pending", "started", "done", "failed", "escalated"]
+Status = Literal["pending", "started", "done", "failed", "escalated", "stopped"]
 """Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
-state resume keys off (§9)."""
+state resume keys off (§9). `stopped` (addendum P4) is a clean stop on request
+between phases: it is not `failed`, and relaunching the same command continues
+it."""
 
 PhaseKind = Literal["agent", "deterministic"]
 """§5: a phase either dispatches a harness or runs a registered function."""
@@ -138,7 +140,7 @@ class HarnessAssignment(_Model):
 class RunConfig(_Model):
     """The knobs a run was started with, recorded so resume reuses them."""
 
-    max_concurrent_stories: int = Field(default=1, gt=0)
+    max_concurrent_stories: int = Field(default=4, gt=0)
     dry_run: bool = False
     launcher: Launcher = "direct"
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)

@@ -9,6 +9,9 @@ except where a test must force an output git itself would never print.
 import os
 import shutil
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -44,10 +47,8 @@ def _commit(cwd: Path, name: str, body: str) -> str:
     return _head(cwd)
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A real git repo on `main` with one commit, isolated in tmp_path."""
-    root = tmp_path / "repo"
+def _init_repo(root: Path) -> Path:
+    """Create a real git repo at `root` on `main` with one commit."""
     root.mkdir()
     subprocess.run(
         ["git", "init", "-b", "main", str(root)],
@@ -60,6 +61,12 @@ def repo(tmp_path: Path) -> Path:
     _git(root, "config", "commit.gpgsign", "false")
     _commit(root, "README.md", "base\n")
     return root
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """A real git repo on `main` with one commit, isolated in tmp_path."""
+    return _init_repo(tmp_path / "repo")
 
 
 def _recorder(calls: list[list[str]], inner=None):
@@ -571,3 +578,250 @@ def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path)
     assert again["created"] is False
     _assert_no_forbidden_git(calls)
     assert (tmp_path / "wt-8" / "prior.txt").is_file()
+
+
+@requires_git
+def test_every_spelling_of_one_repository_shares_one_lock(repo: Path, tmp_path: Path):
+    # Trailing slash, a `..` hop and a symlinked path all name the same
+    # repository, so they must serialize on the same lock.
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo, target_is_directory=True)
+
+    lock = worktree._repo_lock(str(repo))
+
+    assert worktree._repo_lock(f"{repo}{os.sep}") is lock
+    assert worktree._repo_lock(str(repo / ".git" / "..")) is lock
+    assert worktree._repo_lock(str(link)) is lock
+
+
+def test_different_repositories_get_different_locks(tmp_path: Path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    assert worktree._repo_lock(str(a)) is not worktree._repo_lock(str(b))
+
+
+def test_concurrent_first_lookups_all_get_the_same_lock(tmp_path: Path):
+    fresh = tmp_path / "fresh-repo"
+    fresh.mkdir()
+    lanes = 8
+    barrier = threading.Barrier(lanes)
+
+    def lookup(_: int) -> threading.Lock:
+        barrier.wait(timeout=30)
+        return worktree._repo_lock(str(fresh))
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        locks = list(pool.map(lookup, range(lanes)))
+
+    assert all(lock is locks[0] for lock in locks)
+
+
+def _is_add(argv: list[str]) -> bool:
+    return "worktree" in argv and "add" in argv
+
+
+@requires_git
+def test_eight_distinct_lanes_in_parallel_all_succeed(repo: Path, tmp_path: Path):
+    lanes = 8
+    barrier = threading.Barrier(lanes)
+    state = {"in_flight": 0, "peak": 0}
+    state_lock = threading.Lock()
+
+    def runner(argv: list[str]) -> str:
+        if not _is_add(argv):
+            return worktree.run_git(argv)
+        with state_lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            time.sleep(0.05)
+            return worktree.run_git(argv)
+        finally:
+            with state_lock:
+                state["in_flight"] -= 1
+
+    def lane(index: int) -> dict[str, object]:
+        barrier.wait(timeout=30)
+        return worktree.ensure(
+            branch=f"m4/lane-{index}",
+            base="main",
+            worktree=str(tmp_path / f"wt-{index}"),
+            repo_dir=str(repo),
+            git_runner=runner,
+        )
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        futures = [pool.submit(lane, index) for index in range(lanes)]
+        errors = [future.exception(timeout=120) for future in futures]
+
+    assert errors == [None] * lanes
+    results = [future.result() for future in futures]
+    assert all(result["created"] is True for result in results)
+    assert state["peak"] == 1
+
+    registered = worktree.worktree_paths(
+        _git(repo, "worktree", "list", "--porcelain")
+    )
+    assert len(registered) == lanes + 1
+    assert list((repo / ".git").rglob("*.lock")) == []
+
+    main_head = _git(repo, "rev-parse", "main").strip()
+    for index in range(lanes):
+        wt = tmp_path / f"wt-{index}"
+        assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == (
+            f"m4/lane-{index}"
+        )
+        assert _git(wt, "merge-base", "HEAD", "main").strip() == main_head
+        assert _git(wt, "rev-parse", "HEAD").strip() == main_head
+
+
+@requires_git
+def test_two_threads_ensuring_the_same_worktree_both_succeed(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+    start = threading.Barrier(2)
+    after_reads = threading.Barrier(2)
+
+    def runner(argv: list[str]) -> str:
+        if "--verify" in argv:
+            try:
+                return worktree.run_git(argv)
+            finally:
+                after_reads.wait(timeout=30)
+        return worktree.run_git(argv)
+
+    def lane(_: int) -> dict[str, object]:
+        start.wait(timeout=30)
+        return worktree.ensure(
+            branch="m4/same",
+            base="main",
+            worktree=str(wt),
+            repo_dir=str(repo),
+            git_runner=runner,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(lane, index) for index in range(2)]
+        errors = [future.exception(timeout=120) for future in futures]
+
+    assert errors == [None, None]
+    results = [future.result() for future in futures]
+    assert sorted(result["created"] for result in results) == [False, True]
+    loser = next(result for result in results if result["created"] is False)
+    assert loser["worktree_existed"] is True
+
+    registered = worktree.worktree_paths(
+        _git(repo, "worktree", "list", "--porcelain")
+    )
+    real_wt = os.path.realpath(wt)
+    assert sum(os.path.realpath(p) == real_wt for p in registered) == 1
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m4/same"
+
+
+def _finishes_while_held(lock: threading.Lock, call) -> tuple[bool, object]:
+    """Run `call` in a thread while `lock` is held; report whether it finished."""
+    outcome: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            outcome["result"] = call()
+        except BaseException as exc:  # surfaced to the test, not swallowed
+            outcome["result"] = exc
+
+    with lock:
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+        finished = not thread.is_alive()
+    thread.join(timeout=30)
+    return finished, outcome.get("result")
+
+
+@requires_git
+def test_a_failed_add_releases_the_repository_lock(repo: Path, tmp_path: Path):
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    (stray / "stray.txt").write_text("not a worktree\n")
+
+    with pytest.raises(GitError):
+        worktree.ensure(
+            branch="m4/stray",
+            base="main",
+            worktree=str(stray),
+            repo_dir=str(repo),
+        )
+
+    assert worktree._repo_lock(str(repo)).locked() is False
+    result = worktree.ensure(
+        branch="m4/after",
+        base="main",
+        worktree=str(tmp_path / "wt-after"),
+        repo_dir=str(repo),
+    )
+    assert result["created"] is True
+
+
+@requires_git
+def test_a_same_branch_at_a_different_path_surfaces_gits_error_and_frees_the_lock(
+    repo: Path, tmp_path: Path
+):
+    worktree.ensure(
+        branch="m4/shared",
+        base="main",
+        worktree=str(tmp_path / "wt-one"),
+        repo_dir=str(repo),
+    )
+
+    with pytest.raises(GitError) as excinfo:
+        worktree.ensure(
+            branch="m4/shared",
+            base="main",
+            worktree=str(tmp_path / "wt-two"),
+            repo_dir=str(repo),
+        )
+
+    assert "add" in excinfo.value.argv
+    assert worktree._repo_lock(str(repo)).locked() is False
+
+
+@requires_git
+def test_a_different_repository_is_never_blocked_by_this_ones_lock(
+    repo: Path, tmp_path: Path
+):
+    other = _init_repo(tmp_path / "other-repo")
+
+    finished, result = _finishes_while_held(
+        worktree._repo_lock(str(repo)),
+        lambda: worktree.ensure(
+            branch="m4/other",
+            base="main",
+            worktree=str(tmp_path / "wt-other"),
+            repo_dir=str(other),
+        ),
+    )
+
+    assert finished is True
+    assert isinstance(result, dict) and result["created"] is True
+
+
+@requires_git
+def test_an_existing_worktree_takes_no_lock(repo: Path, tmp_path: Path):
+    args = {
+        "branch": "m4/resume",
+        "base": "main",
+        "worktree": str(tmp_path / "wt-resume"),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+
+    finished, result = _finishes_while_held(
+        worktree._repo_lock(str(repo)),
+        lambda: worktree.ensure(**args),
+    )
+
+    assert finished is True
+    assert isinstance(result, dict) and result["created"] is False

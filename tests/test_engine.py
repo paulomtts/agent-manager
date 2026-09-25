@@ -8,6 +8,7 @@ its names are placeholders that raise `NotImplementedError`.
 """
 
 import json
+import typing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2184,3 +2185,448 @@ def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_run
     assert [tuple(row) for row in attempts] == [("implement", "gate_failed")]
     assert "verify.run_suite" not in calls
     assert "rollup.set_status:done" not in calls
+
+
+def test_a_subtask_summary_may_report_stopped():
+    hints = typing.get_type_hints(engine.SubtaskSummary)
+    assert typing.get_args(hints["status"]) == ("done", "escalated", "stopped")
+
+
+FOUR_PHASES = """
+name: four
+phases:
+  - name: alpha
+    kind: deterministic
+    run: step.alpha
+  - name: beta
+    kind: deterministic
+    run: step.beta
+  - name: gamma
+    kind: deterministic
+    run: step.gamma
+  - name: delta
+    kind: deterministic
+    run: step.delta
+"""
+
+STOP_MIXED = """
+name: stop_mixed
+phases:
+  - name: prepare
+    kind: deterministic
+    run: step.prepare
+  - name: explore
+    kind: agent
+    role: explorer
+    result: ExploreResult
+  - name: finish
+    kind: deterministic
+    run: step.finish
+"""
+
+
+def _subtask_journal_statuses(opened) -> list[str]:
+    return [
+        line.payload["status"]
+        for line in opened.journal.read()
+        if line.event == "subtask_upsert"
+    ]
+
+
+def _projected_subtask_status(opened, card: str = "ed77a917") -> str | None:
+    row = opened.connection.execute(
+        "SELECT status FROM subtasks WHERE card_id = ?", (card,)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+class _StopFlag:
+    """A `should_stop` whose answer a canned step flips mid-walk."""
+
+    def __init__(self, value: bool = False) -> None:
+        self.value = value
+
+    def set(self) -> None:
+        self.value = True
+
+    def __call__(self) -> bool:
+        return self.value
+
+
+def test_a_stop_requested_during_phase_three_stops_before_phase_four(store):
+    calls: list[str] = []
+    flag = _StopFlag()
+
+    def make(name: str, *, stop: bool = False):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            if stop:
+                flag.set()
+            return {"phase": name}
+
+        return step
+
+    workflow = _workflow(
+        FOUR_PHASES,
+        {
+            "step.alpha": make("alpha"),
+            "step.beta": make("beta"),
+            "step.gamma": make("gamma", stop=True),
+            "step.delta": make("delta"),
+        },
+    )
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=flag,
+    )
+
+    assert calls == ["alpha", "beta", "gamma"]
+    assert summary.status == "stopped"
+    assert summary.failed_phase is None
+    assert summary.detail == "stopped before delta"
+    assert set(summary.results) == {"alpha", "beta", "gamma"}
+    assert _projected_phases(store) == [
+        ("alpha", "done"),
+        ("beta", "done"),
+        ("gamma", "done"),
+    ]
+    assert ("delta", "started") not in _journalled_phases(store)
+    assert _subtask_journal_statuses(store) == ["stopped"]
+    assert _projected_subtask_status(store) == "stopped"
+
+
+def test_a_stop_already_requested_runs_no_phase_at_all(store):
+    calls: list[str] = []
+
+    def step(card: str) -> dict[str, Any]:
+        calls.append("ran")
+        return {}
+
+    workflow = _workflow(
+        THREE_PHASES, {"step.alpha": step, "step.beta": step, "step.gamma": step}
+    )
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=lambda: True,
+    )
+
+    assert calls == []
+    assert summary.status == "stopped"
+    assert summary.failed_phase is None
+    assert summary.detail == "stopped before alpha"
+    assert summary.results == {}
+    assert _journalled_phases(store) == []
+    assert store.connection.execute("SELECT COUNT(*) FROM phases").fetchone()[0] == 0
+    assert _subtask_journal_statuses(store) == ["stopped"]
+    assert _projected_subtask_status(store) == "stopped"
+
+
+def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store):
+    calls: list[str] = []
+    flag = _StopFlag()
+
+    def prepare(card: str) -> dict[str, Any]:
+        calls.append("prepare")
+        return {}
+
+    def finish(card: str) -> dict[str, Any]:
+        calls.append("finish")
+        return {}
+
+    def agent_runner(phase, context, rendered):
+        calls.append(f"agent:{phase.name}")
+        flag.set()
+        return {"summary": "explored"}
+
+    workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+        should_stop=flag,
+    )
+
+    assert calls == ["prepare", "agent:explore"]
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before finish"
+    assert summary.results["explore"] == {"summary": "explored"}
+    assert _journalled_phases(store) == [("prepare", "started"), ("prepare", "done")]
+    assert _projected_subtask_status(store) == "stopped"
+
+
+def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store):
+    recorded: dict[str, Any] = {}
+    flag = _StopFlag()
+
+    def prepare(card: str) -> dict[str, Any]:
+        flag.set()
+        return {}
+
+    def finish(card: str) -> dict[str, Any]:
+        raise AssertionError("no phase after the stop may start")
+
+    workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=_recording_runner(recorded),
+        should_stop=flag,
+    )
+
+    assert recorded == {}
+    assert summary.status == "stopped"
+    assert summary.failed_phase is None
+    assert summary.detail == "stopped before explore"
+    assert _projected_phases(store) == [("prepare", "done")]
+    assert _subtask_journal_statuses(store) == ["stopped"]
+
+
+def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store):
+    """The check sits before the `agent_runner is None` error: a walk that
+    stops before its agent phase never reaches that phase, so it has nothing
+    to complain about."""
+    flag = _StopFlag()
+
+    def prepare(card: str) -> dict[str, Any]:
+        flag.set()
+        return {}
+
+    def finish(card: str) -> dict[str, Any]:
+        raise AssertionError("no phase after the stop may start")
+
+    workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=flag,
+    )
+
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before explore"
+    assert _projected_subtask_status(store) == "stopped"
+
+
+def test_a_should_stop_that_never_fires_changes_nothing(store):
+    calls: list[str] = []
+    checks: list[str] = []
+
+    def make(name: str):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            return {"phase": name}
+
+        return step
+
+    def never() -> bool:
+        checks.append("check")
+        return False
+
+    workflow = _workflow(
+        THREE_PHASES,
+        {"step.alpha": make("alpha"), "step.beta": make("beta"), "step.gamma": make("gamma")},
+    )
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=never,
+    )
+
+    assert calls == ["alpha", "beta", "gamma"]
+    assert checks == ["check", "check", "check"]
+    assert summary == engine.SubtaskSummary(
+        status="done",
+        results={
+            "alpha": {"phase": "alpha"},
+            "beta": {"phase": "beta"},
+            "gamma": {"phase": "gamma"},
+        },
+    )
+    assert _journalled_phases(store) == [
+        ("alpha", "started"),
+        ("alpha", "done"),
+        ("beta", "started"),
+        ("beta", "done"),
+        ("gamma", "started"),
+        ("gamma", "done"),
+    ]
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
+    assert _subtask_journal_statuses(store) == ["done"]
+    assert _projected_subtask_status(store) == "done"
+
+
+def test_should_stop_is_checked_only_at_visited_phases(store):
+    """`plan_check` jumps to `implement`; `spec` and `plan` are never visited,
+    so never checked, and nothing is checked after the last phase."""
+    calls: list[str] = []
+
+    def has(result: dict[str, Any]) -> bool:
+        return True
+
+    def never() -> bool:
+        calls.append("check")
+        return False
+
+    workflow = _skipping_workflow(has, calls)
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=never,
+    )
+
+    assert calls == ["check", "plan_check", "check", "implement"]
+    assert summary.status == "done"
+    assert summary.skipped == ["spec", "plan"]
+
+
+def test_an_escalation_during_the_stop_request_wins_over_the_stop(store):
+    calls: list[str] = []
+    flag = _StopFlag()
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        flag.set()
+        raise OSError("disk went away")
+
+    def gamma(card: str) -> dict[str, Any]:
+        calls.append("gamma")
+        return {}
+
+    workflow = _workflow(
+        THREE_PHASES, {"step.alpha": alpha, "step.beta": beta, "step.gamma": gamma}
+    )
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=flag,
+    )
+
+    assert calls == ["alpha", "beta"]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "beta"
+    assert "disk went away" in summary.detail
+    assert _subtask_journal_statuses(store) == ["escalated"]
+    assert _projected_subtask_status(store) == "escalated"
+
+
+def test_an_exception_from_should_stop_propagates_and_records_nothing(store):
+    calls: list[str] = []
+
+    def step(card: str) -> dict[str, Any]:
+        calls.append("ran")
+        return {}
+
+    def broken() -> bool:
+        raise RuntimeError("stop flag unreadable")
+
+    workflow = _workflow(
+        THREE_PHASES, {"step.alpha": step, "step.beta": step, "step.gamma": step}
+    )
+
+    with pytest.raises(RuntimeError, match="stop flag unreadable"):
+        engine.run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            should_stop=broken,
+        )
+
+    assert calls == []
+    # Nothing was ever written, so the journal file does not even exist yet
+    # (`journal.read()` would raise MissingJournalError).
+    assert not store.journal.path.exists()
+    assert _projected_phases(store) == []
+    assert _projected_subtask_status(store) is None
+
+
+def test_a_stopped_subtask_can_be_driven_again_to_done(store):
+    calls: list[str] = []
+    flag = _StopFlag()
+
+    def make(name: str, *, stop: bool = False):
+        def step(card: str) -> dict[str, Any]:
+            calls.append(name)
+            if stop:
+                flag.set()
+            return {"phase": name}
+
+        return step
+
+    workflow = _workflow(
+        THREE_PHASES,
+        {
+            "step.alpha": make("alpha"),
+            "step.beta": make("beta", stop=True),
+            "step.gamma": make("gamma"),
+        },
+    )
+
+    first = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        should_stop=flag,
+    )
+
+    assert first.status == "stopped"
+    assert first.detail == "stopped before gamma"
+    assert calls == ["alpha", "beta"]
+    assert _projected_subtask_status(store) == "stopped"
+
+    calls.clear()
+    second = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        start_phase="gamma",
+    )
+
+    assert calls == ["gamma"]
+    assert second.status == "done"
+    assert second.detail is None
+    assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
+    assert _subtask_journal_statuses(store) == ["stopped", "done"]
+    assert _projected_subtask_status(store) == "done"

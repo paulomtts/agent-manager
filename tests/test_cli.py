@@ -1070,9 +1070,11 @@ def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
         return dag.subtask_branch("m3", subtask)
 
     assert payload == {
+        "max_concurrent": 4,
         "levels": [
             {
                 "level": 0,
+                "concurrent": 1,
                 "stories": [
                     {
                         "story": b.id,
@@ -1159,6 +1161,7 @@ def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_do
     )
 
     assert payload == {
+        "max_concurrent": 4,
         "levels": [],
         "already_done": [
             {"kind": "story", "id": closed.id, "title": "story 1"},
@@ -1166,6 +1169,40 @@ def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_do
             {"kind": "story", "id": empty.id, "title": "story 3"},
         ],
     }
+
+
+def _three_then_one() -> list[census.StoryPlan]:
+    """Level 0 holds stories 1, 2 and 3; level 1 holds story 4, blocked by 1."""
+    return [
+        _plan_story(1, [_plan_subtask(11)]),
+        _plan_story(2, [_plan_subtask(21)]),
+        _plan_story(3, [_plan_subtask(31)]),
+        _plan_story(4, [_plan_subtask(41)], blocked_by=[_plan_id(1)]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "bound, concurrent", [(2, [2, 1]), (1, [1, 1]), (3, [3, 1]), (10, [3, 1])]
+)
+def test_the_dry_run_payload_reports_the_bound_and_each_levels_concurrency(
+    bound, concurrent
+):
+    """A level runs `min(len(level), bound)` stories together; a bound larger
+    than a level reports the level's size, not the bound."""
+    payload = cli.dry_run_payload(
+        _three_then_one(), branch_prefix="m3", base_branch="main", max_concurrent=bound
+    )
+
+    assert payload["max_concurrent"] == bound
+    assert [len(level["stories"]) for level in payload["levels"]] == [3, 1]
+    assert [level["concurrent"] for level in payload["levels"]] == concurrent
+
+
+def test_the_dry_run_payload_defaults_to_four_lanes():
+    payload = cli.dry_run_payload(_three_then_one(), branch_prefix="m3", base_branch="main")
+
+    assert payload["max_concurrent"] == 4
+    assert [level["concurrent"] for level in payload["levels"]] == [3, 1]
 
 
 def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
@@ -1482,6 +1519,75 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
         first_id: "done",
         second_id: "done",
     }
+
+
+@requires_git
+@requires_brd
+def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
+    """Addendum P4: the driver passes the stop check straight through. With a
+    stop already requested, the first phase of `builtin/task.yaml` never
+    starts, so the fake runner is never called and no worktree is made."""
+    root = cli.resolve_repo_dir(project)
+    parent = board.show(cards["story"], repo_dir=root)
+    card = board.show(cards["subtask"], repo_dir=root)
+
+    started_at = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+    run_id = cli.mint_run_id(card.id, started_at)
+    branch = dag.task_branch("m1", card)
+    subtask = models.SubtaskRun(
+        card_id=card.id,
+        branch=branch,
+        base_branch="main",
+        status="started",
+        worktree_path=cli.worktree_for(root, branch),
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+    store = store_module.Store.open(root, run_id)
+    try:
+        store.record_run(
+            models.Run(
+                id=run_id,
+                workflow=cli.WORKFLOW_NAME,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=started_at,
+                config=models.RunConfig(),
+            )
+        )
+        store.record_story(
+            models.StoryRun(
+                card_id=parent.id,
+                title=parent.title,
+                level=0,
+                status="started",
+                tip_branch=branch,
+            )
+        )
+        store.record_subtask(parent.id, subtask)
+
+        drive = cli.drive_subtask(
+            store=store,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=root,
+            runner_factory=lambda **kwargs: fake_runner(seen),
+            should_stop=lambda: True,
+        )
+        run = store.load_run(run_id)
+    finally:
+        store.close()
+
+    assert drive.summary.status == "stopped"
+    assert drive.summary.failed_phase is None
+    assert drive.summary.detail == "stopped before worktree"
+    assert seen == []
+    assert not subtask.worktree_path.exists()
+    assert run is not None
+    assert [sub.status for sub in run.stories[0].subtasks] == ["stopped"]
 
 
 runner = CliRunner()
@@ -2306,7 +2412,7 @@ def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
     assert set(envelope) == {"ok", "data"}
     assert envelope["ok"] is True
     data = envelope["data"]
-    assert set(data) == {"levels", "already_done"}
+    assert set(data) == {"max_concurrent", "levels", "already_done"}
     assert data["already_done"] == []
     assert [level["level"] for level in data["levels"]] == [0, 1, 2]
     assert [
@@ -2409,6 +2515,64 @@ def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
     assert pretty.exit_code == 0, pretty.output
     assert "\n" in pretty.stdout.strip()
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+@requires_git
+@requires_brd
+@pytest.mark.parametrize("extra, bound", [((), 4), (("--max-concurrent", "3"), 3)])
+def test_the_milestone_dry_run_echoes_the_lane_bound_and_writes_nothing(
+    project, milestone_board, monkeypatch, extra, bound
+):
+    """`milestone_board` is three one-story levels, so each level runs one
+    story whatever the bound."""
+    board_before = board.roots(repo_dir=project)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+    result = _dry_run(project, milestone_board["milestone"], *extra)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["max_concurrent"] == bound
+    assert [level["concurrent"] for level in data["levels"]] == [1, 1, 1]
+    _assert_nothing_written(project, porcelain_before)
+    assert board.roots(repo_dir=project) == board_before
+
+
+@pytest.mark.parametrize("extra, bound", [((), 4), (("--max-concurrent", "3"), 3)])
+def test_a_milestone_dry_run_passes_the_lane_bound_to_the_preview(
+    tmp_path, monkeypatch, extra, bound
+):
+    """No git or brd needed: `dry_run_milestone` is replaced by a recorder, and
+    every write path and `run_milestone` are forbidden."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_dry_run_milestone(needle, **kwargs):
+        calls.append((needle, kwargs))
+        return {"max_concurrent": kwargs["max_concurrent"], "levels": [], "already_done": []}
+
+    monkeypatch.setattr(cli, "dry_run_milestone", fake_dry_run_milestone)
+
+    result = _milestone_run(tmp_path, "--dry-run", *extra)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["max_concurrent"] == bound
+    assert calls == [
+        (
+            "Milestone 3",
+            {
+                "repo_dir": tmp_path,
+                "branch_prefix": "m3",
+                "base_branch": "main",
+                "max_concurrent": bound,
+            },
+        )
+    ]
+    assert list(paths.data_dir().iterdir()) == []
 
 
 def _refusal(result) -> dict[str, Any]:
@@ -2558,6 +2722,11 @@ SOME_CARD = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
         (["--card", SOME_CARD, "--dry-run"], "previews"),
         (["--milestone", "", "--dry-run"], "blank"),
         (["--milestone", "   ", "--dry-run"], "blank"),
+        (["--milestone", "2", "--max-concurrent", "0"], "least"),
+        (["--milestone", "2", "--max-concurrent=-1"], "least"),
+        (["--milestone", "2", "--dry-run", "--max-concurrent", "0"], "least"),
+        (["--card", SOME_CARD, "--max-concurrent", "2"], "only"),
+        (["--card", SOME_CARD, "--max-concurrent", "4"], "only"),
     ],
 )
 def test_bad_run_targets_are_usage_errors_that_start_nothing(
@@ -2569,6 +2738,7 @@ def test_bad_run_targets_are_usage_errors_that_start_nothing(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _forbid_writes(monkeypatch)
     monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
 
     result = runner.invoke(
         cli.app,
@@ -2671,9 +2841,33 @@ def test_a_milestone_run_calls_run_milestone_once_with_the_run_options(
                 "branch_prefix": "m3",
                 "commands": ["uv run pytest", "uv run ruff check"],
                 "allow_no_verification": True,
+                "max_concurrent": 4,
             },
         )
     ]
+
+
+@pytest.mark.parametrize("given, passed", [("2", 2), ("1", 1), ("4", 4)])
+def test_an_explicit_max_concurrent_reaches_run_milestone(
+    tmp_path, monkeypatch, given, passed
+):
+    """P1: the flag's value is what `run_milestone` gets, and `1` is passed as
+    `1`, so `--max-concurrent 1` is the sequential runner."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_milestone(monkeypatch, CLEAN_MILESTONE)
+
+    result = _milestone_run(tmp_path, "--max-concurrent", given)
+
+    assert result.exit_code == 0, result.output
+    ((_, kwargs),) = calls
+    assert kwargs["max_concurrent"] == passed
+
+
+def test_the_cli_default_lane_count_is_the_models_default():
+    """Review focus: the flag's default and the recorded model default are the
+    same number, so a run with no flag records what it ran with."""
+    assert cli.DEFAULT_MAX_CONCURRENT == 4
+    assert models.RunConfig().max_concurrent_stories == cli.DEFAULT_MAX_CONCURRENT
 
 
 def test_a_milestone_run_without_verify_passes_an_empty_list_and_no_opt_out(
@@ -3828,3 +4022,124 @@ def test_a_run_recorded_with_an_unknown_workflow_is_an_envelope(project, cards, 
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is False
     assert envelope["error"]["type"] == "WorkflowLoadError"
+
+
+def test_status_rows_and_header_show_a_stopped_run_verbatim():
+    run = _pure_run(
+        [
+            models.StoryRun(
+                card_id="story-1",
+                title="One",
+                level=0,
+                status="stopped",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-1",
+                        branch="m1/a",
+                        base_branch="main",
+                        status="stopped",
+                        phases=[
+                            models.PhaseRun(name="implement", kind="agent", status="stopped")
+                        ],
+                    )
+                ],
+            )
+        ]
+    ).model_copy(update={"status": "stopped"})
+
+    assert cli.status_rows(run) == [
+        {
+            "story": "story-1",
+            "subtask": "card-1",
+            "phase": "implement",
+            "attempt": None,
+            "state": "stopped",
+        }
+    ]
+    assert cli.status_payload(run)["run"]["status"] == "stopped"
+
+
+def test_select_resumable_tells_a_stopped_run_to_relaunch_the_milestone():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [stopped])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "card-1=stopped" in message
+    assert "agent-manager run --milestone" in message
+    assert "agent-manager status" in message
+    assert "retry" not in message
+
+
+def test_select_resumable_names_only_the_stopped_cards_in_the_remedy():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [stopped, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "found: card-1=stopped, card-2=escalated" in message
+    remedy = message.split("shows the run as it stands", 1)[1]
+    assert "card-1" in remedy
+    assert "card-2" not in remedy
+    assert "agent-manager run --milestone" in remedy
+    assert "retry" not in message
+
+
+def test_select_resumable_keeps_its_wording_when_nothing_is_stopped():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [done, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    assert str(caught.value) == (
+        "run '20260923T140506Z-cbe34d00' has no subtask recorded 'started', so there"
+        " is no work in flight to pick up (found: card-1=done, card-2=escalated);"
+        " `agent-manager status 20260923T140506Z-cbe34d00` shows the run as it stands"
+    )
+
+
+def test_select_resumable_does_not_count_a_stopped_subtask_as_in_flight():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    started = _pure_subtask("card-2", [])
+    run = _pure_run([_pure_story("story-1", [stopped]), _pure_story("story-2", [started])])
+
+    story, subtask = cli.select_resumable(run)
+
+    assert story.card_id == "story-2"
+    assert subtask is started
+
+
+def test_a_stopped_card_run_is_ok_true_and_exit_zero(tmp_path, monkeypatch):
+    def fake_run_card(card_id, **kwargs):
+        return {**_fake_payload(card_id, "story-1"), "status": "stopped"}
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(tmp_path, "cbe34d00-9d8d-4f41-9c94-f99e665771b0")
+
+    assert result.exit_code == 0, result.output
+    assert result.exit_code != cli.EXIT_ESCALATED
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "stopped"
+
+
+def test_a_resumed_walk_that_stops_is_ok_true_and_exit_zero(tmp_path, monkeypatch):
+    def fake_resume_run(run_id, **kwargs):
+        return {"run_id": run_id, "status": "stopped"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+    result = runner.invoke(
+        cli.app, ["resume", "20260923T140506Z-cbe34d00", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "stopped"

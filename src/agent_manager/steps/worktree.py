@@ -12,10 +12,17 @@ run, so the forbidden-operations list (`reset`, `checkout -f`, `clean`,
 
 Every invocation is an argument list handed to `subprocess` (design §5 line
 252): there is no shell string and nothing to quote.
+
+Parallel lanes (parallel-stories decision P3) share one repository, so
+`git worktree add` runs under a per-repository lock, re-checking registration
+inside it so two threads ensuring the same worktree both succeed. Threads in
+one process only. There is deliberately no `git worktree prune`: it is a global
+sweep that could remove another lane's not-yet-populated worktree.
 """
 
 import os
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -159,6 +166,29 @@ def _resolve_base(git_runner: GitRunner, repo_path: str, base: str) -> str:
     return f"origin/{base}"
 
 
+_REPO_LOCKS: dict[str, threading.Lock] = {}
+"""One lock per repository, keyed by its resolved path, created on first use."""
+
+_REPO_LOCKS_GUARD = threading.Lock()
+"""Guards lookup-or-create in `_REPO_LOCKS`, so one repository never gets two locks."""
+
+
+def _repo_lock(repo_path: str) -> threading.Lock:
+    """The lock serializing `git worktree add` on the repository at `repo_path`.
+
+    Keyed by the resolved path, so a trailing slash, a `..` hop or a symlinked
+    spelling of the same repository all share one lock. In-process threads
+    only: two `am` processes on one repository are not supported.
+    """
+    key = str(Path(repo_path).resolve())
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _REPO_LOCKS[key] = lock
+        return lock
+
+
 def ensure(
     branch: str,
     base: str,
@@ -199,24 +229,36 @@ def ensure(
 
     created = False
     if not worktree_existed:
-        if branch_existed:
-            # Check the existing branch out. Never re-cut it from base: a
-            # killed run's commits live on that branch and re-cutting would
-            # silently discard them.
-            argv = ["-C", repo_path, "worktree", "add", worktree_path, branch]
-        else:
-            argv = [
-                "-C",
-                repo_path,
-                "worktree",
-                "add",
-                worktree_path,
-                "-b",
-                branch,
-                resolved_base,
-            ]
-        git_runner(argv)
-        created = True
+        # git must never run two `worktree add` on one repository at once.
+        # Only the re-check and the add are held under the lock; the reads
+        # above and the commit count below stay unlocked.
+        with _repo_lock(repo_path):
+            # Another thread may have created this very worktree between the
+            # unlocked read and now: look again before adding.
+            registered = worktree_paths(
+                git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
+            )
+            if _is_registered(worktree_path, registered):
+                worktree_existed = True
+            else:
+                if branch_existed:
+                    # Check the existing branch out. Never re-cut it from
+                    # base: a killed run's commits live on that branch and
+                    # re-cutting would silently discard them.
+                    argv = ["-C", repo_path, "worktree", "add", worktree_path, branch]
+                else:
+                    argv = [
+                        "-C",
+                        repo_path,
+                        "worktree",
+                        "add",
+                        worktree_path,
+                        "-b",
+                        branch,
+                        resolved_base,
+                    ]
+                git_runner(argv)
+                created = True
 
     return {
         "branch": branch,

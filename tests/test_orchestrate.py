@@ -14,6 +14,8 @@ Two tiers, per design §14:
 import json
 import shutil
 import subprocess
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +123,113 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
     assert tips == [
         {"story": a.id, "tip": _branch_of(a.subtasks[-1])},
         {"story": c.id, "tip": _branch_of(c.subtasks[-1])},
+    ]
+
+
+def test_the_before_phase_is_read_out_of_a_stopped_detail():
+    """`engine._stop` writes "stopped before <phase>"; the summary has no field
+    of its own for that phase, so the helper reads it out of `detail`."""
+    assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
+    assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
+    assert orchestrate.stopped_before_phase(None) is None
+
+
+def test_the_first_escalation_is_the_primary_and_every_escalation_sets_the_stop():
+    stop = orchestrate.RunStop()
+    assert not stop.event.is_set()
+    assert stop.primary is None
+
+    stop.escalate("story-b")
+    stop.escalate("story-a")
+
+    assert stop.event.is_set()
+    assert stop.primary == "story-b"
+
+
+def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
+    also = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="A",
+        level=2,
+        subtask="a1",
+        failed_phase="review",
+        detail="reviewer found a blocker",
+    )
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="B", level=2, subtask="b2", before_phase="implement"
+    )
+    primary = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="C",
+        level=2,
+        subtask="c1",
+        failed_phase=None,
+        detail="RuntimeError: boom",
+    )
+    done = orchestrate.LaneOutcome(kind="done", story="D", level=2, completed=("d1",))
+    queued = orchestrate.LaneOutcome(kind="not_started", story="E", level=2)
+
+    payload = orchestrate.escalated_payload(
+        "run-1", "C", [also, parked, primary, done, queued], ["gate warned"]
+    )
+
+    assert payload == {
+        "escalated": True,
+        "run_id": "run-1",
+        "level": 2,
+        "story": "C",
+        "subtask": "c1",
+        "failed_phase": None,
+        "detail": "RuntimeError: boom",
+        "warnings": ["gate warned"],
+        "also_escalated": [
+            {
+                "level": 2,
+                "story": "A",
+                "subtask": "a1",
+                "failed_phase": "review",
+                "detail": "reviewer found a blocker",
+            }
+        ],
+        "stopped": [{"story": "B", "subtask": "b2", "before_phase": "implement"}],
+    }
+
+
+def test_a_lone_escalation_payload_is_exactly_the_sequential_one():
+    """No `also_escalated` or `stopped` key when those lists are empty, so a
+    run at `max_concurrent=1` returns today's dict."""
+    only = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", failed_phase="verify", detail="red"
+    )
+    queued = orchestrate.LaneOutcome(kind="not_started", story="B", level=0)
+
+    payload = orchestrate.escalated_payload("run-1", "A", [only, queued], [])
+
+    assert payload == {
+        "escalated": True,
+        "run_id": "run-1",
+        "level": 0,
+        "story": "A",
+        "subtask": "a1",
+        "failed_phase": "verify",
+        "detail": "red",
+        "warnings": [],
+    }
+
+
+def test_an_unnamed_primary_falls_back_to_the_first_escalation_in_census_order():
+    first = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=1, subtask="a1", failed_phase="review", detail="x"
+    )
+    second = orchestrate.LaneOutcome(
+        kind="escalated", story="B", level=1, subtask="b1", failed_phase="verify", detail="y"
+    )
+
+    payload = orchestrate.escalated_payload("run-1", None, [first, second], [])
+
+    assert (payload["story"], payload["subtask"]) == ("A", "a1")
+    assert payload["also_escalated"] == [
+        {"level": 1, "story": "B", "subtask": "b1", "failed_phase": "verify", "detail": "y"}
     ]
 
 
@@ -258,6 +367,7 @@ class FakeDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
+        should_stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -335,6 +445,137 @@ def _record_git(monkeypatch, fail_on: str | None = None) -> list[list[str]]:
     return calls
 
 
+WAIT = 10.0
+"""Seconds a lane-pool test waits on a barrier or event before failing instead of hanging."""
+
+OVERSHOOT_WINDOW = 1.0
+"""Seconds the bound test holds each lane in flight, so that queued lanes would
+enter the driver in that window if the pool ignored `max_concurrent`."""
+
+Gate = Callable[[Any], None]
+
+
+def _await(event: threading.Event) -> None:
+    assert event.wait(timeout=WAIT), "a gated test's event was never set"
+
+
+def _await_stop(should_stop: Any) -> None:
+    """Block until the run's stop is set, without sleeping.
+
+    `run_milestone` hands each driver `event.is_set` (spec item 2), so the
+    run's event is that bound method's `__self__`. Waiting on it is
+    synchronisation by event, and it pins that wiring.
+    """
+    assert should_stop is not None, "the lane passed no should_stop"
+    event = should_stop.__self__
+    assert isinstance(event, threading.Event)
+    _await(event)
+
+
+def _meet(barrier: threading.Barrier) -> Gate:
+    """A gate that holds a call until every party of `barrier` is in flight."""
+
+    def gate(should_stop: Any) -> None:
+        barrier.wait(timeout=WAIT)
+
+    return gate
+
+
+def _meet_then_await_stop(barrier: threading.Barrier) -> Gate:
+    """A gate that meets `barrier`, then holds the call until the run's stop is set."""
+
+    def gate(should_stop: Any) -> None:
+        barrier.wait(timeout=WAIT)
+        _await_stop(should_stop)
+
+    return gate
+
+
+def _census_levels(project: Path, milestone: str) -> list[list[str]]:
+    """Each dispatch level's story ids in census order, the order lanes are submitted in.
+
+    Sibling stories created in the same second are ordered by id, so a test that
+    gives a lane a role by its queue position must read the order, not assume it.
+    """
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
+    levels = orchestrate.plan_levels(plan.stories, branch_prefix=PREFIX, base_branch="main")
+    return [[planned.story.id for planned in level] for level in levels]
+
+
+def _subtasks_by_story(shape: dict[str, Any]) -> dict[str, list[str]]:
+    return {shape["stories"][key]: shape["subtasks"][key] for key in shape["stories"]}
+
+
+@dataclass
+class GatedDriver:
+    """A thread-safe stand-in for `cli.drive_subtask`, for the lane-pool tests.
+
+    `gates[card]` runs first, with the driver's `should_stop`; tests put
+    barriers and events there, never sleeps. Then `outcomes[card]` decides: an
+    exception instance is raised, a `(phase, detail)` tuple escalates, and
+    `"done"` finishes as a phase already running would. With no entry the fake
+    reaches its simulated phase boundary: if `should_stop()` is true it parks
+    as the engine does, with `"stopped before implement"`; otherwise it is
+    done. Calls are recorded under a lock, `high_water` is the most calls ever
+    in flight at once, and `returned[card]` is set when that card's call ends.
+    """
+
+    outcomes: dict[str, Any] = field(default_factory=dict)
+    gates: dict[str, Gate] = field(default_factory=dict)
+    warnings: dict[str, list[str]] = field(default_factory=dict)
+    returned: dict[str, threading.Event] = field(default_factory=dict)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    high_water: int = 0
+    in_flight: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __call__(
+        self,
+        *,
+        store,
+        run_id,
+        card,
+        parent,
+        subtask,
+        repo_dir,
+        commands=(),
+        allow_no_verification=False,
+        runner_factory=None,
+        should_stop=None,
+    ) -> cli.SubtaskDrive:
+        with self.lock:
+            self.calls.append(
+                {"card": card.id, "parent": parent.id, "base": subtask.base_branch}
+            )
+            self.in_flight += 1
+            self.high_water = max(self.high_water, self.in_flight)
+        try:
+            gate = self.gates.get(card.id)
+            if gate is not None:
+                gate(should_stop)
+            outcome = self.outcomes.get(card.id)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            warnings = list(self.warnings.get(card.id, []))
+            if isinstance(outcome, tuple):
+                phase, detail = outcome
+                summary = engine.SubtaskSummary(
+                    status="escalated", failed_phase=phase, detail=detail
+                )
+            elif outcome != "done" and should_stop is not None and should_stop():
+                summary = engine.SubtaskSummary(
+                    status="stopped", detail="stopped before implement"
+                )
+            else:
+                summary = engine.SubtaskSummary(status="done")
+            return cli.SubtaskDrive(summary=summary, warnings=warnings)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+            if card.id in self.returned:
+                self.returned[card.id].set()
+
+
 @requires_git
 @requires_brd
 def test_subtasks_run_in_order_each_stacked_on_the_one_before(project):
@@ -386,7 +627,7 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project):
 
     run = _load(project, run_id)
     assert run.workflow == "milestone"
-    assert run.config == models.RunConfig()
+    assert run.config == models.RunConfig(max_concurrent_stories=1)
     assert (run.base_branch, run.branch_prefix, run.repo_dir) == ("main", PREFIX, root)
     assert _statuses(run) == {
         "run": "done",
@@ -802,3 +1043,392 @@ def test_a_failed_stale_rollup_is_a_warning_and_the_run_goes_on(project, monkeyp
     assert story_a in warning
     assert a2 in warning
     assert "brd is down" in warning
+
+
+@requires_git
+@requires_brd
+def test_a_board_read_that_fails_inside_a_lane_is_an_escalation_of_that_subtask(
+    project, monkeypatch
+):
+    """Spec item 6: an `Exception` anywhere inside a lane after it picked up a
+    subtask escalates that subtask, not only one raised by the driver."""
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    real_show = board.show
+
+    def failing_show(card_id: str, *, repo_dir: Any = None) -> models.Card:
+        if card_id == a1:
+            raise board.BoardError("brd is down", argv=["brd", "show", card_id])
+        return real_show(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(board, "show", failing_show)
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert driver.calls == []
+    assert (result["escalated"], result["level"], result["story"], result["subtask"]) == (
+        True,
+        0,
+        story_a,
+        a1,
+    )
+    assert result["failed_phase"] is None
+    assert result["detail"].startswith("BoardError: ")
+    assert "brd is down" in result["detail"]
+    assert "also_escalated" not in result
+    assert "stopped" not in result
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "pending",
+        b1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+@pytest.mark.parametrize("bound", [0, -1])
+def test_a_bound_below_one_is_refused_before_anything_is_written(project, monkeypatch, bound):
+    shape = _milestone(project, {"A": 1})
+    git_calls = _record_git(monkeypatch)
+    driver = FakeDriver()
+
+    with pytest.raises(ValueError, match="max_concurrent"):
+        _run(project, shape["milestone"], driver, max_concurrent=bound)
+
+    assert driver.calls == []
+    assert git_calls == []
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@requires_git
+@requires_brd
+def test_the_bound_is_recorded_in_the_run_config(project):
+    shape = _milestone(project, {"A": 1})
+
+    result = _run(project, shape["milestone"], FakeDriver(), max_concurrent=2)
+
+    assert result["done"] is True
+    assert _load(project, result["run_id"]).config == models.RunConfig(max_concurrent_stories=2)
+
+
+@requires_git
+@requires_brd
+def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(project):
+    shape = _milestone(project, {"A": 2, "B": 1, "C": 1})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    all_three = threading.Barrier(3)
+    driver = GatedDriver(gates={a1: _meet(all_three), b1: _meet(all_three), c1: _meet(all_three)})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    (order,) = _census_levels(project, shape["milestone"])
+    subtasks = _subtasks_by_story(shape)
+    cards = [call["card"] for call in driver.calls]
+    assert sorted(cards) == sorted([a1, a2, b1, c1])
+    assert cards.index(a1) < cards.index(a2)
+    assert {call["card"]: call["base"] for call in driver.calls} == {
+        a1: "main",
+        a2: _branch(project, a1),
+        b1: "main",
+        c1: "main",
+    }
+    assert {call["card"]: call["parent"] for call in driver.calls} == {
+        a1: story_a,
+        a2: story_a,
+        b1: story_b,
+        c1: story_c,
+    }
+    assert driver.high_water == 3
+    assert result["done"] is True
+    assert result["levels"] == [{"level": 0, "stories": order}]
+    assert result["completed"] == [card for story in order for card in subtasks[story]]
+    assert "also_escalated" not in result
+    assert "stopped" not in result
+    run = _load(project, result["run_id"])
+    assert run.config == models.RunConfig(max_concurrent_stories=3)
+    assert set(_statuses(run).values()) == {"done"}
+
+
+@requires_git
+@requires_brd
+def test_in_flight_lanes_never_exceed_the_bound(project):
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1})
+    subtasks = _subtasks_by_story(shape)
+    arrivals = 0
+    arrivals_lock = threading.Lock()
+    third_arrived = threading.Event()
+
+    def hold_until_a_third_lane_arrives(should_stop: Any) -> None:
+        # Every lane stays in flight until a third lane has entered the driver,
+        # or the window expires. Without the bound, all four lanes arrive
+        # inside the window and are in flight together. Under the bound only
+        # two can be, so the first two wait out the window and then return.
+        nonlocal arrivals
+        with arrivals_lock:
+            arrivals += 1
+            if arrivals >= 3:
+                third_arrived.set()
+        third_arrived.wait(timeout=OVERSHOOT_WINDOW)
+
+    driver = GatedDriver(
+        gates={cards[0]: hold_until_a_third_lane_arrives for cards in subtasks.values()}
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True
+    assert sorted(call["card"] for call in driver.calls) == sorted(
+        card for cards in subtasks.values() for card in cards
+    )
+    assert driver.high_water == 2
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project):
+    shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    b1, b2 = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1])
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_a,
+        "subtask": a1,
+        "failed_phase": "review",
+        "detail": "reviewer found a blocker",
+        "warnings": [],
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+        b2: "pending",
+        story_c: "pending",
+        c1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_lane_whose_first_subtask_finished_parks_its_next_subtask(project):
+    """After a story has started the lane never checks the stop itself: its
+    next subtask is handed to the driver, and the engine parks it (P4)."""
+    shape = _milestone(project, {"A": 1, "B": 2})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    b1, b2 = shape["subtasks"]["B"]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: ("verify", "suite red"), b1: "done"},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1, b2])
+    assert next(call for call in driver.calls if call["card"] == b2)["base"] == _branch(
+        project, b1
+    )
+    assert (result["story"], result["subtask"]) == (story_a, a1)
+    assert result["stopped"] == [{"story": story_b, "subtask": b2, "before_phase": "implement"}]
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "done",
+        b2: "stopped",
+    }
+
+
+@requires_git
+@requires_brd
+def test_two_simultaneous_escalations_give_one_primary_and_one_also_escalated(project):
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: ("review", "a blocker"), b1: ("verify", "b suite red")},
+        gates={a1: _meet(pair), b1: _meet(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    entries = {
+        story_a: {
+            "level": 0,
+            "story": story_a,
+            "subtask": a1,
+            "failed_phase": "review",
+            "detail": "a blocker",
+        },
+        story_b: {
+            "level": 0,
+            "story": story_b,
+            "subtask": b1,
+            "failed_phase": "verify",
+            "detail": "b suite red",
+        },
+    }
+    primary = result["story"]
+    assert primary in entries
+    (other,) = set(entries) - {primary}
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        **entries[primary],
+        "warnings": [],
+        "also_escalated": [entries[other]],
+    }
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "escalated",
+        b1: "escalated",
+        story_c: "pending",
+        c1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: RuntimeError("harness vanished")},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_a,
+        "subtask": a1,
+        "failed_phase": None,
+        "detail": "RuntimeError: harness vanished",
+        "warnings": [],
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    (first, second, queued) = _census_levels(project, shape["milestone"])[0]
+    subtasks = _subtasks_by_story(shape)
+    (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={f1: ("review", "reviewer found a blocker")},
+        gates={f1: _meet(pair), s1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert q1 not in [call["card"] for call in driver.calls]
+    assert (result["story"], result["subtask"]) == (first, f1)
+    assert result["stopped"] == [{"story": second, "subtask": s1, "before_phase": "implement"}]
+    assert "also_escalated" not in result
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        first: "escalated",
+        f1: "escalated",
+        second: "stopped",
+        s1: "stopped",
+        queued: "pending",
+        q1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_keyboard_interrupt_in_one_lane_parks_the_other_and_propagates(project):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    pair = threading.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: KeyboardInterrupt()},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
+    assert _statuses(run) == {
+        "run": "started",
+        story_a: "started",
+        a1: "started",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+
+
+@requires_git
+@requires_brd
+def test_warnings_and_completed_follow_census_order_not_finish_order(project):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    (first, second) = _census_levels(project, shape["milestone"])[0]
+    subtasks = _subtasks_by_story(shape)
+    (f1,), (s1,) = subtasks[first], subtasks[second]
+    second_returned = threading.Event()
+    driver = GatedDriver(
+        warnings={f1: ["first warned"], s1: ["second warned"]},
+        gates={f1: lambda should_stop: _await(second_returned)},
+        returned={s1: second_returned},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert sorted(call["card"] for call in driver.calls) == sorted([f1, s1])
+    assert result["done"] is True
+    assert result["completed"] == [f1, s1]
+    assert result["warnings"] == ["first warned", "second warned"]
