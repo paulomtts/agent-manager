@@ -71,8 +71,10 @@ milestone (§10).
 **G2 — One event loop; blocking work goes through `asyncio.to_thread`.** The CLI calls
 `asyncio.run` once per subtask. Tools reach the launcher, the board and the steps only
 through `runtime/bridge.py`, which wraps each call in `asyncio.to_thread`, so the loop
-is never blocked and the existing `threading` locks stay valid. Nothing in `harness/`,
-`board.py` or `steps/` is rewritten.
+is never blocked and the existing `threading` locks stay valid. Nothing in `board.py` or
+`steps/` is rewritten. Cancelling a turn cannot stop a `to_thread` worker, so the
+launcher gains an optional `on_spawn(process)` callback and the bridge kills the
+process tree of any call it cancels (Ctrl-C must not orphan `claude -p`).
 
 **G3 — The workflow is declared Python data, compiled into two generic tools.**
 `workflow/phases.py` holds plain frozen dataclasses (no pygents import);
@@ -140,7 +142,8 @@ payload are unchanged.
  ├── steps/reducers.py   CHANGED   + review_blockers_gate; plan_hash_gate_adapter moves here
  ├── steps/verify.py     CHANGED   + typecheck and lint commands
  ├── roles/bundles/      CHANGED   reviewer rewritten; spec_critic, plan_critic replace critic
- └── harness/, results.py    as-is
+ ├── harness/launcher.py CHANGED   optional on_spawn, so a cancelled turn can kill its process tree
+ └── harness/ (rest), results.py    as-is
 ```
 
 `runtime.engine.run_subtask` has the old engine's signature (`workflow` becomes a
@@ -226,7 +229,9 @@ kind>, kwargs={"phase": name, "loop": loop}, timeout=phase.timeout)` or `None`.
   result as `ContextItem(id=phase)` and the next turn. On `AgentPhaseFailed`: if
   `on_fail` and `loop < max_loops`, it yields a feedback item and
   `Turn(on_fail.phase, loop + 1)`; otherwise it raises `Escalated(phase, detail)`.
-- `step_phase(phase, loop, pool)`: runs the step through `bridge.step(...)`, then its
+- `step_phase(phase, loop, pool)`: runs one deterministic step through the function
+  extracted from the old engine's `_run_deterministic` (`engine.run_one_step`), so both
+  engines judge a step identically; then its
   gates (a `warn` verdict is a warning, any other verdict raises `Escalated`); a
   failure of a `best_effort` step is a warning; `when`/`skip_to` yields the skip
   target and records the skipped names as a pool item `skipped`.
@@ -273,7 +278,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 `Store.save_checkpoint(...)` and `Store.latest_checkpoint(run_id, card_id)`;
 `Store.latest_open_checkpoint(card_id, workflow)` finds the newest non-terminal row
 for a card across runs. Hooks are module-level `@hook(..., tags={"subtask"})` and
-find the run's `Store` in a map owned by `runtime/engine.py`, keyed by agent name.
+find the run (store, subtask, workflow, stop) through a `ContextVar` that
+`runtime/engine.py` sets around `run()`; with no run set they do nothing.
 
 - `BEFORE_TURN`: stop set → save `parked`, raise `Parked`; else save `turn`.
 - After `run()` ends: `done`, or `escalated` when `Escalated` or any other
