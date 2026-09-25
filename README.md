@@ -90,6 +90,8 @@ subtasks still to run are listed. `data.already_done` lists what will not run:
 `{"kind": "subtask", "id", "title", "story"}` for a done subtask of a story that
 still has work.
 
+`data.integrate` is the plan for [Integrate](#integrate), the step that runs after the last level: `{"branch", "worktree", "order"}`. `branch` is `<prefix>-integrate`, `worktree` is its worktree, `<repo>/.claude/worktrees/<prefix>-integrate`, and `order` lists `{"story", "tip"}` in the order the tips will be merged. It names every story that has subtasks, done or not, because Integrate merges them all. The preview creates neither the branch nor the worktree.
+
 Read the `base` column before a real run:
 
 - A story with no blocker inside the milestone has `root` equal to
@@ -117,17 +119,18 @@ milestone with it.
 
 A clean run exits 0, and `data` holds:
 
-- `done`: `true`.
+- `done`: `true`, reported only once [Integrate](#integrate) has merged every tip and passed its final check.
 - `run_id`: the run, for `am status <run_id>` and `am logs`.
 - `levels`: the stories this run had work for, as `{"level", "stories"}` with
   story ids.
 - `completed`: the subtask ids finished in this run, in order.
 - `tips`: `{"story", "tip"}` for every story in the milestone that has
-  subtasks, naming the branch its stack ends on.
+  subtasks, naming the branch its stack ends on. These are the branches
+  Integrate merged.
 - `warnings`: board writes that failed but did not stop the run, as text.
+- `integrated`: `{"branch", "worktree", "merged", "resolved"}`. `branch` is `<prefix>-integrate` and `worktree` is its worktree. `merged` lists, in merge order, the story ids whose tip is in `branch`, including tips an earlier run already merged. `resolved` lists the story ids whose conflict a resolver fixed in this run.
 
-Nothing is merged and nothing is pushed. The branches stay local and stacked,
-and the base branch does not move. Merging the tips is left to you.
+The tips are merged into `<prefix>-integrate` and nowhere else. The story branches stay local and stacked, the base branch does not move, and nothing is pushed. Merging the integration branch into the base branch is left to you (see [Integrate](#integrate)).
 
 #### Parallel runs
 
