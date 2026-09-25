@@ -12,9 +12,12 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from agent_manager.workflow import loader
 
 
 class WorkflowError(ValueError):
@@ -145,3 +148,59 @@ class Workflow:
                          repr(p.retry), p.writes or "-", str(p.timeout), repr(p.on_fail)]
             h.update("\x1f".join(parts).encode() + b"\x1e")
         return h.hexdigest()
+
+
+def from_loader(loaded: loader.Workflow, *, timeout: timedelta = timedelta(minutes=30)) -> Workflow:
+    """A resolved `workflow.loader.Workflow` as phase-model data. Side by side only (G7).
+
+    Pure: nothing is read or written, and `loaded` is left as it was. Every
+    `run`, `when` and gate name goes through `loaded.function(name)`, never a
+    registry, so whatever callable the loaded workflow holds -- a fake from a
+    test registry included -- is carried through by identity, and a name it
+    never resolved raises the loader's own `UnknownFunctionError`. `timeout`
+    is put on every agent phase.
+
+    Two things the loader accepts cannot be expressed here and are refused
+    with a `WorkflowError` naming the phase rather than silently dropped: a
+    `result:` name with no model in `results.RESULT_MODELS`, and `when` or
+    `skip_to` on an agent phase (`AgentPhase` has no field for either).
+    """
+    from agent_manager import results
+    from agent_manager.workflow.loader import DeterministicPhase
+
+    out: list[Step | AgentPhase] = []
+    for p in loaded.phases:
+        if isinstance(p, DeterministicPhase):
+            out.append(Step(
+                p.name,
+                loaded.function(p.run),
+                dict(p.args),
+                tuple(loaded.function(name) for name in p.gates),
+                p.best_effort,
+                loaded.function(p.when) if p.when is not None else None,
+                p.skip_to,
+            ))
+            continue
+        if p.when is not None or p.skip_to is not None:
+            raise WorkflowError(
+                "an agent phase cannot carry `when` or `skip_to`; "
+                "only a deterministic step can skip",
+                phase=p.name,
+            )
+        if p.result is not None and p.result not in results.RESULT_MODELS:
+            raise WorkflowError(
+                f"result {p.result!r} is not a known result model "
+                f"(known: {', '.join(sorted(results.RESULT_MODELS))})",
+                phase=p.name,
+            )
+        out.append(AgentPhase(
+            p.name,
+            p.role,
+            tuple(p.inputs),
+            results.RESULT_MODELS[p.result] if p.result is not None else None,
+            tuple(loaded.function(name) for name in p.gates),
+            Retry(p.retry.max_attempts, tuple(p.retry.on)) if p.retry is not None else None,
+            p.writes,
+            timeout,
+        ))
+    return Workflow(loaded.name, tuple(out))
