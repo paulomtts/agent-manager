@@ -15,7 +15,9 @@ each story's implement write the files a scenario needs, keyed by the brief's
 """
 
 import json
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from agent_manager import cli, models, store
@@ -27,6 +29,77 @@ SHARED = "shared.txt"
 BASE_LINE = "the line both stories rewrite\n"
 A_LINE = "story A rewrote this line\n"
 B_LINE = "story B rewrote this line\n"
+
+CALC_SOURCE = "def add(a, b):\n    return a + b\n"
+
+TEST_CALC_SOURCE = (
+    "from calc import add\n"
+    "\n"
+    "\n"
+    "def test_add():\n"
+    "    assert add(2, 3) == 5\n"
+)
+
+RENAMED_CALC_SOURCE = "def plus(a, b):\n    return a + b\n"
+"""Story A renames `add` to `plus`..."""
+
+RENAMED_TEST_SOURCE = (
+    "from calc import plus\n"
+    "\n"
+    "\n"
+    "def test_plus():\n"
+    "    assert plus(2, 3) == 5\n"
+)
+"""...and updates the base test that used the old name."""
+
+EXTRA_TEST_SOURCE = (
+    "from calc import add\n"
+    "\n"
+    "\n"
+    "def test_add_negative():\n"
+    "    assert add(-1, 1) == 0\n"
+)
+"""Story B adds a test that imports the old name: green on base, red once A lands."""
+
+CHECK_SOURCE = '''"""A stdlib-only suite runner: every test_* function in every test_*.py here."""
+import importlib
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+failed = []
+ran = 0
+for path in sorted(ROOT.glob("test_*.py")):
+    try:
+        module = importlib.import_module(path.stem)
+    except Exception as error:
+        print(f"{path.name}: {type(error).__name__}: {error}", file=sys.stderr)
+        failed.append(f"{path.name} ({type(error).__name__})")
+        continue
+    for name, test in sorted(vars(module).items()):
+        if name.startswith("test_") and callable(test):
+            ran += 1
+            try:
+                test()
+            except Exception as error:
+                print(f"{path.name}::{name}: {type(error).__name__}: {error}", file=sys.stderr)
+                failed.append(f"{path.name}::{name} ({type(error).__name__})")
+if failed:
+    print("check.py: FAILED " + ", ".join(failed), file=sys.stderr)
+    sys.exit(1)
+if ran == 0:
+    print("check.py: FAILED no test ran", file=sys.stderr)
+    sys.exit(1)
+print(f"check.py: {ran} passed")
+'''
+"""The repo's own suite. It does not depend on `pytest` being on the child's
+`PATH`, and it writes no bytecode, so it never dirties a worktree."""
+
+CHECK_COMMAND = shlex.join([sys.executable, "-B", "check.py"])
+"""`verify.run_suite` splits with `shlex.split` and runs without a shell, so
+the interpreter path is quoted."""
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -122,6 +195,13 @@ def _same_line_setup(board: dict) -> str:
     main_before = _seed(board["root"], {SHARED: BASE_LINE})
     _write_edits(board, {"A": {SHARED: A_LINE}, "B": {SHARED: B_LINE}})
     return main_before
+
+
+def _check(cwd: Path) -> subprocess.CompletedProcess:
+    """Run the repo's own suite in `cwd`, the way the verify phase does."""
+    return subprocess.run(
+        [sys.executable, "-B", "check.py"], cwd=cwd, capture_output=True, text=True
+    )
 
 
 def test_this_module_runs_in_the_default_suite_unmarked(request):
@@ -312,4 +392,53 @@ def test_relaunching_an_integrated_milestone_moves_no_branch(
     assert "resolve" not in _phases(read_fake_log(data["run_id"]))
     assert not _merge_in_progress(worktree)
     assert _git(worktree, "status", "--porcelain") == ""
+    _assert_base_untouched(root, main_before)
+
+
+def test_a_clean_merge_that_breaks_the_suite_escalates_at_integrate(
+    two_story_board, run_milestone_cli, read_fake_log
+):
+    """Scenario 4: each story is green alone; together the suite is red."""
+    root = two_story_board["root"]
+    subtasks = two_story_board["subtasks"]
+    branches = two_story_board["branches"]
+    main_before = _seed(
+        root,
+        {"calc.py": CALC_SOURCE, "test_calc.py": TEST_CALC_SOURCE, "check.py": CHECK_SOURCE},
+    )
+    assert _check(root).returncode == 0  # the base is green
+    _write_edits(
+        two_story_board,
+        {
+            "A": {"calc.py": RENAMED_CALC_SOURCE, "test_calc.py": RENAMED_TEST_SOURCE},
+            "B": {"test_calc_extra.py": EXTRA_TEST_SOURCE},
+        },
+    )
+
+    result = run_milestone_cli(root, two_story_board["milestone"], verify=[CHECK_COMMAND])
+
+    assert result.exit_code == cli.EXIT_ESCALATED, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["escalated"] is True, data
+    assert data["phase"] == "integrate"
+    assert data["story"] is None  # the final verification, not a tip
+    assert data["files"] == []
+    assert "check.py" in data["detail"]
+    assert "test_calc_extra.py" in data["detail"]
+    assert "integrated" not in data
+
+    worktree = _integration_worktree(root)
+    assert not _merge_in_progress(worktree)
+    for key in ("A", "B"):
+        branch = branches[subtasks[key][0]]
+        assert _is_ancestor(root, branch, INTEGRATION_BRANCH), key
+        # Each story passed its own verify phase, and is still green alone.
+        assert _check(cli.worktree_for(root, branch)).returncode == 0, key
+    red = _check(worktree)
+    assert red.returncode != 0
+    assert "test_calc_extra.py" in red.stderr
+
+    # The merge was textually clean, so no resolver was ever dispatched.
+    assert "resolve" not in _phases(read_fake_log(data["run_id"]))
+    assert _load_run(root, data["run_id"]).status == "escalated"
     _assert_base_untouched(root, main_before)

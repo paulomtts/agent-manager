@@ -442,7 +442,12 @@ def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """
     runner = CliRunner()
 
-    def invoke(root: Path, milestone: str, max_concurrent: int | None = None):
+    def invoke(
+        root: Path,
+        milestone: str,
+        max_concurrent: int | None = None,
+        verify: Sequence[str] | None = None,
+    ):
         argv = [
             "run",
             "--milestone",
@@ -454,7 +459,9 @@ def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
             "--branch-prefix",
             MILESTONE_PREFIX,
         ]
-        for command in VERIFY_COMMANDS:
+        # `None` keeps existing callers' argv byte-identical.
+        commands = VERIFY_COMMANDS if verify is None else tuple(verify)
+        for command in commands:
             argv += ["--verify", command]
         # Only when asked: existing callers keep their exact argv.
         if max_concurrent is not None:
