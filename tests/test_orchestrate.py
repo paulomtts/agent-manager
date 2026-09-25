@@ -217,6 +217,22 @@ def test_a_lone_escalation_payload_is_exactly_the_sequential_one():
     }
 
 
+def test_an_unnamed_primary_falls_back_to_the_first_escalation_in_census_order():
+    first = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=1, subtask="a1", failed_phase="review", detail="x"
+    )
+    second = orchestrate.LaneOutcome(
+        kind="escalated", story="B", level=1, subtask="b1", failed_phase="verify", detail="y"
+    )
+
+    payload = orchestrate.escalated_payload("run-1", None, [first, second], [])
+
+    assert (payload["story"], payload["subtask"]) == ("A", "a1")
+    assert payload["also_escalated"] == [
+        {"level": 1, "story": "B", "subtask": "b1", "failed_phase": "verify", "detail": "y"}
+    ]
+
+
 # ── the runner, on a real repo and a real board ─────────────────────────────
 
 
