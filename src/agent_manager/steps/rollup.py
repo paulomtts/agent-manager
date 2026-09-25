@@ -17,6 +17,13 @@ port of `rollupStatus`/`storedStatus` from leave-me-alone's `scripts/rollup.mjs`
 Nothing is cached: every parent is read fresh, because sibling work can change
 a shared ancestor between one level and the next.
 
+The whole call -- the card's write and every level of the walk -- runs under
+`board.WRITE_LOCK`, one critical section, because a rollup reads, then
+modifies, then writes. Concurrent calls on sibling subtasks in one process
+therefore run one after another, and the last one sees every sibling's final
+status. The lock is reentrant, so the nested `board.set_status` calls re-take
+it on the same thread.
+
 The first parameter is named `card`, not `card_id`, because the engine binds
 arguments by parameter name out of the run context and the context key holding
 the bare id string is `card` (`engine.py:98`, `bind_arguments` at
@@ -79,6 +86,12 @@ def set_status(
     stale by an interrupted earlier run is repaired. More than
     `MAX_ANCESTRY_DEPTH` ancestors raises `board.BoardError`.
 
+    All of it -- the card's write and the whole walk -- holds
+    `board.WRITE_LOCK`, so a concurrent call on a sibling cannot interleave
+    its reads and writes with this one. The lock is released by a `with`
+    block, so a `board.BoardError` from anywhere inside, the depth guard
+    included, never leaves it held.
+
     Idempotency is inherited, not implemented: `brd update --status` stores the
     value it is given, so a repeated identical call is another successful write
     of the same card and, with the ancestors already correct, writes none of
@@ -99,25 +112,31 @@ def set_status(
     process boundary, so it needs no pydantic model (`CLAUDE.md`).
     """
     path = Path(repo_dir) if repo_dir is not None else None
-    written = board.set_status(card, status, repo_dir=path)
+    with board.WRITE_LOCK:
+        written = board.set_status(card, status, repo_dir=path)
 
-    rolled_up: list[dict[str, str]] = []
-    current = written.id
-    depth = 0
-    while True:
-        parent_id = board.show(current, repo_dir=path).parent_id
-        if not parent_id:
-            break
-        depth += 1
-        if depth > MAX_ANCESTRY_DEPTH:
-            raise board.BoardError(
-                "exceeded maximum ancestry depth", argv=board.show_argv(current)
-            )
-        node = board.tree(parent_id, repo_dir=path)
-        target = rollup_status(child.status for child in node.children)
-        if target is not None and stored_status(node.status) != target:
-            parent = board.set_status(parent_id, target, repo_dir=path)
-            rolled_up.append({"card": parent.id, "status": parent.status})
-        current = parent_id
+        rolled_up: list[dict[str, str]] = []
+        current = written.id
+        depth = 0
+        while True:
+            parent_id = board.show(current, repo_dir=path).parent_id
+            if not parent_id:
+                break
+            depth += 1
+            if depth > MAX_ANCESTRY_DEPTH:
+                raise board.BoardError(
+                    "exceeded maximum ancestry depth",
+                    argv=board.show_argv(current),
+                )
+            node = board.tree(parent_id, repo_dir=path)
+            target = rollup_status(child.status for child in node.children)
+            if target is not None and stored_status(node.status) != target:
+                parent = board.set_status(parent_id, target, repo_dir=path)
+                rolled_up.append({"card": parent.id, "status": parent.status})
+            current = parent_id
 
-    return {"card": written.id, "status": written.status, "rolled_up": rolled_up}
+        return {
+            "card": written.id,
+            "status": written.status,
+            "rolled_up": rolled_up,
+        }

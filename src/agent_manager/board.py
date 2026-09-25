@@ -6,6 +6,12 @@ written to the board (decision D5, design §9) -- run state lives in
 agent-manager's own SQLite projection and journal, so `set_status` is the
 module's entire write surface.
 
+Writes are serialized within one process: `set_status` runs under the
+module-level `WRITE_LOCK`, a reentrant lock that `steps/rollup.py` also holds
+around its whole read-modify-write walk up a card's ancestors. Reads take no
+lock. Nothing here coordinates two separate `am` processes on one repository;
+that is not supported.
+
 Every invocation is an argument list handed to `subprocess`. Design §5 line 252
 is explicit that the program runs commands itself with argument lists, so
 `shell_quote` from the shell-script original does not port and there is no
@@ -17,6 +23,7 @@ Naming, slugs, branches and ref matching are `dag.py`'s job, not this module's.
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 from typing import TypeVar
 
@@ -28,6 +35,15 @@ M = TypeVar("M", bound=BaseModel)
 
 BRD = "brd"
 """Executable name, resolved on PATH. Argv element zero of every call."""
+
+WRITE_LOCK = threading.RLock()
+"""Serializes board writes across threads of one process.
+
+Held for the whole of `set_status`, and by `steps/rollup.py` around its entire
+ancestor walk, so a rollup's read-modify-write is one critical section.
+Reentrant because the walk calls `set_status` again on the same thread. Reads
+(`show`, `tree`, `roots`) do not take it.
+"""
 
 
 class BoardError(RuntimeError):
@@ -235,8 +251,14 @@ def set_status(
     write of the same value. Resume re-runs whole phases, and the phases that
     call this are `best_effort`, so a spurious second-call failure would be
     journalled as a board-write failure for work that actually succeeded.
+
+    Runs entirely under `WRITE_LOCK`, so concurrent writers in one process
+    reach brd one at a time.
     """
     argv = set_status_argv(card_id, status)
-    completed = _run(argv, repo_dir)
-    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
-    return _validated(models.Card, data, argv=argv)
+    with WRITE_LOCK:
+        completed = _run(argv, repo_dir)
+        data = _decode(
+            completed.stdout, argv=argv, exit_code=completed.returncode
+        )
+        return _validated(models.Card, data, argv=argv)
