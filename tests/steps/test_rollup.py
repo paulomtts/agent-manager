@@ -325,6 +325,60 @@ def test_the_whole_rollup_walk_runs_under_the_board_lock(temp_board, monkeypatch
     assert not _write_lock_held_by_another_thread()
 
 
+class _CountingRLock:
+    """A real RLock that counts how often it goes from free to held.
+
+    Every acquire and release is delegated, so locking behaves exactly as
+    before; the count exposes whether a call was one critical section or
+    several back to back.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._depth = 0
+        self.outermost_acquisitions = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        got = self._lock.acquire(blocking, timeout)
+        if got:
+            if self._depth == 0:
+                self.outermost_acquisitions += 1
+            self._depth += 1
+        return got
+
+    def release(self) -> None:
+        self._depth -= 1
+        self._lock.release()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
+@requires_brd
+def test_the_card_write_and_whole_walk_are_one_critical_section(
+    temp_board, monkeypatch
+):
+    # Holding the lock per board call, or per level of the walk, would let a
+    # sibling's rollup slip in between; the lock must be taken exactly once.
+    milestone = _add_card(temp_board, "Milestone 4")
+    story = _add_card(temp_board, "Serialize the shared resources", milestone)
+    subtask = _add_card(temp_board, "Serialize board writes", story)
+    counting = _CountingRLock()
+    monkeypatch.setattr(board, "WRITE_LOCK", counting)
+
+    result = rollup.set_status(subtask, "done", repo_dir=temp_board)
+
+    # Three writes happened: the subtask, the story and the milestone.
+    assert result["rolled_up"] == [
+        {"card": story, "status": "done"},
+        {"card": milestone, "status": "done"},
+    ]
+    assert counting.outermost_acquisitions == 1
+
+
 @requires_brd
 def test_a_failed_rollup_releases_the_board_lock(temp_board):
     with pytest.raises(board.BoardError):
