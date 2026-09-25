@@ -132,6 +132,46 @@ A clean run exits 0, and `data` holds:
 
 The tips are merged into `<prefix>-integrate` and nowhere else. The story branches stay local and stacked, the base branch does not move, and nothing is pushed. Merging the integration branch into the base branch is left to you (see [Integrate](#integrate)).
 
+#### Integrate
+
+After the last level, the run merges every story's tip into one local branch, `<prefix>-integrate`, and checks the result once. This step is Integrate. It runs only when every level finished clean: an escalation or a stop ends the run before it. It also runs when there was nothing left to drive, so every relaunch of the milestone runs it again.
+
+Where, and in what order:
+
+- The branch is `<prefix>-integrate` (with `--branch-prefix m3`, `m3-integrate`), and its worktree is `<repo>/.claude/worktrees/<prefix>-integrate`. The branch is cut from the base branch the first time and reused after that.
+- Tips are merged one at a time. The order goes by dependency level over every story of the milestone, done or not, and follows the census order within a level. A story with no subtasks has no branch of its own and is skipped. `--dry-run` shows the exact order in `data.integrate.order`.
+
+How each tip is merged:
+
+- A tip that merges cleanly is merged with `git merge --no-ff`, and no agent is dispatched. A tip the branch already contains is skipped, so running Integrate again never merges anything twice.
+- A tip that conflicts is left mid-merge, and a resolver agent (role `resolver`) is dispatched into the integration worktree with the tip and the list of conflicting files. It runs the builtin `integrate` workflow: a `resolve` phase, then a `verify` phase that runs your `--verify` commands. In `am status <run_id>` the resolver shows up as a story titled `Integrate`, with one subtask per conflicting story.
+- Git decides whether the resolver finished, not the resolver's own report. The merge counts as finished only when no merge is in progress (no `MERGE_HEAD`), `git status` is clean, and no file the merge touched still holds conflict markers. `resolve` gets 2 attempts. A resolver that does not finish escalates, and the merge is left in progress for you.
+
+After the last tip, the `--verify` commands run once on the integrated branch. Two stories that each pass alone can still break the suite together, even when git merged them without a conflict, and that failure escalates here. With `--allow-no-verification` and no `--verify`, this check is skipped.
+
+A clean Integrate is what lets the run report `done`, with an `integrated` key (see [What a clean run leaves behind](#what-a-clean-run-leaves-behind)). A failed one is an escalation (see [What an escalation report contains](#what-an-escalation-report-contains)).
+
+`am` never merges into the base branch and never pushes. Review `<prefix>-integrate`, then merge it yourself from a checkout of the base branch:
+
+```bash
+git switch master
+git merge m3-integrate
+```
+
+After an Integrate escalation:
+
+1. Open the integration worktree, `<repo>/.claude/worktrees/<prefix>-integrate`. The report's `detail` names it.
+2. Finish or fix the merge there: resolve the conflicts, `git add` the files and `git commit`. When the final check failed instead, commit a fix on the branch.
+3. Relaunch the same `am run --milestone` command. Every story is already `done`, so only Integrate runs: tips already merged are skipped, and the final check runs again.
+
+Commit before you relaunch. Integrate will not start a merge while another is in progress in its worktree. It escalates again, with a `detail` saying a merge is already in progress, and touches nothing.
+
+Limits, stated plainly:
+
+- **A resolver can misjudge what two edits meant**, even when the result compiles and passes. The final check narrows that risk but does not remove it, so review the integration branch before you merge it, as with every branch here.
+- **Merges are sequential.** There is one integration worktree, so tips are merged one after another, and `--max-concurrent` does not apply.
+- **Nothing batches them.** A milestone with hundreds of stories means hundreds of sequential merges.
+
 #### Parallel runs
 
 `--max-concurrent N` bounds how many stories of one level run at once. It
