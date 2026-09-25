@@ -274,3 +274,42 @@ def test_a_resolver_that_does_not_finish_escalates_and_a_human_finish_lets_the_r
     assert "resolve" not in _phases(read_fake_log(done["run_id"]))
     assert _load_run(root, done["run_id"]).status == "done"
     _assert_base_untouched(root, main_before)
+
+
+def test_relaunching_an_integrated_milestone_moves_no_branch(
+    two_story_board, run_milestone_cli, read_fake_log
+):
+    """Scenario 5: after a resolved Integrate, a relaunch re-merges nothing."""
+    root = two_story_board["root"]
+    milestone = two_story_board["milestone"]
+    stories = two_story_board["stories"]
+    subtasks = two_story_board["subtasks"]
+    branches = two_story_board["branches"]
+    main_before = _same_line_setup(two_story_board)
+    worktree = _integration_worktree(root)
+
+    first = run_milestone_cli(root, milestone)
+
+    assert first.exit_code == 0, (first.output, first.exception)
+    first_data = _envelope(first)
+    assert first_data["integrated"]["resolved"] == [stories["B"]]  # non-vacuity
+    watched = [INTEGRATION_BRANCH, "main", branches[subtasks["A"][0]], branches[subtasks["B"][0]]]
+    tips_before = {ref: _git(root, "rev-parse", ref).strip() for ref in watched}
+
+    second = run_milestone_cli(root, milestone)
+
+    assert second.exit_code == 0, (second.output, second.exception)
+    data = _envelope(second)
+    assert data["done"] is True, data
+    assert data["run_id"] != first_data["run_id"]
+    assert data["integrated"] == {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(worktree),
+        "merged": [stories["A"], stories["B"]],
+        "resolved": [],
+    }
+    assert {ref: _git(root, "rev-parse", ref).strip() for ref in watched} == tips_before
+    assert "resolve" not in _phases(read_fake_log(data["run_id"]))
+    assert not _merge_in_progress(worktree)
+    assert _git(worktree, "status", "--porcelain") == ""
+    _assert_base_untouched(root, main_before)
