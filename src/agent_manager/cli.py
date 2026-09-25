@@ -866,11 +866,12 @@ def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, 
 def dry_run_payload(
     stories: Sequence[census.StoryPlan],
     *,
+    repo_dir: Path,
     branch_prefix: str,
     base_branch: str,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
-    """O3's preview: dispatch levels with each subtask's branch and base.
+    """O3's preview: dispatch levels with each subtask's branch and base, then Integrate.
 
     Pure over the census, and every derivation belongs to `dag`. The cycle
     check runs first because a cycle is what breaks the geometry, and
@@ -882,7 +883,16 @@ def dry_run_payload(
     still anchors the second. `max_concurrent` is echoed at the top, and each
     level row says how many of its stories would run together:
     `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
+
+    `integrate` is the terminal phase's plan (Integrate addendum I6): the
+    branch every tip is merged into, its worktree under `repo_dir`, and the
+    merge order `integration.merge_order` gives -- every story with subtasks,
+    done or not. `repo_dir` is only joined onto, never read.
     """
+    # `integration` imports this module at load time, so importing it at the
+    # top of this module would be circular. By call time both are loaded.
+    from agent_manager import integration
+
     stories = list(stories)
     dag.assert_no_blocker_cycles(stories)
     levels = dag.compute_levels(stories)
@@ -918,10 +928,21 @@ def dry_run_payload(
                 "stories": story_rows,
             }
         )
+    integrate_branch = integration.integration_branch(branch_prefix)
     return {
         "max_concurrent": max_concurrent,
         "levels": level_rows,
         "already_done": already_done_entries(stories),
+        "integrate": {
+            "branch": integrate_branch,
+            "worktree": str(worktree_for(repo_dir, integrate_branch)),
+            "order": [
+                {"story": story.id, "tip": tip}
+                for story, tip in integration.merge_order(
+                    stories, branch_prefix, base_branch
+                )
+            ],
+        },
     }
 
 
@@ -937,14 +958,15 @@ def dry_run_milestone(
 
     Read-only by construction. The two `brd` reads are its only I/O. No
     `Store` is opened (that would mint a run directory), no runner is built,
-    and nothing is fetched, pruned, branched or written to the board. Every
-    refusal is a type already in `HANDLED`.
+    and nothing is fetched, pruned, branched, merged or written to the board.
+    The Integrate plan is derived, never run. Every refusal is a type already in `HANDLED`.
     """
     root = resolve_repo_dir(repo_dir)
     milestone = census.find_milestone(board.roots(repo_dir=root), needle)
     plan = census.flatten_milestone(board.tree(milestone.id, repo_dir=root))
     return dry_run_payload(
         plan.stories,
+        repo_dir=root,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
         max_concurrent=max_concurrent,

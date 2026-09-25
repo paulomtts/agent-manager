@@ -11,6 +11,7 @@ loaded here by path rather than imported by name, because `tests/e2e` is not on
 `sys.path` under `--import-mode=importlib`.
 """
 
+import ast
 import importlib.util
 import json
 import subprocess
@@ -20,12 +21,30 @@ from pathlib import Path
 import pytest
 
 from agent_manager.steps.reducers import review_gate
+from agent_manager.steps.integrate import merge_completed_gate
 
 _SOURCE = Path(__file__).with_name("fake_claude.py")
 _spec = importlib.util.spec_from_file_location("e2e_fake_claude", _SOURCE)
 assert _spec is not None and _spec.loader is not None
 fake_claude = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fake_claude)
+
+_CONFTEST = Path(__file__).with_name("conftest.py")
+
+
+def _conftest_constant(name):
+    """A module-level literal from `tests/e2e/conftest.py`, read without importing it.
+
+    `--import-mode=importlib` puts nothing on `sys.path`, so conftest names are
+    not importable; parsing the file is how the twins are pinned to each other.
+    """
+    tree = ast.parse(_CONFTEST.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"tests/e2e/conftest.py defines no {name}")
 
 
 def test_the_prompt_path_is_parsed_out_of_the_adapters_p_sentence():
@@ -762,3 +781,426 @@ def test_a_rendezvous_failure_makes_the_fake_process_exit_1(tmp_path, monkeypatc
     assert completed.returncode == 1
     assert "FAKE_CLAUDE_RENDEZVOUS_COUNT" in completed.stderr
     assert not result_path.exists()
+
+
+IMPLEMENT_BRANCH = "m3/task-a1-00000001"
+OTHER_BRANCH = "m3/task-b1-00000002"
+
+
+def _implement_on_branch(repo, branch=IMPLEMENT_BRANCH):
+    """An implement brief that carries `## branch`, as `builtin/task.yaml` renders it."""
+    text = _implement_brief_text(BRIEF_HASH) + f"\n## branch\n{branch}\n"
+    return fake_claude.build_result(
+        "implement", fake_claude.payload_from_schema(IMPLEMENT_SCHEMA), text, repo
+    )
+
+
+def _write_edits(repo, table):
+    (repo / ".git" / fake_claude.IMPLEMENT_EDITS_MARKER).write_text(
+        json.dumps(table), encoding="utf-8"
+    )
+
+
+def _show(repo, spec):
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", spec],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_the_implement_edits_marker_name_is_the_conftest_twin():
+    """The fixture writes `FAKE_IMPLEMENT_EDITS_MARKER`; the script reads
+    `IMPLEMENT_EDITS_MARKER`. They meet across a process boundary."""
+    assert fake_claude.IMPLEMENT_EDITS_MARKER == "fake-claude-implement-edits"
+    assert fake_claude.IMPLEMENT_EDITS_MARKER == _conftest_constant(
+        "FAKE_IMPLEMENT_EDITS_MARKER"
+    )
+
+
+def test_the_marker_entry_for_the_briefs_branch_is_written_and_committed(tmp_path):
+    repo = _implement_repo(tmp_path)
+    _write_edits(
+        repo,
+        {
+            IMPLEMENT_BRANCH: {"shared.txt": "story A\n", "pkg/nested.txt": "deep\n"},
+            OTHER_BRANCH: {"shared.txt": "story B\n"},
+        },
+    )
+
+    payload = _implement_on_branch(repo)
+
+    assert payload["resumed"] is False
+    assert _show(repo, "HEAD:shared.txt") == "story A\n"
+    assert _show(repo, "HEAD:pkg/nested.txt") == "deep\n"
+    assert _show(repo, f"HEAD:{fake_claude.IMPLEMENTATION_NAME}")  # still written
+    assert _porcelain(repo) == ""
+
+
+def test_a_marker_entry_for_another_branch_writes_nothing_extra(tmp_path):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {OTHER_BRANCH: {"shared.txt": "story B\n"}})
+
+    payload = _implement_on_branch(repo)
+
+    assert payload["resumed"] is False
+    assert not (repo / "shared.txt").exists()
+    assert _porcelain(repo) == ""
+
+
+def test_a_marker_with_no_branch_section_in_the_brief_stops_the_fake(tmp_path):
+    """Review focus: the edits are keyed by the brief's `## branch`. A brief
+    without it must fail loudly, never quietly skip the edits."""
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: {"shared.txt": "story A\n"}})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement(repo)
+
+    assert "branch" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+
+
+@pytest.mark.parametrize("relative", ["../outside.txt", "/tmp/absolute.txt", ""])
+def test_a_marker_path_outside_the_worktree_is_refused_before_any_write(
+    tmp_path, relative
+):
+    """Review focus: a typo in a test must not write outside the worktree."""
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: {relative: "nope\n"}})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not a path inside the worktree" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_a_marker_that_is_not_json_is_refused(tmp_path):
+    repo = _implement_repo(tmp_path)
+    (repo / ".git" / fake_claude.IMPLEMENT_EDITS_MARKER).write_text(
+        "{not json", encoding="utf-8"
+    )
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not valid JSON" in str(caught.value)
+
+
+@pytest.mark.parametrize("table", [[], "a string", 1])
+def test_a_marker_that_is_not_an_object_of_branches_is_refused(tmp_path, table):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, table)
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not a JSON object of branches" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+
+
+@pytest.mark.parametrize(
+    "entry", [["shared.txt"], "shared.txt", {"shared.txt": 1}, {"shared.txt": None}]
+)
+def test_a_marker_entry_that_is_not_path_to_content_strings_is_refused(
+    tmp_path, entry
+):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: entry})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "is not an object of path -> content strings" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+    assert not (repo / "shared.txt").exists()
+
+
+def test_both_sides_of_a_hunk_are_kept_ours_then_theirs():
+    text = "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\nbottom\n"
+
+    assert fake_claude.keep_both_sides(text) == "top\nours\ntheirs\nbottom\n"
+
+
+def test_a_diff3_base_section_is_dropped():
+    text = (
+        "<<<<<<< HEAD\nours\n||||||| merged common ancestors\nbase\n"
+        "=======\ntheirs\n>>>>>>> side\n"
+    )
+
+    assert fake_claude.keep_both_sides(text) == "ours\ntheirs\n"
+
+
+def test_every_hunk_in_a_file_is_rewritten():
+    text = (
+        "<<<<<<< HEAD\none\n=======\nuno\n>>>>>>> side\n"
+        "middle\n"
+        "<<<<<<< HEAD\ntwo\n=======\ndos\n>>>>>>> side\n"
+    )
+
+    assert fake_claude.keep_both_sides(text) == "one\nuno\nmiddle\ntwo\ndos\n"
+
+
+def test_an_underline_outside_a_hunk_is_kept():
+    """Review focus: `=======` is a markdown/rst underline as often as a marker;
+    it only counts inside a hunk."""
+    text = "Title\n=======\n\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\n"
+
+    assert fake_claude.keep_both_sides(text) == "Title\n=======\n\nours\ntheirs\n"
+
+
+def test_crlf_lines_keep_their_endings():
+    text = "<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> side\r\n"
+
+    assert fake_claude.keep_both_sides(text) == "ours\r\ntheirs\r\n"
+
+
+def test_a_file_with_no_hunk_is_unchanged():
+    assert fake_claude.keep_both_sides("plain\ntext\n") == "plain\ntext\n"
+
+
+def test_an_unclosed_hunk_is_refused_rather_than_truncated():
+    """Review focus: half a rewrite would commit a file missing its tail."""
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.keep_both_sides("<<<<<<< HEAD\nours\n=======\ntheirs\n")
+
+    assert "never closed" in str(caught.value)
+
+
+RESOLVE_SCHEMA = {
+    "properties": {
+        "resolved": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "type": "object",
+}
+"""`results.ResolveResult`'s shape, written out for the same reason as
+`IMPLEMENT_SCHEMA`."""
+
+SIDE_BRANCH = "m3/task-b1-00000002"
+CONFLICT_FILES = '[\n  "shared.txt"\n]'
+"""`prompt._inline_json`'s multi-line rendering of `["shared.txt"]`."""
+
+
+def _git_ok(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _merge_head_exists(repo):
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def _conflicted_repo(tmp_path, style="merge"):
+    """A real repo stopped mid-merge: `main` says `ours`, `SIDE_BRANCH` says `theirs`.
+
+    The conflict style is set in the repo's own config, so a developer's global
+    `merge.conflictStyle` cannot change which markers the test sees.
+    """
+    repo = _implement_repo(tmp_path)
+    _git_ok(repo, "config", "merge.conflictStyle", style)
+    (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+    _git_ok(repo, "add", "shared.txt")
+    _git_ok(repo, "commit", "-m", "base line")
+    _git_ok(repo, "checkout", "-b", SIDE_BRANCH)
+    (repo / "shared.txt").write_text("theirs\n", encoding="utf-8")
+    _git_ok(repo, "commit", "-am", "theirs")
+    _git_ok(repo, "checkout", "main")
+    (repo / "shared.txt").write_text("ours\n", encoding="utf-8")
+    _git_ok(repo, "commit", "-am", "ours")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "--no-edit", SIDE_BRANCH],
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode != 0, merge.stdout  # non-vacuity: a real conflict
+    assert _merge_head_exists(repo)
+    return repo
+
+
+def _resolve_brief_text(tip=SIDE_BRANCH, files=CONFLICT_FILES):
+    """A `resolve` brief shaped like `builtin/integrate.yaml` renders it."""
+    text = (
+        "# Resolver\n\nstanding instructions\n\n"
+        "# phase: resolve\n# role: resolver\n"
+        "\n## branch\nm3-integrate\n"
+        "\n## base_branch\nmain\n"
+    )
+    if tip is not None:
+        text += f"\n## merge_tip\n{tip}\n"
+    if files is not None:
+        text += f"\n## conflict_files\n{files}\n"
+    return text
+
+
+def _resolve(repo, **brief):
+    return fake_claude.build_result(
+        "resolve",
+        fake_claude.payload_from_schema(RESOLVE_SCHEMA),
+        _resolve_brief_text(**brief),
+        repo,
+    )
+
+
+def test_the_resolver_env_var_name_is_pinned():
+    assert fake_claude.RESOLVER_ENV == "FAKE_CLAUDE_RESOLVER"
+    assert fake_claude.RESOLVER_REFUSE == "refuse"
+
+
+@pytest.mark.parametrize("style", ["merge", "diff3", "zdiff3"])
+def test_the_resolver_keeps_both_sides_commits_and_the_real_gate_passes(
+    tmp_path, monkeypatch, style
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path, style)
+
+    payload = _resolve(repo)
+
+    assert payload == {"resolved": True, "summary": fake_claude.SUMMARY}
+    assert (repo / "shared.txt").read_text(encoding="utf-8") == "ours\ntheirs\n"
+    assert not _merge_head_exists(repo)
+    assert _porcelain(repo) == ""
+    parents = _git_ok(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert len(parents) == 3  # a real merge commit: itself plus two parents
+    assert merge_completed_gate(payload, repo) is None
+
+
+def test_an_empty_resolver_env_value_means_resolve(tmp_path, monkeypatch):
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, "")
+    repo = _conflicted_repo(tmp_path)
+
+    _resolve(repo)
+
+    assert not _merge_head_exists(repo)
+
+
+def test_a_refusing_resolver_claims_resolved_but_git_still_says_no(
+    tmp_path, monkeypatch
+):
+    """Addendum I3: `resolved` is advisory. Refuse mode lies, and the production
+    gate, which only asks git, blocks it."""
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, fake_claude.RESOLVER_REFUSE)
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+    head = _head(repo)
+
+    payload = _resolve(repo)
+
+    assert payload == {"resolved": True, "summary": fake_claude.REFUSE_SUMMARY}
+    assert _merge_head_exists(repo)
+    assert (repo / "shared.txt").read_bytes() == before
+    assert b"<<<<<<< " in before
+    assert _head(repo) == head
+    verdict = merge_completed_gate(payload, repo)
+    assert verdict is not None and "MERGE_HEAD" in verdict["detail"]
+
+
+def test_an_unknown_resolver_env_value_fails_the_fake_and_touches_nothing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, "refused")
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo)
+
+    assert fake_claude.RESOLVER_ENV in str(caught.value)
+    assert "refused" in str(caught.value)
+    assert _merge_head_exists(repo)
+    assert (repo / "shared.txt").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("missing", "brief"),
+    [("merge_tip", {"tip": None}), ("conflict_files", {"files": None})],
+)
+def test_a_resolve_brief_missing_a_section_fails_the_fake(
+    tmp_path, monkeypatch, missing, brief
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, **brief)
+
+    assert missing in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+@pytest.mark.parametrize(
+    "files", ["not json", '{"shared.txt": 1}', "[1]", '[""]', '"shared.txt"']
+)
+def test_a_malformed_conflict_files_section_fails_the_fake(
+    tmp_path, monkeypatch, files
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, files=files)
+
+    assert "conflict_files" in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+def test_a_merge_tip_that_is_not_merge_head_fails_the_fake(tmp_path, monkeypatch):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, tip="main")
+
+    assert "MERGE_HEAD" in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+def test_a_resolve_with_no_merge_in_progress_fails_the_fake(tmp_path, monkeypatch):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _implement_repo(tmp_path)
+    _git_ok(repo, "branch", SIDE_BRANCH)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo)
+
+    assert "MERGE_HEAD" in str(caught.value)
+
+
+def test_a_listed_conflict_file_that_is_not_there_fails_before_any_write(
+    tmp_path, monkeypatch
+):
+    """Review focus: nothing is rewritten or committed if one path is wrong."""
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, files='["shared.txt", "missing.txt"]')
+
+    assert "missing.txt" in str(caught.value)
+    assert (repo / "shared.txt").read_bytes() == before
+    assert _merge_head_exists(repo)
+
+
+def test_the_resolver_env_var_is_the_conftest_twin():
+    """The fixture sets `FAKE_RESOLVER_ENV`; the script reads `RESOLVER_ENV`."""
+    assert fake_claude.RESOLVER_ENV == _conftest_constant("FAKE_RESOLVER_ENV")

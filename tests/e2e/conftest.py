@@ -52,11 +52,35 @@ MILESTONE_PREFIX = "m3"
 FAKE_REVIEW_FAIL_MARKER = "fake-claude-review-fail"
 """Must equal `fake_claude.REVIEW_FAIL_MARKER`, which `test_fake_claude.py` pins."""
 
+FAKE_IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
+"""Must equal `fake_claude.IMPLEMENT_EDITS_MARKER`, which `test_fake_claude.py` pins.
+
+A JSON file in the repo's git common dir mapping a branch to
+`{relative path: full file content}`: what that branch's implement writes."""
+
+FAKE_RESOLVER_ENV = "FAKE_CLAUDE_RESOLVER"
+"""Must equal `fake_claude.RESOLVER_ENV`, which `test_fake_claude.py` pins."""
+
 FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 """Must equal `fake_claude.RENDEZVOUS_DIR_ENV`, which `test_fake_claude.py` pins."""
 
 FAKE_RENDEZVOUS_COUNT_ENV = "FAKE_CLAUDE_RENDEZVOUS_COUNT"
 """Must equal `fake_claude.RENDEZVOUS_COUNT_ENV`, which `test_fake_claude.py` pins."""
+
+FAKE_IMPLEMENTATION_NAME = "IMPLEMENTATION.md"
+"""Must equal `fake_claude.IMPLEMENTATION_NAME`: the one file the fake coder writes."""
+
+UNION_ATTRIBUTE = f"{FAKE_IMPLEMENTATION_NAME} merge=union\n"
+"""Git's built-in union merge driver for the fake coder's file.
+
+Integrate (card a74f2cd6) merges every story tip into one branch. On
+`parallel_board`, A and B are independent roots and the fake coder writes
+`IMPLEMENTATION.md` on both, so their tips would conflict and need a resolver
+the fake does not have (its `resolve` phase is sibling a37460b9's, as are the
+conflict scenarios). Written to the git common dir's `info/attributes`, it
+applies in every linked worktree, is in no tree and never shows in
+`git status`, and it tells the fake nothing: it only lets git fold the two
+versions, so these lane tests stay about lanes."""
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -309,6 +333,32 @@ def rendezvous(tmp_path, monkeypatch) -> Rendezvous:
     return Rendezvous(directory=tmp_path / "rendezvous", monkeypatch=monkeypatch)
 
 
+@dataclass
+class FakeResolver:
+    """Switches the fake's resolve phase between resolving and refusing for one test.
+
+    The env var goes through the test's own function-scoped `monkeypatch`, so it
+    is undone when the test ends. Child processes inherit it: `run_direct`
+    calls `Popen` with no `env=` (`harness/launcher.py:132`).
+    """
+
+    monkeypatch: pytest.MonkeyPatch
+
+    def refuse(self) -> None:
+        self.monkeypatch.setenv(FAKE_RESOLVER_ENV, "refuse")
+
+    def reset(self) -> None:
+        self.monkeypatch.delenv(FAKE_RESOLVER_ENV, raising=False)
+
+
+@pytest.fixture
+def fake_resolver(monkeypatch) -> FakeResolver:
+    """The test's resolver switch, starting in resolve mode."""
+    resolver = FakeResolver(monkeypatch=monkeypatch)
+    resolver.reset()
+    return resolver
+
+
 @pytest.fixture
 def parallel_board(fresh_project) -> dict[str, Any]:
     """One milestone: A (a1 -> a2) and B (b1 -> b2) independent, C (c1) blocked by A.
@@ -317,8 +367,12 @@ def parallel_board(fresh_project) -> dict[str, Any]:
     the census order does not depend on timestamps. Branch names come from
     `dag`, never retyped here. `review_fail_marker` is where the fake looks for
     branches whose review must fail; the test writes it and removes it.
+    The union attribute (`UNION_ATTRIBUTE`) lets Integrate fold A's and B's `IMPLEMENTATION.md` without a resolver.
     """
     root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
     milestone = _add_card(root, "Milestone 4: parallel stories under a fake claude")
     a = _add_card(root, "Story A: an independent root story", milestone)
     b = _add_card(root, "Story B: independent of story A", milestone)
@@ -345,6 +399,41 @@ def parallel_board(fresh_project) -> dict[str, Any]:
 
 
 @pytest.fixture
+def two_story_board(fresh_project) -> dict[str, Any]:
+    """One milestone with two independent stories, A (a1) and B (b1), for Integrate.
+
+    Both stories are level-0 roots, so Integrate merges A's tip and then B's
+    into `m3-integrate`. `UNION_ATTRIBUTE` folds the fake coder's
+    `IMPLEMENTATION.md` and covers only that file, so any conflict a scenario
+    wants comes from the implement-edits marker's own files. The test writes
+    that marker (`implement_edits_marker`) keyed by `branches`.
+    """
+    root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
+    milestone = _add_card(root, "Milestone 5: integrate under a fake claude")
+    a = _add_card(root, "Story A: one side of the merge", milestone)
+    b = _add_card(root, "Story B: the other side of the merge", milestone)
+    a1 = _add_card(root, "a1: only subtask of story A", a)
+    b1 = _add_card(root, "b1: only subtask of story B", b)
+    subtasks = {"A": [a1], "B": [b1]}
+    branches = {
+        card_id: dag.task_branch(MILESTONE_PREFIX, board.show(card_id, repo_dir=root))
+        for chain in subtasks.values()
+        for card_id in chain
+    }
+    return {
+        "root": root,
+        "milestone": milestone,
+        "stories": {"A": a, "B": b},
+        "subtasks": subtasks,
+        "branches": branches,
+        "implement_edits_marker": root / ".git" / FAKE_IMPLEMENT_EDITS_MARKER,
+    }
+
+
+@pytest.fixture
 def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
 
@@ -353,7 +442,12 @@ def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """
     runner = CliRunner()
 
-    def invoke(root: Path, milestone: str, max_concurrent: int | None = None):
+    def invoke(
+        root: Path,
+        milestone: str,
+        max_concurrent: int | None = None,
+        verify: Sequence[str] | None = None,
+    ):
         argv = [
             "run",
             "--milestone",
@@ -365,7 +459,9 @@ def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
             "--branch-prefix",
             MILESTONE_PREFIX,
         ]
-        for command in VERIFY_COMMANDS:
+        # `None` keeps existing callers' argv byte-identical.
+        commands = VERIFY_COMMANDS if verify is None else tuple(verify)
+        for command in commands:
             argv += ["--verify", command]
         # Only when asked: existing callers keep their exact argv.
         if max_concurrent is not None:

@@ -10,12 +10,18 @@ adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no extra argv flag and no import
 of `agent_manager` -- a brief that omits the contract must make this script
-fail, because that failure is the test's whole point. There are exactly two
-test-controlled inputs, and neither tells the fake anything the brief owns:
+fail, because that failure is the test's whole point. There are exactly four
+test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
-from its own cwd and compares with the brief's `## branch`; and the
-implement-only rendezvous (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`),
-which only makes implement wait for other lanes and changes nothing it writes.
+from its own cwd and compares with the brief's `## branch`;
+`IMPLEMENT_EDITS_MARKER`, a JSON file beside it giving the files an implement
+writes for the brief's `## branch`; the implement-only rendezvous
+(`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
+wait for other lanes and changes nothing it writes; and `RESOLVER_ENV`, which
+only makes the resolve phase leave the merge it was given unfinished while
+still claiming `resolved`, so git has to catch the lie. The resolve phase
+learns the tip and the conflicting files from the brief's `## merge_tip` and
+`## conflict_files` and nowhere else.
 
 Standard library only: it runs under a bare `#!<python>` line.
 """
@@ -217,6 +223,34 @@ REVIEW_FAIL_PORCELAIN = "?? fake-claude: the review-fail marker names this branc
 """What a failing review reports as `porcelain`. Non-empty, so the production
 `review_gate` blocks on it, and worded so the escalation detail says why."""
 
+IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
+"""A JSON file, in the repo's git common dir, of files a subtask's implement writes.
+
+It maps a branch to `{repo-relative path: full file content}`. It is found from
+this process's own cwd through `git rev-parse --git-common-dir`, like
+`REVIEW_FAIL_MARKER`, so it is in no worktree's tree. It is keyed by the
+implement brief's `## branch` section, so the brief still picks the subtask.
+The marker only says what that subtask's files contain, which is how the
+Integrate tests make two stories edit the same line. No marker, or no entry
+for the branch, changes nothing.
+"""
+
+RESOLVER_ENV = "FAKE_CLAUDE_RESOLVER"
+"""Test scaffolding, never in a brief: how the resolve phase behaves.
+
+Unset or empty resolves the merge. `refuse` claims `resolved: true` and leaves
+the merge exactly as it found it (no edit, no add, no commit), so the
+production `merge_completed_gate`, which asks git and never reads the flag,
+has to catch it. Any other value is a typo and fails the fake."""
+
+RESOLVER_REFUSE = "refuse"
+
+REFUSE_SUMMARY = (
+    "the fake claude executable was told to refuse: it claims the merge is "
+    "resolved but left MERGE_HEAD, the conflict markers and the index exactly "
+    "as it found them."
+)
+
 RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 """Test scaffolding, never in a brief: a directory where each implement leaves a
 marker named for its cwd and then waits for other lanes' markers. Unset or
@@ -288,12 +322,17 @@ def rendezvous(cwd):
 
 
 
-def review_fail_branches(cwd):
-    """The branches the review-fail marker names, or an empty set when there is none."""
+def _common_dir_file(cwd, name):
+    """`<git common dir>/<name>`, found from `cwd`."""
     common = git(cwd, "rev-parse", "--git-common-dir").strip()
     # Relative (`.git`) in a main checkout, absolute in a linked worktree;
     # joining onto the cwd handles both.
-    marker = Path(cwd) / common / REVIEW_FAIL_MARKER
+    return Path(cwd) / common / name
+
+
+def review_fail_branches(cwd):
+    """The branches the review-fail marker names, or an empty set when there is none."""
+    marker = _common_dir_file(cwd, REVIEW_FAIL_MARKER)
     if not marker.is_file():
         return set()
     return {
@@ -348,6 +387,139 @@ def _section(found, name, phase):
     return found[name].strip()
 
 
+def _inside_worktree(relative, marker):
+    """`relative` as a `Path`, refusing anything that could land outside the cwd."""
+    path = Path(relative)
+    if not relative or path.is_absolute() or ".." in path.parts:
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} names {relative!r}, which is "
+            "not a path inside the worktree"
+        )
+    return path
+
+
+def implement_edits(cwd, found, phase):
+    """The files the implement-edits marker gives the brief's `## branch`, or `{}`.
+
+    No marker means `{}` without reading the brief, so an implement brief that
+    carries no `## branch` still works when no test asked for edits.
+    """
+    marker = _common_dir_file(cwd, IMPLEMENT_EDITS_MARKER)
+    if not marker.is_file():
+        return {}
+    branch = _section(found, "branch", phase)
+    try:
+        table = json.loads(marker.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} is not valid JSON: {error}"
+        ) from None
+    if not isinstance(table, dict):
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} is not a JSON object of branches"
+        )
+    entry = table.get(branch, {})
+    if not isinstance(entry, dict) or not all(
+        isinstance(name, str) and isinstance(content, str)
+        for name, content in entry.items()
+    ):
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} entry for {branch!r} is not an "
+            "object of path -> content strings"
+        )
+    return {_inside_worktree(name, marker): content for name, content in entry.items()}
+
+
+def _is_marker(bare, sigil):
+    """A conflict-marker line: the seven-character sigil alone or followed by a space."""
+    return bare == sigil or bare.startswith(sigil + " ")
+
+
+def keep_both_sides(text):
+    """`text` with every conflict hunk replaced by its two sides, ours then theirs.
+
+    The marker lines go, and so does a diff3/zdiff3 `|||||||` base section, so
+    a developer's `merge.conflictStyle` cannot break the fake. A `=======` line
+    counts only inside a hunk, so a markdown underline survives. Line endings
+    are kept as they were. A hunk that never closes is refused rather than
+    half-rewritten.
+    """
+    kept = []
+    state = None  # None outside a hunk, else "ours", "base" or "theirs"
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if state is None:
+            if _is_marker(bare, "<<<<<<<"):
+                state = "ours"
+            else:
+                kept.append(line)
+        elif state == "ours" and _is_marker(bare, "|||||||"):
+            state = "base"
+        elif state in ("ours", "base") and bare == "=======":
+            state = "theirs"
+        elif state == "theirs" and _is_marker(bare, ">>>>>>>"):
+            state = None
+        elif state != "base":
+            kept.append(line)
+    if state is not None:
+        raise FakeClaudeError(
+            "a conflict hunk is never closed: no `>>>>>>>` line after its `<<<<<<<`"
+        )
+    return "".join(kept)
+
+
+def resolver_mode():
+    """`"resolve"` or `RESOLVER_REFUSE`, from `RESOLVER_ENV`. Anything else is refused."""
+    raw = os.environ.get(RESOLVER_ENV, "")
+    if raw == "":
+        return "resolve"
+    if raw == RESOLVER_REFUSE:
+        return RESOLVER_REFUSE
+    raise FakeClaudeError(
+        f"{RESOLVER_ENV} must be unset, empty or {RESOLVER_REFUSE!r}, got {raw!r}"
+    )
+
+
+def conflict_files_of(found, phase):
+    """The brief's `## conflict_files`: a JSON list of non-empty path strings."""
+    raw = _section(found, "conflict_files", phase)
+    try:
+        files = json.loads(raw)
+    except json.JSONDecodeError:
+        raise FakeClaudeError(
+            f"the {phase!r} brief's `## conflict_files` is not JSON: {raw!r}"
+        ) from None
+    if not isinstance(files, list) or not all(
+        isinstance(name, str) and name for name in files
+    ):
+        raise FakeClaudeError(
+            f"the {phase!r} brief's `## conflict_files` is not a JSON list of "
+            f"paths: {raw!r}"
+        )
+    return files
+
+
+def check_merge_head(cwd, tip):
+    """Refuse unless `MERGE_HEAD` in `cwd` is the commit the brief's `merge_tip` names."""
+    probe = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise FakeClaudeError(
+            f"no merge is in progress in {cwd} (no MERGE_HEAD), yet the brief's "
+            f"merge_tip is {tip!r}"
+        )
+    merge_head = probe.stdout.strip()
+    wanted = git(cwd, "rev-parse", "--verify", f"{tip}^{{commit}}").strip()
+    if merge_head != wanted:
+        raise FakeClaudeError(
+            f"MERGE_HEAD in {cwd} is {merge_head}, not the brief's merge_tip "
+            f"{tip!r} ({wanted})"
+        )
+
+
 def build_result(phase, payload, text, cwd):
     """The phase's result: the schema skeleton, with what the gates need set."""
     found = sections(text)
@@ -383,11 +555,18 @@ def build_result(phase, payload, text, cwd):
         # which is the one thing this tier exists to catch (R4).
         digest = _section(found, "plan_hash", phase)
         relative = _section(found, "plan_path", phase)
+        # Test scaffolding, keyed by the brief's `## branch`: read and checked
+        # before anything is written, so a bad marker leaves the tree untouched.
+        edits = implement_edits(cwd, found, phase)
         # The content names this card's plan, so a subtask stacked on another's
         # branch (where the file already exists) still has a change to commit.
         (Path(cwd) / IMPLEMENTATION_NAME).write_text(
             f"# implementation of {relative}\n\n{SUMMARY}\n", encoding="utf-8"
         )
+        for path, content in edits.items():
+            target = Path(cwd) / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
         git(cwd, "add", "-A")
         # A relaunched subtask's implementation is already committed: nothing
         # changed, so there is nothing to commit, and the honest answer is
@@ -432,6 +611,32 @@ def build_result(phase, payload, text, cwd):
             tagged_count=len(tagged),
             plan_hash=plan_hash_of(Path(cwd) / relative),
         )
+    if phase == "resolve":
+        # Everything is checked before anything is touched: the env switch, the
+        # two brief sections, that the merge in the cwd is the brief's, and
+        # that every listed file is there.
+        mode = resolver_mode()
+        tip = _section(found, "merge_tip", phase)
+        files = conflict_files_of(found, phase)
+        check_merge_head(cwd, tip)
+        missing = [name for name in files if not (Path(cwd) / name).is_file()]
+        if missing:
+            raise FakeClaudeError(
+                f"the brief's `## conflict_files` names paths that are not files "
+                f"in {cwd}: {missing}"
+            )
+        if mode == RESOLVER_REFUSE:
+            # The advisory flag lies; git, through `merge_completed_gate`, judges.
+            return override(payload, resolved=True, summary=REFUSE_SUMMARY)
+        rewritten = {
+            name: keep_both_sides((Path(cwd) / name).read_bytes().decode("utf-8"))
+            for name in files
+        }
+        for name, resolved_text in rewritten.items():
+            (Path(cwd) / name).write_bytes(resolved_text.encode("utf-8"))
+            git(cwd, "add", "--", name)
+        git(cwd, "commit", "--no-edit")
+        return override(payload, resolved=True, summary=SUMMARY)
     raise FakeClaudeError(f"no behaviour for phase {phase!r}")
 
 
