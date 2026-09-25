@@ -423,6 +423,12 @@ single-card run. With `--milestone`, a level's stories run on up to
 
 ## 11. Concurrency
 
+**Status:** as of milestone 4, stories in a dependency level run in parallel,
+bounded by `max_concurrent_stories` (default 4, set with
+`am run --milestone --max-concurrent N`). Levels are barriers: the next level
+starts only after every story of the current one has finished. See the
+parallel-stories addendum, `2026-09-24-parallel-stories-design.md`.
+
 Stories within a dependency level run in parallel, bounded by
 `max_concurrent_stories` (default 4). Subtasks within a story run
 **sequentially**, each branch stacked on the previous subtask's branch. This is
