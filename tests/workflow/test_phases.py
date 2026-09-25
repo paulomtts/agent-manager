@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from agent_manager.workflow import phases as phases_module
 from agent_manager.workflow.phases import (
@@ -203,3 +204,36 @@ def test_digest_ignores_args_order():
     second = wf(Step("a", step_fn, args={"y": 2, "x": 1}))
     assert first.digest() == second.digest()
     assert first.digest() != wf(Step("a", step_fn, args={"x": 1, "y": 3})).digest()
+
+
+def other_step_fn(worktree): return {"ok": True}
+def other_when(state): return True
+
+
+class ResultA(BaseModel):
+    ok: bool
+
+
+class ResultB(BaseModel):
+    ok: bool
+
+
+@pytest.mark.parametrize("changed", [
+    Step("s", other_step_fn),                                  # run
+    Step("s", step_fn, best_effort=True),                      # best_effort
+    Step("s", step_fn, when=other_when, skip_to="z"),          # when
+    Step("s", step_fn, gates=(gate_ok, other_gate)),           # an added gate
+], ids=["run", "best_effort", "when", "gates"])
+def test_digest_covers_every_step_field(changed):
+    base = Step("s", step_fn, when=gate_ok, skip_to="z") if changed.when else Step("s", step_fn)
+    tail = (agent("z"),)
+    assert wf(changed, *tail).digest() != wf(base, *tail).digest()
+
+
+@pytest.mark.parametrize("field, before, after", [
+    ("result", ResultA, ResultB),
+    ("writes", None, "docs/plan.md"),
+    ("gates", (gate_ok,), (other_gate,)),
+])
+def test_digest_covers_every_agent_field(field, before, after):
+    assert wf(agent("a", **{field: before})).digest() != wf(agent("a", **{field: after})).digest()
