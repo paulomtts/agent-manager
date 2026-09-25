@@ -36,9 +36,10 @@ Every command prints one line of JSON — `{"ok": true, "data": ...}` on success
 
 ### Milestone runs
 
-Drive every remaining subtask of one milestone. A level's stories run side by
-side, and each story's subtasks run one at a time, each on its own local branch
-stacked on the branch before it:
+Drive every remaining subtask of one milestone. Stories in the same dependency
+level run side by side, up to `--max-concurrent` of them at once. Inside a
+story, subtasks always run in order, each on its own local branch stacked on
+the branch before it:
 
 ```bash
 am run --milestone "document milestone runs" \
@@ -48,7 +49,9 @@ am run --milestone "document milestone runs" \
 ```
 
 `--max-concurrent N` is how many of a level's stories run at once. It defaults
-to 4. `--max-concurrent 1` runs stories one at a time, as before.
+to 4. `--max-concurrent 1` runs a level's stories one at a time, as the runner
+did before parallel runs. See [Parallel runs](#parallel-runs) for what runs
+together, how a run stops, and the limits.
 
 `--milestone` takes the milestone card's id, its exact title (case does not
 matter), or a piece of its title that matches exactly one root card. A piece
@@ -126,32 +129,95 @@ A clean run exits 0, and `data` holds:
 Nothing is merged and nothing is pushed. The branches stay local and stacked,
 and the base branch does not move. Merging the tips is left to you.
 
+#### Parallel runs
+
+`--max-concurrent N` bounds how many stories of one level run at once. It
+defaults to 4, and `--max-concurrent 1` runs them in sequence, exactly as the
+sequential runner did. The run records the value in its config as
+`max_concurrent_stories`.
+
+What runs together:
+
+- Only stories in the same dependency level. Levels are barriers: level N+1
+  starts only after every story of level N has finished.
+- Never two subtasks of one story. A story's subtasks run in order, each
+  stacked on the branch before it.
+
+How a run stops. The first escalation in any lane, or an exception raised
+inside a lane, sets the run's stop. Every other lane checks the stop before it
+starts its next phase. A phase already running is never interrupted, so
+a stop waits for the running phase to finish: a lane in the middle of a long
+`implement` finishes it and then parks. The subtask that lane was on is
+recorded `stopped`, and so is its story. A story of the same level that had
+not started yet stays `pending`, and no later level starts.
+
+`stopped` is not `escalated`:
+
+- `escalated` is a failure. A gate gave up (for example `review`), or the lane
+  raised an exception. Something needs fixing before you go on.
+- `stopped` is a clean park between two phases. Nothing failed, and the work
+  done so far is kept.
+
+To continue, fix the escalation and relaunch the same `am run --milestone`
+command (see [Relaunching resumes](#relaunching-resumes)). The stopped subtask
+picks up where it parked, and every card already `done` on the board is
+skipped. `am resume <run-id>` does not continue stopped work: on a run with a
+stopped subtask it is refused with `{"ok": false, "error": {...}}` and exit
+code 3, and the message names the stopped subtasks and says to relaunch the
+milestone command.
+
+Run one `am` process per repository. Two `am` processes on the same repository
+or on the same run are not supported.
+
+Limits, stated plainly:
+
+- **Your test suite runs side by side.** Each lane's `verify` phase runs your
+  `--verify` commands in its own worktree while other lanes do the same. Tests
+  that use a fixed port, a shared file or a shared database will collide. Run
+  such a repository with `--max-concurrent 1`.
+- **One environment per lane.** `uv run pytest` builds
+  a `.venv` in each worktree, which takes time and disk once per lane.
+- **Machine load.** N lanes means up to N `claude -p` processes at once, and
+  nothing rate-limits them.
+
 #### What an escalation report contains
 
-The run stops at the first subtask that does not finish, and no later subtask
-or story starts. It exits 1, and `data` holds `escalated` (`true`), `run_id`,
-`level`, `story`, `subtask`, `failed_phase`, `detail` and `warnings`.
+The first escalation stops the run: the other lanes of its level park at their
+next phase boundary, and no later level starts (see
+[Parallel runs](#parallel-runs)). The run exits 1, and `data` holds `escalated`
+(`true`), `run_id`, `level`, `story`, `subtask`, `failed_phase`, `detail` and
+`warnings`. These top-level fields describe the first escalation.
 `failed_phase` is the phase that gave up (for example `review`) and `detail`
 says why. When the subtask's driver raised instead, `failed_phase` is `null`
-and `detail` is `<ExceptionType>: <message>`. The subtask, its story and the
-run are recorded `escalated`, and `am status <run_id>` shows the whole plan. A
-coder that reports `blocked` ends its subtask escalated at `implement`, and
-review never runs.
+and `detail` is `<ExceptionType>: <message>`. The escalated subtask, its story
+and the run are recorded `escalated`, and `am status <run_id>` shows the whole
+plan. A coder that reports `blocked` ends its subtask escalated at `implement`,
+and review never runs.
+
+Two more keys appear only when they are not empty:
+
+- `also_escalated`: a list of
+  {"level", "story", "subtask", "failed_phase", "detail"}, one for each other
+  lane that failed before it saw the stop.
+- `stopped`: a list of {"story", "subtask", "before_phase"}, one for each lane
+  the stop parked. `before_phase` is the phase it would have run next. A
+  stopped subtask and its story are recorded `stopped`, not `escalated`.
 
 When the run cannot start at all (an unknown or ambiguous milestone, a blocker
 cycle, a board error), it prints `{"ok": false, "error": {...}}` and exits 3.
 
 #### Relaunching resumes
 
-To go on after an escalation or a killed run, fix the cause and run the same
-`am run --milestone` command again. It starts a new run that skips every card
-already `done` on the board. A subtask that was killed part way picks up in its
-existing worktree and does not redo a plan that already passed. Relaunching a
-finished milestone drives nothing and reports `done` with an empty
-`completed`.
+To go on after an escalation, a stopped lane or a killed run, fix the cause
+and run the same `am run --milestone` command again. It starts a new run that
+skips every card already `done` on the board. A subtask that was stopped or
+killed part way picks up in its existing worktree and does not redo a plan
+that already passed. Relaunching a finished milestone drives nothing and
+reports `done` with an empty `completed`.
 
 `am resume <run-id>` is not milestone-aware and does not continue a milestone.
-Relaunch the `am run --milestone` command instead.
+On a run with a stopped subtask it is refused with exit code 3, and its message
+says to relaunch. Relaunch the `am run --milestone` command instead.
 
 #### Not there yet
 
@@ -160,7 +226,10 @@ Relaunch the `am run --milestone` command instead.
 - `watch`, `retry` and `cancel` do not exist.
 
 See section 4 of the
-[orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet).
+[orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet)
+and section 5 of the
+[parallel-stories addendum](docs/superpowers/specs/2026-09-24-parallel-stories-design.md#5-deferred)
+for everything deferred.
 
 ## Develop
 
