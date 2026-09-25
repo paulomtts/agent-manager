@@ -351,6 +351,7 @@ def run_subtask(
     agent_runner: AgentPhaseRunner | None = None,
     start_phase: str | None = None,
     clock: Clock = _utcnow,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SubtaskSummary:
     """Walk `workflow`'s phases for one subtask, running the deterministic ones.
 
@@ -365,6 +366,12 @@ def run_subtask(
     document's gates, the caller supplies them. Reserved keys are refused: a
     caller that could overwrite `worktree` would point every later step at a
     path the engine never derived.
+
+    `should_stop` is the cooperative stop (addendum P4): asked once before each
+    phase the walk actually visits, never during one and never after the last.
+    A true answer records the subtask `stopped` and returns without starting
+    that phase. A phase already running finishes and is recorded as normal. An
+    exception from it is the caller's and is not caught.
     """
     index = _start_index(workflow, start_phase)
     context = subtask_context(
@@ -384,6 +391,10 @@ def run_subtask(
 
     while index < len(workflow.phases):
         phase = workflow.phases[index]
+        # Before anything about the phase runs -- the missing-runner error,
+        # `render_prompt`, the `started` row -- so a stop starts nothing.
+        if should_stop is not None and should_stop():
+            return _stop(summary, store, story_id, subtask, phase.name)
         if not isinstance(phase, DeterministicPhase):
             if agent_runner is None:
                 raise EngineError(
@@ -572,4 +583,23 @@ def _escalate(
     summary.failed_phase = phase_name
     summary.detail = detail
     _record_subtask_status(store, story_id, subtask, "escalated")
+    return summary
+
+
+def _stop(
+    summary: SubtaskSummary,
+    store: Store,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    phase_name: str,
+) -> SubtaskSummary:
+    """Record the subtask `stopped` before `phase_name` and hand the summary back.
+
+    Kept apart from `_escalate` on purpose: `stopped` is not `failed`, so
+    `failed_phase` stays `None`. Results, warnings and skips gathered so far
+    stay on the summary.
+    """
+    summary.status = "stopped"
+    summary.detail = f"stopped before {phase_name}"
+    _record_subtask_status(store, story_id, subtask, "stopped")
     return summary
