@@ -543,3 +543,143 @@ def test_a_merge_already_in_progress_escalates_without_dispatching(
     assert _sha(repo.worktree, "HEAD") == head
     assert store.load_run(RUN_ID).stories == []
     _assert_protected(repo, before, tips)
+
+# ── conflicts go to the resolver ─────────────────────────────────────────────
+
+
+def _integrate_story(store: Store) -> models.StoryRun:
+    run = store.load_run(RUN_ID)
+    assert [story.card_id for story in run.stories] == ["integrate"]
+    return run.stories[0]
+
+
+def test_a_conflict_dispatches_exactly_once_for_the_conflicting_tip(
+    repo: Repo, store: Store
+) -> None:
+    stories, tips = _conflicting_pair(repo)
+    before = _protected(repo, tips)
+    factory = FakeFactory()
+
+    outcome = _integrate(repo, store, stories, factory=factory)
+
+    assert isinstance(outcome, IntegrateSuccess), outcome
+    assert outcome.merged == [STORY_A, STORY_B]
+    assert outcome.resolved == [STORY_B]
+    assert factory.calls == [
+        {"workflow": "integrate", "run_id": RUN_ID, "story_id": "integrate", "card_id": STORY_B}
+    ]
+    assert factory.resolver.calls == [["shared.txt"]]
+    # git judges the merge, not the resolver's report.
+    assert _merge_head(repo.worktree) is None
+    assert _git(repo.worktree, "status", "--porcelain") == ""
+    assert _is_ancestor(repo.worktree, tips[0])
+    assert _is_ancestor(repo.worktree, tips[1])
+    assert _git(repo.worktree, "show", "HEAD:shared.txt") == RESOLVED
+    # The synthetic story and subtask are in the store, and replay agrees.
+    story = _integrate_story(store)
+    assert story.title == "Integrate"
+    assert story.status == "done"
+    [subtask] = story.subtasks
+    assert subtask.card_id == STORY_B
+    assert subtask.branch == INTEGRATION_BRANCH
+    assert subtask.base_branch == BASE
+    assert subtask.worktree_path == repo.worktree
+    assert subtask.status == "done"
+    assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
+    rebuilt = store.rebuild_from_journal(RUN_ID)
+    assert [s.card_id for s in rebuilt.stories] == ["integrate"]
+    assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
+    assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]
+    _assert_protected(repo, before, tips)
+
+
+def test_a_refusing_resolver_escalates_and_leaves_merge_head_in_place(
+    repo: Repo, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stories, tips = _conflicting_pair(repo)
+    before = _protected(repo, tips)
+    monkeypatch.setenv(REFUSE_ENV, "1")
+    factory = FakeFactory()
+
+    outcome = _integrate(repo, store, stories, factory=factory)
+
+    assert isinstance(outcome, IntegrateEscalation)
+    assert outcome.phase == "integrate"
+    assert outcome.story == STORY_B
+    assert outcome.files == ["shared.txt"]
+    assert "resolve" in outcome.detail
+    assert "MERGE_HEAD exists" in outcome.detail
+    assert [call["card_id"] for call in factory.calls] == [STORY_B]
+    # One dispatch per conflicting tip; the runner's own retry is inside it.
+    assert factory.resolver.calls == [["shared.txt"], ["shared.txt"]]
+    # Left exactly as it is for a human: never aborted, reset or cleaned.
+    assert _merge_head(repo.worktree) == _sha(repo.root, tips[1])
+    assert repo.worktree.is_dir()
+    assert str(repo.worktree) in _git(repo.root, "worktree", "list", "--porcelain")
+    assert _sha(repo.root, f"refs/heads/{INTEGRATION_BRANCH}")
+    story = _integrate_story(store)
+    assert story.status == "escalated"
+    assert [(s.card_id, s.status) for s in story.subtasks] == [(STORY_B, "escalated")]
+    _assert_protected(repo, before, tips)
+
+
+def test_two_conflicting_tips_dispatch_once_each_under_one_integrate_story(
+    repo: Repo, store: Store
+) -> None:
+    story_a = _story(STORY_A, "Story A", SUB_A)
+    story_b = _story(STORY_B, "Story B", SUB_B)
+    story_c = _story(STORY_C, "Story C", SUB_C)
+    tips = [
+        _story_branch(repo, story_a, {"shared.txt": "story a\n"}),
+        _story_branch(repo, story_b, {"shared.txt": "story b\n"}),
+        _story_branch(repo, story_c, {"shared.txt": "story c\n"}),
+    ]
+    before = _protected(repo, tips)
+    factory = FakeFactory()
+
+    outcome = _integrate(repo, store, [story_a, story_b, story_c], factory=factory)
+
+    assert isinstance(outcome, IntegrateSuccess), outcome
+    assert outcome.merged == [STORY_A, STORY_B, STORY_C]
+    assert outcome.resolved == [STORY_B, STORY_C]
+    assert [call["card_id"] for call in factory.calls] == [STORY_B, STORY_C]
+    assert factory.resolver.calls == [["shared.txt"], ["shared.txt"]]
+    assert _merge_head(repo.worktree) is None
+    for tip in tips:
+        assert _is_ancestor(repo.worktree, tip)
+    story = _integrate_story(store)
+    assert [(s.card_id, s.status) for s in story.subtasks] == [
+        (STORY_B, "done"),
+        (STORY_C, "done"),
+    ]
+    _assert_protected(repo, before, tips)
+
+
+def test_a_relaunch_after_a_human_finished_the_merge_succeeds_without_dispatch(
+    repo: Repo, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stories, tips = _conflicting_pair(repo)
+    before = _protected(repo, tips)
+    monkeypatch.setenv(REFUSE_ENV, "1")
+    first_factory = FakeFactory()
+    first = _integrate(repo, store, stories, factory=first_factory)
+    assert isinstance(first, IntegrateEscalation)
+    assert len(first_factory.calls) == 1
+
+    # The human finishes the merge in the integration worktree.
+    (repo.worktree / "shared.txt").write_text("human fix\n", encoding="utf-8")
+    _git(repo.worktree, "add", "shared.txt")
+    _git(repo.worktree, "commit", "--no-edit")
+    monkeypatch.delenv(REFUSE_ENV)
+    head = _sha(repo.worktree, "HEAD")
+    second_factory = FakeFactory()
+
+    second = _integrate(repo, store, stories, factory=second_factory)
+
+    assert isinstance(second, IntegrateSuccess), second
+    assert second.merged == [STORY_A, STORY_B]
+    assert second.resolved == []
+    assert second_factory.calls == []
+    assert _sha(repo.worktree, "HEAD") == head
+    assert _git(repo.worktree, "show", "HEAD:shared.txt") == "human fix\n"
+    _assert_protected(repo, before, tips)

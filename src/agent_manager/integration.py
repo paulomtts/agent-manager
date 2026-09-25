@@ -8,22 +8,30 @@ Each tip is merged by `steps.integrate.merge_tip` into `<prefix>-integrate`, in
 the worktree `cli.worktree_for` names. After the last tip the suite runs once in
 that worktree, and `verification_passed_gate` judges what it measured.
 
+A conflicting tip is handed to the builtin `integrate.yaml` (resolve, then
+verify) through `engine.run_subtask`, under a synthetic "Integrate" story with
+one synthetic subtask per conflicting story. Both are recorded before the
+engine journals any phase, because `store.rebuild_from_journal` refuses a phase
+whose story or subtask no earlier line created. A resolver that does not finish
+stops the run with the merge left in progress for a human.
+
 Integrate never checks out, merges into, resets or pushes the base branch or a
-story branch, and never pushes anything. Every git write is `merge_tip`'s, in
-the integration worktree. The outcome is internal state, so it is a plain
-dataclass (CLAUDE.md). Wiring this into `orchestrate.run_milestone` belongs to
-sibling a74f2cd6.
+story branch, and never pushes anything. Every git write is `merge_tip`'s or the
+resolver's, in the integration worktree. The outcome is internal state, so it is
+a plain dataclass (CLAUDE.md). Wiring this into `orchestrate.run_milestone`
+belongs to sibling a74f2cd6.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_manager import cli, dag
+from agent_manager import cli, dag, engine, models
 from agent_manager.census import StoryPlan
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
+from agent_manager.workflow.loader import load_builtin
 
 PHASE = "integrate"
 """The `phase` every Integrate escalation names."""
@@ -113,6 +121,69 @@ def _final_verification(
     )
 
 
+def _resolve_conflict(
+    *,
+    story_id: str,
+    tip: str,
+    files: list[str],
+    branch: str,
+    base_branch: str,
+    worktree: Path,
+    repo_dir: Path,
+    commands: list[str],
+    allow_no_verification: bool,
+    store: Store,
+    run_id: str,
+    runner_factory: cli.RunnerFactory,
+) -> engine.SubtaskSummary:
+    """Drive `builtin/integrate.yaml` once for one conflicting tip.
+
+    The synthetic subtask is recorded before `run_subtask` journals its first
+    phase. The caller has already recorded the synthetic story.
+    """
+    workflow = load_builtin(WORKFLOW_NAME)
+    subtask = models.SubtaskRun(
+        card_id=story_id,
+        branch=branch,
+        base_branch=base_branch,
+        status="started",
+        worktree_path=worktree,
+    )
+    store.record_subtask(INTEGRATE_STORY_ID, subtask)
+    runner = runner_factory(
+        workflow=workflow,
+        store=store,
+        run_id=run_id,
+        story_id=INTEGRATE_STORY_ID,
+        card_id=story_id,
+    )
+    return engine.run_subtask(
+        workflow,
+        store,
+        story_id=INTEGRATE_STORY_ID,
+        subtask=subtask,
+        repo_dir=repo_dir,
+        commands=commands,
+        extra_context={
+            "merge_tip": tip,
+            "conflict_files": list(files),
+            **cli.gate_context(commands, allow_no_verification),
+        },
+        agent_runner=runner,
+    )
+
+
+def _resolver_detail(
+    tip: str, branch: str, worktree: Path, summary: engine.SubtaskSummary
+) -> str:
+    return (
+        f"the resolver did not finish merging {tip} into {branch}: phase "
+        f"{summary.failed_phase!r} ended {summary.status} ({summary.detail}). "
+        f"The branch and worktree are left as they are in {worktree}; a human must "
+        "finish the merge there, then relaunch."
+    )
+
+
 def integrate_milestone(
     stories: Sequence[StoryPlan],
     repo_dir: Path,
@@ -124,13 +195,32 @@ def integrate_milestone(
     run_id: str,
     runner_factory: cli.RunnerFactory,
 ) -> IntegrateOutcome:
-    """Merge every story tip into `<branch_prefix>-integrate`, then verify it once."""
+    """Merge every story tip into `<branch_prefix>-integrate`, then verify it once.
+
+    The caller owns the run: it has recorded the `Run` in `store` under
+    `run_id`, and it decides the run's status from the outcome. This function
+    records only the synthetic "Integrate" story and its subtasks, and only when
+    a tip conflicts.
+    """
     root = Path(repo_dir).resolve()
     branch = integration_branch(branch_prefix)
     worktree = cli.worktree_for(root, branch)
     suite = list(commands)
+    story_row = models.StoryRun(
+        card_id=INTEGRATE_STORY_ID,
+        title=INTEGRATE_STORY_TITLE,
+        level=0,
+        status="started",
+        tip_branch=branch,
+    )
+    story_recorded = False
     merged: list[str] = []
     resolved: list[str] = []
+
+    def escalate(story_id: str | None, files: list[str], detail: str) -> IntegrateEscalation:
+        if story_recorded:
+            store.record_story(story_row.model_copy(update={"status": "escalated"}))
+        return IntegrateEscalation(story=story_id, files=files, detail=detail)
 
     for story, tip in merge_order(stories, branch_prefix, base_branch):
         try:
@@ -139,20 +229,36 @@ def integrate_milestone(
             # The error's own message already tells the human to finish the
             # merge in the worktree and relaunch. Nothing is dispatched or
             # recorded: that unresolved merge is not this run's to touch.
-            return IntegrateEscalation(story=story.id, files=[], detail=str(error))
+            return escalate(story.id, [], str(error))
         if result["conflict"]:
             files = [str(name) for name in result["files"]]
-            return IntegrateEscalation(
-                story=story.id,
+            if not story_recorded:
+                store.record_story(story_row)
+                story_recorded = True
+            summary = _resolve_conflict(
+                story_id=story.id,
+                tip=tip,
                 files=files,
-                detail=(
-                    f"merging {tip} into {branch} conflicted in {', '.join(files)}; "
-                    f"the merge is left in progress in {worktree}"
-                ),
+                branch=branch,
+                base_branch=base_branch,
+                worktree=worktree,
+                repo_dir=root,
+                commands=suite,
+                allow_no_verification=allow_no_verification,
+                store=store,
+                run_id=run_id,
+                runner_factory=runner_factory,
             )
+            if summary.status != "done":
+                return escalate(
+                    story.id, files, _resolver_detail(tip, branch, worktree, summary)
+                )
+            resolved.append(story.id)
         merged.append(story.id)
 
     failure = _final_verification(suite, allow_no_verification, worktree)
     if failure is not None:
-        return IntegrateEscalation(story=None, files=[], detail=failure)
+        return escalate(None, [], failure)
+    if story_recorded:
+        store.record_story(story_row.model_copy(update={"status": "done"}))
     return IntegrateSuccess(branch=branch, worktree=worktree, merged=merged, resolved=resolved)
