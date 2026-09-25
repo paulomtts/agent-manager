@@ -894,6 +894,39 @@ def test_a_marker_that_is_not_json_is_refused(tmp_path):
     assert "not valid JSON" in str(caught.value)
 
 
+@pytest.mark.parametrize("table", [[], "a string", 1])
+def test_a_marker_that_is_not_an_object_of_branches_is_refused(tmp_path, table):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, table)
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not a JSON object of branches" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+
+
+@pytest.mark.parametrize(
+    "entry", [["shared.txt"], "shared.txt", {"shared.txt": 1}, {"shared.txt": None}]
+)
+def test_a_marker_entry_that_is_not_path_to_content_strings_is_refused(
+    tmp_path, entry
+):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: entry})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "is not an object of path -> content strings" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+    assert not (repo / "shared.txt").exists()
+
+
 def test_both_sides_of_a_hunk_are_kept_ours_then_theirs():
     text = "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\nbottom\n"
 
