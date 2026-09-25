@@ -365,6 +365,58 @@ def test_rollup_reenters_a_board_lock_its_own_thread_already_holds(temp_board):
     }
 
 
+_RACE_ITERATIONS = 20
+_RACE_STORIES = 2
+_RACE_SUBTASKS_PER_STORY = 4
+
+
+@requires_brd
+def test_concurrent_rollups_reach_done(temp_board):
+    # Parallel-stories P3: 8 sibling-and-cousin subtasks finishing at once must
+    # not lose a story or milestone update. Fresh cards every iteration.
+    for iteration in range(_RACE_ITERATIONS):
+        milestone = _add_card(temp_board, f"Milestone {iteration}")
+        stories = [
+            _add_card(temp_board, f"Story {iteration}.{s}", milestone)
+            for s in range(_RACE_STORIES)
+        ]
+        subtasks = [
+            _add_card(temp_board, f"Subtask {iteration}.{s}.{t}", story)
+            for s, story in enumerate(stories)
+            for t in range(_RACE_SUBTASKS_PER_STORY)
+        ]
+        barrier = threading.Barrier(len(subtasks))
+        results: dict[str, dict[str, object]] = {}
+        errors: list[tuple[str, BaseException]] = []
+
+        def mark_done(card: str) -> None:
+            barrier.wait()
+            try:
+                results[card] = rollup.set_status(card, "done", repo_dir=temp_board)
+            except BaseException as exc:
+                errors.append((card, exc))
+
+        threads = [
+            threading.Thread(target=mark_done, args=(card,), daemon=True)
+            for card in subtasks
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=300)
+
+        assert not any(thread.is_alive() for thread in threads), iteration
+        assert errors == [], iteration
+        assert sorted(results) == sorted(subtasks), iteration
+        assert all(result["status"] == "done" for result in results.values())
+        for story in stories:
+            assert _brd_json(temp_board, "show", story)["status"] == "done", (
+                iteration,
+                story,
+            )
+        assert _brd_json(temp_board, "show", milestone)["status"] == "done", iteration
+
+
 # --- Pure-function tier (design §14): the status computation, no board. ---
 
 
