@@ -248,8 +248,8 @@ Two more keys appear only when they are not empty:
 
 An escalation at [Integrate](#integrate) has its own shape. The run exits 1, and `data` holds `escalated` (`true`), `phase` (`"integrate"`), `story`, `files`, `detail`, `run_id` and `warnings`. There is no `integrated` key.
 
-- `story` is the story whose tip was being merged, or `null` when the final check of the integrated branch failed.
-- `files` lists the conflicting files the resolver did not finish. It is empty when a merge was already in progress in the integration worktree, and when the final check failed.
+- `story` is the story whose tip was being merged, or `null` when the final check of the integrated branch failed. When a merge was already in progress, it is the first story in the merge order, not necessarily the one whose merge is stuck.
+- `files` lists the files that conflicted when that story's tip was merged, as they stood before the resolver ran. It is empty when a merge was already in progress in the integration worktree, and when the final check failed.
 - `detail` says what went wrong and names the integration worktree.
 
 The run is recorded `escalated`. The integration branch and its worktree are left exactly as Integrate left them, a merge still in progress included, so you can finish it there. See [Integrate](#integrate) for what to do next.
