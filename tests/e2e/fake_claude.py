@@ -10,12 +10,14 @@ adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no extra argv flag and no import
 of `agent_manager` -- a brief that omits the contract must make this script
-fail, because that failure is the test's whole point. There are exactly two
-test-controlled inputs, and neither tells the fake anything the brief owns:
+fail, because that failure is the test's whole point. There are exactly three
+test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
-from its own cwd and compares with the brief's `## branch`; and the
-implement-only rendezvous (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`),
-which only makes implement wait for other lanes and changes nothing it writes.
+from its own cwd and compares with the brief's `## branch`;
+`IMPLEMENT_EDITS_MARKER`, a JSON file beside it giving the files an implement
+writes for the brief's `## branch`; and the implement-only rendezvous
+(`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
+wait for other lanes and changes nothing it writes.
 
 Standard library only: it runs under a bare `#!<python>` line.
 """
@@ -217,6 +219,18 @@ REVIEW_FAIL_PORCELAIN = "?? fake-claude: the review-fail marker names this branc
 """What a failing review reports as `porcelain`. Non-empty, so the production
 `review_gate` blocks on it, and worded so the escalation detail says why."""
 
+IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
+"""A JSON file, in the repo's git common dir, of files a subtask's implement writes.
+
+It maps a branch to `{repo-relative path: full file content}`. It is found from
+this process's own cwd through `git rev-parse --git-common-dir`, like
+`REVIEW_FAIL_MARKER`, so it is in no worktree's tree. It is keyed by the
+implement brief's `## branch` section, so the brief still picks the subtask.
+The marker only says what that subtask's files contain, which is how the
+Integrate tests make two stories edit the same line. No marker, or no entry
+for the branch, changes nothing.
+"""
+
 RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 """Test scaffolding, never in a brief: a directory where each implement leaves a
 marker named for its cwd and then waits for other lanes' markers. Unset or
@@ -288,12 +302,17 @@ def rendezvous(cwd):
 
 
 
-def review_fail_branches(cwd):
-    """The branches the review-fail marker names, or an empty set when there is none."""
+def _common_dir_file(cwd, name):
+    """`<git common dir>/<name>`, found from `cwd`."""
     common = git(cwd, "rev-parse", "--git-common-dir").strip()
     # Relative (`.git`) in a main checkout, absolute in a linked worktree;
     # joining onto the cwd handles both.
-    marker = Path(cwd) / common / REVIEW_FAIL_MARKER
+    return Path(cwd) / common / name
+
+
+def review_fail_branches(cwd):
+    """The branches the review-fail marker names, or an empty set when there is none."""
+    marker = _common_dir_file(cwd, REVIEW_FAIL_MARKER)
     if not marker.is_file():
         return set()
     return {
@@ -348,6 +367,49 @@ def _section(found, name, phase):
     return found[name].strip()
 
 
+def _inside_worktree(relative, marker):
+    """`relative` as a `Path`, refusing anything that could land outside the cwd."""
+    path = Path(relative)
+    if not relative or path.is_absolute() or ".." in path.parts:
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} names {relative!r}, which is "
+            "not a path inside the worktree"
+        )
+    return path
+
+
+def implement_edits(cwd, found, phase):
+    """The files the implement-edits marker gives the brief's `## branch`, or `{}`.
+
+    No marker means `{}` without reading the brief, so an implement brief that
+    carries no `## branch` still works when no test asked for edits.
+    """
+    marker = _common_dir_file(cwd, IMPLEMENT_EDITS_MARKER)
+    if not marker.is_file():
+        return {}
+    branch = _section(found, "branch", phase)
+    try:
+        table = json.loads(marker.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} is not valid JSON: {error}"
+        ) from None
+    if not isinstance(table, dict):
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} is not a JSON object of branches"
+        )
+    entry = table.get(branch, {})
+    if not isinstance(entry, dict) or not all(
+        isinstance(name, str) and isinstance(content, str)
+        for name, content in entry.items()
+    ):
+        raise FakeClaudeError(
+            f"the implement-edits marker {marker} entry for {branch!r} is not an "
+            "object of path -> content strings"
+        )
+    return {_inside_worktree(name, marker): content for name, content in entry.items()}
+
+
 def build_result(phase, payload, text, cwd):
     """The phase's result: the schema skeleton, with what the gates need set."""
     found = sections(text)
@@ -383,11 +445,18 @@ def build_result(phase, payload, text, cwd):
         # which is the one thing this tier exists to catch (R4).
         digest = _section(found, "plan_hash", phase)
         relative = _section(found, "plan_path", phase)
+        # Test scaffolding, keyed by the brief's `## branch`: read and checked
+        # before anything is written, so a bad marker leaves the tree untouched.
+        edits = implement_edits(cwd, found, phase)
         # The content names this card's plan, so a subtask stacked on another's
         # branch (where the file already exists) still has a change to commit.
         (Path(cwd) / IMPLEMENTATION_NAME).write_text(
             f"# implementation of {relative}\n\n{SUMMARY}\n", encoding="utf-8"
         )
+        for path, content in edits.items():
+            target = Path(cwd) / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
         git(cwd, "add", "-A")
         # A relaunched subtask's implementation is already committed: nothing
         # changed, so there is nothing to commit, and the honest answer is

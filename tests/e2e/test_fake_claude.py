@@ -11,6 +11,7 @@ loaded here by path rather than imported by name, because `tests/e2e` is not on
 `sys.path` under `--import-mode=importlib`.
 """
 
+import ast
 import importlib.util
 import json
 import subprocess
@@ -26,6 +27,23 @@ _spec = importlib.util.spec_from_file_location("e2e_fake_claude", _SOURCE)
 assert _spec is not None and _spec.loader is not None
 fake_claude = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fake_claude)
+
+_CONFTEST = Path(__file__).with_name("conftest.py")
+
+
+def _conftest_constant(name):
+    """A module-level literal from `tests/e2e/conftest.py`, read without importing it.
+
+    `--import-mode=importlib` puts nothing on `sys.path`, so conftest names are
+    not importable; parsing the file is how the twins are pinned to each other.
+    """
+    tree = ast.parse(_CONFTEST.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"tests/e2e/conftest.py defines no {name}")
 
 
 def test_the_prompt_path_is_parsed_out_of_the_adapters_p_sentence():
@@ -762,3 +780,114 @@ def test_a_rendezvous_failure_makes_the_fake_process_exit_1(tmp_path, monkeypatc
     assert completed.returncode == 1
     assert "FAKE_CLAUDE_RENDEZVOUS_COUNT" in completed.stderr
     assert not result_path.exists()
+
+
+IMPLEMENT_BRANCH = "m3/task-a1-00000001"
+OTHER_BRANCH = "m3/task-b1-00000002"
+
+
+def _implement_on_branch(repo, branch=IMPLEMENT_BRANCH):
+    """An implement brief that carries `## branch`, as `builtin/task.yaml` renders it."""
+    text = _implement_brief_text(BRIEF_HASH) + f"\n## branch\n{branch}\n"
+    return fake_claude.build_result(
+        "implement", fake_claude.payload_from_schema(IMPLEMENT_SCHEMA), text, repo
+    )
+
+
+def _write_edits(repo, table):
+    (repo / ".git" / fake_claude.IMPLEMENT_EDITS_MARKER).write_text(
+        json.dumps(table), encoding="utf-8"
+    )
+
+
+def _show(repo, spec):
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", spec],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_the_implement_edits_marker_name_is_the_conftest_twin():
+    """The fixture writes `FAKE_IMPLEMENT_EDITS_MARKER`; the script reads
+    `IMPLEMENT_EDITS_MARKER`. They meet across a process boundary."""
+    assert fake_claude.IMPLEMENT_EDITS_MARKER == "fake-claude-implement-edits"
+    assert fake_claude.IMPLEMENT_EDITS_MARKER == _conftest_constant(
+        "FAKE_IMPLEMENT_EDITS_MARKER"
+    )
+
+
+def test_the_marker_entry_for_the_briefs_branch_is_written_and_committed(tmp_path):
+    repo = _implement_repo(tmp_path)
+    _write_edits(
+        repo,
+        {
+            IMPLEMENT_BRANCH: {"shared.txt": "story A\n", "pkg/nested.txt": "deep\n"},
+            OTHER_BRANCH: {"shared.txt": "story B\n"},
+        },
+    )
+
+    payload = _implement_on_branch(repo)
+
+    assert payload["resumed"] is False
+    assert _show(repo, "HEAD:shared.txt") == "story A\n"
+    assert _show(repo, "HEAD:pkg/nested.txt") == "deep\n"
+    assert _show(repo, f"HEAD:{fake_claude.IMPLEMENTATION_NAME}")  # still written
+    assert _porcelain(repo) == ""
+
+
+def test_a_marker_entry_for_another_branch_writes_nothing_extra(tmp_path):
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {OTHER_BRANCH: {"shared.txt": "story B\n"}})
+
+    payload = _implement_on_branch(repo)
+
+    assert payload["resumed"] is False
+    assert not (repo / "shared.txt").exists()
+    assert _porcelain(repo) == ""
+
+
+def test_a_marker_with_no_branch_section_in_the_brief_stops_the_fake(tmp_path):
+    """Review focus: the edits are keyed by the brief's `## branch`. A brief
+    without it must fail loudly, never quietly skip the edits."""
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: {"shared.txt": "story A\n"}})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement(repo)
+
+    assert "branch" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+
+
+@pytest.mark.parametrize("relative", ["../outside.txt", "/tmp/absolute.txt", ""])
+def test_a_marker_path_outside_the_worktree_is_refused_before_any_write(
+    tmp_path, relative
+):
+    """Review focus: a typo in a test must not write outside the worktree."""
+    repo = _implement_repo(tmp_path)
+    _write_edits(repo, {IMPLEMENT_BRANCH: {relative: "nope\n"}})
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not a path inside the worktree" in str(caught.value)
+    assert _head(repo) == before
+    assert _porcelain(repo) == ""
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_a_marker_that_is_not_json_is_refused(tmp_path):
+    repo = _implement_repo(tmp_path)
+    (repo / ".git" / fake_claude.IMPLEMENT_EDITS_MARKER).write_text(
+        "{not json", encoding="utf-8"
+    )
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement_on_branch(repo)
+
+    assert "not valid JSON" in str(caught.value)

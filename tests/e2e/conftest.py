@@ -52,6 +52,12 @@ MILESTONE_PREFIX = "m3"
 FAKE_REVIEW_FAIL_MARKER = "fake-claude-review-fail"
 """Must equal `fake_claude.REVIEW_FAIL_MARKER`, which `test_fake_claude.py` pins."""
 
+FAKE_IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
+"""Must equal `fake_claude.IMPLEMENT_EDITS_MARKER`, which `test_fake_claude.py` pins.
+
+A JSON file in the repo's git common dir mapping a branch to
+`{relative path: full file content}`: what that branch's implement writes."""
+
 FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 """Must equal `fake_claude.RENDEZVOUS_DIR_ENV`, which `test_fake_claude.py` pins."""
 
