@@ -319,6 +319,10 @@ def run_milestone(
                         failed_phase = result.summary.failed_phase
                         detail = result.summary.detail
 
+                    # Every non-`done` result is recorded `escalated` here. Nothing
+                    # returns `stopped` yet; once the engine can (card 0d8b7c9a), a
+                    # `stopped` summary must be handled before this branch rather
+                    # than fall into it, because `stopped` is not an escalation (P4).
                     if status != "done":
                         store.record_subtask(
                             story_id, started.model_copy(update={"status": "escalated"})
