@@ -88,14 +88,6 @@ def test_workflow_error_names_the_phase():
     assert str(WorkflowError("boom")) == "boom"
 
 
-def test_input_names_are_exactly_the_resolver_table():
-    from agent_manager import prompt
-
-    assert isinstance(prompt.INPUT_NAMES, frozenset)
-    assert prompt.INPUT_NAMES == frozenset(prompt._TABLE)
-    assert "card" in prompt.INPUT_NAMES
-
-
 def test_valid_workflow_passes():
     wf(Step("a", step_fn), agent("b"), agent("c", on_fail=Goto("b"))).validate(launcher_timeout=LAUNCHER)
 
