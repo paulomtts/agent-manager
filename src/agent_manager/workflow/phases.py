@@ -8,6 +8,7 @@ workflow it checkpointed is the one it is about to run.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -58,6 +59,11 @@ class AgentPhase:
     writes: str | None = None
     timeout: timedelta = timedelta(minutes=30)
     on_fail: Goto | None = None
+
+
+def _qual(fn: object) -> str:
+    """A callable's stable identity for the digest: `module.qualname`."""
+    return f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__qualname__', repr(fn))}"
 
 
 @dataclass(frozen=True)
@@ -119,3 +125,23 @@ class Workflow:
                         raise WorkflowError(
                             f"Goto {p.on_fail.phase!r} must name an earlier phase", phase=p.name)
             seen.append(p.name)
+
+    def digest(self) -> str:
+        """sha256 over the name and one record per phase, in declared order.
+
+        Fields are joined by `\\x1f` and each record ends with `\\x1e`, so no
+        two different workflows can concatenate to the same bytes by shifting
+        a value across a field boundary.
+        """
+        h = hashlib.sha256(self.name.encode())
+        for p in self.phases:
+            if isinstance(p, Step):
+                parts = ["step", p.name, _qual(p.run), repr(sorted(p.args.items())),
+                         *map(_qual, p.gates), str(p.best_effort),
+                         _qual(p.when) if p.when else "-", p.skip_to or "-"]
+            else:
+                parts = ["agent", p.name, p.role, ",".join(p.inputs),
+                         _qual(p.result) if p.result else "-", *map(_qual, p.gates),
+                         repr(p.retry), p.writes or "-", str(p.timeout), repr(p.on_fail)]
+            h.update("\x1f".join(parts).encode() + b"\x1e")
+        return h.hexdigest()

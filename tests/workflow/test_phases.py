@@ -169,3 +169,45 @@ def test_timeout_just_above_the_launcher_passes():
     wf(agent("a", timeout=LAUNCHER + timedelta(seconds=1))).validate(launcher_timeout=LAUNCHER)
     with pytest.raises(WorkflowError, match="timeout .* must exceed the launcher timeout"):
         wf(agent("a", timeout=LAUNCHER - timedelta(seconds=1))).validate(launcher_timeout=LAUNCHER)
+
+
+def test_digest_is_stable_and_sensitive():
+    base = wf(Step("a", step_fn, gates=(gate_ok,)), agent("b"))
+    assert base.digest() == wf(Step("a", step_fn, gates=(gate_ok,)), agent("b")).digest()
+    for changed in (
+        wf(agent("b"), Step("a", step_fn, gates=(gate_ok,))),              # reorder
+        wf(Step("a2", step_fn, gates=(gate_ok,)), agent("b")),             # rename
+        wf(Step("a", step_fn, gates=(other_gate,)), agent("b")),           # gate swap
+        wf(Step("a", step_fn, gates=(gate_ok,)), agent("b", retry=Retry(2, ("gate_failed",)))),
+        # Review Focus 5: the rest of the spec's must-change list.
+        wf(Step("a", step_fn, gates=(gate_ok,)), agent("b", timeout=timedelta(minutes=31))),
+        wf(Step("a", step_fn, gates=(gate_ok,)), agent("b", role="planner")),
+        wf(Step("a", step_fn, gates=(gate_ok,)), agent("b", inputs=("card", "branch"))),
+    ):
+        assert changed.digest() != base.digest()
+
+
+def test_digest_is_a_sha256_hex_string():
+    digest = wf(Step("a", step_fn)).digest()
+    assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+
+
+def test_digest_changes_when_skip_to_or_on_fail_is_retargeted():
+    def skipping(target):
+        return wf(Step("a", step_fn, when=gate_ok, skip_to=target), Step("b", step_fn), Step("c", step_fn))
+
+    assert skipping("b").digest() != skipping("c").digest()
+
+    def looping(target):
+        return wf(agent("a"), agent("b"), agent("c", on_fail=Goto(target)))
+
+    assert looping("a").digest() != looping("b").digest()
+    assert looping("a").digest() != wf(agent("a"), agent("b"), agent("c", on_fail=Goto("a", max_loops=2))).digest()
+
+
+def test_digest_ignores_args_order():
+    # Review Focus 5: args are sorted, so insertion order is not identity.
+    first = wf(Step("a", step_fn, args={"x": 1, "y": 2}))
+    second = wf(Step("a", step_fn, args={"y": 2, "x": 1}))
+    assert first.digest() == second.digest()
+    assert first.digest() != wf(Step("a", step_fn, args={"x": 1, "y": 3})).digest()
