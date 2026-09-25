@@ -519,6 +519,19 @@ def test_a_context_without_merge_tip_names_the_key_it_reads():
     assert "nothing in the context supplies it" in str(caught.value)
 
 
+def test_a_context_without_conflict_files_names_the_key_it_reads():
+    """Spec error path: an `extra_context` that omits `conflict_files` fails
+    with the resolver's existing missing-key error, nothing new."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(
+            _phase(["conflict_files"], name="resolve", role="resolver"), _context()
+        )
+
+    assert caught.value.phase == "resolve"
+    assert caught.value.parameter == "conflict_files"
+    assert "nothing in the context supplies it" in str(caught.value)
+
+
 def test_the_producer_map_is_derived_from_the_table_it_describes():
     """A resolver that reads another phase's result is a resume dependency:
     `cli.resume_start_phase` has to back off over that phase. The mapping is
