@@ -632,8 +632,8 @@ def build_result(phase, payload, text, cwd):
             name: keep_both_sides((Path(cwd) / name).read_bytes().decode("utf-8"))
             for name in files
         }
-        for name, text in rewritten.items():
-            (Path(cwd) / name).write_bytes(text.encode("utf-8"))
+        for name, resolved_text in rewritten.items():
+            (Path(cwd) / name).write_bytes(resolved_text.encode("utf-8"))
             git(cwd, "add", "--", name)
         git(cwd, "commit", "--no-edit")
         return override(payload, resolved=True, summary=SUMMARY)
