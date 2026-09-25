@@ -338,3 +338,70 @@ def test_a_tip_given_as_a_commit_sha_is_merged_and_reported_as_given(
     assert result["conflict"] is False
     assert _parents(wt) == [main_sha, tip]
     assert _base_state(repo) == before
+
+
+@requires_git
+def test_an_already_merged_tip_is_a_stable_no_op(repo: Path, wt: Path, tmp_path: Path):
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    before = _base_state(repo)
+    first = _merge(repo, wt, "m5/story-a")
+    head = _head(wt)
+
+    second = _merge(repo, wt, "m5/story-a")
+    third = _merge(repo, wt, "m5/story-a")
+
+    expected = {
+        "created": False,
+        "conflict": False,
+        "files": [],
+        "merged": "m5/story-a",
+        "already_merged": True,
+        "detail": "",
+    }
+    assert first["already_merged"] is False
+    assert second == expected
+    assert third == expected
+    assert _head(wt) == head
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_an_already_merged_tip_never_reaches_git_merge(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # git measures containment (merge-base --is-ancestor); merge is not even tried.
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+
+    calls: list[list[str]] = []
+    _merge(repo, wt, "m5/story-a", _recorder(calls))
+
+    assert any("--is-ancestor" in argv for argv in calls)
+    assert not any("merge" in argv for argv in calls)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_git_saying_already_up_to_date_is_also_the_no_op(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # Only a race could make the ancestry probe say "no" for a merged tip; the
+    # probe is forced here so the real `git merge` prints "Already up to date."
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+    head = _head(wt)
+
+    def runner(argv: list[str]) -> str:
+        if "--is-ancestor" in argv:
+            raise GitError("forced: the ancestry probe answers no", argv=argv, exit_code=1)
+        return run_git(argv)
+
+    result = _merge(repo, wt, "m5/story-a", runner)
+
+    assert result["already_merged"] is True
+    assert result["merged"] == "m5/story-a"
+    assert result["conflict"] is False
+    assert _head(wt) == head
+    assert _base_state(repo) == before

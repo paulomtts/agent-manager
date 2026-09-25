@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from agent_manager.steps.worktree import (
+    GitError,
     GitRunner,
     _required_absolute,
     _required_name,
@@ -72,6 +73,26 @@ def _result(
     }
 
 
+def _already_contains(git_runner: GitRunner, worktree_path: str, tip: str) -> bool:
+    """Whether HEAD already contains `tip`, as git measures it.
+
+    `merge-base --is-ancestor` exits 0 for yes and 1 for no. Anything else
+    (a bad ref is 128) is a real failure and propagates.
+    """
+    try:
+        git_runner(["-C", worktree_path, "merge-base", "--is-ancestor", tip, "HEAD"])
+    except GitError as error:
+        if error.exit_code == 1:
+            return False
+        raise
+    return True
+
+
+def _says_already_up_to_date(output: str) -> bool:
+    """Whether `git merge` reported a no-op ("Already up to date." / "up-to-date")."""
+    return "already up to date" in output.lower().replace("-", " ")
+
+
 def merge_tip(
     repo_dir: str | Path,
     worktree: str | Path,
@@ -82,9 +103,10 @@ def merge_tip(
 ) -> dict[str, object]:
     """Merge `tip` into `integration_branch`'s worktree with `--no-ff`, and report it.
 
-    The return value is the deterministic phase's result -- a plain dict,
-    since it crosses no process boundary and so needs no Pydantic model
-    (`CLAUDE.md`).
+    A tip already contained in HEAD is a no-op, so a relaunch never
+    re-merges. The return value is the deterministic phase's result -- a
+    plain dict, since it crosses no process boundary and so needs no Pydantic
+    model (`CLAUDE.md`).
     """
     tip = _required_tip(tip)
     integration_branch = _required_name(integration_branch, "integration_branch")
@@ -95,6 +117,11 @@ def merge_tip(
     ensured = ensure(integration_branch, base_branch, worktree_path, repo_path, git_runner)
     created = bool(ensured["created"])
 
+    if _already_contains(git_runner, worktree_path, tip):
+        return _result(created=created, merged=tip, already_merged=True)
+
     # --no-edit: take git's generated message; never wait on an editor.
-    git_runner(["-C", worktree_path, "merge", "--no-ff", "--no-edit", tip])
+    output = git_runner(["-C", worktree_path, "merge", "--no-ff", "--no-edit", tip])
+    if _says_already_up_to_date(output):
+        return _result(created=created, merged=tip, already_merged=True)
     return _result(created=created, merged=tip)
