@@ -19,6 +19,7 @@ import pytest
 from agent_manager.steps.integrate import (
     MergeInProgressError,
     measure_merge,
+    merge_completed_gate,
     merge_tip,
 )
 from agent_manager.steps.worktree import GitError, run_git
@@ -826,3 +827,207 @@ def test_a_head_with_no_parent_has_nothing_touched(tmp_path: Path):
         "status": "",
         "marked_files": [],
     }
+
+
+RESOLVED = {"resolved": True, "files": ["a.js"], "summary": "kept both sides"}
+"""What a resolver that claims success returns. The gate must not believe it."""
+
+
+@requires_git
+def test_the_gate_passes_a_finished_merge(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is None
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_fails_a_merge_still_in_progress(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    tip_b = _leave_a_conflict(repo, wt, tmp_path)
+    head = _head(wt)
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(None, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is not None
+    assert set(verdict) == {"detail"}
+    detail = verdict["detail"]
+    assert "MERGE_HEAD" in detail
+    assert "commit" in detail
+    assert "a.js" in detail
+    # Judging changed nothing: the merge is still exactly where it was.
+    assert _merge_head(wt) == tip_b
+    assert _head(wt) == head
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@pytest.mark.parametrize("path", ["scratch.txt", "b.js"], ids=["untracked", "modified"])
+@requires_git
+def test_the_gate_fails_a_finished_merge_with_a_dirty_tree(
+    repo: Path, wt: Path, tmp_path: Path, path: str
+):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+    (wt / path).write_text("left behind by the resolver\n")
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is not None
+    assert set(verdict) == {"detail"}
+    assert "not clean" in verdict["detail"]
+    assert path in verdict["detail"]
+    assert "MERGE_HEAD" not in verdict["detail"]
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_fails_a_committed_resolution_that_kept_the_markers(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _leave_a_conflict(repo, wt, tmp_path)
+    assert "<<<<<<< " in (wt / "a.js").read_text()  # non-vacuity
+    # A resolver that staged and committed the conflicted file as-is.
+    _git(wt, "add", "a.js")
+    _git(wt, "commit", "--no-edit")
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is not None
+    assert set(verdict) == {"detail"}
+    assert "Conflict markers remain in: a.js" in verdict["detail"]
+    assert "MERGE_HEAD" not in verdict["detail"]
+    assert "not clean" not in verdict["detail"]
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_passes_a_touched_file_with_only_an_underline(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"README.md": "Title\n=======\n\nBody.\n"})
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is None
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_resolver_claiming_resolved_does_not_pass_an_unfinished_merge(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _leave_a_conflict(repo, wt, tmp_path)
+
+    calls: list[list[str]] = []
+    claimed = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+    unclaimed = merge_completed_gate({"resolved": False}, str(wt))
+
+    assert claimed is not None
+    assert "MERGE_HEAD" in claimed["detail"]
+    assert claimed == unclaimed
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_ignores_markers_in_a_file_the_merge_did_not_touch(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    _commit(repo, "legacy.md", MARKED)
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+
+    calls: list[list[str]] = []
+    verdict = merge_completed_gate(RESOLVED, str(wt), git_runner=_recorder(calls))
+
+    assert verdict is None
+    _assert_read_only_git(calls, wt)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_names_every_failure_in_order(repo: Path, wt: Path, tmp_path: Path):
+    before = _base_state(repo)
+    _leave_a_conflict(repo, wt, tmp_path)
+    (wt / "scratch.txt").write_text("left behind\n")
+
+    detail = merge_completed_gate(RESOLVED, str(wt))["detail"]
+
+    assert detail.startswith("The merge is not complete: ")
+    in_progress = detail.index("MERGE_HEAD")
+    markers = detail.index("Conflict markers remain in: a.js")
+    dirty = detail.index("The working tree is not clean: ")
+    assert in_progress < markers < dirty
+    assert "?? scratch.txt" in detail[dirty:]
+    assert "a.js" in detail[dirty:]  # the unmerged path is dirty too
+    assert "\n" not in detail
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_merge_head_probe_failing_otherwise_propagates_from_the_gate(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+
+    def runner(argv: list[str]) -> str:
+        if "MERGE_HEAD" in argv:
+            raise GitError("forced: the probe itself broke", argv=argv, exit_code=128)
+        return run_git(argv)
+
+    with pytest.raises(GitError) as excinfo:
+        merge_completed_gate(RESOLVED, str(wt), git_runner=runner)
+
+    assert excinfo.value.exit_code == 128
+    assert "MERGE_HEAD" in excinfo.value.argv
+    assert _base_state(repo) == before
+
+
+@pytest.mark.parametrize(
+    ("token", "exit_code"),
+    [("status", 1), ("diff", 1), ("HEAD^1", 128)],
+    ids=["status-exit-1", "diff-exit-1", "first-parent-probe-exit-128"],
+)
+@requires_git
+def test_any_other_git_failure_propagates_from_the_gate(
+    repo: Path, wt: Path, tmp_path: Path, token: str, exit_code: int
+):
+    # Exit 1 is "absent" only for a ref probe; anywhere else it is a failure.
+    before = _base_state(repo)
+    _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
+
+    def runner(argv: list[str]) -> str:
+        if token in argv:
+            raise GitError("forced failure", argv=argv, exit_code=exit_code)
+        return run_git(argv)
+
+    with pytest.raises(GitError) as excinfo:
+        merge_completed_gate(RESOLVED, str(wt), git_runner=runner)
+
+    assert token in excinfo.value.argv
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_the_gate_raises_for_a_worktree_that_is_not_a_repository(tmp_path: Path):
+    with pytest.raises(GitError) as excinfo:
+        merge_completed_gate(RESOLVED, str(tmp_path / "not-a-repo"))
+
+    assert excinfo.value.exit_code not in (None, 0, 1)

@@ -18,7 +18,7 @@ import pytest
 from agent_manager import dispatch, engine, models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
-from agent_manager.steps import reducers
+from agent_manager.steps import integrate, reducers
 from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
 from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
@@ -198,6 +198,26 @@ def test_bind_arguments_refuses_a_positional_only_parameter():
 
     assert caught.value.parameter == "card"
     assert "positional-only" in str(caught.value)
+
+def test_bind_arguments_binds_the_merge_completed_gate_from_a_gate_table():
+    """The gate takes `result` and `worktree` by name out of exactly the table
+    `_gate_values` builds for a deterministic phase; `git_runner` is keyword-only
+    with a default and must never be required or bound from the context."""
+    result = {"resolved": True, "files": ["a.js"], "summary": "kept both sides"}
+    context = engine.subtask_context(_subtask(), REPO, ["uv run pytest"])
+    values = engine._gate_values(context, "merge", result)
+
+    bound = engine.bind_arguments(
+        integrate.merge_completed_gate,
+        values,
+        phase="merge",
+        function="merge_completed_gate",
+    )
+
+    assert bound == {
+        "result": result,
+        "worktree": Path("/repo/.claude/worktrees/m1/task-ed77a917"),
+    }
 
 
 RUN_ID = "run-2026-09-23-01"

@@ -279,3 +279,41 @@ def measure_merge(
         and _has_conflict_markers(Path(worktree_path) / name)
     ]
     return {"merge_in_progress": in_progress, "status": status, "marked_files": marked}
+
+
+def _dirty_paths(status: str) -> list[str]:
+    """The `git status --porcelain` entries, one per dirty path, as git printed them."""
+    return [line.strip() for line in status.split("\n") if line.strip()]
+
+
+def merge_completed_gate(
+    result: object, worktree: str | Path, *, git_runner: GitRunner = run_git
+) -> dict[str, str] | None:
+    """Pass (None) only when git says the merge in `worktree` is finished.
+
+    Finished means: no MERGE_HEAD, a clean `git status --porcelain`, and no
+    touched file holding both conflict-marker lines. `result` is the
+    resolver's report and is deliberately never read -- its `resolved` flag is
+    advisory; git judges. Otherwise the verdict is `{"detail": ...}`, written
+    as feedback for the resolver because it is appended to its retry brief.
+    Any git failure propagates: it is never a pass and never a verdict.
+    """
+    measured = measure_merge(worktree, git_runner)
+    in_progress = bool(measured["merge_in_progress"])
+    marked = list(measured["marked_files"])
+    dirty = _dirty_paths(str(measured["status"]))
+    if not in_progress and not marked and not dirty:
+        return None
+
+    lead = "The merge is not complete"
+    if in_progress:
+        sentences = [
+            f"{lead}: a merge is still in progress (MERGE_HEAD exists); commit it."
+        ]
+    else:
+        sentences = [f"{lead}."]
+    if marked:
+        sentences.append(f"Conflict markers remain in: {', '.join(marked)}.")
+    if dirty:
+        sentences.append(f"The working tree is not clean: {'; '.join(dirty)}.")
+    return {"detail": " ".join(sentences)}
