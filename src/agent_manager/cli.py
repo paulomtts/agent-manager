@@ -864,7 +864,11 @@ def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, 
 
 
 def dry_run_payload(
-    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+    stories: Sequence[census.StoryPlan],
+    *,
+    branch_prefix: str,
+    base_branch: str,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
     """O3's preview: dispatch levels with each subtask's branch and base.
 
@@ -875,7 +879,9 @@ def dry_run_payload(
     blocked by a done story still roots on that story's tip. A story's
     `subtasks` lists only what would be dispatched, but each `base` comes
     from `stack_bases` over the full ordered list, so a done first subtask
-    still anchors the second.
+    still anchors the second. `max_concurrent` is echoed at the top, and each
+    level row says how many of its stories would run together:
+    `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
     """
     stories = list(stories)
     dag.assert_no_blocker_cycles(stories)
@@ -905,12 +911,27 @@ def dry_run_payload(
                     ],
                 }
             )
-        level_rows.append({"level": index, "stories": story_rows})
-    return {"levels": level_rows, "already_done": already_done_entries(stories)}
+        level_rows.append(
+            {
+                "level": index,
+                "concurrent": min(len(level), max_concurrent),
+                "stories": story_rows,
+            }
+        )
+    return {
+        "max_concurrent": max_concurrent,
+        "levels": level_rows,
+        "already_done": already_done_entries(stories),
+    }
 
 
 def dry_run_milestone(
-    needle: str, *, repo_dir: Path, branch_prefix: str, base_branch: str
+    needle: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
     """O3's order: repo dir, roots, milestone, tree, census, then the payload.
 
@@ -923,7 +944,10 @@ def dry_run_milestone(
     milestone = census.find_milestone(board.roots(repo_dir=root), needle)
     plan = census.flatten_milestone(board.tree(milestone.id, repo_dir=root))
     return dry_run_payload(
-        plan.stories, branch_prefix=branch_prefix, base_branch=base_branch
+        plan.stories,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        max_concurrent=max_concurrent,
     )
 
 
@@ -1058,6 +1082,7 @@ def run(
                 repo_dir=repo_dir,
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
+                max_concurrent=lanes,
             )
         elif milestone is not None:
             # `orchestrate` imports this module at load time and reads its names
