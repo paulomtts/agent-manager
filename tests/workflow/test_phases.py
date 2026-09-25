@@ -86,3 +86,86 @@ def test_workflow_error_names_the_phase():
     assert error.phase == "spec"
     assert str(error) == "phase 'spec': boom"
     assert str(WorkflowError("boom")) == "boom"
+
+
+def test_input_names_are_exactly_the_resolver_table():
+    from agent_manager import prompt
+
+    assert isinstance(prompt.INPUT_NAMES, frozenset)
+    assert prompt.INPUT_NAMES == frozenset(prompt._TABLE)
+    assert "card" in prompt.INPUT_NAMES
+
+
+def test_valid_workflow_passes():
+    wf(Step("a", step_fn), agent("b"), agent("c", on_fail=Goto("b"))).validate(launcher_timeout=LAUNCHER)
+
+
+@pytest.mark.parametrize("phases, needle", [
+    ((Step("a", step_fn), Step("a", step_fn)), "duplicate"),
+    ((Step("a", step_fn, skip_to="a", when=gate_ok),), "skip_to"),
+    ((Step("a", step_fn, when=gate_ok),), "when"),
+    ((Step("a", step_fn, skip_to="b"), Step("b", step_fn)), "when"),
+    ((agent("a", on_fail=Goto("b")), agent("b")), "Goto"),
+    ((agent("a"), agent("b", on_fail=Goto("a", max_loops=0))), "max_loops"),
+    ((agent("a", role="no_such_role"),), "role"),
+    ((agent("a", inputs=("nonsense",)),), "input"),
+    ((agent("a", timeout=timedelta(minutes=10)),), "timeout"),
+    # Review Focus 2: the other non-strict directions and unknown targets.
+    ((Step("a", step_fn), Step("b", step_fn, when=gate_ok, skip_to="a")), "skip_to .* must name a later phase"),
+    ((Step("a", step_fn, when=gate_ok, skip_to="nowhere"),), "skip_to .* must name a later phase"),
+    ((agent("a", on_fail=Goto("a")),), "Goto .* must name an earlier phase"),
+    ((agent("a"), agent("b", on_fail=Goto("nowhere"))), "Goto .* must name an earlier phase"),
+])
+def test_validate_refuses(phases, needle):
+    with pytest.raises(WorkflowError, match=needle) as info:
+        wf(*phases).validate(launcher_timeout=LAUNCHER)
+    assert info.value.phase is not None
+
+
+def test_duplicate_is_checked_before_any_other_rule():
+    # The first "a" has a bad role, but the duplicate is reported first.
+    with pytest.raises(WorkflowError, match="duplicate") as info:
+        wf(agent("a", role="no_such_role"), Step("a", step_fn)).validate(launcher_timeout=LAUNCHER)
+    assert info.value.phase == "a"
+
+
+def test_when_without_skip_to_names_both_fields():
+    with pytest.raises(WorkflowError, match=r"when.*skip_to") as info:
+        wf(Step("a", step_fn, when=gate_ok), Step("b", step_fn)).validate(launcher_timeout=LAUNCHER)
+    assert info.value.phase == "a"
+
+
+def test_an_earlier_phase_name_is_a_valid_input():
+    wf(agent("explore"), agent("spec", inputs=("explore",))).validate(launcher_timeout=LAUNCHER)
+
+
+def test_an_earlier_phase_name_outside_the_resolver_table_is_a_valid_input():
+    # "explore" above is also a _TABLE key; "design" is not, so only the
+    # earlier-phase rule can accept it.
+    wf(agent("design"), agent("impl", inputs=("card", "design"))).validate(launcher_timeout=LAUNCHER)
+
+
+def test_an_input_naming_a_later_or_same_phase_is_refused():
+    # Review Focus 1: only a strictly earlier phase can feed an input.
+    with pytest.raises(WorkflowError, match="input 'b' has no resolver and no earlier phase") as info:
+        wf(agent("a", inputs=("b",)), agent("b")).validate(launcher_timeout=LAUNCHER)
+    assert info.value.phase == "a"
+    with pytest.raises(WorkflowError, match="input 'a'"):
+        wf(agent("a", inputs=("a",))).validate(launcher_timeout=LAUNCHER)
+
+
+def test_role_failure_is_chained_and_honours_role_root(tmp_path):
+    # Review Focus 3: an empty role_root means even a shipped role cannot load.
+    from agent_manager.roles.loader import RoleBundleError
+
+    with pytest.raises(WorkflowError, match="role 'explorer' does not load") as info:
+        wf(agent("a")).validate(launcher_timeout=LAUNCHER, role_root=tmp_path)
+    assert info.value.phase == "a"
+    assert isinstance(info.value.__cause__, RoleBundleError)
+
+
+def test_timeout_just_above_the_launcher_passes():
+    # Review Focus 4: G2 is strict, so one second over is enough.
+    wf(agent("a", timeout=LAUNCHER + timedelta(seconds=1))).validate(launcher_timeout=LAUNCHER)
+    with pytest.raises(WorkflowError, match="timeout .* must exceed the launcher timeout"):
+        wf(agent("a", timeout=LAUNCHER - timedelta(seconds=1))).validate(launcher_timeout=LAUNCHER)

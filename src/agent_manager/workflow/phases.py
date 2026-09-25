@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from pydantic import BaseModel
@@ -73,3 +74,48 @@ class Workflow:
             if p.name == name:
                 return p
         raise WorkflowError(f"no phase named {name!r} (phases: {', '.join(self.phase_names)})")
+
+    def validate(self, *, launcher_timeout: timedelta, role_root: Path | None = None) -> None:
+        """Refuse a workflow that must not run, naming the phase at fault.
+
+        `launcher_timeout` is G2: every agent phase's turn timeout must exceed
+        it strictly, because the launcher has to kill `claude -p` before the
+        turn is cancelled -- cancellation cannot stop a `to_thread` worker.
+        """
+        from agent_manager import prompt
+        from agent_manager.roles.loader import load_role
+
+        order: dict[str, int] = {}
+        for index, p in enumerate(self.phases):
+            if p.name in order:
+                raise WorkflowError("duplicate phase name", phase=p.name)
+            order[p.name] = index
+
+        seen: list[str] = []
+        for index, p in enumerate(self.phases):
+            if isinstance(p, Step):
+                if (p.when is None) != (p.skip_to is None):
+                    raise WorkflowError("`when` and `skip_to` must be given together", phase=p.name)
+                if p.skip_to is not None and order.get(p.skip_to, -1) <= index:
+                    raise WorkflowError(f"skip_to {p.skip_to!r} must name a later phase", phase=p.name)
+            else:
+                try:
+                    load_role(p.role, root=role_root)
+                except Exception as error:
+                    raise WorkflowError(f"role {p.role!r} does not load: {error}", phase=p.name) from error
+                for name in p.inputs:
+                    if name not in prompt.INPUT_NAMES and name not in seen:
+                        raise WorkflowError(
+                            f"input {name!r} has no resolver and no earlier phase", phase=p.name)
+                if p.timeout <= launcher_timeout:
+                    raise WorkflowError(
+                        f"timeout {p.timeout} must exceed the launcher timeout {launcher_timeout}",
+                        phase=p.name,
+                    )
+                if p.on_fail is not None:
+                    if p.on_fail.max_loops < 1:
+                        raise WorkflowError("Goto max_loops must be at least 1", phase=p.name)
+                    if order.get(p.on_fail.phase, index) >= index:
+                        raise WorkflowError(
+                            f"Goto {p.on_fail.phase!r} must name an earlier phase", phase=p.name)
+            seen.append(p.name)
