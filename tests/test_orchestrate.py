@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, census, cli, dag, engine, models, orchestrate, paths
+from agent_manager import board, census, cli, dag, engine, integration, models, orchestrate, paths
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow.registry import WorkflowLoadError
@@ -231,6 +231,48 @@ def test_an_unnamed_primary_falls_back_to_the_first_escalation_in_census_order()
     assert payload["also_escalated"] == [
         {"level": 1, "story": "B", "subtask": "b1", "failed_phase": "verify", "detail": "y"}
     ]
+
+
+def test_the_integrated_payload_is_plain_json_with_the_worktree_as_a_string():
+    outcome = integration.IntegrateSuccess(
+        branch="m3-integrate",
+        worktree=Path("/repo/.claude/worktrees/m3-integrate"),
+        merged=["A", "B"],
+        resolved=["B"],
+    )
+
+    assert orchestrate.integrated_payload(outcome) == {
+        "branch": "m3-integrate",
+        "worktree": "/repo/.claude/worktrees/m3-integrate",
+        "merged": ["A", "B"],
+        "resolved": ["B"],
+    }
+
+
+def test_the_integrate_escalation_payload_names_the_phase_story_and_files():
+    outcome = integration.IntegrateEscalation(
+        story="B", files=["shared.txt"], detail="the resolver did not finish"
+    )
+
+    payload = orchestrate.integrate_escalated_payload("run-1", outcome, ["gate warned"])
+
+    assert payload == {
+        "escalated": True,
+        "phase": "integrate",
+        "story": "B",
+        "files": ["shared.txt"],
+        "detail": "the resolver did not finish",
+        "run_id": "run-1",
+        "warnings": ["gate warned"],
+    }
+
+
+def test_a_final_verification_escalation_payload_has_no_story():
+    outcome = integration.IntegrateEscalation(story=None, files=[], detail="suite red")
+
+    payload = orchestrate.integrate_escalated_payload("run-1", outcome, [])
+
+    assert (payload["story"], payload["files"], payload["phase"]) == (None, [], "integrate")
 
 
 # ── the runner, on a real repo and a real board ─────────────────────────────

@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from agent_manager import board, census, cli, dag, models
+from agent_manager import board, census, cli, dag, integration, models
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Store
 from agent_manager.workflow.loader import load_builtin
@@ -156,6 +156,40 @@ def escalated_payload(
     if stopped:
         payload["stopped"] = stopped
     return payload
+
+
+def integrated_payload(outcome: integration.IntegrateSuccess) -> dict[str, Any]:
+    """A clean run's `integrated` key: where every story tip now lives (addendum I6).
+
+    `worktree` is a `str`, so the payload is plain JSON before `render` ever
+    sees it. `merged` and `resolved` are story ids in merge order.
+    """
+    return {
+        "branch": outcome.branch,
+        "worktree": str(outcome.worktree),
+        "merged": list(outcome.merged),
+        "resolved": list(outcome.resolved),
+    }
+
+
+def integrate_escalated_payload(
+    run_id: str, outcome: integration.IntegrateEscalation, warnings: list[str]
+) -> dict[str, Any]:
+    """The result of a run that stopped at Integrate (addendum I5).
+
+    `escalated: true` is what `am run` reads for its exit code, as for a lane
+    escalation. `story` is `None` when the final verification failed rather
+    than a tip. The branch and worktree are left as Integrate left them.
+    """
+    return {
+        "escalated": True,
+        "phase": outcome.phase,
+        "story": outcome.story,
+        "files": list(outcome.files),
+        "detail": outcome.detail,
+        "run_id": run_id,
+        "warnings": warnings,
+    }
 
 
 def _utcnow() -> datetime:
