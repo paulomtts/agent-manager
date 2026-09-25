@@ -538,6 +538,64 @@ def test_reads_do_not_wait_for_the_board_write_lock(temp_board):
     assert [node.id for node in outcome["roots"]] == [subtask]
 
 
+_STRESS_STATUSES = ("todo", "in_progress", "done")
+_STRESS_WRITERS = 8
+_STRESS_WRITES_EACH = 25
+
+
+def _stress_status(writer: int, write: int) -> str:
+    # Offset by writer so the cards end on different statuses, not all on one.
+    return _STRESS_STATUSES[(writer + write) % len(_STRESS_STATUSES)]
+
+
+@requires_brd
+def test_brd_update_survives_concurrent_writers(temp_board):
+    # Main spec §17 "brd concurrency" / parallel-stories P3: this deliberately
+    # bypasses board.py and WRITE_LOCK, calling `brd update` straight from 8
+    # threads, to find out whether brd itself tolerates concurrent writers.
+    # Never weaken this if it flakes -- a failure is the evidence that
+    # board._run needs its bounded lock-error retry.
+    cards = [
+        _add_card(temp_board, f"stress card {writer}")
+        for writer in range(_STRESS_WRITERS)
+    ]
+    failures: list[tuple[str, int, int, str, str]] = []
+    barrier = threading.Barrier(_STRESS_WRITERS)
+
+    def hammer(writer: int, card_id: str) -> None:
+        barrier.wait()
+        for write in range(_STRESS_WRITES_EACH):
+            completed = subprocess.run(
+                ["brd", "update", card_id, "--status", _stress_status(writer, write)],
+                cwd=temp_board,
+                capture_output=True,
+                text=True,
+            )
+            try:
+                ok = json.loads(completed.stdout).get("ok") is True
+            except (json.JSONDecodeError, AttributeError):
+                ok = False
+            if completed.returncode != 0 or not ok:
+                failures.append(
+                    (card_id, write, completed.returncode, completed.stdout, completed.stderr)
+                )
+
+    threads = [
+        threading.Thread(target=hammer, args=(writer, card_id))
+        for writer, card_id in enumerate(cards)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=300)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert failures == []
+    for writer, card_id in enumerate(cards):
+        expected = _stress_status(writer, _STRESS_WRITES_EACH - 1)
+        assert _brd_json(temp_board, "show", card_id)["status"] == expected
+
+
 @requires_brd
 def test_nothing_but_status_is_ever_written_to_the_board(temp_board, tmp_path):
     # Decision D5: the board receives status transitions and nothing else. No
