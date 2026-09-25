@@ -8,6 +8,7 @@ its names are placeholders that raise `NotImplementedError`.
 """
 
 import json
+import typing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2184,3 +2185,8 @@ def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_run
     assert [tuple(row) for row in attempts] == [("implement", "gate_failed")]
     assert "verify.run_suite" not in calls
     assert "rollup.set_status:done" not in calls
+
+
+def test_a_subtask_summary_may_report_stopped():
+    hints = typing.get_type_hints(engine.SubtaskSummary)
+    assert typing.get_args(hints["status"]) == ("done", "escalated", "stopped")

@@ -12,6 +12,7 @@ typo has to name the statuses that would have worked.
 import importlib
 import os
 import sys
+import typing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -855,3 +856,51 @@ def test_brd_models_still_ignore_unknown_keys_alongside_the_new_fields(model):
     assert not hasattr(instance, "assignee")
     assert "updated_at" not in instance.model_dump()
     assert "assignee" not in instance.model_dump()
+
+
+def test_every_status_carrying_model_accepts_stopped():
+    assert models.PhaseRun(name="implement", kind="agent", status="stopped").status == "stopped"
+    assert (
+        models.SubtaskRun(
+            card_id="a3dd82f4", branch="m4/x-a3dd82f4", base_branch="main", status="stopped"
+        ).status
+        == "stopped"
+    )
+    assert (
+        models.StoryRun(card_id="9bfb5ac2", title="Stop cleanly", level=0, status="stopped").status
+        == "stopped"
+    )
+    assert (
+        models.Run(
+            id="run-2026-09-24-01",
+            workflow="task",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m4/",
+            status="stopped",
+        ).status
+        == "stopped"
+    )
+
+
+def test_status_grew_by_exactly_stopped_and_still_rejects_unknown_values():
+    assert typing.get_args(models.Status) == (
+        "pending",
+        "started",
+        "done",
+        "failed",
+        "escalated",
+        "stopped",
+    )
+    with pytest.raises(ValidationError) as excinfo:
+        models.SubtaskRun(
+            card_id="a3dd82f4", branch="m4/x-a3dd82f4", base_branch="main", status="halted"
+        )
+    message = str(excinfo.value)
+    for allowed in ("pending", "started", "done", "failed", "escalated", "stopped"):
+        assert allowed in message
+
+
+def test_attempt_status_does_not_pick_up_stopped():
+    with pytest.raises(ValidationError):
+        models.Attempt(n=1, dispatch=_dispatch(), status="stopped")

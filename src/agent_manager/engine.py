@@ -241,7 +241,7 @@ class SubtaskSummary:
     carries neither the results nor the warnings.
     """
 
-    status: Literal["done", "escalated"] = "done"
+    status: Literal["done", "escalated", "stopped"] = "done"
     results: dict[str, Any] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
