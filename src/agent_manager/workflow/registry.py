@@ -16,7 +16,15 @@ one type for "this workflow could not be loaded".
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
+from agent_manager.steps import (
+    docs_commit,
+    integrate,
+    plan_check,
+    reducers,
+    rollup,
+    verify,
+    worktree,
+)
 
 Function = Callable[..., Any]
 """What a registered name resolves to. The engine, not this module, knows what
@@ -212,6 +220,7 @@ BUILTIN_FUNCTION_NAMES = (
     "docs_commit.commit_documents",
     "exploration_output_gate",
     "implement_blocked_gate",
+    "merge_completed_gate",
     "plan_check.find_validated_plan",
     "plan_check.has_validated_plan",
     "plan_check.mark_validated",
@@ -223,13 +232,16 @@ BUILTIN_FUNCTION_NAMES = (
     "verify.run_suite",
     "worktree.ensure",
 )
-"""Every name appearing in a run/when/gate position of `builtin/task.yaml`,
-sorted. Kept here as data so a test can assert the registry and the document
-have not drifted apart."""
+"""Every name the builtin workflow documents use in a run/when/gate position,
+sorted: `task.yaml`, plus the integrate-only names the forthcoming
+`integrate.yaml` will reference (`merge_completed_gate`). Kept here as data so
+a test can assert the registry and the documents have not drifted apart."""
 
 
 def default_registry() -> FunctionRegistry:
-    """A fresh registry holding every name `builtin/task.yaml` references.
+    """A fresh registry holding every name the builtin workflow documents use:
+    `task.yaml`, plus the integrate-only names the forthcoming `integrate.yaml`
+    will reference.
 
     A new instance per call on purpose: a module-level singleton is mutable
     global state that any importer could rebind a gate in, and the second call
@@ -254,6 +266,9 @@ def default_registry() -> FunctionRegistry:
     registry.register("critic_blockers_gate", reducers.critic_blockers_gate)
     # Decision O7: a coder that reports blocked stops the subtask at implement.
     registry.register("implement_blocked_gate", reducers.implement_blocked_gate)
+
+    # Integrate addendum I3: git, not the resolver, judges a merge complete.
+    registry.register("merge_completed_gate", integrate.merge_completed_gate)
 
     # Deterministic steps.
     registry.register("worktree.ensure", worktree.ensure)
