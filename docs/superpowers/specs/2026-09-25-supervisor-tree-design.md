@@ -97,7 +97,7 @@ tests are the oracle; assertions about level barriers become dataflow assertions
 refusal tests become merged-base tests, everything else passes unchanged.
 
 **T10 — grafo is a runtime dependency from the release that empties its runtime dependencies.**
-`grafo>=0.3.5` (the dependency-groups release), imported only by `orchestrate.py` and `bases.py`.
+`grafo>=0.3.5` (the dependency-groups release), imported only by `orchestrate.py`.
 
 ## 4. Architecture
 
