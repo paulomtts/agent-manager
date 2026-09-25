@@ -33,8 +33,8 @@ def test_an_unknown_result_name_is_a_named_engine_error():
     assert "Canned" in message
 
 
-def test_the_shipped_table_holds_exactly_the_six_declared_names():
-    # An equality, not a superset: a stray seventh key is a name the engine would
+def test_the_shipped_table_holds_exactly_the_seven_declared_names():
+    # An equality, not a superset: a stray eighth key is a name the engine would
     # happily resolve for a phase that has no business declaring it.
     assert set(results.RESULT_MODELS) == {
         "ExploreResult",
@@ -43,6 +43,7 @@ def test_the_shipped_table_holds_exactly_the_six_declared_names():
         "PlanResult",
         "ImplementResult",
         "ReviewResult",
+        "ResolveResult",
     }
 
 
@@ -62,9 +63,9 @@ def test_verification_is_not_registered():
     assert "Verification" not in results.RESULT_MODELS
 
 
-def test_an_unknown_name_now_lists_the_six_registered_names():
+def test_an_unknown_name_now_lists_the_seven_registered_names():
     # The addendum's opening failure ends "(registered: nothing)". That exact
-    # phrasing must be gone, and the six sorted names must be what it offers.
+    # phrasing must be gone, and the seven sorted names must be what it offers.
     with pytest.raises(EngineError) as caught:
         results.resolve_result_model("VerifyResult", results.RESULT_MODELS, phase="verify")
 
@@ -72,8 +73,8 @@ def test_an_unknown_name_now_lists_the_six_registered_names():
     assert caught.value.phase == "verify"
     assert "registered: nothing" not in message
     assert (
-        "CriticResult, ExploreResult, ImplementResult, PlanResult, ReviewResult, "
-        "SpecResult"
+        "CriticResult, ExploreResult, ImplementResult, PlanResult, ResolveResult, "
+        "ReviewResult, SpecResult"
         in message
     )
 
@@ -519,6 +520,66 @@ def test_review_result_dumps_the_two_counts_in_camel_case_only_under_by_alias():
     assert aliased["plan_hash"] == "a1b2c3d4"
 
     assert review.model_dump()["commit_count"] == 3
+
+
+def test_resolve_result_accepts_a_full_payload():
+    resolve = results.ResolveResult.model_validate(
+        {"resolved": True, "summary": "kept both stories' edits to results.py"}
+    )
+
+    assert resolve.resolved is True
+    assert resolve.summary == "kept both stories' edits to results.py"
+
+
+def test_resolve_result_rejects_a_missing_resolved():
+    with pytest.raises(ValidationError) as caught:
+        results.ResolveResult.model_validate({"summary": "merged both sides"})
+
+    assert "resolved" in str(caught.value)
+
+
+def test_resolve_result_rejects_a_missing_summary():
+    with pytest.raises(ValidationError) as caught:
+        results.ResolveResult.model_validate({"resolved": True})
+
+    assert "summary" in str(caught.value)
+
+
+@pytest.mark.parametrize("value", ["yes", "true", 1, None])
+def test_resolve_result_does_not_coerce_a_non_bool_into_resolved(value):
+    with pytest.raises(ValidationError) as caught:
+        results.ResolveResult.model_validate(
+            {"resolved": value, "summary": "merged both sides"}
+        )
+
+    assert "resolved" in str(caught.value)
+
+
+def test_resolve_result_rejects_an_unknown_key():
+    with pytest.raises(ValidationError) as caught:
+        results.ResolveResult.model_validate(
+            {"resolved": True, "summary": "merged both sides", "conflict_files": []}
+        )
+
+    assert "conflict_files" in str(caught.value)
+
+
+def test_resolve_result_schema_requires_both_fields_and_forbids_extras():
+    schema = results.ResolveResult.model_json_schema()
+
+    assert set(schema["required"]) == {"resolved", "summary"}
+    assert set(schema["properties"]) == {"resolved", "summary"}
+    assert schema["additionalProperties"] is False
+
+
+def test_the_resolve_result_name_resolves_to_its_class():
+    assert results.RESULT_MODELS["ResolveResult"] is results.ResolveResult
+    assert (
+        results.resolve_result_model(
+            "ResolveResult", results.RESULT_MODELS, phase="resolve"
+        )
+        is results.ResolveResult
+    )
 
 
 # --- The one place the snake_case/camelCase mismatch is reconciled (design §3).

@@ -4,10 +4,11 @@
 to a class is the agent-dispatch sibling's job"). This module is that mapping,
 and nothing more: no validation happens here, and importing it reads no file.
 
-`RESULT_MODELS` is that mapping: every `result:` name `builtin/task.yaml`
+`RESULT_MODELS` is that mapping: every `result:` name a builtin workflow
 declares -- `ExploreResult`, `CriticResult`, `SpecResult`, `PlanResult`,
-`ImplementResult`, `ReviewResult` -- against the model that validates that
-phase's `result.json`.
+`ImplementResult`, `ReviewResult` from `builtin/task.yaml`, and `ResolveResult`
+from `builtin/integrate.yaml` -- against the model that validates that phase's
+`result.json`.
 `Verification` is not in it; no phase declares it, and it is reachable only as
 `ExploreResult.verification`. A name with no entry still fails loudly at
 dispatch time, which is strictly better than validating nothing and calling
@@ -122,6 +123,19 @@ class ReviewResult(_Result):
     plan_hash: str
 
 
+class ResolveResult(_Result):
+    """The `resolve` phase's result file (`builtin/integrate.yaml`, addendum I3).
+
+    `resolved` is advisory. Whether the merge really completed is something git
+    can measure, so `merge_completed_gate` judges it from the repository, not from
+    this flag. No `serialization_alias` on either field, because no reducer reads a
+    resolve result under a camelCase name.
+    """
+
+    resolved: bool
+    summary: str
+
+
 RESULT_MODELS: dict[str, type[BaseModel]] = {
     "ExploreResult": ExploreResult,
     "CriticResult": CriticResult,
@@ -129,11 +143,13 @@ RESULT_MODELS: dict[str, type[BaseModel]] = {
     "PlanResult": PlanResult,
     "ImplementResult": ImplementResult,
     "ReviewResult": ReviewResult,
+    "ResolveResult": ResolveResult,
 }
-"""Every `result:` name `builtin/task.yaml` declares, keyed by class name.
+"""Every `result:` name a builtin workflow declares, keyed by class name.
 
-`Verification` is absent on purpose: no phase declares it, and it is reachable
-only as `ExploreResult.verification`.
+`builtin/task.yaml` declares the first six; `builtin/integrate.yaml` declares
+`ResolveResult` for its `resolve` phase. `Verification` is absent on purpose: no
+phase declares it, and it is reachable only as `ExploreResult.verification`.
 """
 
 
