@@ -132,6 +132,89 @@ def test_the_before_phase_is_read_out_of_a_stopped_detail():
     assert orchestrate.stopped_before_phase(None) is None
 
 
+def test_the_first_escalation_is_the_primary_and_every_escalation_sets_the_stop():
+    stop = orchestrate.RunStop()
+    assert not stop.event.is_set()
+    assert stop.primary is None
+
+    stop.escalate("story-b")
+    stop.escalate("story-a")
+
+    assert stop.event.is_set()
+    assert stop.primary == "story-b"
+
+
+def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
+    also = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="A",
+        level=2,
+        subtask="a1",
+        failed_phase="review",
+        detail="reviewer found a blocker",
+    )
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="B", level=2, subtask="b2", before_phase="implement"
+    )
+    primary = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="C",
+        level=2,
+        subtask="c1",
+        failed_phase=None,
+        detail="RuntimeError: boom",
+    )
+    done = orchestrate.LaneOutcome(kind="done", story="D", level=2, completed=("d1",))
+    queued = orchestrate.LaneOutcome(kind="not_started", story="E", level=2)
+
+    payload = orchestrate.escalated_payload(
+        "run-1", "C", [also, parked, primary, done, queued], ["gate warned"]
+    )
+
+    assert payload == {
+        "escalated": True,
+        "run_id": "run-1",
+        "level": 2,
+        "story": "C",
+        "subtask": "c1",
+        "failed_phase": None,
+        "detail": "RuntimeError: boom",
+        "warnings": ["gate warned"],
+        "also_escalated": [
+            {
+                "level": 2,
+                "story": "A",
+                "subtask": "a1",
+                "failed_phase": "review",
+                "detail": "reviewer found a blocker",
+            }
+        ],
+        "stopped": [{"story": "B", "subtask": "b2", "before_phase": "implement"}],
+    }
+
+
+def test_a_lone_escalation_payload_is_exactly_the_sequential_one():
+    """No `also_escalated` or `stopped` key when those lists are empty, so a
+    run at `max_concurrent=1` returns today's dict."""
+    only = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", failed_phase="verify", detail="red"
+    )
+    queued = orchestrate.LaneOutcome(kind="not_started", story="B", level=0)
+
+    payload = orchestrate.escalated_payload("run-1", "A", [only, queued], [])
+
+    assert payload == {
+        "escalated": True,
+        "run_id": "run-1",
+        "level": 0,
+        "story": "A",
+        "subtask": "a1",
+        "failed_phase": "verify",
+        "detail": "red",
+        "warnings": [],
+    }
+
+
 # ── the runner, on a real repo and a real board ─────────────────────────────
 
 

@@ -22,11 +22,13 @@ The module holds no mutable state of its own (O4).
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from agent_manager import board, census, cli, dag, models
 from agent_manager.steps import rollup, worktree
@@ -51,6 +53,106 @@ def stopped_before_phase(detail: str | None) -> str | None:
     if detail is None or not detail.startswith(STOPPED_PREFIX):
         return None
     return detail[len(STOPPED_PREFIX):]
+
+
+LaneKind = Literal["done", "escalated", "stopped", "not_started"]
+"""How one story's lane ended: finished, escalated, parked by the stop after it
+had started, or never started because the stop was already set."""
+
+
+@dataclass(frozen=True)
+class LaneOutcome:
+    """What one story's lane did. Internal state, so a dataclass (CLAUDE.md).
+
+    `subtask` is the subtask that escalated or was parked. `failed_phase` and
+    `detail` describe an escalation, `before_phase` a stop. `completed` and
+    `warnings` are this lane's own, in the order they arrived; `run_milestone`
+    merges them across lanes in census order.
+    """
+
+    kind: LaneKind
+    story: str
+    level: int
+    subtask: str | None = None
+    failed_phase: str | None = None
+    detail: str | None = None
+    before_phase: str | None = None
+    completed: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass
+class RunStop:
+    """One run's cooperative stop, shared by every lane of that run (P4, P6).
+
+    `run_milestone` creates one per run, so this module still holds no mutable
+    state of its own. Each lane hands `event.is_set` to the driver as
+    `should_stop`. `lock` decides which escalation came first, so `primary` is
+    well defined however the lanes interleave.
+    """
+
+    event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    primary: str | None = None
+
+    def escalate(self, story_id: str) -> None:
+        """Set the stop, and name `story_id` the primary escalation if none is yet."""
+        with self.lock:
+            if self.primary is None:
+                self.primary = story_id
+            self.event.set()
+
+
+def escalated_payload(
+    run_id: str,
+    primary_story: str | None,
+    outcomes: Sequence[LaneOutcome],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The escalated result for one level's lane outcomes, given in census order.
+
+    The top-level keys describe the primary escalation, as the sequential
+    runner always did. `also_escalated` lists the other escalations and
+    `stopped` the parked lanes, both in census order, and each key is present
+    only when its list is non-empty. A `primary_story` that names no escalated
+    outcome falls back to the first escalation in census order.
+    """
+    escalations = [outcome for outcome in outcomes if outcome.kind == "escalated"]
+    primary = next(
+        (outcome for outcome in escalations if outcome.story == primary_story),
+        escalations[0],
+    )
+    payload: dict[str, Any] = {
+        "escalated": True,
+        "run_id": run_id,
+        "level": primary.level,
+        "story": primary.story,
+        "subtask": primary.subtask,
+        "failed_phase": primary.failed_phase,
+        "detail": primary.detail,
+        "warnings": warnings,
+    }
+    also = [
+        {
+            "level": outcome.level,
+            "story": outcome.story,
+            "subtask": outcome.subtask,
+            "failed_phase": outcome.failed_phase,
+            "detail": outcome.detail,
+        }
+        for outcome in escalations
+        if outcome is not primary
+    ]
+    stopped = [
+        {"story": outcome.story, "subtask": outcome.subtask, "before_phase": outcome.before_phase}
+        for outcome in outcomes
+        if outcome.kind == "stopped"
+    ]
+    if also:
+        payload["also_escalated"] = also
+    if stopped:
+        payload["stopped"] = stopped
+    return payload
 
 
 def _utcnow() -> datetime:
