@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **In this repo** every task below is one `brd` subtask card, driven by the `task` workflow (`/task <card>` or `am run --milestone`), which writes its own per-subtask spec and TDD plan from the card and from this file. Task numbers here are `<story>.<subtask>` and match the card titles.
+> **In this repo** every task below is one `brd` subtask card, driven by the `task` workflow (`/task <card>` or `am run --milestone`), which writes its own per-subtask spec and TDD plan from the card and from this file. Task numbers here are `<story>.<subtask>`; each card's description names its Task. Milestone card: `84c3b532-50dd-4443-a0bf-5245cc19f847`.
 
 **Goal:** Rebuild agent-manager's subtask engine on `pygents`, with checkpoint-based resume and critic revision loops, close the gaps between the `task.yaml` port and `leave-me-alone`'s `task.js`, then make it the only engine.
 
