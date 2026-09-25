@@ -420,43 +420,103 @@ def test_a_blank_plan_hash_from_docs_commit_is_refused(blank):
     assert "supplied no 'plan_hash'" in str(caught.value)
 
 
-def test_the_table_carries_exactly_the_ten_names_section_7_fixes():
-    """§7's table is fixed. An eleventh name is a design change, not a code change.
+TWELVE_INPUTS = [
+    "card",
+    "parent_story",
+    "repo_docs",
+    "explore",
+    "spec_path",
+    "plan_path",
+    "branch",
+    "base_branch",
+    "verification",
+    "plan_hash",
+    "merge_tip",
+    "conflict_files",
+]
+
+MERGE_TIP = "m5/story-the-resolver-5216cbee"
+CONFLICT_FILES = ["src/agent_manager/prompt.py", "tests/test_prompt.py"]
+
+
+def test_the_table_carries_exactly_the_twelve_names_section_7_and_integrate_fix():
+    """§7's table is fixed. A thirteenth name is a design change, not a code change.
 
     `plan_hash` is the tenth, added by card f26b377d together with its row in
     §7's table in `docs/superpowers/specs/2026-09-23-agent-manager-design.md`.
+    `merge_tip` and `conflict_files` are the eleventh and twelfth, the resolver's
+    inputs, which the Integrate addendum
+    (`docs/superpowers/specs/2026-09-25-integrate-design.md` §2) says must be
+    added to this table (card b4bd3795).
     """
     rendered = prompt.render_prompt(
-        _phase(
-            [
-                "card",
-                "parent_story",
-                "repo_docs",
-                "explore",
-                "spec_path",
-                "plan_path",
-                "branch",
-                "base_branch",
-                "verification",
-                "plan_hash",
-            ]
-        ),
-        _context(),
+        _phase(TWELVE_INPUTS),
+        _context(merge_tip=MERGE_TIP, conflict_files=list(CONFLICT_FILES)),
     )
 
-    assert rendered.inputs == (
-        "card",
-        "parent_story",
-        "repo_docs",
-        "explore",
-        "spec_path",
-        "plan_path",
-        "branch",
-        "base_branch",
-        "verification",
-        "plan_hash",
-    )
+    assert rendered.inputs == tuple(TWELVE_INPUTS)
     assert sorted(prompt._TABLE) == sorted(rendered.inputs)
+
+
+def test_merge_tip_renders_the_tip_ref_verbatim():
+    rendered = prompt.render_prompt(
+        _phase(["merge_tip"], name="resolve", role="resolver"),
+        _context(merge_tip=MERGE_TIP),
+    )
+
+    assert _section(rendered, "merge_tip") == MERGE_TIP
+    assert f"\n## merge_tip\n{MERGE_TIP}\n" in rendered.text
+
+
+def test_conflict_files_inlines_the_list_as_json():
+    rendered = prompt.render_prompt(
+        _phase(["conflict_files"], name="resolve", role="resolver"),
+        _context(conflict_files=list(CONFLICT_FILES)),
+    )
+
+    body = _section(rendered, "conflict_files")
+    assert json.loads(body) == CONFLICT_FILES
+    assert body == json.dumps(CONFLICT_FILES, indent=2, ensure_ascii=False)
+
+
+def test_conflict_file_names_with_spaces_quotes_and_non_ascii_round_trip_exactly():
+    """Review Focus: the resolver parses this list back out of its brief, so a
+    path git reports verbatim must come back out of the JSON verbatim."""
+    files = ["docs/release notes.md", "src/café.py", 'notes/"quoted".txt']
+    rendered = prompt.render_prompt(
+        _phase(["conflict_files"], name="resolve", role="resolver"),
+        _context(conflict_files=files),
+    )
+
+    body = _section(rendered, "conflict_files")
+    assert json.loads(body) == files
+    assert "café" in body  # ensure_ascii=False: no \u escapes in the brief
+
+
+def test_a_conflict_files_key_that_was_never_populated_is_named_as_such():
+    """Review Focus: `None` is a caller bug, never a `null` in the brief."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(
+            _phase(["conflict_files"], name="resolve", role="resolver"),
+            _context(conflict_files=None),
+        )
+
+    assert caught.value.phase == "resolve"
+    assert caught.value.parameter == "conflict_files"
+    assert "never populated" in str(caught.value)
+
+
+def test_a_context_without_merge_tip_names_the_key_it_reads():
+    """Spec error path: an `extra_context` that omits `merge_tip` fails with the
+    resolver's existing missing-key error, nothing new."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(
+            _phase(["merge_tip"], name="resolve", role="resolver"), _context()
+        )
+
+    assert caught.value.phase == "resolve"
+    assert caught.value.parameter == "merge_tip"
+    assert "nothing in the context supplies it" in str(caught.value)
 
 
 def test_the_producer_map_is_derived_from_the_table_it_describes():
