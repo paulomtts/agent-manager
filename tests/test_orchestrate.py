@@ -429,9 +429,12 @@ def _record_git(monkeypatch, fail_on: str | None = None) -> list[list[str]]:
     return calls
 
 
-
 WAIT = 10.0
 """Seconds a lane-pool test waits on a barrier or event before failing instead of hanging."""
+
+OVERSHOOT_WINDOW = 1.0
+"""Seconds the bound test holds each lane in flight, so that queued lanes would
+enter the driver in that window if the pool ignored `max_concurrent`."""
 
 Gate = Callable[[Any], None]
 
@@ -1142,11 +1145,25 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
 @requires_brd
 def test_in_flight_lanes_never_exceed_the_bound(project):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1})
-    (order,) = _census_levels(project, shape["milestone"])
     subtasks = _subtasks_by_story(shape)
-    pair = threading.Barrier(2)
+    arrivals = 0
+    arrivals_lock = threading.Lock()
+    third_arrived = threading.Event()
+
+    def hold_until_a_third_lane_arrives(should_stop: Any) -> None:
+        # Every lane stays in flight until a third lane has entered the driver,
+        # or the window expires. Without the bound, all four lanes arrive
+        # inside the window and are in flight together. Under the bound only
+        # two can be, so the first two wait out the window and then return.
+        nonlocal arrivals
+        with arrivals_lock:
+            arrivals += 1
+            if arrivals >= 3:
+                third_arrived.set()
+        third_arrived.wait(timeout=OVERSHOOT_WINDOW)
+
     driver = GatedDriver(
-        gates={subtasks[order[0]][0]: _meet(pair), subtasks[order[1]][0]: _meet(pair)}
+        gates={cards[0]: hold_until_a_third_lane_arrives for cards in subtasks.values()}
     )
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
