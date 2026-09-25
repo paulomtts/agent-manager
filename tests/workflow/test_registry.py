@@ -16,6 +16,7 @@ from agent_manager.steps import (
     verify,
     worktree,
 )
+from agent_manager.steps.reducers import plan_hash_gate_adapter
 from agent_manager.workflow.registry import (
     BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
@@ -23,7 +24,6 @@ from agent_manager.workflow.registry import (
     UnknownFunctionError,
     WorkflowLoadError,
     default_registry,
-    plan_hash_gate_adapter,
 )
 
 
@@ -283,34 +283,3 @@ def test_the_plan_hash_adapter_is_one_object_across_two_registries() -> None:
     assert default_registry().resolve("plan_hash_gate") is default_registry().resolve(
         "plan_hash_gate"
     )
-
-
-def test_the_plan_hash_adapter_compares_the_two_phases_plan_hash_fields() -> None:
-    gate = plan_hash_gate_adapter(
-        {"plan_hash": "a1b2c3d4", "report": "done"},
-        {"plan_hash": "ffffffff", "porcelain": ""},
-    )
-    assert "plan hash CHANGED mid-run" in gate["detail"]
-    assert "a1b2c3d4" in gate["detail"] and "ffffffff" in gate["detail"]
-    assert "blocked" not in gate
-
-
-def test_the_plan_hash_adapter_passes_when_the_two_hashes_match() -> None:
-    assert (
-        plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, {"plan_hash": "a1b2c3d4"})
-        is None
-    )
-
-
-@pytest.mark.parametrize("dead", [None, {}, "implement", 7, [{"plan_hash": "a1b2c3d4"}]])
-def test_the_plan_hash_adapter_passes_when_either_phase_result_is_missing(dead) -> None:
-    # A skipped or dead phase has no hash to compare; the reducer's own rule is
-    # "nothing trustworthy to say" -> None.
-    assert plan_hash_gate_adapter(dead, {"plan_hash": "a1b2c3d4"}) is None
-    assert plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, dead) is None
-
-
-def test_the_plan_hash_adapter_binds_with_no_arguments_at_all() -> None:
-    """Both parameters default to None so a run that skipped `implement` binds
-    and passes, instead of `bind_arguments` reporting a required parameter."""
-    assert plan_hash_gate_adapter() is None
