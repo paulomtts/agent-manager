@@ -370,6 +370,41 @@ def parallel_board(fresh_project) -> dict[str, Any]:
 
 
 @pytest.fixture
+def two_story_board(fresh_project) -> dict[str, Any]:
+    """One milestone with two independent stories, A (a1) and B (b1), for Integrate.
+
+    Both stories are level-0 roots, so Integrate merges A's tip and then B's
+    into `m3-integrate`. `UNION_ATTRIBUTE` folds the fake coder's
+    `IMPLEMENTATION.md` and covers only that file, so any conflict a scenario
+    wants comes from the implement-edits marker's own files. The test writes
+    that marker (`implement_edits_marker`) keyed by `branches`.
+    """
+    root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
+    milestone = _add_card(root, "Milestone 5: integrate under a fake claude")
+    a = _add_card(root, "Story A: one side of the merge", milestone)
+    b = _add_card(root, "Story B: the other side of the merge", milestone)
+    a1 = _add_card(root, "a1: only subtask of story A", a)
+    b1 = _add_card(root, "b1: only subtask of story B", b)
+    subtasks = {"A": [a1], "B": [b1]}
+    branches = {
+        card_id: dag.task_branch(MILESTONE_PREFIX, board.show(card_id, repo_dir=root))
+        for chain in subtasks.values()
+        for card_id in chain
+    }
+    return {
+        "root": root,
+        "milestone": milestone,
+        "stories": {"A": a, "B": b},
+        "subtasks": subtasks,
+        "branches": branches,
+        "implement_edits_marker": root / ".git" / FAKE_IMPLEMENT_EDITS_MARKER,
+    }
+
+
+@pytest.fixture
 def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
 
