@@ -398,8 +398,11 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
     store is opened is what keeps a refusal from minting a run directory.
 
     Exactly one `started` subtask is the resumable shape. Zero means the run
-    finished, escalated or never started, and the statuses are listed because
-    the fix differs for each. More than one is a milestone-shaped run: this
+    finished, escalated, stopped or never started, and the statuses are listed
+    because the fix differs for each. A `stopped` subtask (addendum P4) stopped
+    cleanly and did not fail, so the refusal names its remedy: relaunch the same
+    `run --milestone` command. It never points at `retry`, which is for
+    escalations. More than one is a milestone-shaped run: this
     command drives one subtask the way `run --card` does, and choosing between
     them would leave the rest recorded `started` with nothing driving them.
     """
@@ -420,10 +423,23 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
             )
             or "no subtask at all"
         )
+        stopped = [
+            subtask.card_id
+            for story in run.stories
+            for subtask in story.subtasks
+            if subtask.status == "stopped"
+        ]
+        remedy = (
+            f"; {', '.join(stopped)} stopped cleanly and did not fail, so relaunch the"
+            " same `agent-manager run --milestone` command that started this run to"
+            " continue from where it stopped"
+            if stopped
+            else ""
+        )
         raise NotResumableError(
             f"run {run.id!r} has no subtask recorded 'started', so there is no work"
             f" in flight to pick up (found: {found});"
-            f" `agent-manager status {run.id}` shows the run as it stands"
+            f" `agent-manager status {run.id}` shows the run as it stands{remedy}"
         )
     cards = ", ".join(subtask.card_id for _story, subtask in started)
     raise NotResumableError(
@@ -1035,7 +1051,8 @@ def run(
     # A card payload reports `status`. A milestone payload has no `status` key:
     # it carries `escalated: true` only when it stopped, a clean one carries
     # `done: true`, and a dry-run preview carries neither. So the flag is read
-    # with `.get`, never indexed.
+    # with `.get`, never indexed. Both checks are strict equality on purpose: a
+    # `stopped` card (addendum P4) is not an escalation and exits 0.
     if milestone is None:
         escalated = payload["status"] == "escalated"
     else:
@@ -1358,5 +1375,7 @@ def resume(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+    # Strict equality on purpose: a `stopped` walk (addendum P4) is not an
+    # escalation, so it exits 0 with an ok envelope.
     if payload["status"] == "escalated":
         raise typer.Exit(EXIT_ESCALATED)

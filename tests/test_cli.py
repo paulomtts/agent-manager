@@ -3828,3 +3828,124 @@ def test_a_run_recorded_with_an_unknown_workflow_is_an_envelope(project, cards, 
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is False
     assert envelope["error"]["type"] == "WorkflowLoadError"
+
+
+def test_status_rows_and_header_show_a_stopped_run_verbatim():
+    run = _pure_run(
+        [
+            models.StoryRun(
+                card_id="story-1",
+                title="One",
+                level=0,
+                status="stopped",
+                subtasks=[
+                    models.SubtaskRun(
+                        card_id="card-1",
+                        branch="m1/a",
+                        base_branch="main",
+                        status="stopped",
+                        phases=[
+                            models.PhaseRun(name="implement", kind="agent", status="stopped")
+                        ],
+                    )
+                ],
+            )
+        ]
+    ).model_copy(update={"status": "stopped"})
+
+    assert cli.status_rows(run) == [
+        {
+            "story": "story-1",
+            "subtask": "card-1",
+            "phase": "implement",
+            "attempt": None,
+            "state": "stopped",
+        }
+    ]
+    assert cli.status_payload(run)["run"]["status"] == "stopped"
+
+
+def test_select_resumable_tells_a_stopped_run_to_relaunch_the_milestone():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [stopped])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "card-1=stopped" in message
+    assert "agent-manager run --milestone" in message
+    assert "agent-manager status" in message
+    assert "retry" not in message
+
+
+def test_select_resumable_names_only_the_stopped_cards_in_the_remedy():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [stopped, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "found: card-1=stopped, card-2=escalated" in message
+    remedy = message.split("shows the run as it stands", 1)[1]
+    assert "card-1" in remedy
+    assert "card-2" not in remedy
+    assert "agent-manager run --milestone" in remedy
+    assert "retry" not in message
+
+
+def test_select_resumable_keeps_its_wording_when_nothing_is_stopped():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [done, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    assert str(caught.value) == (
+        "run '20260923T140506Z-cbe34d00' has no subtask recorded 'started', so there"
+        " is no work in flight to pick up (found: card-1=done, card-2=escalated);"
+        " `agent-manager status 20260923T140506Z-cbe34d00` shows the run as it stands"
+    )
+
+
+def test_select_resumable_does_not_count_a_stopped_subtask_as_in_flight():
+    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
+    started = _pure_subtask("card-2", [])
+    run = _pure_run([_pure_story("story-1", [stopped]), _pure_story("story-2", [started])])
+
+    story, subtask = cli.select_resumable(run)
+
+    assert story.card_id == "story-2"
+    assert subtask is started
+
+
+def test_a_stopped_card_run_is_ok_true_and_exit_zero(tmp_path, monkeypatch):
+    def fake_run_card(card_id, **kwargs):
+        return {**_fake_payload(card_id, "story-1"), "status": "stopped"}
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+    result = _invoke(tmp_path, "cbe34d00-9d8d-4f41-9c94-f99e665771b0")
+
+    assert result.exit_code == 0, result.output
+    assert result.exit_code != cli.EXIT_ESCALATED
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "stopped"
+
+
+def test_a_resumed_walk_that_stops_is_ok_true_and_exit_zero(tmp_path, monkeypatch):
+    def fake_resume_run(run_id, **kwargs):
+        return {"run_id": run_id, "status": "stopped"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+    result = runner.invoke(
+        cli.app, ["resume", "20260923T140506Z-cbe34d00", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "stopped"
