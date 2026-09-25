@@ -275,8 +275,17 @@ _TABLE: dict[str, Resolver] = {
     "branch": _verbatim("branch"),
     "base_branch": _verbatim("base"),
     "plan_hash": _phase_field("docs_commit", "plan_hash"),
+    "merge_tip": _verbatim("merge_tip"),
+    "conflict_files": _inline_json("conflict_files"),
 }
-"""The fixed §7 resolution table, keyed by the name a document may declare."""
+"""The fixed §7 resolution table, keyed by the name a document may declare.
+
+The last two rows are the resolver's (Integrate addendum §2 and I3,
+`builtin/integrate.yaml`): the story tip being merged, inlined as a ref, and
+the conflicting paths `steps.integrate.merge_tip` reported, inlined as JSON.
+Neither reads another phase's result, so neither appears in `INPUT_PRODUCERS`:
+the caller supplies both through `engine.run_subtask(extra_context=...)`.
+"""
 
 
 INPUT_PRODUCERS: dict[str, str] = {

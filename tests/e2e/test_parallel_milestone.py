@@ -84,6 +84,10 @@ def _run_two_lanes(parallel_board, rendezvous, run_milestone_cli):
     )
 
 
+INTEGRATION_BRANCH = "m3-integrate"
+"""`integration.integration_branch` for the conftest's `m3` prefix."""
+
+
 def test_this_module_runs_in_the_default_suite_unmarked(request):
     """No `e2e` marker may reach this module, or parallel wiring stops being
     checked on every `uv run pytest`."""
@@ -115,6 +119,14 @@ def test_two_lanes_overlap_in_implement_and_the_milestone_finishes(
         [stories["C"]],
     ]
     assert data["completed"] == [a1, a2, b1, b2, c1]
+    assert data["integrated"] == {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(cli.worktree_for(root, INTEGRATION_BRANCH)),
+        "merged": [stories["A"], stories["B"], stories["C"]],
+        "resolved": [],
+    }
+    for tip in (branches[a2], branches[b2], branches[c1]):
+        assert _is_ancestor(root, tip, INTEGRATION_BRANCH), tip
     # The env reached every implement child: one marker per subtask worktree.
     assert len(rendezvous.markers()) == 5
 
@@ -243,6 +255,7 @@ def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_star
     assert data["failed_phase"] == "review"
     assert "review-fail marker" in data["detail"]
     assert "also_escalated" not in data, data
+    assert "integrated" not in data and "phase" not in data, data
     assert "stopped" in data, (
         "lane B finished before lane A escalated, so nothing was stopped; the "
         "ordering margin this test relies on was lost",
@@ -293,6 +306,7 @@ def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_star
     assert c_worktree.resolve() not in _cwds(entries)
     assert board.show(c1, repo_dir=root).status == c_status_before
 
+    assert INTEGRATION_BRANCH not in _git(root, "branch", "--format=%(refname:short)").split()
     assert _git(root, "rev-parse", "main").strip() == main_before
 
 
@@ -341,6 +355,8 @@ def test_a_relaunch_after_the_escalation_finishes_and_skips_done_subtasks(
         if card not in done_first
     ]
     assert finished["completed"] == expected
+    assert finished["integrated"]["merged"] == [stories["A"], stories["B"], stories["C"]]
+    assert finished["integrated"]["resolved"] == []
     second_entries = read_fake_log(finished["run_id"])
     assert second_entries
     done_worktrees = {cli.worktree_for(root, branches[card]).resolve() for card in done_first}

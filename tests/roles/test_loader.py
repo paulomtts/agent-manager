@@ -6,7 +6,7 @@ no network -- so it sits in the Pure-functions/unit tier alongside
 `tests/test_models.py`, not in the Steps tier (`tests/steps/`, temp git repos)
 and not in the Adapters tier (`harness/*.py`, a sibling card).
 
-Synthetic bundles are built in `tmp_path` for every error path; the six shipped
+Synthetic bundles are built in `tmp_path` for every error path; the seven shipped
 bundles are exercised through the same public API, because §8 makes the bundles
 themselves part of the contract.
 """
@@ -446,7 +446,15 @@ def test_a_symlinked_methodology_file_is_rejected(tmp_path):
     assert "resolves outside the bundle" in excinfo.value.reason
 
 
-SHIPPED = ["coder", "critic", "explorer", "planner", "reviewer", "spec_author"]
+SHIPPED = [
+    "coder",
+    "critic",
+    "explorer",
+    "planner",
+    "resolver",
+    "reviewer",
+    "spec_author",
+]
 
 DEFAULT_MODELS = {
     "explorer": "sonnet",
@@ -455,6 +463,7 @@ DEFAULT_MODELS = {
     "critic": "sonnet",
     "coder": "sonnet",
     "reviewer": "opus",
+    "resolver": "opus",
 }
 
 
@@ -465,7 +474,8 @@ def shipped_lock(role: str) -> list[dict[str, str]]:
     return tomllib.loads(path.read_text(encoding="utf-8"))["vendored"]
 
 
-def test_list_roles_returns_exactly_the_six_shipped_roles():
+def test_list_roles_returns_exactly_the_seven_shipped_roles():
+    assert len(SHIPPED) == 7
     assert loader.list_roles() == SHIPPED
 
 
@@ -523,3 +533,41 @@ def test_a_shipped_bundle_vendors_only_methodology_its_system_prompt_names(role)
             f"{role}/system.md never references {filename}, so it should not be "
             "vendored (spec: do not vendor methodology a role does not need)"
         )
+
+
+def test_the_resolver_policy_allows_editing_and_retries_once_on_opus():
+    policy = loader.load_role("resolver").policy
+
+    assert policy.allowed_tools == ["Bash", "Read", "Edit", "Write", "Grep", "Glob"]
+    assert policy.max_attempts == 2
+    assert policy.default_model == {"claude": "opus"}
+    assert policy.required_capabilities == []
+
+
+def test_the_resolver_vendors_no_methodology():
+    directory = loader.bundles_dir() / "resolver"
+
+    assert loader.load_role("resolver").methodology == {}
+    assert not (directory / "methodology").exists()
+    assert (directory / "VENDORED.lock").read_bytes() == b"vendored = []\n"
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "merge is in progress",
+        "git diff HEAD...",
+        "both stories",
+        "git add",
+        "git commit --no-edit",
+        "git merge --abort",
+        "git reset",
+        "git checkout",
+        "not conflicted",
+        "result file",
+    ],
+)
+def test_the_resolver_prompt_states_the_merge_rules(rule):
+    # Each phrase carries one rule from the spec's "system.md behaviour" list;
+    # losing one lets the agent discard a merge or stop short of committing it.
+    assert rule in loader.load_role("resolver").system

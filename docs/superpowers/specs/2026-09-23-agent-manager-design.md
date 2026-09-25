@@ -463,6 +463,8 @@ local branches, nothing is pushed, and `main`/`master` is never touched. The
 launcher seam exists so `bwrap` can close the rest later; that is deliberately
 not v1.
 
+**Status:** as of milestone 5, Integrate merges every story tip into one local `<prefix>-integrate` branch, in its own worktree, after the last level, then runs the verification suite on it once. A merge the resolver does not finish, a merge already in progress, or a failed final verification escalates like any other gate: the run stops, and the branch and worktree are left for a human. The blast-radius guarantee holds: Integrate never checks out, merges into or moves `main`/`master` or the base branch, and never pushes (Integrate addendum I5, `2026-09-25-integrate-design.md`).
+
 ## 13. Where this is more efficient
 
 **Eliminated model calls.** Five of twelve dispatches per subtask disappear.

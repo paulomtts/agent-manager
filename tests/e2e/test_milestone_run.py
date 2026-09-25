@@ -51,6 +51,14 @@ def _all_cards(milestone_board) -> list[str]:
     ]
 
 
+INTEGRATION_BRANCH = "m3-integrate"
+"""`integration.integration_branch` for the conftest's `m3` prefix."""
+
+
+def _branches(root: Path) -> list[str]:
+    return _git(root, "branch", "--format=%(refname:short)").split()
+
+
 def test_a_clean_three_story_milestone_runs_to_done_on_one_stacked_line(
     milestone_board, run_milestone_cli
 ):
@@ -74,6 +82,13 @@ def test_a_clean_three_story_milestone_runs_to_done_on_one_stacked_line(
         [stories["B"]],
         [stories["C"]],
     ]
+    assert data["integrated"] == {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(cli.worktree_for(root, INTEGRATION_BRANCH)),
+        "merged": [stories["A"], stories["B"], stories["C"]],
+        "resolved": [],
+    }
+    assert _is_ancestor(root, branches[subtasks["C"][-1]], INTEGRATION_BRANCH)
 
     # Done ON THE BOARD, subtasks by `mark_done` and stories and the milestone
     # by the rollup walk. This test writes no status itself.
@@ -147,6 +162,9 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     assert stopped["failed_phase"] == "review"
     assert "review_gate" in stopped["detail"]
     assert "review-fail marker" in stopped["detail"]
+    # A lane escalation never reaches Integrate.
+    assert "integrated" not in stopped and "phase" not in stopped, stopped
+    assert INTEGRATION_BRANCH not in _branches(root)
     # The marker never dirtied B's worktree.
     assert _git(b_worktree, "status", "--porcelain") == ""
 
@@ -180,6 +198,8 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     assert finished["done"] is True, finished
     assert finished["run_id"] != stopped["run_id"]
     assert finished["completed"] == [b1, c1]
+    assert finished["integrated"]["merged"] == [stories["A"], stories["B"], stories["C"]]
+    assert finished["integrated"]["resolved"] == []
     second_entries = read_fake_log(finished["run_id"])
     assert second_entries
     a_worktrees = {cli.worktree_for(root, branches[card]).resolve() for card in (a1, a2)}
@@ -196,4 +216,5 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     idle = _envelope(third)
     assert idle["done"] is True
     assert idle["completed"] == []
+    assert idle["integrated"] == finished["integrated"]
     assert read_fake_log(idle["run_id"]) == []

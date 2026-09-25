@@ -6,7 +6,8 @@ a pool bounded by `max_concurrent`; a story's subtasks stay strictly sequential
 and level N+1 starts only after every lane of level N returns. Every derivation
 belongs to a collaborator: the milestone and its census to `census`, levels,
 stack bases and tips to `dag`, board reads to `board`, rollup to
-`steps.rollup`, git to `steps.worktree.run_git`, run state to `Store`. This module decides only the
+`steps.rollup`, git to `steps.worktree.run_git`, run state to `Store`. The
+terminal merge of every story tip belongs to `integration`. This module decides only the
 order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
@@ -33,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from agent_manager import board, census, cli, dag, models
+from agent_manager import board, census, cli, dag, integration, models
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Store
 from agent_manager.workflow.loader import load_builtin
@@ -158,6 +159,40 @@ def escalated_payload(
     return payload
 
 
+def integrated_payload(outcome: integration.IntegrateSuccess) -> dict[str, Any]:
+    """A clean run's `integrated` key: where every story tip now lives (addendum I6).
+
+    `worktree` is a `str`, so the payload is plain JSON before `render` ever
+    sees it. `merged` and `resolved` are story ids in merge order.
+    """
+    return {
+        "branch": outcome.branch,
+        "worktree": str(outcome.worktree),
+        "merged": list(outcome.merged),
+        "resolved": list(outcome.resolved),
+    }
+
+
+def integrate_escalated_payload(
+    run_id: str, outcome: integration.IntegrateEscalation, warnings: list[str]
+) -> dict[str, Any]:
+    """The result of a run that stopped at Integrate (addendum I5).
+
+    `escalated: true` is what `am run` reads for its exit code, as for a lane
+    escalation. `story` is `None` when the final verification failed rather
+    than a tip. The branch and worktree are left as Integrate left them.
+    """
+    return {
+        "escalated": True,
+        "phase": outcome.phase,
+        "story": outcome.story,
+        "files": list(outcome.files),
+        "detail": outcome.detail,
+        "run_id": run_id,
+        "warnings": warnings,
+    }
+
+
 def _utcnow() -> datetime:
     """This module's own clock default. `cli._utcnow` is private, and binding a
     `cli` name at definition time would break under the circular import."""
@@ -242,7 +277,7 @@ def story_tips(
 ) -> list[dict[str, str]]:
     """Every census story that has subtasks, with the branch its stack ends on.
 
-    What a human merges after a clean run, since this card has no Integrate.
+    Every story's own branch, reported beside `integrated`, which names the one branch they were merged into.
     A story with no subtasks contributes no branch of its own, so it is left
     out.
     """
@@ -489,6 +524,13 @@ def run_milestone(
     their next phase boundary and are recorded `stopped`, lanes not yet started
     leave their story `pending`, and no later level is scheduled. At
     `max_concurrent=1` the result is exactly the sequential runner's.
+
+    When every level finished clean -- or none had anything to run --
+    Integrate folds every story tip into `<branch_prefix>-integrate` before
+    the run is recorded. Success records `done` and adds `integrated`; an
+    Integrate escalation records `escalated` and returns
+    `integrate_escalated_payload`. An exception from Integrate propagates and
+    the run is never recorded `done`.
     """
     if max_concurrent < 1:
         raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
@@ -558,6 +600,29 @@ def run_milestone(
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
                 return escalated_payload(run_id, stop.primary, outcomes, warnings)
 
+        # Integrate (addendum I6) runs only once every level finished clean,
+        # and also when there was nothing left to drive: that is how a relaunch
+        # retries an Integrate escalation, and why a finished milestone's
+        # relaunch is a no-op merge. Read as `integration.integrate_milestone`
+        # so a test can replace it, as `driver` is. It needs a factory for a
+        # conflicting tip; `None` is production's, read off `cli` now.
+        factory = cli.default_runner_factory if runner_factory is None else runner_factory
+        outcome = integration.integrate_milestone(
+            stories=plan.stories,
+            repo_dir=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            commands=list(commands),
+            allow_no_verification=allow_no_verification,
+            store=store,
+            run_id=run_id,
+            runner_factory=factory,
+        )
+        if isinstance(outcome, integration.IntegrateEscalation):
+            # The branch and worktree stay exactly as Integrate left them (I5).
+            store.record_run(run_record.model_copy(update={"status": "escalated"}))
+            return integrate_escalated_payload(run_id, outcome, warnings)
+
         store.record_run(run_record.model_copy(update={"status": "done"}))
         return {
             "done": True,
@@ -569,6 +634,7 @@ def run_milestone(
             "completed": completed,
             "tips": tips,
             "warnings": warnings,
+            "integrated": integrated_payload(outcome),
         }
     finally:
         store.close()

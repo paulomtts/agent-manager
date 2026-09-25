@@ -1,0 +1,6 @@
+allowed_tools = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"]
+max_attempts = 2
+required_capabilities = []
+
+[default_model]
+claude = "opus"
