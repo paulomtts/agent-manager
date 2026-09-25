@@ -470,6 +470,7 @@ def run_milestone(
     runner_factory: cli.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    max_concurrent: int = 1,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone`, one at a time, and report (O6).
 
@@ -480,6 +481,8 @@ def run_milestone(
     branch still anchors the next subtask's base. The card and its story are
     read fresh from the board before each subtask.
     """
+    if max_concurrent < 1:
+        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
     root = cli.resolve_repo_dir(repo_dir)
     milestone_card = census.find_milestone(board.roots(repo_dir=root), milestone)
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
@@ -506,7 +509,7 @@ def run_milestone(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(max_concurrent_stories=max_concurrent),
         )
         store.record_run(run_record)
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)

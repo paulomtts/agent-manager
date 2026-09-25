@@ -938,3 +938,30 @@ def test_a_board_read_that_fails_inside_a_lane_is_an_escalation_of_that_subtask(
         story_b: "pending",
         b1: "pending",
     }
+
+
+@requires_git
+@requires_brd
+@pytest.mark.parametrize("bound", [0, -1])
+def test_a_bound_below_one_is_refused_before_anything_is_written(project, monkeypatch, bound):
+    shape = _milestone(project, {"A": 1})
+    git_calls = _record_git(monkeypatch)
+    driver = FakeDriver()
+
+    with pytest.raises(ValueError, match="max_concurrent"):
+        _run(project, shape["milestone"], driver, max_concurrent=bound)
+
+    assert driver.calls == []
+    assert git_calls == []
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@requires_git
+@requires_brd
+def test_the_bound_is_recorded_in_the_run_config(project):
+    shape = _milestone(project, {"A": 1})
+
+    result = _run(project, shape["milestone"], FakeDriver(), max_concurrent=2)
+
+    assert result["done"] is True
+    assert _load(project, result["run_id"]).config == models.RunConfig(max_concurrent_stories=2)
