@@ -129,3 +129,70 @@ def test_two_lanes_overlap_in_implement_and_the_milestone_finishes(
     assert not _is_ancestor(root, branches[b2], branches[c1])
 
     assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def _story_span(run: models.Run, story_id: str):
+    """The earliest phase start and the latest phase end across one story's subtasks."""
+    (story,) = [story for story in run.stories if story.card_id == story_id]
+    phases = [phase for subtask in story.subtasks for phase in subtask.phases]
+    starts = [phase.started_at for phase in phases if phase.started_at is not None]
+    ends = [phase.ended_at for phase in phases if phase.ended_at is not None]
+    assert starts and ends, story_id  # non-vacuity: the story really ran phases
+    return min(starts), max(ends)
+
+
+def test_one_lane_runs_the_level_s_stories_one_after_the_other(
+    parallel_board, rendezvous, run_milestone_cli
+):
+    """Spec test 2: `--max-concurrent 1` behaves as the sequential runner did.
+    Count 1 keeps the rendezvous satisfiable by a single lane."""
+    root = parallel_board["root"]
+    stories = parallel_board["stories"]
+    rendezvous.arm(1)
+
+    result = run_milestone_cli(root, parallel_board["milestone"], max_concurrent=1)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["done"] is True, data
+    assert len(rendezvous.markers()) == 5
+    run = _load_run(root, data["run_id"])
+    a_start, a_end = _story_span(run, stories["A"])
+    b_start, b_end = _story_span(run, stories["B"])
+    # Census order within the level: A's lane runs to the end before B's starts.
+    assert a_end <= b_start, (a_start, a_end, b_start, b_end)
+
+
+def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection(
+    parallel_board, rendezvous, run_milestone_cli
+):
+    """Spec test 3, on its own two-lane run (same shape as spec test 1)."""
+    root = parallel_board["root"]
+    stories = parallel_board["stories"]
+
+    result = _run_two_lanes(parallel_board, rendezvous, run_milestone_cli)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    run_id = _envelope(result)["run_id"]
+    lines = store.Journal(run_id).read()
+    seqs = [line.seq for line in lines]
+    assert seqs == list(range(1, len(seqs) + 1))
+    # Non-vacuity: the two lanes' phase lines really interleave, so contiguity
+    # was tested under concurrent appends and not a sequential run. Phase lines
+    # only: `record_plan` journals every story `pending` up front, so story
+    # lines would interleave even in a one-lane run.
+    phase_lines = [line for line in lines if line.event == "phase_upsert"]
+    first_b = min(line.seq for line in phase_lines if line.story == stories["B"])
+    last_a = max(line.seq for line in phase_lines if line.story == stories["A"])
+    assert first_b < last_a, (first_b, last_a)
+
+    st = store.Store.open(cli.resolve_repo_dir(root), run_id)
+    try:
+        projection = st.load_run(run_id)
+        rebuilt = st.rebuild_from_journal(run_id)
+        after = st.load_run(run_id)
+    finally:
+        st.close()
+    assert projection is not None
+    assert rebuilt == projection
+    assert after == projection
