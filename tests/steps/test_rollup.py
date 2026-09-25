@@ -10,11 +10,16 @@ mocked, and neither is any `board` function. The pure status computation
 `requires_git` marker locally), so the brd helpers are lifted from
 `tests/test_board.py`: the `requires_brd` marker, the `temp_board` fixture,
 `_add_card` and `_brd_json`.
+
+Two lock-scope tests wrap `board.show` and `board.tree` in pass-through spies
+that only record whether `board.WRITE_LOCK` is held; the real functions still
+run against the real board.
 """
 
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -268,6 +273,96 @@ def test_the_walk_is_capped_at_sixteen_ancestors(temp_board):
     with pytest.raises(board.BoardError, match="exceeded maximum ancestry depth"):
         rollup.set_status(past_the_cap, "done", repo_dir=temp_board)
     assert _brd_json(temp_board, "show", past_the_cap)["status"] == "done"
+
+
+def _write_lock_held_by_another_thread() -> bool:
+    """Whether some other thread holds board.WRITE_LOCK right now.
+
+    Probed from a fresh thread with a non-blocking acquire, so it uses only the
+    lock's public API and never blocks.
+    """
+    acquired: list[bool] = []
+
+    def probe() -> None:
+        got = board.WRITE_LOCK.acquire(blocking=False)
+        if got:
+            board.WRITE_LOCK.release()
+        acquired.append(got)
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    prober.join()
+    return not acquired[0]
+
+
+@requires_brd
+def test_the_whole_rollup_walk_runs_under_the_board_lock(temp_board, monkeypatch):
+    # A rollup is read-modify-write: the ancestor reads must be inside the same
+    # critical section as the writes, or two sibling walks can interleave.
+    milestone = _add_card(temp_board, "Milestone 4")
+    story = _add_card(temp_board, "Serialize the shared resources", milestone)
+    subtask = _add_card(temp_board, "Serialize board writes", story)
+    held_during: list[tuple[str, bool]] = []
+    real_show, real_tree = board.show, board.tree
+
+    def show_spy(card_id, **kwargs):
+        held_during.append(("show", _write_lock_held_by_another_thread()))
+        return real_show(card_id, **kwargs)
+
+    def tree_spy(card_id, **kwargs):
+        held_during.append(("tree", _write_lock_held_by_another_thread()))
+        return real_tree(card_id, **kwargs)
+
+    monkeypatch.setattr(board, "show", show_spy)
+    monkeypatch.setattr(board, "tree", tree_spy)
+
+    result = rollup.set_status(subtask, "done", repo_dir=temp_board)
+
+    assert result["card"] == subtask
+    # show(subtask), tree(story), show(story), tree(milestone), show(milestone)
+    assert [name for name, _ in held_during] == ["show", "tree", "show", "tree", "show"]
+    assert all(held for _, held in held_during)
+    assert not _write_lock_held_by_another_thread()
+
+
+@requires_brd
+def test_a_failed_rollup_releases_the_board_lock(temp_board):
+    with pytest.raises(board.BoardError):
+        rollup.set_status("deadbeef", "done", repo_dir=temp_board)
+    assert not _write_lock_held_by_another_thread()
+
+    # The depth guard raises from inside the walk; the lock must still be free.
+    chain = [_add_card(temp_board, "Level 0")]
+    for level in range(1, rollup.MAX_ANCESTRY_DEPTH + 2):
+        chain.append(_add_card(temp_board, f"Level {level}", chain[-1]))
+    with pytest.raises(board.BoardError, match="exceeded maximum ancestry depth"):
+        rollup.set_status(chain[-1], "done", repo_dir=temp_board)
+    assert not _write_lock_held_by_another_thread()
+
+
+@requires_brd
+def test_rollup_reenters_a_board_lock_its_own_thread_already_holds(temp_board):
+    story = _add_card(temp_board, "Serialize the shared resources")
+    subtask = _add_card(temp_board, "Serialize board writes", story)
+    outcome: dict[str, object] = {}
+
+    def nested() -> None:
+        with board.WRITE_LOCK:
+            outcome["result"] = rollup.set_status(
+                subtask, "done", repo_dir=temp_board
+            )
+
+    # On a worker with a timeout, so a non-reentrant lock fails the test
+    # instead of hanging the suite.
+    worker = threading.Thread(target=nested, daemon=True)
+    worker.start()
+    worker.join(timeout=60)
+    assert not worker.is_alive()
+    assert outcome["result"] == {
+        "card": subtask,
+        "status": "done",
+        "rolled_up": [{"card": story, "status": "done"}],
+    }
 
 
 # --- Pure-function tier (design §14): the status computation, no board. ---
