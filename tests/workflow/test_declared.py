@@ -7,11 +7,13 @@ from datetime import timedelta
 from pathlib import Path
 
 from agent_manager import dispatch
+from agent_manager.workflow import integrate as integrate_module
 from agent_manager.workflow import task as task_module
 from agent_manager.workflow.loader import load_builtin
 from agent_manager.workflow.phases import AgentPhase, Step, from_loader
 from agent_manager.workflow.registry import default_registry
 from agent_manager.workflow.task import TASK, LAUNCHER_TIMEOUT
+from agent_manager.workflow.integrate import INTEGRATE
 
 
 def _shipped(name, like):
@@ -53,12 +55,21 @@ def test_task_equals_the_shipped_yaml():
     assert TASK.digest() == _shipped("task", TASK).digest()
 
 
+def test_integrate_equals_the_shipped_yaml():
+    assert INTEGRATE.digest() == _shipped("integrate", INTEGRATE).digest()
+
+
 def test_both_validate():
     TASK.validate(launcher_timeout=LAUNCHER_TIMEOUT)
+    INTEGRATE.validate(launcher_timeout=LAUNCHER_TIMEOUT)
 
 
 def test_task_callables_are_the_registry_bindings():
     _assert_same_callables(TASK, "task")
+
+
+def test_integrate_callables_are_the_registry_bindings():
+    _assert_same_callables(INTEGRATE, "integrate")
 
 
 def test_launcher_timeout_is_the_dispatch_default():
@@ -82,7 +93,20 @@ def test_task_timeouts_are_the_chosen_values_floored_above_the_launcher():
     assert task_module.agent_timeout(90) == timedelta(minutes=90)
 
 
+def test_integrate_timeout_is_floored_above_the_launcher():
+    timeouts = {p.name: p.timeout for p in INTEGRATE.phases if isinstance(p, AgentPhase)}
+    assert timeouts == {"resolve": timedelta(minutes=35)}
+
+
+def test_integrate_reuses_the_task_timeout_floor():
+    source = Path(integrate_module.__file__).read_text(encoding="utf-8")
+    assert "agent_manager.workflow.task" in _imported_modules(integrate_module)
+    assert "DEFAULT_TIMEOUT" not in source
+    assert "LAUNCHER_TIMEOUT =" not in source
+    assert "AGENT_TIMEOUT_FLOOR =" not in source
+
+
 def test_declared_modules_never_import_pygents():
-    for module in (task_module,):
+    for module in (task_module, integrate_module):
         imported = _imported_modules(module)
         assert not any(n == "pygents" or n.startswith("pygents.") for n in imported), module.__name__
