@@ -246,6 +246,14 @@ Two more keys appear only when they are not empty:
   the stop parked. `before_phase` is the phase it would have run next. A
   stopped subtask and its story are recorded `stopped`, not `escalated`.
 
+An escalation at [Integrate](#integrate) has its own shape. The run exits 1, and `data` holds `escalated` (`true`), `phase` (`"integrate"`), `story`, `files`, `detail`, `run_id` and `warnings`. There is no `integrated` key.
+
+- `story` is the story whose tip was being merged, or `null` when the final check of the integrated branch failed.
+- `files` lists the conflicting files the resolver did not finish. It is empty when a merge was already in progress in the integration worktree, and when the final check failed.
+- `detail` says what went wrong and names the integration worktree.
+
+The run is recorded `escalated`. The integration branch and its worktree are left exactly as Integrate left them, a merge still in progress included, so you can finish it there. See [Integrate](#integrate) for what to do next.
+
 When the run cannot start at all (an unknown or ambiguous milestone, a blocker
 cycle, a board error), it prints `{"ok": false, "error": {...}}` and exits 3.
 
@@ -255,8 +263,7 @@ To go on after an escalation, a stopped lane or a killed run, fix the cause
 and run the same `am run --milestone` command again. It starts a new run that
 skips every card already `done` on the board. A subtask that was stopped or
 killed part way picks up in its existing worktree and does not redo a plan
-that already passed. Relaunching a finished milestone drives nothing and
-reports `done` with an empty `completed`.
+that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first.
 
 `am resume <run-id>` is not milestone-aware and does not continue a milestone.
 On a run with a stopped subtask it is refused with exit code 3, and its message
@@ -264,14 +271,16 @@ says to relaunch. Relaunch the `am run --milestone` command instead.
 
 #### Not there yet
 
-- There is no Integrate step: nothing merges the story tips into one branch.
 - `am resume` is not milestone-aware.
 - `watch`, `retry` and `cancel` do not exist.
+- There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate.
 
 See section 4 of the
-[orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet)
-and section 5 of the
+[orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet),
+section 5 of the
 [parallel-stories addendum](docs/superpowers/specs/2026-09-24-parallel-stories-design.md#5-deferred)
+and section 6 of the
+[Integrate addendum](docs/superpowers/specs/2026-09-25-integrate-design.md#6-deferred)
 for everything deferred.
 
 ## Develop
