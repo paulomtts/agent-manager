@@ -410,6 +410,44 @@ def implement_edits(cwd, found, phase):
     return {_inside_worktree(name, marker): content for name, content in entry.items()}
 
 
+def _is_marker(bare, sigil):
+    """A conflict-marker line: the seven-character sigil alone or followed by a space."""
+    return bare == sigil or bare.startswith(sigil + " ")
+
+
+def keep_both_sides(text):
+    """`text` with every conflict hunk replaced by its two sides, ours then theirs.
+
+    The marker lines go, and so does a diff3/zdiff3 `|||||||` base section, so
+    a developer's `merge.conflictStyle` cannot break the fake. A `=======` line
+    counts only inside a hunk, so a markdown underline survives. Line endings
+    are kept as they were. A hunk that never closes is refused rather than
+    half-rewritten.
+    """
+    kept = []
+    state = None  # None outside a hunk, else "ours", "base" or "theirs"
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if state is None:
+            if _is_marker(bare, "<<<<<<<"):
+                state = "ours"
+            else:
+                kept.append(line)
+        elif state == "ours" and _is_marker(bare, "|||||||"):
+            state = "base"
+        elif state in ("ours", "base") and bare == "=======":
+            state = "theirs"
+        elif state == "theirs" and _is_marker(bare, ">>>>>>>"):
+            state = None
+        elif state != "base":
+            kept.append(line)
+    if state is not None:
+        raise FakeClaudeError(
+            "a conflict hunk is never closed: no `>>>>>>>` line after its `<<<<<<<`"
+        )
+    return "".join(kept)
+
+
 def build_result(phase, payload, text, cwd):
     """The phase's result: the schema skeleton, with what the gates need set."""
     found = sections(text)

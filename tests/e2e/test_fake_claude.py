@@ -891,3 +891,54 @@ def test_a_marker_that_is_not_json_is_refused(tmp_path):
         _implement_on_branch(repo)
 
     assert "not valid JSON" in str(caught.value)
+
+
+def test_both_sides_of_a_hunk_are_kept_ours_then_theirs():
+    text = "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\nbottom\n"
+
+    assert fake_claude.keep_both_sides(text) == "top\nours\ntheirs\nbottom\n"
+
+
+def test_a_diff3_base_section_is_dropped():
+    text = (
+        "<<<<<<< HEAD\nours\n||||||| merged common ancestors\nbase\n"
+        "=======\ntheirs\n>>>>>>> side\n"
+    )
+
+    assert fake_claude.keep_both_sides(text) == "ours\ntheirs\n"
+
+
+def test_every_hunk_in_a_file_is_rewritten():
+    text = (
+        "<<<<<<< HEAD\none\n=======\nuno\n>>>>>>> side\n"
+        "middle\n"
+        "<<<<<<< HEAD\ntwo\n=======\ndos\n>>>>>>> side\n"
+    )
+
+    assert fake_claude.keep_both_sides(text) == "one\nuno\nmiddle\ntwo\ndos\n"
+
+
+def test_an_underline_outside_a_hunk_is_kept():
+    """Review focus: `=======` is a markdown/rst underline as often as a marker;
+    it only counts inside a hunk."""
+    text = "Title\n=======\n\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\n"
+
+    assert fake_claude.keep_both_sides(text) == "Title\n=======\n\nours\ntheirs\n"
+
+
+def test_crlf_lines_keep_their_endings():
+    text = "<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> side\r\n"
+
+    assert fake_claude.keep_both_sides(text) == "ours\r\ntheirs\r\n"
+
+
+def test_a_file_with_no_hunk_is_unchanged():
+    assert fake_claude.keep_both_sides("plain\ntext\n") == "plain\ntext\n"
+
+
+def test_an_unclosed_hunk_is_refused_rather_than_truncated():
+    """Review focus: half a rewrite would commit a file missing its tail."""
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.keep_both_sides("<<<<<<< HEAD\nours\n=======\ntheirs\n")
+
+    assert "never closed" in str(caught.value)
