@@ -1,0 +1,16 @@
+name: integrate
+description: Resolve one story tip's merge conflict in the integration worktree, then verify it.
+
+phases:
+  - name: resolve
+    kind: agent
+    role: resolver
+    inputs: [branch, base_branch, merge_tip, conflict_files, verification]
+    result: ResolveResult
+    gates: [merge_completed_gate]
+    retry: { max_attempts: 2, on: [gate_failed, schema_invalid] }
+
+  - name: verify
+    kind: deterministic
+    run: verify.run_suite
+    gates: [verification_passed_gate]
