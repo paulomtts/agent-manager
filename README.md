@@ -211,9 +211,9 @@ cycle, a board error), it prints `{"ok": false, "error": {...}}` and exits 3.
 To go on after an escalation, a stopped lane or a killed run, fix the cause
 and run the same `am run --milestone` command again. It starts a new run that
 skips every card already `done` on the board. A subtask that was stopped or
-killed part way picks up in its existing worktree and does not redo a plan that already passed. Relaunching a
-finished milestone drives nothing and reports `done` with an empty
-`completed`.
+killed part way picks up in its existing worktree and does not redo a plan
+that already passed. Relaunching a finished milestone drives nothing and
+reports `done` with an empty `completed`.
 
 `am resume <run-id>` is not milestone-aware and does not continue a milestone.
 On a run with a stopped subtask it is refused with exit code 3, and its message
