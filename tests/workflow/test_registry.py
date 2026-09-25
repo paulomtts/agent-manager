@@ -7,7 +7,15 @@ import pytest
 from agent_manager import models
 from agent_manager.engine import bind_arguments
 from agent_manager.errors import EngineError
-from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
+from agent_manager.steps import (
+    docs_commit,
+    integrate,
+    plan_check,
+    reducers,
+    rollup,
+    verify,
+    worktree,
+)
 from agent_manager.workflow.registry import (
     BUILTIN_FUNCTION_NAMES,
     DuplicateFunctionError,
@@ -99,10 +107,18 @@ TASK_YAML_NAMES = (
     "worktree.ensure",
 )
 
+# Names the forthcoming builtin/integrate.yaml references and task.yaml never
+# does (Integrate addendum I3). Kept explicit so the drift check still pins the
+# registry to exactly what the builtin documents use.
+INTEGRATE_ONLY_NAMES = ("merge_completed_gate",)
 
-def test_default_registry_holds_exactly_the_names_task_yaml_uses() -> None:
-    assert default_registry().names() == TASK_YAML_NAMES
-    assert BUILTIN_FUNCTION_NAMES == TASK_YAML_NAMES
+BUILTIN_NAMES = tuple(sorted(TASK_YAML_NAMES + INTEGRATE_ONLY_NAMES))
+
+
+def test_default_registry_holds_exactly_the_names_the_builtin_documents_use() -> None:
+    assert not set(TASK_YAML_NAMES) & set(INTEGRATE_ONLY_NAMES)
+    assert default_registry().names() == BUILTIN_NAMES
+    assert BUILTIN_FUNCTION_NAMES == BUILTIN_NAMES
 
 
 def test_default_registry_resolves_the_ported_reducers_to_the_real_callables() -> None:
@@ -118,6 +134,16 @@ def test_default_registry_resolves_the_ported_reducers_to_the_real_callables() -
     assert registry.resolve("verification_passed_gate") is reducers.verification_passed_gate
     assert registry.resolve("critic_blockers_gate") is reducers.critic_blockers_gate
     assert registry.resolve("implement_blocked_gate") is reducers.implement_blocked_gate
+
+
+def test_default_registry_resolves_the_merge_gate_to_the_real_callable() -> None:
+    """Not a wrapper: `bind_arguments` reads the real signature, and a fix to
+    the gate reaches the engine without touching this table."""
+    registry = default_registry()
+    assert registry.resolve("merge_completed_gate") is integrate.merge_completed_gate
+    assert default_registry().resolve("merge_completed_gate") is registry.resolve(
+        "merge_completed_gate"
+    )
 
 
 def test_default_registry_resolves_implemented_steps_to_the_real_callables() -> None:
@@ -248,7 +274,7 @@ def test_default_registry_returns_an_independent_registry_each_call() -> None:
 
     second = default_registry()
     assert "test.only" not in second
-    assert second.names() == TASK_YAML_NAMES
+    assert second.names() == BUILTIN_NAMES
 
 
 def test_the_plan_hash_adapter_is_one_object_across_two_registries() -> None:

@@ -1180,6 +1180,9 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
     def agent_only_gate(**kwargs: Any) -> None:
         raise AssertionError("an agent phase's gate is the agent runner's business")
 
+    def integrate_only_gate(**kwargs: Any) -> None:
+        raise AssertionError("task.yaml never references an integrate-only gate")
+
     functions: dict[str, Any] = {
         "rollup.set_status": set_status,
         "worktree.ensure": ensure,
@@ -1195,6 +1198,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
         "verification_gate": agent_only_gate,
+        "merge_completed_gate": integrate_only_gate,
     }
     assert sorted(functions) == sorted(BUILTIN_FUNCTION_NAMES)
 

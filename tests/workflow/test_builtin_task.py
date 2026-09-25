@@ -57,6 +57,10 @@ EXPECTED_PHASES = (
     ("mark_done", "deterministic"),
 )
 
+# Registered for the forthcoming builtin/integrate.yaml; task.yaml never names
+# them (Integrate addendum I3).
+INTEGRATE_ONLY_NAMES = ("merge_completed_gate",)
+
 
 def test_builtin_task_loads_against_the_default_registry() -> None:
     """The regression guard for the whole subtask: every name resolves."""
@@ -249,7 +253,9 @@ def test_no_phase_declares_plan_hash_before_docs_commit_runs() -> None:
 def test_every_resolved_function_is_the_registry_binding() -> None:
     workflow = load_builtin("task")
     registry = default_registry()
-    assert sorted(workflow.functions) == sorted(registry.names())
+    assert set(INTEGRATE_ONLY_NAMES) <= set(registry.names())
+    task_names = sorted(set(registry.names()) - set(INTEGRATE_ONLY_NAMES))
+    assert sorted(workflow.functions) == task_names
     for name, fn in workflow.functions.items():
         assert fn is registry.resolve(name)
 
