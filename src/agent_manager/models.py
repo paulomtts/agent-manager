@@ -140,7 +140,7 @@ class HarnessAssignment(_Model):
 class RunConfig(_Model):
     """The knobs a run was started with, recorded so resume reuses them."""
 
-    max_concurrent_stories: int = Field(default=1, gt=0)
+    max_concurrent_stories: int = Field(default=4, gt=0)
     dry_run: bool = False
     launcher: Launcher = "direct"
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)

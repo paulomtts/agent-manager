@@ -627,7 +627,7 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project):
 
     run = _load(project, run_id)
     assert run.workflow == "milestone"
-    assert run.config == models.RunConfig()
+    assert run.config == models.RunConfig(max_concurrent_stories=1)
     assert (run.base_branch, run.branch_prefix, run.repo_dir) == ("main", PREFIX, root)
     assert _statuses(run) == {
         "run": "done",
