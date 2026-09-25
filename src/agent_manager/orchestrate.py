@@ -1,7 +1,9 @@
-"""The sequential milestone runner (orchestration addendum O6).
+"""The milestone runner (orchestration addendum O6, parallel-stories P1/P4/P6).
 
-`run_milestone` drives every remaining subtask of one milestone, one at a time,
-through the shared per-subtask driver (O4). Every derivation belongs to a
+`run_milestone` drives every remaining subtask of one milestone through the
+shared per-subtask driver (O4). Each dependency level's stories run as lanes on
+a pool bounded by `max_concurrent`; a story's subtasks stay strictly sequential
+and level N+1 starts only after every lane of level N returns. Every derivation belongs to a
 collaborator: the milestone and its census to `census`, levels, stack bases and
 tips to `dag`, board reads to `board`, rollup to `steps.rollup`, git to
 `steps.worktree.run_git`, run state to `Store`. This module decides only the
@@ -17,7 +19,8 @@ CLI wiring card makes `cli` import this module, and binding a `cli` name at
 import or definition time would break under that circular import. The clock
 default is this module's own `_utcnow` for the same reason.
 
-The module holds no mutable state of its own (O4).
+The module holds no mutable state of its own (O4). A run's lock and stop event
+live in a `RunStop` that `run_milestone` creates for that run.
 """
 
 from __future__ import annotations
@@ -472,14 +475,20 @@ def run_milestone(
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
 ) -> dict[str, Any]:
-    """Drive every remaining subtask of `milestone`, one at a time, and report (O6).
+    """Drive every remaining subtask of `milestone`, level by level, and report (O6).
 
-    `milestone` is a card id or a title needle (O1). Everything that can refuse
-    runs before the store is opened. Then one `milestone` run is recorded with
-    its whole plan `pending`, and levels, stories and subtasks are walked in
-    order. A subtask already `done` on the board is never driven, but its
-    branch still anchors the next subtask's base. The card and its story are
-    read fresh from the board before each subtask.
+    `milestone` is a card id or a title needle (O1). Everything that can refuse,
+    `max_concurrent < 1` included, runs before the store is opened. Then one
+    `milestone` run is recorded with its whole plan `pending`, and each level's
+    stories run as lanes on a pool of `max_concurrent` threads, with a barrier
+    between levels. A subtask already `done` on the board is never driven, but
+    its branch still anchors the next subtask's base. The card and its story
+    are read fresh from the board before each subtask.
+
+    The first escalation sets the run's stop: lanes already running park at
+    their next phase boundary and are recorded `stopped`, lanes not yet started
+    leave their story `pending`, and no later level is scheduled. At
+    `max_concurrent=1` the result is exactly the sequential runner's.
     """
     if max_concurrent < 1:
         raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
@@ -518,21 +527,29 @@ def run_milestone(
         stop = RunStop()
 
         for level in levels:
-            outcomes = [
-                run_story_lane(
-                    planned,
-                    store=store,
-                    run_id=run_id,
-                    rows=rows,
-                    root=root,
-                    drive=drive,
-                    commands=list(commands),
-                    allow_no_verification=allow_no_verification,
-                    runner_factory=runner_factory,
-                    stop=stop,
-                )
-                for planned in level
-            ]
+            with ThreadPoolExecutor(
+                max_workers=max_concurrent, thread_name_prefix="am-lane"
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        run_story_lane,
+                        planned,
+                        store=store,
+                        run_id=run_id,
+                        rows=rows,
+                        root=root,
+                        drive=drive,
+                        commands=list(commands),
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                    )
+                    for planned in level
+                ]
+            # Leaving the `with` block is the level barrier: every lane has
+            # returned. `result()` re-raises a lane's BaseException here, after
+            # the pool has shut down, in census order.
+            outcomes = [future.result() for future in futures]
             # Census order, never completion order: deterministic at any bound.
             for outcome in outcomes:
                 completed.extend(outcome.completed)
