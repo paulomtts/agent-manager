@@ -502,3 +502,44 @@ def test_a_missing_story_tip_propagates_the_git_error(repo: Repo, store: Store) 
 
     assert factory.calls == []
     _assert_protected(repo, before, [tip_a])
+
+# ── a merge already in progress ──────────────────────────────────────────────
+
+
+def _conflicting_pair(repo: Repo) -> tuple[list[StoryPlan], list[str]]:
+    """Stories A and B, both cut from the base, editing the same line of shared.txt."""
+    story_a = _story(STORY_A, "Story A", SUB_A)
+    story_b = _story(STORY_B, "Story B", SUB_B)
+    tip_a = _story_branch(repo, story_a, {"shared.txt": "story a\n"})
+    tip_b = _story_branch(repo, story_b, {"shared.txt": "story b\n"})
+    return [story_a, story_b], [tip_a, tip_b]
+
+
+def test_a_merge_already_in_progress_escalates_without_dispatching(
+    repo: Repo, store: Store
+) -> None:
+    stories, tips = _conflicting_pair(repo)
+    before = _protected(repo, tips)
+    # An earlier run left B's conflict unresolved in the integration worktree.
+    assert merge_tip(repo.root, repo.worktree, INTEGRATION_BRANCH, BASE, tips[0])["conflict"] is False
+    assert merge_tip(repo.root, repo.worktree, INTEGRATION_BRANCH, BASE, tips[1])["conflict"] is True
+    merge_head = _merge_head(repo.worktree)
+    head = _sha(repo.worktree, "HEAD")
+    assert merge_head is not None
+    factory = FakeFactory()
+
+    outcome = _integrate(repo, store, stories, factory=factory)
+
+    assert isinstance(outcome, IntegrateEscalation)
+    assert outcome.phase == "integrate"
+    assert outcome.story == STORY_A
+    assert outcome.files == []
+    assert "A human must finish it" in outcome.detail
+    assert "relaunch" in outcome.detail
+    assert str(repo.worktree) in outcome.detail
+    assert factory.calls == []
+    assert factory.resolver.calls == []
+    assert _merge_head(repo.worktree) == merge_head
+    assert _sha(repo.worktree, "HEAD") == head
+    assert store.load_run(RUN_ID).stories == []
+    _assert_protected(repo, before, tips)

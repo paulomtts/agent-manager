@@ -22,7 +22,7 @@ from pathlib import Path
 from agent_manager import cli, dag
 from agent_manager.census import StoryPlan
 from agent_manager.steps import reducers, verify
-from agent_manager.steps.integrate import merge_tip
+from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
 
 PHASE = "integrate"
@@ -133,7 +133,13 @@ def integrate_milestone(
     resolved: list[str] = []
 
     for story, tip in merge_order(stories, branch_prefix, base_branch):
-        result = merge_tip(root, worktree, branch, base_branch, tip)
+        try:
+            result = merge_tip(root, worktree, branch, base_branch, tip)
+        except MergeInProgressError as error:
+            # The error's own message already tells the human to finish the
+            # merge in the worktree and relaunch. Nothing is dispatched or
+            # recorded: that unresolved merge is not this run's to touch.
+            return IntegrateEscalation(story=story.id, files=[], detail=str(error))
         if result["conflict"]:
             files = [str(name) for name in result["files"]]
             return IntegrateEscalation(
