@@ -15,6 +15,7 @@ each story's implement write the files a scenario needs, keyed by the brief's
 """
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -442,3 +443,10 @@ def test_a_clean_merge_that_breaks_the_suite_escalates_at_integrate(
     assert "resolve" not in _phases(read_fake_log(data["run_id"]))
     assert _load_run(root, data["run_id"]).status == "escalated"
     _assert_base_untouched(root, main_before)
+
+
+def test_no_resolver_mode_is_left_armed_for_later_tests():
+    """Review focus: scenario 2 arms `FAKE_CLAUDE_RESOLVER` through the
+    function-scoped `monkeypatch`; it must be gone once that test ends, or every
+    later resolve in the session would refuse. Kept last in the module."""
+    assert "FAKE_CLAUDE_RESOLVER" not in os.environ
