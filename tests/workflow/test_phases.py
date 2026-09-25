@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from agent_manager import results
+from agent_manager.steps import plan_check as plan_check_module
 from agent_manager.steps import reducers, rollup
 from agent_manager.workflow import phases as phases_module
 from agent_manager.workflow.loader import load_builtin, load_workflow
@@ -268,7 +269,9 @@ def test_from_loader_resolves_every_name_of_the_shipped_task():
     assert reducers.plan_hash_gate_adapter in review.gates
     assert converted.phase("explore").retry == Retry(2, ("schema_invalid", "gate_failed"))
     plan_check = converted.phase("plan_check")
-    assert plan_check.skip_to == "docs_commit" and callable(plan_check.when)
+    assert plan_check.skip_to == "docs_commit"
+    assert plan_check.when is plan_check_module.has_validated_plan
+    assert plan_check.run is plan_check_module.find_validated_plan
 
 
 def test_from_loader_keeps_fakes_from_a_test_registry():
