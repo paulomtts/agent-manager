@@ -611,3 +611,154 @@ def test_a_marker_naming_only_other_branches_does_not_fail_this_review(tmp_path)
 
     assert payload["porcelain"] == ""
     assert review_gate(payload, REVIEW_BRANCH, "main") is None
+
+
+def test_the_rendezvous_env_var_names_are_the_ones_the_e2e_fixtures_set():
+    """`tests/e2e/conftest.py` sets `FAKE_RENDEZVOUS_DIR_ENV` and
+    `FAKE_RENDEZVOUS_COUNT_ENV`; the fixture and the script meet across a
+    process boundary, like `LOG_NAME` and `REVIEW_FAIL_MARKER`."""
+    assert fake_claude.RENDEZVOUS_DIR_ENV == "FAKE_CLAUDE_RENDEZVOUS_DIR"
+    assert fake_claude.RENDEZVOUS_COUNT_ENV == "FAKE_CLAUDE_RENDEZVOUS_COUNT"
+    assert fake_claude.RENDEZVOUS_TIMEOUT == 20
+
+
+def test_a_rendezvous_marker_name_is_stable_per_cwd_and_filesystem_safe(tmp_path):
+    first = tmp_path / "worktrees" / "m3" / "task-a1-00000001"
+    second = tmp_path / "worktrees" / "m3" / "task-b1-00000002"
+
+    name = fake_claude.rendezvous_marker_name(first)
+
+    assert name == fake_claude.rendezvous_marker_name(first)
+    assert name != fake_claude.rendezvous_marker_name(second)
+    assert name.endswith(fake_claude.RENDEZVOUS_SUFFIX)
+    stem = name[: -len(fake_claude.RENDEZVOUS_SUFFIX)]
+    assert len(stem) == 16 and set(stem) <= set("0123456789abcdef")
+
+
+def test_without_a_rendezvous_dir_implement_neither_waits_nor_writes_a_marker(
+    tmp_path, monkeypatch
+):
+    """Unset means today's behaviour exactly. The count is set to something
+    unmeetable and the timeout is short, so any wait would raise."""
+    monkeypatch.delenv(fake_claude.RENDEZVOUS_DIR_ENV, raising=False)
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "99")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+    repo = _implement_repo(tmp_path)
+    before = sorted(path.name for path in tmp_path.iterdir())
+
+    payload = _implement(repo)
+
+    assert payload["resumed"] is False
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+
+def test_a_met_rendezvous_writes_a_marker_named_for_the_cwd_and_implements(
+    tmp_path, monkeypatch
+):
+    """Review focus: the dir does not exist yet, and the fake creates it."""
+    folder = tmp_path / "rendezvous" / "created-by-the-fake"
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(folder))
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "1")
+    repo = _implement_repo(tmp_path)
+    before = _head(repo)
+
+    payload = _implement(repo)
+
+    marker = folder / fake_claude.rendezvous_marker_name(repo)
+    assert marker.is_file()
+    assert marker.read_text(encoding="utf-8").strip() == str(repo)
+    assert payload["resumed"] is False
+    assert payload["plan_hash"] == BRIEF_HASH
+    assert _head(repo) != before
+
+
+def test_a_rendezvous_counts_markers_other_lanes_left(tmp_path, monkeypatch):
+    """Count 2 with one peer marker already present: the second arrival passes
+    straight through, which is how two lanes release each other."""
+    folder = tmp_path / "rendezvous"
+    folder.mkdir()
+    (folder / ("0" * 16 + fake_claude.RENDEZVOUS_SUFFIX)).write_text(
+        "peer\n", encoding="utf-8"
+    )
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(folder))
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "2")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 5.0)
+    repo = _implement_repo(tmp_path)
+
+    payload = _implement(repo)
+
+    assert payload["resumed"] is False
+    assert len(list(folder.glob(f"*{fake_claude.RENDEZVOUS_SUFFIX}"))) == 2
+
+
+def test_an_unmet_rendezvous_fails_the_fake_before_it_commits(tmp_path, monkeypatch):
+    folder = tmp_path / "rendezvous"
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(folder))
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "2")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+    repo = _implement_repo(tmp_path)
+    before = _head(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _implement(repo)
+
+    message = str(caught.value)
+    assert str(folder) in message
+    assert "saw 1 of 2" in message
+    assert _head(repo) == before
+
+
+def test_the_same_cwd_arriving_twice_counts_once(tmp_path, monkeypatch):
+    """Review focus: a retried implement in one worktree must not satisfy a
+    count of 2 on its own, or a single lane would fake an overlap."""
+    folder = tmp_path / "rendezvous"
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(folder))
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "2")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+    repo = _implement_repo(tmp_path)
+
+    for _ in range(2):
+        with pytest.raises(fake_claude.FakeClaudeError):
+            fake_claude.rendezvous(repo)
+
+    assert len(list(folder.glob(f"*{fake_claude.RENDEZVOUS_SUFFIX}"))) == 1
+
+
+@pytest.mark.parametrize("raw", [None, "", "two", "1.5", "0", "-1"])
+def test_a_missing_or_bad_rendezvous_count_is_refused(tmp_path, monkeypatch, raw):
+    """Review focus: a count below 1 would pass silently, and a non-number
+    would be a guess; both are refusals naming the env var."""
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(tmp_path / "rendezvous"))
+    if raw is None:
+        monkeypatch.delenv(fake_claude.RENDEZVOUS_COUNT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, raw)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.rendezvous(tmp_path)
+
+    assert fake_claude.RENDEZVOUS_COUNT_ENV in str(caught.value)
+
+
+def test_a_rendezvous_failure_makes_the_fake_process_exit_1(tmp_path, monkeypatch):
+    """The `__main__` mapping, end to end: the child inherits the env (as it does
+    under `launcher.run_direct`), refuses the count, writes no result."""
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(tmp_path / "rendezvous"))
+    monkeypatch.setenv(fake_claude.RENDEZVOUS_COUNT_ENV, "two")
+    attempt = tmp_path / "runs" / "r1" / "card" / "implement.1"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path,
+        "implement",
+        "coder",
+        f"\n## plan_path\n{PLAN_RELATIVE}\n\n## plan_hash\n{BRIEF_HASH}\n",
+        IMPLEMENT_SCHEMA,
+        result_path,
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 1
+    assert "FAKE_CLAUDE_RENDEZVOUS_COUNT" in completed.stderr
+    assert not result_path.exists()

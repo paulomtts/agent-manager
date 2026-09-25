@@ -8,12 +8,14 @@ executable named `claude` and put first on `PATH`, so `harness/claude.py`'s bare
 Everything it needs comes out of the brief on disk: the prompt path from the
 adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
-(`prompt.py:281-374`). There is deliberately no environment variable, no extra
-argv flag and no import of `agent_manager` -- a brief that omits the contract
-must make this script fail, because that failure is the test's whole point.
-The one test-controlled input is `REVIEW_FAIL_MARKER`, a file in the repo's git
-common dir that the fake finds from its own cwd and compares with the brief's
-`## branch`.
+(`prompt.py:281-374`). There is deliberately no extra argv flag and no import
+of `agent_manager` -- a brief that omits the contract must make this script
+fail, because that failure is the test's whole point. There are exactly two
+test-controlled inputs, and neither tells the fake anything the brief owns:
+`REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
+from its own cwd and compares with the brief's `## branch`; and the
+implement-only rendezvous (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`),
+which only makes implement wait for other lanes and changes nothing it writes.
 
 Standard library only: it runs under a bare `#!<python>` line.
 """
@@ -24,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -214,6 +217,76 @@ REVIEW_FAIL_PORCELAIN = "?? fake-claude: the review-fail marker names this branc
 """What a failing review reports as `porcelain`. Non-empty, so the production
 `review_gate` blocks on it, and worded so the escalation detail says why."""
 
+RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
+"""Test scaffolding, never in a brief: a directory where each implement leaves a
+marker named for its cwd and then waits for other lanes' markers. Unset or
+empty means no rendezvous at all. The parallel milestone tests set it so a run
+can only finish if two lanes were inside implement at the same time."""
+
+RENDEZVOUS_COUNT_ENV = "FAKE_CLAUDE_RENDEZVOUS_COUNT"
+"""How many markers implement waits for; a whole number of at least 1."""
+
+RENDEZVOUS_TIMEOUT = 20.0
+"""Seconds to wait before failing. Read at call time, so a self-test can patch it."""
+
+RENDEZVOUS_POLL = 0.05
+"""Seconds between marker counts."""
+
+RENDEZVOUS_SUFFIX = ".arrived"
+"""Only files with this suffix count, so nothing else in the dir can release a wait."""
+
+
+def rendezvous_marker_name(cwd):
+    """A filesystem-safe marker name that is the same on every run for one cwd.
+
+    Hashed rather than escaped, so a path of any shape or length is safe. One
+    name per cwd means a retried implement in the same worktree counts once.
+    """
+    digest = hashlib.sha256(str(Path(cwd).resolve()).encode("utf-8")).hexdigest()
+    return digest[:16] + RENDEZVOUS_SUFFIX
+
+
+def _rendezvous_count(raw):
+    try:
+        needed = int(raw)
+    except (TypeError, ValueError):
+        raise FakeClaudeError(
+            f"{RENDEZVOUS_DIR_ENV} is set but {RENDEZVOUS_COUNT_ENV} is {raw!r}, "
+            "not a whole number"
+        ) from None
+    if needed < 1:
+        raise FakeClaudeError(
+            f"{RENDEZVOUS_COUNT_ENV} must be at least 1, got {needed}"
+        )
+    return needed
+
+
+def rendezvous(cwd):
+    """Leave this cwd's marker and wait until enough lanes have left theirs.
+
+    A no-op unless `RENDEZVOUS_DIR_ENV` is set. Markers are never removed, so
+    once a run reaches the count every later implement passes straight through.
+    """
+    directory = os.environ.get(RENDEZVOUS_DIR_ENV)
+    if not directory:
+        return
+    needed = _rendezvous_count(os.environ.get(RENDEZVOUS_COUNT_ENV))
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / rendezvous_marker_name(cwd)).write_text(f"{cwd}\n", encoding="utf-8")
+    deadline = time.monotonic() + RENDEZVOUS_TIMEOUT
+    while True:
+        seen = len(list(folder.glob(f"*{RENDEZVOUS_SUFFIX}")))
+        if seen >= needed:
+            return
+        if time.monotonic() >= deadline:
+            raise FakeClaudeError(
+                f"rendezvous in {folder} timed out after {RENDEZVOUS_TIMEOUT}s: "
+                f"saw {seen} of {needed} marker(s)"
+            )
+        time.sleep(RENDEZVOUS_POLL)
+
+
 
 def review_fail_branches(cwd):
     """The branches the review-fail marker names, or an empty set when there is none."""
@@ -301,6 +374,9 @@ def build_result(phase, payload, text, cwd):
         _document(cwd, relative, "plan")
         return override(payload, path=relative, self_reviewed=True, note=None)
     if phase == "implement":
+        # Test scaffolding: wait here for the other lanes, before any work, so
+        # an unmet rendezvous fails without committing anything.
+        rendezvous(cwd)
         # Card f26b377d: the hash comes from the brief's `## plan_hash` section,
         # never from hashing the plan. A fake that computed it would keep the
         # wiring test green with the input missing from `builtin/task.yaml`,

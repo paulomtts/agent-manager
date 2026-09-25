@@ -51,6 +51,12 @@ MILESTONE_PREFIX = "m3"
 FAKE_REVIEW_FAIL_MARKER = "fake-claude-review-fail"
 """Must equal `fake_claude.REVIEW_FAIL_MARKER`, which `test_fake_claude.py` pins."""
 
+FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
+"""Must equal `fake_claude.RENDEZVOUS_DIR_ENV`, which `test_fake_claude.py` pins."""
+
+FAKE_RENDEZVOUS_COUNT_ENV = "FAKE_CLAUDE_RENDEZVOUS_COUNT"
+"""Must equal `fake_claude.RENDEZVOUS_COUNT_ENV`, which `test_fake_claude.py` pins."""
+
 
 def git(cwd: Path, *args: str) -> str:
     """Run one git command for fixture setup or assertion, failing loudly."""
