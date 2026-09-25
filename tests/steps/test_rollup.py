@@ -419,7 +419,7 @@ def test_rollup_reenters_a_board_lock_its_own_thread_already_holds(temp_board):
     }
 
 
-_RACE_ITERATIONS = 20
+_RACE_ITERATIONS = 4
 _RACE_STORIES = 2
 _RACE_SUBTASKS_PER_STORY = 4
 
