@@ -349,6 +349,7 @@ class FakeDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
+        should_stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -893,3 +894,47 @@ def test_a_failed_stale_rollup_is_a_warning_and_the_run_goes_on(project, monkeyp
     assert story_a in warning
     assert a2 in warning
     assert "brd is down" in warning
+
+
+@requires_git
+@requires_brd
+def test_a_board_read_that_fails_inside_a_lane_is_an_escalation_of_that_subtask(
+    project, monkeypatch
+):
+    """Spec item 6: an `Exception` anywhere inside a lane after it picked up a
+    subtask escalates that subtask, not only one raised by the driver."""
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    real_show = board.show
+
+    def failing_show(card_id: str, *, repo_dir: Any = None) -> models.Card:
+        if card_id == a1:
+            raise board.BoardError("brd is down", argv=["brd", "show", card_id])
+        return real_show(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(board, "show", failing_show)
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert driver.calls == []
+    assert (result["escalated"], result["level"], result["story"], result["subtask"]) == (
+        True,
+        0,
+        story_a,
+        a1,
+    )
+    assert result["failed_phase"] is None
+    assert result["detail"].startswith("BoardError: ")
+    assert "brd is down" in result["detail"]
+    assert "also_escalated" not in result
+    assert "stopped" not in result
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "pending",
+        b1: "pending",
+    }
