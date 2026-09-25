@@ -486,3 +486,157 @@ def test_local_edits_the_merge_would_overwrite_raise_and_survive(
     assert _merge_head(wt) is None
     assert _head(wt) == head
     assert _base_state(repo) == before
+
+
+def _leave_a_conflict(repo: Path, wt: Path, tmp_path: Path) -> str:
+    """Merge story-a cleanly, then story-b onto the same line: return story-b's sha."""
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    tip_b = _make_tip(repo, tmp_path, "m5/story-b", {"a.js": "from story b\n"})
+    _merge(repo, wt, "m5/story-a")
+    conflict = _merge(repo, wt, "m5/story-b")
+    assert conflict["conflict"] is True
+    return tip_b
+
+
+@requires_git
+def test_a_merge_left_in_progress_refuses_the_next_call(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    _make_tip(repo, tmp_path, "m5/story-c", {"c.txt": "from story c\n"})
+    before = _base_state(repo)
+    tip_b = _leave_a_conflict(repo, wt, tmp_path)
+    head = _head(wt)
+    status = _git(wt, "status", "--porcelain")
+    marked = (wt / "a.js").read_text()
+
+    for tip in ("m5/story-c", "m5/story-b"):
+        with pytest.raises(MergeInProgressError, match="never resolved") as excinfo:
+            _merge(repo, wt, tip)
+        message = str(excinfo.value)
+        assert "already in progress" in message
+        assert str(wt) in message
+        assert excinfo.value.worktree == str(wt)
+
+    assert _merge_head(wt) == tip_b
+    assert _head(wt) == head
+    assert _git(wt, "status", "--porcelain") == status
+    assert (wt / "a.js").read_text() == marked
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_differently_spelled_worktree_path_is_still_refused_mid_merge(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    tip_b = _leave_a_conflict(repo, wt, tmp_path)
+
+    with pytest.raises(MergeInProgressError):
+        _merge(repo, wt, "m5/story-b", worktree=f"{wt}{os.sep}.{os.sep}")
+
+    assert _merge_head(wt) == tip_b
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_merge_head_probe_that_fails_otherwise_is_re_raised(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # Exit 1 means "no MERGE_HEAD"; any other failure is not an answer and
+    # must not be read as "safe to merge".
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    _make_tip(repo, tmp_path, "m5/story-b", {"b.js": "from story b\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+    head = _head(wt)
+
+    def runner(argv: list[str]) -> str:
+        if "MERGE_HEAD" in argv:
+            raise GitError("forced: the probe itself broke", argv=argv, exit_code=128)
+        return run_git(argv)
+
+    with pytest.raises(GitError) as excinfo:
+        _merge(repo, wt, "m5/story-b", runner)
+
+    assert "MERGE_HEAD" in excinfo.value.argv
+    assert _head(wt) == head
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_worktree_not_yet_registered_skips_the_probe(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # The guard does not need the integration branch to exist yet.
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    before = _base_state(repo)
+
+    calls: list[list[str]] = []
+    result = _merge(repo, wt, "m5/story-a", _recorder(calls))
+
+    assert result["created"] is True
+    assert not any("MERGE_HEAD" in argv for argv in calls)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_conflict_a_human_resolved_and_committed_is_merged_on_relaunch(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+    _leave_a_conflict(repo, wt, tmp_path)
+    (wt / "a.js").write_text("resolved by a human\n")
+    _git(wt, "add", "a.js")
+    _git(wt, "commit", "--no-edit")
+    head = _head(wt)
+
+    for tip in ("m5/story-a", "m5/story-b"):
+        assert _merge(repo, wt, tip) == {
+            "created": False,
+            "conflict": False,
+            "files": [],
+            "merged": tip,
+            "already_merged": True,
+            "detail": "",
+        }
+
+    assert _head(wt) == head
+    assert _merge_head(wt) is None
+    assert _base_state(repo) == before
+
+
+FORBIDDEN_TOKENS = ("reset", "clean", "commit", "push", "prune", "--abort")
+
+
+def _assert_no_forbidden_git(calls: list[list[str]]) -> None:
+    for argv in calls:
+        for token in FORBIDDEN_TOKENS:
+            assert token not in argv, f"forbidden git operation {token!r} in {argv!r}"
+        assert not ("checkout" in argv and "-f" in argv), argv
+        assert not ("worktree" in argv and "remove" in argv), argv
+        assert "update-ref" not in argv, argv
+        assert "branch" not in argv, argv
+
+
+@requires_git
+def test_no_forbidden_git_operation_runs_on_any_path(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    _make_tip(repo, tmp_path, "m5/story-b", {"a.js": "from story b\n"})
+    _make_tip(repo, tmp_path, "m5/story-c", {"c.txt": "from story c\n"})
+    before = _base_state(repo)
+    calls: list[list[str]] = []
+    runner = _recorder(calls)
+
+    fresh = _merge(repo, wt, "m5/story-a", runner)
+    again = _merge(repo, wt, "m5/story-a", runner)
+    conflict = _merge(repo, wt, "m5/story-b", runner)
+    with pytest.raises(MergeInProgressError):
+        _merge(repo, wt, "m5/story-c", runner)
+
+    assert fresh["created"] is True
+    assert again["already_merged"] is True
+    assert conflict["conflict"] is True
+    _assert_no_forbidden_git(calls)
+    assert _base_state(repo) == before

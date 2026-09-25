@@ -27,10 +27,12 @@ from pathlib import Path
 from agent_manager.steps.worktree import (
     GitError,
     GitRunner,
+    _is_registered,
     _required_absolute,
     _required_name,
     ensure,
     run_git,
+    worktree_paths,
 )
 
 
@@ -107,6 +109,33 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _refuse_unfinished_merge(
+    git_runner: GitRunner, repo_path: str, worktree_path: str
+) -> None:
+    """Raise `MergeInProgressError` when `worktree_path` has a merge under way.
+
+    A worktree git does not know yet cannot hold a merge, so the probe is
+    skipped and the integration branch need not exist. Registration uses the
+    same test as `worktree.ensure`, so a trailing slash or `.` cannot slip
+    past. `rev-parse --verify --quiet` exits 1 when MERGE_HEAD is absent; any
+    other failure is not an answer and propagates.
+    """
+    registered = worktree_paths(
+        git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
+    )
+    if not _is_registered(worktree_path, registered):
+        return
+    try:
+        git_runner(
+            ["-C", worktree_path, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+    except GitError as error:
+        if error.exit_code == 1:
+            return
+        raise
+    raise MergeInProgressError(worktree_path)
+
+
 def merge_tip(
     repo_dir: str | Path,
     worktree: str | Path,
@@ -117,17 +146,21 @@ def merge_tip(
 ) -> dict[str, object]:
     """Merge `tip` into `integration_branch`'s worktree with `--no-ff`, and report it.
 
-    A tip already contained in HEAD is a no-op, so a relaunch never
-    re-merges. A content conflict is left in progress and reported with its
-    files; any other git failure raises. The return value is the
-    deterministic phase's result -- a plain dict, since it crosses no process
-    boundary and so needs no Pydantic model (`CLAUDE.md`).
+    Refuses to start on top of an unresolved merge. A tip already contained
+    in HEAD is a no-op, so a relaunch never re-merges. A content conflict is
+    left in progress and reported with its files; any other git failure
+    raises. The return value is the deterministic phase's result -- a plain
+    dict, since it crosses no process boundary and so needs no Pydantic model
+    (`CLAUDE.md`).
     """
     tip = _required_tip(tip)
     integration_branch = _required_name(integration_branch, "integration_branch")
     base_branch = _required_name(base_branch, "base_branch")
     worktree_path = _required_absolute(worktree, "worktree")
     repo_path = _required_absolute(repo_dir, "repo_dir")
+
+    # Before anything else touches git state: never merge on top of a merge.
+    _refuse_unfinished_merge(git_runner, repo_path, worktree_path)
 
     ensured = ensure(integration_branch, base_branch, worktree_path, repo_path, git_runner)
     created = bool(ensured["created"])
