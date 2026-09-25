@@ -3,10 +3,10 @@
 `run_milestone` drives every remaining subtask of one milestone through the
 shared per-subtask driver (O4). Each dependency level's stories run as lanes on
 a pool bounded by `max_concurrent`; a story's subtasks stay strictly sequential
-and level N+1 starts only after every lane of level N returns. Every derivation belongs to a
-collaborator: the milestone and its census to `census`, levels, stack bases and
-tips to `dag`, board reads to `board`, rollup to `steps.rollup`, git to
-`steps.worktree.run_git`, run state to `Store`. This module decides only the
+and level N+1 starts only after every lane of level N returns. Every derivation
+belongs to a collaborator: the milestone and its census to `census`, levels,
+stack bases and tips to `dag`, board reads to `board`, rollup to
+`steps.rollup`, git to `steps.worktree.run_git`, run state to `Store`. This module decides only the
 order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
