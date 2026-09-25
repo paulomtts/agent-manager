@@ -199,6 +199,7 @@ def test_bind_arguments_refuses_a_positional_only_parameter():
     assert caught.value.parameter == "card"
     assert "positional-only" in str(caught.value)
 
+
 def test_bind_arguments_binds_the_merge_completed_gate_from_a_gate_table():
     """The gate takes `result` and `worktree` by name out of exactly the table
     `_gate_values` builds for a deterministic phase; `git_runner` is keyword-only
