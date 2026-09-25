@@ -36,14 +36,19 @@ Every command prints one line of JSON — `{"ok": true, "data": ...}` on success
 
 ### Milestone runs
 
-Drive every remaining subtask of one milestone, one at a time, each on its own
-local branch stacked on the branch before it:
+Drive every remaining subtask of one milestone. A level's stories run side by
+side, and each story's subtasks run one at a time, each on its own local branch
+stacked on the branch before it:
 
 ```bash
 am run --milestone "document milestone runs" \
   --branch-prefix m3 \
-  --verify "uv run pytest"
+  --verify "uv run pytest" \
+  [--max-concurrent N]
 ```
+
+`--max-concurrent N` is how many of a level's stories run at once. It defaults
+to 4. `--max-concurrent 1` runs stories one at a time, as before.
 
 `--milestone` takes the milestone card's id, its exact title (case does not
 matter), or a piece of its title that matches exactly one root card. A piece
@@ -60,9 +65,10 @@ gate refuses to go on. `--repo-dir` defaults to `.` and `--base-branch` to
 `master`.
 
 Some combinations are refused before anything is read: `--card` together with
-`--milestone`, neither of them, a blank `--milestone`, and `--dry-run` with
-`--card`. These are usage errors, like a missing `--branch-prefix`: Typer prints
-the message on stderr, nothing is printed on stdout, and the exit code is 2.
+`--milestone`, neither of them, a blank `--milestone`, `--dry-run` with
+`--card`, `--max-concurrent` with `--card`, and a `--max-concurrent` below 1.
+These are usage errors, like a missing `--branch-prefix`: Typer prints the
+message on stderr, nothing is printed on stdout, and the exit code is 2.
 
 #### Preview with `--dry-run`
 
@@ -71,8 +77,10 @@ am run --milestone "document milestone runs" --branch-prefix m3 --dry-run --pret
 ```
 
 The preview reads the board and writes nothing: no run directory, no branch, no
-worktree, no board change. It exits 0. `data.levels` is a list of
-`{"level", "stories"}`. Each story is `{"story", "title", "root", "subtasks"}`,
+worktree, no board change. It exits 0. It takes `--max-concurrent` too, and
+`data.max_concurrent` echoes it (4 when not given). `data.levels` is a list of
+`{"level", "concurrent", "stories"}`, where `concurrent` is how many of that
+level's stories would run at once. Each story is `{"story", "title", "root", "subtasks"}`,
 and each subtask is `{"id", "title", "status", "branch", "base"}`. Only the
 subtasks still to run are listed. `data.already_done` lists what will not run:
 `{"kind": "story", "id", "title"}` for a story with nothing left, and
@@ -97,8 +105,9 @@ Read the `base` column before a real run:
 
 #### What a clean run leaves behind
 
-Stories run one at a time, level by level, and each story's subtasks run in
-order. Before the first subtask the run does `git fetch origin` once (only when
+Levels run one after another, a level's stories run on up to `--max-concurrent`
+lanes, and each story's subtasks run in order. Before the first subtask the run
+does `git fetch origin` once (only when
 a remote named `origin` exists) and `git worktree prune` once. Each finished
 subtask is `done` on the board, and the rollup moves its story and the
 milestone with it.
@@ -146,7 +155,6 @@ Relaunch the `am run --milestone` command instead.
 
 #### Not there yet
 
-- Stories never run in parallel: one story at a time, even inside a level.
 - There is no Integrate step: nothing merges the story tips into one branch.
 - `am resume` is not milestone-aware.
 - `watch`, `retry` and `cancel` do not exist.
