@@ -31,6 +31,7 @@ from agent_manager import (
     cli,
     dag,
     dispatch,
+    integration,
     models,
     orchestrate,
     paths,
@@ -1052,6 +1053,11 @@ def _plan_story(
     )
 
 
+DRY_RUN_REPO = Path("/repo")
+"""The repo dir the pure dry-run tests pass. `worktree_for` only joins onto it,
+so it need not exist, and the payload is still computed without touching disk."""
+
+
 def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
     """A done story is `already_done` and roots its dependent. A pending story
     lists only its remaining subtasks, and a done first subtask still anchors
@@ -1064,7 +1070,7 @@ def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
         blocked_by=[a.id],
     )
 
-    payload = cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload([a, b], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     def branch(subtask: census.SubtaskPlan) -> str:
         return dag.subtask_branch("m3", subtask)
@@ -1104,6 +1110,14 @@ def test_the_dry_run_payload_lists_remaining_subtasks_on_full_list_bases():
             {"kind": "story", "id": a.id, "title": "story 1"},
             {"kind": "subtask", "id": _plan_id(21), "title": "subtask 21", "story": b.id},
         ],
+        "integrate": {
+            "branch": "m3-integrate",
+            "worktree": "/repo/.claude/worktrees/m3-integrate",
+            "order": [
+                {"story": a.id, "tip": branch(a.subtasks[-1])},
+                {"story": b.id, "tip": branch(b.subtasks[-1])},
+            ],
+        },
     }
 
 
@@ -1112,7 +1126,7 @@ def test_the_dry_run_payload_keeps_census_order_across_and_within_levels():
     b = _plan_story(2, [_plan_subtask(21)])
     c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id])
 
-    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload([a, b, c], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     assert [level["level"] for level in payload["levels"]] == [0, 1]
     assert [[story["story"] for story in level["stories"]] for level in payload["levels"]] == [
@@ -1131,7 +1145,7 @@ def test_the_dry_run_checks_for_blocker_cycles_before_any_geometry():
     b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
 
     with pytest.raises(dag.DependencyCycleError) as caught:
-        cli.dry_run_payload([a, b], branch_prefix="m3", base_branch="main")
+        cli.dry_run_payload([a, b], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
 
@@ -1142,7 +1156,7 @@ def test_the_dry_run_refuses_a_story_with_two_in_milestone_blockers():
     c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
 
     with pytest.raises(dag.StackRootError) as caught:
-        cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+        cli.dry_run_payload([a, b, c], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     assert f"#{a.id}" in str(caught.value)
     assert f"#{b.id}" in str(caught.value)
@@ -1157,7 +1171,10 @@ def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_do
     empty = _plan_story(3, [])
 
     payload = cli.dry_run_payload(
-        [closed, finished, empty], branch_prefix="m3", base_branch="main"
+        [closed, finished, empty],
+        repo_dir=DRY_RUN_REPO,
+        branch_prefix="m3",
+        base_branch="main",
     )
 
     assert payload == {
@@ -1167,6 +1184,38 @@ def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_do
             {"kind": "story", "id": closed.id, "title": "story 1"},
             {"kind": "story", "id": finished.id, "title": "story 2"},
             {"kind": "story", "id": empty.id, "title": "story 3"},
+        ],
+        "integrate": {
+            "branch": "m3-integrate",
+            "worktree": "/repo/.claude/worktrees/m3-integrate",
+            "order": [
+                {"story": closed.id, "tip": dag.subtask_branch("m3", closed.subtasks[-1])},
+                {"story": finished.id, "tip": dag.subtask_branch("m3", finished.subtasks[-1])},
+            ],
+        },
+    }
+
+
+def test_the_dry_run_payload_plans_integrate_over_every_story_in_integrate_order():
+    """Spec test 7. Integrate covers every story, done or not, level by level
+    in census order within a level, and a story with no subtasks has no tip of
+    its own, so it is left out of the order."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    empty = _plan_story(3, [])
+    done = _plan_story(4, [_plan_subtask(41, "done")], status="done")
+
+    payload = cli.dry_run_payload(
+        [b, a, empty, done], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
+
+    assert payload["integrate"] == {
+        "branch": "m3-integrate",
+        "worktree": "/repo/.claude/worktrees/m3-integrate",
+        "order": [
+            {"story": a.id, "tip": dag.subtask_branch("m3", a.subtasks[-1])},
+            {"story": done.id, "tip": dag.subtask_branch("m3", done.subtasks[-1])},
+            {"story": b.id, "tip": dag.subtask_branch("m3", b.subtasks[-1])},
         ],
     }
 
@@ -1190,7 +1239,11 @@ def test_the_dry_run_payload_reports_the_bound_and_each_levels_concurrency(
     """A level runs `min(len(level), bound)` stories together; a bound larger
     than a level reports the level's size, not the bound."""
     payload = cli.dry_run_payload(
-        _three_then_one(), branch_prefix="m3", base_branch="main", max_concurrent=bound
+        _three_then_one(),
+        repo_dir=DRY_RUN_REPO,
+        branch_prefix="m3",
+        base_branch="main",
+        max_concurrent=bound,
     )
 
     assert payload["max_concurrent"] == bound
@@ -1199,7 +1252,7 @@ def test_the_dry_run_payload_reports_the_bound_and_each_levels_concurrency(
 
 
 def test_the_dry_run_payload_defaults_to_four_lanes():
-    payload = cli.dry_run_payload(_three_then_one(), branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload(_three_then_one(), repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     assert payload["max_concurrent"] == 4
     assert [level["concurrent"] for level in payload["levels"]] == [3, 1]
@@ -1212,7 +1265,7 @@ def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
     b = _plan_story(2, [_plan_subtask(21)], blocked_by=["not-in-this-milestone"])
     c = _plan_story(3, [_plan_subtask(31)], blocked_by=["not-in-this-milestone", a.id])
 
-    payload = cli.dry_run_payload([a, b, c], branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload([a, b, c], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
 
     roots = {
         story["story"]: story["root"]
@@ -2376,6 +2429,12 @@ def _forbid_writes(monkeypatch) -> None:
     monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
     monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
     monkeypatch.setattr(cli.board, "set_status", _Forbidden("board.set_status"))
+    # The dry run plans Integrate from `integration`'s pure helpers; the two
+    # names that would write a branch or a worktree must never be reached.
+    monkeypatch.setattr(
+        integration, "integrate_milestone", _Forbidden("integration.integrate_milestone")
+    )
+    monkeypatch.setattr(integration, "merge_tip", _Forbidden("integration.merge_tip"))
 
 
 def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
@@ -2412,7 +2471,7 @@ def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
     assert set(envelope) == {"ok", "data"}
     assert envelope["ok"] is True
     data = envelope["data"]
-    assert set(data) == {"max_concurrent", "levels", "already_done"}
+    assert set(data) == {"max_concurrent", "levels", "already_done", "integrate"}
     assert data["already_done"] == []
     assert [level["level"] for level in data["levels"]] == [0, 1, 2]
     assert [
@@ -2483,6 +2542,41 @@ def test_done_work_is_already_done_and_still_anchors_the_stack(
     (c_row,) = data["levels"][1]["stories"]
     assert c_row["root"] == b_branches[-1]
 
+    _assert_nothing_written(project, porcelain_before)
+    assert board.roots(repo_dir=project) == board_before
+
+
+@requires_git
+@requires_brd
+def test_the_milestone_dry_run_shows_the_integrate_plan_and_writes_nothing(
+    project, milestone_board, monkeypatch
+):
+    """Spec test 8. Story A is already done and still leads the Integrate
+    order: Integrate folds in every story's tip. Nothing is written: no run
+    directory, no `m2-integrate` branch, no worktree, no board change."""
+    stories = milestone_board["stories"]
+    subtasks = milestone_board["subtasks"]
+    for subtask in subtasks["A"]:
+        board.set_status(subtask, "done", repo_dir=project)
+    board.set_status(stories["A"], "done", repo_dir=project)
+    board_before = board.roots(repo_dir=project)
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+    result = _dry_run(project, milestone_board["milestone"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["integrate"] == {
+        "branch": "m2-integrate",
+        "worktree": str(cli.worktree_for(project, "m2-integrate")),
+        "order": [
+            {"story": stories[key], "tip": _m2_branch(project, subtasks[key][-1])}
+            for key in "ABC"
+        ],
+    }
+    assert not cli.worktree_for(project, "m2-integrate").exists()
     _assert_nothing_written(project, porcelain_before)
     assert board.roots(repo_dir=project) == board_before
 
