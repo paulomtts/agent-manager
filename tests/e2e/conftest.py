@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -273,8 +274,78 @@ def milestone_board(fresh_project) -> dict[str, Any]:
     }
 
 
+@dataclass
+class Rendezvous:
+    """Arms and disarms the fake's implement-only rendezvous for one test.
+
+    Env vars go through the test's own function-scoped `monkeypatch`, so they
+    are undone when the test ends. Child processes inherit them: `run_direct`
+    calls `Popen` with no `env=` (`harness/launcher.py:132`).
+    """
+
+    directory: Path
+    monkeypatch: pytest.MonkeyPatch
+
+    def arm(self, count: int) -> Path:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.monkeypatch.setenv(FAKE_RENDEZVOUS_DIR_ENV, str(self.directory))
+        self.monkeypatch.setenv(FAKE_RENDEZVOUS_COUNT_ENV, str(count))
+        return self.directory
+
+    def disarm(self) -> None:
+        self.monkeypatch.delenv(FAKE_RENDEZVOUS_DIR_ENV, raising=False)
+        self.monkeypatch.delenv(FAKE_RENDEZVOUS_COUNT_ENV, raising=False)
+
+    def markers(self) -> list[Path]:
+        """The markers the fake left, one per distinct implement cwd."""
+        if not self.directory.is_dir():
+            return []
+        return sorted(self.directory.iterdir())
+
+
 @pytest.fixture
-def run_milestone_cli(fake_claude_bin) -> Callable[[Path, str], Any]:
+def rendezvous(tmp_path, monkeypatch) -> Rendezvous:
+    """The test's rendezvous, unarmed. Its dir is beside the repo, never inside it."""
+    return Rendezvous(directory=tmp_path / "rendezvous", monkeypatch=monkeypatch)
+
+
+@pytest.fixture
+def parallel_board(fresh_project) -> dict[str, Any]:
+    """One milestone: A (a1 -> a2) and B (b1 -> b2) independent, C (c1) blocked by A.
+
+    Level 0 is A and B, level 1 is C. Subtasks are chained with `brd block`, so
+    the census order does not depend on timestamps. Branch names come from
+    `dag`, never retyped here. `review_fail_marker` is where the fake looks for
+    branches whose review must fail; the test writes it and removes it.
+    """
+    root = fresh_project
+    milestone = _add_card(root, "Milestone 4: parallel stories under a fake claude")
+    a = _add_card(root, "Story A: an independent root story", milestone)
+    b = _add_card(root, "Story B: independent of story A", milestone)
+    c = _add_card(root, "Story C: blocked by story A", milestone, blocked_by=[a])
+    a1 = _add_card(root, "a1: first subtask of story A", a)
+    a2 = _add_card(root, "a2: second subtask of story A", a, blocked_by=[a1])
+    b1 = _add_card(root, "b1: first subtask of story B", b)
+    b2 = _add_card(root, "b2: second subtask of story B", b, blocked_by=[b1])
+    c1 = _add_card(root, "c1: only subtask of story C", c)
+    subtasks = {"A": [a1, a2], "B": [b1, b2], "C": [c1]}
+    branches = {
+        card_id: dag.task_branch(MILESTONE_PREFIX, board.show(card_id, repo_dir=root))
+        for chain in subtasks.values()
+        for card_id in chain
+    }
+    return {
+        "root": root,
+        "milestone": milestone,
+        "stories": {"A": a, "B": b, "C": c},
+        "subtasks": subtasks,
+        "branches": branches,
+        "review_fail_marker": root / ".git" / FAKE_REVIEW_FAIL_MARKER,
+    }
+
+
+@pytest.fixture
+def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
 
     Depends on `fake_claude_bin` so the fake is first on `PATH`: the real
@@ -282,7 +353,7 @@ def run_milestone_cli(fake_claude_bin) -> Callable[[Path, str], Any]:
     """
     runner = CliRunner()
 
-    def invoke(root: Path, milestone: str):
+    def invoke(root: Path, milestone: str, max_concurrent: int | None = None):
         argv = [
             "run",
             "--milestone",
@@ -296,6 +367,9 @@ def run_milestone_cli(fake_claude_bin) -> Callable[[Path, str], Any]:
         ]
         for command in VERIFY_COMMANDS:
             argv += ["--verify", command]
+        # Only when asked: existing callers keep their exact argv.
+        if max_concurrent is not None:
+            argv += ["--max-concurrent", str(max_concurrent)]
         return runner.invoke(cli.app, argv)
 
     return invoke
