@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager.steps.reducers import review_gate
+from agent_manager.steps.integrate import merge_completed_gate
 
 _SOURCE = Path(__file__).with_name("fake_claude.py")
 _spec = importlib.util.spec_from_file_location("e2e_fake_claude", _SOURCE)
@@ -942,3 +943,226 @@ def test_an_unclosed_hunk_is_refused_rather_than_truncated():
         fake_claude.keep_both_sides("<<<<<<< HEAD\nours\n=======\ntheirs\n")
 
     assert "never closed" in str(caught.value)
+
+
+RESOLVE_SCHEMA = {
+    "properties": {
+        "resolved": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "type": "object",
+}
+"""`results.ResolveResult`'s shape, written out for the same reason as
+`IMPLEMENT_SCHEMA`."""
+
+SIDE_BRANCH = "m3/task-b1-00000002"
+CONFLICT_FILES = '[\n  "shared.txt"\n]'
+"""`prompt._inline_json`'s multi-line rendering of `["shared.txt"]`."""
+
+
+def _git_ok(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _merge_head_exists(repo):
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def _conflicted_repo(tmp_path, style="merge"):
+    """A real repo stopped mid-merge: `main` says `ours`, `SIDE_BRANCH` says `theirs`.
+
+    The conflict style is set in the repo's own config, so a developer's global
+    `merge.conflictStyle` cannot change which markers the test sees.
+    """
+    repo = _implement_repo(tmp_path)
+    _git_ok(repo, "config", "merge.conflictStyle", style)
+    (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+    _git_ok(repo, "add", "shared.txt")
+    _git_ok(repo, "commit", "-m", "base line")
+    _git_ok(repo, "checkout", "-b", SIDE_BRANCH)
+    (repo / "shared.txt").write_text("theirs\n", encoding="utf-8")
+    _git_ok(repo, "commit", "-am", "theirs")
+    _git_ok(repo, "checkout", "main")
+    (repo / "shared.txt").write_text("ours\n", encoding="utf-8")
+    _git_ok(repo, "commit", "-am", "ours")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-ff", "--no-edit", SIDE_BRANCH],
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode != 0, merge.stdout  # non-vacuity: a real conflict
+    assert _merge_head_exists(repo)
+    return repo
+
+
+def _resolve_brief_text(tip=SIDE_BRANCH, files=CONFLICT_FILES):
+    """A `resolve` brief shaped like `builtin/integrate.yaml` renders it."""
+    text = (
+        "# Resolver\n\nstanding instructions\n\n"
+        "# phase: resolve\n# role: resolver\n"
+        "\n## branch\nm3-integrate\n"
+        "\n## base_branch\nmain\n"
+    )
+    if tip is not None:
+        text += f"\n## merge_tip\n{tip}\n"
+    if files is not None:
+        text += f"\n## conflict_files\n{files}\n"
+    return text
+
+
+def _resolve(repo, **brief):
+    return fake_claude.build_result(
+        "resolve",
+        fake_claude.payload_from_schema(RESOLVE_SCHEMA),
+        _resolve_brief_text(**brief),
+        repo,
+    )
+
+
+def test_the_resolver_env_var_name_is_pinned():
+    assert fake_claude.RESOLVER_ENV == "FAKE_CLAUDE_RESOLVER"
+    assert fake_claude.RESOLVER_REFUSE == "refuse"
+
+
+@pytest.mark.parametrize("style", ["merge", "diff3", "zdiff3"])
+def test_the_resolver_keeps_both_sides_commits_and_the_real_gate_passes(
+    tmp_path, monkeypatch, style
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path, style)
+
+    payload = _resolve(repo)
+
+    assert payload == {"resolved": True, "summary": fake_claude.SUMMARY}
+    assert (repo / "shared.txt").read_text(encoding="utf-8") == "ours\ntheirs\n"
+    assert not _merge_head_exists(repo)
+    assert _porcelain(repo) == ""
+    parents = _git_ok(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert len(parents) == 3  # a real merge commit: itself plus two parents
+    assert merge_completed_gate(payload, repo) is None
+
+
+def test_an_empty_resolver_env_value_means_resolve(tmp_path, monkeypatch):
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, "")
+    repo = _conflicted_repo(tmp_path)
+
+    _resolve(repo)
+
+    assert not _merge_head_exists(repo)
+
+
+def test_a_refusing_resolver_claims_resolved_but_git_still_says_no(
+    tmp_path, monkeypatch
+):
+    """Addendum I3: `resolved` is advisory. Refuse mode lies, and the production
+    gate, which only asks git, blocks it."""
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, fake_claude.RESOLVER_REFUSE)
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+    head = _head(repo)
+
+    payload = _resolve(repo)
+
+    assert payload == {"resolved": True, "summary": fake_claude.REFUSE_SUMMARY}
+    assert _merge_head_exists(repo)
+    assert (repo / "shared.txt").read_bytes() == before
+    assert b"<<<<<<< " in before
+    assert _head(repo) == head
+    verdict = merge_completed_gate(payload, repo)
+    assert verdict is not None and "MERGE_HEAD" in verdict["detail"]
+
+
+def test_an_unknown_resolver_env_value_fails_the_fake_and_touches_nothing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(fake_claude.RESOLVER_ENV, "refused")
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo)
+
+    assert fake_claude.RESOLVER_ENV in str(caught.value)
+    assert "refused" in str(caught.value)
+    assert _merge_head_exists(repo)
+    assert (repo / "shared.txt").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("missing", "brief"),
+    [("merge_tip", {"tip": None}), ("conflict_files", {"files": None})],
+)
+def test_a_resolve_brief_missing_a_section_fails_the_fake(
+    tmp_path, monkeypatch, missing, brief
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, **brief)
+
+    assert missing in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+@pytest.mark.parametrize(
+    "files", ["not json", '{"shared.txt": 1}', "[1]", '[""]', '"shared.txt"']
+)
+def test_a_malformed_conflict_files_section_fails_the_fake(
+    tmp_path, monkeypatch, files
+):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, files=files)
+
+    assert "conflict_files" in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+def test_a_merge_tip_that_is_not_merge_head_fails_the_fake(tmp_path, monkeypatch):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, tip="main")
+
+    assert "MERGE_HEAD" in str(caught.value)
+    assert _merge_head_exists(repo)
+
+
+def test_a_resolve_with_no_merge_in_progress_fails_the_fake(tmp_path, monkeypatch):
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _implement_repo(tmp_path)
+    _git_ok(repo, "branch", SIDE_BRANCH)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo)
+
+    assert "MERGE_HEAD" in str(caught.value)
+
+
+def test_a_listed_conflict_file_that_is_not_there_fails_before_any_write(
+    tmp_path, monkeypatch
+):
+    """Review focus: nothing is rewritten or committed if one path is wrong."""
+    monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
+    repo = _conflicted_repo(tmp_path)
+    before = (repo / "shared.txt").read_bytes()
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _resolve(repo, files='["shared.txt", "missing.txt"]')
+
+    assert "missing.txt" in str(caught.value)
+    assert (repo / "shared.txt").read_bytes() == before
+    assert _merge_head_exists(repo)

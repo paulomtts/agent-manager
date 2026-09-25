@@ -23,6 +23,11 @@ from agent_manager import cli, models, store
 INTEGRATION_BRANCH = "m3-integrate"
 """`integration.integration_branch` for the conftest's `m3` prefix."""
 
+SHARED = "shared.txt"
+BASE_LINE = "the line both stories rewrite\n"
+A_LINE = "story A rewrote this line\n"
+B_LINE = "story B rewrote this line\n"
+
 
 def _git(cwd: Path, *args: str) -> str:
     completed = subprocess.run(
@@ -112,6 +117,13 @@ def _assert_base_untouched(root: Path, main_before: str) -> None:
     assert _git(root, "for-each-ref", "refs/remotes").strip() == ""
 
 
+def _same_line_setup(board: dict) -> str:
+    """Seed `shared.txt` on main; A and B each rewrite its one line differently."""
+    main_before = _seed(board["root"], {SHARED: BASE_LINE})
+    _write_edits(board, {"A": {SHARED: A_LINE}, "B": {SHARED: B_LINE}})
+    return main_before
+
+
 def test_this_module_runs_in_the_default_suite_unmarked(request):
     """No `e2e` marker may reach this module, or Integrate stops being checked
     on every `uv run pytest`."""
@@ -155,4 +167,52 @@ def test_stories_that_touch_different_files_integrate_with_no_resolver(
     assert "resolve" not in _all_phase_names(run)
 
     assert not _merge_in_progress(_integration_worktree(root))
+    _assert_base_untouched(root, main_before)
+
+
+def test_a_same_line_conflict_is_resolved_verified_and_left_on_the_integration_branch(
+    two_story_board, run_milestone_cli, read_fake_log
+):
+    """Scenario 1: B's merge conflicts with A's; the resolver keeps both sides."""
+    root = two_story_board["root"]
+    stories = two_story_board["stories"]
+    subtasks = two_story_board["subtasks"]
+    branches = two_story_board["branches"]
+    main_before = _same_line_setup(two_story_board)
+    worktree = _integration_worktree(root)
+
+    result = run_milestone_cli(root, two_story_board["milestone"])
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["done"] is True, data
+    assert data["integrated"] == {
+        "branch": INTEGRATION_BRANCH,
+        "worktree": str(worktree),
+        "merged": [stories["A"], stories["B"]],
+        "resolved": [stories["B"]],
+    }
+    # Both edits, ours (A, merged first) then theirs (B), and no markers.
+    assert (worktree / SHARED).read_text(encoding="utf-8") == A_LINE + B_LINE
+    assert _git(root, "show", f"{INTEGRATION_BRANCH}:{SHARED}") == A_LINE + B_LINE
+    assert not _merge_in_progress(worktree)
+    assert _git(worktree, "status", "--porcelain") == ""
+    for key in ("A", "B"):
+        assert _is_ancestor(root, branches[subtasks[key][0]], INTEGRATION_BRANCH), key
+
+    resolves = [entry for entry in read_fake_log(data["run_id"]) if entry["phase"] == "resolve"]
+    assert len(resolves) == 1, resolves
+    assert Path(resolves[0]["cwd"]).resolve() == worktree.resolve()
+
+    # `done` only after the integrate workflow's own verify phase passed.
+    run = _load_run(root, data["run_id"])
+    assert run.status == "done"
+    (integrate_story,) = [story for story in run.stories if story.card_id == "integrate"]
+    assert integrate_story.title == "Integrate"
+    assert integrate_story.status == "done"
+    (resolver_row,) = integrate_story.subtasks
+    assert resolver_row.card_id == stories["B"]
+    assert [phase.name for phase in resolver_row.phases] == ["resolve", "verify"]
+    assert {phase.status for phase in resolver_row.phases} == {"done"}
+
     _assert_base_untouched(root, main_before)
