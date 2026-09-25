@@ -93,6 +93,20 @@ def _says_already_up_to_date(output: str) -> bool:
     return "already up to date" in output.lower().replace("-", " ")
 
 
+def _unmerged_files(git_runner: GitRunner, worktree_path: str) -> list[str]:
+    """The paths git holds as unmerged in `worktree_path`, in git's order."""
+    out = git_runner(["-C", worktree_path, "diff", "--name-only", "--diff-filter=U"])
+    return [line.strip() for line in out.split("\n") if line.strip()]
+
+
+def _first_line(text: str) -> str:
+    """The first non-blank line of `text`, stripped, or "" when there is none."""
+    for line in text.split("\n"):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
 def merge_tip(
     repo_dir: str | Path,
     worktree: str | Path,
@@ -104,9 +118,10 @@ def merge_tip(
     """Merge `tip` into `integration_branch`'s worktree with `--no-ff`, and report it.
 
     A tip already contained in HEAD is a no-op, so a relaunch never
-    re-merges. The return value is the deterministic phase's result -- a
-    plain dict, since it crosses no process boundary and so needs no Pydantic
-    model (`CLAUDE.md`).
+    re-merges. A content conflict is left in progress and reported with its
+    files; any other git failure raises. The return value is the
+    deterministic phase's result -- a plain dict, since it crosses no process
+    boundary and so needs no Pydantic model (`CLAUDE.md`).
     """
     tip = _required_tip(tip)
     integration_branch = _required_name(integration_branch, "integration_branch")
@@ -120,8 +135,24 @@ def merge_tip(
     if _already_contains(git_runner, worktree_path, tip):
         return _result(created=created, merged=tip, already_merged=True)
 
-    # --no-edit: take git's generated message; never wait on an editor.
-    output = git_runner(["-C", worktree_path, "merge", "--no-ff", "--no-edit", tip])
+    try:
+        # --no-edit: take git's generated message; never wait on an editor.
+        output = git_runner(
+            ["-C", worktree_path, "merge", "--no-ff", "--no-edit", tip]
+        )
+    except GitError as error:
+        files = _unmerged_files(git_runner, worktree_path)
+        if not files:
+            raise
+        # Left in progress on purpose: MERGE_HEAD and the markers are what a
+        # resolver works from. Never `merge --abort`.
+        return _result(
+            created=created,
+            conflict=True,
+            files=files,
+            detail=_first_line(error.message),
+        )
+
     if _says_already_up_to_date(output):
         return _result(created=created, merged=tip, already_merged=True)
     return _result(created=created, merged=tip)

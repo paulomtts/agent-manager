@@ -405,3 +405,84 @@ def test_git_saying_already_up_to_date_is_also_the_no_op(
     assert result["conflict"] is False
     assert _head(wt) == head
     assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_conflict_is_reported_and_left_in_progress(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    tip_b = _make_tip(repo, tmp_path, "m5/story-b", {"a.js": "from story b\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+    head = _head(wt)
+
+    calls: list[list[str]] = []
+    result = _merge(repo, wt, "m5/story-b", _recorder(calls))
+
+    assert result["conflict"] is True
+    assert result["files"] == ["a.js"]
+    assert result["merged"] is None
+    assert result["already_merged"] is False
+    assert result["created"] is False
+    assert result["detail"].strip() != ""
+    assert "\n" not in result["detail"]
+    # Left in progress for a resolver: never aborted, never reset.
+    assert _merge_head(wt) == tip_b
+    assert "<<<<<<<" in (wt / "a.js").read_text()
+    assert _head(wt) == head
+    assert not any("--abort" in argv for argv in calls)
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_conflict_across_several_files_lists_them_all(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "a from a\n", "b.js": "b from a\n"})
+    _make_tip(repo, tmp_path, "m5/story-b", {"a.js": "a from b\n", "b.js": "b from b\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+
+    result = _merge(repo, wt, "m5/story-b")
+
+    assert result["conflict"] is True
+    assert result["files"] == ["a.js", "b.js"]
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_a_bad_tip_ref_raises_rather_than_reporting_a_conflict(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    before = _base_state(repo)
+
+    with pytest.raises(GitError) as excinfo:
+        _merge(repo, wt, "m5/no-such-story")
+
+    assert excinfo.value.exit_code not in (None, 0, 1)
+    assert _merge_head(wt) is None
+    assert _base_state(repo) == before
+
+
+@requires_git
+def test_local_edits_the_merge_would_overwrite_raise_and_survive(
+    repo: Path, wt: Path, tmp_path: Path
+):
+    # git refuses the merge but leaves no unmerged paths: that is a failure to
+    # re-raise, not a conflict to hand to a resolver.
+    _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
+    _make_tip(repo, tmp_path, "m5/story-c", {"b.js": "from story c\n"})
+    before = _base_state(repo)
+    _merge(repo, wt, "m5/story-a")
+    head = _head(wt)
+    (wt / "b.js").write_text("uncommitted edit\n")
+
+    with pytest.raises(GitError) as excinfo:
+        _merge(repo, wt, "m5/story-c")
+
+    assert "merge" in excinfo.value.argv
+    assert (wt / "b.js").read_text() == "uncommitted edit\n"
+    assert _merge_head(wt) is None
+    assert _head(wt) == head
+    assert _base_state(repo) == before
