@@ -830,6 +830,12 @@ def run_card(
         store.close()
 
 
+DEFAULT_MAX_CONCURRENT = 4
+"""How many of a level's stories a milestone run drives at once when
+`--max-concurrent` is not given (main spec section 11, addendum P1). It matches
+`models.RunConfig.max_concurrent_stories`'s default."""
+
+
 def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, str]]:
     """Everything in the census that never enters a dispatch level, in census order.
 
@@ -937,14 +943,24 @@ should crash loudly with its stack intact.
 """
 
 
-def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--dry-run` combination as a usage error.
+def _check_run_targets(
+    *,
+    card: str | None,
+    milestone: str | None,
+    dry_run: bool,
+    max_concurrent: int | None = None,
+) -> None:
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
     or dispatched. A blank `--milestone` is refused here too: the census strips
     the needle, and an empty needle is a substring of every title, so on a
     one-milestone board it would silently pick that milestone.
+    `--max-concurrent` is `None` when not given, so giving it with `--card` is
+    refused whatever its value, the default included. The Option has no
+    `min=1`, so a value below 1 is refused here, worded and routed like every
+    other run-target refusal.
     """
     if card is not None and milestone is not None:
         raise typer.BadParameter(
@@ -966,6 +982,16 @@ def _check_run_targets(*, card: str | None, milestone: str | None, dry_run: bool
             "--dry-run previews a milestone and does not apply to --card",
             param_hint="'--dry-run'",
         )
+    if max_concurrent is not None and max_concurrent < 1:
+        raise typer.BadParameter(
+            f"--max-concurrent must be at least 1, got {max_concurrent}",
+            param_hint="'--max-concurrent'",
+        )
+    if card is not None and max_concurrent is not None:
+        raise typer.BadParameter(
+            "--max-concurrent applies only to --milestone",
+            param_hint="'--max-concurrent'",
+        )
 
 
 @app.command("run")
@@ -985,6 +1011,14 @@ def run(
         False,
         "--dry-run",
         help="With --milestone: print the levels and stack bases, and write nothing.",
+    ),
+    max_concurrent: int | None = typer.Option(
+        None,
+        "--max-concurrent",
+        help=(
+            "With --milestone: how many of a level's stories run at once "
+            f"(default {DEFAULT_MAX_CONCURRENT}). 1 runs them one at a time."
+        ),
     ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
@@ -1013,7 +1047,10 @@ def run(
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
-    _check_run_targets(card=card, milestone=milestone, dry_run=dry_run)
+    _check_run_targets(
+        card=card, milestone=milestone, dry_run=dry_run, max_concurrent=max_concurrent
+    )
+    lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
         if milestone is not None and dry_run:
             payload = dry_run_milestone(
@@ -1038,6 +1075,7 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
             )
         else:
             payload = run_card(

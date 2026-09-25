@@ -2627,6 +2627,11 @@ SOME_CARD = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
         (["--card", SOME_CARD, "--dry-run"], "previews"),
         (["--milestone", "", "--dry-run"], "blank"),
         (["--milestone", "   ", "--dry-run"], "blank"),
+        (["--milestone", "2", "--max-concurrent", "0"], "least"),
+        (["--milestone", "2", "--max-concurrent=-1"], "least"),
+        (["--milestone", "2", "--dry-run", "--max-concurrent", "0"], "least"),
+        (["--card", SOME_CARD, "--max-concurrent", "2"], "only"),
+        (["--card", SOME_CARD, "--max-concurrent", "4"], "only"),
     ],
 )
 def test_bad_run_targets_are_usage_errors_that_start_nothing(
@@ -2638,6 +2643,7 @@ def test_bad_run_targets_are_usage_errors_that_start_nothing(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _forbid_writes(monkeypatch)
     monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
 
     result = runner.invoke(
         cli.app,
@@ -2740,9 +2746,33 @@ def test_a_milestone_run_calls_run_milestone_once_with_the_run_options(
                 "branch_prefix": "m3",
                 "commands": ["uv run pytest", "uv run ruff check"],
                 "allow_no_verification": True,
+                "max_concurrent": 4,
             },
         )
     ]
+
+
+@pytest.mark.parametrize("given, passed", [("2", 2), ("1", 1), ("4", 4)])
+def test_an_explicit_max_concurrent_reaches_run_milestone(
+    tmp_path, monkeypatch, given, passed
+):
+    """P1: the flag's value is what `run_milestone` gets, and `1` is passed as
+    `1`, so `--max-concurrent 1` is the sequential runner."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_milestone(monkeypatch, CLEAN_MILESTONE)
+
+    result = _milestone_run(tmp_path, "--max-concurrent", given)
+
+    assert result.exit_code == 0, result.output
+    ((_, kwargs),) = calls
+    assert kwargs["max_concurrent"] == passed
+
+
+def test_the_cli_default_lane_count_is_the_models_default():
+    """Review focus: the flag's default and the recorded model default are the
+    same number, so a run with no flag records what it ran with."""
+    assert cli.DEFAULT_MAX_CONCURRENT == 4
+    assert models.RunConfig().max_concurrent_stories == cli.DEFAULT_MAX_CONCURRENT
 
 
 def test_a_milestone_run_without_verify_passes_an_empty_list_and_no_opt_out(
