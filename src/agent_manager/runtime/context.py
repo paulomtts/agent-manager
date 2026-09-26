@@ -18,6 +18,8 @@ from typing import Any
 from pydantic import BaseModel
 from pygents import ContextItem, ContextPool, ContextQueue
 
+from agent_manager.engine import RESERVED_CONTEXT_KEYS
+
 SUBTASK = "subtask"
 SKIPPED = "skipped"
 
@@ -65,10 +67,18 @@ def seed_item(binding: Mapping[str, Any]) -> ContextItem:
 
 
 def binding_table(pool: ContextPool, memory: ContextQueue, phase: str) -> dict[str, Any]:
+    """The seed, every phase result, and this phase's feedback, as one table.
+
+    A result pooled under a reserved key -- the shipped `task` workflow's
+    `worktree` phase is one -- stays in the pool, so the summary still reports
+    it, but never replaces the engine's own value in the table: the pygents
+    twin of `engine._bind_result`.
+    """
     table: dict[str, Any] = dict(decode(pool.get(SUBTASK).content))
     for item in pool.items:
-        if item.id not in (SUBTASK, SKIPPED):
-            table[item.id] = decode(item.content)
+        if item.id in (SUBTASK, SKIPPED) or item.id in RESERVED_CONTEXT_KEYS:
+            continue
+        table[item.id] = decode(item.content)
     table["feedback"] = [
         dict(i.content)
         for i in memory.items
