@@ -16,9 +16,10 @@ import pytest
 from pygents import Agent, Turn, tool
 
 from agent_manager import models, store as store_module
+from agent_manager.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
-from agent_manager.workflow.phases import Step, Workflow
+from agent_manager.workflow.phases import AgentPhase, Step, Workflow
 
 RUN_ID = "run-2026-09-26-02"
 STORY_ID = "a6c7bff3"
@@ -230,3 +231,23 @@ def test_a_checkpoint_never_reads_the_injected_clock(store):
     assert summary.status == "done"
     assert len(calls) == 6
     assert len(_rows(store)) >= 3
+
+
+
+def test_an_engine_error_writes_no_after_run_row(store):
+    """A wiring bug (`old.EngineError`, here an agent phase with no agent
+    runner injected) is raised to the caller, not escalated: the `turn` row
+    written before the phase stays the newest, and no `escalated` or `done`
+    row follows it."""
+    with pytest.raises(EngineError) as caught:
+        runtime_engine.run_subtask(
+            Workflow("miswired", (AgentPhase("explore", "explorer", (), None),)),
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            clock=lambda: FIXED,
+        )
+
+    assert caught.value.phase == "explore"
+    assert [(seq, reason) for seq, reason, _ in _rows(store)] == [(0, "turn")]
