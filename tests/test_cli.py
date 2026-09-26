@@ -4399,3 +4399,34 @@ def test_resume_launches_no_harness(project, cards, monkeypatch):
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
 
     assert payload["status"] == "done"
+
+
+@pytest.mark.parametrize("command", [["run", "--card", "cbe34d00"], ["resume", "any-run"]])
+@pytest.mark.parametrize("value", ["yaml", "pygents"])
+def test_the_removed_engine_flag_is_a_usage_error_that_starts_nothing(
+    tmp_path, monkeypatch, command, value
+):
+    """Card 7a744199: `--engine` is gone from `run` and `resume`, so a script
+    still passing it gets Typer's own exit 2, never an envelope, and nothing is
+    driven or written."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+
+    result = runner.invoke(
+        cli.app, [*command, "--repo-dir", str(tmp_path), "--engine", value]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert "--engine" in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+def test_the_help_offers_no_engine_flag(command):
+    result = runner.invoke(cli.app, [command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--engine" not in result.output
