@@ -30,6 +30,12 @@ if TYPE_CHECKING:
     from agent_manager.store import Checkpoint
 
 
+class CheckpointMismatch(Exception):
+    """A checkpoint saved under another version of the workflow: its digest is
+    not the digest of the workflow asked to resume it. Raised before any agent
+    is built, so nothing is run or recorded."""
+
+
 def run_subtask(
     workflow: Workflow,
     store: Any,
@@ -125,6 +131,16 @@ async def _drive(
             tags=["subtask"],
         )
     else:
+        digest = workflow.digest()
+        if resume_from.digest != digest:
+            raise CheckpointMismatch(
+                f"checkpoint {resume_from.card_id}#{resume_from.seq} was saved under "
+                f"digest {resume_from.digest}, but workflow {workflow.name!r} "
+                f"has digest {digest}"
+            )
+        # A run that died before its `finally` may have left its agent
+        # registered under this name; `from_dict` would be refused it.
+        _forget(resume_from.agent["name"])
         # The pool (seed, earlier results) and the queue (pending turn, loop
         # count) come from the checkpoint: no seed item, no first turn.
         agent = Agent.from_dict(resume_from.agent)

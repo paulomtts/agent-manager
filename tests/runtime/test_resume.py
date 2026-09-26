@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pygents import AgentRegistry, ToolRegistry
+from pygents import Agent, AgentRegistry, ToolRegistry
 
 from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
@@ -309,3 +309,68 @@ def test_a_resume_with_the_stop_still_set_parks_again(store):
     newest = store.latest_checkpoint(CARD_ID)
     assert (newest.seq, newest.reason) == (parked.seq + 1, "parked")
     assert _head(newest.agent) == "b"
+
+
+def _extra(card: str) -> dict[str, Any]:
+    return {"f": "F"}
+
+
+def test_a_changed_workflow_is_refused(store):
+    ran: list[str] = []
+    wf = _five(ran, set())
+    _go(wf, store, should_stop=lambda: ran == ["a"])
+    parked = store.latest_checkpoint(CARD_ID)
+    changed = Workflow("five", wf.phases + (Step("f", _extra),))
+    assert changed.digest() != wf.digest()
+    rows_before = _reasons(store)
+    journal_before = len(store.journal.read())
+
+    with pytest.raises(runtime_engine.CheckpointMismatch) as caught:
+        _go(changed, store, resume_from=parked)
+
+    assert isinstance(caught.value, Exception)
+    assert parked.digest in str(caught.value)
+    assert changed.digest() in str(caught.value)
+    assert ran == ["a"]
+    assert _reasons(store) == rows_before
+    assert len(store.journal.read()) == journal_before
+
+
+def test_a_refused_resume_leaves_the_card_runnable(store):
+    # Review Focus 3: the refusal comes before any agent is registered, so a
+    # fresh run of the same card in the same process is not refused a name.
+    ran: list[str] = []
+    wf = _five(ran, set())
+    _go(wf, store, should_stop=lambda: ran == ["a"])
+    parked = store.latest_checkpoint(CARD_ID)
+    changed = Workflow("five", wf.phases + (Step("f", _extra),))
+
+    with pytest.raises(runtime_engine.CheckpointMismatch):
+        _go(changed, store, resume_from=parked)
+
+    assert parked.agent["name"] not in AgentRegistry._registry
+    ran.clear()
+    summary = _go(changed, store)
+
+    assert ran == ["a", "b", "c", "d", "e"]
+    assert summary.status == "done"
+    assert summary.results == {**ALL_RESULTS, "f": {"f": "F"}}
+
+
+def test_a_stale_registry_entry_does_not_block_a_resume(store):
+    # Review Focus 2: a process that died before its `finally` left the agent
+    # registered under the checkpointed name.
+    ran: list[str] = []
+    wf = _five(ran, {"c"})
+    with pytest.raises(_Crash):
+        _go(wf, store)
+    crashed = store.latest_checkpoint(CARD_ID)
+    Agent(crashed.agent["name"], "left behind by a dead run", [])
+
+    ran.clear()
+    summary = _go(wf, store, resume_from=crashed)
+
+    assert ran == ["c", "d", "e"]
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS
+    assert crashed.agent["name"] not in AgentRegistry._registry
