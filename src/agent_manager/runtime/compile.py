@@ -29,7 +29,7 @@ from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
 from agent_manager import engine as old_engine
 from agent_manager import prompt
-from agent_manager.errors import AgentPhaseFailed
+from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.runtime import bridge, context
 from agent_manager.runtime.state import current_run
 from agent_manager.workflow.phases import AgentPhase, Workflow
@@ -105,6 +105,12 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
     async def agent_phase(phase: str, loop: int, pool: ContextPool, memory: ContextQueue):
         deps = current_run.get()
         p = deps.workflow.phase(phase)
+        if deps.agent_runner is None:
+            # A wiring bug, not a phase failure: raised as the old engine raises
+            # it, before anything runs, rather than escalated as a TypeError.
+            raise EngineError(
+                "is an agent phase, but no agent runner was injected", phase=phase
+            )
         table = context.binding_table(pool, memory, phase)
         # Outside the try, as in the old engine: an input no resolver provides
         # is a workflow bug and its `EngineError` must reach the caller as is.

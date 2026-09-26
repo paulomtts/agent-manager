@@ -354,3 +354,16 @@ async def test_on_fail_loops_back_with_feedback_then_escalates_when_loops_run_ou
     ]
     assert info.value.phase == "review"
     assert info.value.detail == "blocker 4"
+
+
+async def test_an_agent_phase_with_no_runner_injected_raises_the_old_engines_error(store):
+    # A missing runner is a wiring bug, not a phase failure: the old engine
+    # raises it to the caller before anything runs, and so must the tool.
+    wf = Workflow("t", (AgentPhase("review", "critic", (), None),))
+
+    with pytest.raises(EngineError) as info:
+        await _drive(wf, _deps(wf, store, runner=None))
+
+    assert str(info.value) == (
+        "phase 'review': is an agent phase, but no agent runner was injected"
+    )
