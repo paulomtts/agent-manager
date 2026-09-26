@@ -11,11 +11,13 @@ run in the default `uv run pytest` suite.
 writes nowhere real.
 """
 
+import dataclasses
 import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -1726,3 +1728,190 @@ def test_a_stopped_run_survives_a_rebuild_from_the_journal(repo):
     assert _stopped_levels(returned) == ("stopped", "stopped", "stopped", "stopped")
     assert after == returned
     assert row["status"] == "stopped"
+
+
+# -- checkpoints ---------------------------------------------------------------
+#
+# A row-only table outside the journal (pygents-engine spec §6). Steps tier:
+# real temp DB and journal, no harness, not engine-parametrised.
+
+OTHER_RUN_ID = "run-2026-09-24-01"
+
+
+def _at(minute: int) -> datetime:
+    return datetime(2026, 9, 25, 12, minute, tzinfo=timezone.utc)
+
+
+def _save_checkpoint(
+    st: store.Store,
+    card_id: str = "ef248597",
+    *,
+    reason: str = "turn",
+    workflow: str = "task",
+    digest: str = "sha256:aaa",
+    agent: dict | None = None,
+    saved_at: datetime | None = None,
+) -> store.Checkpoint:
+    return st.save_checkpoint(
+        card_id,
+        workflow=workflow,
+        digest=digest,
+        reason=reason,
+        agent={"turn": 0} if agent is None else agent,
+        saved_at=_at(0) if saved_at is None else saved_at,
+    )
+
+
+def test_open_db_creates_the_checkpoints_table(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        ]
+    finally:
+        conn.close()
+    assert columns == [
+        "run_id",
+        "card_id",
+        "seq",
+        "workflow",
+        "digest",
+        "reason",
+        "agent",
+        "saved_at",
+    ]
+
+
+def test_save_checkpoint_numbers_each_cards_rows_from_zero(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        seqs = [_save_checkpoint(st, "card-a", saved_at=_at(i)).seq for i in range(3)]
+        other = _save_checkpoint(st, "card-b", saved_at=_at(3))
+        rows = st.connection.execute(
+            "SELECT run_id, card_id, seq FROM checkpoints ORDER BY card_id, seq"
+        ).fetchall()
+    finally:
+        st.close()
+
+    assert seqs == [0, 1, 2]
+    assert other.seq == 0
+    assert other.run_id == RUN_ID
+    assert [tuple(row) for row in rows] == [
+        (RUN_ID, "card-a", 0),
+        (RUN_ID, "card-a", 1),
+        (RUN_ID, "card-a", 2),
+        (RUN_ID, "card-b", 0),
+    ]
+
+
+def test_latest_checkpoint_is_the_highest_seq_of_this_stores_run(repo):
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        for i in range(5):
+            _save_checkpoint(other, "card-a", digest="sha256:other", saved_at=_at(i))
+    finally:
+        other.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(10))
+        newest = _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(11))
+        latest = st.latest_checkpoint("card-a")
+        unknown = st.latest_checkpoint("card-never-saved")
+    finally:
+        st.close()
+
+    assert latest == newest
+    assert latest is not None
+    assert latest.run_id == RUN_ID
+    assert latest.seq == 1
+    assert latest.reason == "parked"
+    assert latest.digest == "sha256:aaa"
+    assert latest.saved_at == _at(11)
+    assert unknown is None
+
+
+def test_a_checkpoint_with_an_unknown_reason_is_refused_and_writes_nothing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _save_checkpoint(st, "card-a", reason="bogus")
+
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.in_transaction is False
+        assert st.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+        # The refused save spent no seq.
+        assert _save_checkpoint(st, "card-a").seq == 0
+    finally:
+        st.close()
+
+
+def test_a_checkpoint_whose_agent_is_not_json_is_refused_and_writes_nothing(repo):
+    # Review Focus 4: the agent dict is encoded before anything is written.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(TypeError):
+            _save_checkpoint(st, "card-a", agent={"when": _at(0)})
+
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+        assert _save_checkpoint(st, "card-a").seq == 0
+    finally:
+        st.close()
+
+
+def test_a_checkpoints_agent_round_trips_byte_equal(repo):
+    agent = {
+        "zeta": [3, {"b": 2, "a": 1}],
+        "alpha": {"nested": {"y": None, "x": "é"}},
+        "count": 7,
+    }
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        saved = _save_checkpoint(st, "card-a", agent=agent)
+        stored = st.connection.execute(
+            "SELECT agent FROM checkpoints WHERE run_id = ? AND card_id = ?",
+            (RUN_ID, "card-a"),
+        ).fetchone()["agent"]
+        read = st.latest_checkpoint("card-a")
+    finally:
+        st.close()
+
+    assert stored == json.dumps(agent, sort_keys=True)
+    assert json.dumps(saved.agent, sort_keys=True) == stored
+    assert read is not None
+    assert json.dumps(read.agent, sort_keys=True) == stored
+    assert read.agent == agent
+    assert read == saved
+
+    # Review Focus 5: the returned value is not aliased to the caller's dict.
+    agent["count"] = 8
+    assert saved.agent["count"] == 7
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        saved.seq = 9  # type: ignore[misc]
+
+
+def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
+    # G10: checkpoints are not part of the journaled tree.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        before = [line.seq for line in st.journal.read()]
+        saved = _save_checkpoint(st, "ef248597", reason="parked")
+        after = [line.seq for line in st.journal.read()]
+        st.rebuild_from_journal(RUN_ID)
+        kept = st.latest_checkpoint("ef248597")
+    finally:
+        st.close()
+
+    assert after == before
+    assert kept == saved
+    assert set(get_args(store.EventKind)) == {
+        "run_upsert",
+        "story_upsert",
+        "subtask_upsert",
+        "phase_upsert",
+        "attempt_upsert",
+    }
