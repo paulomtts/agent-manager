@@ -29,6 +29,8 @@ This module is pure: no I/O, no subprocesses, no ``brd``.
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal
 
 from agent_manager.census import StoryPlan, SubtaskPlan
 
@@ -244,6 +246,24 @@ class StackRootError(ValueError):
     """
 
 
+@dataclass(frozen=True)
+class RootPlan:
+    """Where a story's stack starts, and why.
+
+    ``kind`` is ``"base"`` when the story has no in-milestone blocker
+    (``branch`` is the milestone's base branch), ``"tip"`` when it has exactly
+    one (``branch`` is that blocker's tip), and ``"merged"`` when it has two or
+    more (``branch`` is the story's own ``base_branch_name``, which a later
+    card builds by merging the blockers' tips). ``blockers`` are the
+    in-milestone blockers, de-duplicated, in the order the story's
+    ``blocked_by`` lists them. Internal state, so a dataclass (CLAUDE.md).
+    """
+
+    kind: Literal["base", "tip", "merged"]
+    branch: str
+    blockers: tuple[str, ...]
+
+
 def subtask_branch(prefix: str, subtask: SubtaskPlan) -> str:
     """The branch a subtask's work lives on: exactly ``task_branch``.
 
@@ -254,6 +274,15 @@ def subtask_branch(prefix: str, subtask: SubtaskPlan) -> str:
     the prefix is part of the milestone's identity, full stop.
     """
     return task_branch(prefix, subtask)
+
+
+def base_branch_name(prefix: str, story: StoryPlan) -> str:
+    """The branch a multi-blocker story's merged base lives on.
+
+    Keyed on the story's short id like every derived name, so a title edit
+    cannot orphan it; ``short_id`` refuses anything that is not a card id.
+    """
+    return f"{prefix}/base-{short_id(story.id)}"
 
 
 def story_tip(

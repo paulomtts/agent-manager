@@ -1,10 +1,14 @@
+import dataclasses
+
 import pytest
 
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
     DependencyCycleError,
+    RootPlan,
     StackRootError,
     assert_no_blocker_cycles,
+    base_branch_name,
     compute_integrate_levels,
     compute_levels,
     is_story_closed,
@@ -363,6 +367,34 @@ def _gsub(title: str, hex8: str, status: str = "todo") -> SubtaskPlan:
 
 def _by_id(*stories: StoryPlan) -> dict[str, StoryPlan]:
     return {story.id: story for story in stories}
+
+
+def _story_id(n: int) -> str:
+    """A UUID-shaped STORY id whose short id is ``n`` in eight hex digits.
+
+    ``base_branch_name`` goes through ``short_id``, which refuses the letter
+    ids ``_story`` uses elsewhere, so a story that roots on a merged base needs
+    a real-shaped id of its own. Distinct from ``_gsub``'s subtask ids.
+    """
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def test_base_branch_name_is_the_prefix_then_base_then_the_short_id():
+    c = _story(_story_id(0xC), subtasks=[])
+    assert base_branch_name(PREFIX, c) == "m3/base-0000000c"
+    assert base_branch_name(PREFIX, c) == f"{PREFIX}/base-{short_id(c.id)}"
+
+
+def test_base_branch_name_refuses_a_story_whose_id_is_not_a_card_id():
+    with pytest.raises(ValueError, match="not a card id"):
+        base_branch_name(PREFIX, _story("c", subtasks=[]))
+
+
+def test_a_root_plan_is_frozen_and_compares_by_value():
+    root = RootPlan(kind="base", branch="main", blockers=())
+    assert root == RootPlan("base", "main", ())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        root.branch = "other"  # type: ignore[misc]
 
 
 def test_subtask_branch_is_task_branch_so_names_have_one_source():
