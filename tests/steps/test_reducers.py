@@ -20,6 +20,7 @@ from agent_manager.steps.reducers import (
     plan_hash_gate,
     plan_hash_gate_adapter,
     plan_hash_mismatch,
+    review_blockers_gate,
     review_gate,
     verification_gate,
     verification_passed_gate,
@@ -824,3 +825,58 @@ def test_the_plan_hash_adapter_binds_with_no_arguments_at_all():
     """Both parameters default to None so a run that skipped `implement` binds
     and passes, instead of `bind_arguments` reporting a required parameter."""
     assert plan_hash_gate_adapter() is None
+
+
+# ── review_blockers_gate ─────────────────────────────────────────────────────
+# task.js:842-855: only what the reviewer says is STILL standing gates done.
+
+
+def test_no_unresolved_blockers_passes():
+    assert review_blockers_gate({"unresolved_blockers": []}) is None
+
+
+def test_unresolved_blockers_block_review():
+    verdict = review_blockers_gate(
+        {"unresolved_blockers": ["tests assert the mock", "no error path"]}
+    )
+    assert verdict == {
+        "blocked": "review",
+        "detail": "review left 2 unresolved blocker(s): tests assert the mock; no error path",
+    }
+
+
+def test_a_dead_reviewer_blocks():
+    assert review_blockers_gate(None) == {
+        "blocked": "review",
+        "detail": "the review stage returned nothing",
+    }
+
+
+@pytest.mark.parametrize("dead", [["x"], "x", 7, True])
+def test_any_non_mapping_review_result_is_the_dead_reviewer_verdict(dead):
+    assert review_blockers_gate(dead) == {
+        "blocked": "review",
+        "detail": "the review stage returned nothing",
+    }
+
+
+@pytest.mark.parametrize("clean", [{}, {"unresolved_blockers": None}, {"findings": ["x"]}])
+def test_a_review_with_no_blockers_key_or_a_null_one_passes(clean):
+    # Findings the reviewer already fixed are not blockers: only
+    # `unresolved_blockers` gates.
+    assert review_blockers_gate(clean) is None
+
+
+def test_a_single_blocker_is_counted_and_named():
+    assert review_blockers_gate({"unresolved_blockers": ["x"]}) == {
+        "blocked": "review",
+        "detail": "review left 1 unresolved blocker(s): x",
+    }
+
+
+def test_non_string_blockers_are_rendered_not_raised_on():
+    verdict = review_blockers_gate({"unresolved_blockers": [1, {"a": 1}]})
+    assert verdict == {
+        "blocked": "review",
+        "detail": "review left 2 unresolved blocker(s): 1; {'a': 1}",
+    }
