@@ -29,6 +29,7 @@ from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
 from agent_manager import engine as old_engine
 from agent_manager import prompt
+from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import bridge, context
 from agent_manager.runtime.state import current_run
 from agent_manager.workflow.phases import AgentPhase, Workflow
@@ -105,8 +106,23 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         deps = current_run.get()
         p = deps.workflow.phase(phase)
         table = context.binding_table(pool, memory, phase)
+        # Outside the try, as in the old engine: an input no resolver provides
+        # is a workflow bug and its `EngineError` must reach the caller as is.
         rendered = prompt.render_prompt(p, table)
-        result = await bridge.call_agent(deps.agent_runner, p, table, rendered)
+        try:
+            result = await bridge.call_agent(deps.agent_runner, p, table, rendered)
+        except AgentPhaseFailed as failure:
+            if p.on_fail is not None and loop < p.on_fail.max_loops:
+                yield ContextItem(
+                    content={"for": p.on_fail.phase, "from": phase, "detail": failure.detail}
+                )
+                yield holder["compiled"].turn_for(p.on_fail.phase, loop + 1)
+                return
+            raise Escalated(phase, failure.detail) from failure
+        except Exception as error:
+            # Total, as the old engine's agent branch is: an exception escaping
+            # the walk would leave the subtask recorded `started` forever.
+            raise Escalated(phase, old_engine._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
         nxt = holder["compiled"].after(phase, loop)
         if nxt is not None:

@@ -16,8 +16,9 @@ import pytest
 from pygents import Agent, ContextPool, ContextQueue, ToolRegistry
 
 from agent_manager import models, store as store_module
+from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.runtime import compile as C, context, state
-from agent_manager.workflow.phases import AgentPhase, Step, Workflow
+from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-01"
 STORY_ID = "f9c19dc3"
@@ -296,3 +297,60 @@ def test_two_threads_compiling_at_once_share_one_compilation():
     assert errors == []
     assert len(out) == 8
     assert len({id(c) for c in out}) == 1
+
+
+async def test_agent_phase_failure_escalates(store):
+    def runner(phase, table, rendered):
+        raise AgentPhaseFailed("review", outcome="gate_failed", detail="blocked by critic")
+
+    wf = Workflow("t", (AgentPhase("review", "critic", (), None), Step("b", _noop)))
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.phase == "review"
+    assert info.value.detail == "blocked by critic"
+
+
+async def test_an_unexpected_runner_error_escalates_with_the_rendered_error(store):
+    # Review Focus 5: the old engine escalates any runner exception as
+    # "{Type}: {message}"; 3.4's parity run needs the same here.
+    def runner(phase, table, rendered):
+        raise EngineError("no worktree", phase="review")
+
+    wf = Workflow("t", (AgentPhase("review", "critic", (), None),))
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.phase == "review"
+    assert info.value.detail == "EngineError: phase 'review': no worktree"
+
+
+async def test_on_fail_loops_back_with_feedback_then_escalates_when_loops_run_out(store):
+    # Mechanics only: the feedback prompt resolver and the full loop behaviour
+    # belong to b904b9e7.
+    calls: list[Any] = []
+
+    def runner(phase, table, rendered):
+        calls.append((phase.name, [f["detail"] for f in table["feedback"]]))
+        if phase.name == "review":
+            raise AgentPhaseFailed("review", outcome="gate_failed", detail=f"blocker {len(calls)}")
+        return {"path": "docs/s.md"}
+
+    wf = Workflow("t", (
+        AgentPhase("spec", "writer", (), None),
+        AgentPhase("review", "critic", (), None, on_fail=Goto("spec", 1)),
+    ))
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert calls == [
+        ("spec", []),
+        ("review", []),
+        ("spec", ["blocker 2"]),
+        ("review", []),
+    ]
+    assert info.value.phase == "review"
+    assert info.value.detail == "blocker 4"
