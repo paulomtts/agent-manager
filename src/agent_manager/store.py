@@ -903,6 +903,30 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
+    def latest_open_checkpoint(self, card_id: str, workflow: str) -> Checkpoint | None:
+        """The newest open checkpoint of `card_id` for `workflow`, across every run.
+
+        The card's newest row in any run and any workflow decides first: if it
+        is `done`, the card is closed and this returns `None`. Otherwise it is
+        the newest `turn`/`parked`/`escalated` row of `workflow`, or `None`.
+        "Newest" is `saved_at` descending, then `seq` descending.
+        """
+        with self._lock:
+            newest = self._conn.execute(
+                "SELECT reason FROM checkpoints WHERE card_id = ?"
+                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                (card_id,),
+            ).fetchone()
+            if newest is None or newest["reason"] == "done":
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
+                " AND reason IN ('turn', 'parked', 'escalated')"
+                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                (card_id, workflow),
+            ).fetchone()
+            return None if row is None else _checkpoint_from_row(row)
+
     # -- rebuild -------------------------------------------------------------
 
     def rebuild_from_journal(self, run_id: str) -> models.Run:

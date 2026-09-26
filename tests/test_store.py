@@ -1915,3 +1915,109 @@ def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
         "phase_upsert",
         "attempt_upsert",
     }
+
+
+def test_latest_open_checkpoint_finds_an_older_runs_parked_row(repo):
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(old, "card-a", reason="turn", saved_at=_at(0))
+        parked = _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(1))
+        # A newer, still-open row under another workflow: ignored by the filter.
+        _save_checkpoint(old, "card-a", reason="turn", workflow="integrate", saved_at=_at(2))
+    finally:
+        old.close()
+
+    new = store.Store.open(repo, RUN_ID)
+    try:
+        found = new.latest_open_checkpoint("card-a", "task")
+        own = new.latest_checkpoint("card-a")
+        other_workflow = new.latest_open_checkpoint("card-a", "never-ran")
+        unknown = new.latest_open_checkpoint("card-never-saved", "task")
+    finally:
+        new.close()
+
+    assert found == parked
+    assert found is not None
+    assert found.run_id == OTHER_RUN_ID
+    assert found.seq == 1
+    assert found.reason == "parked"
+    assert own is None
+    assert other_workflow is None
+    assert unknown is None
+
+
+def test_latest_open_checkpoint_is_none_when_the_newest_row_is_done(repo):
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(old, "card-a", reason="turn", saved_at=_at(0))
+        _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(1))
+    finally:
+        old.close()
+
+    new = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(new, "card-a", reason="done", saved_at=_at(2))
+        assert new.latest_open_checkpoint("card-a", "task") is None
+    finally:
+        new.close()
+
+
+def test_latest_open_checkpoint_is_none_when_a_done_row_of_another_workflow_is_newest(repo):
+    # Review Focus 2: the newest row "in any run and with any workflow" decides.
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(0))
+    finally:
+        old.close()
+
+    new = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(new, "card-a", reason="done", workflow="integrate", saved_at=_at(1))
+        assert new.latest_open_checkpoint("card-a", "task") is None
+    finally:
+        new.close()
+
+
+def test_latest_open_checkpoint_returns_a_later_runs_row_after_an_earlier_done(repo):
+    # Review Focus 1: a card finished in one run and reopened in a later one.
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(old, "card-a", reason="done", saved_at=_at(0))
+    finally:
+        old.close()
+
+    new = store.Store.open(repo, RUN_ID)
+    try:
+        reopened = _save_checkpoint(new, "card-a", reason="turn", saved_at=_at(1))
+        found = new.latest_open_checkpoint("card-a", "task")
+    finally:
+        new.close()
+
+    assert found == reopened
+    assert found is not None
+    assert found.run_id == RUN_ID
+
+
+def test_latest_open_checkpoint_returns_an_escalated_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
+        escalated = _save_checkpoint(st, "card-a", reason="escalated", saved_at=_at(1))
+        assert st.latest_open_checkpoint("card-a", "task") == escalated
+    finally:
+        st.close()
+
+
+def test_latest_open_checkpoint_breaks_a_saved_at_tie_with_seq(repo):
+    # Review Focus 3: equal timestamps are ordered by seq.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(5))
+        parked = _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(5))
+        assert st.latest_open_checkpoint("card-a", "task") == parked
+
+        _save_checkpoint(st, "card-b", reason="parked", saved_at=_at(5))
+        _save_checkpoint(st, "card-b", reason="done", saved_at=_at(5))
+        assert st.latest_open_checkpoint("card-b", "task") is None
+    finally:
+        st.close()
