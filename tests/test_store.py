@@ -2021,3 +2021,19 @@ def test_latest_open_checkpoint_breaks_a_saved_at_tie_with_seq(repo):
         assert st.latest_open_checkpoint("card-b", "task") is None
     finally:
         st.close()
+
+
+def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is_newest(
+    repo,
+):
+    # The newest row overall is open (another workflow), so the card is not
+    # closed; the answer is then the newest *open* row of `workflow`, never its
+    # newer `done` row.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        opened = _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
+        _save_checkpoint(st, "card-a", reason="done", saved_at=_at(1))
+        _save_checkpoint(st, "card-a", reason="turn", workflow="integrate", saved_at=_at(2))
+        assert st.latest_open_checkpoint("card-a", "task") == opened
+    finally:
+        st.close()
