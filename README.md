@@ -22,13 +22,10 @@ am run --card 19efcddc-0000-0000-0000-000000000000 \
   --verify "uv run ruff check"
 ```
 
-Pick a killed run back up at the phase it died in. There is no `--base-branch`
-and no `--branch-prefix` here: both were decided when the run started and are
-recorded on the run. The verification suite is not recorded, so a resume is told
-it the same way a fresh run was:
+Pick a stopped or killed subtask back up at the phase it was interrupted in. There is no `--base-branch` and no `--branch-prefix` here: both were decided when the run started and are recorded on the run. `--verify` and `--allow-no-verification` are still accepted but have no effect: the checkpoint carries the verification suite and the opt-out the run started with. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
 
 ```bash
-am resume 20260923T140506Z-19efcddc --verify "uv run pytest"
+am resume 20260923T140506Z-19efcddc
 ```
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
@@ -201,13 +198,7 @@ not started yet stays `pending`, and no later level starts.
 - `stopped` is a clean park between two phases. Nothing failed, and the work
   done so far is kept.
 
-To continue, fix the escalation and relaunch the same `am run --milestone`
-command (see [Relaunching resumes](#relaunching-resumes)). The stopped subtask
-picks up where it parked, and every card already `done` on the board is
-skipped. `am resume <run-id>` does not continue stopped work: on a run with a
-stopped subtask it is refused with `{"ok": false, "error": {...}}` and exit
-code 3, and the message names the stopped subtasks and says to relaunch the
-milestone command.
+To continue, fix the escalation and relaunch the same `am run --milestone` command (see [Relaunching resumes](#relaunching-resumes)). The stopped subtask picks up where it parked, and every card already `done` on the board is skipped. `am resume <run-id>` is not the way to continue a milestone. It drives exactly one subtask and nothing after it: a run with more than one subtask recorded `started` or `stopped` is refused with `{"ok": false, "error": {...}}` and exit code 3, and a resume never starts a later subtask, story, level or Integrate.
 
 Run one `am` process per repository. Two `am` processes on the same repository
 or on the same run are not supported.
@@ -237,6 +228,8 @@ and the run are recorded `escalated`, and `am status <run_id>` shows the whole
 plan. A coder that reports `blocked` ends its subtask escalated at `implement`,
 and review never runs.
 
+When a critic, `validate_spec` or `validate_plan`, reports blockers, the subtask gets one revision: `spec` (or `plan`) runs again with the critic's reason as feedback, and then the critic runs again. A second block escalates at that critic's phase, so `failed_phase` is `validate_spec` or `validate_plan`. `review` has no revision loop. The report's shape is the same either way.
+
 Two more keys appear only when they are not empty:
 
 - `also_escalated`: a list of
@@ -265,9 +258,15 @@ skips every card already `done` on the board. A subtask that was stopped or
 killed part way picks up in its existing worktree and does not redo a plan
 that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first.
 
-`am resume <run-id>` is not milestone-aware and does not continue a milestone.
-On a run with a stopped subtask it is refused with exit code 3, and its message
-says to relaunch. Relaunch the `am run --milestone` command instead.
+`am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done` or `stopped` exits 0, and one that escalates exits 1.
+
+Resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
+
+- the workflow changed since the checkpoint was saved (its digest no longer matches). Start a fresh `am run --card`.
+- the subtask has no checkpoint (the run died before its first turn, or it predates checkpoints), its newest checkpoint is `done`, or its newest checkpoint was left by a phase escalation. An escalated subtask is never resumed.
+- the run has no subtask recorded `started` or `stopped`, or more than one of them (a milestone-shaped run).
+
+`am resume` is not milestone-aware: it drives that one subtask and stops, and never runs a later subtask, story, level or Integrate. To continue a milestone, relaunch the `am run --milestone` command.
 
 #### Not there yet
 

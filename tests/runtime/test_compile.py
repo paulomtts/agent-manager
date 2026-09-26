@@ -17,7 +17,8 @@ import pytest
 from pygents import Agent, ContextPool, ContextQueue, ToolRegistry
 
 from agent_manager import models, store as store_module
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import compile as C, context, state
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
@@ -488,3 +489,80 @@ async def test_loop_count_is_in_the_queued_turn(store):
     assert queue[0]["kwargs"] == {"phase": "spec", "loop": 1}
     assert queue[0]["tool_name"] == compiled.agent_phase.__name__
     assert names == LOOP_ORDER
+
+
+# G4 says each critic loops at most once: a loop spent by one critic must not
+# use up the next critic's. The built-in task workflow has two critics in a row.
+
+def _two_critics() -> Workflow:
+    return Workflow("two-critics", (
+        AgentPhase("spec", "spec_author", ("feedback",), None),
+        AgentPhase("validate_spec", "critic", (), None, on_fail=Goto("spec", 1)),
+        AgentPhase("plan", "planner", ("feedback",), None),
+        AgentPhase("validate_plan", "critic", (), None, on_fail=Goto("plan", 1)),
+        AgentPhase("review", "reviewer", (), None),
+    ))
+
+
+def _critics_fail(budget: dict[str, int]):
+    """A fake runner whose critics fail as many times as `budget` says, then pass."""
+    names: list[str] = []
+    left = dict(budget)
+
+    def runner(phase, ctx, rendered):
+        names.append(phase.name)
+        if left.get(phase.name, 0) > 0:
+            left[phase.name] -= 1
+            raise AgentPhaseFailed(phase.name, outcome="gate_failed", detail=f"{phase.name} blocks")
+        return {"ok": True}
+
+    return runner, names
+
+
+async def test_each_critic_gets_its_own_loop(store):
+    runner, names = _critics_fail({"validate_spec": 1, "validate_plan": 1})
+    wf = _two_critics()
+
+    await _drive(wf, _deps(wf, store, runner))
+
+    assert names == [
+        "spec", "validate_spec", "spec", "validate_spec",
+        "plan", "validate_plan", "plan", "validate_plan", "review",
+    ]
+
+
+async def test_a_later_critic_still_escalates_on_its_second_failure(store):
+    runner, names = _critics_fail({"validate_spec": 1, "validate_plan": 2})
+    wf = _two_critics()
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.phase == "validate_plan"
+    assert info.value.detail == "validate_plan blocks"
+    assert names == [
+        "spec", "validate_spec", "spec", "validate_spec",
+        "plan", "validate_plan", "plan", "validate_plan",
+    ]
+
+
+async def test_a_critic_looping_back_past_an_earlier_critic_shares_its_loop(store):
+    # Termination: were the counter reset when `validate_spec` passes, a
+    # `validate_plan` that loops back to `spec` would re-earn its loop on every
+    # pass and never escalate. Such a critic keeps the one shared counter.
+    runner, names = _critics_fail({"validate_plan": 5})
+    wf = Workflow("overlapping", (
+        AgentPhase("spec", "spec_author", ("feedback",), None),
+        AgentPhase("validate_spec", "critic", (), None, on_fail=Goto("spec", 1)),
+        AgentPhase("plan", "planner", (), None),
+        AgentPhase("validate_plan", "critic", (), None, on_fail=Goto("spec", 1)),
+    ))
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.phase == "validate_plan"
+    assert names == [
+        "spec", "validate_spec", "plan", "validate_plan",
+        "spec", "validate_spec", "plan", "validate_plan",
+    ]

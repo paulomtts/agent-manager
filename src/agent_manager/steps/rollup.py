@@ -26,8 +26,8 @@ it on the same thread.
 
 The first parameter is named `card`, not `card_id`, because the engine binds
 arguments by parameter name out of the run context and the context key holding
-the bare id string is `card` (`engine.py:98`, `bind_arguments` at
-`engine.py:163-212`). There is no `card_id` key, so a parameter by that name
+the bare id string is `card` (`runtime.walk.subtask_context` and
+`bind_arguments`). There is no `card_id` key, so a parameter by that name
 would fail to bind and the engine would report a missing required parameter.
 """
 
@@ -72,9 +72,9 @@ def set_status(
 ) -> dict[str, object]:
     """Set `card`'s board status, roll it up its ancestors, and report both.
 
-    Called by the two `best_effort: true` phases of `builtin/task.yaml`
+    Called by the two `best_effort=True` steps of `TASK`
     (`mark_in_progress`, `mark_done`), which supply `status` through the
-    document's `args`.
+    workflow's `args`.
 
     First the card itself is written. Then the walk climbs one ancestor at a
     time: `board.show` names the parent (tree nodes carry no `parent_id`),

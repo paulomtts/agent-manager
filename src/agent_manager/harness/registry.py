@@ -6,9 +6,8 @@ calls. That is all this module is. It deliberately does not route roles: which
 harness a role gets is `RunConfig.harness_map`'s answer, read by
 `dispatch.resolve_target`.
 
-A fresh dict per call, for the reason `workflow.registry.default_registry`
-gives: a module-level singleton is mutable global state any importer could
-rebind an adapter in.
+A fresh dict per call: a module-level singleton is mutable global state any
+importer could rebind an adapter in.
 """
 
 from agent_manager.harness.base import HarnessAdapter

@@ -14,10 +14,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from agent_manager import board, prompt, results
+from agent_manager import board, cli, prompt
 from agent_manager.steps import docs_commit
-from agent_manager.workflow import load_builtin
+from agent_manager.workflow import task as task_workflow
 
 AGENT_PHASES = (
     "explore",
@@ -28,14 +29,6 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-
-
-@pytest.fixture(scope="module", params=["yaml", "pygents"])
-def engine(request) -> str:
-    """Overrides the conftest's `engine`: every test in this module that reads
-    the run runs once per engine, each on its own repo and board (spec test 5).
-    Fixture params, not a parametrize mark, so no marker reaches this module."""
-    return request.param
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -50,7 +43,7 @@ def test_run_card_drives_every_phase_under_a_fake_claude_and_the_board_says_done
 ):
     """R7: the card reads `done` ON THE BOARD, not merely in the payload.
 
-    `mark_done` is `best_effort: true` (`builtin/task.yaml:75-79`), so a run can
+    `mark_done` is `best_effort=True` (`workflow.task.TASK`), so a run can
     report `done` while the card never moved -- which is exactly the bug this
     assertion exists to catch.
     """
@@ -100,13 +93,12 @@ def test_the_brief_carries_the_result_path_and_the_schema(agent_attempts):
     prompt-composition regression into a named failure instead of a mysterious
     missing result file.
     """
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
 
     for name in AGENT_PHASES:
         attempt = agent_attempts[name]
         text = Path(attempt.prompt_path).read_text(encoding="utf-8")
-        declared = workflow.phase(name).result
-        model = results.RESULT_MODELS[declared]
+        model = workflow.phase(name).result
         schema = json.dumps(
             model.model_json_schema(), indent=2, ensure_ascii=False
         )
@@ -122,7 +114,7 @@ def test_the_spec_and_plan_documents_exist_where_the_phases_declared_them(
     """The `writes:` templates resolved to real files inside the worktree and
     were committed. Paths come from the document and `prompt.expand_writes`,
     never from a convention retyped here."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     spec_relative = prompt.expand_writes(
         workflow.phase("spec").writes, card, phase="spec", input_name="spec_path"
@@ -145,7 +137,7 @@ def test_the_implement_commit_carries_a_plan_hash_trailer_review_agrees_with(
     """`review_gate` and `plan_hash_gate` passed for a real reason: the branch's
     commits all carry the trailer, and implement's hash is review's hash is the
     sha256 of the plan file on disk (`reducers.is_plan_hash`: 8 lowercase hex)."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     plan_relative = prompt.expand_writes(
         workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
@@ -196,7 +188,7 @@ def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
     engine owes. The spec and the plan are committed by the `docs_commit` step,
     with the Plan-Hash trailer, before `implement` ever starts -- so the docs
     commit is OLDER than the fake's implementation commit."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     plan_relative = prompt.expand_writes(
         workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
@@ -226,21 +218,196 @@ def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
     assert sorted(named) == sorted([spec_relative, plan_relative])
 
 
-def test_the_selected_engine_is_the_one_that_walked(
-    engine, project, completed_run, checkpoint_rows
-):
-    """Review Focus 1: non-vacuity for the whole parametrization."""
+def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
+    """Non-vacuity: the pygents walk is the only one that checkpoints."""
     rows = checkpoint_rows(project, completed_run["run_id"])
-    if engine == "pygents":
-        assert rows > 0, "a pygents run wrote no checkpoint: --engine never reached the walk"
-    else:
-        assert rows == 0, rows
+    assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"
 
 
-def test_the_run_data_is_the_same_on_both_engines(
-    engine, project, cards, completed_run, engine_parity
-):
-    """Spec test 5 / G10: `run_card`'s data, ignoring `run_id`."""
-    engine_parity(
-        "production-wiring", engine, completed_run, tmp=project.parent, cards=cards
+CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
+"""Must equal `fake_claude.CRITIC_BLOCKS_ENV`, which `test_fake_claude.py` pins."""
+
+CRITIC_BLOCK_REASON = (
+    "fake-claude critic: the critic-blocks budget told this critic to block"
+)
+"""Must equal `fake_claude.CRITIC_BLOCK_REASON`, which `test_fake_claude.py` pins."""
+
+VERIFY = "git rev-parse --verify HEAD"
+"""Must equal the conftest's `VERIFY_COMMANDS[0]`."""
+
+FEEDBACK_SECTION = "\n## feedback\n"
+"""How `prompt._assemble` heads the `feedback` input's section."""
+
+
+def _arm_critic_blocks(tmp_path: Path, monkeypatch, table: dict[str, int]) -> Path:
+    """Write the fake's critic budget beside the repo and point the env var at it.
+
+    Through the test's own function-scoped `monkeypatch`, so it is undone when
+    the test ends and never reaches the shared `completed_run`. Child processes
+    inherit it: `run_direct` calls `Popen` with no `env=`."""
+    budget = tmp_path / "critic-blocks.json"
+    budget.write_text(json.dumps(table), encoding="utf-8")
+    monkeypatch.setenv(CRITIC_BLOCKS_ENV, str(budget))
+    return budget
+
+
+def _run_one_card(root: Path, card: str):
+    """`am run --card` through `CliRunner`, with no runner_factory anywhere."""
+    return CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            card,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            "--verify",
+            VERIFY,
+        ],
     )
+
+
+def _envelope(result) -> dict:
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}, envelope
+    assert envelope["ok"] is True, envelope
+    return envelope["data"]
+
+
+def _brief_of(entry: dict) -> str:
+    """The brief the fake was given for one logged dispatch: `prompt.txt` sits
+    beside the attempt's `result.json`."""
+    return (Path(entry["result_path"]).parent / "prompt.txt").read_text(encoding="utf-8")
+
+
+def _feedback_of(brief: str) -> str | None:
+    """The body of the brief's `## feedback` section, or `None` when it has none."""
+    start = brief.find(FEEDBACK_SECTION)
+    if start < 0:
+        return None
+    body = brief[start + len(FEEDBACK_SECTION) :]
+    end = body.find("\n## ")
+    return body if end < 0 else body[:end]
+
+
+@pytest.mark.parametrize(
+    ("critic", "author", "walked"),
+    [
+        (
+            "validate_spec",
+            "spec",
+            [
+                "explore", "spec", "validate_spec", "spec", "validate_spec",
+                "plan", "validate_plan", "implement", "review",
+            ],
+        ),
+        (
+            "validate_plan",
+            "plan",
+            [
+                "explore", "spec", "validate_spec", "plan", "validate_plan",
+                "plan", "validate_plan", "implement", "review",
+            ],
+        ),
+    ],
+)
+def test_a_critic_that_blocks_once_loops_back_and_the_run_finishes_done(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch,
+    critic, author, walked,
+):
+    """Spec test 4 (and G4's "validate_plan loops back to plan in the same way"):
+    under pygents one block sends the run back to the phase the critic judged,
+    whose second brief carries the critic's reason, and the run ends done."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {critic: 1})
+
+    result = _run_one_card(root, card)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert board.show(card, repo_dir=root).status == "done"
+    # Non-vacuity: the block really was spent, so the loop really happened.
+    assert json.loads(budget.read_text(encoding="utf-8")) == {critic: 0}
+
+    entries = read_fake_log(data["run_id"])
+    assert [entry["phase"] for entry in entries] == walked
+    first, second = [entry for entry in entries if entry["phase"] == author]
+    assert Path(first["result_path"]).parent.name == f"{author}.1"
+    assert Path(second["result_path"]).parent.name == f"{author}.2"
+
+    feedback = _feedback_of(_brief_of(second))
+    assert feedback is not None, _brief_of(second)
+    assert feedback.splitlines()[0] == prompt.FEEDBACK_TITLE
+    assert f"- {critic}: " in feedback
+    assert CRITIC_BLOCK_REASON in feedback
+    # Review focus 5: feedback reaches the looped-to phase's second brief only.
+    for entry in entries:
+        if entry is not second:
+            assert _feedback_of(_brief_of(entry)) is None, entry
+
+
+def test_a_critic_that_blocks_twice_escalates_validation_at_the_critic(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Spec test 5: the one loop is spent, so the second block escalates at the
+    critic -- never at the looped-to phase -- the way it does today."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 2})
+
+    result = _run_one_card(root, card)
+
+    assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "escalated"
+    assert data["failed_phase"] == "validate_spec"
+    assert "blocked=validation" in data["detail"], data["detail"]
+    assert CRITIC_BLOCK_REASON in data["detail"], data["detail"]
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
+    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
+        "explore", "spec", "validate_spec", "spec", "validate_spec",
+    ]
+    assert board.show(card, repo_dir=root).status != "done"
+
+
+def test_both_critics_blocking_once_each_both_loop(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Review focus 1 / G4 "each at most once": the spec loop does not spend
+    validate_plan's, so both critics loop and the run ends done."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(
+        tmp_path, monkeypatch, {"validate_spec": 1, "validate_plan": 1}
+    )
+
+    result = _run_one_card(root, card)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert json.loads(budget.read_text(encoding="utf-8")) == {
+        "validate_plan": 0,
+        "validate_spec": 0,
+    }
+    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
+        "explore", "spec", "validate_spec", "spec", "validate_spec",
+        "plan", "validate_plan", "plan", "validate_plan", "implement", "review",
+    ]
+
+
+def test_with_no_critic_block_no_brief_carries_a_feedback_section(
+    completed_run, agent_attempts
+):
+    """Spec "No block" / review focus 3: an empty `feedback` renders nothing,
+    so a clean run's briefs are what they were before."""
+    assert completed_run["status"] == "done", completed_run["detail"]
+    for name in AGENT_PHASES:
+        text = Path(agent_attempts[name].prompt_path).read_text(encoding="utf-8")
+        assert FEEDBACK_SECTION not in text, name

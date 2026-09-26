@@ -1,15 +1,21 @@
 """The builtin `task` workflow as declared phase-model data (spec G3).
 
-Pinned to `builtin/task.yaml`: `tests/workflow/test_declared.py` asserts that
-`TASK.digest()` equals the digest of the shipped YAML run through
-`phases.from_loader`, so the two cannot drift apart silently. Every callable
-is the real function object `registry.default_registry()` binds -- never a
-registry lookup -- because the digest names callables by `module.qualname`.
+Every callable is the real function object, never a name looked up at run
+time, because the digest names callables by `module.qualname` and a resumed
+run must be able to tell whether the workflow it checkpointed is this one.
+`tests/workflow/test_declared.py` pins the timeouts, the critics' `on_fail`
+loops and that the workflow validates.
 
-Timeouts are the one thing the YAML never had. G2 requires every agent turn
-timeout to exceed the launcher's strictly (the launcher must kill `claude -p`
-before the turn is cancelled), so each phase gets `max(chosen, floor)` with the
-floor five minutes above the launcher timeout. The launcher's is never lowered.
+G2 requires every agent turn timeout to exceed the launcher's strictly (the
+launcher must kill `claude -p` before the turn is cancelled), so each phase
+gets `max(chosen, floor)` with the floor five minutes above the launcher
+timeout. The launcher's is never lowered.
+
+G4: `validate_spec` loops back to `spec` and `validate_plan` to `plan`, at
+most once each (`Goto`'s default `max_loops=1`); a second block escalates
+`validation` as before. Review does not loop. The looped-to phase reads the
+critic's reason through its `feedback` input; with no loop that input is empty
+and renders no section, so a clean run's briefs are unchanged.
 
 No pygents import here (rule 1).
 """
@@ -20,7 +26,7 @@ from datetime import timedelta
 
 from agent_manager import dispatch, results
 from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
-from agent_manager.workflow.phases import AgentPhase, Retry, Step, Workflow
+from agent_manager.workflow.phases import AgentPhase, Goto, Retry, Step, Workflow
 
 LAUNCHER_TIMEOUT = timedelta(seconds=dispatch.DEFAULT_TIMEOUT)
 """How long the launcher lets one `claude -p` run before killing it (1800 s)."""
@@ -55,7 +61,7 @@ TASK = Workflow("task", (
     AgentPhase(
         "spec",
         role="spec_author",
-        inputs=("card", "explore", "spec_path"),
+        inputs=("card", "explore", "spec_path", "feedback"),
         result=results.SpecResult,
         writes="docs/superpowers/specs/{stem}.md",
         timeout=agent_timeout(30),
@@ -67,11 +73,12 @@ TASK = Workflow("task", (
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),
         timeout=agent_timeout(20),
+        on_fail=Goto("spec"),
     ),
     AgentPhase(
         "plan",
         role="planner",
-        inputs=("spec_path", "plan_path"),
+        inputs=("spec_path", "plan_path", "feedback"),
         result=results.PlanResult,
         writes="docs/superpowers/plans/{stem}.md",
         timeout=agent_timeout(30),
@@ -83,6 +90,7 @@ TASK = Workflow("task", (
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),
         timeout=agent_timeout(20),
+        on_fail=Goto("plan"),
     ),
     Step("mark_validated", plan_check.mark_validated),
     Step("docs_commit", docs_commit.commit_documents),
@@ -109,4 +117,4 @@ TASK = Workflow("task", (
     Step("verify", verify.run_suite, gates=(reducers.verification_passed_gate,)),
     Step("mark_done", rollup.set_status, args={"status": "done"}, best_effort=True),
 ))
-"""`builtin/task.yaml`, phase for phase."""
+"""The fourteen-phase task workflow of design §5, phase for phase."""

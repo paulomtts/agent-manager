@@ -18,7 +18,7 @@ from typing import Any
 from pydantic import BaseModel
 from pygents import ContextItem, ContextPool, ContextQueue
 
-from agent_manager.engine import RESERVED_CONTEXT_KEYS
+from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS
 
 SUBTASK = "subtask"
 SKIPPED = "skipped"
@@ -71,8 +71,8 @@ def binding_table(pool: ContextPool, memory: ContextQueue, phase: str) -> dict[s
 
     A result pooled under a reserved key -- the shipped `task` workflow's
     `worktree` phase is one -- stays in the pool, so the summary still reports
-    it, but never replaces the engine's own value in the table: the pygents
-    twin of `engine._bind_result`.
+    it, but never replaces the engine's own value in the table: the rule
+    `walk._bind_result` applies, over the pool.
     """
     table: dict[str, Any] = dict(decode(pool.get(SUBTASK).content))
     for item in pool.items:

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import engine
+from agent_manager.runtime import walk
 from agent_manager.results import ExploreResult, Verification
 from agent_manager.steps import verify
 from agent_manager.steps.verify import (
@@ -365,7 +365,7 @@ def test_argv_sequences_and_a_path_worktree_are_accepted(tmp_path: Path):
 
 
 def test_run_suite_takes_explore_by_name_before_the_keyword_only_runner():
-    # `engine.bind_arguments` binds strictly by parameter name, so the name
+    # `walk.bind_arguments` binds strictly by parameter name, so the name
     # `explore` is what wires the Explore phase's result in -- no YAML edit.
     parameters = inspect.signature(verify.run_suite).parameters
     assert list(parameters) == ["commands", "worktree", "explore", "runner"]
@@ -622,7 +622,7 @@ def test_the_engine_binds_the_real_explore_dump_into_the_run(tmp_path: Path):
     ).model_dump(mode="json")
     context = {"commands": [suite], "worktree": str(tmp_path), "explore": explore}
 
-    kwargs = engine.bind_arguments(
+    kwargs = walk.bind_arguments(
         verify.run_suite, context, phase="verify", function="verify.run_suite"
     )
     result = verify.run_suite(**kwargs)
@@ -639,7 +639,7 @@ def test_the_engine_binds_no_explore_when_the_workflow_has_no_explore_phase(
     # and run only the suite.
     suite = _py("print('5 passed')")
     context = {"commands": [suite], "worktree": str(tmp_path)}
-    kwargs = engine.bind_arguments(
+    kwargs = walk.bind_arguments(
         verify.run_suite, context, phase="verify", function="verify.run_suite"
     )
     result = verify.run_suite(**kwargs)

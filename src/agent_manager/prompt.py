@@ -2,8 +2,7 @@
 
 §7 fixes a table: a phase declares `inputs`, and each name resolves through that
 table and through nothing else. There is no expression language and no fallback
-lookup -- the same invariant `workflow/registry.py` enforces for `when:` and
-gates at load time. A name the table does not carry is a document bug, reported
+lookup. A name the table does not carry is a workflow bug, reported
 with the phase and the list of names that are.
 
 The rule the table encodes, from §7 verbatim: **small structured results are
@@ -12,7 +11,7 @@ it on every phase and invite the agent to work from a stale copy of a file it ca
 read live in the worktree it is already sitting in.
 
 Input names are the *document's* vocabulary; context keys are the *callees'*
-parameter names, as `engine.subtask_context` established. The two are not the
+parameter names, as `walk.subtask_context` established. The two are not the
 same word in several rows: `base_branch` reads `base`, `card` reads
 `card_details`, `verification` reads `commands`.
 
@@ -31,15 +30,15 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 from agent_manager import dag, models
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.roles.loader import RoleBundle
 
 
 class PromptPhase(Protocol):
     """The three things rendering reads from an agent phase, and nothing else.
 
-    Structural, so both the YAML `workflow.loader.AgentPhase` and the declared
-    `workflow.phases.AgentPhase` satisfy it without either being imported here.
+    Structural, so the declared `workflow.phases.AgentPhase` satisfies it
+    without being imported here.
     Read-only properties, because a frozen dataclass and a frozen pydantic model
     both expose these as attributes that must not be assigned.
     """
@@ -167,7 +166,7 @@ def _verbatim(key: str) -> Resolver:
 def _phase_field(phase_key: str, field: str) -> Resolver:
     """One field of an earlier phase's result, inlined as its own string.
 
-    `engine._bind_result` stores a phase's result in the context under the
+    `walk._bind_result` stores a phase's result in the context under the
     phase's own name, so `docs_commit`'s `{"plan_hash": digest}` lands at
     `context["docs_commit"]["plan_hash"]`. Input names are the document's
     vocabulary and context keys are the callees' names, so the declared input
@@ -244,7 +243,7 @@ def _repo_docs(request: _Request) -> str:
     """Path plus an excerpt of each repo conventions document that exists.
 
     Resolves against the worktree root when there is one and against `repo_dir`
-    when there is not: `explore` is the first phase of `builtin/task.yaml` and
+    when there is not: `explore` is the first agent phase of `TASK` and
     the `worktree` phase runs two phases later, so at explore time there is no
     worktree to read from. Absence of both files is a stated fact, not a failure
     -- plenty of repositories have neither. Unreadability *is* a failure: a file
@@ -303,8 +302,7 @@ def _feedback(request: _Request) -> str | None:
 
     The runtime's binding table has already kept only the items whose `for`
     names this phase, so `for` is not rendered. A missing key, `None` or an
-    empty list is the normal case -- no loop has happened, or the old engine
-    is running and never supplies the key -- so this never goes through
+    empty list is the normal case -- no loop has happened -- so this never goes through
     `_required`/`_present`, and returns `None` to omit the section. An item
     without `from` or `detail` is a codec bug and is refused by name rather
     than rendered as a blank bullet.
@@ -343,11 +341,11 @@ _TABLE: dict[str, Resolver] = {
 """The fixed §7 resolution table, keyed by the name a document may declare.
 
 `merge_tip` and `conflict_files` are the resolver's (Integrate addendum §2 and
-I3, `builtin/integrate.yaml`): the story tip being merged, inlined as a ref,
+I3, `workflow.integrate.INTEGRATE`): the story tip being merged, inlined as a ref,
 and the conflicting paths `steps.integrate.merge_tip` reported, inlined as
 JSON. Neither reads another phase's result, so neither appears in
 `INPUT_PRODUCERS`: the caller supplies both through
-`engine.run_subtask(extra_context=...)`.
+`runtime.engine.run_subtask(extra_context=...)`.
 
 `feedback` is the last row (pygents-engine design G4, §5): the critic's reason
 for a `Goto` loop-back, supplied by the runtime's binding table. It reads the
@@ -369,9 +367,8 @@ INPUT_PRODUCERS: dict[str, str] = {
 
 Derived from `_TABLE`, never hand-written: `_phase_field` stamps the phase key
 on the resolver it builds, so this map cannot disagree with the lookup it
-describes. `cli.resume_start_phase` reads it, because an input resolved out of
-another phase's result is a dependency on that phase having run in *this*
-process -- the journal never replays the binding table.
+describes. The pygents walk never needs it -- a checkpoint's pool carries every
+earlier result -- but it stays the one place the mapping is written down.
 """
 
 

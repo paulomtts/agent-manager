@@ -311,7 +311,7 @@ def exploration_output_gate(
     return None
 
 
-# The `verify` phase's gate (`builtin/task.yaml`). `verify.run_suite` reports
+# The `verify` phase's gate (`TASK`). `verify.run_suite` reports
 # what happened and judges nothing -- it returns `passed: false` for a red
 # command and raises `VerifyError` only for a command it could not launch at
 # all. Something has to turn "red" into a stop, and doing it here rather than
@@ -343,7 +343,7 @@ def verification_passed_gate(result: object) -> dict[str, str] | None:
     }
 
 
-# The `implement` phase's gate (`builtin/task.yaml`), decision O7. The coder is
+# The `implement` phase's gate (`TASK`), decision O7. The coder is
 # told to REPORT `blocked: true` with a reason when it cannot proceed (a red
 # baseline, a plan hash it could not compute) and never to decide what happens
 # next. Without this gate `review` ran anyway and a subtask could reach `done`
@@ -369,8 +369,8 @@ def implement_blocked_gate(result: object) -> dict[str, str] | None:
     }
 
 
-# The `validate_spec` / `validate_plan` gate (`builtin/task.yaml` lines 40 and
-# 54), ported from task.js lines 631-638 and 717-721. The critic is asked to
+# The `validate_spec` / `validate_plan` gate (`TASK`), ported from task.js
+# lines 631-638 and 717-721. The critic is asked to
 # REPORT whether the spec or the plan has unresolvable blockers and never to
 # decide what to do about them, for the reason `review_gate` exists: an agent
 # that both measures and judges can talk itself out of the judgement. One
@@ -380,7 +380,7 @@ def implement_blocked_gate(result: object) -> dict[str, str] | None:
 def critic_blockers_gate(result: object) -> dict[str, str] | None:
     """``None`` when the critic found no blockers, else a blocked verdict.
 
-    ``result`` is the critic phase's own result: both ``engine._gate_values``
+    ``result`` is the critic phase's own result: both ``walk._gate_values``
     and ``dispatch.gate_values`` place it under exactly that key, which is why
     the parameter is not named after either phase.
 
@@ -405,7 +405,7 @@ def critic_blockers_gate(result: object) -> dict[str, str] | None:
     }
 
 
-# The `review` phase's first gate (`builtin/task.yaml`), ported from task.js
+# The `review` phase's first gate (`TASK`), ported from task.js
 # lines 842-855. The reviewer fixes what it can and REPORTS what is still
 # standing in `unresolved_blockers`; before this gate nothing read that list,
 # so a review that said "this is not done" still went on to `verify` and
@@ -450,17 +450,17 @@ def plan_hash_gate_adapter(
     """`reducers.plan_hash_gate` bound to the two phase results it compares.
 
     The document names this gate on the `review` phase, and
-    `engine.bind_arguments` binds strictly by parameter name out of a table of
+    `walk.bind_arguments` binds strictly by parameter name out of a table of
     whole values -- nothing in that table is called `impl_hash` or
-    `review_hash`, and the yaml `args:` map holds literals, so neither could be
+    `review_hash`, and a step's declared `args` hold literals, so neither could be
     written there either. This adapter takes the two names the table *does*
     hold, the phase names `implement` and `review`, and does the one field
     lookup the binder cannot do for itself. The reducer keeps its signature and
     its tests; nothing about the comparison moves.
 
-    A module-level function rather than a closure built inside
-    `default_registry()`: `resolve(name) is resolve(name)` must hold across two
-    registries, which is the same invariant `_PLACEHOLDERS` exists to preserve.
+    A module-level function rather than a closure: `TASK`'s digest names it by
+    `module.qualname`, and one function object is what every workflow gating
+    on it shares.
 
     Both parameters default to `None` so a run where `implement` never executed
     in this process (a `plan_check` skip, or a resume started later) still binds

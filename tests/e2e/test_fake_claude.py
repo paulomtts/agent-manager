@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager.steps.reducers import review_gate
+from agent_manager.steps.reducers import critic_blockers_gate, review_gate
 from agent_manager.steps.integrate import merge_completed_gate
 
 _SOURCE = Path(__file__).with_name("fake_claude.py")
@@ -1204,3 +1204,181 @@ def test_a_listed_conflict_file_that_is_not_there_fails_before_any_write(
 def test_the_resolver_env_var_is_the_conftest_twin():
     """The fixture sets `FAKE_RESOLVER_ENV`; the script reads `RESOLVER_ENV`."""
     assert fake_claude.RESOLVER_ENV == _conftest_constant("FAKE_RESOLVER_ENV")
+
+
+def _critic_text(phase):
+    """A critic brief, as `builtin/task.yaml` renders one, without its contract."""
+    return (
+        "# Critic\n\nstanding instructions\n\n"
+        f"# phase: {phase}\n# role: critic\n"
+        "\n## spec_path\ndocs/superpowers/specs/x-00000001.md\n"
+    )
+
+
+def _critic(phase, cwd):
+    return fake_claude.build_result(
+        phase, fake_claude.payload_from_schema(CRITIC_SCHEMA), _critic_text(phase), cwd
+    )
+
+
+def _arm_critic_blocks(tmp_path, monkeypatch, table):
+    """Write the budget file and point the env var at it, as the e2e tests do."""
+    budget = tmp_path / "critic-blocks.json"
+    budget.write_text(json.dumps(table), encoding="utf-8")
+    monkeypatch.setenv(fake_claude.CRITIC_BLOCKS_ENV, str(budget))
+    return budget
+
+
+def test_the_critic_blocks_names_are_pinned():
+    """`tests/e2e/test_production_wiring.py` re-declares these as literals; the
+    script and the tests meet across a process boundary, like `RESOLVER_ENV`."""
+    assert fake_claude.CRITIC_BLOCKS_ENV == "FAKE_CLAUDE_CRITIC_BLOCKS"
+    assert fake_claude.CRITIC_BLOCK_REASON == (
+        "fake-claude critic: the critic-blocks budget told this critic to block"
+    )
+    assert fake_claude.CRITIC_PHASES == ("validate_spec", "validate_plan")
+    assert fake_claude.MAX_CRITIC_BLOCKS == 2
+
+
+@pytest.mark.parametrize("value", [None, ""])
+@pytest.mark.parametrize("phase", ["validate_spec", "validate_plan"])
+def test_without_a_critic_blocks_budget_every_critic_passes(
+    tmp_path, monkeypatch, phase, value
+):
+    """Unset or empty is today's behaviour exactly."""
+    if value is None:
+        monkeypatch.delenv(fake_claude.CRITIC_BLOCKS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(fake_claude.CRITIC_BLOCKS_ENV, value)
+
+    payload = _critic(phase, tmp_path)
+
+    assert payload == {"blockers": False, "reason": None, "summary": fake_claude.SUMMARY}
+    assert critic_blockers_gate(payload) is None
+
+
+def test_a_budget_of_one_blocks_once_with_the_fixed_reason_then_passes(
+    tmp_path, monkeypatch
+):
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1})
+
+    first = _critic("validate_spec", tmp_path)
+
+    assert first == {
+        "blockers": True,
+        "reason": fake_claude.CRITIC_BLOCK_REASON,
+        "summary": fake_claude.SUMMARY,
+    }
+    # The production gate turns it into a `validation` block carrying the reason.
+    assert critic_blockers_gate(first) == {
+        "blocked": "validation",
+        "detail": fake_claude.CRITIC_BLOCK_REASON,
+    }
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
+
+    second = _critic("validate_spec", tmp_path)
+
+    assert second["blockers"] is False
+    assert second["reason"] is None
+
+
+def test_a_budget_of_two_blocks_twice_then_passes(tmp_path, monkeypatch):
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_plan": 2})
+
+    verdicts = [_critic("validate_plan", tmp_path)["blockers"] for _ in range(3)]
+
+    assert verdicts == [True, True, False]
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_plan": 0}
+
+
+def test_a_budget_for_one_critic_leaves_the_other_passing_and_the_file_untouched(
+    tmp_path, monkeypatch
+):
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_plan": 1})
+    before = budget.read_text(encoding="utf-8")
+
+    payload = _critic("validate_spec", tmp_path)
+
+    assert payload["blockers"] is False
+    assert budget.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{not json",
+        "[]",
+        '"validate_spec"',
+        '{"review": 1}',
+        '{"validate_spec": 3}',
+        '{"validate_spec": -1}',
+        '{"validate_spec": "1"}',
+        '{"validate_spec": true}',
+        '{"validate_spec": 1.0}',
+        '{"validate_spec": 1, "spec": 1}',
+    ],
+)
+def test_a_malformed_critic_blocks_budget_stops_the_fake(tmp_path, monkeypatch, raw):
+    """Review focus 4: a typo in a test must never read as "no block"."""
+    budget = tmp_path / "critic-blocks.json"
+    budget.write_text(raw, encoding="utf-8")
+    monkeypatch.setenv(fake_claude.CRITIC_BLOCKS_ENV, str(budget))
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _critic("validate_spec", tmp_path)
+
+    assert fake_claude.CRITIC_BLOCKS_ENV in str(caught.value)
+    assert budget.read_text(encoding="utf-8") == raw
+
+
+def test_a_critic_blocks_env_naming_a_missing_file_stops_the_fake(tmp_path, monkeypatch):
+    missing = tmp_path / "nowhere.json"
+    monkeypatch.setenv(fake_claude.CRITIC_BLOCKS_ENV, str(missing))
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        _critic("validate_spec", tmp_path)
+
+    assert fake_claude.CRITIC_BLOCKS_ENV in str(caught.value)
+    assert str(missing) in str(caught.value)
+
+
+def test_a_bad_critic_blocks_budget_makes_the_fake_process_exit_1(tmp_path, monkeypatch):
+    """The `__main__` mapping, end to end: the child inherits the env (as it does
+    under `launcher.run_direct`), refuses the budget, writes no result."""
+    budget = tmp_path / "critic-blocks.json"
+    budget.write_text('{"validate_spec": 9}', encoding="utf-8")
+    monkeypatch.setenv(fake_claude.CRITIC_BLOCKS_ENV, str(budget))
+    attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.1"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path, "validate_spec", "spec_critic", "\n## spec_path\nx.md\n",
+        CRITIC_SCHEMA, result_path,
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 1
+    assert "FAKE_CLAUDE_CRITIC_BLOCKS" in completed.stderr
+    assert not result_path.exists()
+
+
+def test_a_blocking_critic_process_writes_the_blocked_result(tmp_path, monkeypatch):
+    """The whole script, driven by a brief plus the env switch: the brief says
+    nothing about blocking, the budget alone decides (Rule 4)."""
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1})
+    attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.1"
+    attempt.mkdir(parents=True)
+    result_path = attempt / "result.json"
+    prompt_path = _brief(
+        tmp_path, "validate_spec", "spec_critic", "\n## spec_path\nx.md\n",
+        CRITIC_SCHEMA, result_path,
+    )
+
+    completed = _run_fake(prompt_path, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["blockers"] is True
+    assert payload["reason"] == fake_claude.CRITIC_BLOCK_REASON
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}

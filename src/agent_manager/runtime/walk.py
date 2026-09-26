@@ -1,19 +1,25 @@
-"""Walk one subtask's phases and execute the deterministic ones (design §6).
+"""The pieces of the subtask walk that live below pygents (design §6, G10).
 
-The walk is the only thing here. The engine resolves each agent phase's declared
-`inputs` and renders its prompt (§6 step 2, `prompt.py`), then hands phase,
-context and prompt to the injected runner: everything past that call --
-the attempt directory, the dispatch, the result file, the retry -- belongs to a
-sibling, and this module treats it as an opaque call.
+`runtime/engine.py` walks one subtask on pygents. What that walk, the two
+compiled tools (`runtime/compile.py`) and the agent-phase dispatcher
+(`dispatch.py`) share lives here: the binding table (`subtask_context`,
+`_document_paths`, `RESERVED_CONTEXT_KEYS`), binding by parameter name
+(`bind_arguments`), one deterministic step run, judged and recorded
+(`run_one_step`), and the summary and its subtask rows (`SubtaskSummary`,
+`_escalate`, `_stop`, `_record_subtask_status`).
 
-§6 says the engine calls `run(ctx) -> dict`, but the real steps take named
+No pygents import here (rule 1): `dispatch.py` imports this module, and
+dispatch must never load pygents. `runtime/__init__.py` imports nothing, so
+importing this module loads nothing else from `runtime/`.
+
+§6 says a step is called as `run(ctx) -> dict`, but the real steps take named
 keyword arguments (`worktree.ensure(branch, base, worktree, repo_dir)`,
 `verify.run_suite(commands, worktree)`, `plan_check.find_validated_plan(card)`).
-Rather than rewrite four working steps, the engine binds by parameter name out
+Rather than rewrite four working steps, a step is bound by parameter name out
 of a per-subtask context mapping overlaid with the phase's declared `args`, and
-raises its own error naming phase, function and parameter before the call -- a
-bare `TypeError` from a call site tells an operator nothing about which line of
-YAML is wrong.
+a binding failure raises `EngineError` naming phase, function and parameter
+before the call -- a bare `TypeError` from a call site tells an operator
+nothing about which phase is wrong.
 """
 
 import inspect
@@ -24,20 +30,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_manager import models, prompt
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.store import Store
 from agent_manager.workflow import phases as phase_model
-from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
-
-AnyStep = DeterministicPhase | phase_model.Step
-"""Either deterministic-phase type: the YAML one (`run`, gates and `when` as
-names) or the declared phase model (the callables themselves)."""
 
 _EMPTY = inspect.Parameter.empty
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-
-# `EngineError` is imported, not defined, so `prompt.py` can raise it without
-# importing this module back. `engine.EngineError` is still the public name.
 
 RESERVED_CONTEXT_KEYS = (
     "card",
@@ -55,18 +53,17 @@ RESERVED_CONTEXT_KEYS = (
 """The context keys the engine owns, and no phase result may replace.
 
 `subtask_context` always sets all but `spec_path` and `plan_path`; those two are
-set by `_document_paths` only when some agent phase in the document declares
+set by `_document_paths` only when some agent phase in the workflow declares
 them as inputs. Reserved either way: a key the engine may set is a key a phase
-result must never take over, whether this particular document made it appear or
+result must never take over, whether this particular workflow made it appear or
 not.
 
-
 Named as a constant because phase results land in the same mapping under the
-phase's name: a phase called `worktree` -- the shipped `builtin/task.yaml`
-has exactly one -- would otherwise overwrite the real worktree path every
-later step binds from, and a phase called `spec_path` would overwrite the
-document path `implement` and `review` both declare. `_bind_result` uses this
-to skip writing such a result back into the table rather than refuse the phase
+phase's name: a phase called `worktree` -- the shipped `task` workflow has
+exactly one -- would otherwise overwrite the real worktree path every later
+step binds from, and a phase called `spec_path` would overwrite the document
+path `implement` and `review` both declare. `_bind_result` uses this to skip
+writing such a result back into the table rather than refuse the phase
 outright.
 """
 
@@ -82,15 +79,15 @@ def subtask_context(
     """The starting binding table for one subtask's phases.
 
     The keys are the *callables'* parameter names, not the model's field names:
-    binding is by name, and no deterministic phase in `builtin/task.yaml`
-    declares `args` that could bridge the difference. Hence `base` for
-    `base_branch` and `worktree` for `worktree_path`.
+    binding is by name, and no step in `workflow.task.TASK` declares `args`
+    that could bridge the difference. Hence `base` for `base_branch` and
+    `worktree` for `worktree_path`.
 
     `base_branch` is that same string under a second key, because the two sides
-    of the document disagree about the name: `worktree.ensure(branch, base,
+    of the workflow disagree about the name: `worktree.ensure(branch, base,
     ...)` asks for `base`, and `reducers.review_gate(review, branch,
-    base_branch)` asks for `base_branch`. An `args:` entry cannot bridge it --
-    yaml `args` are literals and the base branch is per-run -- and renaming
+    base_branch)` asks for `base_branch`. A declared `args` entry cannot bridge
+    it -- `args` are literals and the base branch is per-run -- and renaming
     either parameter would change a shipped step or a ported gate. Both keys are
     reserved, so no phase result can make them disagree.
 
@@ -114,34 +111,28 @@ def subtask_context(
 
 
 _DOCUMENT_INPUTS = {"spec_path": "spec", "plan_path": "plan"}
-"""Which phase's `writes:` template each §7 document-path input comes from.
+"""Which phase's `writes` template each §7 document-path input comes from.
 
-Keyed on the phase *name*, not on a guess about the path: `builtin/task.yaml`
-names them `spec` and `plan`, and matching on the template text would make a
-document whose plan phase writes into `docs/specs/` resolve backwards.
+Keyed on the phase *name*, not on a guess about the path: `TASK` names them
+`spec` and `plan`, and matching on the template text would make a workflow
+whose plan phase writes into `docs/specs/` resolve backwards.
 """
 
 
-_AGENT_PHASES = (AgentPhase, phase_model.AgentPhase)
-"""Both agent-phase types: the YAML loader's and the declared phase model's.
-The pygents engine hands `_document_paths` a `phases.Workflow`, and a loader-only
-check would find no agent phase in it and bind no document path at all."""
-
-
 def _document_paths(
-    workflow: Workflow | phase_model.Workflow, card: models.Card | None
+    workflow: phase_model.Workflow, card: models.Card | None
 ) -> dict[str, str]:
-    """`spec_path` / `plan_path` for the whole subtask, computed once, from the document.
+    """`spec_path` / `plan_path` for the whole subtask, computed once, from the workflow.
 
     Computed at subtask start rather than when the `spec` and `plan` phases run:
-    `plan_check` may `skip_to: implement`, and `implement` still declares both
+    `plan_check` may `skip_to` `docs_commit`, and `implement` still declares both
     inputs. §7 calls them "paths in the repo, already committed" -- the path is a
-    property of the card and the document, not of a phase having executed.
+    property of the card and the workflow, not of a phase having executed.
     """
     declared = {
         name
         for phase in workflow.phases
-        if isinstance(phase, _AGENT_PHASES)
+        if isinstance(phase, phase_model.AgentPhase)
         for name in phase.inputs
         if name in _DOCUMENT_INPUTS
     }
@@ -162,10 +153,10 @@ def _document_paths(
 
 
 def _writing_phase(
-    workflow: Workflow | phase_model.Workflow, phase_name: str, input_name: str
-) -> AgentPhase | phase_model.AgentPhase:
+    workflow: phase_model.Workflow, phase_name: str, input_name: str
+) -> phase_model.AgentPhase:
     found = next((p for p in workflow.phases if p.name == phase_name), None)
-    if not isinstance(found, _AGENT_PHASES) or found.writes is None:
+    if not isinstance(found, phase_model.AgentPhase) or found.writes is None:
         raise EngineError(
             f"is declared as an input, but this workflow has no agent phase named "
             f"{phase_name!r} with a `writes:` template to take the path from "
@@ -234,16 +225,16 @@ def _utcnow() -> datetime:
 Clock = Callable[[], datetime]
 
 AgentPhaseRunner = Callable[
-    ["AgentPhase", Mapping[str, Any], prompt.RenderedPrompt], Any
+    [phase_model.AgentPhase, Mapping[str, Any], prompt.RenderedPrompt], Any
 ]
-"""The seam sibling bf8e415b fills: `(phase, context, rendered) -> result`.
+"""The seam `dispatch.AgentRunner` fills: `(phase, context, rendered) -> result`.
 
-The engine resolves the phase's declared `inputs` and renders the prompt before
+The walk resolves the phase's declared `inputs` and renders the prompt before
 the call, because that is exactly where §6 puts step 2 -- and because the runner
 cannot dispatch without a prompt it can write to the attempt directory first.
 Everything past this call -- that directory, dispatch, schema validation, retry,
-its gates -- belongs to that subtask, not here. This module only takes the
-returned result into the context under the phase's name.
+its gates -- belongs to the runner. The walk only takes the returned result
+into the pool under the phase's name.
 """
 
 
@@ -303,36 +294,19 @@ def _gate_values(
     return values
 
 
-def _resolve(entry: Any, workflow: Workflow | None) -> Callable[..., Any]:
-    """A phase's `run`, gate or `when` entry as the callable to call.
-
-    A `phases.Step` holds the callable itself; a loader phase holds a name,
-    which only the workflow that loaded it can resolve.
-    """
-    if callable(entry):
-        return entry
-    if workflow is None:
-        raise EngineError(
-            f"names function {entry!r}, but no workflow was given to resolve it"
-        )
-    return workflow.function(entry)
-
-
-def _label(entry: Any) -> str:
-    """How messages name an entry: the name as written, or a callable's `__name__`."""
-    return entry if isinstance(entry, str) else getattr(entry, "__name__", repr(entry))
+def _label(fn: Callable[..., Any]) -> str:
+    """How messages name a callable: its `__name__`, or its `repr` when it has none."""
+    return getattr(fn, "__name__", repr(fn))
 
 
 def _evaluate_gates(
-    phase: AnyStep,
-    workflow: Workflow | None,
+    phase: phase_model.Step,
     values: Mapping[str, Any],
     warnings: list[str],
 ) -> None:
     """Run every gate in order; append warnings, raise `_GateFailed` on a verdict."""
-    for entry in phase.gates:
-        gate = _resolve(entry, workflow)
-        name = _label(entry)
+    for gate in phase.gates:
+        name = _label(gate)
         kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
         verdict = gate(**kwargs)
         if verdict is None:
@@ -357,220 +331,62 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
 
 
-def _skip_target(
-    phase: AnyStep, workflow: Workflow | None, values: Mapping[str, Any]
-) -> str | None:
+def _skip_target(phase: phase_model.Step, values: Mapping[str, Any]) -> str | None:
     """The phase to jump to, or `None` to fall through to the next one.
 
     Both `when` and `skip_to` are required for a jump: `when` alone has nowhere
-    to go, and `skip_to` alone would be an unconditional jump the document
+    to go, and `skip_to` alone would be an unconditional jump the workflow
     author did not write.
     """
     if phase.when is None or phase.skip_to is None:
         return None
-    predicate = _resolve(phase.when, workflow)
     kwargs = bind_arguments(
-        predicate, values, phase=phase.name, function=_label(phase.when)
+        phase.when, values, phase=phase.name, function=_label(phase.when)
     )
-    return phase.skip_to if predicate(**kwargs) else None
-
-
-def run_subtask(
-    workflow: Workflow,
-    store: Store,
-    *,
-    story_id: str,
-    subtask: models.SubtaskRun,
-    repo_dir: Path,
-    commands: Sequence[str] = (),
-    card: models.Card | None = None,
-    parent_story: models.Card | None = None,
-    extra_context: Mapping[str, Any] | None = None,
-    agent_runner: AgentPhaseRunner | None = None,
-    start_phase: str | None = None,
-    clock: Clock = _utcnow,
-    should_stop: Callable[[], bool] | None = None,
-) -> SubtaskSummary:
-    """Walk `workflow`'s phases for one subtask, running the deterministic ones.
-
-    `story_id` is the caller's: `Store.record_phase` and `Store.record_subtask`
-    are both keyed by it, and nothing in a subtask knows its story.
-
-    `extra_context` is the caller's half of the binding table (§12): the shipped
-    `builtin/task.yaml` gates on `verification_gate(suite_cmds,
-    allow_no_verification, caller_provided)` and `exploration_output_gate(explore,
-    provided_verification)`, and `subtask_context` is a fixed table that holds
-    none of those names. Rather than teach this module about a particular
-    document's gates, the caller supplies them. Reserved keys are refused: a
-    caller that could overwrite `worktree` would point every later step at a
-    path the engine never derived.
-
-    `should_stop` is the cooperative stop (addendum P4): asked once before each
-    phase the walk actually visits, never during one and never after the last.
-    A true answer records the subtask `stopped` and returns without starting
-    that phase. A phase already running finishes and is recorded as normal. An
-    exception from it is the caller's and is not caught.
-    """
-    index = _start_index(workflow, start_phase)
-    context = subtask_context(
-        subtask, repo_dir, commands, card=card, parent_story=parent_story
-    )
-    if extra_context:
-        reserved = sorted(set(extra_context) & set(RESERVED_CONTEXT_KEYS))
-        if reserved:
-            raise EngineError(
-                "extra_context supplies "
-                f"{', '.join(repr(key) for key in reserved)}, which the engine owns "
-                f"(reserved: {', '.join(RESERVED_CONTEXT_KEYS)})"
-            )
-        context.update(extra_context)
-    context.update(_document_paths(workflow, card))
-    summary = SubtaskSummary()
-
-    while index < len(workflow.phases):
-        phase = workflow.phases[index]
-        # Before anything about the phase runs -- the missing-runner error,
-        # `render_prompt`, the `started` row -- so a stop starts nothing.
-        if should_stop is not None and should_stop():
-            return _stop(summary, store, story_id, subtask, phase.name)
-        if not isinstance(phase, DeterministicPhase):
-            if agent_runner is None:
-                raise EngineError(
-                    "is an agent phase, but no agent runner was injected",
-                    phase=phase.name,
-                )
-            rendered = prompt.render_prompt(phase, context)
-            try:
-                result = agent_runner(phase, dict(context), rendered)
-            except AgentPhaseFailed as failure:
-                # §6 step 8 / §12 line 429: exhausted retries or a non-retryable
-                # gate failure ends the subtask here. The runner has already
-                # journalled every attempt and the phase's terminal status.
-                return _escalate(
-                    summary, store, story_id, subtask, phase.name, failure.detail
-                )
-            except Exception as error:
-                # Total, for the reason `_run_deterministic` is: the runner is
-                # the one place a harness, a gate and the filesystem all meet,
-                # and an exception escaping the walk would leave the subtask
-                # recorded `started` forever -- which resume reads as work in
-                # flight. `render_prompt` stays outside the try: a document that
-                # declares an unresolvable input is a load-time bug, and its
-                # `EngineError` must still reach the caller.
-                return _escalate(
-                    summary, store, story_id, subtask, phase.name, _render_error(error)
-                )
-            _bind_result(context, phase.name, result)
-            summary.results[phase.name] = result
-            index += 1
-            continue
-        outcome = _run_deterministic(
-            phase, workflow, store, story_id, subtask, context, clock
-        )
-        summary.warnings.extend(outcome.warnings)
-        if not outcome.ok:
-            if phase.best_effort:
-                # §12: the board write is the one thing allowed to fail quietly.
-                # Quietly in the *run*, not in the report -- a run that says
-                # `done` while the card never moved is the failure mode this
-                # warning exists to prevent.
-                summary.warnings.append(
-                    f"best-effort phase {phase.name!r} failed: {outcome.detail}"
-                )
-                index += 1
-                continue
-            return _escalate(
-                summary, store, story_id, subtask, phase.name, outcome.detail
-            )
-        _bind_result(context, phase.name, outcome.result)
-        summary.results[phase.name] = outcome.result
-        if outcome.skip_to is None:
-            index += 1
-            continue
-        target = workflow.phase_names.index(outcome.skip_to)
-        summary.skipped.extend(workflow.phase_names[index + 1 : target])
-        index = target
-
-    _record_subtask_status(store, story_id, subtask, summary.status)
-    return summary
+    return phase.skip_to if phase.when(**kwargs) else None
 
 
 def _bind_result(context: dict[str, Any], phase_name: str, result: Any) -> None:
     """Fold one phase's result into the binding table under its own name.
 
-    The shipped `builtin/task.yaml` names its worktree-setup phase `worktree`,
-    exactly the key `subtask_context` binds the real worktree path under. Its
-    result is still recorded and returned in the summary either way (see
-    `run_subtask`); it is just never written back here, so the reserved value
-    survives for every later phase that binds `worktree` (or any other
-    reserved key) by name, instead of being silently replaced by a same-named
-    phase's own result.
+    `TASK` names its worktree-setup phase `worktree`, exactly the key
+    `subtask_context` binds the real worktree path under. The result is still
+    recorded and returned in the summary either way; it is just never written
+    back here, so the reserved value survives for every later phase that binds
+    `worktree` (or any other reserved key) by name, instead of being silently
+    replaced by a same-named phase's own result. `runtime/context.py`'s
+    `binding_table` applies the same rule to the pygents pool.
     """
     if phase_name not in RESERVED_CONTEXT_KEYS:
         context[phase_name] = result
 
 
-def _start_index(workflow: Workflow, start_phase: str | None) -> int:
-    if start_phase is None:
-        return 0
-    for index, phase in enumerate(workflow.phases):
-        if phase.name == start_phase:
-            return index
-    raise EngineError(
-        f"cannot start at {start_phase!r}: workflow {workflow.name!r} has no such phase "
-        f"(phases: {', '.join(workflow.phase_names)})"
-    )
-
-
-def _run_deterministic(
-    phase: DeterministicPhase,
-    workflow: Workflow,
-    store: Store,
-    story_id: str,
-    subtask: models.SubtaskRun,
-    context: Mapping[str, Any],
-    clock: Clock,
-) -> _Outcome:
-    return run_one_step(
-        phase=phase,
-        table=context,
-        store=store,
-        story_id=story_id,
-        subtask=subtask,
-        clock=clock,
-        workflow=workflow,
-    )
-
-
 def run_one_step(
     *,
-    phase: AnyStep,
+    phase: phase_model.Step,
     table: Mapping[str, Any],
     store: Store,
     story_id: str,
     subtask: models.SubtaskRun,
     clock: Clock,
-    workflow: Workflow | None = None,
 ) -> _Outcome:
     """One deterministic phase, run, judged and recorded.
 
-    The old engine's walk and the pygents engine's `step_phase` both call this,
-    so both judge a step identically: binding, the mapping check, gates, `when`
-    and `skip_to`, and the `started`/`done`/`failed` phase rows. `workflow` is
-    needed only to resolve a loader phase's names; a `phases.Step` carries its
-    callables. `best_effort` is the caller's to apply -- this returns the
-    verdict, not the walk's reaction to it.
+    The pygents engine's `step_phase` tool calls this through
+    `bridge.call_step`: binding, the mapping check, gates, `when` and
+    `skip_to`, and the `started`/`done`/`failed` phase rows. `best_effort` is
+    the caller's to apply -- this returns the verdict, not the walk's reaction
+    to it.
     """
     started_at = clock()
     _record_phase(store, story_id, subtask, phase, "started", started_at, None)
     warnings: list[str] = []
     try:
-        function = _resolve(phase.run, workflow)
         label = _label(phase.run)
         kwargs = bind_arguments(
-            function, table, phase.args, phase=phase.name, function=label
+            phase.run, table, phase.args, phase=phase.name, function=label
         )
-        result = function(**kwargs)
+        result = phase.run(**kwargs)
         if not isinstance(result, Mapping):
             raise EngineError(
                 f"returned {type(result).__name__}, but a deterministic phase must "
@@ -579,8 +395,8 @@ def run_one_step(
                 phase=phase.name,
                 function=label,
             )
-        _evaluate_gates(phase, workflow, _gate_values(table, phase.name, result), warnings)
-        skip_to = _skip_target(phase, workflow, _gate_values(table, phase.name, result))
+        _evaluate_gates(phase, _gate_values(table, phase.name, result), warnings)
+        skip_to = _skip_target(phase, _gate_values(table, phase.name, result))
     except _GateFailed as failure:
         _record_phase(
             store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail
@@ -608,7 +424,7 @@ def _record_phase(
     store: Store,
     story_id: str,
     subtask: models.SubtaskRun,
-    phase: AnyStep,
+    phase: phase_model.Step,
     status: models.Status,
     started_at: datetime,
     ended_at: datetime | None,

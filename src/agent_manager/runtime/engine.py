@@ -1,11 +1,10 @@
 """The pygents subtask engine (pygents-engine design §4): one subtask, one agent, one loop.
 
-`run_subtask` is the old engine's `run_subtask` with the walk replaced. The
-binding table, the escalation and the final subtask row are the old engine's
-own helpers, called exactly as it calls them, so a summary, a journal line or
-a phase row cannot tell the two engines apart (G10). What differs is the walk:
-the workflow is compiled into two pygents tools, one `Agent` runs them, and
-`agent.run()` is always consumed to the end -- never broken or returned out of.
+The binding table, the escalation and the final subtask row are
+`runtime/walk.py`'s helpers, so a summary, a journal line or a phase row keeps
+the shape it has always had (G10). The workflow is compiled into two pygents
+tools, one `Agent` runs them, and `agent.run()` is always consumed to the end
+-- never broken or returned out of.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
 
-from agent_manager import engine as old
+from agent_manager.runtime import walk
 from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN hook
 from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
@@ -64,10 +63,10 @@ def run_subtask(
     parent_story: Any = None,
     extra_context: Mapping[str, Any] | None = None,
     agent_runner: Any = None,
-    clock: Callable[[], Any] = old._utcnow,
+    clock: Callable[[], Any] = walk._utcnow,
     should_stop: Callable[[], bool] | None = None,
     resume_from: Checkpoint | None = None,
-) -> old.SubtaskSummary:
+) -> walk.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`.
 
     Every turn is saved as a `turn` checkpoint before it runs, and the run ends
@@ -117,22 +116,22 @@ async def _drive(
     clock: Callable[[], Any],
     should_stop: Callable[[], bool] | None,
     resume_from: Checkpoint | None,
-) -> old.SubtaskSummary:
-    # The binding, built and refused exactly as the old engine builds it:
-    # before any agent exists, so a refusal records nothing.
-    binding = old.subtask_context(
+) -> walk.SubtaskSummary:
+    # The binding, built and refused before any agent exists, so a refusal
+    # records nothing.
+    binding = walk.subtask_context(
         subtask, repo_dir, commands, card=card, parent_story=parent_story
     )
     if extra_context:
-        reserved = sorted(set(extra_context) & set(old.RESERVED_CONTEXT_KEYS))
+        reserved = sorted(set(extra_context) & set(walk.RESERVED_CONTEXT_KEYS))
         if reserved:
-            raise old.EngineError(
+            raise walk.EngineError(
                 "extra_context supplies "
                 f"{', '.join(repr(key) for key in reserved)}, which the engine owns "
-                f"(reserved: {', '.join(old.RESERVED_CONTEXT_KEYS)})"
+                f"(reserved: {', '.join(walk.RESERVED_CONTEXT_KEYS)})"
             )
         binding.update(extra_context)
-    binding.update(old._document_paths(workflow, card))
+    binding.update(walk._document_paths(workflow, card))
 
     # Compiled first on both paths: it registers the digest-prefixed tools
     # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
@@ -170,8 +169,8 @@ async def _drive(
         _forget(agent.name)
 
 
-async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
-    summary = old.SubtaskSummary()
+async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
+    summary = walk.SubtaskSummary()
     token = current_run.set(deps)
     # Every `checkpoint.save` below runs inside this `try`, while `current_run`
     # is still set: after the `finally` resets it, `save` is a silent no-op.
@@ -182,18 +181,18 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
         # The stop, raised by the BEFORE_TURN hook after it saved `parked`:
         # no further row, so that one stays the newest.
         _collect(agent, deps, summary)
-        return old._stop(
+        return walk._stop(
             summary, deps.store, deps.story_id, deps.subtask, parked.before_phase
         )
     except C.Escalated as esc:
         _collect(agent, deps, summary)
         checkpoint.save(agent, "escalated")
-        return old._escalate(
+        return walk._escalate(
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail
         )
-    except old.EngineError:
-        # A missing runner or an unresolvable input: a wiring or document bug
-        # the old engine raises to its caller, `.phase`/`.parameter` intact.
+    except walk.EngineError:
+        # A missing runner or an unresolvable input: a wiring or workflow bug
+        # raised to the caller, `.phase`/`.parameter` intact.
         # Not an escalation, so no checkpoint row.
         raise
     except Exception as error:
@@ -201,13 +200,13 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
         checkpoint.save(agent, "escalated")
         # `deps.running` is only `None` if the error came before any tool was
         # entered; there is no phase to name then.
-        return old._escalate(
+        return walk._escalate(
             summary,
             deps.store,
             deps.story_id,
             deps.subtask,
             deps.running or "?",
-            old._render_error(error),
+            walk._render_error(error),
         )
     else:
         _collect(agent, deps, summary)
@@ -216,11 +215,11 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
         # A `BaseException` (cancellation, KeyboardInterrupt) passes straight
         # through here and writes nothing: the last `turn` row stands.
         current_run.reset(token)
-    old._record_subtask_status(deps.store, deps.story_id, deps.subtask, summary.status)
+    walk._record_subtask_status(deps.store, deps.story_id, deps.subtask, summary.status)
     return summary
 
 
-def _collect(agent: Agent, deps: RunDeps, summary: old.SubtaskSummary) -> None:
+def _collect(agent: Agent, deps: RunDeps, summary: walk.SubtaskSummary) -> None:
     summary.results = {
         item.id: context.decode(item.content)
         for item in agent.context_pool.items

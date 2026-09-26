@@ -271,7 +271,7 @@ def run_suite(
     same callable-injection seam `worktree.py` uses for git.
 
     `explore` is the Explore phase's result, bound by parameter name by
-    `engine.bind_arguments` (no workflow edit needed; the integrate workflow
+    `walk.bind_arguments` (no workflow edit needed; the integrate workflow
     has no such phase and gets `None`). Its `verification.typecheck` and each
     `verification.lint` command run after `commands` and are reported, and fail
     the suite, exactly like `--verify` commands (pygents design G9 item 4).

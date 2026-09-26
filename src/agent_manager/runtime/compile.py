@@ -27,10 +27,10 @@ from typing import Any
 
 from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
-from agent_manager import engine as old_engine
 from agent_manager import prompt
-from agent_manager.errors import AgentPhaseFailed, EngineError
-from agent_manager.runtime import bridge, context
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime import bridge, context, walk
+from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
 from agent_manager.workflow.phases import AgentPhase, Workflow
 
@@ -99,22 +99,47 @@ def _rename(fn: Any, name: str) -> None:
     fn.__qualname__ = name
 
 
+def _fresh_loop_after(wf: Workflow) -> frozenset[str]:
+    """The critics whose pass gives what follows a fresh loop count (G4).
+
+    G4 lets each critic loop at most once, so a loop one critic spent must not
+    use up the next one's. A critic's pass resets the count unless some later
+    phase's `Goto` lands at or before it: that walk can come back through the
+    critic, and a reset there would re-earn the loop on every pass and never
+    escalate. Such workflows keep the one shared count.
+    """
+    names = wf.phase_names
+    fresh = set()
+    for i, p in enumerate(wf.phases):
+        if not isinstance(p, AgentPhase) or p.on_fail is None:
+            continue
+        if not any(
+            isinstance(q, AgentPhase)
+            and q.on_fail is not None
+            and names.index(q.on_fail.phase) <= i
+            for q in wf.phases[i + 1 :]
+        ):
+            fresh.add(p.name)
+    return frozenset(fresh)
+
+
 def _build(wf: Workflow, *, suffix: str) -> Compiled:
     holder: dict[str, Compiled] = {}
+    fresh_loop_after = _fresh_loop_after(wf)
 
     async def agent_phase(phase: str, loop: int, pool: ContextPool, memory: ContextQueue):
         deps = current_run.get()
         deps.running = phase
         p = deps.workflow.phase(phase)
         if deps.agent_runner is None:
-            # A wiring bug, not a phase failure: raised as the old engine raises
-            # it, before anything runs, rather than escalated as a TypeError.
+            # A wiring bug, not a phase failure: raised before anything runs,
+            # rather than escalated as a TypeError.
             raise EngineError(
                 "is an agent phase, but no agent runner was injected", phase=phase
             )
         table = context.binding_table(pool, memory, phase)
-        # Outside the try, as in the old engine: an input no resolver provides
-        # is a workflow bug and its `EngineError` must reach the caller as is.
+        # Outside the try: an input no resolver provides is a workflow bug
+        # and its `EngineError` must reach the caller as is.
         rendered = prompt.render_prompt(p, table)
         try:
             result = await bridge.call_agent(deps.agent_runner, p, table, rendered)
@@ -127,11 +152,11 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 return
             raise Escalated(phase, failure.detail) from failure
         except Exception as error:
-            # Total, as the old engine's agent branch is: an exception escaping
-            # the walk would leave the subtask recorded `started` forever.
-            raise Escalated(phase, old_engine._render_error(error)) from error
+            # Total: an exception escaping the walk would leave the subtask
+            # recorded `started` forever.
+            raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
-        nxt = holder["compiled"].after(phase, loop)
+        nxt = holder["compiled"].after(phase, 0 if phase in fresh_loop_after else loop)
         if nxt is not None:
             yield nxt
 
@@ -142,7 +167,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         # A step never reads feedback, so it gets an empty memory window.
         table = context.binding_table(pool, ContextQueue(limit=1), phase)
         outcome = await bridge.call_step(
-            old_engine.run_one_step,
+            walk.run_one_step,
             {
                 "phase": p,
                 "table": table,

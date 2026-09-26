@@ -1,8 +1,7 @@
 """The builtin `integrate` workflow as declared phase-model data (spec G3).
 
-Pinned to `builtin/integrate.yaml` by `tests/workflow/test_declared.py`, the
-same way `workflow.task.TASK` is pinned to `task.yaml`. The timeout floor is
-`workflow.task`'s -- one launcher timeout for every declared workflow.
+The timeout floor is `workflow.task`'s -- one launcher timeout for every
+declared workflow.
 
 `merge_completed_gate` lives in `steps/integrate.py`; that module is imported
 as `integrate_steps` so it is never confused with this one.
@@ -30,4 +29,4 @@ INTEGRATE = Workflow("integrate", (
     ),
     Step("verify", verify.run_suite, gates=(reducers.verification_passed_gate,)),
 ))
-"""`builtin/integrate.yaml`, phase for phase."""
+"""Resolve, then verify (Integrate addendum I3)."""

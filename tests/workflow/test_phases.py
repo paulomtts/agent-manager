@@ -9,11 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from agent_manager import results
-from agent_manager.steps import plan_check as plan_check_module
-from agent_manager.steps import reducers, rollup
 from agent_manager.workflow import phases as phases_module
-from agent_manager.workflow.loader import load_builtin, load_workflow
 from agent_manager.workflow.phases import (
     AgentPhase,
     Goto,
@@ -21,12 +17,6 @@ from agent_manager.workflow.phases import (
     Step,
     Workflow,
     WorkflowError,
-    from_loader,
-)
-from agent_manager.workflow.registry import (
-    FunctionRegistry,
-    UnknownFunctionError,
-    default_registry,
 )
 
 LAUNCHER = timedelta(minutes=10)
@@ -249,129 +239,3 @@ def test_digest_covers_every_agent_field(field, before, after):
     assert wf(agent("a", **{field: before})).digest() != wf(agent("a", **{field: after})).digest()
 
 
-# --- from_loader (card 0326732a) -------------------------------------------
-
-
-def fake_run_suite(worktree): return {"passed": True}
-def fake_verification_passed_gate(result): return None
-def fake_merge_completed_gate(result): return None
-def fake_when(state): return True
-def fake_run(worktree): return {"ok": True}
-
-
-def test_from_loader_resolves_every_name_of_the_shipped_task():
-    loaded = load_builtin("task", default_registry())
-    converted = from_loader(loaded)
-    assert converted.phase_names == tuple(p.name for p in loaded.phases)
-    review = converted.phase("review")
-    assert review.result is results.ReviewResult
-    assert review.gates[0] is reducers.review_blockers_gate
-    assert reducers.review_gate in review.gates
-    assert reducers.plan_hash_gate_adapter in review.gates
-    assert converted.phase("explore").retry == Retry(2, ("schema_invalid", "gate_failed"))
-    plan_check = converted.phase("plan_check")
-    assert plan_check.skip_to == "docs_commit"
-    assert plan_check.when is plan_check_module.has_validated_plan
-    assert plan_check.run is plan_check_module.find_validated_plan
-
-
-def test_from_loader_keeps_fakes_from_a_test_registry():
-    # The engine tests build workflows from fake registries; the conversion
-    # must carry whatever callable the loaded workflow holds, by identity.
-    loaded = load_builtin("integrate", default_registry())
-    assert from_loader(loaded).phase("verify").run is loaded.function("verify.run_suite")
-
-    fakes = FunctionRegistry()
-    fakes.register("merge_completed_gate", fake_merge_completed_gate)
-    fakes.register("verify.run_suite", fake_run_suite)
-    fakes.register("verification_passed_gate", fake_verification_passed_gate)
-    converted = from_loader(load_builtin("integrate", fakes))
-    assert converted.phase("verify").run is fake_run_suite
-    assert converted.phase("verify").gates == (fake_verification_passed_gate,)
-    assert converted.phase("resolve").gates == (fake_merge_completed_gate,)
-
-
-def test_from_loader_maps_a_deterministic_phase_field_by_field():
-    loaded = load_builtin("task", default_registry())
-    step = from_loader(loaded).phase("mark_in_progress")
-    assert isinstance(step, Step)
-    assert step.run is rollup.set_status
-    assert step.args == {"status": "in_progress"}
-    # A copy, not the loader model's own dict (Review Focus 4).
-    assert step.args is not loaded.phase("mark_in_progress").args
-    assert step.best_effort is True
-    assert step.when is None and step.skip_to is None and step.gates == ()
-
-
-def test_from_loader_maps_an_agent_phase_field_by_field():
-    converted = from_loader(load_builtin("task", default_registry()))
-    spec = converted.phase("spec")
-    assert isinstance(spec, AgentPhase)
-    assert spec.role == "spec_author"
-    assert spec.inputs == ("card", "explore", "spec_path")
-    assert spec.result is results.SpecResult
-    assert spec.writes == "docs/superpowers/specs/{stem}.md"
-    assert spec.retry is None and spec.gates == ()
-    assert all(p.on_fail is None for p in converted.phases if isinstance(p, AgentPhase))
-
-
-def test_from_loader_puts_the_timeout_on_every_agent_phase():
-    loaded = load_builtin("task", default_registry())
-    agents = [p for p in from_loader(loaded).phases if isinstance(p, AgentPhase)]
-    assert agents and all(p.timeout == timedelta(minutes=30) for p in agents)
-    longer = from_loader(loaded, timeout=timedelta(minutes=45))
-    assert all(p.timeout == timedelta(minutes=45)
-               for p in longer.phases if isinstance(p, AgentPhase))
-
-
-def test_from_loader_digest_is_reproducible_across_loads():
-    # Review Focus 5: sibling 04a5b91e pins declared digests to this value.
-    first = from_loader(load_builtin("task", default_registry())).digest()
-    second = from_loader(load_builtin("task", default_registry())).digest()
-    assert first == second
-
-
-def _loaded_with_agent(agent_extra: str):
-    """A two-phase `loader.Workflow`: an agent phase `ask` with `agent_extra`
-    YAML lines appended, then a deterministic phase `later`."""
-    registry = FunctionRegistry()
-    registry.register("fake_when", fake_when)
-    registry.register("fake_run", fake_run)
-    document = (
-        "name: t\n"
-        "phases:\n"
-        "  - name: ask\n"
-        "    kind: agent\n"
-        "    role: explorer\n"
-        f"{agent_extra}"
-        "  - name: later\n"
-        "    kind: deterministic\n"
-        "    run: fake_run\n"
-    )
-    return load_workflow(document, registry)
-
-
-def test_from_loader_rejects_an_unknown_result_name():
-    loaded = _loaded_with_agent("    result: NoSuchResult\n")
-    with pytest.raises(WorkflowError, match="NoSuchResult") as info:
-        from_loader(loaded)
-    assert info.value.phase == "ask"
-
-
-@pytest.mark.parametrize("agent_extra", [
-    "    when: fake_when\n",
-    "    skip_to: later\n",
-    "    when: fake_when\n    skip_to: later\n",
-], ids=["when", "skip_to", "both"])
-def test_from_loader_rejects_when_on_an_agent_phase(agent_extra):
-    loaded = _loaded_with_agent(agent_extra)
-    with pytest.raises(WorkflowError, match=r"when.*skip_to") as info:
-        from_loader(loaded)
-    assert info.value.phase == "ask"
-
-
-def test_from_loader_lets_an_unresolved_name_raise_unknown_function_error():
-    # Review Focus 3: the loader's own error, not a KeyError or a WorkflowError.
-    stripped = _loaded_with_agent("").model_copy(update={"functions": {}})
-    with pytest.raises(UnknownFunctionError, match="fake_run"):
-        from_loader(stripped)

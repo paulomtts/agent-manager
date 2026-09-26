@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, cli, models, store
-from agent_manager.workflow.loader import load_builtin
+from agent_manager.workflow import task as task_workflow
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -90,15 +90,6 @@ INTEGRATION_BRANCH = "m3-integrate"
 """`integration.integration_branch` for the conftest's `m3` prefix."""
 
 
-@pytest.fixture(scope="module", params=["yaml", "pygents"])
-def engine(request) -> str:
-    """Overrides the conftest's `engine` (spec test 7): every lane scenario
-    runs once per engine, and on pygents each lane thread's walk does its own
-    `asyncio.run`. Fixture params, not a parametrize mark, so no marker reaches
-    this module."""
-    return request.param
-
-
 def test_this_module_runs_in_the_default_suite_unmarked(request):
     """No `e2e` marker may reach this module, or parallel wiring stops being
     checked on every `uv run pytest`."""
@@ -107,14 +98,7 @@ def test_this_module_runs_in_the_default_suite_unmarked(request):
 
 
 def test_two_lanes_overlap_in_implement_and_the_milestone_finishes(
-    parallel_board,
-    rendezvous,
-    run_milestone_cli,
-    engine,
-    tmp_path,
-    engine_parity,
-    board_card_labels,
-    checkpoint_rows,
+    parallel_board, rendezvous, run_milestone_cli, checkpoint_rows
 ):
     """Spec test 1."""
     root = parallel_board["root"]
@@ -163,10 +147,7 @@ def test_two_lanes_overlap_in_implement_and_the_milestone_finishes(
     assert _git(root, "rev-parse", "main").strip() == main_before
 
     rows = checkpoint_rows(root, data["run_id"])
-    assert (rows > 0) is (engine == "pygents"), (engine, rows)
-    engine_parity(
-        "parallel-two-lanes", engine, data, tmp=tmp_path, cards=board_card_labels(parallel_board)
-    )
+    assert rows > 0, rows
 
 
 def _story_span(run: models.Run, story_id: str):
@@ -180,13 +161,7 @@ def _story_span(run: models.Run, story_id: str):
 
 
 def test_one_lane_runs_the_level_s_stories_one_after_the_other(
-    parallel_board,
-    rendezvous,
-    run_milestone_cli,
-    engine,
-    tmp_path,
-    engine_parity,
-    board_card_labels,
+    parallel_board, rendezvous, run_milestone_cli
 ):
     """Spec test 2: `--max-concurrent 1` behaves as the sequential runner did.
     Count 1 keeps the rendezvous satisfiable by a single lane."""
@@ -205,9 +180,6 @@ def test_one_lane_runs_the_level_s_stories_one_after_the_other(
     b_start, b_end = _story_span(run, stories["B"])
     # Census order within the level: A's lane runs to the end before B's starts.
     assert a_end <= b_start, (a_start, a_end, b_start, b_end)
-    engine_parity(
-        "parallel-one-lane", engine, data, tmp=tmp_path, cards=board_card_labels(parallel_board)
-    )
 
 
 def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection(
@@ -297,7 +269,7 @@ def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_star
     (parked,) = data["stopped"]
     assert parked["story"] == stories["B"]
     assert parked["subtask"] in (b1, b2)
-    phase_names = load_builtin(cli.WORKFLOW_NAME).phase_names
+    phase_names = task_workflow.TASK.phase_names
     before = parked["before_phase"]
     assert before in phase_names, parked
     later = set(phase_names[phase_names.index(before):])
