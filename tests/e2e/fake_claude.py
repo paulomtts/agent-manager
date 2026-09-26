@@ -10,18 +10,20 @@ adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no extra argv flag and no import
 of `agent_manager` -- a brief that omits the contract must make this script
-fail, because that failure is the test's whole point. There are exactly four
+fail, because that failure is the test's whole point. There are exactly five
 test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
 from its own cwd and compares with the brief's `## branch`;
 `IMPLEMENT_EDITS_MARKER`, a JSON file beside it giving the files an implement
 writes for the brief's `## branch`; the implement-only rendezvous
 (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
-wait for other lanes and changes nothing it writes; and `RESOLVER_ENV`, which
+wait for other lanes and changes nothing it writes; `RESOLVER_ENV`, which
 only makes the resolve phase leave the merge it was given unfinished while
-still claiming `resolved`, so git has to catch the lie. The resolve phase
-learns the tip and the conflicting files from the brief's `## merge_tip` and
-`## conflict_files` and nowhere else.
+still claiming `resolved`, so git has to catch the lie; and
+`CRITIC_BLOCKS_ENV`, a budget file that makes a critic block a set number of
+times with a fixed reason. The resolve phase learns the tip and the
+conflicting files from the brief's `## merge_tip` and `## conflict_files` and
+nowhere else.
 
 Standard library only: it runs under a bare `#!<python>` line.
 """
@@ -321,6 +323,82 @@ def rendezvous(cwd):
         time.sleep(RENDEZVOUS_POLL)
 
 
+CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
+"""Test scaffolding, never in a brief: the path of a JSON budget of critic blocks.
+
+Unset or empty means no critic ever blocks -- today's behaviour exactly. Set,
+it names a file the test wrote, mapping a critic phase (one of
+`CRITIC_PHASES`) to how many more times it must block, from 0 to
+`MAX_CRITIC_BLOCKS`. Each block spends one and writes the file back, so a
+count of 1 blocks once and then passes, and 2 blocks twice. Which critic
+blocks, and how often, comes from this file alone, never from the brief
+(Rule 4); the whole file is checked on every critic call, so a typo stops the
+fake instead of reading as "no block"."""
+
+CRITIC_PHASES = ("validate_spec", "validate_plan")
+"""The two critic phases of `builtin/task.yaml`, the only keys a budget may name."""
+
+MAX_CRITIC_BLOCKS = 2
+"""The highest count a budget may give: one loop plus the block that escalates."""
+
+CRITIC_BLOCK_REASON = (
+    "fake-claude critic: the critic-blocks budget told this critic to block"
+)
+"""The `reason` of every blocked critic result. Fixed, so a test can find it in
+the looped-to phase's `## feedback` and in the escalation detail."""
+
+
+def _critic_budget(path):
+    """The budget file's table, refused whole unless every entry is well formed."""
+    if not path.is_file():
+        raise FakeClaudeError(f"{CRITIC_BLOCKS_ENV} names {path}, which is not a file")
+    try:
+        table = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise FakeClaudeError(
+            f"{CRITIC_BLOCKS_ENV} names {path}, which is not valid JSON: {error}"
+        ) from None
+    if not isinstance(table, dict):
+        raise FakeClaudeError(
+            f"{CRITIC_BLOCKS_ENV} names {path}, which is not a JSON object of "
+            "critic phases"
+        )
+    for name, count in table.items():
+        if name not in CRITIC_PHASES:
+            raise FakeClaudeError(
+                f"{CRITIC_BLOCKS_ENV} names {path}, whose key {name!r} is not a "
+                f"critic phase (one of {list(CRITIC_PHASES)})"
+            )
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 0 <= count <= MAX_CRITIC_BLOCKS
+        ):
+            raise FakeClaudeError(
+                f"{CRITIC_BLOCKS_ENV} names {path}, which gives {name!r} {count!r} "
+                f"blocks; a count is a whole number from 0 to {MAX_CRITIC_BLOCKS}"
+            )
+    return table
+
+
+def critic_blocks(phase):
+    """`True`, spending one block, when the budget says `phase` must block now.
+
+    A no-op returning `False` unless `CRITIC_BLOCKS_ENV` is set. The file is
+    only rewritten when a block is spent.
+    """
+    raw = os.environ.get(CRITIC_BLOCKS_ENV, "")
+    if raw == "":
+        return False
+    path = Path(raw)
+    table = _critic_budget(path)
+    remaining = table.get(phase, 0)
+    if remaining == 0:
+        return False
+    table[phase] = remaining - 1
+    path.write_text(json.dumps(table, sort_keys=True), encoding="utf-8")
+    return True
+
 
 def _common_dir_file(cwd, name):
     """`<git common dir>/<name>`, found from `cwd`."""
@@ -535,7 +613,12 @@ def build_result(phase, payload, text, cwd):
             summary=SUMMARY,
             verification=payload["verification"],
         )
-    if phase in ("validate_spec", "validate_plan"):
+    if phase in CRITIC_PHASES:
+        # Test scaffolding: the budget, never the brief, says whether to block.
+        if critic_blocks(phase):
+            return override(
+                payload, blockers=True, reason=CRITIC_BLOCK_REASON, summary=SUMMARY
+            )
         return override(payload, blockers=False, reason=None, summary=SUMMARY)
     if phase == "spec":
         relative = _section(found, "spec_path", phase)
