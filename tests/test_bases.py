@@ -371,3 +371,53 @@ async def test_a_merge_in_progress_fails_for_a_human(
     assert _merge_head(wt) == rev(repo, "m7/c")
     assert rev(repo, BASE) == head
     assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_failing_verify_fails_the_base(two_story_repo: Path, MASTER_BEFORE: str):
+    repo = two_story_repo
+
+    with pytest.raises(bases.BaseFailed, match="failed its verification") as excinfo:
+        await _build(repo, ["m7/a", "m7/b"], commands=["false"])
+
+    assert excinfo.value.stopped is False
+    assert BASE in excinfo.value.detail
+    assert str(base_worktree(repo)) in excinfo.value.detail
+    # The merges stand; only the verdict failed.
+    assert is_ancestor(repo, "m7/b", BASE)
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_an_empty_suite_is_judged_before_running(
+    two_story_repo: Path, MASTER_BEFORE: str
+):
+    repo = two_story_repo
+
+    with pytest.raises(bases.BaseFailed, match="no full-suite command") as excinfo:
+        await _build(repo, ["m7/a", "m7/b"], commands=[], allow_no_verification=False)
+    assert excinfo.value.stopped is False
+
+    result = await _build(repo, ["m7/a", "m7/b"], commands=[], allow_no_verification=True)
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=[], already_merged=["m7/b"], resolved=[]
+    )
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_verification_runs_in_the_base_worktree(
+    two_story_repo: Path, MASTER_BEFORE: str
+):
+    repo = two_story_repo
+
+    await _build(
+        repo,
+        ["m7/a", "m7/b"],
+        commands=["test -f a.txt", "test -f b.txt", "touch verified-here.txt"],
+    )
+
+    assert (base_worktree(repo) / "verified-here.txt").is_file()
+    assert not (repo / "verified-here.txt").exists()
+    assert rev(repo, "master") == MASTER_BEFORE

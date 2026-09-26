@@ -29,6 +29,7 @@ from pathlib import Path
 from agent_manager import cli
 from agent_manager.dag import RootPlan
 from agent_manager.runtime.stop import StopSignal
+from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, _ref_exists, merge_tip
 from agent_manager.steps.worktree import ensure, run_git
 from agent_manager.store import Store
@@ -71,6 +72,30 @@ def _missing_tips(repo: Path, tips: list[str]) -> list[str]:
     return [tip for tip in tips if not _ref_exists(run_git, str(repo), tip)]
 
 
+def _verify(
+    commands: list[str], allow_no_verification: bool, branch: str, worktree: Path
+) -> str | None:
+    """`None` when the base is verified or opted out, else the reason.
+
+    Mirrors `integration._final_verification`: an empty suite is judged by
+    `verification_gate` first, because running zero commands reports
+    `passed: True` and `verification_passed_gate` would wave it through.
+    `bool()` matches `cli.gate_context`: the reducer tests `is True`.
+    """
+    missing = reducers.verification_gate(commands, bool(allow_no_verification), True)
+    if missing is not None:
+        return f"the merged base {branch} has no verification: {missing['detail']}"
+    if not commands:
+        return None
+    verdict = reducers.verification_passed_gate(verify.run_suite(commands, worktree))
+    if verdict is None:
+        return None
+    return (
+        f"the merged base {branch} failed its verification in {worktree}: "
+        f"{verdict['detail']}"
+    )
+
+
 async def build(
     root: RootPlan,
     tips: list[str],
@@ -98,6 +123,7 @@ async def build(
         )
     repo = Path(repo_dir).resolve()
     worktree = cli.worktree_for(repo, root.branch)
+    suite = list(commands)
 
     missing = await asyncio.to_thread(_missing_tips, repo, tips)
     if missing:
@@ -132,6 +158,12 @@ async def build(
             already_merged.append(tip)
         else:
             merged.append(tip)
+
+    failure = await asyncio.to_thread(
+        _verify, suite, allow_no_verification, root.branch, worktree
+    )
+    if failure is not None:
+        raise BaseFailed(failure)
 
     return BaseResult(
         branch=root.branch, merged=merged, already_merged=already_merged, resolved=[]
