@@ -13,15 +13,43 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
 
 from agent_manager import engine as old
+from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN hook
 from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
 from agent_manager.runtime.state import RunDeps, current_run
 from agent_manager.workflow.phases import Workflow
+
+if TYPE_CHECKING:
+    # Annotation only (the module has `from __future__ import annotations`);
+    # the name `store` is taken by `run_subtask`'s parameter.
+    from agent_manager.store import Checkpoint
+
+
+class CheckpointMismatch(Exception):
+    """A checkpoint saved under another version of the workflow: its digest is
+    not the digest of the workflow asked to resume it. Raised before any agent
+    is built, so nothing is run or recorded."""
+
+
+def pending_phase(checkpoint: Checkpoint) -> str | None:
+    """The phase `checkpoint`'s agent would run next, or `None` if it holds no turn.
+
+    Read-only: it reads the stored `Agent.to_dict()` and builds nothing, so a
+    caller outside `runtime/` can name where a resume would start without
+    touching a pygents structure itself (card 02890d5d). The next turn is the
+    turn in flight if there was one, else the queue head -- the reading the
+    `BEFORE_TURN` hook makes. A `done` row holds no turn, and neither does an
+    `escalated` row written after a phase escalated: `Escalated` enqueues
+    nothing and `agent.run()` clears the turn in flight on its way out.
+    """
+    agent = checkpoint.agent
+    turn = agent.get("current_turn") or next(iter(agent.get("queue") or ()), None)
+    return None if turn is None else turn["kwargs"]["phase"]
 
 
 def run_subtask(
@@ -38,11 +66,22 @@ def run_subtask(
     agent_runner: Any = None,
     clock: Callable[[], Any] = old._utcnow,
     should_stop: Callable[[], bool] | None = None,
+    resume_from: Checkpoint | None = None,
 ) -> old.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`.
 
-    No `start_phase`: resume belongs to the yaml engine. `should_stop` is kept
-    in `RunDeps` and not yet read -- the stop bridge is plan Task 4.2.
+    Every turn is saved as a `turn` checkpoint before it runs, and the run ends
+    with a `done` or `escalated` one (`runtime/checkpoint.py`). `should_stop` is
+    asked before every turn: once it answers true, a `parked` checkpoint is
+    saved, the next phase is not started, and the subtask is recorded
+    `stopped before <phase>`.
+
+    `resume_from` continues from a saved checkpoint instead of the first phase:
+    the agent is rebuilt from it, so the pool (seed and earlier results) and
+    the queue (the pending turn and its loop count) are the checkpoint's, and
+    no seed or first turn is added. A checkpoint saved under another workflow
+    digest is refused with `CheckpointMismatch` before anything runs or is
+    recorded.
     """
     return asyncio.run(
         _drive(
@@ -58,6 +97,7 @@ def run_subtask(
             agent_runner=agent_runner,
             clock=clock,
             should_stop=should_stop,
+            resume_from=resume_from,
         )
     )
 
@@ -76,6 +116,7 @@ async def _drive(
     agent_runner: Any,
     clock: Callable[[], Any],
     should_stop: Callable[[], bool] | None,
+    resume_from: Checkpoint | None,
 ) -> old.SubtaskSummary:
     # The binding, built and refused exactly as the old engine builds it:
     # before any agent exists, so a refusal records nothing.
@@ -93,18 +134,36 @@ async def _drive(
         binding.update(extra_context)
     binding.update(old._document_paths(workflow, card))
 
+    # Compiled first on both paths: it registers the digest-prefixed tools
+    # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
     compiled = C.compile_workflow(workflow)
-    agent = Agent(
-        f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
-        workflow.name,
-        [compiled.agent_phase, compiled.step_phase],
-        context_pool=ContextPool(),
-        context_queue=ContextQueue(limit=10),
-        tags=["subtask"],
-    )
+    if resume_from is None:
+        agent = Agent(
+            f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
+            workflow.name,
+            [compiled.agent_phase, compiled.step_phase],
+            context_pool=ContextPool(),
+            context_queue=ContextQueue(limit=10),
+            tags=["subtask"],
+        )
+    else:
+        digest = workflow.digest()
+        if resume_from.digest != digest:
+            raise CheckpointMismatch(
+                f"checkpoint {resume_from.card_id}#{resume_from.seq} was saved under "
+                f"digest {resume_from.digest}, but workflow {workflow.name!r} "
+                f"has digest {digest}"
+            )
+        # A run that died before its `finally` may have left its agent
+        # registered under this name; `from_dict` would be refused it.
+        _forget(resume_from.agent["name"])
+        # The pool (seed, earlier results) and the queue (pending turn, loop
+        # count) come from the checkpoint: no seed item, no first turn.
+        agent = Agent.from_dict(resume_from.agent)
     try:
-        await agent.context_pool.add(context.seed_item(binding))
-        await agent.put(compiled.first_turn())
+        if resume_from is None:
+            await agent.context_pool.add(context.seed_item(binding))
+            await agent.put(compiled.first_turn())
         deps = RunDeps(workflow, store, story_id, subtask, agent_runner, clock, should_stop)
         return await _run(agent, deps)
     finally:
@@ -114,20 +173,32 @@ async def _drive(
 async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
     summary = old.SubtaskSummary()
     token = current_run.set(deps)
+    # Every `checkpoint.save` below runs inside this `try`, while `current_run`
+    # is still set: after the `finally` resets it, `save` is a silent no-op.
     try:
         async for _ in agent.run():  # consumed to the end, always
             pass
+    except checkpoint.Parked as parked:
+        # The stop, raised by the BEFORE_TURN hook after it saved `parked`:
+        # no further row, so that one stays the newest.
+        _collect(agent, deps, summary)
+        return old._stop(
+            summary, deps.store, deps.story_id, deps.subtask, parked.before_phase
+        )
     except C.Escalated as esc:
         _collect(agent, deps, summary)
+        checkpoint.save(agent, "escalated")
         return old._escalate(
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail
         )
     except old.EngineError:
         # A missing runner or an unresolvable input: a wiring or document bug
         # the old engine raises to its caller, `.phase`/`.parameter` intact.
+        # Not an escalation, so no checkpoint row.
         raise
     except Exception as error:
         _collect(agent, deps, summary)
+        checkpoint.save(agent, "escalated")
         # `deps.running` is only `None` if the error came before any tool was
         # entered; there is no phase to name then.
         return old._escalate(
@@ -138,9 +209,13 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
             deps.running or "?",
             old._render_error(error),
         )
+    else:
+        _collect(agent, deps, summary)
+        checkpoint.save(agent, "done")
     finally:
+        # A `BaseException` (cancellation, KeyboardInterrupt) passes straight
+        # through here and writes nothing: the last `turn` row stands.
         current_run.reset(token)
-    _collect(agent, deps, summary)
     old._record_subtask_status(deps.store, deps.story_id, deps.subtask, summary.status)
     return summary
 

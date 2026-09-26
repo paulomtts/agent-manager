@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast, get_args
 
 import typer
 
@@ -36,9 +36,12 @@ from agent_manager import (
     prompt,
     store as store_module,
 )
+from agent_manager import engine as yaml_engine
 from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
+from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.loader import Workflow, load_builtin
 from agent_manager.workflow.registry import WorkflowLoadError
 
@@ -121,6 +124,17 @@ class NotResumableError(CliError):
     fine, so what an operator does next -- start a fresh `run --card`, wait for
     `retry`, or drive the subtasks one at a time -- depends entirely on the
     status this message names, and a script can branch on the `type` field.
+    """
+
+
+class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
+    """`resume --engine pygents` found a checkpoint saved under another `TASK`.
+
+    A `CliError`, so it rides `HANDLED` to an `ok: false` envelope at exit 3,
+    and a `runtime_engine.CheckpointMismatch`, so it is the engine's own
+    refusal by type (card 02890d5d). The CLI raises it itself, before any
+    write, rather than letting `run_subtask` raise it after the orphan
+    attempts and the `started` rows were already recorded.
     """
 
 
@@ -390,7 +404,9 @@ def logs_payload(
     }
 
 
-def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRun]:
+def select_resumable(
+    run: models.Run, *, engine: "Engine" = "yaml"
+) -> tuple[models.StoryRun, models.SubtaskRun]:
     """The one subtask of `run` that was in flight, or a refusal naming why not.
 
     Pure over the tree `load_run` assembled, like `find_subtask`: which subtask
@@ -405,16 +421,24 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
     escalations. More than one is a milestone-shaped run: this
     command drives one subtask the way `run --card` does, and choosing between
     them would leave the rest recorded `started` with nothing driving them.
+
+    `engine` (card 02890d5d): on `pygents` a `stopped` subtask counts beside a
+    `started` one, because its parked checkpoint is what `resume --engine
+    pygents` continues from, so the relaunch remedy can never apply there.
+    `escalated` is refused on both engines. The yaml wording is unchanged to
+    the character. `Engine` is quoted because it is defined further down.
     """
-    started = [
+    resumable = ("started", "stopped") if engine == "pygents" else ("started",)
+    wanted = " or ".join(repr(status) for status in resumable)
+    in_flight = [
         (story, subtask)
         for story in run.stories
         for subtask in story.subtasks
-        if subtask.status == "started"
+        if subtask.status in resumable
     ]
-    if len(started) == 1:
-        return started[0]
-    if not started:
+    if len(in_flight) == 1:
+        return in_flight[0]
+    if not in_flight:
         found = (
             ", ".join(
                 f"{subtask.card_id}={subtask.status}"
@@ -437,13 +461,13 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
             else ""
         )
         raise NotResumableError(
-            f"run {run.id!r} has no subtask recorded 'started', so there is no work"
+            f"run {run.id!r} has no subtask recorded {wanted}, so there is no work"
             f" in flight to pick up (found: {found});"
             f" `agent-manager status {run.id}` shows the run as it stands{remedy}"
         )
-    cards = ", ".join(subtask.card_id for _story, subtask in started)
+    cards = ", ".join(subtask.card_id for _story, subtask in in_flight)
     raise NotResumableError(
-        f"run {run.id!r} has {len(started)} subtasks recorded 'started' ({cards}),"
+        f"run {run.id!r} has {len(in_flight)} subtasks recorded {wanted} ({cards}),"
         " and `resume` drives one subtask the way `run --card` does;"
         f" `agent-manager status {run.id}` shows all of them"
     )
@@ -579,6 +603,68 @@ def orphan_attempts(
     ]
 
 
+def checkpoint_resume_phase(
+    checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
+) -> str:
+    """The phase `resume --engine pygents` continues `card_id` at, or a refusal.
+
+    Pure over the row `Store.latest_checkpoint` returned, so every refusal is
+    testable without a store, and `resume_run` calls it before its first
+    write. In order: no row (a yaml run, or one that died before its first
+    turn); a newest row `done` (only the final status write was lost); a
+    digest other than `TASK.digest()`; a row holding no turn, which is what a
+    phase escalation leaves (`runtime_engine.pending_phase`).
+    """
+    if checkpoint is None:
+        raise NotResumableError(
+            f"card {card_id} in run {run_id!r} has no checkpoint to resume from:"
+            " the run was driven on the yaml engine, or it died before its first"
+            " turn; resume a yaml run without `--engine pygents`"
+        )
+    if checkpoint.reason == "done":
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is 'done',"
+            " so there is no turn to continue -- only the final status write was"
+            " lost; start a fresh run with `agent-manager run --card` if the card"
+            " still needs work"
+        )
+    digest = task_workflow.TASK.digest()
+    if checkpoint.digest != digest:
+        raise CheckpointMismatchError(
+            f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
+            f" {card_id} in run {run_id!r} was saved under digest {checkpoint.digest},"
+            f" but workflow {task_workflow.TASK.name!r} now has digest {digest};"
+            " start a fresh run with `agent-manager run --card`"
+        )
+    phase = runtime_engine.pending_phase(checkpoint)
+    if phase is None:
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is"
+            f" {checkpoint.reason!r} with no turn left to run: a phase escalated and"
+            " ended the walk; start a fresh run with `agent-manager run --card`"
+        )
+    return phase
+
+
+def continuable_checkpoint(
+    store: Store, card_id: str
+) -> store_module.Checkpoint | None:
+    """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
+
+    `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row
+    saved under another digest, or one holding no turn (a phase escalation,
+    see `runtime_engine.pending_phase`), is `None` too: a relaunch never
+    refuses, it starts the card from its first phase as the yaml engine does
+    (card 02890d5d).
+    """
+    found = store.latest_open_checkpoint(card_id, task_workflow.TASK.name)
+    if found is None or found.digest != task_workflow.TASK.digest():
+        return None
+    if runtime_engine.pending_phase(found) is None:
+        return None
+    return found
+
+
 app = typer.Typer(
     add_completion=False,
     help="Drive brd cards through the agent-manager workflow engine.",
@@ -597,6 +683,14 @@ def main() -> None:
 
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
+
+Engine = Literal["yaml", "pygents"]
+"""Which engine walks a subtask: the YAML walk in `agent_manager.engine`, or the
+pygents one in `agent_manager.runtime.engine`. Only `runtime/` imports pygents;
+this module reaches it through `runtime_engine` alone (pygents-engine RULE 1)."""
+
+ENGINES: tuple[str, ...] = get_args(Engine)
+"""`Engine`'s values, in the order a refusal lists them."""
 
 
 class RunnerFactory(Protocol):
@@ -688,6 +782,8 @@ def drive_subtask(
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
     should_stop: Callable[[], bool] | None = None,
+    engine: Engine = "yaml",
+    resume_from: store_module.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
 
@@ -696,9 +792,30 @@ def drive_subtask(
     everything around the walk: the board reads, the run id, opening and
     closing the store, and the run/story/subtask rows. This function catches
     nothing. An escalation is `summary.status == "escalated"`, not an exception.
-    `should_stop` goes straight to `engine.run_subtask`; a stop is
+    `should_stop` goes straight to the engine; a stop is
     `summary.status == "stopped"`.
+
+    `engine` picks the walk (card 7fdec762). `yaml` is `agent_manager.engine`
+    over the loaded document, exactly as before. `pygents` is
+    `agent_manager.runtime.engine` over `workflow.task.TASK`, with the same
+    keyword arguments and no `resume_from`. The runner factory gets the loaded
+    YAML `Workflow` on both: `dispatch.AgentRunner` reads it only for by-name
+    gates, which `TASK` never produces. The parameter shadows the module-level
+    `engine` name here, so the walks are reached as `yaml_engine` and
+    `runtime_engine`. Any other value is refused before a runner is built.
+
+    `resume_from` (card 02890d5d) continues a pygents walk from a saved
+    checkpoint. It joins the walk's keywords only when given, so a fresh walk
+    is called exactly as before. With `engine="yaml"` it is refused before a
+    runner is built: the yaml walk has no checkpoints to continue from.
     """
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
+    if resume_from is not None and engine != "pygents":
+        raise ValueError(
+            f"resume_from continues a pygents checkpoint, and engine {engine!r} has"
+            " none; pass engine='pygents' or no resume_from"
+        )
     workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
@@ -708,19 +825,23 @@ def drive_subtask(
         story_id=parent.id,
         card_id=card.id,
     )
-    summary = engine.run_subtask(
-        workflow,
-        store,
-        story_id=parent.id,
-        subtask=subtask,
-        repo_dir=repo_dir,
-        commands=commands,
-        card=card,
-        parent_story=parent,
-        extra_context=gate_context(commands, allow_no_verification),
-        agent_runner=runner,
-        should_stop=should_stop,
-    )
+    walk: dict[str, Any] = {
+        "story_id": parent.id,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "card": card,
+        "parent_story": parent,
+        "extra_context": gate_context(commands, allow_no_verification),
+        "agent_runner": runner,
+        "should_stop": should_stop,
+    }
+    if engine == "pygents":
+        if resume_from is not None:
+            walk["resume_from"] = resume_from
+        summary = runtime_engine.run_subtask(task_workflow.TASK, store, **walk)
+    else:
+        summary = yaml_engine.run_subtask(workflow, store, **walk)
     # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
     # its signature returns a result, so a warning has nowhere else to go,
     # and dropping them is the §12 failure this whole list exists to prevent.
@@ -738,6 +859,7 @@ def run_card(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    engine: Engine = "yaml",
 ) -> dict[str, Any]:
     """Drive one subtask card through `builtin/task.yaml` once, and report.
 
@@ -745,6 +867,9 @@ def run_card(
     a run id exists (so a bad card leaves no run directory), and the run, story
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
+
+    `engine` goes to `drive_subtask` unchanged; the preflight loads the YAML
+    document on both engines.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -803,6 +928,7 @@ def run_card(
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
+            engine=engine,
         )
         summary = drive.summary
 
@@ -989,14 +1115,29 @@ should crash loudly with its stack intact.
 """
 
 
+def _check_engine(engine: str) -> None:
+    """Refuse an `--engine` outside `ENGINES` as a usage error (Typer's exit 2).
+
+    Exact and without case folding. Shared by `run` and `resume` (card
+    02890d5d); `--engine` is typed `str` on both because Typer 0.27.2 cannot
+    take a `Literal` annotation.
+    """
+    if engine not in ENGINES:
+        raise typer.BadParameter(
+            f"--engine must be one of {', '.join(ENGINES)}, got {engine!r}",
+            param_hint="'--engine'",
+        )
+
+
 def _check_run_targets(
     *,
     card: str | None,
     milestone: str | None,
     dry_run: bool,
     max_concurrent: int | None = None,
+    engine: str = "yaml",
 ) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` combination as a usage error.
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` / `--engine` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
@@ -1007,6 +1148,9 @@ def _check_run_targets(
     refused whatever its value, the default included. The Option has no
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
+    `--engine` is typed `str` because Typer 0.27.2 cannot take a `Literal`
+    annotation, so a value outside `ENGINES` is refused here, exactly and
+    without case folding; `--dry-run` still validates it.
     """
     if card is not None and milestone is not None:
         raise typer.BadParameter(
@@ -1038,6 +1182,7 @@ def _check_run_targets(
             "--max-concurrent applies only to --milestone",
             param_hint="'--max-concurrent'",
         )
+    _check_engine(engine)
 
 
 @app.command("run")
@@ -1090,12 +1235,25 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    engine: str = typer.Option(
+        "yaml",
+        "--engine",
+        help=(
+            "Which engine walks each subtask: `yaml` (the default) or `pygents`. "
+            "--dry-run accepts it and ignores it."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
     _check_run_targets(
-        card=card, milestone=milestone, dry_run=dry_run, max_concurrent=max_concurrent
+        card=card,
+        milestone=milestone,
+        dry_run=dry_run,
+        max_concurrent=max_concurrent,
+        engine=engine,
     )
+    selected = cast(Engine, engine)
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
         if milestone is not None and dry_run:
@@ -1123,6 +1281,7 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+                engine=selected,
             )
         else:
             payload = run_card(
@@ -1132,6 +1291,7 @@ def run(
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
                 commands=list(verify),
+                engine=selected,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -1300,6 +1460,97 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
+def _resume_from_checkpoint(
+    run: models.Run,
+    *,
+    root: Path,
+    allow_no_verification: bool,
+    commands: Sequence[str],
+    runner_factory: RunnerFactory | None,
+) -> dict[str, Any]:
+    """`resume --engine pygents`: continue the run's one in-flight subtask from its checkpoint.
+
+    The yaml resume's order, kept: every refusal that needs no store --
+    nothing in flight, a card the board lost, a workflow that will not load --
+    comes before `Store.open`. The checkpoint can only be read through the
+    store, so its refusals (`checkpoint_resume_phase`) come right after it is
+    opened and before the first write. Then the orphan attempts are marked
+    `harness_error` and the run, story and subtask recorded `started`, as the
+    yaml resume does, and `drive_subtask` walks `TASK` from the checkpoint.
+    `interrupted_phase` and `resume_start_phase` are never called: the
+    checkpoint's queue says where the walk goes on.
+
+    The preflight loads `WORKFLOW_NAME` (`task`), not `run.workflow`: a
+    milestone run records `workflow="milestone"`, which is no document, and
+    every subtask is walked through `TASK` on this engine either way (card
+    02890d5d).
+    """
+    story, subtask = select_resumable(run, engine="pygents")
+    card = board.show(subtask.card_id, repo_dir=root)
+    parent = board.show(story.card_id, repo_dir=root)
+    load_builtin(WORKFLOW_NAME)
+    orphans = orphan_attempts(subtask)
+    resumed = subtask.model_copy(update={"status": "started"})
+
+    store = Store.open(root, run.id)
+    try:
+        checkpoint = store.latest_checkpoint(subtask.card_id)
+        phase = checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
+        for orphan, attempt in orphans:
+            store.record_attempt(
+                story.card_id,
+                subtask.card_id,
+                orphan.name,
+                attempt.model_copy(update={"status": "harness_error"}),
+            )
+        store.record_run(run.model_copy(update={"status": "started"}))
+        store.record_story(story.model_copy(update={"status": "started"}))
+        store.record_subtask(story.card_id, resumed)
+
+        drive = drive_subtask(
+            store=store,
+            run_id=run.id,
+            card=card,
+            parent=parent,
+            subtask=resumed,
+            repo_dir=root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            engine="pygents",
+            resume_from=checkpoint,
+        )
+        summary = drive.summary
+
+        store.record_run(run.model_copy(update={"status": summary.status}))
+        store.record_story(story.model_copy(update={"status": summary.status}))
+        store.record_subtask(
+            story.card_id, resumed.model_copy(update={"status": summary.status})
+        )
+
+        return {
+            "run_id": run.id,
+            "card_id": subtask.card_id,
+            "story_id": story.card_id,
+            "branch": subtask.branch,
+            "base_branch": subtask.base_branch,
+            "worktree": None
+            if subtask.worktree_path is None
+            else str(subtask.worktree_path),
+            "status": summary.status,
+            "failed_phase": summary.failed_phase,
+            "detail": summary.detail,
+            "skipped": list(summary.skipped),
+            "warnings": drive.warnings,
+            "resumed_from": phase,
+            "discarded_attempts": [
+                {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
+            ],
+        }
+    finally:
+        store.close()
+
+
 def resume_run(
     run_id: str,
     *,
@@ -1308,6 +1559,7 @@ def resume_run(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    engine: Engine = "yaml",
 ) -> dict[str, Any]:
     """Pick one killed run back up at the phase it died in (§9 lines 370-386).
 
@@ -1324,7 +1576,16 @@ def resume_run(
     `models.RunConfig` has no suite commands and no `allow_no_verification` --
     are taken as arguments here rather than grown onto the model, so a resume
     means exactly what a fresh `run` with the same flags means.
+
+    `engine` picks the resume (card 02890d5d). `yaml` is everything described
+    above, unchanged. `pygents` is `_resume_from_checkpoint`, which continues
+    from the subtask's newest checkpoint instead of re-running a phase. An
+    unknown engine is refused before anything is read. `clock` is the yaml
+    walk's; the pygents walk stamps with its own default, as `drive_subtask`
+    does.
     """
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
     try:
@@ -1336,6 +1597,15 @@ def resume_run(
             )
     finally:
         conn.close()
+
+    if engine == "pygents":
+        return _resume_from_checkpoint(
+            run,
+            root=root,
+            allow_no_verification=allow_no_verification,
+            commands=commands,
+            runner_factory=runner_factory,
+        )
 
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1379,7 +1649,7 @@ def resume_run(
             story_id=story.card_id,
             card_id=subtask.card_id,
         )
-        summary = engine.run_subtask(
+        summary = yaml_engine.run_subtask(
             workflow,
             store,
             story_id=story.card_id,
@@ -1443,6 +1713,15 @@ def resume(
             "carry the suite, so a resume is told it the way a fresh run was."
         ),
     ),
+    engine: str = typer.Option(
+        "yaml",
+        "--engine",
+        help=(
+            "Which engine resumes the subtask: `yaml` (the default) re-runs the "
+            "phase the run died in; `pygents` continues from the subtask's newest "
+            "checkpoint, a parked (`stopped`) subtask included."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Re-run the phase a killed run died in, and drive the subtask to the end.
@@ -1451,14 +1730,17 @@ def resume(
     started and are recorded on the subtask (§9). `--allow-no-verification` and
     `--verify` are offered because `models.RunConfig` carries neither the opt-out
     nor the suite commands, so both mean the same thing here as they do on a
-    fresh `run`.
+    fresh `run`. `--engine` (card 02890d5d) is checked before anything is read;
+    on `pygents` the checkpoint carries the gate context the run started with.
     """
+    _check_engine(engine)
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
             commands=list(verify),
+            engine=cast(Engine, engine),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

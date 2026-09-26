@@ -16,6 +16,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -89,6 +90,18 @@ CREATE TABLE IF NOT EXISTS attempts (
     stdout_path  TEXT,
     dispatch     TEXT NOT NULL,
     PRIMARY KEY (run_id, story_id, card_id, phase, n)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    run_id    TEXT NOT NULL,
+    card_id   TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    workflow  TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    reason    TEXT NOT NULL CHECK (reason IN ('turn', 'parked', 'done', 'escalated')),
+    agent     TEXT NOT NULL,
+    saved_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, card_id, seq)
 );
 """
 
@@ -490,11 +503,47 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
     return run
 
 
+@dataclass(frozen=True)
+class Checkpoint:
+    """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
+
+    Internal state, so a plain dataclass rather than a pydantic model. It is not
+    part of the §9 tree: no journal line records it and `rebuild_from_journal`
+    neither writes nor deletes it. `agent` is the decoded JSON of the stored
+    text, never the dict the caller handed in.
+    """
+
+    run_id: str
+    card_id: str
+    seq: int
+    workflow: str
+    digest: str
+    reason: str
+    agent: dict
+    saved_at: datetime
+
+
+def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
+    return Checkpoint(
+        run_id=row["run_id"],
+        card_id=row["card_id"],
+        seq=row["seq"],
+        workflow=row["workflow"],
+        digest=row["digest"],
+        reason=row["reason"],
+        agent=json.loads(row["agent"]),
+        saved_at=datetime.fromisoformat(row["saved_at"]),
+    )
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
     Every `record_*` appends the journal line first and writes the row second.
-    There is deliberately no public method that writes a row on its own.
+    There is deliberately no public method that writes a tree row on its own.
+    The one exception is `checkpoints` (pygents spec §6): a row-only table
+    outside the journal. `save_checkpoint` writes its row and never touches the
+    journal, and `rebuild_from_journal` leaves those rows alone.
 
     One process writes a given run (P2), and its threads share one `Store`. A
     single re-entrant lock serialises every use of the shared connection. Each
@@ -783,6 +832,100 @@ class Store:
         """
         with self._lock:
             return load_run(self._conn, run_id)
+
+    # -- checkpoints ---------------------------------------------------------
+    #
+    # A row-only table outside the journal (pygents spec §6, G10): nothing here
+    # calls `self._journal`. Each method holds the store lock across its whole
+    # body, so `seq` is read and the row written with no other write between.
+
+    def save_checkpoint(
+        self,
+        card_id: str,
+        *,
+        workflow: str,
+        digest: str,
+        reason: str,
+        agent: dict,
+        saved_at: datetime,
+    ) -> Checkpoint:
+        """Write the next checkpoint of `card_id` under this store's run.
+
+        `seq` is 0 for the card's first row in this run and one past the
+        highest after that. An unknown `reason` is refused by the table's
+        `CHECK` as `sqlite3.IntegrityError`; the statement is rolled back, the
+        error propagates unchanged and no `seq` is spent.
+        """
+        with self._lock:
+            text = json.dumps(agent, sort_keys=True)
+            highest = self._conn.execute(
+                "SELECT MAX(seq) FROM checkpoints WHERE run_id = ? AND card_id = ?",
+                (self.run_id, card_id),
+            ).fetchone()[0]
+            seq = 0 if highest is None else highest + 1
+            try:
+                self._conn.execute(
+                    "INSERT INTO checkpoints (run_id, card_id, seq, workflow, digest,"
+                    " reason, agent, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self.run_id,
+                        card_id,
+                        seq,
+                        workflow,
+                        digest,
+                        reason,
+                        text,
+                        _iso(saved_at),
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+            return Checkpoint(
+                run_id=self.run_id,
+                card_id=card_id,
+                seq=seq,
+                workflow=workflow,
+                digest=digest,
+                reason=reason,
+                agent=json.loads(text),
+                saved_at=saved_at,
+            )
+
+    def latest_checkpoint(self, card_id: str) -> Checkpoint | None:
+        """The highest-`seq` checkpoint of `card_id` in this store's run, any reason."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
+                " ORDER BY seq DESC LIMIT 1",
+                (self.run_id, card_id),
+            ).fetchone()
+            return None if row is None else _checkpoint_from_row(row)
+
+    def latest_open_checkpoint(self, card_id: str, workflow: str) -> Checkpoint | None:
+        """The newest open checkpoint of `card_id` for `workflow`, across every run.
+
+        The card's newest row in any run and any workflow decides first: if it
+        is `done`, the card is closed and this returns `None`. Otherwise it is
+        the newest `turn`/`parked`/`escalated` row of `workflow`, or `None`.
+        "Newest" is `saved_at` descending, then `seq` descending.
+        """
+        with self._lock:
+            newest = self._conn.execute(
+                "SELECT reason FROM checkpoints WHERE card_id = ?"
+                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                (card_id,),
+            ).fetchone()
+            if newest is None or newest["reason"] == "done":
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
+                " AND reason IN ('turn', 'parked', 'escalated')"
+                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                (card_id, workflow),
+            ).fetchone()
+            return None if row is None else _checkpoint_from_row(row)
 
     # -- rebuild -------------------------------------------------------------
 

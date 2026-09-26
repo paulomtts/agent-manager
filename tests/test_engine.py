@@ -238,14 +238,24 @@ def store(monkeypatch, tmp_path):
     opened.close()
 
 
+# `should_stop` tests whose yaml-engine behavior the pygents engine does not
+# share: its BEFORE_TURN hook turns an error from `should_stop` into an
+# escalation (tests/runtime/test_checkpoint.py pins that side).
+_YAML_ONLY_STOP = frozenset(
+    {"test_an_exception_from_should_stop_propagates_and_records_nothing"}
+)
+
+
 @pytest.fixture(params=["yaml", "pygents"])
 def run_subtask(request):
     """`run_subtask` on each engine (pygents-engine design G7, §9).
 
     `yaml` is the old walk as is. `pygents` converts the loaded document with
-    `phases.from_loader` and runs it on `runtime.engine`. Two kwargs have no
-    pygents counterpart yet, and a test that passes one is skipped on that
-    engine rather than run against something that does not exist.
+    `phases.from_loader` and runs it on `runtime.engine`. `start_phase` has no
+    pygents counterpart, so a test that passes it is skipped on that engine
+    rather than run against something that does not exist. `should_stop` is
+    bridged (`runtime/checkpoint.py`) and runs on both, except in the tests in
+    `_YAML_ONLY_STOP`, whose pinned behavior the pygents engine does not share.
     """
     if request.param == "yaml":
         return engine.run_subtask
@@ -253,9 +263,10 @@ def run_subtask(request):
     def run(workflow, store, **kw):
         if "start_phase" in kw:
             pytest.skip("start_phase is the yaml engine's resume")
-        if "should_stop" in kw:
+        if "should_stop" in kw and request.node.originalname in _YAML_ONLY_STOP:
             pytest.skip(
-                "the pygents stop bridge is plan Task 4.2 (runtime/checkpoint.py)"
+                "an error from should_stop escalates on pygents instead of "
+                "propagating; that parity is not decided yet"
             )
         return new_engine.run_subtask(phase_model.from_loader(workflow), store, **kw)
 
