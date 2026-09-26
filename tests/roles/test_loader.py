@@ -450,10 +450,12 @@ SHIPPED = [
     "coder",
     "critic",
     "explorer",
+    "plan_critic",
     "planner",
     "resolver",
     "reviewer",
     "spec_author",
+    "spec_critic",
 ]
 
 DEFAULT_MODELS = {
@@ -461,6 +463,8 @@ DEFAULT_MODELS = {
     "spec_author": "opus",
     "planner": "opus",
     "critic": "sonnet",
+    "spec_critic": "sonnet",
+    "plan_critic": "sonnet",
     "coder": "sonnet",
     "reviewer": "opus",
     "resolver": "opus",
@@ -474,8 +478,8 @@ def shipped_lock(role: str) -> list[dict[str, str]]:
     return tomllib.loads(path.read_text(encoding="utf-8"))["vendored"]
 
 
-def test_list_roles_returns_exactly_the_seven_shipped_roles():
-    assert len(SHIPPED) == 7
+def test_list_roles_returns_exactly_the_nine_shipped_roles():
+    assert len(SHIPPED) == 9
     assert loader.list_roles() == SHIPPED
 
 
