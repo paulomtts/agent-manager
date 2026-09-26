@@ -4707,3 +4707,140 @@ def test_drive_subtask_refuses_resume_from_on_yaml_before_building_a_runner(monk
 
     assert seen == []
     assert walks == {"yaml": [], "pygents": []}
+
+
+def test_checkpoint_resume_phase_is_the_queue_head_of_a_parked_row():
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("parked", queue=("validate_plan", "implement")),
+        card_id="card-1",
+        run_id="run-1",
+    )
+
+    assert phase == "validate_plan"
+
+
+def test_checkpoint_resume_phase_prefers_the_turn_in_flight():
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("turn", current="plan", queue=("validate_plan",)),
+        card_id="card-1",
+        run_id="run-1",
+    )
+
+    assert phase == "plan"
+
+
+def test_checkpoint_resume_phase_refuses_a_card_with_no_checkpoint():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(None, card_id="card-1", run_id="run-1")
+
+    message = str(caught.value)
+    assert "card-1" in message
+    assert "no checkpoint" in message
+
+
+def test_checkpoint_resume_phase_refuses_a_done_row_before_judging_its_digest():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("done", digest="saved-under-another-task"),
+            card_id="card-1",
+            run_id="run-1",
+        )
+
+    assert not isinstance(caught.value, cli.CheckpointMismatchError)
+    assert "'done'" in str(caught.value)
+
+
+def test_checkpoint_resume_phase_refuses_a_changed_workflow_as_a_checkpoint_mismatch():
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("parked", digest="saved-under-another-task", queue=("plan",)),
+            card_id="card-1",
+            run_id="run-1",
+        )
+
+    assert isinstance(caught.value, runtime_engine.CheckpointMismatch)
+    assert isinstance(caught.value, cli.HANDLED)
+    message = str(caught.value)
+    assert "workflow changed since checkpoint" in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+
+
+def test_checkpoint_resume_phase_refuses_an_escalated_row_with_no_turn_left():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("escalated"), card_id="card-1", run_id="run-1"
+        )
+
+    message = str(caught.value)
+    assert "'escalated'" in message
+    assert "no turn left" in message
+
+
+def test_checkpoint_resume_phase_continues_an_escalated_row_that_still_holds_a_turn():
+    """An error raised by the BEFORE_TURN hook escalates with the turn still
+    queued (tests/runtime/test_checkpoint.py:174-209): that row is continuable."""
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("escalated", queue=("review",)), card_id="card-1", run_id="run-1"
+    )
+
+    assert phase == "review"
+
+
+def _saved(
+    opened: store_module.Store,
+    card_id: str,
+    reason: str,
+    *,
+    digest: str | None = None,
+    queue: tuple[str, ...] = ("implement",),
+    minute: int = 0,
+) -> store_module.Checkpoint:
+    return opened.save_checkpoint(
+        card_id,
+        workflow=task_workflow.TASK.name,
+        digest=task_workflow.TASK.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None,
+            "queue": [{"kwargs": {"phase": name, "loop": 0}} for name in queue],
+        },
+        saved_at=CHECKPOINT_AT.replace(minute=minute),
+    )
+
+
+def test_continuable_checkpoint_is_the_open_matching_row_or_none(projection):
+    opened = store_module.Store.open(projection, "20260926T090000Z-02890d5d")
+    try:
+        parked = _saved(opened, "card-parked", "parked")
+        _saved(opened, "card-changed", "parked", digest="saved-under-another-task")
+        _saved(opened, "card-closed", "parked", minute=1)
+        _saved(opened, "card-closed", "done", queue=(), minute=2)
+        _saved(opened, "card-escalated", "escalated", queue=())
+        found = {
+            card: cli.continuable_checkpoint(opened, card)
+            for card in (
+                "card-parked",
+                "card-changed",
+                "card-closed",
+                "card-escalated",
+                "card-never-saved",
+            )
+        }
+    finally:
+        opened.close()
+
+    got = found.pop("card-parked")
+    assert got is not None
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (
+        parked.run_id,
+        "card-parked",
+        parked.seq,
+        "parked",
+    )
+    assert found == {
+        "card-changed": None,
+        "card-closed": None,
+        "card-escalated": None,
+        "card-never-saved": None,
+    }

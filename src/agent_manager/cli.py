@@ -127,6 +127,17 @@ class NotResumableError(CliError):
     """
 
 
+class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
+    """`resume --engine pygents` found a checkpoint saved under another `TASK`.
+
+    A `CliError`, so it rides `HANDLED` to an `ok: false` envelope at exit 3,
+    and a `runtime_engine.CheckpointMismatch`, so it is the engine's own
+    refusal by type (card 02890d5d). The CLI raises it itself, before any
+    write, rather than letting `run_subtask` raise it after the orphan
+    attempts and the `started` rows were already recorded.
+    """
+
+
 def resolve_repo_dir(repo_dir: Path) -> Path:
     """`--repo-dir` as an existing absolute directory, or `RepoDirError`.
 
@@ -590,6 +601,68 @@ def orphan_attempts(
         for attempt in phase.attempts
         if attempt.status == "started"
     ]
+
+
+def checkpoint_resume_phase(
+    checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
+) -> str:
+    """The phase `resume --engine pygents` continues `card_id` at, or a refusal.
+
+    Pure over the row `Store.latest_checkpoint` returned, so every refusal is
+    testable without a store, and `resume_run` calls it before its first
+    write. In order: no row (a yaml run, or one that died before its first
+    turn); a newest row `done` (only the final status write was lost); a
+    digest other than `TASK.digest()`; a row holding no turn, which is what a
+    phase escalation leaves (`runtime_engine.pending_phase`).
+    """
+    if checkpoint is None:
+        raise NotResumableError(
+            f"card {card_id} in run {run_id!r} has no checkpoint to resume from:"
+            " the run was driven on the yaml engine, or it died before its first"
+            " turn; resume a yaml run without `--engine pygents`"
+        )
+    if checkpoint.reason == "done":
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is 'done',"
+            " so there is no turn to continue -- only the final status write was"
+            " lost; start a fresh run with `agent-manager run --card` if the card"
+            " still needs work"
+        )
+    digest = task_workflow.TASK.digest()
+    if checkpoint.digest != digest:
+        raise CheckpointMismatchError(
+            f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
+            f" {card_id} in run {run_id!r} was saved under digest {checkpoint.digest},"
+            f" but workflow {task_workflow.TASK.name!r} now has digest {digest};"
+            " start a fresh run with `agent-manager run --card`"
+        )
+    phase = runtime_engine.pending_phase(checkpoint)
+    if phase is None:
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is"
+            f" {checkpoint.reason!r} with no turn left to run: a phase escalated and"
+            " ended the walk; start a fresh run with `agent-manager run --card`"
+        )
+    return phase
+
+
+def continuable_checkpoint(
+    store: Store, card_id: str
+) -> store_module.Checkpoint | None:
+    """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
+
+    `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row
+    saved under another digest, or one holding no turn (a phase escalation,
+    see `runtime_engine.pending_phase`), is `None` too: a relaunch never
+    refuses, it starts the card from its first phase as the yaml engine does
+    (card 02890d5d).
+    """
+    found = store.latest_open_checkpoint(card_id, task_workflow.TASK.name)
+    if found is None or found.digest != task_workflow.TASK.digest():
+        return None
+    if runtime_engine.pending_phase(found) is None:
+        return None
+    return found
 
 
 app = typer.Typer(
