@@ -191,3 +191,17 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 
     # Non-vacuity: an empty `agent_attempts` would sail through the loop above.
     assert validated == set(AGENT_PHASES), sorted(validated)
+
+
+def test_the_selected_engine_is_the_one_that_walked(
+    engine, project, completed_run, checkpoint_rows
+):
+    """Non-vacuity for the `[yaml]`/`[pygents]` parametrization: every assertion
+    above holds on both engines, so without this a dropped `engine=` would let
+    `[pygents]` pass by running yaml. Only pygents checkpoints (its BEFORE_TURN
+    hook). Reuses the module's one paid run; costs nothing extra."""
+    rows = checkpoint_rows(project, completed_run["run_id"])
+    if engine == "pygents":
+        assert rows > 0, "a pygents run wrote no checkpoint: engine never reached the walk"
+    else:
+        assert rows == 0, rows
