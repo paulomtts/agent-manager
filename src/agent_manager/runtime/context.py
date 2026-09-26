@@ -16,6 +16,7 @@ from pathlib import Path, PurePath
 from typing import Any
 
 from pydantic import BaseModel
+from pygents import ContextItem, ContextPool, ContextQueue
 
 SUBTASK = "subtask"
 SKIPPED = "skipped"
@@ -55,3 +56,22 @@ def decode(value: Any) -> Any:
     if isinstance(value, list):
         return [decode(v) for v in value]
     return value
+
+
+def seed_item(binding: Mapping[str, Any]) -> ContextItem:
+    return ContextItem(
+        id=SUBTASK, description="fixed subtask context", content=encode(dict(binding))
+    )
+
+
+def binding_table(pool: ContextPool, memory: ContextQueue, phase: str) -> dict[str, Any]:
+    table: dict[str, Any] = dict(decode(pool.get(SUBTASK).content))
+    for item in pool.items:
+        if item.id not in (SUBTASK, SKIPPED):
+            table[item.id] = decode(item.content)
+    table["feedback"] = [
+        dict(i.content)
+        for i in memory.items
+        if isinstance(i.content, Mapping) and i.content.get("for") == phase
+    ]
+    return table
