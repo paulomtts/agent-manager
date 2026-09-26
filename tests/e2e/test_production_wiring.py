@@ -13,6 +13,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agent_manager import board, prompt, results
 from agent_manager.steps import docs_commit
 from agent_manager.workflow import load_builtin
@@ -26,6 +28,14 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
+
+
+@pytest.fixture(scope="module", params=["yaml", "pygents"])
+def engine(request) -> str:
+    """Overrides the conftest's `engine`: every test in this module that reads
+    the run runs once per engine, each on its own repo and board (spec test 5).
+    Fixture params, not a parametrize mark, so no marker reaches this module."""
+    return request.param
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -214,3 +224,23 @@ def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
 
     named = _git(worktree, "show", "--name-only", "--format=", docs_revision).split()
     assert sorted(named) == sorted([spec_relative, plan_relative])
+
+
+def test_the_selected_engine_is_the_one_that_walked(
+    engine, project, completed_run, checkpoint_rows
+):
+    """Review Focus 1: non-vacuity for the whole parametrization."""
+    rows = checkpoint_rows(project, completed_run["run_id"])
+    if engine == "pygents":
+        assert rows > 0, "a pygents run wrote no checkpoint: --engine never reached the walk"
+    else:
+        assert rows == 0, rows
+
+
+def test_the_run_data_is_the_same_on_both_engines(
+    engine, project, cards, completed_run, engine_parity
+):
+    """Spec test 5 / G10: `run_card`'s data, ignoring `run_id`."""
+    engine_parity(
+        "production-wiring", engine, completed_run, tmp=project.parent, cards=cards
+    )

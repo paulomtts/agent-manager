@@ -15,6 +15,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agent_manager import board, cli, models, store
 
 
@@ -59,8 +61,21 @@ def _branches(root: Path) -> list[str]:
     return _git(root, "branch", "--format=%(refname:short)").split()
 
 
+@pytest.fixture(scope="module", params=["yaml", "pygents"])
+def engine(request) -> str:
+    """Overrides the conftest's `engine` (spec test 6). Fixture params, not a
+    parametrize mark, so no marker reaches this module."""
+    return request.param
+
+
 def test_a_clean_three_story_milestone_runs_to_done_on_one_stacked_line(
-    milestone_board, run_milestone_cli
+    milestone_board,
+    run_milestone_cli,
+    engine,
+    tmp_path,
+    engine_parity,
+    board_card_labels,
+    checkpoint_rows,
 ):
     """Spec test 1 / acceptance 2."""
     root = milestone_board["root"]
@@ -113,6 +128,12 @@ def test_a_clean_three_story_milestone_runs_to_done_on_one_stacked_line(
 
     assert _git(root, "rev-parse", "main").strip() == main_before
 
+    rows = checkpoint_rows(root, data["run_id"])
+    assert (rows > 0) is (engine == "pygents"), (engine, rows)
+    engine_parity(
+        "milestone-clean", engine, data, tmp=tmp_path, cards=board_card_labels(milestone_board)
+    )
+
 
 def test_this_module_runs_in_the_default_suite_unmarked(request):
     """Like `test_production_wiring.py`'s guard: no `e2e` marker may reach this
@@ -136,9 +157,17 @@ def _cwds(entries) -> set[Path]:
 
 
 def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
-    milestone_board, review_fail_marker, run_milestone_cli, read_fake_log
+    milestone_board,
+    review_fail_marker,
+    run_milestone_cli,
+    read_fake_log,
+    engine,
+    tmp_path,
+    engine_parity,
+    board_card_labels,
 ):
     """Spec test 2 / acceptances 3 and 5."""
+    labels = board_card_labels(milestone_board)
     root = milestone_board["root"]
     milestone = milestone_board["milestone"]
     stories = milestone_board["stories"]
@@ -188,6 +217,7 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     c_status_after = board.show(c1, repo_dir=root).status
     assert c_status_after in ("todo", "blocked")
     assert c_status_after == c_status_before
+    engine_parity("milestone-relaunch-stopped", engine, stopped, tmp=tmp_path, cards=labels)
 
     # Fix the fake, then relaunch the same command.
     review_fail_marker.unlink()
@@ -208,6 +238,9 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
         assert board.show(card_id, repo_dir=root).status == "done", card_id
     assert _is_ancestor(root, branches[a2], branches[b1])
     assert _is_ancestor(root, branches[b1], branches[c1])
+    # On pygents too, the relaunch re-drives b1 from its first phase (no
+    # checkpoint continuation here -- that is card 02890d5d's).
+    engine_parity("milestone-relaunch-finished", engine, finished, tmp=tmp_path, cards=labels)
 
     # Review focus: relaunching a finished milestone drives nothing.
     third = run_milestone_cli(root, milestone)
@@ -218,3 +251,4 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     assert idle["completed"] == []
     assert idle["integrated"] == finished["integrated"]
     assert read_fake_log(idle["run_id"]) == []
+    engine_parity("milestone-relaunch-idle", engine, idle, tmp=tmp_path, cards=labels)
