@@ -1196,6 +1196,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
         "critic_blockers_gate": agent_only_gate,
         "exploration_output_gate": agent_only_gate,
         "implement_blocked_gate": agent_only_gate,
+        "review_blockers_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
         "verification_gate": agent_only_gate,
@@ -1666,6 +1667,7 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         "critic_blockers_gate": agent_only_gate,
         "exploration_output_gate": agent_only_gate,
         "implement_blocked_gate": agent_only_gate,
+        "review_blockers_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
         "verification_gate": agent_only_gate,
@@ -2208,6 +2210,80 @@ def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_run
         "SELECT phase, status FROM attempts ORDER BY phase, n"
     ).fetchall()
     assert [tuple(row) for row in attempts] == [("implement", "gate_failed")]
+    assert "verify.run_suite" not in calls
+    assert "rollup.set_status:done" not in calls
+
+
+# A `ReviewResult` whose reviewer left one blocker standing. Clean in every
+# other respect -- empty porcelain, one tagged commit, a well-formed hash -- so
+# the only thing that can stop `review` is the blocker.
+BLOCKED_REVIEW = json.dumps(
+    {
+        "findings": ["x"],
+        "unresolved_blockers": ["x"],
+        "fix_summary": "one finding is still open",
+        "porcelain": "",
+        "commit_count": 1,
+        "tagged_count": 1,
+        "plan_hash": "a1b2c3d4",
+    }
+)
+
+
+def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_runs(store):
+    calls: list[str] = []
+    functions = _builtin_functions(calls, validated=True)
+    # The real gate under test. `review_gate` and `plan_hash_gate` stay
+    # `agent_only_gate`, which raises if called: listed first, the blockers
+    # gate must stop the phase before either of them runs.
+    functions["review_blockers_gate"] = reducers.review_blockers_gate
+    workflow = load_builtin("task", _registry(functions))
+
+    launcher = _CannedLauncher({"reviewer": BLOCKED_REVIEW})
+    adapter = _FakeAdapter()
+    subtask = _subtask()
+    dispatching = dispatch.AgentRunner(
+        workflow=workflow,
+        store=store,
+        launcher=launcher,
+        run_id=RUN_ID,
+        story_id=STORY_ID,
+        card_id=subtask.card_id,
+        adapters={adapter.name: adapter},
+        harness_map={
+            "reviewer": models.HarnessAssignment(harness=adapter.name, model="fake-model"),
+        },
+    )
+
+    def agent_runner(phase, context, rendered):
+        if phase.name == "review":
+            return dispatching(phase, context, rendered)
+        calls.append(f"agent:{phase.name}")
+        return {"role": phase.role}
+
+    summary = engine.run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=subtask,
+        repo_dir=REPO,
+        commands=["uv run pytest"],
+        card=CARD,
+        parent_story=PARENT,
+        agent_runner=agent_runner,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "review"
+    assert "review_blockers_gate" in summary.detail
+    assert "blocked=review" in summary.detail
+    assert "review left 1 unresolved blocker(s): x" in summary.detail
+    assert launcher.roles == ["reviewer"]
+    attempts = store.connection.execute(
+        "SELECT phase, status FROM attempts ORDER BY phase, n"
+    ).fetchall()
+    assert [tuple(row) for row in attempts] == [("review", "gate_failed")]
+    assert "agent:implement" in calls
     assert "verify.run_suite" not in calls
     assert "rollup.set_status:done" not in calls
 

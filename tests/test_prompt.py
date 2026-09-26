@@ -667,14 +667,14 @@ def test_the_brief_carries_the_rendered_text_verbatim_and_ends_in_one_newline():
 def test_two_roles_produce_different_briefs_from_the_same_rendered_prompt():
     rendered = _rendered()
     coder = _role(methodology={"test-driven-development.md": TDD_BODY})
-    critic = _role(name="critic", system="# Critic\n\nYou adversarially review.\n")
+    critic = _role(name="spec_critic", system="# Spec critic\n\nYou adversarially review.\n")
 
     coder_brief = prompt.compose_brief(coder, rendered)
     critic_brief = prompt.compose_brief(critic, rendered)
 
     assert coder_brief != critic_brief
-    assert "# Coder" in coder_brief and "# Critic" not in coder_brief
-    assert "# Critic" in critic_brief and "# Coder" not in critic_brief
+    assert "# Coder" in coder_brief and "# Spec critic" not in coder_brief
+    assert "# Spec critic" in critic_brief and "# Coder" not in critic_brief
 
 
 def test_composing_twice_is_byte_identical():

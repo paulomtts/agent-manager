@@ -8,6 +8,7 @@ gate that binds and returns the wrong verdict is the failure this file exists
 to catch."""
 
 import inspect
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from agent_manager.results import (
     Verification,
     resolve_result_model,
 )
+from agent_manager.roles.loader import load_role
 from agent_manager.workflow import load_builtin
 from agent_manager.workflow.loader import (
     AgentPhase,
@@ -201,10 +203,10 @@ def test_every_agent_phase_in_the_shipped_document_declares_a_result() -> None:
     assert [phase.name for phase in agent_phases if phase.result is None] == []
 
 
-def test_review_carries_both_of_its_gates() -> None:
+def test_review_carries_its_three_gates_blockers_first() -> None:
     phase = load_builtin("task").phase("review")
     assert isinstance(phase, AgentPhase)
-    assert phase.gates == ["review_gate", "plan_hash_gate"]
+    assert phase.gates == ["review_blockers_gate", "review_gate", "plan_hash_gate"]
     assert phase.inputs == ["branch", "base_branch", "plan_path"]
     # The reviewer recomputes the hash from the plan file; card f26b377d gives
     # the input to the coder only.
@@ -330,6 +332,23 @@ def test_both_validation_phases_resolve_to_the_same_critic_model() -> None:
 
     assert spec_model is plan_model
     assert spec_model is CriticResult
+
+
+def test_each_validation_phase_names_its_own_critic_in_the_yaml() -> None:
+    workflow = load_builtin("task")
+    assert workflow.phase("validate_spec").role == "spec_critic"
+    assert workflow.phase("validate_plan").role == "plan_critic"
+
+
+@pytest.mark.parametrize("phase_name", ["validate_spec", "validate_plan"])
+def test_each_critic_brief_names_only_its_phases_inputs(phase_name: str) -> None:
+    """A brief that points at `## card` in a phase that never renders a card
+    section sends the agent looking for text that is not there."""
+    phase = load_builtin("task").phase(phase_name)
+    assert isinstance(phase, AgentPhase)
+    named = set(re.findall(r"`## (\w+)`", load_role(phase.role).system))
+    assert named, "the brief names none of its input sections"
+    assert named <= set(phase.inputs), named - set(phase.inputs)
 
 
 # ── acceptance #2: every gate binds against a real result object ─────────────
@@ -485,6 +504,7 @@ def test_the_document_still_names_exactly_the_gates_this_suite_covers() -> None:
         ("validate_spec", "critic_blockers_gate"),
         ("validate_plan", "critic_blockers_gate"),
         ("implement", "implement_blocked_gate"),
+        ("review", "review_blockers_gate"),
         ("review", "review_gate"),
         ("review", "plan_hash_gate"),
         ("verify", "verification_passed_gate"),

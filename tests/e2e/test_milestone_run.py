@@ -160,7 +160,7 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     assert stopped["story"] == stories["B"]
     assert stopped["subtask"] == b1
     assert stopped["failed_phase"] == "review"
-    assert "review_gate" in stopped["detail"]
+    assert "review_blockers_gate" in stopped["detail"]
     assert "review-fail marker" in stopped["detail"]
     # A lane escalation never reaches Integrate.
     assert "integrated" not in stopped and "phase" not in stopped, stopped

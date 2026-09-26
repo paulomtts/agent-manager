@@ -35,7 +35,7 @@ phases:
 
   - name: validate_spec
     kind: agent
-    role: critic
+    role: spec_critic
     inputs: [card, spec_path]
     result: CriticResult
     gates: [critic_blockers_gate]
@@ -49,7 +49,7 @@ phases:
 
   - name: validate_plan
     kind: agent
-    role: critic
+    role: plan_critic
     inputs: [spec_path, plan_path]
     result: CriticResult
     gates: [critic_blockers_gate]
@@ -74,7 +74,7 @@ phases:
     role: reviewer
     inputs: [branch, base_branch, plan_path]
     result: ReviewResult
-    gates: [review_gate, plan_hash_gate]
+    gates: [review_blockers_gate, review_gate, plan_hash_gate]
 
   - name: verify
     kind: deterministic

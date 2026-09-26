@@ -62,7 +62,7 @@ TASK = Workflow("task", (
     ),
     AgentPhase(
         "validate_spec",
-        role="critic",
+        role="spec_critic",
         inputs=("card", "spec_path"),
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),
@@ -78,7 +78,7 @@ TASK = Workflow("task", (
     ),
     AgentPhase(
         "validate_plan",
-        role="critic",
+        role="plan_critic",
         inputs=("spec_path", "plan_path"),
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),
@@ -99,7 +99,11 @@ TASK = Workflow("task", (
         role="reviewer",
         inputs=("branch", "base_branch", "plan_path"),
         result=results.ReviewResult,
-        gates=(reducers.review_gate, reducers.plan_hash_gate_adapter),
+        gates=(
+            reducers.review_blockers_gate,
+            reducers.review_gate,
+            reducers.plan_hash_gate_adapter,
+        ),
         timeout=agent_timeout(45),
     ),
     Step("verify", verify.run_suite, gates=(reducers.verification_passed_gate,)),

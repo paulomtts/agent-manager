@@ -19,7 +19,7 @@ there is no shell string and nothing to quote.
 import re
 import shlex
 import subprocess
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -200,6 +200,43 @@ def _plan_commands(commands: object) -> list[tuple[object, list[str]]]:
     return planned
 
 
+def _field(mapping: object, name: str) -> object:
+    """Read ``name`` off a mapping, or ``None`` if it is not a mapping at all.
+
+    The same tolerant read as `reducers._field`: `explore` arrives as whatever
+    the Explore phase's result was bound to, and a missing or odd-shaped value
+    means "Explore named nothing extra", not a crash.
+    """
+    return mapping.get(name) if isinstance(mapping, Mapping) else None
+
+
+def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
+    """Explore's `verification.typecheck` then each `verification.lint` entry.
+
+    Pygents design G9 item 4: these run after the `--verify` commands, in that
+    order. `fullSuite`/`full_suite` is deliberately not read -- `commands` is
+    the suite's only source. A blank typecheck or blank lint entry is skipped;
+    a wrong-typed one raises `ValueError` here, before any process starts,
+    exactly like a malformed `--verify` command. `typecheck` and `lint` carry
+    no alias in `results.Verification`, so the engine's snake_case dump and a
+    hand-written camelCase result use the same two keys.
+    """
+    verification = _field(explore, "verification")
+    planned: list[tuple[object, list[str]]] = []
+
+    typecheck = _field(verification, "typecheck")
+    if typecheck is not None:
+        argv = _argv_for(typecheck)
+        if argv is not None:
+            planned.append((typecheck, argv))
+
+    lint = _field(verification, "lint")
+    if lint is not None:
+        planned.extend(_plan_commands(lint))
+
+    return planned
+
+
 def _required_worktree(worktree: object) -> str:
     """An existing absolute directory as a string, or `ValueError` up front.
 
@@ -222,6 +259,7 @@ def _required_worktree(worktree: object) -> str:
 def run_suite(
     commands: object,
     worktree: object,
+    explore: object = None,
     *,
     runner: CommandRunner = run_command,
 ) -> dict[str, object]:
@@ -231,8 +269,15 @@ def run_suite(
     crosses no process boundary and so needs no Pydantic model (`CLAUDE.md`).
     `runner` defaults to real execution and exists to be swapped in tests, the
     same callable-injection seam `worktree.py` uses for git.
+
+    `explore` is the Explore phase's result, bound by parameter name by
+    `engine.bind_arguments` (no workflow edit needed; the integrate workflow
+    has no such phase and gets `None`). Its `verification.typecheck` and each
+    `verification.lint` command run after `commands` and are reported, and fail
+    the suite, exactly like `--verify` commands (pygents design G9 item 4).
+    Every command, extra or not, is planned before the first one runs.
     """
-    planned = _plan_commands(commands)
+    planned = [*_plan_commands(commands), *_plan_explore_commands(explore)]
     worktree_path = _required_worktree(worktree)
     result: dict[str, object] = {"passed": False, "verified": [], "detail": ""}
     verified: list[dict[str, object]] = result["verified"]  # type: ignore[assignment]

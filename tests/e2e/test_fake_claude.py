@@ -273,7 +273,7 @@ def test_the_fake_writes_a_gate_passing_critic_result_where_the_brief_says(tmp_p
     prompt_path = _brief(
         tmp_path,
         "validate_spec",
-        "critic",
+        "spec_critic",
         "\n## spec_path\ndocs/superpowers/specs/x-00000001.md\n",
         CRITIC_SCHEMA,
         result_path,
@@ -293,7 +293,7 @@ def test_the_fake_logs_its_phase_and_cwd_beside_the_run_directory(tmp_path):
     attempt.mkdir(parents=True)
     result_path = attempt / "result.json"
     prompt_path = _brief(
-        tmp_path, "validate_spec", "critic", "\n## spec_path\nx.md\n",
+        tmp_path, "validate_spec", "spec_critic", "\n## spec_path\nx.md\n",
         CRITIC_SCHEMA, result_path,
     )
     workdir = tmp_path / "workdir"
@@ -314,7 +314,7 @@ def test_a_brief_without_a_result_contract_makes_the_fake_exit_non_zero(tmp_path
     production-wiring test fail loudly if prompt composition ever regresses."""
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text(
-        "# Critic\n\n# phase: validate_spec\n# role: critic\n\n## spec_path\nx.md\n",
+        "# Spec critic\n\n# phase: validate_spec\n# role: spec_critic\n\n## spec_path\nx.md\n",
         encoding="utf-8",
     )
 
@@ -331,7 +331,7 @@ def test_a_feedback_block_after_the_contract_does_not_hide_the_contract(tmp_path
     attempt.mkdir(parents=True)
     result_path = attempt / "result.json"
     prompt_path = _brief(
-        tmp_path, "validate_spec", "critic", "\n## spec_path\nx.md\n",
+        tmp_path, "validate_spec", "spec_critic", "\n## spec_path\nx.md\n",
         CRITIC_SCHEMA, result_path,
     )
     prompt_path.write_text(

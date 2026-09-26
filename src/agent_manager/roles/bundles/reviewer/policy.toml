@@ -1,4 +1,4 @@
-allowed_tools = ["Read", "Grep", "Glob", "Bash"]
+allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 max_attempts = 1
 required_capabilities = []
 

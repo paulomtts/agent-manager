@@ -405,6 +405,34 @@ def critic_blockers_gate(result: object) -> dict[str, str] | None:
     }
 
 
+# The `review` phase's first gate (`builtin/task.yaml`), ported from task.js
+# lines 842-855. The reviewer fixes what it can and REPORTS what is still
+# standing in `unresolved_blockers`; before this gate nothing read that list,
+# so a review that said "this is not done" still went on to `verify` and
+# `done`. Only what is STILL standing gates: `findings` the reviewer already
+# fixed do not. Listed before `review_gate` so the escalation names the
+# reviewer's own judgement rather than a symptom of it.
+def review_blockers_gate(result: object) -> dict[str, str] | None:
+    """``None`` when the reviewer left nothing open, else a blocked verdict.
+
+    A dead reviewer -- ``None``, or anything that is not a ``Mapping`` -- is
+    itself a block, for the reason ``critic_blockers_gate`` gives: silence is
+    not a clean review.
+    """
+    if not isinstance(result, Mapping):
+        return {"blocked": "review", "detail": "the review stage returned nothing"}
+    blockers = list(_field(result, "unresolved_blockers") or [])
+    if not blockers:
+        return None
+    return {
+        "blocked": "review",
+        "detail": (
+            f"review left {len(blockers)} unresolved blocker(s): "
+            f"{'; '.join(map(str, blockers))}"
+        ),
+    }
+
+
 def _plan_hash_of(result: object) -> object:
     """The `plan_hash` field of a dumped phase result, or `None`.
 
