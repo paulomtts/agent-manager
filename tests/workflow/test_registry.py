@@ -99,6 +99,7 @@ TASK_YAML_NAMES = (
     "plan_check.has_validated_plan",
     "plan_check.mark_validated",
     "plan_hash_gate",
+    "review_blockers_gate",
     "review_gate",
     "rollup.set_status",
     "verification_gate",
@@ -126,6 +127,8 @@ def test_default_registry_resolves_the_ported_reducers_to_the_real_callables() -
     assert registry.resolve("exploration_output_gate") is reducers.exploration_output_gate
     assert registry.resolve("verification_gate") is reducers.verification_gate
     assert registry.resolve("review_gate") is reducers.review_gate
+    # Takes only `result`, so it needs no adapter: the bare reducer.
+    assert registry.resolve("review_blockers_gate") is reducers.review_blockers_gate
     # The one name that is deliberately NOT the bare reducer: `plan_hash_gate`
     # compares two fields of two different phase results, and `bind_arguments`
     # binds whole values by parameter name only.

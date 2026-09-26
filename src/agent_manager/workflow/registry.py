@@ -190,6 +190,7 @@ BUILTIN_FUNCTION_NAMES = (
     "plan_check.has_validated_plan",
     "plan_check.mark_validated",
     "plan_hash_gate",
+    "review_blockers_gate",
     "review_gate",
     "rollup.set_status",
     "verification_gate",
@@ -212,7 +213,7 @@ def default_registry() -> FunctionRegistry:
     global state that any importer could rebind a gate in, and the second call
     would then fail on `DuplicateFunctionError`.
 
-    The seven reducers and the five implemented steps are the real, imported
+    The eight reducers and the five implemented steps are the real, imported
     callables -- not wrappers -- so `resolve(name) is the_function` holds and a
     sibling's bugfix reaches the engine without touching this table. No
     placeholder registrations remain: every name the document uses now has an
@@ -226,6 +227,8 @@ def default_registry() -> FunctionRegistry:
     registry.register("exploration_output_gate", reducers.exploration_output_gate)
     registry.register("verification_gate", reducers.verification_gate)
     registry.register("review_gate", reducers.review_gate)
+    # task.js:842-855: what the reviewer says is still standing stops `review`.
+    registry.register("review_blockers_gate", reducers.review_blockers_gate)
     registry.register("plan_hash_gate", plan_hash_gate_adapter)
     registry.register("verification_passed_gate", reducers.verification_passed_gate)
     registry.register("critic_blockers_gate", reducers.critic_blockers_gate)
