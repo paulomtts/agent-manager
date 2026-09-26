@@ -121,7 +121,7 @@ def _required_worktree(value: object) -> str:
 def _required_title(card_details: object) -> str:
     """The card's non-blank title, or `ValueError` before any git call.
 
-    `engine.subtask_context` binds `card_details` to `None` when the caller
+    `walk.subtask_context` binds `card_details` to `None` when the caller
     supplied no card, so `None` must not surface as an `AttributeError`.
     """
     title = getattr(card_details, "title", None)

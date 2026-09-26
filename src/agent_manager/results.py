@@ -1,14 +1,13 @@
-"""`result:` names -> the pydantic model that validates one result file (§6 step 5).
+"""Result model names -> the pydantic model that validates one result file (§6 step 5).
 
-`workflow/loader.py` keeps `AgentPhase.result` a string on purpose ("mapping it
-to a class is the agent-dispatch sibling's job"). This module is that mapping,
-and nothing more: no validation happens here, and importing it reads no file.
+A declared `phases.AgentPhase` carries its result model as the class itself.
+This module is the table of those classes by name, and nothing more: no
+validation happens here, and importing it reads no file.
 
-`RESULT_MODELS` is that mapping: every `result:` name a builtin workflow
-declares -- `ExploreResult`, `CriticResult`, `SpecResult`, `PlanResult`,
-`ImplementResult`, `ReviewResult` from `builtin/task.yaml`, and `ResolveResult`
-from `builtin/integrate.yaml` -- against the model that validates that phase's
-`result.json`.
+`RESULT_MODELS` maps every result model a shipped workflow declares --
+`ExploreResult`, `CriticResult`, `SpecResult`, `PlanResult`,
+`ImplementResult`, `ReviewResult` from `workflow.task.TASK`, and
+`ResolveResult` from `workflow.integrate.INTEGRATE` -- to itself by name.
 `Verification` is not in it; no phase declares it, and it is reachable only as
 `ExploreResult.verification`. A name with no entry still fails loudly at
 dispatch time, which is strictly better than validating nothing and calling
@@ -45,7 +44,7 @@ class Verification(_Result):
 
 
 class ExploreResult(_Result):
-    """The `explore` phase's result file (`builtin/task.yaml` line 9)."""
+    """The `explore` phase's result file."""
 
     refused: bool
     reason: str | None
@@ -54,7 +53,7 @@ class ExploreResult(_Result):
 
 
 class CriticResult(_Result):
-    """The `critic` phase's result file (`builtin/task.yaml` lines 39 and 53)."""
+    """The `validate_spec` and `validate_plan` phases' result file."""
 
     blockers: bool
     reason: str | None
@@ -62,11 +61,11 @@ class CriticResult(_Result):
 
 
 class SpecResult(_Result):
-    """The `spec` phase's result file (`builtin/task.yaml`, the `spec` phase).
+    """The `spec` phase's result file.
 
     `PlanResult`'s shape minus `self_reviewed`: nothing asks the spec author to
     self-review, so a result claiming it is an unknown key. `path` is what the
-    agent says it wrote; `engine._document_paths` still derives `spec_path` from
+    agent says it wrote; `walk._document_paths` still derives `spec_path` from
     the phase's `writes:` template, so this field is the agent's claim on record
     rather than the engine's input. No `serialization_alias` on either field: no
     reducer in `steps/reducers.py` reads a spec result, so there is no camelCase
@@ -78,7 +77,7 @@ class SpecResult(_Result):
 
 
 class PlanResult(_Result):
-    """The `plan` phase's result file (`builtin/task.yaml` line 46).
+    """The `plan` phase's result file.
 
     No `skill_invoked`: D6 inlines the planning methodology into the prompt, so
     there is no skill invocation left to report.
@@ -90,7 +89,7 @@ class PlanResult(_Result):
 
 
 class ImplementResult(_Result):
-    """The `implement` phase's result file (`builtin/task.yaml` line 60).
+    """The `implement` phase's result file.
 
     `plan_hash` carries no format constraint: `reducers.is_plan_hash` owns the
     "8 lowercase hex characters" judgement, and a malformed hash has to reach
@@ -105,7 +104,7 @@ class ImplementResult(_Result):
 
 
 class ReviewResult(_Result):
-    """The `review` phase's result file (`builtin/task.yaml` line 66).
+    """The `review` phase's result file.
 
     `commit_count` and `tagged_count` carry camelCase serialisation aliases
     because `reducers.review_gate` reads `commitCount`/`taggedCount` off the
@@ -124,7 +123,7 @@ class ReviewResult(_Result):
 
 
 class ResolveResult(_Result):
-    """The `resolve` phase's result file (`builtin/integrate.yaml`, addendum I3).
+    """The `resolve` phase's result file (addendum I3).
 
     `resolved` is advisory. Whether the merge really completed is something git
     can measure, so `merge_completed_gate` judges it from the repository, not from
@@ -145,11 +144,11 @@ RESULT_MODELS: dict[str, type[BaseModel]] = {
     "ReviewResult": ReviewResult,
     "ResolveResult": ResolveResult,
 }
-"""Every `result:` name a builtin workflow declares, keyed by class name.
+"""Every result model a shipped workflow declares, keyed by class name.
 
-`builtin/task.yaml` declares the first six; `builtin/integrate.yaml` declares
-`ResolveResult` for its `resolve` phase. `Verification` is absent on purpose: no
-phase declares it, and it is reachable only as `ExploreResult.verification`.
+`TASK` declares the first six; `INTEGRATE` declares `ResolveResult` for its
+`resolve` phase. `Verification` is absent on purpose: no phase declares it, and
+it is reachable only as `ExploreResult.verification`.
 """
 
 

@@ -216,7 +216,7 @@ def mark_validated(
     -- it cannot re-encode or re-terminate a single existing byte.
 
     No `try` here on purpose: a missing, unreadable or non-UTF-8 plan must reach
-    `engine._run_deterministic`, which is total, records the phase failed and
+    `walk.run_one_step`, which is total, records the phase failed and
     escalates. A silent "nothing to mark" success would hand the sibling a
     Plan-Hash over a file that was never marked.
     """

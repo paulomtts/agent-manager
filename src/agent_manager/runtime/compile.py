@@ -132,14 +132,14 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         deps.running = phase
         p = deps.workflow.phase(phase)
         if deps.agent_runner is None:
-            # A wiring bug, not a phase failure: raised as the old engine raises
-            # it, before anything runs, rather than escalated as a TypeError.
+            # A wiring bug, not a phase failure: raised before anything runs,
+            # rather than escalated as a TypeError.
             raise EngineError(
                 "is an agent phase, but no agent runner was injected", phase=phase
             )
         table = context.binding_table(pool, memory, phase)
-        # Outside the try, as in the old engine: an input no resolver provides
-        # is a workflow bug and its `EngineError` must reach the caller as is.
+        # Outside the try: an input no resolver provides is a workflow bug
+        # and its `EngineError` must reach the caller as is.
         rendered = prompt.render_prompt(p, table)
         try:
             result = await bridge.call_agent(deps.agent_runner, p, table, rendered)
@@ -152,8 +152,8 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 return
             raise Escalated(phase, failure.detail) from failure
         except Exception as error:
-            # Total, as the old engine's agent branch is: an exception escaping
-            # the walk would leave the subtask recorded `started` forever.
+            # Total: an exception escaping the walk would leave the subtask
+            # recorded `started` forever.
             raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
         nxt = holder["compiled"].after(phase, 0 if phase in fresh_loop_after else loop)

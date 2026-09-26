@@ -337,7 +337,7 @@ def reroll_stale_stories(stories: Sequence[census.StoryPlan], root: Path) -> lis
 
     Writing `done` to a subtask that is already done is harmless, and the
     rollup's walk to the root repairs the story and the milestone above it.
-    Best effort, like `mark_done` in `task.yaml`: a `BoardError` becomes a
+    Best effort, like `TASK`'s `mark_done`: a `BoardError` becomes a
     warning naming the story and its anchor, and the run goes on.
     """
     warnings: list[str] = []

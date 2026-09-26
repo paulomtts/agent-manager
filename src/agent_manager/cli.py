@@ -2,7 +2,7 @@
 
 This module composes and renders; it decides nothing a collaborator already
 decides. Branch names come from `dag`, board reads from `board`, artifact paths
-from `paths` via `store`, the phase walk from `engine`, and the dispatch from
+from `paths` via `store`, the phase walk from `runtime.engine`, and the dispatch from
 `dispatch.AgentRunner`. §4 calls this file "typer app" and that is the whole
 constraint: no step logic, no gate logic, no branch strings built by hand, and
 no run state written anywhere but through `Store`.
@@ -592,7 +592,7 @@ def default_runner_factory(
 
 
 def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[str, Any]:
-    """The gate parameters `builtin/task.yaml` binds and `subtask_context` lacks.
+    """The gate parameters `TASK`'s gates bind and `subtask_context` lacks.
 
     `explore` gates on `verification_gate(suite_cmds, allow_no_verification,
     caller_provided)` and `exploration_output_gate(explore,

@@ -117,8 +117,8 @@ async def _drive(
     should_stop: Callable[[], bool] | None,
     resume_from: Checkpoint | None,
 ) -> walk.SubtaskSummary:
-    # The binding, built and refused exactly as the old engine builds it:
-    # before any agent exists, so a refusal records nothing.
+    # The binding, built and refused before any agent exists, so a refusal
+    # records nothing.
     binding = walk.subtask_context(
         subtask, repo_dir, commands, card=card, parent_story=parent_story
     )
@@ -191,8 +191,8 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail
         )
     except walk.EngineError:
-        # A missing runner or an unresolvable input: a wiring or document bug
-        # the old engine raises to its caller, `.phase`/`.parameter` intact.
+        # A missing runner or an unresolvable input: a wiring or workflow bug
+        # raised to the caller, `.phase`/`.parameter` intact.
         # Not an escalation, so no checkpoint row.
         raise
     except Exception as error:
