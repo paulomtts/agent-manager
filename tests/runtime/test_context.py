@@ -40,7 +40,7 @@ async def test_binding_table_rebuilds_seed_results_and_feedback():
         ContextItem(
             id="spec",
             description="spec result",
-            content=context.encode({"path": "docs/s.md", "note": None}),
+            content=context.encode({"path": Path("docs/s.md"), "note": None}),
         )
     )
     await memory.append(
@@ -54,10 +54,11 @@ async def test_binding_table_rebuilds_seed_results_and_feedback():
 
     assert table["branch"] == "m6/task-x-1234abcd"
     assert table["worktree"] == Path("/w")
-    assert table["spec"] == {"path": "docs/s.md", "note": None}
+    assert table["spec"] == {"path": Path("docs/s.md"), "note": None}
     assert table["feedback"] == [
         {"for": "spec", "from": "validate_spec", "detail": "no error path"}
     ]
+    assert table["feedback"][0] is not memory.items[0].content
 
 
 async def test_binding_table_excludes_the_skipped_item():
