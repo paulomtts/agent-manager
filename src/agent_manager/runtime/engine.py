@@ -18,6 +18,7 @@ from typing import Any
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
 
 from agent_manager import engine as old
+from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN hook
 from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
 from agent_manager.runtime.state import RunDeps, current_run
@@ -41,8 +42,11 @@ def run_subtask(
 ) -> old.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`.
 
-    No `start_phase`: resume belongs to the yaml engine. `should_stop` is kept
-    in `RunDeps` and not yet read -- the stop bridge is plan Task 4.2.
+    No `start_phase`: resume belongs to the yaml engine. Every turn is saved as
+    a `turn` checkpoint before it runs, and the run ends with a `done` or
+    `escalated` one (`runtime/checkpoint.py`). `should_stop` is asked before
+    every turn: once it answers true, a `parked` checkpoint is saved, the next
+    phase is not started, and the subtask is recorded `stopped before <phase>`.
     """
     return asyncio.run(
         _drive(
@@ -114,20 +118,32 @@ async def _drive(
 async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
     summary = old.SubtaskSummary()
     token = current_run.set(deps)
+    # Every `checkpoint.save` below runs inside this `try`, while `current_run`
+    # is still set: after the `finally` resets it, `save` is a silent no-op.
     try:
         async for _ in agent.run():  # consumed to the end, always
             pass
+    except checkpoint.Parked as parked:
+        # The stop, raised by the BEFORE_TURN hook after it saved `parked`:
+        # no further row, so that one stays the newest.
+        _collect(agent, deps, summary)
+        return old._stop(
+            summary, deps.store, deps.story_id, deps.subtask, parked.before_phase
+        )
     except C.Escalated as esc:
         _collect(agent, deps, summary)
+        checkpoint.save(agent, "escalated")
         return old._escalate(
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail
         )
     except old.EngineError:
         # A missing runner or an unresolvable input: a wiring or document bug
         # the old engine raises to its caller, `.phase`/`.parameter` intact.
+        # Not an escalation, so no checkpoint row.
         raise
     except Exception as error:
         _collect(agent, deps, summary)
+        checkpoint.save(agent, "escalated")
         # `deps.running` is only `None` if the error came before any tool was
         # entered; there is no phase to name then.
         return old._escalate(
@@ -138,9 +154,13 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
             deps.running or "?",
             old._render_error(error),
         )
+    else:
+        _collect(agent, deps, summary)
+        checkpoint.save(agent, "done")
     finally:
+        # A `BaseException` (cancellation, KeyboardInterrupt) passes straight
+        # through here and writes nothing: the last `turn` row stands.
         current_run.reset(token)
-    _collect(agent, deps, summary)
     old._record_subtask_status(deps.store, deps.story_id, deps.subtask, summary.status)
     return summary
 
