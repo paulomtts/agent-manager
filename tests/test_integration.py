@@ -597,6 +597,8 @@ def test_a_conflict_dispatches_exactly_once_for_the_conflicting_tip(
     assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
     assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]
     _assert_protected(repo, before, tips)
+    # The yaml walk never checkpoints; the pygents twin below asserts it does.
+    assert store.latest_checkpoint(STORY_B) is None
 
 
 def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
@@ -620,15 +622,27 @@ def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     assert factory.resolver.calls == [["shared.txt"]]
     assert _merge_head(repo.worktree) is None
     assert _git(repo.worktree, "status", "--porcelain") == ""
+    assert _is_ancestor(repo.worktree, tips[0])
+    assert _is_ancestor(repo.worktree, tips[1])
     assert _git(repo.worktree, "show", "HEAD:shared.txt") == RESOLVED
     story = _integrate_story(store)
+    assert story.title == "Integrate"
     assert story.status == "done"
     [subtask] = story.subtasks
     assert (subtask.card_id, subtask.status) == (STORY_B, "done")
+    assert subtask.branch == INTEGRATION_BRANCH
+    assert subtask.base_branch == BASE
+    assert subtask.worktree_path == repo.worktree
     assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
     rebuilt = store.rebuild_from_journal(RUN_ID)
+    assert [s.card_id for s in rebuilt.stories] == ["integrate"]
+    assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
     assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]
     _assert_protected(repo, before, tips)
+    # Non-vacuity: only the pygents engine checkpoints, so a resolver walk with
+    # no checkpoint means `integrate_milestone` never handed `engine` on and
+    # this test passed on the yaml walk.
+    assert store.latest_checkpoint(STORY_B) is not None
 
 
 class _RecordingStore:
