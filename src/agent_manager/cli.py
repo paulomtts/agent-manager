@@ -884,6 +884,12 @@ def dry_run_payload(
     level row says how many of its stories would run together:
     `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
 
+    A story's `root` is `dag.story_root(...).branch`. A story with two or more
+    in-milestone blockers is not refused here: its `root` is its own merged
+    base branch and its row gains `merged_from`, the blockers in `blocked_by`
+    order. The key is absent for every other row. The real run still refuses
+    such a story (`orchestrate.plan_levels`).
+
     `integrate` is the terminal phase's plan (Integrate addendum I6): the
     branch every tip is merged into, its worktree under `repo_dir`, and the
     merge order `integration.merge_order` gives -- every story with subtasks,
@@ -902,25 +908,25 @@ def dry_run_payload(
         story_rows: list[dict[str, Any]] = []
         for story in level:
             bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
-            story_rows.append(
-                {
-                    "story": story.id,
-                    "title": story.title,
-                    "root": dag.story_root(
-                        story, stories_by_id, branch_prefix, base_branch
-                    ),
-                    "subtasks": [
-                        {
-                            "id": subtask.id,
-                            "title": subtask.title,
-                            "status": subtask.status,
-                            "branch": dag.subtask_branch(branch_prefix, subtask),
-                            "base": bases[subtask.id],
-                        }
-                        for subtask in dag.remaining_subtasks(story)
-                    ],
-                }
-            )
+            root = dag.story_root(story, stories_by_id, branch_prefix, base_branch)
+            row: dict[str, Any] = {
+                "story": story.id,
+                "title": story.title,
+                "root": root.branch,
+                "subtasks": [
+                    {
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "status": subtask.status,
+                        "branch": dag.subtask_branch(branch_prefix, subtask),
+                        "base": bases[subtask.id],
+                    }
+                    for subtask in dag.remaining_subtasks(story)
+                ],
+            }
+            if root.kind == "merged":
+                row["merged_from"] = list(root.blockers)
+            story_rows.append(row)
         level_rows.append(
             {
                 "level": index,

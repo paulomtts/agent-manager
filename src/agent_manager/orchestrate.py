@@ -245,6 +245,45 @@ class PlannedStory:
         return dag.remaining_subtasks(self.story)
 
 
+def _merged_root_behind(
+    story: census.StoryPlan,
+    stories_by_id: dict[str, census.StoryPlan],
+    branch_prefix: str,
+    base_branch: str,
+) -> tuple[census.StoryPlan, dag.RootPlan] | None:
+    """The merged root this story's stack would build on, and whose it is, or None.
+
+    A story's own root can be merged, or its single blocker can have no
+    subtasks and fall through to a root that is merged -- the same fall-through
+    `dag.story_tip` takes. Only that path is followed. The cycle check has
+    already run, so the walk ends.
+    """
+    current = story
+    while True:
+        root = dag.story_root(current, stories_by_id, branch_prefix, base_branch)
+        if root.kind == "merged":
+            return current, root
+        if root.kind == "base":
+            return None
+        blocker = stories_by_id[root.blockers[0]]
+        if blocker.subtasks:
+            return None
+        current = blocker
+
+
+def _merged_root_error(
+    story: census.StoryPlan, root: dag.RootPlan, base_branch: str
+) -> dag.StackRootError:
+    """Today's refusal, word for word, for a story whose root would be merged."""
+    listed = ", ".join(f"#{dep}" for dep in root.blockers)
+    return dag.StackRootError(
+        f"dag: story #{story.id} is blocked by {len(root.blockers)} stories ({listed}), "
+        "and a stack can only root on ONE parent branch. Merge those blockers into "
+        f"{base_branch} first, or restructure the dependencies so this story has "
+        "a single blocker."
+    )
+
+
 def plan_levels(
     stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
 ) -> list[list[PlannedStory]]:
@@ -253,14 +292,21 @@ def plan_levels(
     The same composition as `cli.dry_run_payload`: the cycle check runs first,
     because a cycle is what breaks the geometry, and `stories_by_id` covers
     every story, done ones included, so a story blocked by a done story still
-    roots on that story's tip. A story with two in-milestone blockers raises
-    `dag.StackRootError` here, from `stack_bases`.
+    roots on that story's tip. A story whose root is `dag.RootPlan` kind
+    `"merged"` -- two or more in-milestone blockers, directly or through a
+    subtask-less blocker -- raises `dag.StackRootError` here, before any
+    geometry is returned: the dry run shows a merged root, but nothing builds
+    merged bases yet (Task 3.2).
     """
     stories = list(stories)
     dag.assert_no_blocker_cycles(stories)
     stories_by_id = {story.id: story for story in stories}
     planned: list[list[PlannedStory]] = []
     for index, level in enumerate(dag.compute_levels(stories)):
+        for story in level:
+            merged = _merged_root_behind(story, stories_by_id, branch_prefix, base_branch)
+            if merged is not None:
+                raise _merged_root_error(*merged, base_branch)
         planned.append(
             [
                 PlannedStory(

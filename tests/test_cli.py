@@ -966,16 +966,36 @@ def test_the_dry_run_checks_for_blocker_cycles_before_any_geometry():
     assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
 
 
-def test_the_dry_run_refuses_a_story_with_two_in_milestone_blockers():
+def test_the_dry_run_roots_a_story_with_two_in_milestone_blockers_on_a_merged_base():
+    """Not refused: the joined story's root is its own merged base branch and
+    `merged_from` names its in-milestone blockers in `blocked_by` order, an
+    outside id left out. Rows rooted on the base or on one tip have no
+    `merged_from` key."""
     a = _plan_story(1, [_plan_subtask(11)])
     b = _plan_story(2, [_plan_subtask(21)])
-    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    c = _plan_story(
+        3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[a.id, "outside", b.id]
+    )
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[a.id])
 
-    with pytest.raises(dag.StackRootError) as caught:
-        cli.dry_run_payload([a, b, c], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload(
+        [a, b, c, d], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
 
-    assert f"#{a.id}" in str(caught.value)
-    assert f"#{b.id}" in str(caught.value)
+    rows = {row["story"]: row for level in payload["levels"] for row in level["stories"]}
+    assert rows[c.id]["root"] == f"m3/base-{dag.short_id(c.id)}" == "m3/base-00000003"
+    assert rows[c.id]["merged_from"] == [a.id, b.id]
+    assert [row["base"] for row in rows[c.id]["subtasks"]] == [
+        "m3/base-00000003",
+        dag.subtask_branch("m3", c.subtasks[0]),
+    ]
+    assert rows[a.id]["root"] == rows[b.id]["root"] == "main"
+    assert rows[d.id]["root"] == dag.subtask_branch("m3", a.subtasks[-1])
+    for story in (a, b, d):
+        assert "merged_from" not in rows[story.id]
+    # The row survives the one-line JSON render untouched.
+    rendered = json.loads(cli.render(cli.ok_envelope(payload)))["data"]
+    assert rendered == payload
 
 
 def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_done():
@@ -2848,7 +2868,7 @@ def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
 
 @requires_git
 @requires_brd
-def test_a_story_blocked_by_two_stories_is_an_envelope_naming_both(project, monkeypatch):
+def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monkeypatch):
     milestone = _add_card(project, "Milestone 8: diamond")
     first = _add_card(project, "Story one", milestone)
     second = _add_card(project, "Story two", milestone)
@@ -2857,14 +2877,29 @@ def test_a_story_blocked_by_two_stories_is_an_envelope_naming_both(project, monk
         _add_card(project, f"only subtask of {story}", story)
     _block(project, joined, first)
     _block(project, joined, second)
+    # `merged_from` follows the joined story's `blocked_by` as brd reports it,
+    # which the census copies through untouched.
+    joined_node = next(
+        node for node in board.tree(milestone, repo_dir=project).children if node.id == joined
+    )
+    census_order = [dep for dep in joined_node.blocked_by if dep in (first, second)]
+    assert sorted(census_order) == sorted([first, second])
     porcelain_before = _git(project, "status", "--porcelain")
     _forbid_writes(monkeypatch)
 
-    error = _refusal(_dry_run(project, milestone))
+    result = _dry_run(project, milestone)
 
-    assert error["type"] == "StackRootError"
-    assert f"#{first}" in error["message"]
-    assert f"#{second}" in error["message"]
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    rows = {
+        row["story"]: row for level in envelope["data"]["levels"] for row in level["stories"]
+    }
+    assert rows[joined]["merged_from"] == census_order
+    assert rows[joined]["root"] == f"m2/base-{dag.short_id(joined)}"
+    assert rows[joined]["subtasks"][0]["base"] == rows[joined]["root"]
+    assert "merged_from" not in rows[first]
+    assert "merged_from" not in rows[second]
     _assert_nothing_written(project, porcelain_before)
 
 
