@@ -3149,6 +3149,7 @@ def test_a_milestone_run_calls_run_milestone_once_with_the_run_options(
                 "commands": ["uv run pytest", "uv run ruff check"],
                 "allow_no_verification": True,
                 "max_concurrent": 4,
+                "engine": "yaml",
             },
         )
     ]
@@ -3168,6 +3169,115 @@ def test_an_explicit_max_concurrent_reaches_run_milestone(
     assert result.exit_code == 0, result.output
     ((_, kwargs),) = calls
     assert kwargs["max_concurrent"] == passed
+
+
+@pytest.mark.parametrize("value", ["bogus", "PYGENTS", "Yaml", ""])
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ["--card", SOME_CARD],
+        ["--milestone", "2"],
+        ["--milestone", "2", "--dry-run"],
+    ],
+)
+def test_a_bad_engine_is_a_usage_error_that_starts_nothing(
+    tmp_path, monkeypatch, targets, value
+):
+    """Spec test 1 and Review Focus 2: exit 2, NOTHING on stdout (usage errors
+    go to stderr), no case folding, and no run directory. Every run path is
+    forbidden, so reaching one fails the test."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            *targets,
+            "--engine",
+            value,
+            "--repo-dir",
+            str(tmp_path),
+            "--branch-prefix",
+            "m2",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert result.stdout == ""
+    assert "--engine" in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "extra, passed", [((), "yaml"), (("--engine", "yaml"), "yaml"), (("--engine", "pygents"), "pygents")]
+)
+def test_the_engine_reaches_run_card(tmp_path, monkeypatch, extra, passed):
+    """No git or brd: `run_card` is replaced. Without `--engine` it gets `yaml`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    seen: dict[str, Any] = {}
+
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        return _fake_payload(card_id, "a6c7bff3-0000-4000-8000-000000000002")
+
+    monkeypatch.setattr(cli, "run_card", fake_run_card)
+
+    result = runner.invoke(
+        cli.app,
+        ["run", "--card", SOME_CARD, "--repo-dir", str(tmp_path), "--branch-prefix", "m2", *extra],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["engine"] == passed
+
+
+@pytest.mark.parametrize(
+    "extra, passed", [((), "yaml"), (("--engine", "yaml"), "yaml"), (("--engine", "pygents"), "pygents")]
+)
+def test_the_engine_reaches_run_milestone(tmp_path, monkeypatch, extra, passed):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_milestone(monkeypatch, CLEAN_MILESTONE)
+
+    result = _milestone_run(tmp_path, *extra)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(CLEAN_MILESTONE)
+    ((_, kwargs),) = calls
+    assert kwargs["engine"] == passed
+
+
+def test_a_dry_run_accepts_and_ignores_the_engine(tmp_path, monkeypatch):
+    """Review Focus 4: the preview is the same call it always was -- no
+    `engine` key reaches it -- and nothing is driven or written."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_dry_run_milestone(needle, **kwargs):
+        calls.append((needle, kwargs))
+        return {"max_concurrent": kwargs["max_concurrent"], "levels": [], "already_done": []}
+
+    monkeypatch.setattr(cli, "dry_run_milestone", fake_dry_run_milestone)
+
+    result = _milestone_run(tmp_path, "--dry-run", "--engine", "pygents")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (
+            "Milestone 3",
+            {
+                "repo_dir": tmp_path,
+                "branch_prefix": "m3",
+                "base_branch": "main",
+                "max_concurrent": 4,
+            },
+        )
+    ]
+    assert list(paths.data_dir().iterdir()) == []
 
 
 def test_the_cli_default_lane_count_is_the_models_default():

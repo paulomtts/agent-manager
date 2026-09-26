@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 import typer
 
@@ -1025,8 +1025,9 @@ def _check_run_targets(
     milestone: str | None,
     dry_run: bool,
     max_concurrent: int | None = None,
+    engine: str = "yaml",
 ) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` combination as a usage error.
+    """Refuse a bad `--card` / `--milestone` / `--dry-run` / `--max-concurrent` / `--engine` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
@@ -1037,6 +1038,9 @@ def _check_run_targets(
     refused whatever its value, the default included. The Option has no
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
+    `--engine` is typed `str` because Typer 0.27.2 cannot take a `Literal`
+    annotation, so a value outside `ENGINES` is refused here, exactly and
+    without case folding; `--dry-run` still validates it.
     """
     if card is not None and milestone is not None:
         raise typer.BadParameter(
@@ -1067,6 +1071,11 @@ def _check_run_targets(
         raise typer.BadParameter(
             "--max-concurrent applies only to --milestone",
             param_hint="'--max-concurrent'",
+        )
+    if engine not in ENGINES:
+        raise typer.BadParameter(
+            f"--engine must be one of {', '.join(ENGINES)}, got {engine!r}",
+            param_hint="'--engine'",
         )
 
 
@@ -1120,12 +1129,25 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    engine: str = typer.Option(
+        "yaml",
+        "--engine",
+        help=(
+            "Which engine walks each subtask: `yaml` (the default) or `pygents`. "
+            "--dry-run accepts it and ignores it."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
     _check_run_targets(
-        card=card, milestone=milestone, dry_run=dry_run, max_concurrent=max_concurrent
+        card=card,
+        milestone=milestone,
+        dry_run=dry_run,
+        max_concurrent=max_concurrent,
+        engine=engine,
     )
+    selected = cast(Engine, engine)
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
         if milestone is not None and dry_run:
@@ -1153,6 +1175,7 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+                engine=selected,
             )
         else:
             payload = run_card(
@@ -1162,6 +1185,7 @@ def run(
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
                 commands=list(verify),
+                engine=selected,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
