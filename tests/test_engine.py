@@ -234,6 +234,98 @@ def test_bind_arguments_binds_the_merge_completed_gate_from_a_gate_table():
     }
 
 
+def test_the_engine_can_bind_mark_validated_out_of_the_subtask_context():
+    """The phase carries no `args`, so both parameters have to come from the
+    context by name -- `plan_path` from `walk._document_paths` and `worktree`
+    from `walk.subtask_context`. If either name drifted, the phase would die
+    at runtime while every unit test still passed."""
+    bound = walk.bind_arguments(
+        plan_check.mark_validated,
+        {
+            "card": "a32af745",
+            "worktree": Path("/repo/.claude/worktrees/m2/task-rows-a32af745"),
+            "plan_path": "docs/superpowers/plans/task-rows-a32af745.md",
+            "spec_path": "docs/superpowers/specs/task-rows-a32af745.md",
+            "commands": ["uv run pytest"],
+        },
+        None,
+        phase="mark_validated",
+        function="plan_check.mark_validated",
+    )
+
+    assert bound == {
+        "plan_path": "docs/superpowers/plans/task-rows-a32af745.md",
+        "worktree": Path("/repo/.claude/worktrees/m2/task-rows-a32af745"),
+    }
+
+
+def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context():
+    """The phase carries no `args`, so all four parameters have to come from the
+    context by name -- `card_details` and `worktree` from
+    `walk.subtask_context`, `spec_path` and `plan_path` from
+    `walk._document_paths`. `git_runner` has a default and must NOT be bound
+    out of a context that happens to hold no such key."""
+    card = models.Card(
+        id="6f1a2f2e-1f1c-4f0e-9a6d-0c2f3b4a5d6e",
+        title="Commit the spec and plan with the Plan-Hash trailer",
+        status="todo",
+    )
+    bound = walk.bind_arguments(
+        docs_commit.commit_documents,
+        {
+            "card": "ba15da20",
+            "card_details": card,
+            "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+            "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+            "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+            "commands": ["uv run pytest"],
+        },
+        None,
+        phase="docs_commit",
+        function="docs_commit.commit_documents",
+    )
+
+    assert bound == {
+        "card_details": card,
+        "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
+        "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
+        "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+    }
+
+
+def test_the_engine_can_bind_the_workflows_args_to_the_rollup_step():
+    """The `card` vs `card_id` trap: the context key is `card`, a bare id."""
+    bound = walk.bind_arguments(
+        rollup.set_status,
+        {
+            "card": "43008688",
+            "card_details": None,
+            "branch": "m2/task-implement-the-rollup-43008688",
+            "repo_dir": Path("/repo"),
+        },
+        {"status": "done"},
+        phase="mark_done",
+        function="rollup.set_status",
+    )
+    assert bound == {
+        "card": "43008688",
+        "status": "done",
+        "repo_dir": Path("/repo"),
+    }
+
+
+def test_binding_rejects_an_args_key_the_rollup_step_does_not_take():
+    """A step declared with `args={"card_id": ...}` must fail loudly."""
+    with pytest.raises(walk.EngineError):
+        walk.bind_arguments(
+            rollup.set_status,
+            {"card": "43008688", "repo_dir": Path("/repo")},
+            {"card_id": "43008688", "status": "done"},
+            phase="mark_done",
+            function="rollup.set_status",
+        )
+
+
 RUN_ID = "run-2026-09-23-01"
 STORY_ID = "2143808b"
 
@@ -2527,6 +2619,57 @@ def test_an_escalation_during_the_stop_request_wins_over_the_stop(store, run_sub
     assert "disk went away" in summary.detail
     assert _subtask_journal_statuses(store) == ["escalated"]
     assert _projected_subtask_status(store) == "escalated"
+
+
+# ── run_one_step: one deterministic phase, run, judged and recorded ─────────
+
+FIXED = datetime(2026, 9, 26, tzinfo=timezone.utc)
+
+
+def test_run_one_step_calls_a_phase_models_callables_directly(store):
+    seen: dict[str, Any] = {}
+
+    def build(card):
+        return {"built": card}
+
+    def ok_gate(result):
+        seen["gate"] = result
+
+    step = phase_model.Step(
+        "a",
+        build,
+        gates=(ok_gate,),
+        when=lambda result: result["built"] == "c1",
+        skip_to="z",
+    )
+
+    outcome = walk.run_one_step(
+        phase=step, table={"card": "c1"}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is True
+    assert outcome.result == {"built": "c1"}
+    assert outcome.skip_to == "z"
+    assert outcome.warnings == []
+    assert seen["gate"] == {"built": "c1"}
+    assert _journalled_phases(store) == [("a", "started"), ("a", "done")]
+
+
+def test_run_one_step_names_a_callable_gate_by_its_function_name(store):
+    def blocking(result):
+        return {"blocked": "x"}
+
+    step = phase_model.Step("a", lambda: {}, gates=(blocking,))
+
+    outcome = walk.run_one_step(
+        phase=step, table={}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is False
+    assert outcome.detail == "phase 'a' gate 'blocking' failed: blocked=x"
+    assert _journalled_phases(store) == [("a", "started"), ("a", "failed")]
 
 
 def test_an_error_no_phase_handles_escalates_at_the_phase_that_was_running(
