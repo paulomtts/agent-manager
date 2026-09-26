@@ -35,7 +35,13 @@ from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.store import Store
+from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, Workflow
+
+AnyAgentPhase = AgentPhase | phase_model.AgentPhase
+"""Either agent-phase type: the YAML one (`result` and gates as names) or the
+declared phase model (`result` a class, gates callables). Dispatch accepts both
+while the YAML engine exists; nothing here imports pygents (rule 1)."""
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -277,7 +283,7 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
 
 
 def evaluate_gates(
-    phase: AgentPhase,
+    phase: AnyAgentPhase,
     workflow: Workflow,
     values: Mapping[str, Any],
     warnings: list[str],
@@ -296,9 +302,17 @@ def evaluate_gates(
     A binding failure is different again and propagates as `EngineError`: it
     means the document names a gate whose parameters nothing supplies, which is
     a bug in the document, not in the attempt.
+
+    A gate entry is either a name, resolved through `workflow.function` as the
+    YAML document declares it, or -- on a declared `phases.AgentPhase` -- the
+    callable itself, used as-is and named by its `__name__` (its `repr` when it
+    has none) in every message.
     """
-    for name in phase.gates:
-        gate = workflow.function(name)
+    for entry in phase.gates:
+        if isinstance(entry, str):
+            name, gate = entry, workflow.function(entry)
+        else:
+            name, gate = getattr(entry, "__name__", repr(entry)), entry
         kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
         try:
             verdict = gate(**kwargs)

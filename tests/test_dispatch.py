@@ -8,6 +8,7 @@ JSONL journal. No process is ever started -- the launcher is injected, and one
 test asserts `subprocess.Popen` is never reached.
 """
 
+import functools
 import hashlib
 import json
 import subprocess
@@ -30,6 +31,7 @@ from agent_manager import (
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
+from agent_manager.workflow import phases
 from agent_manager.workflow.loader import load_workflow
 from agent_manager.workflow.registry import FunctionRegistry
 
@@ -611,6 +613,155 @@ def test_a_gate_whose_parameter_nothing_supplies_is_a_named_engine_error():
 
     assert caught.value.parameter == "provided_verification"
     assert caught.value.function == "output_gate"
+
+
+# ── phase-model phases (workflow.phases.AgentPhase) ──────────────────────────
+
+
+class _NoLookupWorkflow:
+    """A workflow whose name table must never be consulted.
+
+    A phase-model phase carries its gates as callables, so nothing about it
+    should reach `workflow.function`; any call is recorded and fails loudly.
+    """
+
+    def __init__(self) -> None:
+        self.looked_up: list[object] = []
+
+    def function(self, name):
+        self.looked_up.append(name)
+        raise AssertionError(f"workflow.function({name!r}) was called for a callable gate")
+
+
+def _model_phase(*gates, **overrides) -> phases.AgentPhase:
+    """A declared `phases.AgentPhase` shaped like AGENT_DOCUMENT's explore phase."""
+    fields = {
+        "name": "explore",
+        "role": "explorer",
+        "inputs": (),
+        "result": FakeResult,
+        "gates": tuple(gates),
+    }
+    fields.update(overrides)
+    return phases.AgentPhase(**fields)
+
+
+def test_callable_gate_is_called_directly():
+    workflow = _NoLookupWorkflow()
+
+    verdict = dispatch.evaluate_gates(
+        _model_phase(lambda result: {"blocked": "x", "detail": "d"}),
+        workflow,
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is False
+    assert verdict.detail == "phase 'explore' gate '<lambda>' failed: blocked=x, detail=d"
+    assert workflow.looked_up == []
+
+
+def test_a_passing_callable_gate_sees_the_result():
+    seen: list[object] = []
+
+    def output_gate(result):
+        seen.append(result)
+        return None
+
+    verdict = dispatch.evaluate_gates(
+        _model_phase(output_gate),
+        _NoLookupWorkflow(),
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict is None
+    assert seen == [{"summary": "ok"}]
+
+
+def test_a_callable_gate_that_raises_is_fatal_and_named_by_its_function_name():
+    def output_gate(result):
+        raise RuntimeError("the gate itself is broken")
+
+    verdict = dispatch.evaluate_gates(
+        _model_phase(output_gate),
+        _NoLookupWorkflow(),
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is True
+    assert "gate 'output_gate' raised RuntimeError: the gate itself is broken" in verdict.detail
+
+
+def test_a_callable_gate_returning_a_non_mapping_is_fatal_and_named_lambda():
+    verdict = dispatch.evaluate_gates(
+        _model_phase(lambda result: "looks fine to me"),
+        _NoLookupWorkflow(),
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is True
+    assert "gate '<lambda>' returned str" in verdict.detail
+
+
+def test_a_callable_gate_with_an_unsupplied_parameter_is_a_named_engine_error():
+    def output_gate(result, provided_verification):
+        return None
+
+    with pytest.raises(EngineError) as caught:
+        dispatch.evaluate_gates(
+            _model_phase(output_gate),
+            _NoLookupWorkflow(),
+            dispatch.gate_values({}, "explore", {"summary": "ok"}),
+            [],
+        )
+
+    assert caught.value.parameter == "provided_verification"
+    assert caught.value.function == "output_gate"
+    assert caught.value.phase == "explore"
+
+
+def test_a_callable_gate_warning_names_the_gate_by_its_function_name():
+    def output_gate(result):
+        return {"warn": "counts unusable"}
+
+    warnings: list[str] = []
+
+    verdict = dispatch.evaluate_gates(
+        _model_phase(output_gate),
+        _NoLookupWorkflow(),
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        warnings,
+    )
+
+    assert verdict is None
+    assert warnings == ["phase 'explore' gate 'output_gate' warned: counts unusable"]
+
+
+def _blocking_gate(result, blocked):
+    return {"blocked": blocked}
+
+
+def test_a_callable_gate_without_a_name_is_named_by_its_repr():
+    # A functools.partial has no __name__; the display name falls back to repr.
+    gate = functools.partial(_blocking_gate, blocked="x")
+    name = repr(gate)
+
+    verdict = dispatch.evaluate_gates(
+        _model_phase(gate),
+        _NoLookupWorkflow(),
+        dispatch.gate_values({}, "explore", {"summary": "ok"}),
+        [],
+    )
+
+    assert verdict.status == "gate_failed"
+    assert verdict.fatal is False
+    assert verdict.detail == f"phase 'explore' gate {name!r} failed: blocked=x"
 
 
 STORY_ID = "2143808b"
