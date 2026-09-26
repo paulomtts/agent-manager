@@ -265,6 +265,7 @@ def test_from_loader_resolves_every_name_of_the_shipped_task():
     assert converted.phase_names == tuple(p.name for p in loaded.phases)
     review = converted.phase("review")
     assert review.result is results.ReviewResult
+    assert review.gates[0] is reducers.review_blockers_gate
     assert reducers.review_gate in review.gates
     assert reducers.plan_hash_gate_adapter in review.gates
     assert converted.phase("explore").retry == Retry(2, ("schema_invalid", "gate_failed"))

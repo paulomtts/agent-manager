@@ -593,9 +593,10 @@ def build_result(phase, payload, text, cwd):
             if "Plan-Hash:" in git(cwd, "show", "-s", "--format=%B", revision)
         ]
         if branch in review_fail_branches(cwd):
-            # A review the production `review_gate` blocks: a non-empty
-            # `porcelain`. `unresolved_blockers` alone would fail nothing,
-            # because no gate reads it.
+            # A review the production gates block. `review_blockers_gate`,
+            # listed first on `review`, stops on the non-empty
+            # `unresolved_blockers`; the non-empty `porcelain` is what
+            # `review_gate` would block on if it ran.
             findings = [f"the review-fail marker names {branch}"]
             porcelain = REVIEW_FAIL_PORCELAIN
         else:

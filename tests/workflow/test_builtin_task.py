@@ -201,10 +201,10 @@ def test_every_agent_phase_in_the_shipped_document_declares_a_result() -> None:
     assert [phase.name for phase in agent_phases if phase.result is None] == []
 
 
-def test_review_carries_both_of_its_gates() -> None:
+def test_review_carries_its_three_gates_blockers_first() -> None:
     phase = load_builtin("task").phase("review")
     assert isinstance(phase, AgentPhase)
-    assert phase.gates == ["review_gate", "plan_hash_gate"]
+    assert phase.gates == ["review_blockers_gate", "review_gate", "plan_hash_gate"]
     assert phase.inputs == ["branch", "base_branch", "plan_path"]
     # The reviewer recomputes the hash from the plan file; card f26b377d gives
     # the input to the coder only.
@@ -485,6 +485,7 @@ def test_the_document_still_names_exactly_the_gates_this_suite_covers() -> None:
         ("validate_spec", "critic_blockers_gate"),
         ("validate_plan", "critic_blockers_gate"),
         ("implement", "implement_blocked_gate"),
+        ("review", "review_blockers_gate"),
         ("review", "review_gate"),
         ("review", "plan_hash_gate"),
         ("verify", "verification_passed_gate"),

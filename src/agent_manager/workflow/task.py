@@ -99,7 +99,11 @@ TASK = Workflow("task", (
         role="reviewer",
         inputs=("branch", "base_branch", "plan_path"),
         result=results.ReviewResult,
-        gates=(reducers.review_gate, reducers.plan_hash_gate_adapter),
+        gates=(
+            reducers.review_blockers_gate,
+            reducers.review_gate,
+            reducers.plan_hash_gate_adapter,
+        ),
         timeout=agent_timeout(45),
     ),
     Step("verify", verify.run_suite, gates=(reducers.verification_passed_gate,)),

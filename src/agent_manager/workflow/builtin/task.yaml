@@ -74,7 +74,7 @@ phases:
     role: reviewer
     inputs: [branch, base_branch, plan_path]
     result: ReviewResult
-    gates: [review_gate, plan_hash_gate]
+    gates: [review_blockers_gate, review_gate, plan_hash_gate]
 
   - name: verify
     kind: deterministic
