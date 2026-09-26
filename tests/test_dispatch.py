@@ -1621,3 +1621,45 @@ def test_a_result_class_wins_over_a_same_named_table_entry(store, tmp_path, work
     assert caught.value.outcome == "schema_invalid"
     assert "blockers" in caught.value.detail
     assert len(launcher.calls) == 1
+
+
+def test_phase_model_retry_is_honoured(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[INVALID_RESULT, CRITIC_RESULT])
+    runner, _ = _runner(
+        store, workflow, launcher, tmp_path, worktree, result_models={}
+    )
+    phase = _model_phase(
+        result=results.CriticResult, retry=phases.Retry(2, ("schema_invalid",))
+    )
+
+    result = runner(phase, _context(worktree), _rendered())
+
+    assert result == {"blockers": False, "reason": None, "summary": "no blockers"}
+    assert len(launcher.calls) == 2
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "schema_invalid"), (2, "started"), (2, "ok")
+    ]
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "done")]
+
+
+def test_phase_model_retry_does_not_retry_an_outcome_outside_on(store, tmp_path, worktree):
+    # The `on` half of the duck-typed read: gate_failed is not in `on`, so one
+    # dispatch only, even with attempts left.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[CRITIC_RESULT])
+    runner, _ = _runner(
+        store, workflow, launcher, tmp_path, worktree, result_models={}
+    )
+    phase = _model_phase(
+        lambda result: {"blocked": "critic"},
+        result=results.CriticResult,
+        retry=phases.Retry(3, ("schema_invalid",)),
+    )
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(phase, _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert len(launcher.calls) == 1
+    assert _phase_statuses(store)[-1] == ("explore", "failed")
