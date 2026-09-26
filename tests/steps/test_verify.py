@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager import engine
+from agent_manager.results import ExploreResult, Verification
 from agent_manager.steps import verify
 from agent_manager.steps.verify import (
     CommandResult,
@@ -600,3 +602,49 @@ def test_an_unlaunchable_typecheck_raises_verify_error(tmp_path: Path):
         verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
     assert "definitely-not-mypy" in str(excinfo.value)
     assert ran == [["uv", "run", "pytest"], ["definitely-not-mypy", "."]]
+
+
+def test_the_engine_binds_the_real_explore_dump_into_the_run(tmp_path: Path):
+    # The wiring itself, not just the signature: the engine's own binder, fed a
+    # context holding a validated `ExploreResult` dumped the way `dispatch.py`
+    # dumps it, must hand Explore's typecheck and lint to `run_suite`.
+    marker = tmp_path / "lint-ran.txt"
+    suite = _py("print('5 passed')")
+    typecheck = _py("print('0 errors')")
+    lint = _py(f"open({str(marker)!r}, 'w').write('ran'); print('clean')")
+    explore = ExploreResult(
+        refused=False,
+        reason=None,
+        summary="verify runs Explore's typecheck and lint",
+        verification=Verification(
+            full_suite=[_py("raise SystemExit(9)")], typecheck=typecheck, lint=[lint]
+        ),
+    ).model_dump(mode="json")
+    context = {"commands": [suite], "worktree": str(tmp_path), "explore": explore}
+
+    kwargs = engine.bind_arguments(
+        verify.run_suite, context, phase="verify", function="verify.run_suite"
+    )
+    result = verify.run_suite(**kwargs)
+
+    assert result["passed"] is True
+    assert [entry["command"] for entry in result["verified"]] == [suite, typecheck, lint]
+    assert marker.read_text() == "ran"
+
+
+def test_the_engine_binds_no_explore_when_the_workflow_has_no_explore_phase(
+    tmp_path: Path,
+):
+    # The integrate workflow has no Explore phase: binding must still succeed
+    # and run only the suite.
+    suite = _py("print('5 passed')")
+    context = {"commands": [suite], "worktree": str(tmp_path)}
+    kwargs = engine.bind_arguments(
+        verify.run_suite, context, phase="verify", function="verify.run_suite"
+    )
+    result = verify.run_suite(**kwargs)
+    assert result == {
+        "passed": True,
+        "verified": [{"command": suite, "ok": True, "tail": "5 passed"}],
+        "detail": "",
+    }
