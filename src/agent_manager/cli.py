@@ -1353,7 +1353,10 @@ def resume_run(
     never from a flag: §9's "the run records what it was started with" is the
     reason the record exists. The two knobs the record does *not* carry --
     `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are taken as arguments here rather than grown onto the model.
+    are still taken as arguments, but a walk continued from a checkpoint never
+    reads them: its binding comes from the checkpoint's pool, which holds the
+    suite and the opt-out the run *started* with. Whether a resume should be
+    able to change them is a follow-up decision, not this function's.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1374,6 +1377,7 @@ def resume_run(
         runner_factory=runner_factory,
     )
 
+
 @app.command("resume")
 def resume(
     run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to pick back up."),
@@ -1383,14 +1387,17 @@ def resume(
     allow_no_verification: bool = typer.Option(
         False,
         "--allow-no-verification",
-        help="Proceed even when no verification suite is available (§12's opt-out).",
+        help=(
+            "Accepted for compatibility and currently has no effect: the checkpoint "
+            "carries the opt-out the run started with."
+        ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "One whole verification command, repeatable. The run record does not "
-            "carry the suite, so a resume is told it the way a fresh run was."
+            "Accepted for compatibility and currently has no effect: the checkpoint "
+            "carries the verification suite the run started with."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
@@ -1399,9 +1406,9 @@ def resume(
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
     started and are recorded on the subtask (§9). `--allow-no-verification` and
-    `--verify` are offered because `models.RunConfig` carries neither the opt-out
-    nor the suite commands. The checkpoint carries the gate context the run
-    started with.
+    `--verify` are still accepted, but the continued walk binds the suite and
+    the opt-out out of the checkpoint the run started with, so neither changes
+    what a resume verifies.
     """
     try:
         payload = resume_run(
