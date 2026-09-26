@@ -26,7 +26,12 @@ from typing import Any, Literal
 from agent_manager import models, prompt
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.store import Store
+from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, DeterministicPhase, Workflow
+
+AnyStep = DeterministicPhase | phase_model.Step
+"""Either deterministic-phase type: the YAML one (`run`, gates and `when` as
+names) or the declared phase model (the callables themselves)."""
 
 _EMPTY = inspect.Parameter.empty
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
@@ -261,7 +266,7 @@ class _Outcome:
 
 
 class _GateFailed(Exception):
-    """A gate returned a verdict. Private: it never leaves `_run_deterministic`."""
+    """A gate returned a verdict. Private: it never leaves `run_one_step`."""
 
     def __init__(self, detail: str) -> None:
         self.detail = detail
@@ -288,15 +293,36 @@ def _gate_values(
     return values
 
 
+def _resolve(entry: Any, workflow: Workflow | None) -> Callable[..., Any]:
+    """A phase's `run`, gate or `when` entry as the callable to call.
+
+    A `phases.Step` holds the callable itself; a loader phase holds a name,
+    which only the workflow that loaded it can resolve.
+    """
+    if callable(entry):
+        return entry
+    if workflow is None:
+        raise EngineError(
+            f"names function {entry!r}, but no workflow was given to resolve it"
+        )
+    return workflow.function(entry)
+
+
+def _label(entry: Any) -> str:
+    """How messages name an entry: the name as written, or a callable's `__name__`."""
+    return entry if isinstance(entry, str) else getattr(entry, "__name__", repr(entry))
+
+
 def _evaluate_gates(
-    phase: DeterministicPhase,
-    workflow: Workflow,
+    phase: AnyStep,
+    workflow: Workflow | None,
     values: Mapping[str, Any],
     warnings: list[str],
 ) -> None:
     """Run every gate in order; append warnings, raise `_GateFailed` on a verdict."""
-    for name in phase.gates:
-        gate = workflow.function(name)
+    for entry in phase.gates:
+        gate = _resolve(entry, workflow)
+        name = _label(entry)
         kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
         verdict = gate(**kwargs)
         if verdict is None:
@@ -322,7 +348,7 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
 
 
 def _skip_target(
-    phase: DeterministicPhase, workflow: Workflow, values: Mapping[str, Any]
+    phase: AnyStep, workflow: Workflow | None, values: Mapping[str, Any]
 ) -> str | None:
     """The phase to jump to, or `None` to fall through to the next one.
 
@@ -332,8 +358,10 @@ def _skip_target(
     """
     if phase.when is None or phase.skip_to is None:
         return None
-    predicate = workflow.function(phase.when)
-    kwargs = bind_arguments(predicate, values, phase=phase.name, function=phase.when)
+    predicate = _resolve(phase.when, workflow)
+    kwargs = bind_arguments(
+        predicate, values, phase=phase.name, function=_label(phase.when)
+    )
     return phase.skip_to if predicate(**kwargs) else None
 
 
@@ -493,13 +521,44 @@ def _run_deterministic(
     context: Mapping[str, Any],
     clock: Clock,
 ) -> _Outcome:
+    return run_one_step(
+        phase=phase,
+        table=context,
+        store=store,
+        story_id=story_id,
+        subtask=subtask,
+        clock=clock,
+        workflow=workflow,
+    )
+
+
+def run_one_step(
+    *,
+    phase: AnyStep,
+    table: Mapping[str, Any],
+    store: Store,
+    story_id: str,
+    subtask: models.SubtaskRun,
+    clock: Clock,
+    workflow: Workflow | None = None,
+) -> _Outcome:
+    """One deterministic phase, run, judged and recorded.
+
+    The old engine's walk and the pygents engine's `step_phase` both call this,
+    so both judge a step identically: binding, the mapping check, gates, `when`
+    and `skip_to`, and the `started`/`done`/`failed` phase rows. `workflow` is
+    needed only to resolve a loader phase's names; a `phases.Step` carries its
+    callables. `best_effort` is the caller's to apply -- this returns the
+    verdict, not the walk's reaction to it.
+    """
     started_at = clock()
     _record_phase(store, story_id, subtask, phase, "started", started_at, None)
     warnings: list[str] = []
     try:
-        function = workflow.function(phase.run)
+        function = _resolve(phase.run, workflow)
+        label = _label(phase.run)
         kwargs = bind_arguments(
-            function, context, phase.args, phase=phase.name, function=phase.run
+            function, table, phase.args, phase=phase.name, function=label
         )
         result = function(**kwargs)
         if not isinstance(result, Mapping):
@@ -508,10 +567,10 @@ def _run_deterministic(
                 "return a mapping: a gate or a later `when` would read anything else "
                 "as closed and the run would branch wrongly",
                 phase=phase.name,
-                function=phase.run,
+                function=label,
             )
-        _evaluate_gates(phase, workflow, _gate_values(context, phase.name, result), warnings)
-        skip_to = _skip_target(phase, workflow, _gate_values(context, phase.name, result))
+        _evaluate_gates(phase, workflow, _gate_values(table, phase.name, result), warnings)
+        skip_to = _skip_target(phase, workflow, _gate_values(table, phase.name, result))
     except _GateFailed as failure:
         _record_phase(
             store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail
@@ -539,7 +598,7 @@ def _record_phase(
     store: Store,
     story_id: str,
     subtask: models.SubtaskRun,
-    phase: DeterministicPhase,
+    phase: AnyStep,
     status: models.Status,
     started_at: datetime,
     ended_at: datetime | None,

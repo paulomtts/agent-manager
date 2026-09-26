@@ -19,6 +19,7 @@ from agent_manager import dispatch, engine, models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
 from agent_manager.steps import integrate, reducers
+from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
 from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
@@ -2731,3 +2732,89 @@ def test_a_stopped_subtask_can_be_driven_again_to_done(store):
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
     assert _subtask_journal_statuses(store) == ["stopped", "done"]
     assert _projected_subtask_status(store) == "done"
+
+
+# ── run_one_step: one deterministic phase, either phase type ────────────────
+
+FIXED = datetime(2026, 9, 26, tzinfo=timezone.utc)
+
+
+def _step_functions() -> dict[str, Any]:
+    return {
+        "step.alpha": lambda card: {"card": card},
+        "step.beta": lambda card: {},
+        "step.gamma": lambda card: {},
+    }
+
+
+def test_run_one_step_calls_a_phase_models_callables_directly(store):
+    seen: dict[str, Any] = {}
+
+    def build(card):
+        return {"built": card}
+
+    def ok_gate(result):
+        seen["gate"] = result
+
+    step = phase_model.Step(
+        "a",
+        build,
+        gates=(ok_gate,),
+        when=lambda result: result["built"] == "c1",
+        skip_to="z",
+    )
+
+    outcome = engine.run_one_step(
+        phase=step, table={"card": "c1"}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is True
+    assert outcome.result == {"built": "c1"}
+    assert outcome.skip_to == "z"
+    assert outcome.warnings == []
+    assert seen["gate"] == {"built": "c1"}
+    assert _journalled_phases(store) == [("a", "started"), ("a", "done")]
+
+
+def test_run_one_step_names_a_callable_gate_by_its_function_name(store):
+    def blocking(result):
+        return {"blocked": "x"}
+
+    step = phase_model.Step("a", lambda: {}, gates=(blocking,))
+
+    outcome = engine.run_one_step(
+        phase=step, table={}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is False
+    assert outcome.detail == "phase 'a' gate 'blocking' failed: blocked=x"
+    assert _journalled_phases(store) == [("a", "started"), ("a", "failed")]
+
+
+def test_run_one_step_resolves_a_loader_phases_names_through_the_workflow(store):
+    loaded = _workflow(THREE_PHASES, _step_functions())
+
+    outcome = engine.run_one_step(
+        phase=loaded.phases[0], table={"card": "c1"}, store=store,
+        story_id=STORY_ID, subtask=_subtask(), clock=lambda: FIXED,
+        workflow=loaded,
+    )
+
+    assert outcome.ok is True
+    assert outcome.result == {"card": "c1"}
+
+
+def test_run_one_step_fails_a_named_function_it_has_no_workflow_to_resolve(store):
+    loaded = _workflow(THREE_PHASES, _step_functions())
+
+    outcome = engine.run_one_step(
+        phase=loaded.phases[0], table={"card": "c1"}, store=store,
+        story_id=STORY_ID, subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is False
+    assert outcome.detail.startswith("EngineError: ")
+    assert "'step.alpha'" in outcome.detail
+    assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
