@@ -19,6 +19,7 @@ Three rules shape everything here, and none of them is negotiable:
   clean-tree check or be swept into a commit.
 """
 
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -34,6 +35,7 @@ from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
+from agent_manager.runtime import bridge
 from agent_manager.store import Store
 from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, Workflow
@@ -363,6 +365,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _spawn_kwargs(launcher: LauncherFn) -> dict[str, Any]:
+    """`on_spawn` for a launcher that declares it, bound to the bridge call in flight.
+
+    Inside `bridge.call_agent` the hook records every process this attempt
+    starts, so a cancelled turn can kill it (pygents-engine design G2);
+    anywhere else it is `None`, which `run_direct` treats as absent. A launcher
+    that does not declare the keyword -- every fake launcher in the tests --
+    is called exactly as before.
+    """
+    try:
+        parameters = inspect.signature(launcher).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "on_spawn" not in parameters:
+        return {}
+    return {"on_spawn": bridge.current_spawn_hook()}
+
+
 Clock = Callable[[], datetime]
 
 
@@ -517,7 +537,11 @@ class AgentRunner:
         )
         argv = target.adapter.build_command(dispatch_record)
         outcome = self.launcher(
-            argv, cwd=cwd, timeout=self.timeout, stdout_path=stdout_path
+            argv,
+            cwd=cwd,
+            timeout=self.timeout,
+            stdout_path=stdout_path,
+            **_spawn_kwargs(self.launcher),
         )
         # The same `None if model is None` the brief uses: the two halves of
         # "this phase has no result" must agree. The dispatch and the journalled

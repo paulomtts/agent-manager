@@ -31,6 +31,7 @@ from agent_manager import (
 from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
+from agent_manager.runtime import bridge
 from agent_manager.workflow import phases
 from agent_manager.workflow.loader import load_workflow
 from agent_manager.workflow.registry import FunctionRegistry
@@ -1663,3 +1664,62 @@ def test_phase_model_retry_does_not_retry_an_outcome_outside_on(store, tmp_path,
     assert caught.value.outcome == "gate_failed"
     assert len(launcher.calls) == 1
     assert _phase_statuses(store)[-1] == ("explore", "failed")
+
+
+# ── the bridge's spawn hook reaches a launcher that declares it ──────────────
+
+
+@dataclass
+class SpawnAwareLauncher(FakeLauncher):
+    """A `FakeLauncher` that declares `on_spawn`, as `launcher.run_direct` does."""
+
+    hooks: list[object] = field(default_factory=list)
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path, on_spawn=None) -> Outcome:
+        self.hooks.append(on_spawn)
+        return super().__call__(
+            argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path
+        )
+
+
+async def test_a_launcher_that_declares_on_spawn_gets_the_bridge_calls_hook(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = SpawnAwareLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    result = await bridge.call_agent(
+        runner, workflow.phase("explore"), _context(worktree), _rendered()
+    )
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.hooks) == 1
+    assert callable(launcher.hooks[0])
+
+
+def test_a_launcher_that_declares_on_spawn_gets_none_outside_a_bridge_call(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = SpawnAwareLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert launcher.hooks == [None]
+
+
+async def test_a_launcher_without_on_spawn_still_works_inside_a_bridge_call(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+
+    result = await bridge.call_agent(
+        runner, workflow.phase("explore"), _context(worktree), _rendered()
+    )
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 1
