@@ -22,8 +22,8 @@ from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
-from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 from agent_manager.runtime.stop import StopSignal
+from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
 STORY_ID = "a6c7bff3"
