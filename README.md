@@ -228,6 +228,8 @@ and the run are recorded `escalated`, and `am status <run_id>` shows the whole
 plan. A coder that reports `blocked` ends its subtask escalated at `implement`,
 and review never runs.
 
+When a critic, `validate_spec` or `validate_plan`, reports blockers, the subtask gets one revision: `spec` (or `plan`) runs again with the critic's reason as feedback, and then the critic runs again. A second block escalates at that critic's phase, so `failed_phase` is `validate_spec` or `validate_plan`. `review` has no revision loop. The report's shape is the same either way.
+
 Two more keys appear only when they are not empty:
 
 - `also_escalated`: a list of
