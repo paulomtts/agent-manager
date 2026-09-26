@@ -44,7 +44,7 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-"""`builtin/task.yaml`'s seven agent phases, in document order."""
+"""`TASK`'s seven agent phases, in document order."""
 
 MILESTONE_PREFIX = "m3"
 """The `--branch-prefix` every milestone-run test uses."""

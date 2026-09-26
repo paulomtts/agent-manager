@@ -877,8 +877,8 @@ def test_a_gate_that_raises_stops_after_one_dispatch(store, tmp_path, worktree):
 
 
 def test_a_phase_with_no_retry_block_dispatches_exactly_once(store, tmp_path, worktree):
-    # Review Focus: builtin/task.yaml's spec, plan, implement and review phases
-    # carry no retry: block at all.
+    # Review Focus: TASK's spec, plan, implement and review phases
+    # carry no retry at all.
     def document(functions):
         return _agentic(retry=None)
 

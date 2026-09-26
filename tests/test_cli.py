@@ -441,7 +441,7 @@ def test_select_resumable_refuses_more_than_one_subtask_in_flight():
 AGENT_PHASE_NAMES = frozenset(
     {"explore", "spec", "validate_spec", "plan", "validate_plan", "implement", "review"}
 )
-"""Which phases of `builtin/task.yaml` are `kind: agent`. `PhaseRun.kind` is a
+"""Which phases of `TASK` are `kind: agent`. `PhaseRun.kind` is a
 Literal, so a hand-built phase has to name the right one."""
 
 
@@ -1391,7 +1391,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 @requires_brd
 def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
     """Addendum P4: the driver passes the stop check straight through. With a
-    stop already requested, the first phase of `builtin/task.yaml` never
+    stop already requested, the first phase of `TASK` never
     starts, so the fake runner is never called and no worktree is made."""
     root = cli.resolve_repo_dir(project)
     parent = board.show(cards["story"], repo_dir=root)
@@ -2111,7 +2111,7 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
     project, cards, monkeypatch
 ):
     """The whole chain, not just the call: `--verify` -> `run_card` ->
-    `gate_context` -> the context `builtin/task.yaml` binds its gates out of.
+    `gate_context` -> the context `TASK` binds its gates out of.
 
     The real verify step runs these commands in the worktree, so they are ones
     that pass anywhere."""
@@ -4196,7 +4196,7 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
 @requires_git
 @requires_brd
 def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):
-    """Spec test 5: the orphan is discarded exactly as the yaml resume does it."""
+    """Spec test 5: the orphan attempt is marked `harness_error`."""
     run_id = _crash_pygents(project, cards, "plan")
 
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())

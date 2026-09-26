@@ -43,7 +43,7 @@ def test_run_card_drives_every_phase_under_a_fake_claude_and_the_board_says_done
 ):
     """R7: the card reads `done` ON THE BOARD, not merely in the payload.
 
-    `mark_done` is `best_effort: true` (`builtin/task.yaml:75-79`), so a run can
+    `mark_done` is `best_effort=True` (`workflow.task.TASK`), so a run can
     report `done` while the card never moved -- which is exactly the bug this
     assertion exists to catch.
     """

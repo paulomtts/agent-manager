@@ -59,7 +59,7 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-"""`builtin/task.yaml`'s seven agent phases; see `VERIFY_COMMANDS` on why this
+"""`TASK`'s seven agent phases; see `VERIFY_COMMANDS` on why this
 is re-declared."""
 
 PLAN_HASH_TRAILER = "Plan-Hash:"

@@ -4,7 +4,7 @@ Engine tier per design §14 lines 477-492: canned fake callables in declared
 phase-model workflows stand in for §14's fake adapter with canned result
 files, and the store is a real temp SQLite projection plus a real temp JSONL
 journal. No git, no `brd`, no harness process. Every walk is
-`runtime.walk.run_subtask`, and each workflow below is the declared twin of
+`runtime.engine.run_subtask`, and each workflow below is the declared twin of
 the YAML document the walk was first specified against, phase for phase.
 """
 
@@ -342,7 +342,7 @@ def store(monkeypatch, tmp_path):
 
 @pytest.fixture
 def run_subtask():
-    """`runtime.walk.run_subtask`, the one walk (pygents-engine design G7)."""
+    """`runtime.engine.run_subtask`, the one walk (pygents-engine design G7)."""
     return new_engine.run_subtask
 
 
@@ -350,8 +350,8 @@ Step = phase_model.Step
 
 
 def _agent(name, role, *, inputs=(), result=None, writes=None) -> phase_model.AgentPhase:
-    """An agent phase as `phases.from_loader` built one from a YAML `kind: agent`
-    entry: no gates, no retry, the thirty-minute default timeout."""
+    """A bare declared agent phase: no gates, no retry, the thirty-minute
+    default timeout."""
     return phase_model.AgentPhase(
         name, role=role, inputs=tuple(inputs), result=result, writes=writes
     )
@@ -534,7 +534,7 @@ def test_no_attempt_row_is_written_for_a_deterministic_phase(store, run_subtask)
 
 
 def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store, run_subtask):
-    """The `worktree` phase of the shipped `builtin/task.yaml` names itself the
+    """The `worktree` phase of the shipped `TASK` names itself the
     same as the context key `subtask_context` binds the real worktree path
     under. It must still run and record normally; its own result must simply
     never overwrite the context key later phases bind `worktree` from, or the
@@ -1165,7 +1165,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subt
         raise AssertionError("an agent phase's gate is the agent runner's business")
 
     def integrate_only_gate(**kwargs: Any) -> None:
-        raise AssertionError("task.yaml never references an integrate-only gate")
+        raise AssertionError("TASK never references an integrate-only gate")
 
     functions: dict[str, Any] = {
         "rollup.set_status": set_status,
@@ -1606,7 +1606,7 @@ def _fake_task(functions: dict[str, Any]) -> phase_model.Workflow:
 
 
 def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
-    """The fake registry `builtin/task.yaml` needs, with no git, brd or harness."""
+    """The fake callables `TASK` needs, with no git, brd or harness."""
 
     def set_status(card: str, status: str) -> dict[str, Any]:
         calls.append(f"rollup.set_status:{status}")
@@ -2027,7 +2027,7 @@ def test_a_base_exception_propagates_and_records_no_outcome(store, run_subtask):
 
 def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path, run_subtask):
     """The §12 escape hatch's parameters have to arrive somehow: `subtask_context`
-    is a fixed table, and `builtin/task.yaml`'s gates bind names it does not hold.
+    is a fixed table, and `TASK`'s gates bind names it does not hold.
     """
     seen: dict[str, Any] = {}
 
@@ -2092,7 +2092,7 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path, ru
 
 
 # ── decision O7: a blocked coder stops the subtask ───────────────────────────
-# Engine tier per design 14: the real `task.yaml`, the real gate, the real
+# Engine tier per design 14: the real `TASK`, the real gate, the real
 # `dispatch.AgentRunner` for the two phases under test, and a fake adapter plus
 # a fake launcher that writes a canned result file. No process is started.
 

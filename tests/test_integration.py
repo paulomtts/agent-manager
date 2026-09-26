@@ -553,7 +553,7 @@ def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
 ) -> None:
     """Review Focus 5: the same scenario as the test above, walked by the
     pygents engine over `INTEGRATE` through the real `integrate_milestone`.
-    Everything the yaml walk is asserted to leave behind is asserted here."""
+    Everything a resolved conflict leaves behind is asserted here."""
     stories, tips = _conflicting_pair(repo)
     before = _protected(repo, tips)
     factory = FakeFactory()
