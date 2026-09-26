@@ -285,3 +285,89 @@ async def test_a_tip_given_as_a_sha_is_merged_and_reported_as_given(
     assert result.already_merged == []
     assert is_ancestor(repo, sha_b, BASE)
     assert rev(repo, "master") == MASTER_BEFORE
+
+
+@pytest.fixture
+def conflicting_repo(repo: Path, tmp_path: Path) -> Path:
+    """`repo` plus m7/a and m7/b, both rewriting shared.txt's one line."""
+    _make_tip(repo, tmp_path, "m7/a", {"shared.txt": "from story a\n"})
+    _make_tip(repo, tmp_path, "m7/b", {"shared.txt": "from story b\n"})
+    return repo
+
+
+@requires_git
+@pytest.mark.parametrize(
+    "tips",
+    [["m7/a", "m7/gone"], ["m7/gone", "m7/b"]],
+    ids=["missing-later-tip", "missing-first-tip"],
+)
+async def test_a_missing_tip_fails_naming_the_ref(
+    two_story_repo: Path, tmp_path: Path, MASTER_BEFORE: str, tips: list[str]
+):
+    repo = two_story_repo
+    # A tip deleted after an earlier run finished its story.
+    _make_tip(repo, tmp_path, "m7/gone", {"gone.txt": "deleted later\n"})
+    _git(repo, "branch", "-D", "m7/gone")
+
+    with pytest.raises(bases.BaseFailed, match="m7/gone") as excinfo:
+        await _build(repo, tips)
+
+    assert excinfo.value.stopped is False
+    assert "m7/gone" in excinfo.value.detail
+    assert _git(repo, "branch", "--list", BASE).strip() == ""
+    assert not base_worktree(repo).exists()
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_no_tips_is_refused_before_any_git(two_story_repo: Path, MASTER_BEFORE: str):
+    repo = two_story_repo
+
+    with pytest.raises(ValueError, match=BASE):
+        await _build(repo, [])
+
+    assert _git(repo, "branch", "--list", BASE).strip() == ""
+    assert not base_worktree(repo).exists()
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_conflict_is_not_resolved_yet(conflicting_repo: Path, MASTER_BEFORE: str):
+    repo = conflicting_repo
+
+    with pytest.raises(bases.BaseFailed, match="conflict.*resolver not wired") as excinfo:
+        await _build(repo, ["m7/a", "m7/b"])
+
+    assert excinfo.value.stopped is False
+    assert "m7/b" in excinfo.value.detail
+    assert "shared.txt" in excinfo.value.detail
+    # Left in progress for Task 2.2's resolver or a human: never aborted.
+    wt = base_worktree(repo)
+    assert _merge_head(wt) == rev(repo, "m7/b")
+    assert "<<<<<<< " in (wt / "shared.txt").read_text()
+    assert rev(repo, BASE) == rev(repo, "m7/a")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_merge_in_progress_fails_for_a_human(
+    two_story_repo: Path, tmp_path: Path, MASTER_BEFORE: str
+):
+    repo = two_story_repo
+    _make_tip(repo, tmp_path, "m7/c", {"c.txt": "from story c\n"})
+    await _build(repo, ["m7/a", "m7/b"])
+    wt = base_worktree(repo)
+    head = rev(repo, BASE)
+    # A merge someone started in the base worktree and never finished.
+    _git(wt, "merge", "--no-ff", "--no-commit", "m7/c")
+    assert _merge_head(wt) == rev(repo, "m7/c")
+
+    with pytest.raises(bases.BaseFailed, match="never resolved") as excinfo:
+        await _build(repo, ["m7/a", "m7/b"])
+
+    assert excinfo.value.stopped is False
+    assert BASE in excinfo.value.detail
+    assert str(wt) in excinfo.value.detail
+    assert _merge_head(wt) == rev(repo, "m7/c")
+    assert rev(repo, BASE) == head
+    assert rev(repo, "master") == MASTER_BEFORE
