@@ -10,6 +10,11 @@ default suite. To run it: `uv run pytest -m e2e` (a bare path invocation such
 as `uv run pytest tests/e2e/test_real_harness.py` is still deselected by
 `addopts` and exits 5 -- pass `-m e2e` alongside the path).
 
+The test runs once per engine (`[yaml]` and `[pygents]`, pygents-engine spec
+§9), so `-m e2e` alone pays for TWO real runs of this module. To pay for one,
+select an engine by id:
+`uv run pytest -m e2e -k pygents -v tests/e2e/test_real_harness.py`.
+
 The marker is applied HERE and only here. Marking it from `tests/e2e/conftest.py`
 would drag the sibling's free, fake-claude `test_production_wiring.py` out of the
 default suite, which its own `test_this_module_runs_in_the_default_suite_unmarked`
@@ -87,6 +92,15 @@ def _plan_hashes(message: str) -> list[str]:
     ]
 
 
+@pytest.fixture(scope="module", params=["yaml", "pygents"])
+def engine(request) -> str:
+    """Overrides the conftest's `engine`: the one real run happens once per
+    engine, each on its own repo and board (pygents spec §9). Fixture params,
+    not a parametrize mark, so no marker other than `e2e` reaches this module.
+    Select one engine with `-k yaml` or `-k pygents`."""
+    return request.param
+
+
 @pytest.fixture(scope="module")
 def real_claude() -> Path:
     """The real `claude`, or a skip that says so in as many words.
@@ -105,8 +119,9 @@ def real_claude() -> Path:
 
 
 @pytest.fixture(scope="module")
-def completed_run(real_claude, project, cards) -> dict[str, Any]:
-    """One real, paid `cli.run_card` -- no `runner_factory`, no fake on `PATH`.
+def completed_run(real_claude, project, cards, engine) -> dict[str, Any]:
+    """One real, paid `cli.run_card` on `engine` -- no `runner_factory`, no
+    fake on `PATH`.
 
     Overrides the conftest fixture of the same name, so `run_tree`,
     `agent_attempts` and `worktree` resolve against THIS run. `fake_claude_bin`
@@ -121,6 +136,7 @@ def completed_run(real_claude, project, cards) -> dict[str, Any]:
         base_branch="main",
         branch_prefix=BRANCH_PREFIX,
         commands=list(VERIFY_COMMANDS),
+        engine=engine,
     )
 
 
