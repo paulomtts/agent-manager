@@ -422,9 +422,9 @@ class AgentRunner:
         """
         role = load_role(phase.role, root=self.role_root)
         target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
-        # A declared phase-model phase carries its result model as the class
-        # itself, which is used as-is; a YAML phase carries a name, looked up
-        # in the table exactly as before.
+        # A declared phase carries its result model as the class itself, which
+        # is used as-is; a result given by name is looked up in
+        # `result_models`, and a name the table lacks is refused here.
         if phase.result is None:
             model = None
         elif isinstance(phase.result, type):

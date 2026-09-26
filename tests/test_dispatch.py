@@ -8,6 +8,7 @@ JSONL journal. No process is ever started -- the launcher is injected, and one
 test asserts `subprocess.Popen` is never reached.
 """
 
+import dataclasses
 import functools
 import hashlib
 import json
@@ -988,6 +989,21 @@ def test_a_spec_attempt_that_writes_no_result_file_is_a_harness_error(
 
     assert caught.value.outcome == "harness_error"
     assert "no result file" in caught.value.detail
+
+
+def test_an_unregistered_result_model_is_a_named_engine_error(store, tmp_path, worktree):
+    """`AgentRunner` still resolves a result given by name through
+    `result_models`; a name the table lacks is refused before any launch."""
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    named = dataclasses.replace(workflow.phase("explore"), result="ExploreResult")
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree, result_models={})
+
+    with pytest.raises(EngineError) as caught:
+        runner(named, _context(worktree), _rendered())
+
+    assert caught.value.phase == "explore"
+    assert launcher.calls == []
 
 
 def test_a_context_with_no_worktree_is_a_named_engine_error(store, tmp_path, worktree):
