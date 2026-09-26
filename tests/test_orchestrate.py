@@ -36,7 +36,6 @@ from agent_manager import engine as engine_module
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import task as task_workflow
-from agent_manager.workflow.registry import WorkflowLoadError
 
 
 # ── pure plans ──────────────────────────────────────────────────────────────
@@ -450,7 +449,6 @@ class FakeDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
-        engine="yaml",
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -465,7 +463,6 @@ class FakeDriver:
                 "commands": list(commands),
                 "allow_no_verification": allow_no_verification,
                 "runner_factory": runner_factory,
-                "engine": engine,
             }
         )
         self.snapshots.append(store.load_run(run_id))
@@ -522,7 +519,6 @@ class IntegrateRecorder:
         store,
         run_id,
         runner_factory,
-        engine="yaml",
     ):
         stories = list(stories)
         self.calls.append(
@@ -536,7 +532,6 @@ class IntegrateRecorder:
                 "store": store,
                 "run_id": run_id,
                 "runner_factory": runner_factory,
-                "engine": engine,
                 "run_status": store.load_run(run_id).status,
             }
         )
@@ -757,7 +752,6 @@ class GatedDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
-        engine="yaml",
     ) -> cli.SubtaskDrive:
         with self.lock:
             self.calls.append(
@@ -852,7 +846,6 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
         "allow_no_verification": True,
         "run_id": run_id,
         "runner_factory": factory,
-        "engine": "yaml",
         "run_status": "started",
     }
 
@@ -992,29 +985,6 @@ def test_no_runner_factory_gives_integrate_cli_default_runner_factory_at_call_ti
     assert [call["runner_factory"] for call in driver.calls] == [None]
     (integrate_call,) = integrate_recorder.calls
     assert integrate_call["runner_factory"] is sentinel_factory
-
-
-@requires_git
-@requires_brd
-@pytest.mark.parametrize(
-    "given, passed",
-    [({}, "yaml"), ({"engine": "yaml"}, "yaml"), ({"engine": "pygents"}, "pygents")],
-)
-@pytest.mark.parametrize("lanes", [1, 2])
-def test_run_milestone_hands_its_engine_to_every_driver_call_and_to_integrate(
-    project, integrate_recorder, given, passed, lanes
-):
-    """Spec test 3: one engine per run, on every lane thread and on Integrate.
-    With no argument the engine is `yaml`."""
-    shape = _milestone(project, {"A": 2, "B": 1})
-    driver = FakeDriver()
-
-    result = _run(project, shape["milestone"], driver, max_concurrent=lanes, **given)
-
-    assert result["done"] is True
-    assert len(driver.calls) == 3
-    assert [call["engine"] for call in driver.calls] == [passed] * 3
-    assert [call["engine"] for call in integrate_recorder.calls] == [passed]
 
 
 def _imported_modules(module) -> set[str]:
@@ -1360,27 +1330,6 @@ def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project
     assert list(paths.data_dir().iterdir()) == []
     assert not (project / ".claude").exists()
     assert _git(project, "status", "--porcelain") == porcelain_before
-
-
-@requires_git
-@requires_brd
-def test_a_workflow_that_will_not_load_is_refused_before_anything_is_written(
-    project, monkeypatch
-):
-    """The preflight `run_card` does: a workflow that will not load refuses the
-    run before the fetch, the prune, the store or the first subtask."""
-    shape = _milestone(project, {"A": 1})
-    monkeypatch.setattr(cli, "WORKFLOW_NAME", "no-such-workflow")
-    git_calls = _record_git(monkeypatch)
-    driver = FakeDriver()
-
-    with pytest.raises(WorkflowLoadError) as caught:
-        _run(project, shape["milestone"], driver)
-
-    assert "no-such-workflow" in str(caught.value)
-    assert driver.calls == []
-    assert git_calls == []
-    assert list(paths.data_dir().iterdir()) == []
 
 
 @requires_git
@@ -2075,7 +2024,7 @@ def test_a_pygents_relaunch_continues_a_matching_open_checkpoint_and_starts_the_
     _plant(project, earlier, b2, "escalated", queue=())
     driver = CheckpointDriver()
 
-    result = _run(project, shape["milestone"], driver, engine="pygents")
+    result = _run(project, shape["milestone"], driver)
 
     assert result["done"] is True
     assert result["completed"] == [a1, a2, b1, b2]
@@ -2085,27 +2034,6 @@ def test_a_pygents_relaunch_continues_a_matching_open_checkpoint_and_starts_the_
     assert driver.resumed[a2] is _ABSENT
     assert driver.resumed[b1] is _ABSENT
     assert driver.resumed[b2] is _ABSENT
-
-
-@requires_git
-@requires_brd
-def test_a_yaml_relaunch_looks_up_no_checkpoint(project, monkeypatch):
-    """Spec test 10, yaml half. A guard: it passes before this task and must
-    keep passing after it."""
-    shape = _milestone(project, {"A": 1})
-    (a1,) = shape["subtasks"]["A"]
-    _plant(project, cli.mint_run_id(shape["milestone"], EARLIER), a1, "parked")
-    looked: list[str] = []
-    monkeypatch.setattr(
-        cli, "continuable_checkpoint", lambda store, card_id: looked.append(card_id)
-    )
-    driver = CheckpointDriver()
-
-    result = _run(project, shape["milestone"], driver)
-
-    assert result["done"] is True
-    assert looked == []
-    assert driver.resumed[a1] is _ABSENT
 
 
 @requires_git
@@ -2122,7 +2050,7 @@ def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypa
     monkeypatch.setattr(cli, "continuable_checkpoint", broken)
     driver = CheckpointDriver()
 
-    result = _run(project, shape["milestone"], driver, engine="pygents")
+    result = _run(project, shape["milestone"], driver)
 
     assert result["escalated"] is True
     assert result["subtask"] == a1

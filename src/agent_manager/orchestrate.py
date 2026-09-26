@@ -11,9 +11,9 @@ terminal merge of every story tip belongs to `integration`. This module decides 
 order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
-a blocker cycle, a story with two in-milestone blockers, a workflow that will
-not load -- runs before the first write, so a refusal leaves no run directory,
-no store, no fetch and no prune behind.
+a blocker cycle, a story with two in-milestone blockers -- runs before the
+first write, so a refusal leaves no run directory, no store, no fetch and no
+prune behind.
 
 `cli` is imported as a module and every name on it is read at call time: the
 CLI wiring card makes `cli` import this module, and binding a `cli` name at
@@ -37,7 +37,6 @@ from typing import Any, Literal, Protocol
 from agent_manager import board, census, cli, dag, integration, models
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Checkpoint, Store
-from agent_manager.workflow.loader import load_builtin
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
@@ -205,8 +204,8 @@ class Driver(Protocol):
     The seam the tests replace. Annotations are strings (`from __future__ import
     annotations`), so no `cli` name is resolved when this module is imported.
 
-    `resume_from` (card 02890d5d) is passed only when a pygents relaunch found
-    a checkpoint to continue, so a driver written before it keeps working.
+    `resume_from` (card 02890d5d) is passed only when a relaunch found a
+    checkpoint to continue, so a driver written before it keeps working.
     """
 
     def __call__(
@@ -222,7 +221,6 @@ class Driver(Protocol):
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
         should_stop: Callable[[], bool] | None = None,
-        engine: cli.Engine = "yaml",
         resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
 
@@ -406,7 +404,6 @@ def run_story_lane(
     allow_no_verification: bool,
     runner_factory: cli.RunnerFactory | None,
     stop: RunStop,
-    engine: cli.Engine = "yaml",
 ) -> LaneOutcome:
     """Drive one story's remaining subtasks in order, and say how the lane ended.
 
@@ -419,7 +416,7 @@ def run_story_lane(
     subtask, escalates through `stop.escalate`. A `BaseException` sets the stop
     so sibling lanes park, and propagates.
 
-    On `engine="pygents"` each subtask's open checkpoint is looked up first
+    Each subtask's open checkpoint is looked up first
     (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
     """
@@ -440,16 +437,15 @@ def run_story_lane(
             store.record_subtask(story_id, row)
             if position == 0:
                 store.record_story(story_row.model_copy(update={"status": "started"}))
-            # Relaunch continuation (card 02890d5d): on pygents a card whose
-            # open checkpoint was saved under this `TASK` continues from it; a
+            # Relaunch continuation (card 02890d5d): a card whose open
+            # checkpoint was saved under this `TASK` continues from it; a
             # changed workflow, a closed card or no row starts it fresh, with
             # no error. The keyword is passed only when there is a row, so a
-            # driver that predates it keeps working. Yaml looks nothing up.
+            # driver that predates it keeps working.
             extra: dict[str, Any] = {}
-            if engine == "pygents":
-                checkpoint = cli.continuable_checkpoint(store, subtask.id)
-                if checkpoint is not None:
-                    extra["resume_from"] = checkpoint
+            checkpoint = cli.continuable_checkpoint(store, subtask.id)
+            if checkpoint is not None:
+                extra["resume_from"] = checkpoint
             result = drive(
                 store=store,
                 run_id=run_id,
@@ -461,7 +457,6 @@ def run_story_lane(
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
                 should_stop=stop.event.is_set,
-                engine=engine,
                 **extra,
             )
         except Exception as error:  # not BaseException: Ctrl-C must still stop
@@ -531,7 +526,6 @@ def run_milestone(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
-    engine: cli.Engine = "yaml",
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone`, level by level, and report (O6).
 
@@ -554,9 +548,6 @@ def run_milestone(
     Integrate escalation records `escalated` and returns
     `integrate_escalated_payload`. An exception from Integrate propagates and
     the run is never recorded `done`.
-
-    `engine` goes unchanged to every driver call on every lane thread and to
-    Integrate; the preflight loads the YAML document on both engines.
     """
     if max_concurrent < 1:
         raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
@@ -565,9 +556,6 @@ def run_milestone(
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    # Fail-fast preflight, as `run_card` does: a workflow that will not load
-    # must leave no run directory. The driver loads its own copy.
-    load_builtin(cli.WORKFLOW_NAME)
     drive = cli.drive_subtask if driver is None else driver
 
     # The first side effect. It runs after every refusal and before the store
@@ -611,7 +599,6 @@ def run_milestone(
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
-                        engine=engine,
                     )
                     for planned in level
                 ]
@@ -644,7 +631,6 @@ def run_milestone(
             store=store,
             run_id=run_id,
             runner_factory=factory,
-            engine=engine,
         )
         if isinstance(outcome, integration.IntegrateEscalation):
             # The branch and worktree stay exactly as Integrate left them (I5).

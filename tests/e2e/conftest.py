@@ -170,23 +170,9 @@ def _init_project(root: Path, board_name: str) -> Path:
 
 
 @pytest.fixture(scope="module")
-def engine() -> str:
-    """The engine every run in a module uses: `yaml` unless the module overrides
-    this fixture with `params=["yaml", "pygents"]` (card 7fdec762).
-
-    Module-scoped so the module-scoped `project` can depend on it: an override
-    with params then builds one repo and board per engine, and pytest runs a
-    module's tests grouped by engine."""
-    return "yaml"
-
-
-@pytest.fixture(scope="module")
-def project(tmp_path_factory, module_monkeypatch, toolchain, engine) -> Path:
-    """One directory that is both a real git repo on `main` and a real brd board.
-
-    One per engine: a module that runs on both engines drives the same card
-    twice, and a card a run moved to `done` cannot be driven again."""
-    base = tmp_path_factory.mktemp(f"e2e-{engine}")
+def project(tmp_path_factory, module_monkeypatch, toolchain) -> Path:
+    """One directory that is both a real git repo on `main` and a real brd board."""
+    base = tmp_path_factory.mktemp("e2e")
     module_monkeypatch.setenv("XDG_DATA_HOME", str(base / "xdg"))
     return _init_project(base / "project", "e2e-board")
 
@@ -215,8 +201,8 @@ def fake_claude_bin(tmp_path_factory, module_monkeypatch) -> Path:
 
 
 @pytest.fixture(scope="module")
-def completed_run(project, cards, fake_claude_bin, engine) -> dict[str, Any]:
-    """One real `cli.run_card`, with NO `runner_factory`, on the module's engine.
+def completed_run(project, cards, fake_claude_bin) -> dict[str, Any]:
+    """One real `cli.run_card`, with NO `runner_factory`.
 
     That omission is the point: `cli.default_runner_factory` (`cli.py:588`)
     builds the real `dispatch.AgentRunner` with the real
@@ -229,7 +215,6 @@ def completed_run(project, cards, fake_claude_bin, engine) -> dict[str, Any]:
         base_branch="main",
         branch_prefix="m1",
         commands=list(VERIFY_COMMANDS),
-        engine=engine,
     )
 
 
@@ -449,13 +434,11 @@ def two_story_board(fresh_project) -> dict[str, Any]:
 
 
 @pytest.fixture
-def run_milestone_cli(fake_claude_bin, engine) -> Callable[..., Any]:
-    """`am run --milestone --engine <engine>` through `CliRunner`, with no runner_factory anywhere.
+def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
+    """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
 
     Depends on `fake_claude_bin` so the fake is first on `PATH`: the real
     `ClaudeAdapter` resolves `claude` to it through the real `run_direct`.
-    `--engine` is always passed; in a module that does not override `engine`
-    it is `yaml`, the default, so those runs are unchanged.
     """
     runner = CliRunner()
 
@@ -475,8 +458,6 @@ def run_milestone_cli(fake_claude_bin, engine) -> Callable[..., Any]:
             "main",
             "--branch-prefix",
             MILESTONE_PREFIX,
-            "--engine",
-            engine,
         ]
         commands = VERIFY_COMMANDS if verify is None else tuple(verify)
         for command in commands:
@@ -517,86 +498,12 @@ def review_fail_marker(milestone_board) -> Path:
     return milestone_board["root"] / ".git" / FAKE_REVIEW_FAIL_MARKER
 
 
-def _engine_neutral(
-    data: Mapping[str, Any], *, tmp: Path, cards: Mapping[str, str]
-) -> dict[str, Any]:
-    """`data` with everything one board or one run owns replaced by a label.
-
-    The two engines run on two boards, so card ids, their short ids, the tmp
-    dir (repo, worktrees and `XDG_DATA_HOME` all live under it) and the run id
-    differ by construction. Everything else must match. `run_id` itself is
-    dropped: the spec compares `data` ignoring `run_id` and timestamps. Longest
-    needle first, so a card id is labelled before its own short id.
-    """
-    labels: dict[str, str] = {str(tmp): "<tmp>", str(tmp.resolve()): "<tmp>"}
-    run_id = data.get("run_id")
-    if isinstance(run_id, str):
-        labels[run_id] = "<run_id>"
-    for label, card_id in cards.items():
-        labels[card_id] = f"<{label}>"
-        labels[dag.short_id(card_id)] = f"<{label}:short>"
-    text = json.dumps(data, sort_keys=True)
-    for needle in sorted(labels, key=len, reverse=True):
-        text = text.replace(needle, labels[needle])
-    neutral = json.loads(text)
-    neutral.pop("run_id", None)
-    return neutral
-
-
-@pytest.fixture(scope="session")
-def engine_parity() -> Callable[..., None]:
-    """Spec G10: the same scenario's `data` is the same on every engine.
-
-    `check(key, engine, data, tmp=..., cards=...)` records the engine-neutral
-    form of `data` under `key` and asserts it equals every other engine's
-    record for that key. Whichever engine runs second does the comparing, so
-    the check does not depend on test order; a lone engine (a `-k` selection)
-    has nothing to compare against and passes.
-    """
-    seen: dict[str, dict[str, Any]] = {}
-
-    def check(
-        key: str,
-        engine: str,
-        data: Mapping[str, Any],
-        *,
-        tmp: Path,
-        cards: Mapping[str, str],
-    ) -> None:
-        neutral = _engine_neutral(data, tmp=tmp, cards=cards)
-        by_engine = seen.setdefault(key, {})
-        by_engine[engine] = neutral
-        for other, recorded in by_engine.items():
-            assert recorded == neutral, (key, other, engine)
-
-    return check
-
-
-@pytest.fixture
-def board_card_labels() -> Callable[[Mapping[str, Any]], dict[str, str]]:
-    """A board fixture's cards as `{label: card id}`, for `engine_parity`.
-
-    Works for `milestone_board` and `parallel_board`: `milestone`, then
-    `story-<KEY>` and `<key><n>` for the n-th subtask of that story."""
-
-    def labels(shape: Mapping[str, Any]) -> dict[str, str]:
-        found = {"milestone": shape["milestone"]}
-        for key, story in shape["stories"].items():
-            found[f"story-{key}"] = story
-            for n, subtask in enumerate(shape["subtasks"][key], start=1):
-                found[f"{key.lower()}{n}"] = subtask
-        return found
-
-    return labels
-
-
 @pytest.fixture
 def checkpoint_rows() -> Callable[[Path, str], int]:
     """How many `checkpoints` rows one run wrote.
 
-    Review Focus 1: only the pygents engine checkpoints (its BEFORE_TURN hook),
-    so a pygents run with zero rows means `--engine` never reached the walk and
-    every engine-parametrized assertion passed vacuously on yaml twice.
+    A run with none never reached the pygents walk's BEFORE_TURN hook, and
+    every assertion about that run would have passed on something else.
     """
 
     def count(root: Path, run_id: str) -> int:

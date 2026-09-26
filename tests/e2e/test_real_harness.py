@@ -10,10 +10,8 @@ default suite. To run it: `uv run pytest -m e2e` (a bare path invocation such
 as `uv run pytest tests/e2e/test_real_harness.py` is still deselected by
 `addopts` and exits 5 -- pass `-m e2e` alongside the path).
 
-The test runs once per engine (`[yaml]` and `[pygents]`, pygents-engine spec
-§9), so `-m e2e` alone pays for TWO real runs of this module. To pay for one,
-select an engine by id:
-`uv run pytest -m e2e -k pygents -v tests/e2e/test_real_harness.py`.
+`-m e2e` pays for one real run of this module:
+`uv run pytest -m e2e -v tests/e2e/test_real_harness.py`.
 
 The marker is applied HERE and only here. Marking it from `tests/e2e/conftest.py`
 would drag the sibling's free, fake-claude `test_production_wiring.py` out of the
@@ -35,8 +33,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agent_manager import board, cli, results
-from agent_manager.workflow import load_builtin
+from agent_manager import board, cli
+from agent_manager.workflow import task as task_workflow
 
 pytestmark = pytest.mark.e2e
 
@@ -92,15 +90,6 @@ def _plan_hashes(message: str) -> list[str]:
     ]
 
 
-@pytest.fixture(scope="module", params=["yaml", "pygents"])
-def engine(request) -> str:
-    """Overrides the conftest's `engine`: the one real run happens once per
-    engine, each on its own repo and board (pygents spec §9). Fixture params,
-    not a parametrize mark, so no marker other than `e2e` reaches this module.
-    Select one engine with `-k yaml` or `-k pygents`."""
-    return request.param
-
-
 @pytest.fixture(scope="module")
 def real_claude() -> Path:
     """The real `claude`, or a skip that says so in as many words.
@@ -119,8 +108,8 @@ def real_claude() -> Path:
 
 
 @pytest.fixture(scope="module")
-def completed_run(real_claude, project, cards, engine) -> dict[str, Any]:
-    """One real, paid `cli.run_card` on `engine` -- no `runner_factory`, no
+def completed_run(real_claude, project, cards) -> dict[str, Any]:
+    """One real, paid `cli.run_card` -- no `runner_factory`, no
     fake on `PATH`.
 
     Overrides the conftest fixture of the same name, so `run_tree`,
@@ -136,7 +125,6 @@ def completed_run(real_claude, project, cards, engine) -> dict[str, Any]:
         base_branch="main",
         branch_prefix=BRANCH_PREFIX,
         commands=list(VERIFY_COMMANDS),
-        engine=engine,
     )
 
 
@@ -171,15 +159,12 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
         hashes.update(values)
     assert len(hashes) == 1, hashes
 
-    workflow = load_builtin("task")
     validated: set[str] = set()
     for name, attempt in sorted(agent_attempts.items()):
         assert attempt.result_path is not None, name
         path = Path(attempt.result_path)
         assert path.is_file(), (name, path)
-        model = results.resolve_result_model(
-            workflow.phase(name).result, results.RESULT_MODELS, phase=name
-        )
+        model = task_workflow.TASK.phase(name).result
         try:
             model.model_validate_json(path.read_text(encoding="utf-8"))
         except ValidationError as error:
@@ -193,15 +178,8 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
     assert validated == set(AGENT_PHASES), sorted(validated)
 
 
-def test_the_selected_engine_is_the_one_that_walked(
-    engine, project, completed_run, checkpoint_rows
-):
-    """Non-vacuity for the `[yaml]`/`[pygents]` parametrization: every assertion
-    above holds on both engines, so without this a dropped `engine=` would let
-    `[pygents]` pass by running yaml. Only pygents checkpoints (its BEFORE_TURN
-    hook). Reuses the module's one paid run; costs nothing extra."""
+def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
+    """Non-vacuity: the pygents walk is the only one that checkpoints (its
+    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra."""
     rows = checkpoint_rows(project, completed_run["run_id"])
-    if engine == "pygents":
-        assert rows > 0, "a pygents run wrote no checkpoint: engine never reached the walk"
-    else:
-        assert rows == 0, rows
+    assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"

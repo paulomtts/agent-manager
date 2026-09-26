@@ -16,9 +16,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, prompt, results
+from agent_manager import board, cli, prompt
 from agent_manager.steps import docs_commit
-from agent_manager.workflow import load_builtin
+from agent_manager.workflow import task as task_workflow
 
 AGENT_PHASES = (
     "explore",
@@ -29,14 +29,6 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-
-
-@pytest.fixture(scope="module", params=["yaml", "pygents"])
-def engine(request) -> str:
-    """Overrides the conftest's `engine`: every test in this module that reads
-    the run runs once per engine, each on its own repo and board (spec test 5).
-    Fixture params, not a parametrize mark, so no marker reaches this module."""
-    return request.param
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -101,13 +93,12 @@ def test_the_brief_carries_the_result_path_and_the_schema(agent_attempts):
     prompt-composition regression into a named failure instead of a mysterious
     missing result file.
     """
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
 
     for name in AGENT_PHASES:
         attempt = agent_attempts[name]
         text = Path(attempt.prompt_path).read_text(encoding="utf-8")
-        declared = workflow.phase(name).result
-        model = results.RESULT_MODELS[declared]
+        model = workflow.phase(name).result
         schema = json.dumps(
             model.model_json_schema(), indent=2, ensure_ascii=False
         )
@@ -123,7 +114,7 @@ def test_the_spec_and_plan_documents_exist_where_the_phases_declared_them(
     """The `writes:` templates resolved to real files inside the worktree and
     were committed. Paths come from the document and `prompt.expand_writes`,
     never from a convention retyped here."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     spec_relative = prompt.expand_writes(
         workflow.phase("spec").writes, card, phase="spec", input_name="spec_path"
@@ -146,7 +137,7 @@ def test_the_implement_commit_carries_a_plan_hash_trailer_review_agrees_with(
     """`review_gate` and `plan_hash_gate` passed for a real reason: the branch's
     commits all carry the trailer, and implement's hash is review's hash is the
     sha256 of the plan file on disk (`reducers.is_plan_hash`: 8 lowercase hex)."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     plan_relative = prompt.expand_writes(
         workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
@@ -197,7 +188,7 @@ def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
     engine owes. The spec and the plan are committed by the `docs_commit` step,
     with the Plan-Hash trailer, before `implement` ever starts -- so the docs
     commit is OLDER than the fake's implementation commit."""
-    workflow = load_builtin("task")
+    workflow = task_workflow.TASK
     card = board.show(completed_run["card_id"], repo_dir=project)
     plan_relative = prompt.expand_writes(
         workflow.phase("plan").writes, card, phase="plan", input_name="plan_path"
@@ -227,24 +218,10 @@ def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
     assert sorted(named) == sorted([spec_relative, plan_relative])
 
 
-def test_the_selected_engine_is_the_one_that_walked(
-    engine, project, completed_run, checkpoint_rows
-):
-    """Review Focus 1: non-vacuity for the whole parametrization."""
+def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
+    """Non-vacuity: the pygents walk is the only one that checkpoints."""
     rows = checkpoint_rows(project, completed_run["run_id"])
-    if engine == "pygents":
-        assert rows > 0, "a pygents run wrote no checkpoint: --engine never reached the walk"
-    else:
-        assert rows == 0, rows
-
-
-def test_the_run_data_is_the_same_on_both_engines(
-    engine, project, cards, completed_run, engine_parity
-):
-    """Spec test 5 / G10: `run_card`'s data, ignoring `run_id`."""
-    engine_parity(
-        "production-wiring", engine, completed_run, tmp=project.parent, cards=cards
-    )
+    assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"
 
 
 CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
@@ -274,7 +251,7 @@ def _arm_critic_blocks(tmp_path: Path, monkeypatch, table: dict[str, int]) -> Pa
     return budget
 
 
-def _run_one_card(root: Path, card: str, engine: str):
+def _run_one_card(root: Path, card: str):
     """`am run --card` through `CliRunner`, with no runner_factory anywhere."""
     return CliRunner().invoke(
         cli.app,
@@ -288,8 +265,6 @@ def _run_one_card(root: Path, card: str, engine: str):
             "main",
             "--branch-prefix",
             "m1",
-            "--engine",
-            engine,
             "--verify",
             VERIFY,
         ],
@@ -351,7 +326,7 @@ def test_a_critic_that_blocks_once_loops_back_and_the_run_finishes_done(
     card = milestone_board["subtasks"]["A"][0]
     budget = _arm_critic_blocks(tmp_path, monkeypatch, {critic: 1})
 
-    result = _run_one_card(root, card, "pygents")
+    result = _run_one_card(root, card)
 
     assert result.exit_code == 0, (result.output, result.exception)
     data = _envelope(result)
@@ -386,7 +361,7 @@ def test_a_critic_that_blocks_twice_escalates_validation_at_the_critic(
     card = milestone_board["subtasks"]["A"][0]
     budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 2})
 
-    result = _run_one_card(root, card, "pygents")
+    result = _run_one_card(root, card)
 
     assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
     data = _envelope(result)
@@ -401,29 +376,6 @@ def test_a_critic_that_blocks_twice_escalates_validation_at_the_critic(
     assert board.show(card, repo_dir=root).status != "done"
 
 
-def test_under_yaml_a_critic_that_blocks_once_escalates_at_once(
-    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
-):
-    """Spec test 6: `--engine yaml` never reads `on_fail`; the first block
-    escalates, and `spec` is dispatched once. Documented, not changed."""
-    root = milestone_board["root"]
-    card = milestone_board["subtasks"]["A"][0]
-    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1})
-
-    result = _run_one_card(root, card, "yaml")
-
-    assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
-    data = _envelope(result)
-    assert data["status"] == "escalated"
-    assert data["failed_phase"] == "validate_spec"
-    assert "blocked=validation" in data["detail"], data["detail"]
-    assert CRITIC_BLOCK_REASON in data["detail"], data["detail"]
-    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
-    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
-        "explore", "spec", "validate_spec",
-    ]
-
-
 def test_both_critics_blocking_once_each_both_loop(
     milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
 ):
@@ -435,7 +387,7 @@ def test_both_critics_blocking_once_each_both_loop(
         tmp_path, monkeypatch, {"validate_spec": 1, "validate_plan": 1}
     )
 
-    result = _run_one_card(root, card, "pygents")
+    result = _run_one_card(root, card)
 
     assert result.exit_code == 0, (result.output, result.exception)
     data = _envelope(result)
@@ -451,11 +403,11 @@ def test_both_critics_blocking_once_each_both_loop(
 
 
 def test_with_no_critic_block_no_brief_carries_a_feedback_section(
-    engine, completed_run, agent_attempts
+    completed_run, agent_attempts
 ):
-    """Spec "No block" / review focus 3, on both engines: an empty `feedback`
-    renders nothing, so a clean run's briefs are what they were before."""
+    """Spec "No block" / review focus 3: an empty `feedback` renders nothing,
+    so a clean run's briefs are what they were before."""
     assert completed_run["status"] == "done", completed_run["detail"]
     for name in AGENT_PHASES:
         text = Path(agent_attempts[name].prompt_path).read_text(encoding="utf-8")
-        assert FEEDBACK_SECTION not in text, (engine, name)
+        assert FEEDBACK_SECTION not in text, name
