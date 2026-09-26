@@ -170,6 +170,12 @@ async def run_subtask_async(
         # The pool (seed, earlier results) and the queue (pending turn, loop
         # count) come from the checkpoint: no seed item, no first turn.
         agent = Agent.from_dict(resume_from.agent)
+        # A row parked by a `StopSignal` was saved while its agent was paused,
+        # and `from_dict` restores that pause; left in place, ON_PAUSE would
+        # park the resumed agent again before it ran anything. That pause
+        # belonged to the stopped run: only this run's `stop`, registered in
+        # `_run` after this line, may pause the agent now.
+        agent.resume()
     try:
         if resume_from is None:
             await agent.context_pool.add(context.seed_item(binding))
