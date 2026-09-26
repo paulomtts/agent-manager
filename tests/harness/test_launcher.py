@@ -332,3 +332,68 @@ def test_every_launcher_literal_member_is_accounted_for():
     from agent_manager.models import Launcher
 
     assert set(get_args(Launcher)) == set(launcher.LAUNCHERS)
+
+
+def test_on_spawn_is_called_once_with_the_live_process(tmp_path):
+    # The bridge records the process through this hook so a cancelled turn can
+    # kill it; a hook that ran after the wait would record a corpse.
+    seen = []
+
+    def hook(process):
+        seen.append((process, process.poll()))
+
+    outcome = launcher.run_direct(
+        [sys.executable, "-c", "import time; time.sleep(0.3); print('done')"],
+        cwd=tmp_path,
+        timeout=30.0,
+        stdout_path=tmp_path / "stdout.log",
+        on_spawn=hook,
+    )
+    assert len(seen) == 1
+    process, polled = seen[0]
+    assert polled is None
+    assert process.args[0] == sys.executable
+    assert process.returncode == outcome.exit_code == 0
+
+
+def test_passing_no_on_spawn_behaves_as_before(tmp_path):
+    log = tmp_path / "stdout.log"
+    outcome = launcher.run_direct(
+        [sys.executable, "-c", "print('plain')"],
+        cwd=tmp_path,
+        timeout=30.0,
+        stdout_path=log,
+        on_spawn=None,
+    )
+    assert outcome.exit_code == 0
+    assert outcome.timed_out is False
+    assert "plain" in log.read_text()
+
+
+def test_an_on_spawn_that_raises_kills_the_child_and_propagates(tmp_path):
+    # Review Focus 4: the hook failing must not leave a harness running for the
+    # whole launcher timeout with nobody holding its handle.
+    spawned = []
+
+    def hook(process):
+        spawned.append(process)
+        raise RuntimeError("hook broke")
+
+    with pytest.raises(RuntimeError, match="hook broke"):
+        launcher.run_direct(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=tmp_path,
+            timeout=120.0,
+            stdout_path=tmp_path / "stdout.log",
+            on_spawn=hook,
+        )
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+
+
+def test_kill_tree_is_public_and_the_old_name_is_an_alias():
+    assert launcher._kill_tree is launcher.kill_tree
+    fake = _FakeProcess(os.getpid())
+    launcher.kill_tree(fake)
+    assert fake.killed is True
+    assert fake.waited is True

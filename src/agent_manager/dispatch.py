@@ -19,6 +19,7 @@ Three rules shape everything here, and none of them is negotiable:
   clean-tree check or be swept into a commit.
 """
 
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -34,8 +35,15 @@ from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
+from agent_manager.runtime import bridge
 from agent_manager.store import Store
+from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, Workflow
+
+AnyAgentPhase = AgentPhase | phase_model.AgentPhase
+"""Either agent-phase type: the YAML one (`result` and gates as names) or the
+declared phase model (`result` a class, gates callables). Dispatch accepts both
+while the YAML engine exists; nothing here imports pygents (rule 1)."""
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -277,7 +285,7 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
 
 
 def evaluate_gates(
-    phase: AgentPhase,
+    phase: AnyAgentPhase,
     workflow: Workflow,
     values: Mapping[str, Any],
     warnings: list[str],
@@ -296,9 +304,17 @@ def evaluate_gates(
     A binding failure is different again and propagates as `EngineError`: it
     means the document names a gate whose parameters nothing supplies, which is
     a bug in the document, not in the attempt.
+
+    A gate entry is either a name, resolved through `workflow.function` as the
+    YAML document declares it, or -- on a declared `phases.AgentPhase` -- the
+    callable itself, used as-is and named by its `__name__` (its `repr` when it
+    has none) in every message.
     """
-    for name in phase.gates:
-        gate = workflow.function(name)
+    for entry in phase.gates:
+        if isinstance(entry, str):
+            name, gate = entry, workflow.function(entry)
+        else:
+            name, gate = getattr(entry, "__name__", repr(entry)), entry
         kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
         try:
             verdict = gate(**kwargs)
@@ -349,6 +365,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _spawn_kwargs(launcher: LauncherFn) -> dict[str, Any]:
+    """`on_spawn` for a launcher that declares it, bound to the bridge call in flight.
+
+    Inside `bridge.call_agent` the hook records every process this attempt
+    starts, so a cancelled turn can kill it (pygents-engine design G2);
+    anywhere else it is `None`, which `run_direct` treats as absent. A launcher
+    that does not declare the keyword -- every fake launcher in the tests --
+    is called exactly as before.
+    """
+    try:
+        parameters = inspect.signature(launcher).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "on_spawn" not in parameters:
+        return {}
+    return {"on_spawn": bridge.current_spawn_hook()}
+
+
 Clock = Callable[[], datetime]
 
 
@@ -387,7 +421,7 @@ class AgentRunner:
 
     def __call__(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
     ) -> Any:
@@ -399,13 +433,17 @@ class AgentRunner:
         """
         role = load_role(phase.role, root=self.role_root)
         target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
-        model = (
-            None
-            if phase.result is None
-            else results.resolve_result_model(
+        # A declared phase-model phase carries its result model as the class
+        # itself, which is used as-is; a YAML phase carries a name, looked up
+        # in the table exactly as before.
+        if phase.result is None:
+            model = None
+        elif isinstance(phase.result, type):
+            model = phase.result
+        else:
+            model = results.resolve_result_model(
                 phase.result, self.result_models, phase=phase.name
             )
-        )
         cwd = self._worktree(context, phase.name)
 
         started_at = self.clock()
@@ -446,7 +484,7 @@ class AgentRunner:
 
     def _attempt(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
         feedback: Sequence[str],
@@ -499,7 +537,11 @@ class AgentRunner:
         )
         argv = target.adapter.build_command(dispatch_record)
         outcome = self.launcher(
-            argv, cwd=cwd, timeout=self.timeout, stdout_path=stdout_path
+            argv,
+            cwd=cwd,
+            timeout=self.timeout,
+            stdout_path=stdout_path,
+            **_spawn_kwargs(self.launcher),
         )
         # The same `None if model is None` the brief uses: the two halves of
         # "this phase has no result" must agree. The dispatch and the journalled
@@ -549,7 +591,7 @@ class AgentRunner:
 
     def _record_phase(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         status: models.Status,
         started_at: datetime,
         ended_at: datetime | None,
@@ -568,7 +610,7 @@ class AgentRunner:
             ),
         )
 
-    def _record_attempt(self, phase: AgentPhase, attempt: models.Attempt) -> None:
+    def _record_attempt(self, phase: AnyAgentPhase, attempt: models.Attempt) -> None:
         self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
 
 

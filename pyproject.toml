@@ -8,11 +8,13 @@ dependencies = [
     "typer>=0.27.2",
     "pydantic>=2.9",
     "pyyaml>=6.0.2",
+    "pygents>=0.6.7",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [project.scripts]
@@ -27,6 +29,7 @@ packages = ["src/agent_manager"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 markers = [
     "e2e: slow, opt-in, costs real money -- drives the toy card against the real `claude` on PATH. Excluded by the `-m \"not e2e\"` in addopts; run it with `uv run pytest -m e2e` (a bare path invocation is still deselected, so pass `-m e2e` alongside any path).",
 ]

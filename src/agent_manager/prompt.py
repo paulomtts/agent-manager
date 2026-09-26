@@ -23,17 +23,36 @@ repo docs a `repo_docs` input asks for, and the only file written is the
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from agent_manager import dag, models
 from agent_manager.errors import EngineError
 from agent_manager.roles.loader import RoleBundle
-from agent_manager.workflow.loader import AgentPhase
+
+
+class PromptPhase(Protocol):
+    """The three things rendering reads from an agent phase, and nothing else.
+
+    Structural, so both the YAML `workflow.loader.AgentPhase` and the declared
+    `workflow.phases.AgentPhase` satisfy it without either being imported here.
+    Read-only properties, because a frozen dataclass and a frozen pydantic model
+    both expose these as attributes that must not be assigned.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def role(self) -> str: ...
+
+    @property
+    def inputs(self) -> Sequence[str]: ...
+
 
 _MISSING = object()
 
@@ -90,12 +109,18 @@ class _Request:
     """One input name being resolved, with everything a resolver may read."""
 
     name: str
-    phase: AgentPhase
+    phase: PromptPhase
     context: Mapping[str, Any]
 
 
-Resolver = Callable[[_Request], str]
-"""Turns one declared input into the body of its prompt section."""
+Resolver = Callable[[_Request], str | None]
+"""Turns one declared input into the body of its prompt section.
+
+`None` means "no section for this input": `render_prompt` then adds neither a
+heading nor an entry in `sections`. Only `feedback` returns it -- an empty
+feedback list is the normal case, and a bare heading would read as a review
+that said nothing.
+"""
 
 
 def _present(request: _Request, key: str) -> Any:
@@ -264,6 +289,42 @@ def _repo_doc(request: _Request, path: Path) -> str | None:
     )
 
 
+FEEDBACK_TITLE = "Feedback from review"
+"""First line of the `feedback` section's body (pygents-engine design G4, §5).
+
+Not `FEEDBACK_HEADING`: that heads `compose_brief`'s retry block for a failed
+attempt of the *same* phase. This titles a critic's reason, carried back to
+the phase a `Goto` loop returned to. The two must not be merged.
+"""
+
+
+def _feedback(request: _Request) -> str | None:
+    """The critic feedback addressed to this phase, one bullet per item.
+
+    The runtime's binding table has already kept only the items whose `for`
+    names this phase, so `for` is not rendered. A missing key, `None` or an
+    empty list is the normal case -- no loop has happened, or the old engine
+    is running and never supplies the key -- so this never goes through
+    `_required`/`_present`, and returns `None` to omit the section. An item
+    without `from` or `detail` is a codec bug and is refused by name rather
+    than rendered as a blank bullet.
+    """
+    items = request.context.get("feedback")
+    if not items:
+        return None
+    lines = [FEEDBACK_TITLE]
+    for item in items:
+        if not isinstance(item, Mapping) or "from" not in item or "detail" not in item:
+            raise EngineError(
+                f"is declared as an input, but a feedback item is not a mapping "
+                f"carrying 'from' and 'detail': {item!r}",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        lines.append(f"- {item['from']}: {item['detail']}")
+    return "\n".join(lines)
+
+
 _TABLE: dict[str, Resolver] = {
     "card": _inline_json("card_details"),
     "parent_story": _inline_json("parent_story_details", allow_empty=True),
@@ -277,14 +338,21 @@ _TABLE: dict[str, Resolver] = {
     "plan_hash": _phase_field("docs_commit", "plan_hash"),
     "merge_tip": _verbatim("merge_tip"),
     "conflict_files": _inline_json("conflict_files"),
+    "feedback": _feedback,
 }
 """The fixed §7 resolution table, keyed by the name a document may declare.
 
-The last two rows are the resolver's (Integrate addendum §2 and I3,
-`builtin/integrate.yaml`): the story tip being merged, inlined as a ref, and
-the conflicting paths `steps.integrate.merge_tip` reported, inlined as JSON.
-Neither reads another phase's result, so neither appears in `INPUT_PRODUCERS`:
-the caller supplies both through `engine.run_subtask(extra_context=...)`.
+`merge_tip` and `conflict_files` are the resolver's (Integrate addendum §2 and
+I3, `builtin/integrate.yaml`): the story tip being merged, inlined as a ref,
+and the conflicting paths `steps.integrate.merge_tip` reported, inlined as
+JSON. Neither reads another phase's result, so neither appears in
+`INPUT_PRODUCERS`: the caller supplies both through
+`engine.run_subtask(extra_context=...)`.
+
+`feedback` is the last row (pygents-engine design G4, §5): the critic's reason
+for a `Goto` loop-back, supplied by the runtime's binding table. It reads the
+feedback queue, not another phase's result, so it is not in `INPUT_PRODUCERS`
+either.
 """
 
 
@@ -307,13 +375,14 @@ process -- the journal never replays the binding table.
 """
 
 
-def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:
+def render_prompt(phase: PromptPhase, context: Mapping[str, Any]) -> RenderedPrompt:
     """Resolve every name in `phase.inputs` and assemble the prompt text.
 
     Sections follow the order the document declares, because that order is the
     author's emphasis and a reordering would silently change what the model reads
     first. A name declared twice contributes one section: the second mention adds
-    no information and would only be billed twice.
+    no information and would only be billed twice. A resolver that returns `None`
+    contributes no section at all -- no heading, no entry in `sections`.
     """
     sections: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -329,13 +398,16 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
                 phase=phase.name,
                 parameter=name,
             )
-        sections.append((name, resolver(_Request(name, phase, context))))
+        body = resolver(_Request(name, phase, context))
+        if body is None:
+            continue
+        sections.append((name, body))
     return RenderedPrompt(
         phase=phase.name, text=_assemble(phase, sections), sections=tuple(sections)
     )
 
 
-def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
+def _assemble(phase: PromptPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
 

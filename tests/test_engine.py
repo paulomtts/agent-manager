@@ -18,7 +18,10 @@ import pytest
 from agent_manager import dispatch, engine, models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
+from agent_manager.runtime import bridge
+from agent_manager.runtime import engine as new_engine
 from agent_manager.steps import integrate, reducers
+from agent_manager.workflow import phases as phase_model
 from agent_manager.workflow.loader import AgentPhase, load_builtin, load_workflow
 from agent_manager.workflow.registry import BUILTIN_FUNCTION_NAMES, FunctionRegistry
 
@@ -235,6 +238,30 @@ def store(monkeypatch, tmp_path):
     opened.close()
 
 
+@pytest.fixture(params=["yaml", "pygents"])
+def run_subtask(request):
+    """`run_subtask` on each engine (pygents-engine design G7, §9).
+
+    `yaml` is the old walk as is. `pygents` converts the loaded document with
+    `phases.from_loader` and runs it on `runtime.engine`. Two kwargs have no
+    pygents counterpart yet, and a test that passes one is skipped on that
+    engine rather than run against something that does not exist.
+    """
+    if request.param == "yaml":
+        return engine.run_subtask
+
+    def run(workflow, store, **kw):
+        if "start_phase" in kw:
+            pytest.skip("start_phase is the yaml engine's resume")
+        if "should_stop" in kw:
+            pytest.skip(
+                "the pygents stop bridge is plan Task 4.2 (runtime/checkpoint.py)"
+            )
+        return new_engine.run_subtask(phase_model.from_loader(workflow), store, **kw)
+
+    return run
+
+
 def _registry(functions: dict[str, Any]) -> FunctionRegistry:
     registry = FunctionRegistry()
     for name, fn in functions.items():
@@ -278,7 +305,7 @@ phases:
 """
 
 
-def test_phases_run_in_document_order(store):
+def test_phases_run_in_document_order(store, run_subtask):
     calls: list[str] = []
 
     def make(name: str):
@@ -293,7 +320,7 @@ def test_phases_run_in_document_order(store):
         {"step.alpha": make("alpha"), "step.beta": make("beta"), "step.gamma": make("gamma")},
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -307,7 +334,7 @@ def test_phases_run_in_document_order(store):
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
 
 
-def test_a_phase_result_is_bound_into_a_later_phase(store):
+def test_a_phase_result_is_bound_into_a_later_phase(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def alpha(card: str) -> dict[str, Any]:
@@ -324,14 +351,14 @@ def test_a_phase_result_is_bound_into_a_later_phase(store):
         THREE_PHASES, {"step.alpha": alpha, "step.beta": beta, "step.gamma": gamma}
     )
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
     assert seen["alpha"] == {"plan": "docs/plan.md"}
 
 
-def test_declared_args_reach_the_step_as_a_keyword(store):
+def test_declared_args_reach_the_step_as_a_keyword(store, run_subtask):
     seen: list[str] = []
 
     def set_status(card: str, status: str) -> dict[str, Any]:
@@ -348,14 +375,14 @@ phases:
 """
     workflow = _workflow(document, {"rollup.set_status": set_status})
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
     assert seen == ["in_progress"]
 
 
-def test_a_step_is_called_with_only_the_parameters_it_declares(store):
+def test_a_step_is_called_with_only_the_parameters_it_declares(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def ensure(branch: str, base: str) -> dict[str, Any]:
@@ -371,7 +398,7 @@ phases:
 """
     workflow = _workflow(document, {"worktree.ensure": ensure})
 
-    engine.run_subtask(
+    run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -383,7 +410,7 @@ phases:
     assert seen == {"branch": "m1/task-ed77a917", "base": "m1/story-base"}
 
 
-def test_every_state_edge_is_journalled_before_the_row_is_written(store):
+def test_every_state_edge_is_journalled_before_the_row_is_written(store, run_subtask):
     def step(card: str) -> dict[str, Any]:
         return {}
 
@@ -399,7 +426,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": step, "step.beta": step})
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -414,7 +441,7 @@ phases:
     assert store.journal.read()[-1].payload["status"] == "done"
 
 
-def test_no_attempt_row_is_written_for_a_deterministic_phase(store):
+def test_no_attempt_row_is_written_for_a_deterministic_phase(store, run_subtask):
     def step(card: str) -> dict[str, Any]:
         return {}
 
@@ -427,7 +454,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": step})
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -435,7 +462,7 @@ phases:
     assert not any(line.event == "attempt_upsert" for line in store.journal.read())
 
 
-def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store):
+def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store, run_subtask):
     """The `worktree` phase of the shipped `builtin/task.yaml` names itself the
     same as the context key `subtask_context` binds the real worktree path
     under. It must still run and record normally; its own result must simply
@@ -466,7 +493,7 @@ phases:
         document, {"worktree.make": make_worktree, "step.after": uses_worktree}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -480,7 +507,7 @@ phases:
     assert _projected_phases(store) == [("worktree", "done"), ("after", "done")]
 
 
-def test_a_raising_step_escalates_and_the_exception_does_not_propagate(store):
+def test_a_raising_step_escalates_and_the_exception_does_not_propagate(store, run_subtask):
     calls: list[str] = []
 
     def alpha(card: str) -> dict[str, Any]:
@@ -503,7 +530,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha, "step.beta": beta})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -517,7 +544,7 @@ phases:
     assert store.journal.read()[-1].payload["status"] == "escalated"
 
 
-def test_a_binding_failure_escalates_without_calling_the_step(store):
+def test_a_binding_failure_escalates_without_calling_the_step(store, run_subtask):
     calls: list[str] = []
 
     def alpha(card: str, missing_thing: str) -> dict[str, Any]:
@@ -533,7 +560,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -543,7 +570,7 @@ phases:
 
 
 @pytest.mark.parametrize("returned", [None, ["a", "list"], True, "a string"])
-def test_a_non_mapping_step_result_escalates(store, returned):
+def test_a_non_mapping_step_result_escalates(store, returned, run_subtask):
     def alpha(card: str) -> Any:
         return returned
 
@@ -556,7 +583,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -566,7 +593,7 @@ phases:
     assert _projected_phases(store) == [("alpha", "failed")]
 
 
-def test_a_failed_phase_result_is_not_offered_to_later_phases(store):
+def test_a_failed_phase_result_is_not_offered_to_later_phases(store, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         raise RuntimeError("nope")
 
@@ -579,7 +606,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -599,7 +626,7 @@ phases:
 """
 
 
-def test_a_passing_gate_lets_the_walk_continue(store):
+def test_a_passing_gate_lets_the_walk_continue(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def alpha(card: str) -> dict[str, Any]:
@@ -616,7 +643,7 @@ def test_a_passing_gate_lets_the_walk_continue(store):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -626,7 +653,7 @@ def test_a_passing_gate_lets_the_walk_continue(store):
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
 
 
-def test_a_warning_gate_continues_and_surfaces_the_warning(store):
+def test_a_warning_gate_continues_and_surfaces_the_warning(store, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         return {}
 
@@ -640,7 +667,7 @@ def test_a_warning_gate_continues_and_surfaces_the_warning(store):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -651,7 +678,7 @@ def test_a_warning_gate_continues_and_surfaces_the_warning(store):
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done")]
 
 
-def test_a_failing_gate_escalates_and_stops_the_walk(store):
+def test_a_failing_gate_escalates_and_stops_the_walk(store, run_subtask):
     calls: list[str] = []
 
     def alpha(card: str) -> dict[str, Any]:
@@ -669,7 +696,7 @@ def test_a_failing_gate_escalates_and_stops_the_walk(store):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -682,7 +709,7 @@ def test_a_failing_gate_escalates_and_stops_the_walk(store):
     assert store.journal.read()[-1].payload["status"] == "escalated"
 
 
-def test_a_warning_before_a_failing_gate_survives_into_the_summary(store):
+def test_a_warning_before_a_failing_gate_survives_into_the_summary(store, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         return {}
 
@@ -716,7 +743,7 @@ phases:
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -725,7 +752,7 @@ phases:
 
 
 @pytest.mark.parametrize("verdict", [False, True, "blocked", 0])
-def test_a_gate_returning_neither_none_nor_a_mapping_escalates(store, verdict):
+def test_a_gate_returning_neither_none_nor_a_mapping_escalates(store, verdict, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         return {}
 
@@ -739,7 +766,7 @@ def test_a_gate_returning_neither_none_nor_a_mapping_escalates(store, verdict):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -747,7 +774,7 @@ def test_a_gate_returning_neither_none_nor_a_mapping_escalates(store, verdict):
     assert "mapping" in summary.detail
 
 
-def test_a_gate_binds_the_phase_result_under_the_phase_name_too(store):
+def test_a_gate_binds_the_phase_result_under_the_phase_name_too(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def alpha(card: str) -> dict[str, Any]:
@@ -764,7 +791,7 @@ def test_a_gate_binds_the_phase_result_under_the_phase_name_too(store):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -815,7 +842,7 @@ def _skipping_workflow(has: Any, calls: list[str]):
     )
 
 
-def test_a_truthy_when_jumps_to_skip_to(store):
+def test_a_truthy_when_jumps_to_skip_to(store, run_subtask):
     calls: list[str] = []
 
     def has(result: dict[str, Any]) -> bool:
@@ -823,7 +850,7 @@ def test_a_truthy_when_jumps_to_skip_to(store):
 
     workflow = _skipping_workflow(has, calls)
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -834,7 +861,7 @@ def test_a_truthy_when_jumps_to_skip_to(store):
     assert set(summary.results) == {"plan_check", "implement"}
 
 
-def test_a_falsy_when_continues_to_the_next_phase(store):
+def test_a_falsy_when_continues_to_the_next_phase(store, run_subtask):
     calls: list[str] = []
 
     def has(result: dict[str, Any]) -> bool:
@@ -842,7 +869,7 @@ def test_a_falsy_when_continues_to_the_next_phase(store):
 
     workflow = _skipping_workflow(has, calls)
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -851,7 +878,7 @@ def test_a_falsy_when_continues_to_the_next_phase(store):
     assert summary.status == "done"
 
 
-def test_a_raising_when_fails_its_phase_rather_than_not_skipping(store):
+def test_a_raising_when_fails_its_phase_rather_than_not_skipping(store, run_subtask):
     calls: list[str] = []
 
     def has(result: dict[str, Any]) -> bool:
@@ -859,7 +886,7 @@ def test_a_raising_when_fails_its_phase_rather_than_not_skipping(store):
 
     workflow = _skipping_workflow(has, calls)
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -890,7 +917,7 @@ phases:
 """
 
 
-def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store):
+def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store, run_subtask):
     calls: list[str] = []
 
     def set_status(card: str, status: str) -> dict[str, Any]:
@@ -918,7 +945,7 @@ def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store):
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -936,7 +963,7 @@ def test_a_best_effort_failure_warns_and_does_not_sink_the_subtask(store):
     assert store.journal.read()[-1].payload["status"] == "done"
 
 
-def test_a_best_effort_phase_with_a_failing_gate_only_warns(store):
+def test_a_best_effort_phase_with_a_failing_gate_only_warns(store, run_subtask):
     def set_status(card: str, status: str) -> dict[str, Any]:
         return {}
 
@@ -959,7 +986,7 @@ def test_a_best_effort_phase_with_a_failing_gate_only_warns(store):
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -969,7 +996,7 @@ def test_a_best_effort_phase_with_a_failing_gate_only_warns(store):
     assert _projected_phases(store)[-1] == ("mark_done", "failed")
 
 
-def test_a_best_effort_binding_failure_only_warns(store):
+def test_a_best_effort_binding_failure_only_warns(store, run_subtask):
     def set_status(card: str, status: str, missing_thing: str) -> dict[str, Any]:
         return {}
 
@@ -992,7 +1019,7 @@ def test_a_best_effort_binding_failure_only_warns(store):
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1000,7 +1027,7 @@ def test_a_best_effort_binding_failure_only_warns(store):
     assert "missing_thing" in summary.warnings[0]
 
 
-def test_a_failed_best_effort_phase_contributes_no_result(store):
+def test_a_failed_best_effort_phase_contributes_no_result(store, run_subtask):
     def set_status(card: str, status: str) -> dict[str, Any]:
         raise RuntimeError("board is locked")
 
@@ -1023,7 +1050,7 @@ def test_a_failed_best_effort_phase_contributes_no_result(store):
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1043,7 +1070,7 @@ phases:
 """
 
 
-def test_an_agent_phase_goes_to_the_injected_runner(store):
+def test_an_agent_phase_goes_to_the_injected_runner(store, run_subtask):
     seen: list[tuple[str, str]] = []
 
     def agent_runner(phase, context, rendered):
@@ -1058,7 +1085,7 @@ def test_an_agent_phase_goes_to_the_injected_runner(store):
 
     workflow = _workflow(MIXED, {"step.work": work})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1072,14 +1099,14 @@ def test_an_agent_phase_goes_to_the_injected_runner(store):
     assert _projected_phases(store) == [("work", "done")]
 
 
-def test_an_agent_phase_with_no_runner_is_a_named_engine_error(store):
+def test_an_agent_phase_with_no_runner_is_a_named_engine_error(store, run_subtask):
     def work(card: str) -> dict[str, Any]:
         return {}
 
     workflow = _workflow(MIXED, {"step.work": work})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
         )
 
@@ -1142,7 +1169,7 @@ def test_an_unknown_starting_phase_is_an_error_before_anything_is_recorded(store
     assert store.connection.execute("SELECT COUNT(*) FROM phases").fetchone()[0] == 0
 
 
-def test_the_builtin_task_document_walks_against_a_fake_registry(store):
+def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subtask):
     calls: list[str] = []
 
     def set_status(card: str, status: str) -> dict[str, Any]:
@@ -1210,7 +1237,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
 
     workflow = load_builtin("task", _registry(functions))
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1260,7 +1287,7 @@ def _journalled_details(opened) -> list[tuple[str | None, str, str | None]]:
     ]
 
 
-def test_a_raising_step_writes_why_it_failed_into_the_journal(store):
+def test_a_raising_step_writes_why_it_failed_into_the_journal(store, run_subtask):
     """§9 makes the journal the truth the projection is rebuilt from, so the
     reason a phase failed has to be *in* it. The returned summary is in-memory
     only: an operator reading the audit trail after the process is gone would
@@ -1279,7 +1306,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1290,7 +1317,7 @@ phases:
     assert failed[2] == summary.detail
 
 
-def test_a_failing_gate_writes_its_verdict_into_the_journal(store):
+def test_a_failing_gate_writes_its_verdict_into_the_journal(store, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         return {}
 
@@ -1304,7 +1331,7 @@ def test_a_failing_gate_writes_its_verdict_into_the_journal(store):
         GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1315,7 +1342,7 @@ def test_a_failing_gate_writes_its_verdict_into_the_journal(store):
     assert failed[2] == summary.detail
 
 
-def test_a_best_effort_failure_is_journalled_with_its_reason_too(store):
+def test_a_best_effort_failure_is_journalled_with_its_reason_too(store, run_subtask):
     def set_status(card: str, status: str) -> dict[str, Any]:
         raise RuntimeError("brd exited 1: board is locked")
 
@@ -1338,7 +1365,7 @@ def test_a_best_effort_failure_is_journalled_with_its_reason_too(store):
         },
     )
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1350,7 +1377,7 @@ def test_a_best_effort_failure_is_journalled_with_its_reason_too(store):
     assert "board is locked" in details["mark_in_progress"]
 
 
-def test_a_phase_that_succeeds_journals_no_failure_detail(store):
+def test_a_phase_that_succeeds_journals_no_failure_detail(store, run_subtask):
     def step(card: str) -> dict[str, Any]:
         return {}
 
@@ -1363,7 +1390,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": step})
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1373,7 +1400,7 @@ phases:
     ]
 
 
-def test_a_gate_on_a_phase_named_like_a_context_key_still_sees_the_real_value(store):
+def test_a_gate_on_a_phase_named_like_a_context_key_still_sees_the_real_value(store, run_subtask):
     """The mirror of the `_bind_result` guard, for the phase's own gate and
     `when`. The shipped `worktree` phase carries neither today, but a gate
     added to it that asks for `worktree` wants the path `worktree.ensure` was
@@ -1417,7 +1444,7 @@ phases:
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1428,7 +1455,7 @@ phases:
     assert seen["result"] == {"created": True}
 
 
-def test_a_phase_is_timed_with_the_injected_clock(store):
+def test_a_phase_is_timed_with_the_injected_clock(store, run_subtask):
     """`started_at` is read once, before the call, and reused on the terminal
     record so the row keeps the moment work began rather than the moment it
     ended. Both edges come from the injected clock, never from the wall.
@@ -1457,7 +1484,7 @@ phases:
 """
     workflow = _workflow(document, {"step.alpha": alpha, "step.beta": beta})
 
-    engine.run_subtask(
+    run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1480,7 +1507,7 @@ phases:
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "failed")]
 
 
-def test_the_default_clock_stamps_an_aware_utc_time(store):
+def test_the_default_clock_stamps_an_aware_utc_time(store, run_subtask):
     def alpha(card: str) -> dict[str, Any]:
         return {}
 
@@ -1494,7 +1521,7 @@ phases:
     workflow = _workflow(document, {"step.alpha": alpha})
     before = datetime.now(timezone.utc)
 
-    engine.run_subtask(
+    run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1528,7 +1555,7 @@ phases:
 """
 
 
-def test_document_paths_are_bound_from_the_writes_templates(store):
+def test_document_paths_are_bound_from_the_writes_templates(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def after(spec_path: str, plan_path: str) -> dict[str, Any]:
@@ -1537,7 +1564,7 @@ def test_document_paths_are_bound_from_the_writes_templates(store):
 
     workflow = _workflow(DOCUMENT_PATHS, {"step.after": after})
 
-    engine.run_subtask(
+    run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1550,7 +1577,7 @@ def test_document_paths_are_bound_from_the_writes_templates(store):
     assert seen == {"spec_path": SPEC_PATH, "plan_path": PLAN_PATH}
 
 
-def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store):
+def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store, run_subtask):
     document = """
 name: orphan
 phases:
@@ -1562,7 +1589,7 @@ phases:
     workflow = _workflow(document, {})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -1577,11 +1604,11 @@ phases:
     assert "writes" in str(caught.value)
 
 
-def test_a_document_path_input_with_no_card_is_a_named_error(store):
+def test_a_document_path_input_with_no_card_is_a_named_error(store, run_subtask):
     workflow = _workflow(DOCUMENT_PATHS, {"step.after": lambda spec_path, plan_path: {}})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -1594,7 +1621,7 @@ def test_a_document_path_input_with_no_card_is_a_named_error(store):
     assert "no card was supplied" in str(caught.value)
 
 
-def test_a_document_with_no_path_inputs_needs_no_card(store):
+def test_a_document_with_no_path_inputs_needs_no_card(store, run_subtask):
     """Every existing walk in this file passes no card; none may start failing."""
     workflow = _workflow(THREE_PHASES, {
         "step.alpha": lambda card: {},
@@ -1602,7 +1629,7 @@ def test_a_document_with_no_path_inputs_needs_no_card(store):
         "step.gamma": lambda card: {},
     })
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1674,10 +1701,10 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
     }
 
 
-def _walk_builtin(store, recorded: dict[str, Any], *, validated: bool) -> Any:
+def _walk_builtin(run_subtask, store, recorded: dict[str, Any], *, validated: bool) -> Any:
     calls: list[str] = []
     workflow = load_builtin("task", _registry(_builtin_functions(calls, validated=validated)))
-    return engine.run_subtask(
+    return run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1727,10 +1754,10 @@ def test_a_resume_started_at_explore_never_re_runs_the_worktree_phase(store):
     ]
 
 
-def test_every_document_path_input_renders_the_expanded_writes_template(store):
+def test_every_document_path_input_renders_the_expanded_writes_template(store, run_subtask):
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     for phase_name in ("validate_spec", "plan", "validate_plan", "implement"):
         assert dict(recorded[phase_name].sections)["spec_path"] == SPEC_PATH
@@ -1738,10 +1765,12 @@ def test_every_document_path_input_renders_the_expanded_writes_template(store):
         assert dict(recorded[phase_name].sections)["plan_path"] == PLAN_PATH
 
 
-def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(store):
+def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(
+    store, run_subtask
+):
     recorded: dict[str, Any] = {}
 
-    summary = _walk_builtin(store, recorded, validated=True)
+    summary = _walk_builtin(run_subtask, store, recorded, validated=True)
 
     assert summary.skipped == [
         "spec",
@@ -1756,11 +1785,11 @@ def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(st
     assert sections["plan_path"] == PLAN_PATH
 
 
-def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
+def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store, run_subtask):
     """§13: a phase receives its declared inputs and nothing else."""
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     assert {name: rendered.inputs for name, rendered in recorded.items()} == {
         "explore": ("card", "parent_story", "repo_docs", "verification"),
@@ -1773,10 +1802,10 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
     }
 
 
-def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store):
+def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store, run_subtask):
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     sections = dict(recorded["explore"].sections)
     assert json.loads(sections["card"])["title"] == "Resolve phase inputs"
@@ -1786,7 +1815,7 @@ def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store):
     assert json.loads(sections["verification"]) == ["uv run pytest"]
 
 
-def test_an_unresolvable_input_raises_out_of_the_walk_before_the_runner(store):
+def test_an_unresolvable_input_raises_out_of_the_walk_before_the_runner(store, run_subtask):
     """The walk does not wrap the runner call, so resolution failures propagate.
     Journalling them as an outcome is sibling bf8e415b's choice, not this one's.
     """
@@ -1807,7 +1836,7 @@ phases:
     workflow = _workflow(document, {})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -1822,7 +1851,7 @@ phases:
     assert caught.value.parameter == "explore"
 
 
-def test_a_phase_named_spec_path_never_clobbers_the_document_path(store):
+def test_a_phase_named_spec_path_never_clobbers_the_document_path(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def collide(card: str) -> dict[str, Any]:
@@ -1853,7 +1882,7 @@ phases:
     recorded: dict[str, Any] = {}
     workflow = _workflow(document, {"step.collide": collide, "step.after": after})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1885,7 +1914,9 @@ phases:
 """
 
 
-def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(store):
+def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
+    store, run_subtask
+):
     """The membership check above is only a constant; this is the behaviour it buys.
 
     A document is free to name a phase `card_details`, and its result must not
@@ -1894,7 +1925,7 @@ def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
     recorded: dict[str, Any] = {}
     workflow = _workflow(RESERVED_DETAILS, {"step.collide": lambda card: {"not": "a card"}})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1914,7 +1945,7 @@ def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
 
 
 
-def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store):
+def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store, run_subtask):
     # Spec test 14 (§12 line 429: escalation stops the run -- no later phase is
     # started, and the subtask is recorded escalated).
     calls: list[str] = []
@@ -1933,7 +1964,7 @@ def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store):
 
     workflow = _workflow(MIXED, {"step.work": work})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1955,7 +1986,7 @@ def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store):
     assert subtasks == ["escalated"]
 
 
-def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashing(store):
+def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashing(store, run_subtask):
     # Symmetric with `_run_deterministic`'s deliberately total except: an
     # exception escaping the walk would leave the subtask recorded `started`
     # forever, which is exactly what resume mistakes for work in flight.
@@ -1967,7 +1998,7 @@ def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashin
 
     workflow = _workflow(MIXED, {"step.work": work})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1981,14 +2012,14 @@ def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashin
     assert "OSError: the run directory went away" in summary.detail
 
 
-def test_a_successful_agent_phase_still_advances_the_walk(store):
+def test_a_successful_agent_phase_still_advances_the_walk(store, run_subtask):
     """The existing happy path must not change shape under the new try/except."""
     def work(card: str, explore: dict[str, Any]) -> dict[str, Any]:
         return {"saw": explore["summary"]}
 
     workflow = _workflow(MIXED, {"step.work": work})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2001,7 +2032,97 @@ def test_a_successful_agent_phase_still_advances_the_walk(store):
     assert summary.results["work"] == {"saw": "explored"}
 
 
-def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path):
+def test_an_escalation_keeps_the_results_and_warnings_gathered_before_it(
+    store, run_subtask
+):
+    """Review Focus 3: the failure path collects too. A phase that finished,
+    and a gate warning it raised, must survive into an escalated summary."""
+
+    def alpha(card: str) -> dict[str, Any]:
+        return {"phase": "alpha"}
+
+    def beta(card: str) -> dict[str, Any]:
+        raise OSError("disk went away")
+
+    def alpha_gate(result: dict[str, Any]) -> dict[str, str]:
+        return {"warn": "looked thin"}
+
+    workflow = _workflow(
+        GATED, {"step.alpha": alpha, "step.beta": beta, "alpha_gate": alpha_gate}
+    )
+
+    summary = run_subtask(
+        workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "beta"
+    assert summary.results == {"alpha": {"phase": "alpha"}}
+    assert summary.warnings == ["phase 'alpha' gate 'alpha_gate' warned: looked thin"]
+
+
+def test_a_run_that_raised_leaves_its_agent_name_free_for_the_next_run(
+    store, run_subtask
+):
+    """Review Focus 1: pygents' AgentRegistry is process-wide and refuses a
+    second agent under a name it holds. Both runs use the same run id and
+    card id, so the second can only start if the first freed the name, even
+    though it ended by raising."""
+    workflow = _workflow(MIXED, {"step.work": lambda card, explore: {}})
+
+    with pytest.raises(engine.EngineError):
+        run_subtask(
+            workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+        )
+
+    summary = run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=lambda phase, context, rendered: {"summary": "explored"},
+    )
+
+    assert summary.status == "done"
+
+
+class _Abort(BaseException):
+    """Not an `Exception`: neither engine may catch it."""
+
+
+def test_a_base_exception_propagates_and_records_no_outcome(store, run_subtask):
+    """Review Focus 2 and the last row of the spec's error table: a
+    BaseException propagates, nothing past the phase's own `started` row is
+    written, and the agent name is still freed for the next run."""
+
+    def alpha(card: str) -> dict[str, Any]:
+        raise _Abort("operator pulled the plug")
+
+    aborting = _workflow(
+        THREE_PHASES,
+        {"step.alpha": alpha, "step.beta": lambda card: {}, "step.gamma": lambda card: {}},
+    )
+
+    with pytest.raises(_Abort):
+        run_subtask(
+            aborting, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+        )
+
+    assert _journalled_phases(store) == [("alpha", "started")]
+    assert _projected_subtask_status(store) is None
+
+    finishing = _workflow(
+        THREE_PHASES,
+        {"step.alpha": lambda card: {}, "step.beta": lambda card: {}, "step.gamma": lambda card: {}},
+    )
+    summary = run_subtask(
+        finishing, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
+    )
+    assert summary.status == "done"
+
+
+def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path, run_subtask):
     """The §12 escape hatch's parameters have to arrive somehow: `subtask_context`
     is a fixed table, and `builtin/task.yaml`'s gates bind names it does not hold.
     """
@@ -2027,7 +2148,7 @@ def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path):
     workflow = load_workflow(document, registry)
     store = store_module.Store.open(tmp_path, "run-extra-1")
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id="story-1",
@@ -2040,7 +2161,7 @@ def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path):
     assert seen == {"suite_cmds": [], "allow_no_verification": True}
 
 
-def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
+def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path, run_subtask):
     """`worktree`, `card` and friends are the engine's own: letting a caller
     overwrite one would point every later step at a path the engine never chose.
     """
@@ -2060,7 +2181,7 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
     store = store_module.Store.open(tmp_path, "run-extra-2")
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id="story-1",
@@ -2072,7 +2193,7 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path):
     assert "worktree" in str(caught.value)
 
 
-def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path):
+def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path, run_subtask):
     """A caller that could set `base_branch` would point `review_gate` at a base
     the engine never derived, while every step still used the real one."""
     registry = FunctionRegistry()
@@ -2091,7 +2212,7 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path):
     store = store_module.Store.open(tmp_path, "run-extra-3")
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id="story-1",
@@ -2159,7 +2280,9 @@ BLOCKED_IMPLEMENT = json.dumps(
 )
 
 
-def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_runs(store):
+def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_runs(
+    store, run_subtask
+):
     calls: list[str] = []
     functions = _builtin_functions(calls, validated=True)
     functions["implement_blocked_gate"] = reducers.implement_blocked_gate
@@ -2188,7 +2311,7 @@ def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_run
         calls.append(f"agent:{phase.name}")
         return {"role": phase.role}
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2230,7 +2353,9 @@ BLOCKED_REVIEW = json.dumps(
 )
 
 
-def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_runs(store):
+def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_runs(
+    store, run_subtask
+):
     calls: list[str] = []
     functions = _builtin_functions(calls, validated=True)
     # The real gate under test. `review_gate` and `plan_hash_gate` stay
@@ -2261,7 +2386,7 @@ def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_run
         calls.append(f"agent:{phase.name}")
         return {"role": phase.role}
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2354,7 +2479,7 @@ class _StopFlag:
         return self.value
 
 
-def test_a_stop_requested_during_phase_three_stops_before_phase_four(store):
+def test_a_stop_requested_during_phase_three_stops_before_phase_four(store, run_subtask):
     calls: list[str] = []
     flag = _StopFlag()
 
@@ -2377,7 +2502,7 @@ def test_a_stop_requested_during_phase_three_stops_before_phase_four(store):
         },
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2401,7 +2526,7 @@ def test_a_stop_requested_during_phase_three_stops_before_phase_four(store):
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_stop_already_requested_runs_no_phase_at_all(store):
+def test_a_stop_already_requested_runs_no_phase_at_all(store, run_subtask):
     calls: list[str] = []
 
     def step(card: str) -> dict[str, Any]:
@@ -2412,7 +2537,7 @@ def test_a_stop_already_requested_runs_no_phase_at_all(store):
         THREE_PHASES, {"step.alpha": step, "step.beta": step, "step.gamma": step}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2432,7 +2557,7 @@ def test_a_stop_already_requested_runs_no_phase_at_all(store):
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store):
+def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store, run_subtask):
     calls: list[str] = []
     flag = _StopFlag()
 
@@ -2451,7 +2576,7 @@ def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store):
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2469,7 +2594,7 @@ def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store):
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store):
+def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store, run_subtask):
     recorded: dict[str, Any] = {}
     flag = _StopFlag()
 
@@ -2482,7 +2607,7 @@ def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store):
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2500,7 +2625,7 @@ def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store):
     assert _subtask_journal_statuses(store) == ["stopped"]
 
 
-def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store):
+def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store, run_subtask):
     """The check sits before the `agent_runner is None` error: a walk that
     stops before its agent phase never reaches that phase, so it has nothing
     to complain about."""
@@ -2515,7 +2640,7 @@ def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store):
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2529,7 +2654,7 @@ def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store):
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_should_stop_that_never_fires_changes_nothing(store):
+def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
     calls: list[str] = []
     checks: list[str] = []
 
@@ -2549,7 +2674,7 @@ def test_a_should_stop_that_never_fires_changes_nothing(store):
         {"step.alpha": make("alpha"), "step.beta": make("beta"), "step.gamma": make("gamma")},
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2581,7 +2706,7 @@ def test_a_should_stop_that_never_fires_changes_nothing(store):
     assert _projected_subtask_status(store) == "done"
 
 
-def test_should_stop_is_checked_only_at_visited_phases(store):
+def test_should_stop_is_checked_only_at_visited_phases(store, run_subtask):
     """`plan_check` jumps to `implement`; `spec` and `plan` are never visited,
     so never checked, and nothing is checked after the last phase."""
     calls: list[str] = []
@@ -2595,7 +2720,7 @@ def test_should_stop_is_checked_only_at_visited_phases(store):
 
     workflow = _skipping_workflow(has, calls)
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2609,7 +2734,7 @@ def test_should_stop_is_checked_only_at_visited_phases(store):
     assert summary.skipped == ["spec", "plan"]
 
 
-def test_an_escalation_during_the_stop_request_wins_over_the_stop(store):
+def test_an_escalation_during_the_stop_request_wins_over_the_stop(store, run_subtask):
     calls: list[str] = []
     flag = _StopFlag()
 
@@ -2630,7 +2755,7 @@ def test_an_escalation_during_the_stop_request_wins_over_the_stop(store):
         THREE_PHASES, {"step.alpha": alpha, "step.beta": beta, "step.gamma": gamma}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2647,7 +2772,7 @@ def test_an_escalation_during_the_stop_request_wins_over_the_stop(store):
     assert _projected_subtask_status(store) == "escalated"
 
 
-def test_an_exception_from_should_stop_propagates_and_records_nothing(store):
+def test_an_exception_from_should_stop_propagates_and_records_nothing(store, run_subtask):
     calls: list[str] = []
 
     def step(card: str) -> dict[str, Any]:
@@ -2662,7 +2787,7 @@ def test_an_exception_from_should_stop_propagates_and_records_nothing(store):
     )
 
     with pytest.raises(RuntimeError, match="stop flag unreadable"):
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -2731,3 +2856,196 @@ def test_a_stopped_subtask_can_be_driven_again_to_done(store):
     assert _projected_phases(store) == [("alpha", "done"), ("beta", "done"), ("gamma", "done")]
     assert _subtask_journal_statuses(store) == ["stopped", "done"]
     assert _projected_subtask_status(store) == "done"
+
+
+# ── run_one_step: one deterministic phase, either phase type ────────────────
+
+FIXED = datetime(2026, 9, 26, tzinfo=timezone.utc)
+
+
+def _step_functions() -> dict[str, Any]:
+    return {
+        "step.alpha": lambda card: {"card": card},
+        "step.beta": lambda card: {},
+        "step.gamma": lambda card: {},
+    }
+
+
+def test_run_one_step_calls_a_phase_models_callables_directly(store):
+    seen: dict[str, Any] = {}
+
+    def build(card):
+        return {"built": card}
+
+    def ok_gate(result):
+        seen["gate"] = result
+
+    step = phase_model.Step(
+        "a",
+        build,
+        gates=(ok_gate,),
+        when=lambda result: result["built"] == "c1",
+        skip_to="z",
+    )
+
+    outcome = engine.run_one_step(
+        phase=step, table={"card": "c1"}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is True
+    assert outcome.result == {"built": "c1"}
+    assert outcome.skip_to == "z"
+    assert outcome.warnings == []
+    assert seen["gate"] == {"built": "c1"}
+    assert _journalled_phases(store) == [("a", "started"), ("a", "done")]
+
+
+def test_run_one_step_names_a_callable_gate_by_its_function_name(store):
+    def blocking(result):
+        return {"blocked": "x"}
+
+    step = phase_model.Step("a", lambda: {}, gates=(blocking,))
+
+    outcome = engine.run_one_step(
+        phase=step, table={}, store=store, story_id=STORY_ID,
+        subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is False
+    assert outcome.detail == "phase 'a' gate 'blocking' failed: blocked=x"
+    assert _journalled_phases(store) == [("a", "started"), ("a", "failed")]
+
+
+def test_run_one_step_resolves_a_loader_phases_names_through_the_workflow(store):
+    loaded = _workflow(THREE_PHASES, _step_functions())
+
+    outcome = engine.run_one_step(
+        phase=loaded.phases[0], table={"card": "c1"}, store=store,
+        story_id=STORY_ID, subtask=_subtask(), clock=lambda: FIXED,
+        workflow=loaded,
+    )
+
+    assert outcome.ok is True
+    assert outcome.result == {"card": "c1"}
+
+
+def test_run_one_step_fails_a_named_function_it_has_no_workflow_to_resolve(store):
+    loaded = _workflow(THREE_PHASES, _step_functions())
+
+    outcome = engine.run_one_step(
+        phase=loaded.phases[0], table={"card": "c1"}, store=store,
+        story_id=STORY_ID, subtask=_subtask(), clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is False
+    assert outcome.detail.startswith("EngineError: ")
+    assert "'step.alpha'" in outcome.detail
+    assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
+
+
+# ── parity: the shipped `task` workflow on both engines (spec Tests 3) ──────
+
+
+def test_new_engine_returns_same_summary_for_the_shipped_task(monkeypatch, tmp_path):
+    """One explicit parity check, deliberately not parametrised (spec Tests 3):
+    `builtin/task.yaml`, walked once on each engine against separate temp
+    stores, ends in the same place -- status, result keys, skips, warnings,
+    the steps called, and every phase row. The clock is fixed so the rows'
+    timestamps compare too. Both plan-check outcomes are walked inside the
+    one test: `validated=True` takes the `plan_check` skip, so `skipped` is
+    compared non-empty."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    engines = {
+        "yaml": engine.run_subtask,
+        "pygents": lambda workflow, opened, **kw: new_engine.run_subtask(
+            phase_model.from_loader(workflow), opened, **kw
+        ),
+    }
+    for validated in (False, True):
+        walked: dict[str, Any] = {}
+        for name, run in engines.items():
+            calls: list[str] = []
+            workflow = load_builtin(
+                "task", _registry(_builtin_functions(calls, validated=validated))
+            )
+            label = f"{name}-{'validated' if validated else 'fresh'}"
+            opened = store_module.Store.open(tmp_path / label, f"run-parity-{label}")
+            try:
+                summary = run(
+                    workflow,
+                    opened,
+                    story_id=STORY_ID,
+                    subtask=_subtask(),
+                    repo_dir=REPO,
+                    commands=["uv run pytest"],
+                    card=CARD,
+                    parent_story=PARENT,
+                    agent_runner=_recording_runner({}),
+                    clock=lambda: FIXED,
+                )
+                rows = [
+                    tuple(row)
+                    for row in opened.connection.execute(
+                        "SELECT name, kind, status, started_at, ended_at FROM phases"
+                        " ORDER BY position"
+                    ).fetchall()
+                ]
+            finally:
+                opened.close()
+            walked[name] = (summary, calls, rows)
+
+        old_summary, old_calls, old_rows = walked["yaml"]
+        new_summary, new_calls, new_rows = walked["pygents"]
+        assert old_summary.status == new_summary.status == "done", validated
+        assert sorted(new_summary.results) == sorted(old_summary.results), validated
+        assert new_summary.skipped == old_summary.skipped, validated
+        assert new_summary.warnings == old_summary.warnings, validated
+        assert new_calls == old_calls, validated
+        assert new_rows == old_rows, validated
+        assert new_rows, "the walk recorded no phase rows to compare"
+    assert new_summary.skipped, "the validated walk must exercise a non-empty skip"
+
+
+# ── pygents only: the spec's error table, third row ─────────────────────────
+
+
+def test_an_error_no_phase_handles_escalates_at_the_phase_that_was_running(
+    store, monkeypatch
+):
+    """Review Focus 5. Not parametrised: the yaml engine has no bridge. An
+    `Exception` that is neither `Escalated` nor `EngineError` -- here the
+    bridge itself failing under `beta` -- must end the subtask escalated at
+    `beta`, in the old engine's `{Type}: {message}` form, not propagate."""
+    real_call_step = bridge.call_step
+
+    async def call_step(fn, kwargs):
+        if kwargs["phase"].name == "beta":
+            raise RuntimeError("the worker pool is gone")
+        return await real_call_step(fn, kwargs)
+
+    monkeypatch.setattr(bridge, "call_step", call_step)
+    workflow = _workflow(
+        THREE_PHASES,
+        {
+            "step.alpha": lambda card: {"phase": "alpha"},
+            "step.beta": lambda card: {},
+            "step.gamma": lambda card: {},
+        },
+    )
+
+    summary = new_engine.run_subtask(
+        phase_model.from_loader(workflow),
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "beta"
+    assert summary.detail == "RuntimeError: the worker pool is gone"
+    assert summary.results == {"alpha": {"phase": "alpha"}}
+    assert _projected_phases(store) == [("alpha", "done")]
+    assert _subtask_journal_statuses(store) == ["escalated"]
