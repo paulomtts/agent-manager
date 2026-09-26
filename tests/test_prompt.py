@@ -7,16 +7,19 @@ touch is pytest's `tmp_path`, and only where the module itself reads files
 (`repo_docs`) or writes one (`RenderedPrompt.write`).
 """
 
+import ast
+import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, Field
 
 from agent_manager import dag, models, prompt, results
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.roles import loader as roles_loader
-from agent_manager.workflow.loader import AgentPhase
+from agent_manager.workflow import phases
 
 CARD = models.Card(
     id="968fba15-0971-456a-ae9f-57ff2210f0ce",
@@ -35,8 +38,8 @@ PLAN_HASH = "9f3a12bc"
 """`docs_commit.plan_hash()`'s shape: 8 lowercase hex characters."""
 
 
-def _phase(inputs, *, name="implement", role="coder", **extra) -> AgentPhase:
-    return AgentPhase(kind="agent", name=name, role=role, inputs=list(inputs), **extra)
+def _phase(inputs, *, name="implement", role="coder", **extra) -> phases.AgentPhase:
+    return phases.AgentPhase(name=name, role=role, inputs=tuple(inputs), result=None, **extra)
 
 
 def _context(**overrides):
@@ -108,12 +111,6 @@ def test_an_unknown_input_name_names_the_phase_the_input_and_the_table():
     assert caught.value.parameter == "the_whole_repo"
     assert "'the_whole_repo'" in str(caught.value)
     assert "branch" in str(caught.value)
-
-
-def test_engine_re_exports_the_same_error_class():
-    from agent_manager import engine
-
-    assert engine.EngineError is EngineError
 
 
 def _section(rendered, name: str) -> str:
@@ -420,7 +417,7 @@ def test_a_blank_plan_hash_from_docs_commit_is_refused(blank):
     assert "supplied no 'plan_hash'" in str(caught.value)
 
 
-TWELVE_INPUTS = [
+THIRTEEN_INPUTS = [
     "card",
     "parent_story",
     "repo_docs",
@@ -433,28 +430,39 @@ TWELVE_INPUTS = [
     "plan_hash",
     "merge_tip",
     "conflict_files",
+    "feedback",
 ]
 
 MERGE_TIP = "m5/story-the-resolver-5216cbee"
 CONFLICT_FILES = ["src/agent_manager/prompt.py", "tests/test_prompt.py"]
 
+FEEDBACK_ITEM = {"for": "spec", "from": "validate_spec", "detail": "no error path"}
 
-def test_the_table_carries_exactly_the_twelve_names_section_7_and_integrate_fix():
-    """§7's table is fixed. A thirteenth name is a design change, not a code change.
+
+def test_the_table_carries_exactly_the_thirteen_names_section_7_integrate_and_feedback():
+    """§7's table is fixed. A fourteenth name is a design change, not a code change.
 
     `plan_hash` is the tenth, added by card f26b377d together with its row in
     §7's table in `docs/superpowers/specs/2026-09-23-agent-manager-design.md`.
     `merge_tip` and `conflict_files` are the eleventh and twelfth, the resolver's
     inputs, which the Integrate addendum
     (`docs/superpowers/specs/2026-09-25-integrate-design.md` §2) says must be
-    added to this table (card b4bd3795).
+    added to this table (card b4bd3795). `feedback` is the thirteenth, the
+    critic's reason on a Goto loop-back, which the pygents-engine design
+    (`docs/superpowers/specs/2026-09-25-pygents-engine-design.md` G4, §5) adds
+    (card b904b9e7). It is given one item here, because an empty list omits
+    its section.
     """
     rendered = prompt.render_prompt(
-        _phase(TWELVE_INPUTS),
-        _context(merge_tip=MERGE_TIP, conflict_files=list(CONFLICT_FILES)),
+        _phase(THIRTEEN_INPUTS),
+        _context(
+            merge_tip=MERGE_TIP,
+            conflict_files=list(CONFLICT_FILES),
+            feedback=[dict(FEEDBACK_ITEM)],
+        ),
     )
 
-    assert rendered.inputs == tuple(TWELVE_INPUTS)
+    assert rendered.inputs == tuple(THIRTEEN_INPUTS)
     assert sorted(prompt._TABLE) == sorted(rendered.inputs)
 
 
@@ -667,14 +675,14 @@ def test_the_brief_carries_the_rendered_text_verbatim_and_ends_in_one_newline():
 def test_two_roles_produce_different_briefs_from_the_same_rendered_prompt():
     rendered = _rendered()
     coder = _role(methodology={"test-driven-development.md": TDD_BODY})
-    critic = _role(name="critic", system="# Critic\n\nYou adversarially review.\n")
+    critic = _role(name="spec_critic", system="# Spec critic\n\nYou adversarially review.\n")
 
     coder_brief = prompt.compose_brief(coder, rendered)
     critic_brief = prompt.compose_brief(critic, rendered)
 
     assert coder_brief != critic_brief
-    assert "# Coder" in coder_brief and "# Critic" not in coder_brief
-    assert "# Critic" in critic_brief and "# Coder" not in critic_brief
+    assert "# Coder" in coder_brief and "# Spec critic" not in coder_brief
+    assert "# Spec critic" in critic_brief and "# Coder" not in critic_brief
 
 
 def test_composing_twice_is_byte_identical():
@@ -964,3 +972,122 @@ def test_feedback_that_already_ends_in_newlines_does_not_accumulate_blank_lines(
 
     assert retry.startswith(base)
     assert retry.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")
+
+
+def test_input_names_are_exactly_the_resolver_table():
+    assert isinstance(prompt.INPUT_NAMES, frozenset)
+    assert prompt.INPUT_NAMES == frozenset(prompt._TABLE)
+    assert "card" in prompt.INPUT_NAMES
+
+
+def test_prompt_reads_phases_through_a_protocol_not_the_yaml_type():
+    # Spec: render_prompt, _assemble and _Request are retyped to a Protocol
+    # carrying name, role and inputs, and the loader import is dropped.
+    assert "AgentPhase" not in vars(prompt)
+    assert inspect.signature(prompt.render_prompt).parameters["phase"].annotation is (
+        prompt.PromptPhase
+    )
+    assert all(
+        isinstance(getattr(prompt.PromptPhase, attr), property)
+        for attr in ("name", "role", "inputs")
+    )
+
+
+FEEDBACK_PHASE = SimpleNamespace(name="spec", role="spec_author", inputs=("feedback",))
+
+
+def test_feedback_renders_each_item_and_nothing_when_empty():
+    text = prompt.render_prompt(FEEDBACK_PHASE, {"feedback": [dict(FEEDBACK_ITEM)]}).text
+    assert "Feedback from review" in text and "validate_spec: no error path" in text
+
+    empty = prompt.render_prompt(FEEDBACK_PHASE, {"feedback": []})
+    assert "Feedback from review" not in empty.text
+    assert "## feedback" not in empty.text
+    assert "feedback" not in dict(empty.sections)
+    assert empty.text == "# phase: spec\n# role: spec_author\n"
+
+    two = prompt.render_prompt(
+        FEEDBACK_PHASE,
+        {
+            "feedback": [
+                dict(FEEDBACK_ITEM),
+                {"for": "spec", "from": "validate_spec", "detail": "no rollback step"},
+            ]
+        },
+    )
+    assert _section(two, "feedback") == (
+        "Feedback from review\n"
+        "- validate_spec: no error path\n"
+        "- validate_spec: no rollback step"
+    )
+
+    for context in ({}, {"feedback": None}):
+        missing = prompt.render_prompt(FEEDBACK_PHASE, context)
+        assert missing.sections == ()
+        assert "feedback" not in dict(missing.sections)
+        assert missing.text == "# phase: spec\n# role: spec_author\n"
+
+
+def test_feedback_renders_under_its_own_section_heading_and_omits_the_for_key():
+    rendered = prompt.render_prompt(FEEDBACK_PHASE, {"feedback": [dict(FEEDBACK_ITEM)]})
+
+    assert rendered.inputs == ("feedback",)
+    assert rendered.text == (
+        "# phase: spec\n"
+        "# role: spec_author\n"
+        "\n"
+        "## feedback\n"
+        "Feedback from review\n"
+        "- validate_spec: no error path\n"
+    )
+
+
+def test_feedback_keeps_a_multi_line_detail_verbatim():
+    """Review Focus: gate verdicts span lines; the bullet must carry all of them."""
+    detail = "no error path\nand the rollback section is empty"
+    rendered = prompt.render_prompt(
+        FEEDBACK_PHASE,
+        {"feedback": [{"for": "spec", "from": "validate_spec", "detail": detail}]},
+    )
+
+    assert _section(rendered, "feedback") == (
+        "Feedback from review\n- validate_spec: no error path\nand the rollback section is empty"
+    )
+
+
+def test_an_omitted_feedback_section_leaves_its_neighbours_untouched():
+    """Review Focus: an old-engine context has no `feedback` key at all."""
+    with_feedback = prompt.render_prompt(_phase(["branch", "feedback", "base_branch"]), _context())
+    without = prompt.render_prompt(_phase(["branch", "base_branch"]), _context())
+
+    assert with_feedback.text == without.text
+    assert with_feedback.sections == without.sections
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"for": "spec", "detail": "no error path"},
+        {"for": "spec", "from": "validate_spec"},
+        "validate_spec: no error path",
+    ],
+)
+def test_a_feedback_item_without_from_or_detail_is_refused(item):
+    """Review Focus: a malformed item is a codec bug, never a blank bullet."""
+    with pytest.raises(EngineError) as caught:
+        prompt.render_prompt(FEEDBACK_PHASE, {"feedback": [item]})
+
+    assert caught.value.phase == "spec"
+    assert caught.value.parameter == "feedback"
+    assert "'from'" in str(caught.value) and "'detail'" in str(caught.value)
+
+
+def test_feedback_is_not_a_producer_input_and_prompt_imports_no_pygents():
+    assert "feedback" in prompt.INPUT_NAMES
+    assert "feedback" not in prompt.INPUT_PRODUCERS
+
+    tree = ast.parse(Path(prompt.__file__).read_text(encoding="utf-8"))
+    imported = {
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+    } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+    assert not any(name.split(".")[0] == "pygents" for name in imported)

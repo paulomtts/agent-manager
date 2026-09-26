@@ -10,6 +10,9 @@ default suite. To run it: `uv run pytest -m e2e` (a bare path invocation such
 as `uv run pytest tests/e2e/test_real_harness.py` is still deselected by
 `addopts` and exits 5 -- pass `-m e2e` alongside the path).
 
+`-m e2e` pays for one real run of this module:
+`uv run pytest -m e2e -v tests/e2e/test_real_harness.py`.
+
 The marker is applied HERE and only here. Marking it from `tests/e2e/conftest.py`
 would drag the sibling's free, fake-claude `test_production_wiring.py` out of the
 default suite, which its own `test_this_module_runs_in_the_default_suite_unmarked`
@@ -30,8 +33,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agent_manager import board, cli, results
-from agent_manager.workflow import load_builtin
+from agent_manager import board, cli
+from agent_manager.workflow import task as task_workflow
 
 pytestmark = pytest.mark.e2e
 
@@ -56,7 +59,7 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-"""`builtin/task.yaml`'s seven agent phases; see `VERIFY_COMMANDS` on why this
+"""`TASK`'s seven agent phases; see `VERIFY_COMMANDS` on why this
 is re-declared."""
 
 PLAN_HASH_TRAILER = "Plan-Hash:"
@@ -106,7 +109,8 @@ def real_claude() -> Path:
 
 @pytest.fixture(scope="module")
 def completed_run(real_claude, project, cards) -> dict[str, Any]:
-    """One real, paid `cli.run_card` -- no `runner_factory`, no fake on `PATH`.
+    """One real, paid `cli.run_card` -- no `runner_factory`, no
+    fake on `PATH`.
 
     Overrides the conftest fixture of the same name, so `run_tree`,
     `agent_attempts` and `worktree` resolve against THIS run. `fake_claude_bin`
@@ -155,15 +159,12 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
         hashes.update(values)
     assert len(hashes) == 1, hashes
 
-    workflow = load_builtin("task")
     validated: set[str] = set()
     for name, attempt in sorted(agent_attempts.items()):
         assert attempt.result_path is not None, name
         path = Path(attempt.result_path)
         assert path.is_file(), (name, path)
-        model = results.resolve_result_model(
-            workflow.phase(name).result, results.RESULT_MODELS, phase=name
-        )
+        model = task_workflow.TASK.phase(name).result
         try:
             model.model_validate_json(path.read_text(encoding="utf-8"))
         except ValidationError as error:
@@ -175,3 +176,10 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 
     # Non-vacuity: an empty `agent_attempts` would sail through the loop above.
     assert validated == set(AGENT_PHASES), sorted(validated)
+
+
+def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
+    """Non-vacuity: the pygents walk is the only one that checkpoints (its
+    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra."""
+    rows = checkpoint_rows(project, completed_run["run_id"])
+    assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"

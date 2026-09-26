@@ -38,10 +38,13 @@ from agent_manager import (
     prompt,
     store as store_module,
 )
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps.reducers import verification_gate
-from agent_manager.workflow.loader import load_builtin
-from agent_manager.workflow.registry import WorkflowLoadError
+
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.workflow import task as task_workflow
 
 
 def test_render_is_one_line_of_json_by_default():
@@ -438,19 +441,8 @@ def test_select_resumable_refuses_more_than_one_subtask_in_flight():
 AGENT_PHASE_NAMES = frozenset(
     {"explore", "spec", "validate_spec", "plan", "validate_plan", "implement", "review"}
 )
-"""Which phases of `builtin/task.yaml` are `kind: agent`. `PhaseRun.kind` is a
+"""Which phases of `TASK` are `kind: agent`. `PhaseRun.kind` is a
 Literal, so a hand-built phase has to name the right one."""
-
-
-def _task_workflow():
-    """The shipped `builtin/task.yaml`, loaded and resolved.
-
-    Still unit tier: the only thing read is a packaged document that ships with
-    the source. No run state, no clock, no subprocess -- and the back-off rule
-    these tests pin is a property of *that* document, so substituting a
-    hand-written one would test the wrong thing.
-    """
-    return load_builtin("task")
 
 
 def _recorded(name: str, status: str, attempts: list[models.Attempt] | None = None):
@@ -461,185 +453,6 @@ def _recorded(name: str, status: str, attempts: list[models.Attempt] | None = No
         status=status,
         attempts=list(attempts or []),
     )
-
-
-def test_the_interrupted_phase_is_the_one_recorded_started():
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            _recorded("worktree", "done"),
-            _recorded("explore", "done", [_pure_attempt(1)]),
-            _recorded("mark_in_progress", "done"),
-            _recorded("plan_check", "done"),
-            _recorded("spec", "done", [_pure_attempt(1)]),
-            _recorded("validate_spec", "done", [_pure_attempt(1)]),
-            _recorded("plan", "done", [_pure_attempt(1)]),
-            _recorded("validate_plan", "done", [_pure_attempt(1)]),
-            _recorded("implement", "started", [_pure_attempt(1, status="started")]),
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, _task_workflow()) == "implement"
-
-
-def test_a_crash_between_phases_restarts_at_the_first_phase_not_done():
-    """No phase is `started`, so the process died between two of them: the first
-    phase the projection does not hold as `done` is the one that never ran."""
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            _recorded("worktree", "done"),
-            _recorded("explore", "done", [_pure_attempt(1)]),
-            _recorded("mark_in_progress", "done"),
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
-
-
-def test_a_skipped_stretch_restarts_at_the_phase_whose_when_decided_the_skip():
-    """`plan_check` may `skip_to: implement`, and a skipped phase is never
-    recorded (engine.py:432 only appends to the in-memory summary). Restarting at
-    `spec` would re-author a spec over a plan Validate already signed; restarting
-    at `plan_check` lets its own `when` decide the jump again."""
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            _recorded("worktree", "done"),
-            _recorded("explore", "done", [_pure_attempt(1)]),
-            _recorded("mark_in_progress", "done"),
-            _recorded("plan_check", "done"),
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, _task_workflow()) == "plan_check"
-
-
-def test_a_run_that_lost_everything_after_the_first_phase_restarts_at_explore():
-    """The first phase of the document is `worktree` (R6), so the cheapest real
-    crash there is -- the process dying right after the worktree was created --
-    must restart at `explore` and never re-create the worktree."""
-    workflow = _task_workflow()
-    assert workflow.phase_names[0] == "worktree"
-
-    subtask = _pure_subtask("card-1", [_recorded("worktree", "done")])
-
-    assert cli.interrupted_phase(subtask, workflow) == "explore"
-
-
-def test_a_run_that_only_lost_its_last_phase_restarts_there_and_not_at_plan_check():
-    """The skip-aware branch must stay bounded by the `skip_to` target: with
-    `implement`, `review` and `verify` all recorded `done`, no jump can explain a
-    missing `mark_done`, and re-running the whole tail would be a fresh run."""
-    workflow = _task_workflow()
-    subtask = _pure_subtask(
-        "card-1",
-        [_recorded(name, "done") for name in workflow.phase_names if name != "mark_done"],
-    )
-
-    assert cli.interrupted_phase(subtask, workflow) == "mark_done"
-
-
-SKIPPED_STRETCH = ("spec", "validate_spec", "plan", "validate_plan", "mark_validated")
-"""The phases `plan_check: skip_to docs_commit` jumps over, which the engine
-records nowhere at all (engine.py:431-433 only appends to the in-memory
-summary), so an unrecorded stretch reads the same as one that never ran."""
-
-
-def test_a_skipped_stretch_the_walk_ran_past_does_not_drag_the_restart_back():
-    """The commonest resume there is: a card whose plan was already validated
-    took `plan_check`'s jump, `implement` ran to `done`, and the process died
-    before `review`. `spec` is unrecorded because it was skipped, not because it
-    was interrupted -- and restarting at `plan_check` would re-dispatch a
-    finished `implement`, the single most expensive phase of the document."""
-    workflow = _task_workflow()
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            *[
-                _recorded(name, "done")
-                for name in workflow.phase_names[:4]
-                if name not in SKIPPED_STRETCH
-            ],
-            _recorded("docs_commit", "done"),
-            _recorded("implement", "done", [_pure_attempt(1)]),
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, workflow) == "review"
-
-
-def test_a_skipped_stretch_with_only_the_final_write_lost_restarts_at_mark_done():
-    """Same jump, run out to `verify`: nothing but `mark_done` is left, so the
-    skip explains nothing and the restart must not walk the tail again."""
-    workflow = _task_workflow()
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            _recorded(name, "done")
-            for name in workflow.phase_names
-            if name not in SKIPPED_STRETCH and name != "mark_done"
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, workflow) == "mark_done"
-
-
-def test_a_subtask_with_every_phase_done_has_no_phase_to_resume():
-    """The condition `resume_run` turns into `NotResumableError`: only the final
-    status write was lost, and re-running `mark_done` would not be a resume."""
-    workflow = _task_workflow()
-    subtask = _pure_subtask(
-        "card-1", [_recorded(name, "done") for name in workflow.phase_names]
-    )
-
-    assert cli.interrupted_phase(subtask, workflow) is None
-
-
-def test_an_interrupted_spec_backs_off_to_the_phase_whose_result_it_binds():
-    """`spec` declares `inputs: [card, explore]`, and `explore`'s result lives
-    only in the in-memory binding table `run_subtask` builds -- so a walk started
-    at `spec` could not render its prompt at all."""
-    assert cli.resume_start_phase(_task_workflow(), "spec") == "explore"
-
-
-def test_an_interrupted_implement_backs_off_to_the_phase_that_binds_its_plan_hash():
-    """`implement` declares `[plan_path, spec_path, branch, base_branch,
-    plan_hash]`. The first four come from the record; `plan_hash` is
-    `docs_commit`'s result, which lives only in the in-memory binding table, so
-    a walk started at `implement` could not render its brief. `docs_commit` is
-    idempotent (nothing to commit and the branch already carries the hash
-    returns the same digest), so re-running it is the whole recovery. Card
-    f26b377d."""
-    assert cli.resume_start_phase(_task_workflow(), "implement") == "docs_commit"
-
-
-def test_the_resume_walk_reads_its_producer_map_out_of_the_prompt_table(monkeypatch):
-    """`input name -> producing phase` has one home: the nested resolvers in
-    `prompt._TABLE`, which are what make the dependency real. A second,
-    hand-written copy in `cli.py` would go stale the day a resolver reads a
-    different phase, and the walk would restart somewhere that cannot render."""
-    monkeypatch.setitem(prompt.INPUT_PRODUCERS, "plan_hash", "mark_validated")
-
-    assert cli.resume_start_phase(_task_workflow(), "implement") == "mark_validated"
-
-
-def test_a_deterministic_phase_killed_mid_suite_restarts_at_itself_with_no_orphans():
-    """Review Focus: the process died inside `verify.run_suite`. A deterministic
-    phase dispatches nothing, so there is no attempt to discard, and
-    `verify.run_suite` is read-only -- re-running it is the whole recovery."""
-    workflow = _task_workflow()
-    subtask = _pure_subtask(
-        "card-1",
-        [
-            *[_recorded(name, "done") for name in workflow.phase_names[:11]],
-            _recorded("verify", "started"),
-        ],
-    )
-
-    assert cli.interrupted_phase(subtask, workflow) == "verify"
-    assert cli.resume_start_phase(workflow, "verify") == "verify"
-    assert cli.orphan_attempts(subtask) == []
 
 
 def test_orphan_attempts_are_exactly_the_ones_recorded_started():
@@ -1578,7 +1391,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 @requires_brd
 def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
     """Addendum P4: the driver passes the stop check straight through. With a
-    stop already requested, the first phase of `builtin/task.yaml` never
+    stop already requested, the first phase of `TASK` never
     starts, so the fake runner is never called and no worktree is made."""
     root = cli.resolve_repo_dir(project)
     parent = board.show(cards["story"], repo_dir=root)
@@ -1641,6 +1454,110 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
     assert not subtask.worktree_path.exists()
     assert run is not None
     assert [sub.status for sub in run.stories[0].subtasks] == ["stopped"]
+
+
+# ── drive_subtask's walk (card 7fdec762) ─────────────────────────────────────
+
+DRIVE_CARD = models.Card(
+    id="7fdec762-0000-4000-8000-000000000001",
+    title="Select the engine with --engine",
+    status="todo",
+    parent_id="a6c7bff3-0000-4000-8000-000000000002",
+)
+DRIVE_PARENT = models.Card(
+    id="a6c7bff3-0000-4000-8000-000000000002",
+    title="Checkpoints and resume",
+    status="in_progress",
+)
+DRIVE_RUN_ID = "20260926T000000Z-7fdec762"
+DRIVE_REPO = Path("/repo")
+
+
+def _drive_row() -> models.SubtaskRun:
+    return models.SubtaskRun(
+        card_id=DRIVE_CARD.id,
+        branch="m6/task-select-the-engine-7fdec762",
+        base_branch="main",
+        status="started",
+        worktree_path=Path("/repo/.claude/worktrees/m6/task-select-the-engine-7fdec762"),
+    )
+
+
+def _record_walks(monkeypatch) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """Stub `runtime.engine.run_subtask`; every call is recorded.
+
+    Patched on the module itself, so the stub is what `drive_subtask` reaches
+    through its `runtime_engine` alias.
+    """
+    walks: list[tuple[Any, Any, dict[str, Any]]] = []
+
+    def run_subtask(workflow, store, **kwargs):
+        walks.append((workflow, store, kwargs))
+        return SubtaskSummary(status="done")
+
+    monkeypatch.setattr(runtime_engine, "run_subtask", run_subtask)
+    return walks
+
+
+def _recording_factory(seen: list[dict[str, Any]]):
+    """A runner factory that records its kwargs and hands back one opaque runner."""
+    runner = object()
+
+    def factory(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return runner
+
+    return factory, runner
+
+
+def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
+    """Spec test 2: the walk is `runtime.engine.run_subtask` over `TASK`. The
+    keywords are compared whole, so a `start_phase` or a `resume_from`
+    sneaking into the call fails here."""
+    walks = _record_walks(monkeypatch)
+    seen: list[dict[str, Any]] = []
+    factory, runner = _recording_factory(seen)
+    store = object()
+    subtask = _drive_row()
+
+    def stop() -> bool:
+        return False
+
+    drive = cli.drive_subtask(
+        store=store,
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=subtask,
+        repo_dir=DRIVE_REPO,
+        commands=["uv run pytest"],
+        runner_factory=factory,
+        should_stop=stop,
+    )
+
+    ((workflow, passed_store, kwargs),) = walks
+    assert passed_store is store
+    assert workflow is task_workflow.TASK
+    assert kwargs == {
+        "story_id": DRIVE_PARENT.id,
+        "subtask": subtask,
+        "repo_dir": DRIVE_REPO,
+        "commands": ["uv run pytest"],
+        "card": DRIVE_CARD,
+        "parent_story": DRIVE_PARENT,
+        "extra_context": cli.gate_context(["uv run pytest"], False),
+        "agent_runner": runner,
+        "should_stop": stop,
+    }
+    assert drive.summary.status == "done"
+    assert drive.warnings == []
+    (factory_call,) = seen
+    assert factory_call == {
+        "store": store,
+        "run_id": DRIVE_RUN_ID,
+        "story_id": DRIVE_PARENT.id,
+        "card_id": DRIVE_CARD.id,
+    }
 
 
 runner = CliRunner()
@@ -2015,7 +1932,7 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
     def exploding(*args, **kwargs):
         raise EngineError("no value for a required parameter", phase="explore")
 
-    monkeypatch.setattr(cli.engine, "run_subtask", exploding)
+    monkeypatch.setattr(cli.runtime_engine, "run_subtask", exploding)
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, cards["subtask"])
 
@@ -2023,30 +1940,6 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
     envelope = json.loads(result.stdout)
     assert envelope["error"]["type"] == "EngineError"
     assert "explore" in envelope["error"]["message"]
-
-
-@requires_git
-@requires_brd
-def test_a_workflow_that_will_not_load_reaches_the_operator_unchanged(
-    project, cards, monkeypatch
-):
-    """A broken document is a load-time bug: the loader's own message names the
-    workflow, the phase and the field, and the CLI must not paraphrase it."""
-
-    def exploding(name, registry=None):
-        raise WorkflowLoadError(
-            "names 1 function(s) nobody registered", workflow="task", phase="verify"
-        )
-
-    monkeypatch.setattr(cli, "load_builtin", exploding)
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-    result = _invoke(project, cards["subtask"])
-
-    assert result.exit_code == cli.EXIT_ERROR
-    envelope = json.loads(result.stdout)
-    assert envelope["error"]["type"] == "WorkflowLoadError"
-    assert "verify" in envelope["error"]["message"]
-    assert not (paths.data_dir() / "runs").exists()
 
 
 @requires_git
@@ -2218,7 +2111,7 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
     project, cards, monkeypatch
 ):
     """The whole chain, not just the call: `--verify` -> `run_card` ->
-    `gate_context` -> the context `builtin/task.yaml` binds its gates out of.
+    `gate_context` -> the context `TASK` binds its gates out of.
 
     The real verify step runs these commands in the worktree, so they are ones
     that pass anywhere."""
@@ -3676,6 +3569,7 @@ def recording_runner(
     card_id: str,
     crash_at: str | None = None,
     seen: list[str] | None = None,
+    crash_with: type[BaseException] = KeyboardInterrupt,
 ):
     """A fake `engine.AgentPhaseRunner` that writes the rows a real one writes.
 
@@ -3688,6 +3582,10 @@ def recording_runner(
     `crash_at` raises `KeyboardInterrupt` in the window between the two writes: a
     `BaseException`, so it escapes `engine.run_subtask`'s `except Exception` the
     way `kill -INT` escapes it, leaving subtask, phase and attempt all `started`.
+
+    `crash_with` is the type raised. The pygents walk needs a plain
+    `BaseException` subclass (`_Killed`): asyncio re-raises `KeyboardInterrupt`
+    out of the event loop before the engine unwinds (tests/runtime/test_resume.py).
     """
 
     def runner(phase, context, rendered):
@@ -3715,7 +3613,7 @@ def recording_runner(
         )
         store.record_attempt(story_id, card_id, phase.name, attempt)
         if crash_at is not None and phase.name == crash_at:
-            raise KeyboardInterrupt(f"simulated kill during {phase.name}")
+            raise crash_with(f"simulated kill during {phase.name}")
         store.record_attempt(
             story_id,
             card_id,
@@ -3732,10 +3630,14 @@ def recording_runner(
     return runner
 
 
-def _resume_factory(seen: list[str] | None = None, crash_at: str | None = None):
+def _resume_factory(
+    seen: list[str] | None = None,
+    crash_at: str | None = None,
+    crash_with: type[BaseException] = KeyboardInterrupt,
+):
     """A `cli.RunnerFactory` handing `recording_runner` the store the CLI opened."""
 
-    def factory(*, workflow, store, run_id, story_id, card_id):
+    def factory(*, store, run_id, story_id, card_id):
         return recording_runner(
             store=store,
             run_id=run_id,
@@ -3743,238 +3645,10 @@ def _resume_factory(seen: list[str] | None = None, crash_at: str | None = None):
             card_id=card_id,
             crash_at=crash_at,
             seen=seen,
+            crash_with=crash_with,
         )
 
     return factory
-
-
-def _crash_mid_phase(project: Path, cards: dict[str, str], phase: str) -> str:
-    """Drive a real `run_card` until it is killed inside `phase`, and name the run."""
-    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    with pytest.raises(KeyboardInterrupt):
-        cli.run_card(
-            cards["subtask"],
-            repo_dir=project,
-            base_branch="main",
-            branch_prefix="m1",
-            clock=lambda: CRASHED_AT,
-            runner_factory=_resume_factory(crash_at=phase),
-        )
-    return run_id
-
-
-@requires_git
-@requires_brd
-def test_a_run_killed_mid_implement_resumes_and_leaves_no_started_attempt(project, cards):
-    """§14's required test: a simulated crash mid-phase, then a resume.
-
-    The crash leaves the subtask, the phase and the attempt all recorded
-    `started`; §9 says resume discards the in-flight attempt and re-runs that
-    phase from the top. An attempt row left `started` after the run finished is
-    the corruption this whole command exists to prevent.
-    """
-    run_id = _crash_mid_phase(project, cards, "implement")
-    assert [
-        row for row in _attempt_rows(project) if row[3] == "implement" and row[5] == "started"
-    ] != []
-
-    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
-
-    assert payload["status"] == "done"
-    assert payload["resumed_from"] == "docs_commit"
-    assert {"phase": "implement", "n": 1} in payload["discarded_attempts"]
-    assert payload["run_id"] == run_id
-    assert payload["card_id"] == cards["subtask"]
-    assert payload["story_id"] == cards["story"]
-    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
-
-
-@requires_git
-@requires_brd
-def test_the_resumed_dispatch_numbers_past_the_attempt_the_crash_left(project, cards):
-    """`dispatch.next_attempt` scans directories on disk precisely so a resumed
-    run cannot overwrite the prompt and log of the attempt that died -- they are
-    the only record of what the killed process was doing."""
-    run_id = _crash_mid_phase(project, cards, "implement")
-    crashed_dir = paths.run_dir(run_id) / cards["subtask"] / "implement.1"
-    prompt_before = (crashed_dir / "prompt.txt").read_bytes()
-
-    cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
-
-    assert (crashed_dir / "prompt.txt").read_bytes() == prompt_before
-    assert (paths.run_dir(run_id) / cards["subtask"] / "implement.2").is_dir()
-    implement = [row for row in _attempt_rows(project) if row[3] == "implement"]
-    assert [(row[4], row[5]) for row in implement] == [(1, "harness_error"), (2, "ok")]
-
-
-@requires_git
-@requires_brd
-def test_resume_launches_no_harness(project, cards, monkeypatch):
-    """§14's adapter rule at the resume seam: the launcher is injected, so a
-    resume that got as far as launching one has already failed."""
-    run_id = _crash_mid_phase(project, cards, "implement")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("resume launched a harness process")
-
-    monkeypatch.setattr(cli, "run_direct", forbidden)
-    monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
-
-    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
-
-    assert payload["status"] == "done"
-
-
-@requires_git
-@requires_brd
-def test_a_run_killed_in_spec_restarts_at_explore_so_specs_input_is_bound(project, cards):
-    """The back-off rule observed end to end: `spec` declares `explore` as an
-    input, `explore`'s result was only ever in the dead process's memory, so the
-    resumed walk has to produce it again before `spec` can render at all."""
-    run_id = _crash_mid_phase(project, cards, "spec")
-    seen: list[str] = []
-
-    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(seen))
-
-    assert payload["resumed_from"] == "explore"
-    assert payload["status"] == "done"
-    assert seen[0] == "explore"
-    assert seen.index("explore") < seen.index("spec")
-
-
-@requires_git
-@requires_brd
-def test_resume_passes_its_own_allow_no_verification_into_the_gate_context(project, cards):
-    """`RunConfig` records neither the suite commands nor §12's opt-out, so the
-    flag is the command's own -- and it has to reach the same four context keys
-    `run_card` supplies (cli.py:438-455)."""
-    run_id = _crash_mid_phase(project, cards, "spec")
-    contexts: list[dict[str, Any]] = []
-
-    def factory(*, workflow, store, run_id, story_id, card_id):
-        def collect(phase, context, rendered):
-            contexts.append(dict(context))
-            if phase.name == "explore":
-                return dict(EXPLORE_RESULT)
-            return _canned_agent_result(phase, context)
-
-        return collect
-
-    cli.resume_run(
-        run_id, repo_dir=project, allow_no_verification=True, runner_factory=factory
-    )
-
-    assert contexts[0]["allow_no_verification"] is True
-    assert contexts[0]["suite_cmds"] == []
-    assert contexts[0]["caller_provided"] is False
-    assert contexts[0]["provided_verification"] is None
-
-
-def _record_interrupted(
-    project: Path,
-    cards: dict[str, str],
-    run_id: str,
-    *,
-    workflow: str = "task",
-    done: tuple[str, ...] = (),
-    started: str | None = None,
-) -> None:
-    """A run the projection holds as killed in flight, written row by row.
-
-    The board and the git repo stay the `project` fixture's real ones, so
-    `resume` can re-fetch the cards; only the run state is hand-built, because
-    the two states these tests need -- a stretch a `skip_to` jumped over, and a
-    workflow name no builtin matches -- are not states `run_card` can be driven
-    into. Written through `Store`, which is the only way this program writes
-    rows.
-    """
-    branch = dag.task_branch("m1", board.show(cards["subtask"], repo_dir=project))
-    opened = store_module.Store.open(project, run_id)
-    try:
-        opened.record_run(
-            models.Run(
-                id=run_id,
-                workflow=workflow,
-                repo_dir=project,
-                base_branch="main",
-                branch_prefix="m1",
-                status="started",
-                started_at=CRASHED_AT,
-            )
-        )
-        opened.record_story(
-            models.StoryRun(
-                card_id=cards["story"],
-                title="The CLI",
-                level=0,
-                status="started",
-                tip_branch=branch,
-            )
-        )
-        opened.record_subtask(
-            cards["story"],
-            models.SubtaskRun(
-                card_id=cards["subtask"],
-                branch=branch,
-                base_branch="main",
-                status="started",
-                worktree_path=cli.worktree_for(project, branch),
-            ),
-        )
-        for name in done:
-            opened.record_phase(cards["story"], cards["subtask"], _recorded(name, "done"))
-        if started is not None:
-            opened.record_phase(
-                cards["story"], cards["subtask"], _recorded(started, "started")
-            )
-    finally:
-        opened.close()
-
-
-@requires_git
-@requires_brd
-def test_a_restart_at_plan_check_that_finds_no_plan_is_an_engine_error_not_a_traceback(
-    project, cards
-):
-    """Review Focus: restarting at `plan_check` re-asks its `when`, and a `when`
-    that now says "no validated plan" drops the walk into `spec`, whose `explore`
-    input no fresh context supplies. The honest outcome is the engine's own
-    refusal naming the input -- which `HANDLED` turns into an envelope at exit 3
-    -- and never an unhandled traceback."""
-    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    _record_interrupted(
-        project,
-        cards,
-        run_id,
-        done=("worktree", "explore", "mark_in_progress", "plan_check"),
-    )
-
-    with pytest.raises(EngineError) as caught:
-        cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
-
-    assert "explore" in str(caught.value)
-    assert isinstance(caught.value, cli.HANDLED)
-
-
-@requires_git
-@requires_brd
-def test_resume_refuses_a_subtask_whose_every_phase_is_already_done(project, cards):
-    """`interrupted_phase` returning `None` is a refusal of its own inside
-    `resume_run`: every phase finished and only the closing status write was
-    lost, so there is nothing to re-run. Without that branch the `None` falls
-    straight into `resume_start_phase`, which would answer with the loader's
-    "no phase named None" instead of the one thing an operator needs to hear.
-    """
-    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    _record_interrupted(
-        project, cards, run_id, done=tuple(load_builtin("task").phase_names)
-    )
-
-    with pytest.raises(cli.NotResumableError) as caught:
-        cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
-
-    assert cards["subtask"] in str(caught.value)
-    assert "no phase to re-run" in str(caught.value)
 
 
 def test_resume_of_an_unknown_run_is_an_envelope(projection):
@@ -4038,121 +3712,6 @@ def test_resume_writes_nothing_when_it_refuses(projection):
     assert _attempt_rows(projection) == rows_before
 
 
-@requires_git
-@requires_brd
-def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
-    """The factory is patched on the module rather than passed as an option: the
-    injection seam is `cli.default_runner_factory`, and patching it is what
-    proves the command reaches for that name."""
-    run_id = _crash_mid_phase(project, cards, "implement")
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-
-    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
-
-    assert result.exit_code == 0
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is True
-    assert envelope["data"]["status"] == "done"
-    assert envelope["data"]["resumed_from"] == "docs_commit"
-    assert envelope["data"]["discarded_attempts"] == [{"phase": "implement", "n": 1}]
-    assert "\n" not in result.stdout.strip()
-
-
-@requires_git
-@requires_brd
-def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
-    run_id = _crash_mid_phase(project, cards, "implement")
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-
-    result = runner.invoke(
-        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
-    )
-
-    assert result.exit_code == 0
-    assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "done"
-
-
-@requires_git
-@requires_brd
-def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
-    """An escalation is a truthful result, so the envelope stays `ok: true` and
-    the exit code carries the full stop -- exactly as `run` does."""
-    run_id = _crash_mid_phase(project, cards, "implement")
-    monkeypatch.setattr(
-        cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
-    )
-
-    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
-
-    assert result.exit_code == cli.EXIT_ESCALATED
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is True
-    assert envelope["data"]["status"] == "escalated"
-    assert envelope["data"]["failed_phase"] == "review"
-    assert envelope["data"]["resumed_from"] == "docs_commit"
-
-
-@requires_git
-@requires_brd
-def test_resume_passes_its_repeated_verify_options_into_the_gate_context(
-    project, cards, monkeypatch
-):
-    """`models.RunConfig` carries neither the suite commands nor the opt-out, so
-    a resume has to be told the same things a fresh `run` was told -- and in the
-    same order, since the engine runs the commands in sequence."""
-    run_id = _crash_mid_phase(project, cards, "implement")
-    contexts: list[dict[str, Any]] = []
-
-    def collecting_factory(**kwargs):
-        inner = fake_runner()
-
-        def collect(phase, context, rendered):
-            contexts.append(dict(context))
-            return inner(phase, context, rendered)
-
-        return collect
-
-    monkeypatch.setattr(cli, "default_runner_factory", collecting_factory)
-
-    result = runner.invoke(
-        cli.app,
-        [
-            "resume",
-            run_id,
-            "--repo-dir",
-            str(project),
-            "--verify",
-            "true",
-            "--verify",
-            "echo checked",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert json.loads(result.stdout)["data"]["resumed_from"] == "docs_commit"
-    assert contexts[0]["suite_cmds"] == ["true", "echo checked"]
-    assert contexts[0]["allow_no_verification"] is False
-
-
-@requires_git
-@requires_brd
-def test_a_run_recorded_with_an_unknown_workflow_is_an_envelope(project, cards, monkeypatch):
-    """Review Focus: the workflow name comes off the record, and a projection
-    row naming a document no builtin matches has to reach the operator as the
-    loader's own refusal rather than as a traceback."""
-    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    _record_interrupted(project, cards, run_id, workflow="nope", started="implement")
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-
-    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
-
-    assert result.exit_code == cli.EXIT_ERROR
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "WorkflowLoadError"
-
-
 def test_status_rows_and_header_show_a_stopped_run_verbatim():
     run = _pure_run(
         [
@@ -4188,63 +3747,6 @@ def test_status_rows_and_header_show_a_stopped_run_verbatim():
     assert cli.status_payload(run)["run"]["status"] == "stopped"
 
 
-def test_select_resumable_tells_a_stopped_run_to_relaunch_the_milestone():
-    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
-    run = _pure_run([_pure_story("story-1", [stopped])])
-
-    with pytest.raises(cli.NotResumableError) as caught:
-        cli.select_resumable(run)
-
-    message = str(caught.value)
-    assert "card-1=stopped" in message
-    assert "agent-manager run --milestone" in message
-    assert "agent-manager status" in message
-    assert "retry" not in message
-
-
-def test_select_resumable_names_only_the_stopped_cards_in_the_remedy():
-    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
-    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
-    run = _pure_run([_pure_story("story-1", [stopped, escalated])])
-
-    with pytest.raises(cli.NotResumableError) as caught:
-        cli.select_resumable(run)
-
-    message = str(caught.value)
-    assert "found: card-1=stopped, card-2=escalated" in message
-    remedy = message.split("shows the run as it stands", 1)[1]
-    assert "card-1" in remedy
-    assert "card-2" not in remedy
-    assert "agent-manager run --milestone" in remedy
-    assert "retry" not in message
-
-
-def test_select_resumable_keeps_its_wording_when_nothing_is_stopped():
-    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
-    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
-    run = _pure_run([_pure_story("story-1", [done, escalated])])
-
-    with pytest.raises(cli.NotResumableError) as caught:
-        cli.select_resumable(run)
-
-    assert str(caught.value) == (
-        "run '20260923T140506Z-cbe34d00' has no subtask recorded 'started', so there"
-        " is no work in flight to pick up (found: card-1=done, card-2=escalated);"
-        " `agent-manager status 20260923T140506Z-cbe34d00` shows the run as it stands"
-    )
-
-
-def test_select_resumable_does_not_count_a_stopped_subtask_as_in_flight():
-    stopped = _pure_subtask("card-1", []).model_copy(update={"status": "stopped"})
-    started = _pure_subtask("card-2", [])
-    run = _pure_run([_pure_story("story-1", [stopped]), _pure_story("story-2", [started])])
-
-    story, subtask = cli.select_resumable(run)
-
-    assert story.card_id == "story-2"
-    assert subtask is started
-
-
 def test_a_stopped_card_run_is_ok_true_and_exit_zero(tmp_path, monkeypatch):
     def fake_run_card(card_id, **kwargs):
         return {**_fake_payload(card_id, "story-1"), "status": "stopped"}
@@ -4272,3 +3774,659 @@ def test_a_resumed_walk_that_stops_is_ok_true_and_exit_zero(tmp_path, monkeypatc
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "stopped"
+
+
+# ── pygents resume and relaunch (card 02890d5d) ──────────────────────────────
+
+
+def test_select_resumable_on_pygents_returns_a_lone_stopped_subtask():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    stopped = _pure_subtask("card-2", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [done]), _pure_story("story-2", [stopped])])
+
+    story, subtask = cli.select_resumable(run)
+
+    assert story.card_id == "story-2"
+    assert subtask is stopped
+
+
+def test_select_resumable_on_pygents_still_returns_a_lone_started_subtask():
+    started = _pure_subtask("card-1", [])
+    run = _pure_run([_pure_story("story-1", [started])])
+
+    story, subtask = cli.select_resumable(run)
+
+    assert story.card_id == "story-1"
+    assert subtask is started
+
+
+def test_select_resumable_on_pygents_refuses_nothing_in_flight_without_the_relaunch_remedy():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [done, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "no subtask recorded 'started' or 'stopped'" in message
+    assert "found: card-1=done, card-2=escalated" in message
+    assert "agent-manager status" in message
+    assert "run --milestone" not in message
+
+
+def test_select_resumable_on_pygents_refuses_a_lone_escalated_subtask():
+    escalated = _pure_subtask("card-1", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    assert "card-1=escalated" in str(caught.value)
+
+
+def test_select_resumable_on_pygents_refuses_a_started_and_a_stopped_subtask_together():
+    started = _pure_subtask("card-1", [])
+    stopped = _pure_subtask("card-2", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [started]), _pure_story("story-2", [stopped])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run)
+
+    message = str(caught.value)
+    assert "2 subtasks recorded 'started' or 'stopped' (card-1, card-2)" in message
+
+
+CHECKPOINT_AT = datetime(2026, 9, 26, 9, 0, tzinfo=timezone.utc)
+
+
+def _checkpoint(
+    reason: str,
+    *,
+    digest: str | None = None,
+    current: str | None = None,
+    queue: tuple[str, ...] = (),
+) -> store_module.Checkpoint:
+    """A hand-built checkpoint row of `TASK`: `current` is the turn in flight, `queue` the turns after it."""
+    return store_module.Checkpoint(
+        run_id="20260926T090000Z-02890d5d",
+        card_id="card-1",
+        seq=4,
+        workflow=task_workflow.TASK.name,
+        digest=task_workflow.TASK.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None if current is None else {"kwargs": {"phase": current, "loop": 0}},
+            "queue": [{"kwargs": {"phase": name, "loop": 0}} for name in queue],
+        },
+        saved_at=CHECKPOINT_AT,
+    )
+
+
+def test_drive_subtask_hands_resume_from_to_the_pygents_walk(monkeypatch):
+    walks = _record_walks(monkeypatch)
+    factory, _runner = _recording_factory([])
+    checkpoint = _checkpoint("parked", queue=("plan",))
+
+    cli.drive_subtask(
+        store=object(),
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=_drive_row(),
+        repo_dir=DRIVE_REPO,
+        runner_factory=factory,
+        resume_from=checkpoint,
+    )
+
+    ((workflow, _store, kwargs),) = walks
+    assert workflow is task_workflow.TASK
+    assert kwargs["resume_from"] is checkpoint
+
+
+def test_checkpoint_resume_phase_is_the_queue_head_of_a_parked_row():
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("parked", queue=("validate_plan", "implement")),
+        card_id="card-1",
+        run_id="run-1",
+    )
+
+    assert phase == "validate_plan"
+
+
+def test_checkpoint_resume_phase_prefers_the_turn_in_flight():
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("turn", current="plan", queue=("validate_plan",)),
+        card_id="card-1",
+        run_id="run-1",
+    )
+
+    assert phase == "plan"
+
+
+def test_checkpoint_resume_phase_refuses_a_card_with_no_checkpoint():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(None, card_id="card-1", run_id="run-1")
+
+    message = str(caught.value)
+    assert "card-1" in message
+    assert "no checkpoint" in message
+
+
+def test_checkpoint_resume_phase_refuses_a_done_row_before_judging_its_digest():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("done", digest="saved-under-another-task"),
+            card_id="card-1",
+            run_id="run-1",
+        )
+
+    assert not isinstance(caught.value, cli.CheckpointMismatchError)
+    assert "'done'" in str(caught.value)
+
+
+def test_checkpoint_resume_phase_refuses_a_changed_workflow_as_a_checkpoint_mismatch():
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("parked", digest="saved-under-another-task", queue=("plan",)),
+            card_id="card-1",
+            run_id="run-1",
+        )
+
+    assert isinstance(caught.value, runtime_engine.CheckpointMismatch)
+    assert isinstance(caught.value, cli.HANDLED)
+    message = str(caught.value)
+    assert "workflow changed since checkpoint" in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+
+
+def test_checkpoint_resume_phase_refuses_an_escalated_row_with_no_turn_left():
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.checkpoint_resume_phase(
+            _checkpoint("escalated"), card_id="card-1", run_id="run-1"
+        )
+
+    message = str(caught.value)
+    assert "'escalated'" in message
+    assert "no turn left" in message
+
+
+def test_checkpoint_resume_phase_continues_an_escalated_row_that_still_holds_a_turn():
+    """An error raised by the BEFORE_TURN hook escalates with the turn still
+    queued (tests/runtime/test_checkpoint.py:174-209): that row is continuable."""
+    phase = cli.checkpoint_resume_phase(
+        _checkpoint("escalated", queue=("review",)), card_id="card-1", run_id="run-1"
+    )
+
+    assert phase == "review"
+
+
+def _saved(
+    opened: store_module.Store,
+    card_id: str,
+    reason: str,
+    *,
+    digest: str | None = None,
+    queue: tuple[str, ...] = ("implement",),
+    minute: int = 0,
+) -> store_module.Checkpoint:
+    return opened.save_checkpoint(
+        card_id,
+        workflow=task_workflow.TASK.name,
+        digest=task_workflow.TASK.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None,
+            "queue": [{"kwargs": {"phase": name, "loop": 0}} for name in queue],
+        },
+        saved_at=CHECKPOINT_AT.replace(minute=minute),
+    )
+
+
+def test_continuable_checkpoint_is_the_open_matching_row_or_none(projection):
+    opened = store_module.Store.open(projection, "20260926T090000Z-02890d5d")
+    try:
+        parked = _saved(opened, "card-parked", "parked")
+        _saved(opened, "card-changed", "parked", digest="saved-under-another-task")
+        _saved(opened, "card-closed", "parked", minute=1)
+        _saved(opened, "card-closed", "done", queue=(), minute=2)
+        _saved(opened, "card-escalated", "escalated", queue=())
+        found = {
+            card: cli.continuable_checkpoint(opened, card)
+            for card in (
+                "card-parked",
+                "card-changed",
+                "card-closed",
+                "card-escalated",
+                "card-never-saved",
+            )
+        }
+    finally:
+        opened.close()
+
+    got = found.pop("card-parked")
+    assert got is not None
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (
+        parked.run_id,
+        "card-parked",
+        parked.seq,
+        "parked",
+    )
+    assert found == {
+        "card-changed": None,
+        "card-closed": None,
+        "card-escalated": None,
+        "card-never-saved": None,
+    }
+
+
+class _Killed(BaseException):
+    """A process death mid-phase for the pygents walk. Not `KeyboardInterrupt`:
+    asyncio re-raises that out of the event loop before the engine unwinds."""
+
+
+RESUME_KEYS = {
+    "run_id",
+    "card_id",
+    "story_id",
+    "branch",
+    "base_branch",
+    "worktree",
+    "status",
+    "failed_phase",
+    "detail",
+    "skipped",
+    "warnings",
+    "resumed_from",
+    "discarded_attempts",
+}
+"""Today's resume payload keys; the pygents branch adds and drops none (G10)."""
+
+
+def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
+    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    with pytest.raises(_Killed):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix="m1",
+            clock=lambda: CRASHED_AT,
+            runner_factory=_resume_factory(crash_at=phase, crash_with=_Killed),
+        )
+    return run_id
+
+
+def _checkpoint_rows(root: Path) -> list[tuple]:
+    conn = sqlite3.connect(paths.project_db_path(root))
+    try:
+        return conn.execute(
+            "SELECT run_id, card_id, seq, reason, digest FROM checkpoints"
+            " ORDER BY run_id, card_id, seq"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _resume_state(root: Path) -> tuple:
+    """Everything a refused resume must leave alone: the run tree on disk (the
+    journal included), the attempt rows and the checkpoint rows."""
+    return (_runs_snapshot(), _attempt_rows(root), _checkpoint_rows(root))
+
+
+def _force_started(project: Path, run_id: str, card_id: str) -> None:
+    """Re-record the subtask `started`: what a crash between the engine's closing
+    checkpoint and the caller's final status write leaves behind."""
+    root = cli.resolve_repo_dir(project)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    found = cli.find_subtask(run, card_id)
+    assert found is not None
+    story, subtask = found
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_subtask(story.card_id, subtask.model_copy(update={"status": "started"}))
+    finally:
+        opened.close()
+
+
+def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
+    """A newer copy of the newest checkpoint, saved under a digest `TASK` does not have."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(card_id)
+        assert newest is not None
+        opened.save_checkpoint(
+            card_id,
+            workflow=newest.workflow,
+            digest="saved-under-another-task",
+            reason=newest.reason,
+            agent=newest.agent,
+            saved_at=datetime.now(timezone.utc),
+        )
+    finally:
+        opened.close()
+
+
+def _park_pygents(project: Path, cards: dict[str, str]) -> str:
+    """A milestone run whose one subtask the run's stop parked on pygents after `spec`.
+
+    Recorded the way `orchestrate.run_story_lane` records it: the run is a
+    `milestone` run, the engine records the subtask `stopped`, the lane
+    records the story `stopped`.
+    """
+    root = cli.resolve_repo_dir(project)
+    parent = board.show(cards["story"], repo_dir=root)
+    card = board.show(cards["subtask"], repo_dir=root)
+    run_id = cli.mint_run_id(cards["milestone"], CRASHED_AT)
+    branch = dag.task_branch("m1", card)
+    subtask = models.SubtaskRun(
+        card_id=card.id,
+        branch=branch,
+        base_branch="main",
+        status="started",
+        worktree_path=cli.worktree_for(root, branch),
+    )
+    story = models.StoryRun(
+        card_id=parent.id, title=parent.title, level=0, status="started", tip_branch=branch
+    )
+    seen: list[str] = []
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=orchestrate.MILESTONE_WORKFLOW,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=CRASHED_AT,
+                config=models.RunConfig(),
+            )
+        )
+        opened.record_story(story)
+        opened.record_subtask(parent.id, subtask)
+        drive = cli.drive_subtask(
+            store=opened,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=root,
+            runner_factory=_resume_factory(seen),
+            should_stop=lambda: seen[-1:] == ["spec"],
+        )
+        assert drive.summary.status == "stopped"
+        assert drive.summary.detail == "stopped before validate_spec"
+        opened.record_story(story.model_copy(update={"status": "stopped"}))
+    finally:
+        opened.close()
+    return run_id
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(project, cards):
+    """Spec test 3: the runner sees `plan` next, never `explore` or `spec`."""
+    run_id = _crash_pygents(project, cards, "plan")
+    seen: list[str] = []
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, runner_factory=_resume_factory(seen)
+    )
+
+    assert seen[0] == "plan"
+    assert not {"explore", "spec", "validate_spec"} & set(seen)
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "plan"
+    assert payload["run_id"] == run_id
+    assert payload["card_id"] == cards["subtask"]
+    assert payload["story_id"] == cards["story"]
+    assert set(payload) == RESUME_KEYS
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):
+    """Spec test 5: the orphan attempt is marked `harness_error`."""
+    run_id = _crash_pygents(project, cards, "plan")
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    plan = [row for row in _attempt_rows(project) if row[3] == "plan"]
+    assert [(row[4], row[5]) for row in plan] == [(1, "harness_error"), (2, "ok")]
+    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
+    project, cards
+):
+    """Spec test 4: the run is a `milestone` run, and its parked subtask
+    continues from its checkpoint instead of being refused."""
+    run_id = _park_pygents(project, cards)
+
+    after: list[str] = []
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(after))
+
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "validate_spec"
+    assert payload["discarded_attempts"] == []
+    assert after[0] == "validate_spec"
+    assert not {"explore", "spec"} & set(after)
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
+    """Spec test 7, second half: only the final status write was lost."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+    assert payload["status"] == "done"
+    _force_started(project, payload["run_id"], cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(
+            payload["run_id"],
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+        )
+
+    assert "'done'" in str(caught.value)
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project, cards):
+    """Replaces spec test 8 (plan deviation 1): a phase escalation's row holds
+    no turn, so continuing it would record `done` with review never passed."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(fail="review"),
+    )
+    assert payload["status"] == "escalated"
+    _force_started(project, payload["run_id"], cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(
+            payload["run_id"],
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+        )
+
+    message = str(caught.value)
+    assert "'escalated'" in message
+    assert "no turn left" in message
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards):
+    """Spec test 6 at the function, and Review Focus 3: the orphan attempt is
+    still `started` afterwards, because nothing is re-marked before the
+    checkpoint is judged."""
+    run_id = _crash_pygents(project, cards, "plan")
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        cli.resume_run(
+            run_id,
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+        )
+
+    assert "workflow changed since checkpoint" in str(caught.value)
+    assert _resume_state(project) == before
+    plan = [row for row in _attempt_rows(project) if row[3] == "plan"]
+    assert [(row[4], row[5]) for row in plan] == [(1, "started")]
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
+    project, cards, monkeypatch
+):
+    """Spec test 6 at the command: `ok: false`, exit 3, nothing written."""
+    run_id = _crash_pygents(project, cards, "plan")
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app, ["resume", run_id, "--repo-dir", str(project)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    assert "workflow changed since checkpoint" in envelope["error"]["message"]
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
+    """The factory is patched on the module rather than passed as an option: the
+    injection seam is `cli.default_runner_factory`, and patching it is what
+    proves the command reaches for that name."""
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "done"
+    assert envelope["data"]["resumed_from"] == "plan"
+    assert envelope["data"]["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    assert "\n" not in result.stdout.strip()
+
+
+@requires_git
+@requires_brd
+def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(
+        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
+    """An escalation is a truthful result, so the envelope stays `ok: true` and
+    the exit code carries the full stop -- exactly as `run` does."""
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(
+        cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
+    )
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "escalated"
+    assert envelope["data"]["failed_phase"] == "review"
+    assert envelope["data"]["resumed_from"] == "plan"
+
+
+@requires_git
+@requires_brd
+def test_resume_launches_no_harness(project, cards, monkeypatch):
+    """§14's adapter rule at the resume seam: the launcher is injected, so a
+    resume that got as far as launching one has already failed."""
+    run_id = _crash_pygents(project, cards, "plan")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("resume launched a harness process")
+
+    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done"
+
+
+@pytest.mark.parametrize("command", [["run", "--card", "cbe34d00"], ["resume", "any-run"]])
+@pytest.mark.parametrize("value", ["yaml", "pygents"])
+def test_the_removed_engine_flag_is_a_usage_error_that_starts_nothing(
+    tmp_path, monkeypatch, command, value
+):
+    """Card 7a744199: `--engine` is gone from `run` and `resume`, so a script
+    still passing it gets Typer's own exit 2, never an envelope, and nothing is
+    driven or written."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+
+    result = runner.invoke(
+        cli.app, [*command, "--repo-dir", str(tmp_path), "--engine", value]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert "--engine" in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("command", ["run", "resume"])
+def test_the_help_offers_no_engine_flag(command):
+    result = runner.invoke(cli.app, [command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--engine" not in result.output

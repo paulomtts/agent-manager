@@ -2,8 +2,7 @@
 
 §7 fixes a table: a phase declares `inputs`, and each name resolves through that
 table and through nothing else. There is no expression language and no fallback
-lookup -- the same invariant `workflow/registry.py` enforces for `when:` and
-gates at load time. A name the table does not carry is a document bug, reported
+lookup. A name the table does not carry is a workflow bug, reported
 with the phase and the list of names that are.
 
 The rule the table encodes, from §7 verbatim: **small structured results are
@@ -12,7 +11,7 @@ it on every phase and invite the agent to work from a stale copy of a file it ca
 read live in the worktree it is already sitting in.
 
 Input names are the *document's* vocabulary; context keys are the *callees'*
-parameter names, as `engine.subtask_context` established. The two are not the
+parameter names, as `walk.subtask_context` established. The two are not the
 same word in several rows: `base_branch` reads `base`, `card` reads
 `card_details`, `verification` reads `commands`.
 
@@ -23,17 +22,36 @@ repo docs a `repo_docs` input asks for, and the only file written is the
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from agent_manager import dag, models
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.roles.loader import RoleBundle
-from agent_manager.workflow.loader import AgentPhase
+
+
+class PromptPhase(Protocol):
+    """The three things rendering reads from an agent phase, and nothing else.
+
+    Structural, so the declared `workflow.phases.AgentPhase` satisfies it
+    without being imported here.
+    Read-only properties, because a frozen dataclass and a frozen pydantic model
+    both expose these as attributes that must not be assigned.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def role(self) -> str: ...
+
+    @property
+    def inputs(self) -> Sequence[str]: ...
+
 
 _MISSING = object()
 
@@ -90,12 +108,18 @@ class _Request:
     """One input name being resolved, with everything a resolver may read."""
 
     name: str
-    phase: AgentPhase
+    phase: PromptPhase
     context: Mapping[str, Any]
 
 
-Resolver = Callable[[_Request], str]
-"""Turns one declared input into the body of its prompt section."""
+Resolver = Callable[[_Request], str | None]
+"""Turns one declared input into the body of its prompt section.
+
+`None` means "no section for this input": `render_prompt` then adds neither a
+heading nor an entry in `sections`. Only `feedback` returns it -- an empty
+feedback list is the normal case, and a bare heading would read as a review
+that said nothing.
+"""
 
 
 def _present(request: _Request, key: str) -> Any:
@@ -142,7 +166,7 @@ def _verbatim(key: str) -> Resolver:
 def _phase_field(phase_key: str, field: str) -> Resolver:
     """One field of an earlier phase's result, inlined as its own string.
 
-    `engine._bind_result` stores a phase's result in the context under the
+    `walk._bind_result` stores a phase's result in the context under the
     phase's own name, so `docs_commit`'s `{"plan_hash": digest}` lands at
     `context["docs_commit"]["plan_hash"]`. Input names are the document's
     vocabulary and context keys are the callees' names, so the declared input
@@ -219,7 +243,7 @@ def _repo_docs(request: _Request) -> str:
     """Path plus an excerpt of each repo conventions document that exists.
 
     Resolves against the worktree root when there is one and against `repo_dir`
-    when there is not: `explore` is the first phase of `builtin/task.yaml` and
+    when there is not: `explore` is the first agent phase of `TASK` and
     the `worktree` phase runs two phases later, so at explore time there is no
     worktree to read from. Absence of both files is a stated fact, not a failure
     -- plenty of repositories have neither. Unreadability *is* a failure: a file
@@ -264,6 +288,41 @@ def _repo_doc(request: _Request, path: Path) -> str | None:
     )
 
 
+FEEDBACK_TITLE = "Feedback from review"
+"""First line of the `feedback` section's body (pygents-engine design G4, §5).
+
+Not `FEEDBACK_HEADING`: that heads `compose_brief`'s retry block for a failed
+attempt of the *same* phase. This titles a critic's reason, carried back to
+the phase a `Goto` loop returned to. The two must not be merged.
+"""
+
+
+def _feedback(request: _Request) -> str | None:
+    """The critic feedback addressed to this phase, one bullet per item.
+
+    The runtime's binding table has already kept only the items whose `for`
+    names this phase, so `for` is not rendered. A missing key, `None` or an
+    empty list is the normal case -- no loop has happened -- so this never goes through
+    `_required`/`_present`, and returns `None` to omit the section. An item
+    without `from` or `detail` is a codec bug and is refused by name rather
+    than rendered as a blank bullet.
+    """
+    items = request.context.get("feedback")
+    if not items:
+        return None
+    lines = [FEEDBACK_TITLE]
+    for item in items:
+        if not isinstance(item, Mapping) or "from" not in item or "detail" not in item:
+            raise EngineError(
+                f"is declared as an input, but a feedback item is not a mapping "
+                f"carrying 'from' and 'detail': {item!r}",
+                phase=request.phase.name,
+                parameter=request.name,
+            )
+        lines.append(f"- {item['from']}: {item['detail']}")
+    return "\n".join(lines)
+
+
 _TABLE: dict[str, Resolver] = {
     "card": _inline_json("card_details"),
     "parent_story": _inline_json("parent_story_details", allow_empty=True),
@@ -277,15 +336,26 @@ _TABLE: dict[str, Resolver] = {
     "plan_hash": _phase_field("docs_commit", "plan_hash"),
     "merge_tip": _verbatim("merge_tip"),
     "conflict_files": _inline_json("conflict_files"),
+    "feedback": _feedback,
 }
 """The fixed §7 resolution table, keyed by the name a document may declare.
 
-The last two rows are the resolver's (Integrate addendum §2 and I3,
-`builtin/integrate.yaml`): the story tip being merged, inlined as a ref, and
-the conflicting paths `steps.integrate.merge_tip` reported, inlined as JSON.
-Neither reads another phase's result, so neither appears in `INPUT_PRODUCERS`:
-the caller supplies both through `engine.run_subtask(extra_context=...)`.
+`merge_tip` and `conflict_files` are the resolver's (Integrate addendum §2 and
+I3, `workflow.integrate.INTEGRATE`): the story tip being merged, inlined as a ref,
+and the conflicting paths `steps.integrate.merge_tip` reported, inlined as
+JSON. Neither reads another phase's result, so neither appears in
+`INPUT_PRODUCERS`: the caller supplies both through
+`runtime.engine.run_subtask(extra_context=...)`.
+
+`feedback` is the last row (pygents-engine design G4, §5): the critic's reason
+for a `Goto` loop-back, supplied by the runtime's binding table. It reads the
+feedback queue, not another phase's result, so it is not in `INPUT_PRODUCERS`
+either.
 """
+
+
+INPUT_NAMES: frozenset[str] = frozenset(_TABLE)
+"""Every input name a phase may declare that a resolver provides (phases.validate)."""
 
 
 INPUT_PRODUCERS: dict[str, str] = {
@@ -297,19 +367,19 @@ INPUT_PRODUCERS: dict[str, str] = {
 
 Derived from `_TABLE`, never hand-written: `_phase_field` stamps the phase key
 on the resolver it builds, so this map cannot disagree with the lookup it
-describes. `cli.resume_start_phase` reads it, because an input resolved out of
-another phase's result is a dependency on that phase having run in *this*
-process -- the journal never replays the binding table.
+describes. The pygents walk never needs it -- a checkpoint's pool carries every
+earlier result -- but it stays the one place the mapping is written down.
 """
 
 
-def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:
+def render_prompt(phase: PromptPhase, context: Mapping[str, Any]) -> RenderedPrompt:
     """Resolve every name in `phase.inputs` and assemble the prompt text.
 
     Sections follow the order the document declares, because that order is the
     author's emphasis and a reordering would silently change what the model reads
     first. A name declared twice contributes one section: the second mention adds
-    no information and would only be billed twice.
+    no information and would only be billed twice. A resolver that returns `None`
+    contributes no section at all -- no heading, no entry in `sections`.
     """
     sections: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -325,13 +395,16 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
                 phase=phase.name,
                 parameter=name,
             )
-        sections.append((name, resolver(_Request(name, phase, context))))
+        body = resolver(_Request(name, phase, context))
+        if body is None:
+            continue
+        sections.append((name, body))
     return RenderedPrompt(
         phase=phase.name, text=_assemble(phase, sections), sections=tuple(sections)
     )
 
 
-def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
+def _assemble(phase: PromptPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
 

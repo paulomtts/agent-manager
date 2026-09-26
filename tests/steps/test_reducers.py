@@ -18,7 +18,9 @@ from agent_manager.steps.reducers import (
     implement_blocked_gate,
     is_plan_hash,
     plan_hash_gate,
+    plan_hash_gate_adapter,
     plan_hash_mismatch,
+    review_blockers_gate,
     review_gate,
     verification_gate,
     verification_passed_gate,
@@ -783,3 +785,98 @@ def test_implement_blocked_gate_blocks_anything_that_is_not_a_result_mapping(dea
     verdict = implement_blocked_gate(dead)
     assert verdict["blocked"] == "implement"
     assert "no implement result to judge" in verdict["detail"]
+
+
+def test_plan_hash_gate_adapter_compares_the_two_results():
+    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "aaaaaaaa"}) is None
+    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "bbbbbbbb"}) is not None
+    assert plan_hash_gate_adapter(None, None) is None
+    # digest() hashes `module.qualname`, so the adapter's home is part of the
+    # declared workflow's identity (Review Focus 5).
+    assert plan_hash_gate_adapter.__module__ == "agent_manager.steps.reducers"
+
+
+def test_the_plan_hash_adapter_compares_the_two_phases_plan_hash_fields():
+    gate = plan_hash_gate_adapter(
+        {"plan_hash": "a1b2c3d4", "report": "done"},
+        {"plan_hash": "ffffffff", "porcelain": ""},
+    )
+    assert "plan hash CHANGED mid-run" in gate["detail"]
+    assert "a1b2c3d4" in gate["detail"] and "ffffffff" in gate["detail"]
+    assert "blocked" not in gate
+
+
+def test_the_plan_hash_adapter_passes_when_the_two_hashes_match():
+    assert (
+        plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, {"plan_hash": "a1b2c3d4"})
+        is None
+    )
+
+
+@pytest.mark.parametrize("dead", [None, {}, "implement", 7, [{"plan_hash": "a1b2c3d4"}]])
+def test_the_plan_hash_adapter_passes_when_either_phase_result_is_missing(dead):
+    # A skipped or dead phase has no hash to compare; the reducer's own rule is
+    # "nothing trustworthy to say" -> None.
+    assert plan_hash_gate_adapter(dead, {"plan_hash": "a1b2c3d4"}) is None
+    assert plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, dead) is None
+
+
+def test_the_plan_hash_adapter_binds_with_no_arguments_at_all():
+    """Both parameters default to None so a run that skipped `implement` binds
+    and passes, instead of `bind_arguments` reporting a required parameter."""
+    assert plan_hash_gate_adapter() is None
+
+
+# ── review_blockers_gate ─────────────────────────────────────────────────────
+# task.js:842-855: only what the reviewer says is STILL standing gates done.
+
+
+def test_no_unresolved_blockers_passes():
+    assert review_blockers_gate({"unresolved_blockers": []}) is None
+
+
+def test_unresolved_blockers_block_review():
+    verdict = review_blockers_gate(
+        {"unresolved_blockers": ["tests assert the mock", "no error path"]}
+    )
+    assert verdict == {
+        "blocked": "review",
+        "detail": "review left 2 unresolved blocker(s): tests assert the mock; no error path",
+    }
+
+
+def test_a_dead_reviewer_blocks():
+    assert review_blockers_gate(None) == {
+        "blocked": "review",
+        "detail": "the review stage returned nothing",
+    }
+
+
+@pytest.mark.parametrize("dead", [["x"], "x", 7, True])
+def test_any_non_mapping_review_result_is_the_dead_reviewer_verdict(dead):
+    assert review_blockers_gate(dead) == {
+        "blocked": "review",
+        "detail": "the review stage returned nothing",
+    }
+
+
+@pytest.mark.parametrize("clean", [{}, {"unresolved_blockers": None}, {"findings": ["x"]}])
+def test_a_review_with_no_blockers_key_or_a_null_one_passes(clean):
+    # Findings the reviewer already fixed are not blockers: only
+    # `unresolved_blockers` gates.
+    assert review_blockers_gate(clean) is None
+
+
+def test_a_single_blocker_is_counted_and_named():
+    assert review_blockers_gate({"unresolved_blockers": ["x"]}) == {
+        "blocked": "review",
+        "detail": "review left 1 unresolved blocker(s): x",
+    }
+
+
+def test_non_string_blockers_are_rendered_not_raised_on():
+    verdict = review_blockers_gate({"unresolved_blockers": [1, {"a": 1}]})
+    assert verdict == {
+        "blocked": "review",
+        "detail": "review left 2 unresolved blocker(s): 1; {'a': 1}",
+    }

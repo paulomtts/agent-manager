@@ -13,6 +13,7 @@ The pure helpers ported from `gh.mjs` (`last_line`, `plain_text`) and from
 specification (design §14, Pure-functions tier).
 """
 
+import inspect
 import os
 import shlex
 import shutil
@@ -22,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager.runtime import walk
+from agent_manager.results import ExploreResult, Verification
 from agent_manager.steps import verify
 from agent_manager.steps.verify import (
     CommandResult,
@@ -352,3 +355,296 @@ def test_argv_sequences_and_a_path_worktree_are_accepted(tmp_path: Path):
     assert calls == [(["echo", "hi"], str(tmp_path))]
     assert result["verified"][0]["command"] == ("echo", "hi")
     assert result["passed"] is True
+
+
+# --- Explore's typecheck and lint (card cf8b3888, pygents design G9 item 4) ---
+#
+# The engine binds `explore` by parameter name from the running context, and
+# hands `run_suite` the Explore phase's dumped `ExploreResult`. Recorder tests
+# observe ordering; the failure path is proved against real processes.
+
+
+def test_run_suite_takes_explore_by_name_before_the_keyword_only_runner():
+    # `walk.bind_arguments` binds strictly by parameter name, so the name
+    # `explore` is what wires the Explore phase's result in -- no YAML edit.
+    parameters = inspect.signature(verify.run_suite).parameters
+    assert list(parameters) == ["commands", "worktree", "explore", "runner"]
+    assert parameters["explore"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert parameters["explore"].default is None
+    assert parameters["runner"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_typecheck_and_lint_run_after_the_suite_in_order(tmp_path: Path):
+    calls, runner = _recorder()
+    explore = {
+        "verification": {
+            "fullSuite": ["uv run pytest"],
+            "typecheck": "uv run mypy",
+            "lint": ["uv run ruff check"],
+        }
+    }
+    result = verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest"],
+        ["uv", "run", "mypy"],
+        ["uv", "run", "ruff", "check"],
+    ]
+    assert all(cwd == str(tmp_path) for _, cwd in calls)
+    assert result["passed"] is True
+    assert result["detail"] == ""
+    assert result["verified"] == [
+        {"command": "uv run pytest", "ok": True, "tail": "fine"},
+        {"command": "uv run mypy", "ok": True, "tail": "fine"},
+        {"command": "uv run ruff check", "ok": True, "tail": "fine"},
+    ]
+
+
+def test_every_lint_command_runs_in_list_order(tmp_path: Path):
+    calls, runner = _recorder()
+    explore = {
+        "verification": {
+            "typecheck": "uv run mypy",
+            "lint": ["uv run ruff check", "uv run ruff format --check"],
+        }
+    }
+    verify.run_suite(["uv run pytest"], str(tmp_path), explore=explore, runner=runner)
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest"],
+        ["uv", "run", "mypy"],
+        ["uv", "run", "ruff", "check"],
+        ["uv", "run", "ruff", "format", "--check"],
+    ]
+
+
+def test_the_snake_case_dump_the_engine_binds_is_read_and_full_suite_is_ignored(
+    tmp_path: Path,
+):
+    # `dispatch.py` dumps `ExploreResult` without `by_alias=True`, so the real
+    # bound value says `full_suite`. `commands` stays the suite's only source.
+    calls, runner = _recorder()
+    explore = {
+        "verification": {
+            "full_suite": ["uv run pytest", "uv run pytest tests/e2e"],
+            "typecheck": "uv run mypy",
+            "lint": ["uv run ruff check"],
+        }
+    }
+    verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest"],
+        ["uv", "run", "mypy"],
+        ["uv", "run", "ruff", "check"],
+    ]
+
+
+def test_no_explore_means_only_the_suite(tmp_path: Path):
+    calls, runner = _recorder()
+    result = verify.run_suite(["uv run pytest"], str(tmp_path), runner=runner)
+    assert [argv for argv, _ in calls] == [["uv", "run", "pytest"]]
+    assert result["passed"] is True
+
+
+def test_an_empty_typecheck_and_empty_lint_run_only_the_suite(tmp_path: Path):
+    calls, runner = _recorder()
+    explore = {"verification": {"typecheck": "", "lint": []}}
+    result = verify.run_suite(["x"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [["x"]]
+    assert result["passed"] is True
+    # The empty-suite shape is unchanged when Explore named nothing either.
+    assert verify.run_suite([], str(tmp_path), explore, runner=runner) == {
+        "passed": True,
+        "verified": [],
+        "detail": "",
+    }
+
+
+def test_a_blank_typecheck_and_blank_lint_entries_are_skipped(tmp_path: Path):
+    calls, runner = _recorder()
+    explore = {"verification": {"typecheck": "   ", "lint": ["", "  ", "uv run ruff check"]}}
+    result = verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest"],
+        ["uv", "run", "ruff", "check"],
+    ]
+    assert [entry["command"] for entry in result["verified"]] == [
+        "uv run pytest",
+        "uv run ruff check",
+    ]
+
+
+@pytest.mark.parametrize(
+    "explore",
+    [
+        None,
+        "nonsense",
+        7,
+        [],
+        {},
+        {"other": {"typecheck": "uv run mypy"}},
+        {"verification": None},
+        {"verification": "uv run mypy"},
+        {"verification": ["uv run mypy"]},
+        {"verification": {}},
+        {"verification": {"typecheck": None, "lint": None}},
+    ],
+)
+def test_a_malformed_or_absent_verification_runs_only_the_suite(
+    tmp_path: Path, explore: object
+):
+    calls, runner = _recorder()
+    result = verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [["uv", "run", "pytest"]]
+    assert result["passed"] is True
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [
+        {"typecheck": "", "lint": [7]},
+        {"typecheck": "", "lint": ["uv run ruff check", ["ruff", 7]]},
+        {"typecheck": 7, "lint": []},
+        {"typecheck": "", "lint": 7},
+        # A bare string is not a list of commands: never split it into letters.
+        {"typecheck": "", "lint": "uv run ruff check"},
+        {"typecheck": "uv run 'mypy", "lint": []},
+    ],
+)
+def test_a_wrong_type_explore_entry_raises_before_anything_runs(
+    tmp_path: Path, verification: dict[str, object]
+):
+    calls, runner = _recorder()
+    with pytest.raises(ValueError):
+        verify.run_suite(
+            ["uv run pytest"],
+            str(tmp_path),
+            {"verification": verification},
+            runner=runner,
+        )
+    assert calls == []
+
+
+def test_a_failing_typecheck_fails_the_suite_and_stops_lint(tmp_path: Path):
+    marker = tmp_path / "lint-ran.txt"
+    suite = _py("print('5 passed')")
+    typecheck = _py(
+        "import sys; sys.stderr.write('error: 2 type errors\\n'); sys.exit(1)"
+    )
+    lint = _py(f"open({str(marker)!r}, 'w').write('ran')")
+    explore = {"verification": {"typecheck": typecheck, "lint": [lint]}}
+
+    result = verify.run_suite([suite], str(tmp_path), explore)
+
+    assert result["passed"] is False
+    assert result["verified"] == [
+        {"command": suite, "ok": True, "tail": "5 passed"},
+        {"command": typecheck, "ok": False, "tail": "error: 2 type errors"},
+    ]
+    assert result["detail"] == f"verification failed: {typecheck} — error: 2 type errors"
+    assert not marker.exists()
+
+
+def test_a_silent_failing_typecheck_still_carries_a_tail_and_a_detail(tmp_path: Path):
+    typecheck = _py("raise SystemExit(3)")
+    explore = {"verification": {"typecheck": typecheck, "lint": []}}
+    result = verify.run_suite([_py("print('ok')")], str(tmp_path), explore)
+    assert result["passed"] is False
+    assert result["verified"][-1] == {
+        "command": typecheck,
+        "ok": False,
+        "tail": f"{typecheck} exited with code 3",
+    }
+    assert result["detail"].startswith("verification failed:")
+    assert "exited with code 3" in result["detail"]
+
+
+def test_a_failing_lint_after_a_green_typecheck_names_the_lint_command(tmp_path: Path):
+    typecheck = _py("print('0 errors')")
+    first_lint = _py("print('E501 line too long'); raise SystemExit(1)")
+    marker = tmp_path / "second-lint-ran.txt"
+    second_lint = _py(f"open({str(marker)!r}, 'w').write('ran')")
+    explore = {"verification": {"typecheck": typecheck, "lint": [first_lint, second_lint]}}
+
+    result = verify.run_suite([_py("print('ok')")], str(tmp_path), explore)
+
+    assert result["passed"] is False
+    assert [entry["ok"] for entry in result["verified"]] == [True, True, False]
+    assert result["verified"][-1]["command"] == first_lint
+    assert result["verified"][-1]["tail"] == "E501 line too long"
+    assert result["detail"] == f"verification failed: {first_lint} — E501 line too long"
+    assert not marker.exists()
+
+
+def test_a_red_suite_command_stops_before_typecheck_runs(tmp_path: Path):
+    marker = tmp_path / "typecheck-ran.txt"
+    red = _py("raise SystemExit(1)")
+    typecheck = _py(f"open({str(marker)!r}, 'w').write('ran')")
+    explore = {"verification": {"typecheck": typecheck, "lint": []}}
+
+    result = verify.run_suite([red], str(tmp_path), explore)
+
+    assert result["passed"] is False
+    assert [entry["command"] for entry in result["verified"]] == [red]
+    assert not marker.exists()
+
+
+def test_an_unlaunchable_typecheck_raises_verify_error(tmp_path: Path):
+    # Like a missing `--verify` binary: a misconfigured card, not a red suite.
+    ran: list[list[str]] = []
+
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        ran.append(argv)
+        if argv[0] == "definitely-not-mypy":
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        return CommandResult(exit_code=0, stdout="fine\n", stderr="")
+
+    explore = {"verification": {"typecheck": "definitely-not-mypy .", "lint": []}}
+    with pytest.raises(VerifyError) as excinfo:
+        verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert "definitely-not-mypy" in str(excinfo.value)
+    assert ran == [["uv", "run", "pytest"], ["definitely-not-mypy", "."]]
+
+
+def test_the_engine_binds_the_real_explore_dump_into_the_run(tmp_path: Path):
+    # The wiring itself, not just the signature: the engine's own binder, fed a
+    # context holding a validated `ExploreResult` dumped the way `dispatch.py`
+    # dumps it, must hand Explore's typecheck and lint to `run_suite`.
+    marker = tmp_path / "lint-ran.txt"
+    suite = _py("print('5 passed')")
+    typecheck = _py("print('0 errors')")
+    lint = _py(f"open({str(marker)!r}, 'w').write('ran'); print('clean')")
+    explore = ExploreResult(
+        refused=False,
+        reason=None,
+        summary="verify runs Explore's typecheck and lint",
+        verification=Verification(
+            full_suite=[_py("raise SystemExit(9)")], typecheck=typecheck, lint=[lint]
+        ),
+    ).model_dump(mode="json")
+    context = {"commands": [suite], "worktree": str(tmp_path), "explore": explore}
+
+    kwargs = walk.bind_arguments(
+        verify.run_suite, context, phase="verify", function="verify.run_suite"
+    )
+    result = verify.run_suite(**kwargs)
+
+    assert result["passed"] is True
+    assert [entry["command"] for entry in result["verified"]] == [suite, typecheck, lint]
+    assert marker.read_text() == "ran"
+
+
+def test_the_engine_binds_no_explore_when_the_workflow_has_no_explore_phase(
+    tmp_path: Path,
+):
+    # The integrate workflow has no Explore phase: binding must still succeed
+    # and run only the suite.
+    suite = _py("print('5 passed')")
+    context = {"commands": [suite], "worktree": str(tmp_path)}
+    kwargs = walk.bind_arguments(
+        verify.run_suite, context, phase="verify", function="verify.run_suite"
+    )
+    result = verify.run_suite(**kwargs)
+    assert result == {
+        "passed": True,
+        "verified": [{"command": suite, "ok": True, "tail": "5 passed"}],
+        "detail": "",
+    }

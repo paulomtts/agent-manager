@@ -13,7 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,7 @@ AGENT_PHASES = (
     "implement",
     "review",
 )
-"""`builtin/task.yaml`'s seven agent phases, in document order."""
+"""`TASK`'s seven agent phases, in document order."""
 
 MILESTONE_PREFIX = "m3"
 """The `--branch-prefix` every milestone-run test uses."""
@@ -459,7 +459,6 @@ def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
             "--branch-prefix",
             MILESTONE_PREFIX,
         ]
-        # `None` keeps existing callers' argv byte-identical.
         commands = VERIFY_COMMANDS if verify is None else tuple(verify)
         for command in commands:
             argv += ["--verify", command]
@@ -497,3 +496,24 @@ def review_fail_marker(milestone_board) -> Path:
     worktree's tree and never in `git status`. The test writes it and removes it.
     """
     return milestone_board["root"] / ".git" / FAKE_REVIEW_FAIL_MARKER
+
+
+@pytest.fixture
+def checkpoint_rows() -> Callable[[Path, str], int]:
+    """How many `checkpoints` rows one run wrote.
+
+    A run with none never reached the pygents walk's BEFORE_TURN hook, and
+    every assertion about that run would have passed on something else.
+    """
+
+    def count(root: Path, run_id: str) -> int:
+        conn = store.open_db(cli.resolve_repo_dir(root))
+        try:
+            (rows,) = conn.execute(
+                "SELECT COUNT(*) FROM checkpoints WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(rows)
+
+    return count

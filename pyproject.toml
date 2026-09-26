@@ -7,12 +7,13 @@ requires-python = ">=3.12"
 dependencies = [
     "typer>=0.27.2",
     "pydantic>=2.9",
-    "pyyaml>=6.0.2",
+    "pygents>=0.6.7",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [project.scripts]
@@ -27,11 +28,12 @@ packages = ["src/agent_manager"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 markers = [
     "e2e: slow, opt-in, costs real money -- drives the toy card against the real `claude` on PATH. Excluded by the `-m \"not e2e\"` in addopts; run it with `uv run pytest -m e2e` (a bare path invocation is still deselected, so pass `-m e2e` alongside any path).",
 ]
-# importlib mode, not the default prepend mode: tests/workflow/test_loader.py and
-# tests/roles/test_loader.py share a basename, and prepend mode names test modules
+# importlib mode, not the default prepend mode: tests/steps/test_integrate.py and
+# tests/e2e/test_integrate.py share a basename, and prepend mode names test modules
 # after their basename alone, so collecting both aborts with "import file mismatch".
 # `-m "not e2e"` keeps the paid real-harness test out of the default suite; a `-m`
 # passed on the command line overrides this one, which is how `-m e2e` selects it.

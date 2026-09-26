@@ -10,7 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from agent_manager import results
 from agent_manager.steps import reducers
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 
 
 class Canned(BaseModel):

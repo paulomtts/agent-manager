@@ -1,9 +1,9 @@
 """Run one agent phase to a terminal outcome (design §6 lines 261-278).
 
-`engine.run_subtask` resolves an agent phase's `inputs` and renders its prompt,
-then hands `(phase, context, rendered)` to an injected `AgentPhaseRunner`
-(`engine.py` lines 211-222). This module is that runner: the attempt directory,
-the dispatch, the result file, the gates and the retry loop.
+The pygents walk's `agent_phase` tool (`runtime/compile.py`) resolves an agent
+phase's `inputs` and renders its prompt, then hands `(phase, context, rendered)`
+to an injected `AgentPhaseRunner`. This module is that runner: the attempt
+directory, the dispatch, the result file, the gates and the retry loop.
 
 Three rules shape everything here, and none of them is negotiable:
 
@@ -19,6 +19,7 @@ Three rules shape everything here, and none of them is negotiable:
   clean-tree check or be swept into a commit.
 """
 
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -28,14 +29,17 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from agent_manager import engine, models, paths, prompt, results
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager import models, paths, prompt, results
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS, bind_arguments
 from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
+from agent_manager.runtime import bridge
 from agent_manager.store import Store
-from agent_manager.workflow.loader import AgentPhase, Workflow
+from agent_manager.workflow import phases as phase_model
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -260,14 +264,14 @@ def gate_values(
 ) -> dict[str, Any]:
     """The binding table this phase's gates see.
 
-    The same table `engine._gate_values` builds for a deterministic phase, and
+    The same table `walk._gate_values` builds for a deterministic phase, and
     for the same two reasons: the result appears under `result` (the parameter
     name the ported gates in `steps/reducers.py` declare) and under the phase's
     own name (how §6 says later phases read it), except where that name is one
     of the keys the engine owns.
     """
     values = {**context, "result": result}
-    if phase_name not in engine.RESERVED_CONTEXT_KEYS:
+    if phase_name not in RESERVED_CONTEXT_KEYS:
         values[phase_name] = result
     return values
 
@@ -277,8 +281,7 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
 
 
 def evaluate_gates(
-    phase: AgentPhase,
-    workflow: Workflow,
+    phase: phase_model.AgentPhase,
     values: Mapping[str, Any],
     warnings: list[str],
 ) -> Verdict | None:
@@ -294,12 +297,15 @@ def evaluate_gates(
     returning something that is not a mapping -- come back `fatal`, so no
     `retry.on` list can re-dispatch into a situation the harness cannot change.
     A binding failure is different again and propagates as `EngineError`: it
-    means the document names a gate whose parameters nothing supplies, which is
-    a bug in the document, not in the attempt.
+    means the workflow names a gate whose parameters nothing supplies, which is
+    a bug in the workflow, not in the attempt.
+
+    Every gate is the callable itself, used as-is and named by its `__name__`
+    (its `repr` when it has none) in every message.
     """
-    for name in phase.gates:
-        gate = workflow.function(name)
-        kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
+    for entry in phase.gates:
+        name, gate = getattr(entry, "__name__", repr(entry)), entry
+        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
         try:
             verdict = gate(**kwargs)
         except Exception as error:
@@ -341,7 +347,7 @@ def evaluate_gates(
 
 
 def _render_error(error: BaseException) -> str:
-    """`engine._render_error`'s format, so both phase kinds fail the same way."""
+    """`walk._render_error`'s format, so both phase kinds fail the same way."""
     return f"{type(error).__name__}: {error}"
 
 
@@ -349,12 +355,30 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _spawn_kwargs(launcher: LauncherFn) -> dict[str, Any]:
+    """`on_spawn` for a launcher that declares it, bound to the bridge call in flight.
+
+    Inside `bridge.call_agent` the hook records every process this attempt
+    starts, so a cancelled turn can kill it (pygents-engine design G2);
+    anywhere else it is `None`, which `run_direct` treats as absent. A launcher
+    that does not declare the keyword -- every fake launcher in the tests --
+    is called exactly as before.
+    """
+    try:
+        parameters = inspect.signature(launcher).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "on_spawn" not in parameters:
+        return {}
+    return {"on_spawn": bridge.current_spawn_hook()}
+
+
 Clock = Callable[[], datetime]
 
 
 @dataclass
 class AgentRunner:
-    """One agent phase, run to a terminal outcome: `engine.AgentPhaseRunner`.
+    """One agent phase, run to a terminal outcome: `walk.AgentPhaseRunner`.
 
     A callable object rather than a function because the seam's signature is
     `(phase, context, rendered)` and a dispatch needs six more things -- the
@@ -369,7 +393,6 @@ class AgentRunner:
     this list when the walk returns.
     """
 
-    workflow: Workflow
     store: Store
     launcher: LauncherFn
     run_id: str
@@ -387,7 +410,7 @@ class AgentRunner:
 
     def __call__(
         self,
-        phase: AgentPhase,
+        phase: phase_model.AgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
     ) -> Any:
@@ -399,13 +422,17 @@ class AgentRunner:
         """
         role = load_role(phase.role, root=self.role_root)
         target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
-        model = (
-            None
-            if phase.result is None
-            else results.resolve_result_model(
+        # A declared phase carries its result model as the class itself, which
+        # is used as-is; a result given by name is looked up in
+        # `result_models`, and a name the table lacks is refused here.
+        if phase.result is None:
+            model = None
+        elif isinstance(phase.result, type):
+            model = phase.result
+        else:
+            model = results.resolve_result_model(
                 phase.result, self.result_models, phase=phase.name
             )
-        )
         cwd = self._worktree(context, phase.name)
 
         started_at = self.clock()
@@ -430,7 +457,7 @@ class AgentRunner:
                 # composed brief would duplicate the result contract.
                 feedback.append(verdict.detail or verdict.status)
         except Exception as error:
-            # Symmetric with `engine._run_deterministic`, which records its own
+            # Symmetric with `walk.run_one_step`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for
             # "the process gave up here", so a phase left `started` is what a
             # resume reads as work still in flight. The exception itself still
@@ -446,7 +473,7 @@ class AgentRunner:
 
     def _attempt(
         self,
-        phase: AgentPhase,
+        phase: phase_model.AgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
         feedback: Sequence[str],
@@ -499,7 +526,11 @@ class AgentRunner:
         )
         argv = target.adapter.build_command(dispatch_record)
         outcome = self.launcher(
-            argv, cwd=cwd, timeout=self.timeout, stdout_path=stdout_path
+            argv,
+            cwd=cwd,
+            timeout=self.timeout,
+            stdout_path=stdout_path,
+            **_spawn_kwargs(self.launcher),
         )
         # The same `None if model is None` the brief uses: the two halves of
         # "this phase has no result" must agree. The dispatch and the journalled
@@ -511,7 +542,6 @@ class AgentRunner:
         if verdict.status == "ok":
             failure = evaluate_gates(
                 phase,
-                self.workflow,
                 gate_values(context, phase.name, verdict.result),
                 self.warnings,
             )
@@ -549,7 +579,7 @@ class AgentRunner:
 
     def _record_phase(
         self,
-        phase: AgentPhase,
+        phase: phase_model.AgentPhase,
         status: models.Status,
         started_at: datetime,
         ended_at: datetime | None,
@@ -568,7 +598,7 @@ class AgentRunner:
             ),
         )
 
-    def _record_attempt(self, phase: AgentPhase, attempt: models.Attempt) -> None:
+    def _record_attempt(self, phase: phase_model.AgentPhase, attempt: models.Attempt) -> None:
         self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
 
 

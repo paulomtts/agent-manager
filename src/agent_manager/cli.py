@@ -2,7 +2,7 @@
 
 This module composes and renders; it decides nothing a collaborator already
 decides. Branch names come from `dag`, board reads from `board`, artifact paths
-from `paths` via `store`, the phase walk from `engine`, and the dispatch from
+from `paths` via `store`, the phase walk from `runtime.engine`, and the dispatch from
 `dispatch.AgentRunner`. §4 calls this file "typer app" and that is the whole
 constraint: no step logic, no gate logic, no branch strings built by hand, and
 no run state written anywhere but through `Store`.
@@ -31,16 +31,16 @@ from agent_manager import (
     census,
     dag,
     dispatch,
-    engine,
     models,
     prompt,
     store as store_module,
 )
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
-from agent_manager.workflow.loader import Workflow, load_builtin
-from agent_manager.workflow.registry import WorkflowLoadError
+from agent_manager.workflow import task as task_workflow
 
 EXIT_ESCALATED = 1
 """The subtask escalated. §12: a full stop a human has to read."""
@@ -121,6 +121,17 @@ class NotResumableError(CliError):
     fine, so what an operator does next -- start a fresh `run --card`, wait for
     `retry`, or drive the subtasks one at a time -- depends entirely on the
     status this message names, and a script can branch on the `type` field.
+    """
+
+
+class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
+    """`resume` found a checkpoint saved under another `TASK`.
+
+    A `CliError`, so it rides `HANDLED` to an `ok: false` envelope at exit 3,
+    and a `runtime_engine.CheckpointMismatch`, so it is the engine's own
+    refusal by type (card 02890d5d). The CLI raises it itself, before any
+    write, rather than letting `run_subtask` raise it after the orphan
+    attempts and the `started` rows were already recorded.
     """
 
 
@@ -397,24 +408,26 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
     is resumable is a question about recorded state, and answering it before any
     store is opened is what keeps a refusal from minting a run directory.
 
-    Exactly one `started` subtask is the resumable shape. Zero means the run
-    finished, escalated, stopped or never started, and the statuses are listed
-    because the fix differs for each. A `stopped` subtask (addendum P4) stopped
-    cleanly and did not fail, so the refusal names its remedy: relaunch the same
-    `run --milestone` command. It never points at `retry`, which is for
-    escalations. More than one is a milestone-shaped run: this
-    command drives one subtask the way `run --card` does, and choosing between
-    them would leave the rest recorded `started` with nothing driving them.
+    Exactly one `started` or `stopped` subtask is the resumable shape. A
+    `stopped` subtask (addendum P4) was parked between phases, and its parked
+    checkpoint is what `resume` continues from (card 02890d5d). Zero means the
+    run finished, escalated or never started, and the statuses are listed
+    because the fix differs for each; an escalation is `retry`'s, never this
+    command's. More than one is a milestone-shaped run: this command drives one
+    subtask the way `run --card` does, and choosing between them would leave the
+    rest recorded in flight with nothing driving them.
     """
-    started = [
+    resumable = ("started", "stopped")
+    wanted = " or ".join(repr(status) for status in resumable)
+    in_flight = [
         (story, subtask)
         for story in run.stories
         for subtask in story.subtasks
-        if subtask.status == "started"
+        if subtask.status in resumable
     ]
-    if len(started) == 1:
-        return started[0]
-    if not started:
+    if len(in_flight) == 1:
+        return in_flight[0]
+    if not in_flight:
         found = (
             ", ".join(
                 f"{subtask.card_id}={subtask.status}"
@@ -423,141 +436,17 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
             )
             or "no subtask at all"
         )
-        stopped = [
-            subtask.card_id
-            for story in run.stories
-            for subtask in story.subtasks
-            if subtask.status == "stopped"
-        ]
-        remedy = (
-            f"; {', '.join(stopped)} stopped cleanly and did not fail, so relaunch the"
-            " same `agent-manager run --milestone` command that started this run to"
-            " continue from where it stopped"
-            if stopped
-            else ""
-        )
         raise NotResumableError(
-            f"run {run.id!r} has no subtask recorded 'started', so there is no work"
+            f"run {run.id!r} has no subtask recorded {wanted}, so there is no work"
             f" in flight to pick up (found: {found});"
-            f" `agent-manager status {run.id}` shows the run as it stands{remedy}"
+            f" `agent-manager status {run.id}` shows the run as it stands"
         )
-    cards = ", ".join(subtask.card_id for _story, subtask in started)
+    cards = ", ".join(subtask.card_id for _story, subtask in in_flight)
     raise NotResumableError(
-        f"run {run.id!r} has {len(started)} subtasks recorded 'started' ({cards}),"
+        f"run {run.id!r} has {len(in_flight)} subtasks recorded {wanted} ({cards}),"
         " and `resume` drives one subtask the way `run --card` does;"
         f" `agent-manager status {run.id}` shows all of them"
     )
-
-
-def _skipped_origin(
-    workflow: Workflow, recorded: Mapping[str, models.PhaseRun], index: int
-) -> str | None:
-    """The earlier `skip_to` phase whose jump explains an unrecorded phase.
-
-    A skipped phase leaves no row at all (engine.py:431-433 moves the index and
-    only appends to the in-memory `summary.skipped`), so "not recorded" reads
-    the same as "never reached". The jump is the explanation only when the whole
-    stretch between the jumping phase and its target is unrecorded: one recorded
-    phase in there proves the walk went through rather than over it.
-
-    The `skip_to` phase is returned rather than its target so the document's own
-    `when` decides the jump again -- `plan_check.find_validated_plan` is a
-    read-only directory listing, and re-authoring a spec over a plan Validate
-    already signed is the outcome this exists to prevent.
-    """
-    for candidate_index, candidate in enumerate(workflow.phases[:index]):
-        if candidate.skip_to is None:
-            continue
-        target_index = workflow.phase_names.index(candidate.skip_to)
-        if not candidate_index < index < target_index:
-            continue
-        stretch = workflow.phase_names[candidate_index + 1 : target_index]
-        if all(name not in recorded for name in stretch):
-            return candidate.name
-    return None
-
-
-def interrupted_phase(subtask: models.SubtaskRun, workflow: Workflow) -> str | None:
-    """The phase §9's resume re-runs from the top, or `None` if there is none.
-
-    Pure over the recorded tree plus the document, so the choice is testable
-    without a store. Two readings of a killed process, in order:
-
-    a phase recorded `started` is the crash signature §9 names -- the manager
-    died while that phase was in flight -- and the first such phase wins;
-    otherwise the process died between phases and the first phase not recorded
-    `done` is the one that never ran -- except inside a stretch a `skip_to`
-    jumped over, which is unrecorded for a reason that is not a crash. Such a
-    stretch is handed back to the jumping phase only while its target is still
-    unfinished; once the target is `done` the walk demonstrably ran past the
-    stretch, and the scan carries on to the phase that really is missing.
-
-    `None` means every phase of the document is `done`: only the final status
-    write was lost, and `resume_run` refuses rather than re-running `mark_done`.
-    """
-    recorded = {phase.name: phase for phase in subtask.phases}
-    for name in workflow.phase_names:
-        phase = recorded.get(name)
-        if phase is not None and phase.status == "started":
-            return name
-    for index, phase in enumerate(workflow.phases):
-        record = recorded.get(phase.name)
-        if record is not None and record.status == "done":
-            continue
-        origin = _skipped_origin(workflow, recorded, index)
-        if origin is None:
-            return phase.name
-        target = recorded.get(workflow.phase(origin).skip_to)
-        if target is None or target.status != "done":
-            return origin
-        # The jump landed and its target ran to `done`, so the walk went on past
-        # this stretch: the phases inside it are unrecorded because they were
-        # skipped, not because the crash reached them. Scan on -- restarting at
-        # `origin` here would re-dispatch every phase from the target forward,
-        # `implement` included.
-    return None
-
-
-def resume_start_phase(workflow: Workflow, phase_name: str) -> str:
-    """`phase_name`, backed off over the earlier phases whose results it binds.
-
-    A phase's declared `inputs` are resolved out of the binding table
-    `engine.run_subtask` builds in memory (`_bind_result`, engine.py:439); the
-    journal never replays it. So an input naming an earlier phase is a hard
-    dependency on that phase having run *in this process*, and starting past it
-    would fail in `prompt.render_prompt` before a single token was billed.
-
-    Only names that are phases of this document count. `card`, `branch`,
-    `spec_path` and the rest come from `subtask_context` / `_document_paths` /
-    `gate_context` and are supplied on every walk, so `RESERVED_CONTEXT_KEYS` is
-    excluded by name -- `_bind_result` skips writing those back anyway, which
-    means a same-named phase's result is never what a later phase reads.
-
-    An input whose name is not itself a phase can still name one: `plan_hash` is
-    resolved out of `docs_commit`'s result. `prompt.INPUT_PRODUCERS`, derived
-    from the resolution table, is the one place that mapping lives.
-
-    Transitive by construction, and terminating: each hop moves strictly earlier
-    in `phase_names`. In `builtin/task.yaml` the edges are `spec` -> `explore`
-    and `implement` -> `docs_commit`.
-    """
-    order = {name: index for index, name in enumerate(workflow.phase_names)}
-    current = phase_name
-    while True:
-        phase = workflow.phase(current)
-        producers = [
-            prompt.INPUT_PRODUCERS.get(name, name)
-            for name in getattr(phase, "inputs", ())
-            if name not in engine.RESERVED_CONTEXT_KEYS
-        ]
-        producers = [
-            name
-            for name in producers
-            if order.get(name, order[current]) < order[current]
-        ]
-        if not producers:
-            return current
-        current = min(producers, key=lambda name: order[name])
 
 
 def orphan_attempts(
@@ -579,6 +468,68 @@ def orphan_attempts(
     ]
 
 
+def checkpoint_resume_phase(
+    checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
+) -> str:
+    """The phase `resume` continues `card_id` at, or a refusal.
+
+    Pure over the row `Store.latest_checkpoint` returned, so every refusal is
+    testable without a store, and `resume_run` calls it before its first
+    write. In order: no row (a run that died before its first turn, or one
+    that predates checkpoints); a newest row `done` (only the final status
+    write was lost); a
+    digest other than `TASK.digest()`; a row holding no turn, which is what a
+    phase escalation leaves (`runtime_engine.pending_phase`).
+    """
+    if checkpoint is None:
+        raise NotResumableError(
+            f"card {card_id} in run {run_id!r} has no checkpoint to resume from:"
+            " the run died before its first turn, or it predates checkpoints;"
+            " start a fresh run with `agent-manager run --card`"
+        )
+    if checkpoint.reason == "done":
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is 'done',"
+            " so there is no turn to continue -- only the final status write was"
+            " lost; start a fresh run with `agent-manager run --card` if the card"
+            " still needs work"
+        )
+    digest = task_workflow.TASK.digest()
+    if checkpoint.digest != digest:
+        raise CheckpointMismatchError(
+            f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
+            f" {card_id} in run {run_id!r} was saved under digest {checkpoint.digest},"
+            f" but workflow {task_workflow.TASK.name!r} now has digest {digest};"
+            " start a fresh run with `agent-manager run --card`"
+        )
+    phase = runtime_engine.pending_phase(checkpoint)
+    if phase is None:
+        raise NotResumableError(
+            f"the newest checkpoint of card {card_id} in run {run_id!r} is"
+            f" {checkpoint.reason!r} with no turn left to run: a phase escalated and"
+            " ended the walk; start a fresh run with `agent-manager run --card`"
+        )
+    return phase
+
+
+def continuable_checkpoint(
+    store: Store, card_id: str
+) -> store_module.Checkpoint | None:
+    """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
+
+    `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row
+    saved under another digest, or one holding no turn (a phase escalation,
+    see `runtime_engine.pending_phase`), is `None` too: a relaunch never
+    refuses, it starts the card from its first phase (card 02890d5d).
+    """
+    found = store.latest_open_checkpoint(card_id, task_workflow.TASK.name)
+    if found is None or found.digest != task_workflow.TASK.digest():
+        return None
+    if runtime_engine.pending_phase(found) is None:
+        return None
+    return found
+
+
 app = typer.Typer(
     add_completion=False,
     help="Drive brd cards through the agent-manager workflow engine.",
@@ -598,12 +549,11 @@ def main() -> None:
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
-
 class RunnerFactory(Protocol):
-    """How the command gets its `engine.AgentPhaseRunner`.
+    """How the command gets its `AgentPhaseRunner`.
 
     A factory rather than a runner, because a real `dispatch.AgentRunner` needs
-    the store, the workflow and three ids that do not exist until the run is
+    the store and three ids that do not exist until the run is
     already half set up -- and because a factory is the seam the tests replace
     to launch no harness at all (§14: the launcher is injected).
     """
@@ -611,22 +561,20 @@ class RunnerFactory(Protocol):
     def __call__(
         self,
         *,
-        workflow: Workflow,
         store: Store,
         run_id: str,
         story_id: str,
         card_id: str,
-    ) -> engine.AgentPhaseRunner: ...
+    ) -> AgentPhaseRunner: ...
 
 
 def default_runner_factory(
     *,
-    workflow: Workflow,
     store: Store,
     run_id: str,
     story_id: str,
     card_id: str,
-) -> engine.AgentPhaseRunner:
+) -> AgentPhaseRunner:
     """The production runner: real adapters, real roles, the direct launcher.
 
     `adapters` and `result_models` keep `AgentRunner`'s own defaults and
@@ -635,7 +583,6 @@ def default_runner_factory(
     `--harness`'s job, and `--harness` is not this card's.
     """
     return dispatch.AgentRunner(
-        workflow=workflow,
         store=store,
         launcher=run_direct,
         run_id=run_id,
@@ -645,7 +592,7 @@ def default_runner_factory(
 
 
 def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[str, Any]:
-    """The gate parameters `builtin/task.yaml` binds and `subtask_context` lacks.
+    """The gate parameters `TASK`'s gates bind and `subtask_context` lacks.
 
     `explore` gates on `verification_gate(suite_cmds, allow_no_verification,
     caller_provided)` and `exploration_output_gate(explore,
@@ -672,7 +619,7 @@ class SubtaskDrive:
     list. Internal state, so a dataclass rather than a pydantic model.
     """
 
-    summary: engine.SubtaskSummary
+    summary: SubtaskSummary
     warnings: list[str]
 
 
@@ -688,39 +635,43 @@ def drive_subtask(
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
     should_stop: Callable[[], bool] | None = None,
+    resume_from: store_module.Checkpoint | None = None,
 ) -> SubtaskDrive:
-    """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
+    """Walk one subtask through `workflow.task.TASK` under a store the caller owns.
 
     Addendum O4's shared driver. `run_card` calls it once, and a milestone runner
     calls it once per subtask against one store and one run id. The caller owns
     everything around the walk: the board reads, the run id, opening and
     closing the store, and the run/story/subtask rows. This function catches
     nothing. An escalation is `summary.status == "escalated"`, not an exception.
-    `should_stop` goes straight to `engine.run_subtask`; a stop is
+    `should_stop` goes straight to the engine; a stop is
     `summary.status == "stopped"`.
+
+    The walk is `runtime.engine.run_subtask` over `TASK`. `resume_from` (card
+    02890d5d) continues it from a saved checkpoint; it joins the walk's
+    keywords only when given, so a fresh walk is called exactly as before.
     """
-    workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
-        workflow=workflow,
         store=store,
         run_id=run_id,
         story_id=parent.id,
         card_id=card.id,
     )
-    summary = engine.run_subtask(
-        workflow,
-        store,
-        story_id=parent.id,
-        subtask=subtask,
-        repo_dir=repo_dir,
-        commands=commands,
-        card=card,
-        parent_story=parent,
-        extra_context=gate_context(commands, allow_no_verification),
-        agent_runner=runner,
-        should_stop=should_stop,
-    )
+    walk: dict[str, Any] = {
+        "story_id": parent.id,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "card": card,
+        "parent_story": parent,
+        "extra_context": gate_context(commands, allow_no_verification),
+        "agent_runner": runner,
+        "should_stop": should_stop,
+    }
+    if resume_from is not None:
+        walk["resume_from"] = resume_from
+    summary = runtime_engine.run_subtask(task_workflow.TASK, store, **walk)
     # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
     # its signature returns a result, so a warning has nowhere else to go,
     # and dropping them is the §12 failure this whole list exists to prevent.
@@ -739,7 +690,7 @@ def run_card(
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> dict[str, Any]:
-    """Drive one subtask card through `builtin/task.yaml` once, and report.
+    """Drive one subtask card through `workflow.task.TASK` once, and report.
 
     The order is the spec's and it is load-bearing: the board reads happen before
     a run id exists (so a bad card leaves no run directory), and the run, story
@@ -759,9 +710,6 @@ def run_card(
     worktree = worktree_for(root, branch)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-    # Fail-fast preflight: a workflow that will not load must leave no run
-    # directory, so it is checked before `Store.open`. `drive_subtask` loads its own.
-    load_builtin(WORKFLOW_NAME)
 
     store = Store.open(root, run_id)
     try:
@@ -976,7 +924,6 @@ def dry_run_milestone(
 HANDLED: tuple[type[BaseException], ...] = (
     CliError,
     board.BoardError,
-    WorkflowLoadError,
     EngineError,
     ValueError,
 )
@@ -1094,7 +1041,10 @@ def run(
 ) -> None:
     """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
     _check_run_targets(
-        card=card, milestone=milestone, dry_run=dry_run, max_concurrent=max_concurrent
+        card=card,
+        milestone=milestone,
+        dry_run=dry_run,
+        max_concurrent=max_concurrent,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1300,99 +1250,59 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def resume_run(
-    run_id: str,
+def _resume_from_checkpoint(
+    run: models.Run,
     *,
-    repo_dir: Path,
-    allow_no_verification: bool = False,
-    commands: Sequence[str] = (),
-    runner_factory: RunnerFactory | None = None,
-    clock: Callable[[], datetime] = _utcnow,
+    root: Path,
+    allow_no_verification: bool,
+    commands: Sequence[str],
+    runner_factory: RunnerFactory | None,
 ) -> dict[str, Any]:
-    """Pick one killed run back up at the phase it died in (§9 lines 370-386).
+    """Continue the run's one in-flight subtask from its newest checkpoint.
 
-    The order is the spec's and it is load-bearing in the same way `run_card`'s
-    is, only inverted: every refusal -- unknown run, nothing in flight, a card
-    the board lost, a workflow that will not load -- happens before `Store.open`,
-    because `Store.open` constructs a `Journal` and therefore mints a run
-    directory, and a refusal that left one behind would be this command writing
-    state for a run it declined to touch.
-
-    Branch, base branch and worktree come from the recorded `SubtaskRun` and
-    never from a flag: §9's "the run records what it was started with" is the
-    reason the record exists. The two knobs the record does *not* carry --
-    `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are taken as arguments here rather than grown onto the model, so a resume
-    means exactly what a fresh `run` with the same flags means.
+    Every refusal that needs no store -- nothing in flight, a card the board
+    lost -- comes before `Store.open`. The checkpoint can only be read through
+    the store, so its refusals (`checkpoint_resume_phase`) come right after it
+    is opened and before the first write. Then the orphan attempts are marked
+    `harness_error`, the run, story and subtask are recorded `started`, and
+    `drive_subtask` walks `TASK` from the checkpoint, whose queue says where the
+    walk goes on. A milestone run records `workflow="milestone"`, which names no
+    workflow; every subtask is walked through `TASK` either way (card 02890d5d).
     """
-    root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
-    try:
-        run = store_module.load_run(conn, run_id)
-        if run is None:
-            raise UnknownRunError(
-                f"run {run_id!r} is not in the projection for {root}"
-                " (`agent-manager runs` lists the ones that are)"
-            )
-    finally:
-        conn.close()
-
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
-    workflow = load_builtin(run.workflow)
-    interrupted = interrupted_phase(subtask, workflow)
-    if interrupted is None:
-        raise NotResumableError(
-            f"every phase of card {subtask.card_id} in run {run.id!r} is recorded"
-            " 'done', so there is no phase to re-run -- only the final status write"
-            " was lost; start a fresh run with `agent-manager run --card` if the card"
-            " still needs work"
-        )
-    start_phase = resume_start_phase(workflow, interrupted)
     orphans = orphan_attempts(subtask)
     resumed = subtask.model_copy(update={"status": "started"})
 
     store = Store.open(root, run.id)
     try:
-        # Journal first, row after -- `record_attempt`'s own ordering, and the
-        # reason no delete path is needed: the orphan is one more `attempt_upsert`
-        # keyed by (phase, n), so `replay` and `rebuild_from_journal` need to know
-        # nothing about resume. The attempt *directory* is left alone: its prompt
-        # and stdout are the only evidence of what the killed process was doing.
-        for phase, attempt in orphans:
+        checkpoint = store.latest_checkpoint(subtask.card_id)
+        phase = checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
+        for orphan, attempt in orphans:
             store.record_attempt(
                 story.card_id,
                 subtask.card_id,
-                phase.name,
+                orphan.name,
                 attempt.model_copy(update={"status": "harness_error"}),
             )
         store.record_run(run.model_copy(update={"status": "started"}))
         store.record_story(story.model_copy(update={"status": "started"}))
         store.record_subtask(story.card_id, resumed)
 
-        factory = default_runner_factory if runner_factory is None else runner_factory
-        runner = factory(
-            workflow=workflow,
+        drive = drive_subtask(
             store=store,
             run_id=run.id,
-            story_id=story.card_id,
-            card_id=subtask.card_id,
-        )
-        summary = engine.run_subtask(
-            workflow,
-            store,
-            story_id=story.card_id,
+            card=card,
+            parent=parent,
             subtask=resumed,
             repo_dir=root,
             commands=commands,
-            card=card,
-            parent_story=parent,
-            extra_context=gate_context(commands, allow_no_verification),
-            agent_runner=runner,
-            start_phase=start_phase,
-            clock=clock,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            resume_from=checkpoint,
         )
+        summary = drive.summary
 
         store.record_run(run.model_copy(update={"status": summary.status}))
         store.record_story(story.model_copy(update={"status": summary.status}))
@@ -1400,7 +1310,6 @@ def resume_run(
             story.card_id, resumed.model_copy(update={"status": summary.status})
         )
 
-        warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
         return {
             "run_id": run.id,
             "card_id": subtask.card_id,
@@ -1414,14 +1323,59 @@ def resume_run(
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": warnings,
-            "resumed_from": start_phase,
+            "warnings": drive.warnings,
+            "resumed_from": phase,
             "discarded_attempts": [
-                {"phase": phase.name, "n": attempt.n} for phase, attempt in orphans
+                {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
             ],
         }
     finally:
         store.close()
+
+
+def resume_run(
+    run_id: str,
+    *,
+    repo_dir: Path,
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+) -> dict[str, Any]:
+    """Pick one stopped or killed subtask back up from its checkpoint (§9, card 02890d5d).
+
+    The order is load-bearing in the same way `run_card`'s is, only inverted:
+    every refusal -- unknown run, nothing in flight, a card the board lost --
+    happens before `Store.open`, because `Store.open` constructs a `Journal`
+    and therefore mints a run directory, and a refusal that left one behind
+    would be this command writing state for a run it declined to touch.
+
+    Branch, base branch and worktree come from the recorded `SubtaskRun` and
+    never from a flag: §9's "the run records what it was started with" is the
+    reason the record exists. The two knobs the record does *not* carry --
+    `models.RunConfig` has no suite commands and no `allow_no_verification` --
+    are still taken as arguments, but a walk continued from a checkpoint never
+    reads them: its binding comes from the checkpoint's pool, which holds the
+    suite and the opt-out the run *started* with. Whether a resume should be
+    able to change them is a follow-up decision, not this function's.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+        if run is None:
+            raise UnknownRunError(
+                f"run {run_id!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+    finally:
+        conn.close()
+    return _resume_from_checkpoint(
+        run,
+        root=root,
+        allow_no_verification=allow_no_verification,
+        commands=commands,
+        runner_factory=runner_factory,
+    )
 
 
 @app.command("resume")
@@ -1433,25 +1387,28 @@ def resume(
     allow_no_verification: bool = typer.Option(
         False,
         "--allow-no-verification",
-        help="Proceed even when no verification suite is available (§12's opt-out).",
+        help=(
+            "Accepted for compatibility and currently has no effect: the checkpoint "
+            "carries the opt-out the run started with."
+        ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "One whole verification command, repeatable. The run record does not "
-            "carry the suite, so a resume is told it the way a fresh run was."
+            "Accepted for compatibility and currently has no effect: the checkpoint "
+            "carries the verification suite the run started with."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Re-run the phase a killed run died in, and drive the subtask to the end.
+    """Continue a stopped or killed subtask from its checkpoint, and drive it to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
     started and are recorded on the subtask (§9). `--allow-no-verification` and
-    `--verify` are offered because `models.RunConfig` carries neither the opt-out
-    nor the suite commands, so both mean the same thing here as they do on a
-    fresh `run`.
+    `--verify` are still accepted, but the continued walk binds the suite and
+    the opt-out out of the checkpoint the run started with, so neither changes
+    what a resume verifies.
     """
     try:
         payload = resume_run(

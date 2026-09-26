@@ -4,8 +4,8 @@ Card 6fea51ad (Integrate addendum I1, I3, I4, I5). Default-suite tests that mirr
 `src/agent_manager/integration.py`: not under `tests/e2e/` and not marked `e2e`.
 
 Everything is real except the harness: temporary git repos with a bare `origin`,
-a real `Store` and journal, the shipped `builtin/integrate.yaml` driven by
-`engine.run_subtask`, and `dispatch.AgentRunner` as the agent runner. The runner
+a real `Store` and journal, `workflow.integrate.INTEGRATE` walked by
+`runtime.engine.run_subtask`, and `dispatch.AgentRunner` as the agent runner. The runner
 factory hands out an `AgentRunner` whose launcher is a fake resolver. The fake
 learns the conflicting files and its result path only by parsing the brief it
 is handed. It never asks git for the conflict list, never computes a plan hash
@@ -29,7 +29,8 @@ from typing import Any
 
 import pytest
 
-from agent_manager import cli, dag, dispatch, models
+from agent_manager import cli, dag, dispatch, integration, models
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.integration import (
@@ -37,9 +38,11 @@ from agent_manager.integration import (
     IntegrateSuccess,
     integrate_milestone,
 )
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -320,18 +323,10 @@ class FakeFactory:
     resolver: FakeResolver = field(default_factory=FakeResolver)
     calls: list[dict[str, str]] = field(default_factory=list)
 
-    def __call__(self, *, workflow, store, run_id, story_id, card_id):
-        self.calls.append(
-            {
-                "workflow": workflow.name,
-                "run_id": run_id,
-                "story_id": story_id,
-                "card_id": card_id,
-            }
-        )
+    def __call__(self, *, store, run_id, story_id, card_id):
+        self.calls.append({"run_id": run_id, "story_id": story_id, "card_id": card_id})
         adapter = _FakeAdapter()
         return dispatch.AgentRunner(
-            workflow=workflow,
             store=store,
             launcher=self.resolver,
             run_id=run_id,
@@ -553,9 +548,12 @@ def _integrate_story(store: Store) -> models.StoryRun:
     return run.stories[0]
 
 
-def test_a_conflict_dispatches_exactly_once_for_the_conflicting_tip(
+def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     repo: Repo, store: Store
 ) -> None:
+    """Review Focus 5: the same scenario as the test above, walked by the
+    pygents engine over `INTEGRATE` through the real `integrate_milestone`.
+    Everything a resolved conflict leaves behind is asserted here."""
     stories, tips = _conflicting_pair(repo)
     before = _protected(repo, tips)
     factory = FakeFactory()
@@ -566,31 +564,120 @@ def test_a_conflict_dispatches_exactly_once_for_the_conflicting_tip(
     assert outcome.merged == [STORY_A, STORY_B]
     assert outcome.resolved == [STORY_B]
     assert factory.calls == [
-        {"workflow": "integrate", "run_id": RUN_ID, "story_id": "integrate", "card_id": STORY_B}
+        {"run_id": RUN_ID, "story_id": "integrate", "card_id": STORY_B}
     ]
     assert factory.resolver.calls == [["shared.txt"]]
-    # git judges the merge, not the resolver's report.
     assert _merge_head(repo.worktree) is None
     assert _git(repo.worktree, "status", "--porcelain") == ""
     assert _is_ancestor(repo.worktree, tips[0])
     assert _is_ancestor(repo.worktree, tips[1])
     assert _git(repo.worktree, "show", "HEAD:shared.txt") == RESOLVED
-    # The synthetic story and subtask are in the store, and replay agrees.
     story = _integrate_story(store)
     assert story.title == "Integrate"
     assert story.status == "done"
     [subtask] = story.subtasks
-    assert subtask.card_id == STORY_B
+    assert (subtask.card_id, subtask.status) == (STORY_B, "done")
     assert subtask.branch == INTEGRATION_BRANCH
     assert subtask.base_branch == BASE
     assert subtask.worktree_path == repo.worktree
-    assert subtask.status == "done"
     assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
     rebuilt = store.rebuild_from_journal(RUN_ID)
     assert [s.card_id for s in rebuilt.stories] == ["integrate"]
     assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
     assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]
     _assert_protected(repo, before, tips)
+    # Non-vacuity: the resolver walk went through the pygents engine, the only
+    # walk that checkpoints.
+    assert store.latest_checkpoint(STORY_B) is not None
+
+
+class _RecordingStore:
+    """Only what `_resolve_conflict` touches on a store: `record_subtask`."""
+
+    def __init__(self) -> None:
+        self.subtasks: list[tuple[str, models.SubtaskRun]] = []
+
+    def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> None:
+        self.subtasks.append((story_id, subtask))
+
+
+def _stub_walk(monkeypatch):
+    """Stub `runtime.engine.run_subtask`; every call is recorded."""
+    walks: list[tuple[Any, Any, dict[str, Any]]] = []
+
+    def run_subtask(workflow, store, **kwargs):
+        walks.append((workflow, store, kwargs))
+        return SubtaskSummary(status="done")
+
+    monkeypatch.setattr(runtime_engine, "run_subtask", run_subtask)
+    return walks
+
+
+def _resolve(store, factory, tmp_path: Path):
+    return integration._resolve_conflict(
+        story_id=STORY_B,
+        tip="m5/task-b",
+        files=["shared.txt"],
+        branch=INTEGRATION_BRANCH,
+        base_branch=BASE,
+        worktree=tmp_path / "integrate-worktree",
+        repo_dir=tmp_path,
+        commands=[PASS_CMD],
+        allow_no_verification=False,
+        store=store,
+        run_id=RUN_ID,
+        runner_factory=factory,
+    )
+
+
+def test_resolve_conflict_walks_integrate_with_the_same_arguments(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Spec test 4: `INTEGRATE` on the pygents walk, with no `card`, no
+    `parent_story` and no `resume_from`, and the factory gets only the store and the three ids."""
+    walks = _stub_walk(monkeypatch)
+    factory_calls: list[dict[str, Any]] = []
+    runner = object()
+
+    def factory(**kwargs: Any) -> Any:
+        factory_calls.append(kwargs)
+        return runner
+
+    store = _RecordingStore()
+
+    summary = _resolve(store, factory, tmp_path)
+
+    assert summary.status == "done"
+    ((workflow, passed_store, kwargs),) = walks
+    assert passed_store is store
+    assert workflow is integrate_workflow.INTEGRATE
+    expected_subtask = models.SubtaskRun(
+        card_id=STORY_B,
+        branch=INTEGRATION_BRANCH,
+        base_branch=BASE,
+        status="started",
+        worktree_path=tmp_path / "integrate-worktree",
+    )
+    assert store.subtasks == [("integrate", expected_subtask)]
+    assert kwargs == {
+        "story_id": "integrate",
+        "subtask": expected_subtask,
+        "repo_dir": tmp_path,
+        "commands": [PASS_CMD],
+        "extra_context": {
+            "merge_tip": "m5/task-b",
+            "conflict_files": ["shared.txt"],
+            **cli.gate_context([PASS_CMD], False),
+        },
+        "agent_runner": runner,
+    }
+    (factory_call,) = factory_calls
+    assert factory_call == {
+        "store": store,
+        "run_id": RUN_ID,
+        "story_id": "integrate",
+        "card_id": STORY_B,
+    }
 
 
 def test_a_refusing_resolver_escalates_and_leaves_merge_head_in_place(

@@ -11,9 +11,9 @@ terminal merge of every story tip belongs to `integration`. This module decides 
 order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
-a blocker cycle, a story with two in-milestone blockers, a workflow that will
-not load -- runs before the first write, so a refusal leaves no run directory,
-no store, no fetch and no prune behind.
+a blocker cycle, a story with two in-milestone blockers -- runs before the
+first write, so a refusal leaves no run directory, no store, no fetch and no
+prune behind.
 
 `cli` is imported as a module and every name on it is read at call time: the
 CLI wiring card makes `cli` import this module, and binding a `cli` name at
@@ -36,21 +36,20 @@ from typing import Any, Literal, Protocol
 
 from agent_manager import board, census, cli, dag, integration, models
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Store
-from agent_manager.workflow.loader import load_builtin
+from agent_manager.store import Checkpoint, Store
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
 
 
 STOPPED_PREFIX = "stopped before "
-"""How `engine._stop` opens a stopped subtask's `detail` (addendum P4)."""
+"""How `walk._stop` opens a stopped subtask's `detail` (addendum P4)."""
 
 
 def stopped_before_phase(detail: str | None) -> str | None:
     """The phase a stopped subtask would have run next, read out of its detail.
 
-    `engine._stop` writes `"stopped before <phase>"` and the summary has no
+    `walk._stop` writes `"stopped before <phase>"` and the summary has no
     field of its own for the phase, so this strips the prefix. A detail without
     the prefix, or no detail at all, gives None.
     """
@@ -204,6 +203,9 @@ class Driver(Protocol):
 
     The seam the tests replace. Annotations are strings (`from __future__ import
     annotations`), so no `cli` name is resolved when this module is imported.
+
+    `resume_from` (card 02890d5d) is passed only when a relaunch found a
+    checkpoint to continue, so a driver written before it keeps working.
     """
 
     def __call__(
@@ -219,6 +221,7 @@ class Driver(Protocol):
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
         should_stop: Callable[[], bool] | None = None,
+        resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
 
 
@@ -334,7 +337,7 @@ def reroll_stale_stories(stories: Sequence[census.StoryPlan], root: Path) -> lis
 
     Writing `done` to a subtask that is already done is harmless, and the
     rollup's walk to the root repairs the story and the milestone above it.
-    Best effort, like `mark_done` in `task.yaml`: a `BoardError` becomes a
+    Best effort, like `TASK`'s `mark_done`: a `BoardError` becomes a
     warning naming the story and its anchor, and the run goes on.
     """
     warnings: list[str] = []
@@ -412,6 +415,10 @@ def run_story_lane(
     Any other non-`done` result, or an `Exception` raised while handling a
     subtask, escalates through `stop.escalate`. A `BaseException` sets the stop
     so sibling lanes park, and propagates.
+
+    Each subtask's open checkpoint is looked up first
+    (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
+    driver as `resume_from` when it can be continued.
     """
     story_id = planned.story.id
     level = planned.level
@@ -430,6 +437,15 @@ def run_story_lane(
             store.record_subtask(story_id, row)
             if position == 0:
                 store.record_story(story_row.model_copy(update={"status": "started"}))
+            # Relaunch continuation (card 02890d5d): a card whose open
+            # checkpoint was saved under this `TASK` continues from it; a
+            # changed workflow, a closed card or no row starts it fresh, with
+            # no error. The keyword is passed only when there is a row, so a
+            # driver that predates it keeps working.
+            extra: dict[str, Any] = {}
+            checkpoint = cli.continuable_checkpoint(store, subtask.id)
+            if checkpoint is not None:
+                extra["resume_from"] = checkpoint
             result = drive(
                 store=store,
                 run_id=run_id,
@@ -441,6 +457,7 @@ def run_story_lane(
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
                 should_stop=stop.event.is_set,
+                **extra,
             )
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             status = "escalated"
@@ -539,9 +556,6 @@ def run_milestone(
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    # Fail-fast preflight, as `run_card` does: a workflow that will not load
-    # must leave no run directory. The driver loads its own copy.
-    load_builtin(cli.WORKFLOW_NAME)
     drive = cli.drive_subtask if driver is None else driver
 
     # The first side effect. It runs after every refusal and before the store

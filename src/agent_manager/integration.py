@@ -8,8 +8,8 @@ Each tip is merged by `steps.integrate.merge_tip` into `<prefix>-integrate`, in
 the worktree `cli.worktree_for` names. After the last tip the suite runs once in
 that worktree, and `verification_passed_gate` judges what it measured.
 
-A conflicting tip is handed to the builtin `integrate.yaml` (resolve, then
-verify) through `engine.run_subtask`, under a synthetic "Integrate" story with
+A conflicting tip is handed to `workflow.integrate.INTEGRATE` (resolve, then
+verify) through `runtime.engine.run_subtask`, under a synthetic "Integrate" story with
 one synthetic subtask per conflicting story. Both are recorded before the
 engine journals any phase, because `store.rebuild_from_journal` refuses a phase
 whose story or subtask no earlier line created. A resolver that does not finish
@@ -26,12 +26,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_manager import cli, dag, engine, models
+from agent_manager import cli, dag, models
 from agent_manager.census import StoryPlan
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
-from agent_manager.workflow.loader import load_builtin
+from agent_manager.workflow import integrate as integrate_workflow
 
 PHASE = "integrate"
 """The `phase` every Integrate escalation names."""
@@ -40,9 +42,6 @@ INTEGRATE_STORY_ID = "integrate"
 """The synthetic story every resolver subtask hangs from (addendum I3)."""
 
 INTEGRATE_STORY_TITLE = "Integrate"
-
-WORKFLOW_NAME = "integrate"
-"""The builtin document a conflicting tip is resolved with."""
 
 
 @dataclass(frozen=True)
@@ -135,13 +134,13 @@ def _resolve_conflict(
     store: Store,
     run_id: str,
     runner_factory: cli.RunnerFactory,
-) -> engine.SubtaskSummary:
-    """Drive `builtin/integrate.yaml` once for one conflicting tip.
+) -> SubtaskSummary:
+    """Drive the `integrate` workflow once for one conflicting tip.
 
     The synthetic subtask is recorded before `run_subtask` journals its first
-    phase. The caller has already recorded the synthetic story.
+    phase. The caller has already recorded the synthetic story. The walk is
+    `runtime.engine.run_subtask` over `workflow.integrate.INTEGRATE`.
     """
-    workflow = load_builtin(WORKFLOW_NAME)
     subtask = models.SubtaskRun(
         card_id=story_id,
         branch=branch,
@@ -151,30 +150,28 @@ def _resolve_conflict(
     )
     store.record_subtask(INTEGRATE_STORY_ID, subtask)
     runner = runner_factory(
-        workflow=workflow,
         store=store,
         run_id=run_id,
         story_id=INTEGRATE_STORY_ID,
         card_id=story_id,
     )
-    return engine.run_subtask(
-        workflow,
-        store,
-        story_id=INTEGRATE_STORY_ID,
-        subtask=subtask,
-        repo_dir=repo_dir,
-        commands=commands,
-        extra_context={
+    walk = {
+        "story_id": INTEGRATE_STORY_ID,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "extra_context": {
             "merge_tip": tip,
             "conflict_files": list(files),
             **cli.gate_context(commands, allow_no_verification),
         },
-        agent_runner=runner,
-    )
+        "agent_runner": runner,
+    }
+    return runtime_engine.run_subtask(integrate_workflow.INTEGRATE, store, **walk)
 
 
 def _resolver_detail(
-    tip: str, branch: str, worktree: Path, summary: engine.SubtaskSummary
+    tip: str, branch: str, worktree: Path, summary: SubtaskSummary
 ) -> str:
     return (
         f"the resolver did not finish merging {tip} into {branch}: phase "

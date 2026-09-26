@@ -16,6 +16,7 @@ by a recorder. Tests that request `real_integrate` run the real Integrate over
 branches `BranchingDriver` or `_commit_branch` really commit.
 """
 
+import ast
 import json
 import shlex
 import shutil
@@ -30,10 +31,11 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, census, cli, dag, engine, integration, models, orchestrate, paths
+from agent_manager import board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
-from agent_manager.workflow.registry import WorkflowLoadError
+from agent_manager.workflow import task as task_workflow
 
 
 # ── pure plans ──────────────────────────────────────────────────────────────
@@ -134,7 +136,7 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
 
 
 def test_the_before_phase_is_read_out_of_a_stopped_detail():
-    """`engine._stop` writes "stopped before <phase>"; the summary has no field
+    """`walk._stop` writes "stopped before <phase>"; the summary has no field
     of its own for that phase, so the helper reads it out of `detail`."""
     assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
     assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
@@ -468,10 +470,10 @@ class FakeDriver:
         if isinstance(outcome, BaseException):
             raise outcome
         if outcome is None:
-            summary = engine.SubtaskSummary(status="done")
+            summary = SubtaskSummary(status="done")
         else:
             phase, detail = outcome
-            summary = engine.SubtaskSummary(
+            summary = SubtaskSummary(
                 status="escalated", failed_phase=phase, detail=detail
             )
         return cli.SubtaskDrive(summary=summary, warnings=list(self.warnings.get(card.id, [])))
@@ -767,15 +769,15 @@ class GatedDriver:
             warnings = list(self.warnings.get(card.id, []))
             if isinstance(outcome, tuple):
                 phase, detail = outcome
-                summary = engine.SubtaskSummary(
+                summary = SubtaskSummary(
                     status="escalated", failed_phase=phase, detail=detail
                 )
             elif outcome != "done" and should_stop is not None and should_stop():
-                summary = engine.SubtaskSummary(
+                summary = SubtaskSummary(
                     status="stopped", detail="stopped before implement"
                 )
             else:
-                summary = engine.SubtaskSummary(status="done")
+                summary = SubtaskSummary(status="done")
             return cli.SubtaskDrive(summary=summary, warnings=warnings)
         finally:
             with self.lock:
@@ -983,6 +985,28 @@ def test_no_runner_factory_gives_integrate_cli_default_runner_factory_at_call_ti
     assert [call["runner_factory"] for call in driver.calls] == [None]
     (integrate_call,) = integrate_recorder.calls
     assert integrate_call["runner_factory"] is sentinel_factory
+
+
+def _imported_modules(module) -> set[str]:
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_the_engine_selecting_modules_never_import_pygents():
+    """Pygents-engine RULE 1: these three reach pygents through
+    `agent_manager.runtime.engine` only. A guard: it passes before this card
+    and must keep passing after it."""
+    for module in (cli, orchestrate, integration):
+        imported = _imported_modules(module)
+        assert not any(n == "pygents" or n.startswith("pygents.") for n in imported), (
+            module.__name__
+        )
 
 
 @requires_git
@@ -1306,27 +1330,6 @@ def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project
     assert list(paths.data_dir().iterdir()) == []
     assert not (project / ".claude").exists()
     assert _git(project, "status", "--porcelain") == porcelain_before
-
-
-@requires_git
-@requires_brd
-def test_a_workflow_that_will_not_load_is_refused_before_anything_is_written(
-    project, monkeypatch
-):
-    """The preflight `run_card` does: a workflow that will not load refuses the
-    run before the fetch, the prune, the store or the first subtask."""
-    shape = _milestone(project, {"A": 1})
-    monkeypatch.setattr(cli, "WORKFLOW_NAME", "no-such-workflow")
-    git_calls = _record_git(monkeypatch)
-    driver = FakeDriver()
-
-    with pytest.raises(WorkflowLoadError) as caught:
-        _run(project, shape["milestone"], driver)
-
-    assert "no-such-workflow" in str(caught.value)
-    assert driver.calls == []
-    assert git_calls == []
-    assert list(paths.data_dir().iterdir()) == []
 
 
 @requires_git
@@ -1952,3 +1955,104 @@ def test_warnings_and_completed_follow_census_order_not_finish_order(project):
     assert result["done"] is True
     assert result["completed"] == [f1, s1]
     assert result["warnings"] == ["first warned", "second warned"]
+
+
+# ── relaunch continues an open checkpoint (card 02890d5d) ───────────────────
+
+_ABSENT = object()
+"""What `CheckpointDriver` records when the lane passed no `resume_from` at all."""
+
+EARLIER = datetime(2026, 9, 24, 11, 0, 0, tzinfo=timezone.utc)
+"""When the earlier run saved its checkpoints: before `STARTED_AT`."""
+
+
+@dataclass
+class CheckpointDriver(FakeDriver):
+    """`FakeDriver` that also takes `resume_from` and records it per card."""
+
+    resumed: dict[str, Any] = field(default_factory=dict)
+
+    def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
+        self.resumed[kwargs["card"].id] = resume_from
+        return super().__call__(**kwargs)
+
+
+def _plant(
+    project: Path,
+    run_id: str,
+    card_id: str,
+    reason: str,
+    *,
+    digest: str | None = None,
+    queue: tuple[str, ...] = ("implement",),
+    minute: int = 0,
+) -> store_module.Checkpoint:
+    """One checkpoint row of `TASK` for `card_id`, saved by an earlier run."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        return opened.save_checkpoint(
+            card_id,
+            workflow=task_workflow.TASK.name,
+            digest=task_workflow.TASK.digest() if digest is None else digest,
+            reason=reason,
+            agent={
+                "current_turn": None,
+                "queue": [{"kwargs": {"phase": name, "loop": 0}} for name in queue],
+            },
+            saved_at=EARLIER.replace(minute=minute),
+        )
+    finally:
+        opened.close()
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_relaunch_continues_a_matching_open_checkpoint_and_starts_the_rest_fresh(
+    project,
+):
+    """Spec test 10: a1 parked under this TASK continues; a2's row is from
+    another TASK, b1's newest row is `done`, b2's is a phase escalation with no
+    turn left: all three start fresh, and the run does not raise."""
+    shape = _milestone(project, {"A": 2, "B": 2})
+    a1, a2 = shape["subtasks"]["A"]
+    b1, b2 = shape["subtasks"]["B"]
+    earlier = cli.mint_run_id(shape["milestone"], EARLIER)
+    parked = _plant(project, earlier, a1, "parked")
+    _plant(project, earlier, a2, "parked", digest="saved-under-another-task")
+    _plant(project, earlier, b1, "parked", minute=1)
+    _plant(project, earlier, b1, "done", queue=(), minute=2)
+    _plant(project, earlier, b2, "escalated", queue=())
+    driver = CheckpointDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True
+    assert result["completed"] == [a1, a2, b1, b2]
+    got = driver.resumed[a1]
+    assert got is not _ABSENT
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (earlier, a1, parked.seq, "parked")
+    assert driver.resumed[a2] is _ABSENT
+    assert driver.resumed[b1] is _ABSENT
+    assert driver.resumed[b2] is _ABSENT
+
+
+@requires_git
+@requires_brd
+def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypatch):
+    """Review Focus 4: the lookup runs inside the lane's `try`, so a broken
+    store escalates the subtask it was for and never crashes the run."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+
+    def broken(store, card_id):
+        raise RuntimeError("checkpoints table unreadable")
+
+    monkeypatch.setattr(cli, "continuable_checkpoint", broken)
+    driver = CheckpointDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["escalated"] is True
+    assert result["subtask"] == a1
+    assert result["detail"] == "RuntimeError: checkpoints table unreadable"
+    assert driver.calls == []

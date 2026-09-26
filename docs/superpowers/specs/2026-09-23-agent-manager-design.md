@@ -255,6 +255,8 @@ agent to run verbatim; the program runs commands itself with argument lists.
 
 ## 6. The phase contract
 
+> **Superseded by the pygents engine.** This section and §9 describe the original yaml-engine phase and resume model. The pygents engine replaced that model. For phases, the [pygents addendum's §5 "Phase model and compiler"](2026-09-25-pygents-engine-design.md#5-phase-model-and-compiler) is authoritative, and for checkpoints and resume, its [§6 "Checkpoints and resume"](2026-09-25-pygents-engine-design.md#6-checkpoints-and-resume) is, with one correction: the addendum's §6 says a resume after an escalation re-runs the failed phase, but `am resume` refuses an escalated subtask (exit 3), as the README's "Relaunching resumes" section states.
+
 **Deterministic phase.** The engine calls `run(ctx) -> dict`. No network, no
 model. Unit-tested directly. Its return value is recorded as the phase result
 and becomes available to later phases by name.
@@ -346,6 +348,8 @@ already pin (explore sonnet, spec/plan opus, critic sonnet, coder sonnet,
 review opus).
 
 ## 9. State, durability and resume
+
+> **Superseded by the pygents engine.** This section and §6 describe the original yaml-engine phase and resume model. The pygents engine replaced that model. For phases, the [pygents addendum's §5 "Phase model and compiler"](2026-09-25-pygents-engine-design.md#5-phase-model-and-compiler) is authoritative, and for checkpoints and resume, its [§6 "Checkpoints and resume"](2026-09-25-pygents-engine-design.md#6-checkpoints-and-resume) is, with one correction: the addendum's §6 says a resume after an escalation re-runs the failed phase, but `am resume` refuses an escalated subtask (exit 3), as the README's "Relaunching resumes" section states.
 
 ```
 Run
