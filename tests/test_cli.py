@@ -43,6 +43,11 @@ from agent_manager.steps.reducers import verification_gate
 from agent_manager.workflow.loader import load_builtin
 from agent_manager.workflow.registry import WorkflowLoadError
 
+from agent_manager import engine as yaml_engine
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.workflow import loader
+from agent_manager.workflow import task as task_workflow
+
 
 def test_render_is_one_line_of_json_by_default():
     text = cli.render({"ok": True, "data": {"status": "done"}})
@@ -1641,6 +1646,194 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
     assert not subtask.worktree_path.exists()
     assert run is not None
     assert [sub.status for sub in run.stories[0].subtasks] == ["stopped"]
+
+
+# ── engine selection (card 7fdec762) ─────────────────────────────────────────
+
+DRIVE_CARD = models.Card(
+    id="7fdec762-0000-4000-8000-000000000001",
+    title="Select the engine with --engine",
+    status="todo",
+    parent_id="a6c7bff3-0000-4000-8000-000000000002",
+)
+DRIVE_PARENT = models.Card(
+    id="a6c7bff3-0000-4000-8000-000000000002",
+    title="Checkpoints and resume",
+    status="in_progress",
+)
+DRIVE_RUN_ID = "20260926T000000Z-7fdec762"
+DRIVE_REPO = Path("/repo")
+
+
+def _drive_row() -> models.SubtaskRun:
+    return models.SubtaskRun(
+        card_id=DRIVE_CARD.id,
+        branch="m6/task-select-the-engine-7fdec762",
+        base_branch="main",
+        status="started",
+        worktree_path=Path("/repo/.claude/worktrees/m6/task-select-the-engine-7fdec762"),
+    )
+
+
+def _record_walks(monkeypatch) -> dict[str, list[tuple[Any, Any, dict[str, Any]]]]:
+    """Stub both engines' `run_subtask`; every call lands under its engine's name.
+
+    Patched on the modules themselves, so the stub is what `drive_subtask`
+    reaches whatever alias it holds the module under.
+    """
+    walks: dict[str, list[tuple[Any, Any, dict[str, Any]]]] = {"yaml": [], "pygents": []}
+
+    def recorder(name: str):
+        def run_subtask(workflow, store, **kwargs):
+            walks[name].append((workflow, store, kwargs))
+            return yaml_engine.SubtaskSummary(status="done")
+
+        return run_subtask
+
+    monkeypatch.setattr(yaml_engine, "run_subtask", recorder("yaml"))
+    monkeypatch.setattr(runtime_engine, "run_subtask", recorder("pygents"))
+    return walks
+
+
+def _recording_factory(seen: list[dict[str, Any]]):
+    """A runner factory that records its kwargs and hands back one opaque runner."""
+    runner = object()
+
+    def factory(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return runner
+
+    return factory, runner
+
+
+@pytest.mark.parametrize("engine", ["yaml", "pygents"])
+def test_drive_subtask_walks_the_engine_it_is_given_with_the_same_arguments(
+    monkeypatch, engine
+):
+    """Spec test 2: the walk differs only in which `run_subtask` gets which
+    workflow. The keywords are compared whole, so a `start_phase` or a
+    `resume_from` sneaking into either call fails here."""
+    walks = _record_walks(monkeypatch)
+    seen: list[dict[str, Any]] = []
+    factory, runner = _recording_factory(seen)
+    store = object()
+    subtask = _drive_row()
+
+    def stop() -> bool:
+        return False
+
+    drive = cli.drive_subtask(
+        store=store,
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=subtask,
+        repo_dir=DRIVE_REPO,
+        commands=["uv run pytest"],
+        runner_factory=factory,
+        should_stop=stop,
+        engine=engine,
+    )
+
+    other = "yaml" if engine == "pygents" else "pygents"
+    assert walks[other] == []
+    ((workflow, passed_store, kwargs),) = walks[engine]
+    assert passed_store is store
+    if engine == "pygents":
+        assert workflow is task_workflow.TASK
+    else:
+        assert isinstance(workflow, loader.Workflow)
+        assert workflow.name == cli.WORKFLOW_NAME
+    assert kwargs == {
+        "story_id": DRIVE_PARENT.id,
+        "subtask": subtask,
+        "repo_dir": DRIVE_REPO,
+        "commands": ["uv run pytest"],
+        "card": DRIVE_CARD,
+        "parent_story": DRIVE_PARENT,
+        "extra_context": cli.gate_context(["uv run pytest"], False),
+        "agent_runner": runner,
+        "should_stop": stop,
+    }
+    assert drive.summary.status == "done"
+    assert drive.warnings == []
+    # The factory gets the loaded YAML document on BOTH engines, never TASK.
+    (factory_call,) = seen
+    assert isinstance(factory_call["workflow"], loader.Workflow)
+    assert factory_call["workflow"].name == cli.WORKFLOW_NAME
+    assert {key: value for key, value in factory_call.items() if key != "workflow"} == {
+        "store": store,
+        "run_id": DRIVE_RUN_ID,
+        "story_id": DRIVE_PARENT.id,
+        "card_id": DRIVE_CARD.id,
+    }
+
+
+def test_drive_subtask_defaults_to_the_yaml_walk(monkeypatch):
+    walks = _record_walks(monkeypatch)
+    factory, _ = _recording_factory([])
+
+    cli.drive_subtask(
+        store=object(),
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=_drive_row(),
+        repo_dir=DRIVE_REPO,
+        runner_factory=factory,
+    )
+
+    assert len(walks["yaml"]) == 1
+    assert walks["pygents"] == []
+
+
+@pytest.mark.parametrize("engine", ["PYGENTS", "Yaml", "bogus", ""])
+def test_drive_subtask_refuses_an_unknown_engine_before_building_a_runner(
+    monkeypatch, engine
+):
+    """Review Focus 3: a typo never falls through to the yaml walk."""
+    walks = _record_walks(monkeypatch)
+    seen: list[dict[str, Any]] = []
+    factory, _ = _recording_factory(seen)
+
+    with pytest.raises(ValueError, match="unknown engine"):
+        cli.drive_subtask(
+            store=object(),
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=_drive_row(),
+            repo_dir=DRIVE_REPO,
+            runner_factory=factory,
+            engine=engine,
+        )
+
+    assert seen == []
+    assert walks == {"yaml": [], "pygents": []}
+
+
+def test_engines_lists_exactly_the_literal_values():
+    assert cli.ENGINES == ("yaml", "pygents")
+
+
+@requires_git
+@requires_brd
+@pytest.mark.parametrize("given, passed", [({}, "yaml"), ({"engine": "pygents"}, "pygents")])
+def test_run_card_hands_its_engine_to_drive_subtask(project, cards, monkeypatch, given, passed):
+    seen: list[str] = []
+
+    def fake_drive_subtask(**kwargs: Any) -> cli.SubtaskDrive:
+        seen.append(kwargs["engine"])
+        return cli.SubtaskDrive(summary=yaml_engine.SubtaskSummary(status="done"), warnings=[])
+
+    monkeypatch.setattr(cli, "drive_subtask", fake_drive_subtask)
+
+    payload = cli.run_card(
+        cards["subtask"], repo_dir=project, base_branch="main", branch_prefix="m1", **given
+    )
+
+    assert seen == [passed]
+    assert payload["status"] == "done"
 
 
 runner = CliRunner()

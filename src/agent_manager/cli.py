@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 import typer
 
@@ -36,9 +36,12 @@ from agent_manager import (
     prompt,
     store as store_module,
 )
+from agent_manager import engine as yaml_engine
 from agent_manager.errors import EngineError
 from agent_manager.harness.launcher import run_direct
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
+from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.loader import Workflow, load_builtin
 from agent_manager.workflow.registry import WorkflowLoadError
 
@@ -598,6 +601,14 @@ def main() -> None:
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
+Engine = Literal["yaml", "pygents"]
+"""Which engine walks a subtask: the YAML walk in `agent_manager.engine`, or the
+pygents one in `agent_manager.runtime.engine`. Only `runtime/` imports pygents;
+this module reaches it through `runtime_engine` alone (pygents-engine RULE 1)."""
+
+ENGINES: tuple[str, ...] = get_args(Engine)
+"""`Engine`'s values, in the order a refusal lists them."""
+
 
 class RunnerFactory(Protocol):
     """How the command gets its `engine.AgentPhaseRunner`.
@@ -688,6 +699,7 @@ def drive_subtask(
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
     should_stop: Callable[[], bool] | None = None,
+    engine: Engine = "yaml",
 ) -> SubtaskDrive:
     """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
 
@@ -696,9 +708,20 @@ def drive_subtask(
     everything around the walk: the board reads, the run id, opening and
     closing the store, and the run/story/subtask rows. This function catches
     nothing. An escalation is `summary.status == "escalated"`, not an exception.
-    `should_stop` goes straight to `engine.run_subtask`; a stop is
+    `should_stop` goes straight to the engine; a stop is
     `summary.status == "stopped"`.
+
+    `engine` picks the walk (card 7fdec762). `yaml` is `agent_manager.engine`
+    over the loaded document, exactly as before. `pygents` is
+    `agent_manager.runtime.engine` over `workflow.task.TASK`, with the same
+    keyword arguments and no `resume_from`. The runner factory gets the loaded
+    YAML `Workflow` on both: `dispatch.AgentRunner` reads it only for by-name
+    gates, which `TASK` never produces. The parameter shadows the module-level
+    `engine` name here, so the walks are reached as `yaml_engine` and
+    `runtime_engine`. Any other value is refused before a runner is built.
     """
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
     workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
@@ -708,19 +731,21 @@ def drive_subtask(
         story_id=parent.id,
         card_id=card.id,
     )
-    summary = engine.run_subtask(
-        workflow,
-        store,
-        story_id=parent.id,
-        subtask=subtask,
-        repo_dir=repo_dir,
-        commands=commands,
-        card=card,
-        parent_story=parent,
-        extra_context=gate_context(commands, allow_no_verification),
-        agent_runner=runner,
-        should_stop=should_stop,
-    )
+    walk: dict[str, Any] = {
+        "story_id": parent.id,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "card": card,
+        "parent_story": parent,
+        "extra_context": gate_context(commands, allow_no_verification),
+        "agent_runner": runner,
+        "should_stop": should_stop,
+    }
+    if engine == "pygents":
+        summary = runtime_engine.run_subtask(task_workflow.TASK, store, **walk)
+    else:
+        summary = yaml_engine.run_subtask(workflow, store, **walk)
     # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
     # its signature returns a result, so a warning has nowhere else to go,
     # and dropping them is the §12 failure this whole list exists to prevent.
@@ -738,6 +763,7 @@ def run_card(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    engine: Engine = "yaml",
 ) -> dict[str, Any]:
     """Drive one subtask card through `builtin/task.yaml` once, and report.
 
@@ -745,6 +771,9 @@ def run_card(
     a run id exists (so a bad card leaves no run directory), and the run, story
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
+
+    `engine` goes to `drive_subtask` unchanged; the preflight loads the YAML
+    document on both engines.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -803,6 +832,7 @@ def run_card(
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
+            engine=engine,
         )
         summary = drive.summary
 
