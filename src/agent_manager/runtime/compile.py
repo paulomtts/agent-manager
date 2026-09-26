@@ -104,6 +104,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
 
     async def agent_phase(phase: str, loop: int, pool: ContextPool, memory: ContextQueue):
         deps = current_run.get()
+        deps.running = phase
         p = deps.workflow.phase(phase)
         if deps.agent_runner is None:
             # A wiring bug, not a phase failure: raised as the old engine raises
@@ -136,6 +137,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
 
     async def step_phase(phase: str, loop: int, pool: ContextPool):
         deps = current_run.get()
+        deps.running = phase
         p = deps.workflow.phase(phase)
         # A step never reads feedback, so it gets an empty memory window.
         table = context.binding_table(pool, ContextQueue(limit=1), phase)

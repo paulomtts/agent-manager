@@ -122,6 +122,22 @@ async def _run(agent: Agent, deps: RunDeps) -> old.SubtaskSummary:
         return old._escalate(
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail
         )
+    except old.EngineError:
+        # A missing runner or an unresolvable input: a wiring or document bug
+        # the old engine raises to its caller, `.phase`/`.parameter` intact.
+        raise
+    except Exception as error:
+        _collect(agent, deps, summary)
+        # `deps.running` is only `None` if the error came before any tool was
+        # entered; there is no phase to name then.
+        return old._escalate(
+            summary,
+            deps.store,
+            deps.story_id,
+            deps.subtask,
+            deps.running or "?",
+            old._render_error(error),
+        )
     finally:
         current_run.reset(token)
     _collect(agent, deps, summary)

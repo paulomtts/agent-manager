@@ -26,6 +26,10 @@ class RunDeps:
     should_stop: Callable[[], bool] | None = None
     warnings: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    running: str | None = None
+    """The phase whose tool was entered last. pygents clears the agent's
+    `current_turn` before an error leaves `run()`, so the engine reads the
+    phase an unexpected error escaped from here instead."""
 
 
 current_run: ContextVar[RunDeps] = ContextVar("current_run")

@@ -18,6 +18,7 @@ import pytest
 from agent_manager import dispatch, engine, models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
+from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as new_engine
 from agent_manager.steps import integrate, reducers
 from agent_manager.workflow import phases as phase_model
@@ -3005,3 +3006,46 @@ def test_new_engine_returns_same_summary_for_the_shipped_task(monkeypatch, tmp_p
         assert new_rows == old_rows, validated
         assert new_rows, "the walk recorded no phase rows to compare"
     assert new_summary.skipped, "the validated walk must exercise a non-empty skip"
+
+
+# ── pygents only: the spec's error table, third row ─────────────────────────
+
+
+def test_an_error_no_phase_handles_escalates_at_the_phase_that_was_running(
+    store, monkeypatch
+):
+    """Review Focus 5. Not parametrised: the yaml engine has no bridge. An
+    `Exception` that is neither `Escalated` nor `EngineError` -- here the
+    bridge itself failing under `beta` -- must end the subtask escalated at
+    `beta`, in the old engine's `{Type}: {message}` form, not propagate."""
+    real_call_step = bridge.call_step
+
+    async def call_step(fn, kwargs):
+        if kwargs["phase"].name == "beta":
+            raise RuntimeError("the worker pool is gone")
+        return await real_call_step(fn, kwargs)
+
+    monkeypatch.setattr(bridge, "call_step", call_step)
+    workflow = _workflow(
+        THREE_PHASES,
+        {
+            "step.alpha": lambda card: {"phase": "alpha"},
+            "step.beta": lambda card: {},
+            "step.gamma": lambda card: {},
+        },
+    )
+
+    summary = new_engine.run_subtask(
+        phase_model.from_loader(workflow),
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "beta"
+    assert summary.detail == "RuntimeError: the worker pool is gone"
+    assert summary.results == {"alpha": {"phase": "alpha"}}
+    assert _projected_phases(store) == [("alpha", "done")]
+    assert _subtask_journal_statuses(store) == ["escalated"]
