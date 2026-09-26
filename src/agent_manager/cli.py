@@ -1115,6 +1115,20 @@ should crash loudly with its stack intact.
 """
 
 
+def _check_engine(engine: str) -> None:
+    """Refuse an `--engine` outside `ENGINES` as a usage error (Typer's exit 2).
+
+    Exact and without case folding. Shared by `run` and `resume` (card
+    02890d5d); `--engine` is typed `str` on both because Typer 0.27.2 cannot
+    take a `Literal` annotation.
+    """
+    if engine not in ENGINES:
+        raise typer.BadParameter(
+            f"--engine must be one of {', '.join(ENGINES)}, got {engine!r}",
+            param_hint="'--engine'",
+        )
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -1168,11 +1182,7 @@ def _check_run_targets(
             "--max-concurrent applies only to --milestone",
             param_hint="'--max-concurrent'",
         )
-    if engine not in ENGINES:
-        raise typer.BadParameter(
-            f"--engine must be one of {', '.join(ENGINES)}, got {engine!r}",
-            param_hint="'--engine'",
-        )
+    _check_engine(engine)
 
 
 @app.command("run")
@@ -1703,6 +1713,15 @@ def resume(
             "carry the suite, so a resume is told it the way a fresh run was."
         ),
     ),
+    engine: str = typer.Option(
+        "yaml",
+        "--engine",
+        help=(
+            "Which engine resumes the subtask: `yaml` (the default) re-runs the "
+            "phase the run died in; `pygents` continues from the subtask's newest "
+            "checkpoint, a parked (`stopped`) subtask included."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Re-run the phase a killed run died in, and drive the subtask to the end.
@@ -1711,14 +1730,17 @@ def resume(
     started and are recorded on the subtask (§9). `--allow-no-verification` and
     `--verify` are offered because `models.RunConfig` carries neither the opt-out
     nor the suite commands, so both mean the same thing here as they do on a
-    fresh `run`.
+    fresh `run`. `--engine` (card 02890d5d) is checked before anything is read;
+    on `pygents` the checkpoint carries the gate context the run started with.
     """
+    _check_engine(engine)
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
             commands=list(verify),
+            engine=cast(Engine, engine),
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

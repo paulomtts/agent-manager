@@ -13,11 +13,16 @@ milestone run moves every card it touches.
 
 import json
 import subprocess
+import threading
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from agent_manager import board, cli, models, store
+from agent_manager import board, cli, models, orchestrate, store
+from agent_manager.harness import launcher
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -252,3 +257,132 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
     assert idle["integrated"] == finished["integrated"]
     assert read_fake_log(idle["run_id"]) == []
     engine_parity("milestone-relaunch-idle", engine, idle, tmp=tmp_path, cards=labels)
+
+
+# ── pygents resume and relaunch from checkpoints (card 02890d5d) ─────────────
+
+PREFIX = "m3"
+"""Must equal the conftest's `MILESTONE_PREFIX`: the board fixtures derive their branches with it."""
+
+VERIFY = "git rev-parse --verify HEAD"
+"""Must equal the conftest's `VERIFY_COMMANDS[0]`."""
+
+
+class _Killed(BaseException):
+    """The manager process dying mid-phase. A plain `BaseException`, so neither
+    the engine nor `CliRunner` swallows it, and not `KeyboardInterrupt`, which
+    asyncio re-raises out of the event loop before the engine unwinds."""
+
+
+def _attempt_of(stdout_path: Path) -> tuple[str, str]:
+    """(card id, phase) of the attempt a launch belongs to.
+
+    `paths.attempt_dir` is `<run dir>/<card>/<phase>.<n>` and the dispatcher
+    hands the launcher `<attempt dir>/stdout.log`, so the launch names its own
+    attempt; the fake is never asked.
+    """
+    attempt = stdout_path.parent
+    return attempt.parent.name, attempt.name.rsplit(".", 1)[0]
+
+
+def _latest_run_id(root: Path) -> str:
+    conn = store.open_db(cli.resolve_repo_dir(root))
+    try:
+        run_id = store.latest_run_id(conn)
+    finally:
+        conn.close()
+    assert run_id is not None
+    return run_id
+
+
+def _kill_after(monkeypatch, card_id: str, phase: str) -> None:
+    """Kill the manager once, right after `card_id`'s `phase` launch returns.
+
+    Test scaffolding in the manager process: `cli.default_runner_factory`
+    reads `cli.run_direct` at call time, so the real launcher still spawns the
+    real fake, which writes its result and logs the phase as always. Raising
+    after it returns and before the dispatcher records the outcome leaves the
+    attempt and the phase `started`, the crash signature a real kill leaves.
+    One-shot, so the resume launches through the real launcher.
+    """
+    real = launcher.run_direct
+    armed = {"on": True}
+
+    def killing(argv, *, cwd, timeout, stdout_path, on_spawn=None):
+        outcome = real(
+            argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path, on_spawn=on_spawn
+        )
+        if armed["on"] and _attempt_of(stdout_path) == (card_id, phase):
+            armed["on"] = False
+            raise _Killed(f"killed after the {phase} launch of {card_id} returned")
+        return outcome
+
+    monkeypatch.setattr(cli, "run_direct", killing)
+
+
+def test_a_pygents_run_killed_in_plan_resumes_without_redispatching_explore_or_spec(
+    milestone_board, fake_claude_bin, read_fake_log, monkeypatch
+):
+    """Spec test 12: explore, spec and validate_spec are dispatched once in
+    total, plan twice (the killed attempt and the resumed one)."""
+    root = milestone_board["root"]
+    a1 = milestone_board["subtasks"]["A"][0]
+    _kill_after(monkeypatch, a1, "plan")
+    invoke = CliRunner().invoke
+
+    with pytest.raises(_Killed):
+        invoke(
+            cli.app,
+            [
+                "run",
+                "--card",
+                a1,
+                "--repo-dir",
+                str(root),
+                "--base-branch",
+                "main",
+                "--branch-prefix",
+                PREFIX,
+                "--engine",
+                "pygents",
+                "--verify",
+                VERIFY,
+            ],
+        )
+    run_id = _latest_run_id(root)
+    assert Counter(entry["phase"] for entry in read_fake_log(run_id)) == {
+        "explore": 1,
+        "spec": 1,
+        "validate_spec": 1,
+        "plan": 1,
+    }
+
+    result = invoke(
+        cli.app,
+        [
+            "resume",
+            run_id,
+            "--repo-dir",
+            str(root),
+            "--engine",
+            "pygents",
+            "--verify",
+            VERIFY,
+        ],
+    )
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "done", data
+    assert data["resumed_from"] == "plan"
+    assert data["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    assert Counter(entry["phase"] for entry in read_fake_log(run_id)) == {
+        "explore": 1,
+        "spec": 1,
+        "validate_spec": 1,
+        "plan": 2,
+        "validate_plan": 1,
+        "implement": 1,
+        "review": 1,
+    }
+    assert board.show(a1, repo_dir=root).status == "done"

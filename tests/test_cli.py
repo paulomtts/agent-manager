@@ -5188,3 +5188,74 @@ def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards
     assert _resume_state(project) == before
     plan = [row for row in _attempt_rows(project) if row[3] == "plan"]
     assert [(row[4], row[5]) for row in plan] == [(1, "started")]
+
+
+@pytest.mark.parametrize("value", ["bogus", "PYGENTS", ""])
+def test_resume_with_a_bad_engine_is_a_usage_error_that_starts_nothing(
+    tmp_path, monkeypatch, value
+):
+    """Spec test 9 and Review Focus 5: exit 2, nothing on stdout, no case folding."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            "20260923T140506Z-cbe34d00",
+            "--repo-dir",
+            str(tmp_path),
+            "--engine",
+            value,
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert result.stdout == ""
+    assert "--engine must be one of yaml, pygents" in result.output
+
+
+@pytest.mark.parametrize(
+    "extra, passed",
+    [((), "yaml"), (("--engine", "yaml"), "yaml"), (("--engine", "pygents"), "pygents")],
+)
+def test_the_engine_reaches_resume_run(tmp_path, monkeypatch, extra, passed):
+    """No git or brd: `resume_run` is replaced. Without `--engine` it gets `yaml`."""
+    seen: list[str] = []
+
+    def fake_resume_run(run_id, **kwargs):
+        seen.append(kwargs["engine"])
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "20260923T140506Z-cbe34d00", "--repo-dir", str(tmp_path), *extra],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [passed]
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
+    project, cards, monkeypatch
+):
+    """Spec test 6 at the command: `ok: false`, exit 3, nothing written."""
+    run_id = _crash_pygents(project, cards, "plan")
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app, ["resume", run_id, "--repo-dir", str(project), "--engine", "pygents"]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    assert "workflow changed since checkpoint" in envelope["error"]["message"]
+    assert _resume_state(project) == before
