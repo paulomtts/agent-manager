@@ -1574,3 +1574,50 @@ def test_accumulated_feedback_blocks_keep_the_order_they_were_produced(
     blocks = launcher.prompts[2].split(dispatch.FEEDBACK_HEADING, 1)[1]
     assert launcher.prompts[2].count(dispatch.FEEDBACK_HEADING) == 2
     assert blocks.index("not valid JSON") < blocks.index("Field required")
+
+
+# ── phase-model phases through the runner ────────────────────────────────────
+
+CRITIC_RESULT = json.dumps({"blockers": False, "reason": None, "summary": "no blockers"})
+
+
+def test_result_class_is_used_directly(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[CRITIC_RESULT])
+    runner, _ = _runner(
+        store, workflow, launcher, tmp_path, worktree, result_models={}
+    )
+
+    result = runner(
+        _model_phase(result=results.CriticResult), _context(worktree), _rendered()
+    )
+
+    assert result == {"blockers": False, "reason": None, "summary": "no blockers"}
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "done")]
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+    contract = launcher.prompts[0].split(prompt.RESULT_HEADING, 1)[1]
+    assert '"blockers"' in contract
+
+
+def test_a_result_class_wins_over_a_same_named_table_entry(store, tmp_path, worktree):
+    # Review Focus 5: the table maps "CriticResult" to a different model; the
+    # class on the phase is what the result file is validated against.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(
+        store,
+        workflow,
+        launcher,
+        tmp_path,
+        worktree,
+        result_models={"CriticResult": FakeResult},
+    )
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(
+            _model_phase(result=results.CriticResult), _context(worktree), _rendered()
+        )
+
+    assert caught.value.outcome == "schema_invalid"
+    assert "blockers" in caught.value.detail
+    assert len(launcher.calls) == 1

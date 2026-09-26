@@ -401,7 +401,7 @@ class AgentRunner:
 
     def __call__(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
     ) -> Any:
@@ -413,13 +413,17 @@ class AgentRunner:
         """
         role = load_role(phase.role, root=self.role_root)
         target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
-        model = (
-            None
-            if phase.result is None
-            else results.resolve_result_model(
+        # A declared phase-model phase carries its result model as the class
+        # itself, which is used as-is; a YAML phase carries a name, looked up
+        # in the table exactly as before.
+        if phase.result is None:
+            model = None
+        elif isinstance(phase.result, type):
+            model = phase.result
+        else:
+            model = results.resolve_result_model(
                 phase.result, self.result_models, phase=phase.name
             )
-        )
         cwd = self._worktree(context, phase.name)
 
         started_at = self.clock()
@@ -460,7 +464,7 @@ class AgentRunner:
 
     def _attempt(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
         feedback: Sequence[str],
@@ -563,7 +567,7 @@ class AgentRunner:
 
     def _record_phase(
         self,
-        phase: AgentPhase,
+        phase: AnyAgentPhase,
         status: models.Status,
         started_at: datetime,
         ended_at: datetime | None,
@@ -582,7 +586,7 @@ class AgentRunner:
             ),
         )
 
-    def _record_attempt(self, phase: AgentPhase, attempt: models.Attempt) -> None:
+    def _record_attempt(self, phase: AnyAgentPhase, attempt: models.Attempt) -> None:
         self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
 
 
