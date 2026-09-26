@@ -374,3 +374,68 @@ def test_a_stale_registry_entry_does_not_block_a_resume(store):
     assert summary.status == "done"
     assert summary.results == ALL_RESULTS
     assert crashed.agent["name"] not in AgentRegistry._registry
+
+
+# ── pending_phase (card 02890d5d) ────────────────────────────────────────────
+
+
+def test_pending_phase_reads_the_turn_a_crashed_checkpoint_would_run_next(store):
+    ran: list[str] = []
+    with pytest.raises(_Crash):
+        _go(_five(ran, {"c"}), store)
+
+    assert runtime_engine.pending_phase(store.latest_checkpoint(CARD_ID)) == "c"
+
+
+def test_pending_phase_reads_a_parked_checkpoint(store):
+    ran: list[str] = []
+    _go(_five(ran, set()), store, should_stop=lambda: ran == ["a"])
+    parked = store.latest_checkpoint(CARD_ID)
+
+    assert parked.reason == "parked"
+    assert runtime_engine.pending_phase(parked) == "b"
+
+
+def test_pending_phase_prefers_the_turn_in_flight_over_the_queue():
+    checkpoint = store_module.Checkpoint(
+        run_id=RUN_ID,
+        card_id=CARD_ID,
+        seq=0,
+        workflow="five",
+        digest="any",
+        reason="turn",
+        agent={
+            "current_turn": {"kwargs": {"phase": "c", "loop": 1}},
+            "queue": [{"kwargs": {"phase": "d", "loop": 0}}],
+        },
+        saved_at=FIXED,
+    )
+
+    assert runtime_engine.pending_phase(checkpoint) == "c"
+
+
+def test_a_done_checkpoint_has_no_pending_phase(store):
+    _go(_five([], set()), store)
+    done = store.latest_checkpoint(CARD_ID)
+
+    assert done.reason == "done"
+    assert runtime_engine.pending_phase(done) is None
+
+
+def _boom(card: str) -> dict[str, Any]:
+    raise RuntimeError("boom")
+
+
+def test_a_phase_escalation_leaves_an_escalated_row_with_no_pending_phase(store):
+    """Why card 02890d5d refuses to resume such a row and relaunches it fresh:
+    the failed turn was consumed, `Escalated` enqueued nothing, and
+    `agent.run()` cleared `current_turn` on its way out, so the row holds no
+    turn. Continuing from it would run nothing and record the subtask `done`."""
+    summary = _go(Workflow("escalates", (Step("a", _boom), Step("b", _extra))), store)
+
+    assert summary.status == "escalated"
+    escalated = store.latest_checkpoint(CARD_ID)
+    assert escalated.reason == "escalated"
+    assert escalated.agent["current_turn"] is None
+    assert escalated.agent["queue"] == []
+    assert runtime_engine.pending_phase(escalated) is None

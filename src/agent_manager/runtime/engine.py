@@ -36,6 +36,22 @@ class CheckpointMismatch(Exception):
     is built, so nothing is run or recorded."""
 
 
+def pending_phase(checkpoint: Checkpoint) -> str | None:
+    """The phase `checkpoint`'s agent would run next, or `None` if it holds no turn.
+
+    Read-only: it reads the stored `Agent.to_dict()` and builds nothing, so a
+    caller outside `runtime/` can name where a resume would start without
+    touching a pygents structure itself (card 02890d5d). The next turn is the
+    turn in flight if there was one, else the queue head -- the reading the
+    `BEFORE_TURN` hook makes. A `done` row holds no turn, and neither does an
+    `escalated` row written after a phase escalated: `Escalated` enqueues
+    nothing and `agent.run()` clears the turn in flight on its way out.
+    """
+    agent = checkpoint.agent
+    turn = agent.get("current_turn") or next(iter(agent.get("queue") or ()), None)
+    return None if turn is None else turn["kwargs"]["phase"]
+
+
 def run_subtask(
     workflow: Workflow,
     store: Any,
