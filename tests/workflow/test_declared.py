@@ -10,17 +10,41 @@ from agent_manager import dispatch
 from agent_manager.workflow import integrate as integrate_module
 from agent_manager.workflow import task as task_module
 from agent_manager.workflow.loader import load_builtin
-from agent_manager.workflow.phases import AgentPhase, Step, from_loader
+from agent_manager.workflow.phases import AgentPhase, Goto, Step, from_loader
 from agent_manager.workflow.registry import default_registry
 from agent_manager.workflow.task import TASK, LAUNCHER_TIMEOUT
 from agent_manager.workflow.integrate import INTEGRATE
 
 
+DECLARED_ONLY_INPUTS = ("feedback",)
+"""Inputs the YAML never had: the critic's reason reaches a looped-to phase
+through `feedback`, which only the pygents engine supplies (G4)."""
+
+
+def _declared_only(converted, mine):
+    """`converted` with the data the YAML never had taken from `mine`.
+
+    Timeouts, `on_fail` loops and the `feedback` input are new in the declared
+    workflow. Each is copied from the declared phase; an extra input is
+    appended only where the declared phase has it, so an input the YAML does
+    have can never be hidden this way.
+    """
+    extra = tuple(
+        name for name in DECLARED_ONLY_INPUTS
+        if name in mine.inputs and name not in converted.inputs
+    )
+    return type(converted)(**{
+        **converted.__dict__,
+        "timeout": mine.timeout,
+        "on_fail": mine.on_fail,
+        "inputs": converted.inputs + extra,
+    })
+
+
 def _shipped(name, like):
     converted = from_loader(load_builtin(name, default_registry()))
-    # timeouts are new data the YAML never had: compare with TASK's own
     return type(converted)(converted.name, tuple(
-        p if not hasattr(p, "timeout") else type(p)(**{**p.__dict__, "timeout": like.phase(p.name).timeout})
+        p if not hasattr(p, "timeout") else _declared_only(p, like.phase(p.name))
         for p in converted.phases))
 
 
@@ -115,3 +139,26 @@ def test_declared_modules_never_import_pygents():
 def test_each_validation_phase_names_its_own_critic():
     assert TASK.phase("validate_spec").role == "spec_critic"
     assert TASK.phase("validate_plan").role == "plan_critic"
+
+
+def test_task_critics_loop_back_once():
+    """G4: each critic loops back to the phase it judged, at most once; review
+    does not loop; only the looped-to phases read `feedback`."""
+    assert TASK.phase("validate_spec").on_fail == Goto("spec", 1)
+    assert TASK.phase("validate_plan").on_fail == Goto("plan", 1)
+    assert TASK.phase("review").on_fail is None
+    agents = [p for p in TASK.phases if isinstance(p, AgentPhase)]
+    assert {p.name for p in agents if p.on_fail is not None} == {
+        "validate_spec",
+        "validate_plan",
+    }
+    assert {p.name for p in agents if "feedback" in p.inputs} == {"spec", "plan"}
+    assert TASK.phase("spec").inputs == ("card", "explore", "spec_path", "feedback")
+    assert TASK.phase("plan").inputs == ("spec_path", "plan_path", "feedback")
+
+
+def test_integrate_declares_no_loop_and_no_feedback():
+    """This card turns on TASK's critics only."""
+    agents = [p for p in INTEGRATE.phases if isinstance(p, AgentPhase)]
+    assert all(p.on_fail is None for p in agents)
+    assert all("feedback" not in p.inputs for p in agents)

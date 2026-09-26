@@ -14,8 +14,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from agent_manager import board, prompt, results
+from agent_manager import board, cli, prompt, results
 from agent_manager.steps import docs_commit
 from agent_manager.workflow import load_builtin
 
@@ -244,3 +245,215 @@ def test_the_run_data_is_the_same_on_both_engines(
     engine_parity(
         "production-wiring", engine, completed_run, tmp=project.parent, cards=cards
     )
+
+
+CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
+"""Must equal `fake_claude.CRITIC_BLOCKS_ENV`, which `test_fake_claude.py` pins."""
+
+CRITIC_BLOCK_REASON = (
+    "fake-claude critic: the critic-blocks budget told this critic to block"
+)
+"""Must equal `fake_claude.CRITIC_BLOCK_REASON`, which `test_fake_claude.py` pins."""
+
+VERIFY = "git rev-parse --verify HEAD"
+"""Must equal the conftest's `VERIFY_COMMANDS[0]`."""
+
+FEEDBACK_SECTION = "\n## feedback\n"
+"""How `prompt._assemble` heads the `feedback` input's section."""
+
+
+def _arm_critic_blocks(tmp_path: Path, monkeypatch, table: dict[str, int]) -> Path:
+    """Write the fake's critic budget beside the repo and point the env var at it.
+
+    Through the test's own function-scoped `monkeypatch`, so it is undone when
+    the test ends and never reaches the shared `completed_run`. Child processes
+    inherit it: `run_direct` calls `Popen` with no `env=`."""
+    budget = tmp_path / "critic-blocks.json"
+    budget.write_text(json.dumps(table), encoding="utf-8")
+    monkeypatch.setenv(CRITIC_BLOCKS_ENV, str(budget))
+    return budget
+
+
+def _run_one_card(root: Path, card: str, engine: str):
+    """`am run --card` through `CliRunner`, with no runner_factory anywhere."""
+    return CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--card",
+            card,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            "--engine",
+            engine,
+            "--verify",
+            VERIFY,
+        ],
+    )
+
+
+def _envelope(result) -> dict:
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}, envelope
+    assert envelope["ok"] is True, envelope
+    return envelope["data"]
+
+
+def _brief_of(entry: dict) -> str:
+    """The brief the fake was given for one logged dispatch: `prompt.txt` sits
+    beside the attempt's `result.json`."""
+    return (Path(entry["result_path"]).parent / "prompt.txt").read_text(encoding="utf-8")
+
+
+def _feedback_of(brief: str) -> str | None:
+    """The body of the brief's `## feedback` section, or `None` when it has none."""
+    start = brief.find(FEEDBACK_SECTION)
+    if start < 0:
+        return None
+    body = brief[start + len(FEEDBACK_SECTION) :]
+    end = body.find("\n## ")
+    return body if end < 0 else body[:end]
+
+
+@pytest.mark.parametrize(
+    ("critic", "author", "walked"),
+    [
+        (
+            "validate_spec",
+            "spec",
+            [
+                "explore", "spec", "validate_spec", "spec", "validate_spec",
+                "plan", "validate_plan", "implement", "review",
+            ],
+        ),
+        (
+            "validate_plan",
+            "plan",
+            [
+                "explore", "spec", "validate_spec", "plan", "validate_plan",
+                "plan", "validate_plan", "implement", "review",
+            ],
+        ),
+    ],
+)
+def test_a_critic_that_blocks_once_loops_back_and_the_run_finishes_done(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch,
+    critic, author, walked,
+):
+    """Spec test 4 (and G4's "validate_plan loops back to plan in the same way"):
+    under pygents one block sends the run back to the phase the critic judged,
+    whose second brief carries the critic's reason, and the run ends done."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {critic: 1})
+
+    result = _run_one_card(root, card, "pygents")
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert board.show(card, repo_dir=root).status == "done"
+    # Non-vacuity: the block really was spent, so the loop really happened.
+    assert json.loads(budget.read_text(encoding="utf-8")) == {critic: 0}
+
+    entries = read_fake_log(data["run_id"])
+    assert [entry["phase"] for entry in entries] == walked
+    first, second = [entry for entry in entries if entry["phase"] == author]
+    assert Path(first["result_path"]).parent.name == f"{author}.1"
+    assert Path(second["result_path"]).parent.name == f"{author}.2"
+
+    feedback = _feedback_of(_brief_of(second))
+    assert feedback is not None, _brief_of(second)
+    assert feedback.splitlines()[0] == prompt.FEEDBACK_TITLE
+    assert f"- {critic}: " in feedback
+    assert CRITIC_BLOCK_REASON in feedback
+    # Review focus 5: feedback reaches the looped-to phase's second brief only.
+    for entry in entries:
+        if entry is not second:
+            assert _feedback_of(_brief_of(entry)) is None, entry
+
+
+def test_a_critic_that_blocks_twice_escalates_validation_at_the_critic(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Spec test 5: the one loop is spent, so the second block escalates at the
+    critic -- never at the looped-to phase -- the way it does today."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 2})
+
+    result = _run_one_card(root, card, "pygents")
+
+    assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "escalated"
+    assert data["failed_phase"] == "validate_spec"
+    assert "blocked=validation" in data["detail"], data["detail"]
+    assert CRITIC_BLOCK_REASON in data["detail"], data["detail"]
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
+    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
+        "explore", "spec", "validate_spec", "spec", "validate_spec",
+    ]
+    assert board.show(card, repo_dir=root).status != "done"
+
+
+def test_under_yaml_a_critic_that_blocks_once_escalates_at_once(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Spec test 6: `--engine yaml` never reads `on_fail`; the first block
+    escalates, and `spec` is dispatched once. Documented, not changed."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    budget = _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1})
+
+    result = _run_one_card(root, card, "yaml")
+
+    assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "escalated"
+    assert data["failed_phase"] == "validate_spec"
+    assert "blocked=validation" in data["detail"], data["detail"]
+    assert CRITIC_BLOCK_REASON in data["detail"], data["detail"]
+    assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
+    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
+        "explore", "spec", "validate_spec",
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "runtime/compile.py carries one loop counter along the whole walk, so a "
+        "spec loop leaves validate_plan at loop=1 and its first block escalates; "
+        "G4 says each critic loops at most once. A runtime/ fix, outside card "
+        "058981d3's files."
+    ),
+)
+def test_both_critics_blocking_once_each_should_both_loop(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Review focus 1: pinned as a known gap, loud the day it is fixed."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1, "validate_plan": 1})
+
+    result = _run_one_card(root, card, "pygents")
+
+    data = _envelope(result)
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+
+
+def test_with_no_critic_block_no_brief_carries_a_feedback_section(
+    engine, completed_run, agent_attempts
+):
+    """Spec "No block" / review focus 3, on both engines: an empty `feedback`
+    renders nothing, so a clean run's briefs are what they were before."""
+    assert completed_run["status"] == "done", completed_run["detail"]
+    for name in AGENT_PHASES:
+        text = Path(agent_attempts[name].prompt_path).read_text(encoding="utf-8")
+        assert FEEDBACK_SECTION not in text, (engine, name)
