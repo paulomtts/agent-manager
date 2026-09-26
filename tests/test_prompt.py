@@ -20,7 +20,6 @@ from agent_manager import dag, models, prompt, results
 from agent_manager.errors import EngineError
 from agent_manager.roles import loader as roles_loader
 from agent_manager.workflow import phases
-from agent_manager.workflow.loader import AgentPhase
 
 CARD = models.Card(
     id="968fba15-0971-456a-ae9f-57ff2210f0ce",
@@ -39,8 +38,8 @@ PLAN_HASH = "9f3a12bc"
 """`docs_commit.plan_hash()`'s shape: 8 lowercase hex characters."""
 
 
-def _phase(inputs, *, name="implement", role="coder", **extra) -> AgentPhase:
-    return AgentPhase(kind="agent", name=name, role=role, inputs=list(inputs), **extra)
+def _phase(inputs, *, name="implement", role="coder", **extra) -> phases.AgentPhase:
+    return phases.AgentPhase(name=name, role=role, inputs=tuple(inputs), result=None, **extra)
 
 
 def _context(**overrides):
@@ -998,15 +997,6 @@ def test_prompt_reads_phases_through_a_protocol_not_the_yaml_type():
         isinstance(getattr(prompt.PromptPhase, attr), property)
         for attr in ("name", "role", "inputs")
     )
-
-
-def test_a_phase_model_agent_phase_renders_exactly_like_the_yaml_one():
-    declared = phases.AgentPhase("implement", "coder", ("branch", "base_branch"), None)
-
-    rendered = prompt.render_prompt(declared, _context())
-
-    assert rendered == prompt.render_prompt(_phase(["branch", "base_branch"]), _context())
-    assert rendered.text.startswith("# phase: implement\n# role: coder\n")
 
 
 FEEDBACK_PHASE = SimpleNamespace(name="spec", role="spec_author", inputs=("feedback",))

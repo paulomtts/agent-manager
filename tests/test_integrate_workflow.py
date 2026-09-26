@@ -1,8 +1,8 @@
 """The Integrate resolver document, driven end to end (Integrate addendum I3,
 card b4bd3795).
 
-Engine tier per design §14. Everything is real except the harness: the shipped
-`builtin/integrate.yaml` against the default registry, `engine.run_subtask`,
+Engine tier per design §14. Everything is real except the harness:
+`workflow.integrate.INTEGRATE`, `runtime.engine.run_subtask`,
 `dispatch.AgentRunner` as the injected agent runner (it owns the attempt
 directories, the gates, the retry and the feedback, so a bare lambda would
 prove none of them), the store and journal, and temporary git repositories
@@ -33,7 +33,8 @@ from agent_manager import store as store_module
 from agent_manager.errors import EngineError
 from agent_manager.harness.base import Outcome
 from agent_manager.steps.integrate import merge_tip
-from agent_manager.workflow import load_builtin
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.workflow import integrate as integrate_workflow
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -279,9 +280,9 @@ def _run(
     commands: list[Any] = PWD_SUITE,
     extra_context: dict[str, Any] | None = None,
 ) -> _Ran:
-    """`engine.run_subtask(load_builtin("integrate"), ...)` for one synthetic
-    subtask, with the real `dispatch.AgentRunner` as the agent runner."""
-    workflow = load_builtin("integrate")
+    """`runtime.engine.run_subtask(INTEGRATE, ...)` for one synthetic subtask,
+    with the real `dispatch.AgentRunner` as the agent runner."""
+    workflow = integrate_workflow.INTEGRATE
     subtask = models.SubtaskRun(
         card_id=TIP_CARD,
         branch=INTEGRATION_BRANCH,
@@ -302,7 +303,6 @@ def _run(
         )
         store.record_subtask(STORY_ID, subtask)
         runner = dispatch.AgentRunner(
-            workflow=workflow,
             store=store,
             launcher=resolver,
             run_id=RUN_ID,
@@ -313,7 +313,7 @@ def _run(
                 "resolver": models.HarnessAssignment(harness=adapter.name, model="fake-model")
             },
         )
-        summary = engine.run_subtask(
+        summary = runtime_engine.run_subtask(
             workflow,
             store,
             story_id=STORY_ID,

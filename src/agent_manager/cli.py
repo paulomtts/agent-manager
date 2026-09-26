@@ -41,8 +41,6 @@ from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
 from agent_manager.workflow import task as task_workflow
-from agent_manager.workflow.loader import Workflow, load_builtin
-from agent_manager.workflow.registry import WorkflowLoadError
 
 EXIT_ESCALATED = 1
 """The subtask escalated. §12: a full stop a human has to read."""
@@ -555,7 +553,7 @@ class RunnerFactory(Protocol):
     """How the command gets its `engine.AgentPhaseRunner`.
 
     A factory rather than a runner, because a real `dispatch.AgentRunner` needs
-    the store, the workflow and three ids that do not exist until the run is
+    the store and three ids that do not exist until the run is
     already half set up -- and because a factory is the seam the tests replace
     to launch no harness at all (§14: the launcher is injected).
     """
@@ -563,7 +561,6 @@ class RunnerFactory(Protocol):
     def __call__(
         self,
         *,
-        workflow: Workflow,
         store: Store,
         run_id: str,
         story_id: str,
@@ -573,7 +570,6 @@ class RunnerFactory(Protocol):
 
 def default_runner_factory(
     *,
-    workflow: Workflow,
     store: Store,
     run_id: str,
     story_id: str,
@@ -587,7 +583,6 @@ def default_runner_factory(
     `--harness`'s job, and `--harness` is not this card's.
     """
     return dispatch.AgentRunner(
-        workflow=workflow,
         store=store,
         launcher=run_direct,
         run_id=run_id,
@@ -656,10 +651,8 @@ def drive_subtask(
     02890d5d) continues it from a saved checkpoint; it joins the walk's
     keywords only when given, so a fresh walk is called exactly as before.
     """
-    workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
-        workflow=workflow,
         store=store,
         run_id=run_id,
         story_id=parent.id,
@@ -931,7 +924,6 @@ def dry_run_milestone(
 HANDLED: tuple[type[BaseException], ...] = (
     CliError,
     board.BoardError,
-    WorkflowLoadError,
     EngineError,
     ValueError,
 )

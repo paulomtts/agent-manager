@@ -1,9 +1,9 @@
 """Run one agent phase to a terminal outcome (design §6 lines 261-278).
 
-`engine.run_subtask` resolves an agent phase's `inputs` and renders its prompt,
-then hands `(phase, context, rendered)` to an injected `AgentPhaseRunner`
-(`engine.py` lines 211-222). This module is that runner: the attempt directory,
-the dispatch, the result file, the gates and the retry loop.
+The pygents walk's `agent_phase` tool (`runtime/compile.py`) resolves an agent
+phase's `inputs` and renders its prompt, then hands `(phase, context, rendered)`
+to an injected `AgentPhaseRunner`. This module is that runner: the attempt
+directory, the dispatch, the result file, the gates and the retry loop.
 
 Three rules shape everything here, and none of them is negotiable:
 
@@ -38,12 +38,6 @@ from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.runtime import bridge
 from agent_manager.store import Store
 from agent_manager.workflow import phases as phase_model
-from agent_manager.workflow.loader import AgentPhase, Workflow
-
-AnyAgentPhase = AgentPhase | phase_model.AgentPhase
-"""Either agent-phase type: the YAML one (`result` and gates as names) or the
-declared phase model (`result` a class, gates callables). Dispatch accepts both
-while the YAML engine exists; nothing here imports pygents (rule 1)."""
 
 RESULT_NAME = "result.json"
 """The result file §6 step 3 puts in every attempt directory."""
@@ -285,8 +279,7 @@ def _render_verdict(verdict: Mapping[str, Any]) -> str:
 
 
 def evaluate_gates(
-    phase: AnyAgentPhase,
-    workflow: Workflow,
+    phase: phase_model.AgentPhase,
     values: Mapping[str, Any],
     warnings: list[str],
 ) -> Verdict | None:
@@ -302,19 +295,14 @@ def evaluate_gates(
     returning something that is not a mapping -- come back `fatal`, so no
     `retry.on` list can re-dispatch into a situation the harness cannot change.
     A binding failure is different again and propagates as `EngineError`: it
-    means the document names a gate whose parameters nothing supplies, which is
-    a bug in the document, not in the attempt.
+    means the workflow names a gate whose parameters nothing supplies, which is
+    a bug in the workflow, not in the attempt.
 
-    A gate entry is either a name, resolved through `workflow.function` as the
-    YAML document declares it, or -- on a declared `phases.AgentPhase` -- the
-    callable itself, used as-is and named by its `__name__` (its `repr` when it
-    has none) in every message.
+    Every gate is the callable itself, used as-is and named by its `__name__`
+    (its `repr` when it has none) in every message.
     """
     for entry in phase.gates:
-        if isinstance(entry, str):
-            name, gate = entry, workflow.function(entry)
-        else:
-            name, gate = getattr(entry, "__name__", repr(entry)), entry
+        name, gate = getattr(entry, "__name__", repr(entry)), entry
         kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
         try:
             verdict = gate(**kwargs)
@@ -403,7 +391,6 @@ class AgentRunner:
     this list when the walk returns.
     """
 
-    workflow: Workflow
     store: Store
     launcher: LauncherFn
     run_id: str
@@ -421,7 +408,7 @@ class AgentRunner:
 
     def __call__(
         self,
-        phase: AnyAgentPhase,
+        phase: phase_model.AgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
     ) -> Any:
@@ -484,7 +471,7 @@ class AgentRunner:
 
     def _attempt(
         self,
-        phase: AnyAgentPhase,
+        phase: phase_model.AgentPhase,
         context: Mapping[str, Any],
         rendered: prompt.RenderedPrompt,
         feedback: Sequence[str],
@@ -553,7 +540,6 @@ class AgentRunner:
         if verdict.status == "ok":
             failure = evaluate_gates(
                 phase,
-                self.workflow,
                 gate_values(context, phase.name, verdict.result),
                 self.warnings,
             )
@@ -591,7 +577,7 @@ class AgentRunner:
 
     def _record_phase(
         self,
-        phase: AnyAgentPhase,
+        phase: phase_model.AgentPhase,
         status: models.Status,
         started_at: datetime,
         ended_at: datetime | None,
@@ -610,7 +596,7 @@ class AgentRunner:
             ),
         )
 
-    def _record_attempt(self, phase: AnyAgentPhase, attempt: models.Attempt) -> None:
+    def _record_attempt(self, phase: phase_model.AgentPhase, attempt: models.Attempt) -> None:
         self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
 
 

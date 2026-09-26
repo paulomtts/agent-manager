@@ -33,7 +33,6 @@ from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
 from agent_manager.workflow import integrate as integrate_workflow
-from agent_manager.workflow.loader import load_builtin
 
 PHASE = "integrate"
 """The `phase` every Integrate escalation names."""
@@ -42,9 +41,6 @@ INTEGRATE_STORY_ID = "integrate"
 """The synthetic story every resolver subtask hangs from (addendum I3)."""
 
 INTEGRATE_STORY_TITLE = "Integrate"
-
-WORKFLOW_NAME = "integrate"
-"""The builtin document a conflicting tip is resolved with."""
 
 
 @dataclass(frozen=True)
@@ -144,7 +140,6 @@ def _resolve_conflict(
     phase. The caller has already recorded the synthetic story. The walk is
     `runtime.engine.run_subtask` over `workflow.integrate.INTEGRATE`.
     """
-    workflow = load_builtin(WORKFLOW_NAME)
     subtask = models.SubtaskRun(
         card_id=story_id,
         branch=branch,
@@ -154,7 +149,6 @@ def _resolve_conflict(
     )
     store.record_subtask(INTEGRATE_STORY_ID, subtask)
     runner = runner_factory(
-        workflow=workflow,
         store=store,
         run_id=run_id,
         story_id=INTEGRATE_STORY_ID,

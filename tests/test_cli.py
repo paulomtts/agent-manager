@@ -43,7 +43,6 @@ from agent_manager.errors import AgentPhaseFailed, EngineError
 from agent_manager.steps.reducers import verification_gate
 
 from agent_manager.runtime import engine as runtime_engine
-from agent_manager.workflow import loader
 from agent_manager.workflow import task as task_workflow
 
 
@@ -1552,9 +1551,7 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
     assert drive.summary.status == "done"
     assert drive.warnings == []
     (factory_call,) = seen
-    assert isinstance(factory_call["workflow"], loader.Workflow)
-    assert factory_call["workflow"].name == cli.WORKFLOW_NAME
-    assert {key: value for key, value in factory_call.items() if key != "workflow"} == {
+    assert factory_call == {
         "store": store,
         "run_id": DRIVE_RUN_ID,
         "story_id": DRIVE_PARENT.id,
@@ -3639,7 +3636,7 @@ def _resume_factory(
 ):
     """A `cli.RunnerFactory` handing `recording_runner` the store the CLI opened."""
 
-    def factory(*, workflow, store, run_id, story_id, card_id):
+    def factory(*, store, run_id, story_id, card_id):
         return recording_runner(
             store=store,
             run_id=run_id,

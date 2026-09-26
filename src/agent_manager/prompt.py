@@ -38,8 +38,8 @@ from agent_manager.roles.loader import RoleBundle
 class PromptPhase(Protocol):
     """The three things rendering reads from an agent phase, and nothing else.
 
-    Structural, so both the YAML `workflow.loader.AgentPhase` and the declared
-    `workflow.phases.AgentPhase` satisfy it without either being imported here.
+    Structural, so the declared `workflow.phases.AgentPhase` satisfies it
+    without being imported here.
     Read-only properties, because a frozen dataclass and a frozen pydantic model
     both expose these as attributes that must not be assigned.
     """

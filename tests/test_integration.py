@@ -43,7 +43,6 @@ from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
 from agent_manager.store import Store
 from agent_manager.workflow import integrate as integrate_workflow
-from agent_manager.workflow import loader
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -324,18 +323,10 @@ class FakeFactory:
     resolver: FakeResolver = field(default_factory=FakeResolver)
     calls: list[dict[str, str]] = field(default_factory=list)
 
-    def __call__(self, *, workflow, store, run_id, story_id, card_id):
-        self.calls.append(
-            {
-                "workflow": workflow.name,
-                "run_id": run_id,
-                "story_id": story_id,
-                "card_id": card_id,
-            }
-        )
+    def __call__(self, *, store, run_id, story_id, card_id):
+        self.calls.append({"run_id": run_id, "story_id": story_id, "card_id": card_id})
         adapter = _FakeAdapter()
         return dispatch.AgentRunner(
-            workflow=workflow,
             store=store,
             launcher=self.resolver,
             run_id=run_id,
@@ -573,7 +564,7 @@ def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     assert outcome.merged == [STORY_A, STORY_B]
     assert outcome.resolved == [STORY_B]
     assert factory.calls == [
-        {"workflow": "integrate", "run_id": RUN_ID, "story_id": "integrate", "card_id": STORY_B}
+        {"run_id": RUN_ID, "story_id": "integrate", "card_id": STORY_B}
     ]
     assert factory.resolver.calls == [["shared.txt"]]
     assert _merge_head(repo.worktree) is None
@@ -643,7 +634,7 @@ def test_resolve_conflict_walks_integrate_with_the_same_arguments(
     monkeypatch, tmp_path: Path
 ) -> None:
     """Spec test 4: `INTEGRATE` on the pygents walk, with no `card`, no
-    `parent_story` and no `resume_from`, and the factory gets the YAML document."""
+    `parent_story` and no `resume_from`, and the factory gets only the store and the three ids."""
     walks = _stub_walk(monkeypatch)
     factory_calls: list[dict[str, Any]] = []
     runner = object()
@@ -681,9 +672,7 @@ def test_resolve_conflict_walks_integrate_with_the_same_arguments(
         "agent_runner": runner,
     }
     (factory_call,) = factory_calls
-    assert isinstance(factory_call["workflow"], loader.Workflow)
-    assert factory_call["workflow"].name == "integrate"
-    assert {key: value for key, value in factory_call.items() if key != "workflow"} == {
+    assert factory_call == {
         "store": store,
         "run_id": RUN_ID,
         "story_id": "integrate",

@@ -33,8 +33,6 @@ from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
 from agent_manager.runtime import bridge
 from agent_manager.workflow import phases
-from agent_manager.workflow.loader import load_workflow
-from agent_manager.workflow.registry import FunctionRegistry
 
 RUN_ID = "run-2026-09-23-01"
 CARD = "bf8e415b"
@@ -462,46 +460,22 @@ def test_stdout_is_never_the_channel(tmp_path):
     assert verdict.status == "schema_invalid"
 
 
-AGENT_DOCUMENT = """
-name: agentic
-phases:
-  - name: explore
-    kind: agent
-    role: explorer
-    result: FakeResult
-    gates: [output_gate]
-    retry: { max_attempts: 2, on: [schema_invalid, gate_failed] }
-"""
+def AGENT_DOCUMENT(functions: dict[str, object]) -> phases.Workflow:
+    """One `explore` phase: role `explorer`, result `FakeResult`, gated by
+    `functions["output_gate"]`, retried twice on `schema_invalid` and
+    `gate_failed` -- the declared twin of the YAML document it replaced."""
+    return _agentic(functions["output_gate"])
 
 
-def _workflow(document: str, functions: dict[str, object]):
-    registry = FunctionRegistry()
-    for name, fn in functions.items():
-        registry.register(name, fn)
-    return load_workflow(document, registry)
+def _agentic(*gates, **overrides) -> phases.Workflow:
+    """A one-phase workflow around `_model_phase`, carrying AGENT_DOCUMENT's
+    retry policy unless `overrides` replaces it."""
+    fields = {"retry": phases.Retry(2, ("schema_invalid", "gate_failed")), **overrides}
+    return phases.Workflow("agentic", (_model_phase(*gates, **fields),))
 
 
-def test_a_passing_gate_returns_no_verdict():
-    seen: list[object] = []
-
-    def output_gate(result):
-        seen.append(result)
-        return None
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-    phase = workflow.phase("explore")
-    warnings: list[str] = []
-
-    verdict = dispatch.evaluate_gates(
-        phase,
-        workflow,
-        dispatch.gate_values({"card": CARD}, "explore", {"summary": "ok"}),
-        warnings,
-    )
-
-    assert verdict is None
-    assert seen == [{"summary": "ok"}]
-    assert warnings == []
+def _workflow(document, functions: dict[str, object]) -> phases.Workflow:
+    return document(functions)
 
 
 def test_the_result_is_bound_under_both_result_and_the_phase_name():
@@ -520,120 +494,6 @@ def test_a_reserved_key_is_not_overwritten_by_a_same_named_phase():
     assert "worktree" in engine.RESERVED_CONTEXT_KEYS
 
 
-def test_a_failing_gate_returns_a_retryable_gate_failed_verdict():
-    def output_gate(result):
-        return {"blocked": "exploration", "detail": "summary is a placeholder"}
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-
-    verdict = dispatch.evaluate_gates(
-        workflow.phase("explore"),
-        workflow,
-        dispatch.gate_values({}, "explore", {"summary": "test"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is False
-    assert "summary is a placeholder" in verdict.detail
-    assert "'output_gate'" in verdict.detail
-
-
-def test_a_warning_gate_is_recorded_and_does_not_fail_the_attempt():
-    def output_gate(result):
-        return {"warn": "counts unusable, plan-hash check skipped"}
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-    warnings: list[str] = []
-
-    verdict = dispatch.evaluate_gates(
-        workflow.phase("explore"),
-        workflow,
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        warnings,
-    )
-
-    assert verdict is None
-    assert warnings == [
-        "phase 'explore' gate 'output_gate' warned: counts unusable, plan-hash check skipped"
-    ]
-
-
-def test_a_gate_that_raises_is_a_fatal_gate_failure():
-    # Review Focus / spec error paths: never swallowed, never retried, even
-    # though this phase lists gate_failed in retry.on.
-    def output_gate(result):
-        raise RuntimeError("the gate itself is broken")
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-
-    verdict = dispatch.evaluate_gates(
-        workflow.phase("explore"),
-        workflow,
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is True
-    assert "RuntimeError" in verdict.detail
-    assert "the gate itself is broken" in verdict.detail
-
-
-def test_a_gate_returning_a_non_mapping_is_a_fatal_gate_failure():
-    def output_gate(result):
-        return "looks fine to me"
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-
-    verdict = dispatch.evaluate_gates(
-        workflow.phase("explore"),
-        workflow,
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is True
-    assert "str" in verdict.detail
-
-
-def test_a_gate_whose_parameter_nothing_supplies_is_a_named_engine_error():
-    def output_gate(result, provided_verification):
-        return None
-
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
-
-    with pytest.raises(EngineError) as caught:
-        dispatch.evaluate_gates(
-            workflow.phase("explore"),
-            workflow,
-            dispatch.gate_values({}, "explore", {"summary": "ok"}),
-            [],
-        )
-
-    assert caught.value.parameter == "provided_verification"
-    assert caught.value.function == "output_gate"
-
-
-# ── phase-model phases (workflow.phases.AgentPhase) ──────────────────────────
-
-
-class _NoLookupWorkflow:
-    """A workflow whose name table must never be consulted.
-
-    A phase-model phase carries its gates as callables, so nothing about it
-    should reach `workflow.function`; any call is recorded and fails loudly.
-    """
-
-    def __init__(self) -> None:
-        self.looked_up: list[object] = []
-
-    def function(self, name):
-        self.looked_up.append(name)
-        raise AssertionError(f"workflow.function({name!r}) was called for a callable gate")
-
-
 def _model_phase(*gates, **overrides) -> phases.AgentPhase:
     """A declared `phases.AgentPhase` shaped like AGENT_DOCUMENT's explore phase."""
     fields = {
@@ -648,11 +508,8 @@ def _model_phase(*gates, **overrides) -> phases.AgentPhase:
 
 
 def test_callable_gate_is_called_directly():
-    workflow = _NoLookupWorkflow()
-
     verdict = dispatch.evaluate_gates(
         _model_phase(lambda result: {"blocked": "x", "detail": "d"}),
-        workflow,
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         [],
     )
@@ -660,7 +517,6 @@ def test_callable_gate_is_called_directly():
     assert verdict.status == "gate_failed"
     assert verdict.fatal is False
     assert verdict.detail == "phase 'explore' gate '<lambda>' failed: blocked=x, detail=d"
-    assert workflow.looked_up == []
 
 
 def test_a_passing_callable_gate_sees_the_result():
@@ -672,7 +528,6 @@ def test_a_passing_callable_gate_sees_the_result():
 
     verdict = dispatch.evaluate_gates(
         _model_phase(output_gate),
-        _NoLookupWorkflow(),
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         [],
     )
@@ -687,7 +542,6 @@ def test_a_callable_gate_that_raises_is_fatal_and_named_by_its_function_name():
 
     verdict = dispatch.evaluate_gates(
         _model_phase(output_gate),
-        _NoLookupWorkflow(),
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         [],
     )
@@ -700,7 +554,6 @@ def test_a_callable_gate_that_raises_is_fatal_and_named_by_its_function_name():
 def test_a_callable_gate_returning_a_non_mapping_is_fatal_and_named_lambda():
     verdict = dispatch.evaluate_gates(
         _model_phase(lambda result: "looks fine to me"),
-        _NoLookupWorkflow(),
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         [],
     )
@@ -717,7 +570,6 @@ def test_a_callable_gate_with_an_unsupplied_parameter_is_a_named_engine_error():
     with pytest.raises(EngineError) as caught:
         dispatch.evaluate_gates(
             _model_phase(output_gate),
-            _NoLookupWorkflow(),
             dispatch.gate_values({}, "explore", {"summary": "ok"}),
             [],
         )
@@ -735,7 +587,6 @@ def test_a_callable_gate_warning_names_the_gate_by_its_function_name():
 
     verdict = dispatch.evaluate_gates(
         _model_phase(output_gate),
-        _NoLookupWorkflow(),
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         warnings,
     )
@@ -755,7 +606,6 @@ def test_a_callable_gate_without_a_name_is_named_by_its_repr():
 
     verdict = dispatch.evaluate_gates(
         _model_phase(gate),
-        _NoLookupWorkflow(),
         dispatch.gate_values({}, "explore", {"summary": "ok"}),
         [],
     )
@@ -783,7 +633,7 @@ def worktree(tmp_path):
     return path
 
 
-def _runner(store, workflow, launcher, tmp_path, worktree, **overrides):
+def _runner(store, launcher, tmp_path, worktree, **overrides):
     """A runner wired to the fakes, plus the adapter it was wired to.
 
     `overrides` replaces any keyword (e.g. `result_models={}`) rather than
@@ -792,7 +642,6 @@ def _runner(store, workflow, launcher, tmp_path, worktree, **overrides):
     adapter = overrides.pop("adapter", FakeAdapter())
     make_role(tmp_path / "bundles", methodology=overrides.pop("methodology", None))
     kwargs = {
-        "workflow": workflow,
         "store": store,
         "launcher": launcher,
         "run_id": RUN_ID,
@@ -834,7 +683,7 @@ def test_a_valid_result_with_passing_gates_is_the_phase_result(store, tmp_path, 
     # Spec tests 1 and 2.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, adapter = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, adapter = _runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -859,7 +708,7 @@ def test_the_injected_launcher_is_the_only_way_a_process_could_start(
     monkeypatch.setattr(subprocess, "Popen", explode)
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, adapter = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, adapter = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -870,7 +719,7 @@ def test_the_injected_launcher_is_the_only_way_a_process_could_start(
 
 def test_usage_parsed_from_the_log_is_journalled_on_the_attempt(store, tmp_path, worktree):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    runner, _ = _runner(store, workflow, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree)
+    runner, _ = _runner(store, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -892,7 +741,7 @@ def test_a_persistently_invalid_result_retries_to_max_attempts_then_fails(
     # Spec tests 4, 10 and 12.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -916,7 +765,7 @@ def test_a_non_json_result_is_schema_invalid_and_retried(store, tmp_path, worktr
     # Spec test 5.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[NOT_JSON, VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -932,7 +781,7 @@ def test_a_missing_result_file_is_harness_error_and_is_not_retried(store, tmp_pa
     # attempts remaining does not mean a re-dispatch.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[None])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -946,7 +795,7 @@ def test_a_non_zero_exit_is_harness_error(store, tmp_path, worktree):
     # Spec test 7.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT], exit_code=3)
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -959,7 +808,7 @@ def test_a_timeout_is_harness_error_and_the_log_survives(store, tmp_path, worktr
     # Spec test 8.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[None], exit_code=None, timed_out=True)
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -979,7 +828,7 @@ def test_a_retryable_gate_failure_re_dispatches_with_the_gate_detail(
 
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -995,12 +844,12 @@ def test_a_retryable_gate_failure_re_dispatches_with_the_gate_detail(
 
 def test_a_gate_failure_outside_retry_on_is_not_retried(store, tmp_path, worktree):
     # Spec test 13, the gate_failed half.
-    document = AGENT_DOCUMENT.replace(
-        "on: [schema_invalid, gate_failed]", "on: [schema_invalid]"
-    )
+    def document(functions):
+        return _agentic(functions["output_gate"], retry=phases.Retry(2, ("schema_invalid",)))
+
     workflow = _workflow(document, {"output_gate": lambda result: {"blocked": "exploration"}})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1016,7 +865,7 @@ def test_a_gate_that_raises_stops_after_one_dispatch(store, tmp_path, worktree):
 
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1029,17 +878,12 @@ def test_a_gate_that_raises_stops_after_one_dispatch(store, tmp_path, worktree):
 def test_a_phase_with_no_retry_block_dispatches_exactly_once(store, tmp_path, worktree):
     # Review Focus: builtin/task.yaml's spec, plan, implement and review phases
     # carry no retry: block at all.
-    document = """
-name: agentic
-phases:
-  - name: explore
-    kind: agent
-    role: explorer
-    result: FakeResult
-"""
+    def document(functions):
+        return _agentic(retry=None)
+
     workflow = _workflow(document, {})
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1051,17 +895,14 @@ phases:
 def test_a_phase_with_no_result_model_declared_needs_no_table_entry(
     store, tmp_path, worktree
 ):
-    document = """
-name: agentic
-phases:
-  - name: spec
-    kind: agent
-    role: explorer
-    writes: docs/superpowers/specs/{stem}.md
-"""
+    def document(functions):
+        return _agentic(
+            name="spec", result=None, retry=None, writes="docs/superpowers/specs/{stem}.md"
+        )
+
     workflow = _workflow(document, {})
     launcher = FakeLauncher(results=[None])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("spec"), _context(worktree), _rendered())
 
@@ -1077,24 +918,22 @@ phases:
     assert terminal["result_path"].endswith("spec.1/result.json")
 
 
-SPEC_DOCUMENT = """
-name: agentic
-phases:
-  - name: spec
-    kind: agent
-    role: explorer
-    result: SpecResult
-    writes: docs/superpowers/specs/{stem}.md
-"""
+def SPEC_DOCUMENT(functions: dict[str, object]) -> phases.Workflow:
+    """One `spec` phase: role `explorer`, result `SpecResult`, writing the spec."""
+    return _agentic(
+        name="spec",
+        result=results.SpecResult,
+        retry=None,
+        writes="docs/superpowers/specs/{stem}.md",
+    )
 
 VALID_SPEC_RESULT = json.dumps({"path": "docs/superpowers/specs/task-x.md", "note": None})
 SPEC_RESULT_WITHOUT_PATH = json.dumps({"note": None})
 
 
-def _spec_runner(store, workflow, launcher, tmp_path, worktree):
+def _spec_runner(store, launcher, tmp_path, worktree):
     return _runner(
         store,
-        workflow,
         launcher,
         tmp_path,
         worktree,
@@ -1107,7 +946,7 @@ def test_a_spec_phase_validates_its_result_and_returns_the_json_dump(
 ):
     workflow = _workflow(SPEC_DOCUMENT, {})
     launcher = FakeLauncher(results=[VALID_SPEC_RESULT])
-    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _spec_runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("spec"), _context(worktree), _rendered())
 
@@ -1124,7 +963,7 @@ def test_a_spec_result_missing_path_is_schema_invalid_and_fails_the_phase(
 ):
     workflow = _workflow(SPEC_DOCUMENT, {})
     launcher = FakeLauncher(results=[SPEC_RESULT_WITHOUT_PATH])
-    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _spec_runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("spec"), _context(worktree), _rendered())
@@ -1141,7 +980,7 @@ def test_a_spec_attempt_that_writes_no_result_file_is_a_harness_error(
 ):
     workflow = _workflow(SPEC_DOCUMENT, {})
     launcher = FakeLauncher(results=[None])
-    runner, _ = _spec_runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _spec_runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("spec"), _context(worktree), _rendered())
@@ -1150,24 +989,10 @@ def test_a_spec_attempt_that_writes_no_result_file_is_a_harness_error(
     assert "no result file" in caught.value.detail
 
 
-def test_an_unregistered_result_model_is_a_named_engine_error(store, tmp_path, worktree):
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(
-        store, workflow, launcher, tmp_path, worktree, result_models={}
-    )
-
-    with pytest.raises(EngineError) as caught:
-        runner(workflow.phase("explore"), _context(worktree), _rendered())
-
-    assert caught.value.phase == "explore"
-    assert launcher.calls == []
-
-
 def test_a_context_with_no_worktree_is_a_named_engine_error(store, tmp_path, worktree):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(EngineError) as caught:
         runner(workflow.phase("explore"), {"card": CARD, "worktree": None}, _rendered())
@@ -1188,7 +1013,7 @@ def test_the_journal_holds_the_edge_even_when_the_row_write_fails(
     opened = ExplodingStore.open(tmp_path / "repo", RUN_ID)
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(opened, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(opened, launcher, tmp_path, worktree)
 
     try:
         with pytest.raises(RuntimeError, match="the projection is on fire"):
@@ -1204,15 +1029,9 @@ def test_all_four_outcome_names_are_journalled_as_distinct_values(
     store, tmp_path, worktree
 ):
     # Spec test 17: one runner, four phases, four different journalled outcomes.
-    document = """
-name: four
-phases:
-  - name: explore
-    kind: agent
-    role: explorer
-    result: FakeResult
-    gates: [output_gate]
-"""
+    def document(functions):
+        return _agentic(functions["output_gate"], retry=None)
+
     gate_verdicts = {"good": None, "bad": {"blocked": "exploration"}}
     mode = {"gate": "good"}
 
@@ -1231,7 +1050,7 @@ phases:
     ):
         mode["gate"] = gate
         launcher = FakeLauncher(results=[canned], exit_code=exit_code)
-        runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+        runner, _ = _runner(store, launcher, tmp_path, worktree)
         try:
             runner(phase, _context(worktree), _rendered())
             seen.append("ok")
@@ -1252,7 +1071,7 @@ def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path,
         raise OSError("the run directory went away")
 
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    runner, _ = _runner(store, workflow, explode, tmp_path, worktree)
+    runner, _ = _runner(store, explode, tmp_path, worktree)
 
     with pytest.raises(OSError, match="the run directory went away"):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1275,7 +1094,6 @@ def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path,
 
 def test_a_default_runner_carries_the_shipped_result_model_table(store):
     runner = dispatch.AgentRunner(
-        workflow=_workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None}),
         store=store,
         launcher=FakeLauncher(results=[VALID_RESULT]),
         run_id=RUN_ID,
@@ -1296,7 +1114,6 @@ def test_the_production_runner_factory_carries_the_shipped_table(store):
     # `cli.default_runner_factory` omits `result_models` on purpose. This is the
     # path the addendum section 1 smoke takes, and the only test that walks it.
     runner = cli.default_runner_factory(
-        workflow=_workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None}),
         store=store,
         run_id=RUN_ID,
         story_id=STORY_ID,
@@ -1330,7 +1147,7 @@ def test_the_prompt_the_launcher_is_pointed_at_is_the_full_brief(
     # inputs, then this attempt's own result path, in that order.
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1349,7 +1166,7 @@ def test_the_result_contract_embeds_the_phases_result_schema(store, tmp_path, wo
     # against, so instruction and validator cannot drift.
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1363,17 +1180,14 @@ def test_a_phase_with_no_declared_result_gets_no_result_contract(
     store, tmp_path, worktree
 ):
     # Spec test 6 / Review Focus 4: no contract at all, not a half-contract error.
-    document = """
-name: agentic
-phases:
-  - name: spec
-    kind: agent
-    role: explorer
-    writes: docs/superpowers/specs/{stem}.md
-"""
+    def document(functions):
+        return _agentic(
+            name="spec", result=None, retry=None, writes="docs/superpowers/specs/{stem}.md"
+        )
+
     workflow = _workflow(document, {})
     launcher = FakeLauncher(results=[None])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = runner(workflow.phase("spec"), _context(worktree), _rendered())
 
@@ -1392,7 +1206,7 @@ def test_the_journalled_prompt_path_is_the_file_the_launcher_was_pointed_at(
     # are one and the same thing.
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1421,7 +1235,7 @@ def test_a_role_with_no_methodology_still_composes_a_brief(store, tmp_path, work
     # Review Focus 1: RoleBundle.methodology defaults to {} and that is legal.
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree, methodology={})
+    runner, _ = _runner(store, launcher, tmp_path, worktree, methodology={})
 
     result = runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1440,7 +1254,7 @@ def test_a_methodology_documents_own_headings_survive_into_the_brief(
     # the brief hands the agent the text, byte for byte.
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1465,7 +1279,7 @@ def test_a_prompt_that_cannot_be_written_is_a_named_engine_error(
     monkeypatch.setattr(Path, "write_text", refuse)
     launcher = FakeLauncher(results=[VALID_RESULT])
     workflow = _gated_workflow()
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(EngineError) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1483,7 +1297,7 @@ def test_a_retry_prompt_carries_the_feedback_after_exactly_one_contract(
     # base, so the contract cannot be duplicated by a re-composition.
     workflow = _gated_workflow()
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1502,10 +1316,13 @@ def test_a_third_attempt_accumulates_both_feedback_blocks_with_one_contract(
     # Spec test 4: §6 step 7's "the prior prompt plus the feedback block",
     # preserved now that the accumulation lives in the loop rather than in the
     # RenderedPrompt.
-    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    def document(functions):
+        return _agentic(
+            functions["output_gate"], retry=phases.Retry(3, ("schema_invalid", "gate_failed"))
+        )
     workflow = _workflow(document, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1522,7 +1339,7 @@ def test_each_attempts_prompt_names_its_own_result_path(store, tmp_path, worktre
     # result file -- classify() reads this attempt's path and nothing else.
     workflow = _gated_workflow()
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1542,7 +1359,7 @@ def test_a_retry_changes_only_the_result_path_and_the_feedback(
     # attempt 1's, so a retry is the same brief plus one appended section.
     workflow = _gated_workflow()
     launcher = FakeLauncher(results=[INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1562,10 +1379,13 @@ def test_accumulated_feedback_blocks_keep_the_order_they_were_produced(
 ):
     # Spec invariant 5: a third attempt carries both earlier complaints, oldest
     # first, so the agent reads its own history forwards and not backwards.
-    document = AGENT_DOCUMENT.replace("max_attempts: 2", "max_attempts: 3")
+    def document(functions):
+        return _agentic(
+            functions["output_gate"], retry=phases.Retry(3, ("schema_invalid", "gate_failed"))
+        )
     workflow = _workflow(document, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[NOT_JSON, INVALID_RESULT, INVALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     with pytest.raises(AgentPhaseFailed):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -1583,10 +1403,9 @@ CRITIC_RESULT = json.dumps({"blockers": False, "reason": None, "summary": "no bl
 
 
 def test_result_class_is_used_directly(store, tmp_path, worktree):
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[CRITIC_RESULT])
     runner, _ = _runner(
-        store, workflow, launcher, tmp_path, worktree, result_models={}
+        store, launcher, tmp_path, worktree, result_models={}
     )
 
     result = runner(
@@ -1607,7 +1426,6 @@ def test_a_result_class_wins_over_a_same_named_table_entry(store, tmp_path, work
     launcher = FakeLauncher(results=[VALID_RESULT])
     runner, _ = _runner(
         store,
-        workflow,
         launcher,
         tmp_path,
         worktree,
@@ -1625,10 +1443,9 @@ def test_a_result_class_wins_over_a_same_named_table_entry(store, tmp_path, work
 
 
 def test_phase_model_retry_is_honoured(store, tmp_path, worktree):
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[INVALID_RESULT, CRITIC_RESULT])
     runner, _ = _runner(
-        store, workflow, launcher, tmp_path, worktree, result_models={}
+        store, launcher, tmp_path, worktree, result_models={}
     )
     phase = _model_phase(
         result=results.CriticResult, retry=phases.Retry(2, ("schema_invalid",))
@@ -1647,10 +1464,9 @@ def test_phase_model_retry_is_honoured(store, tmp_path, worktree):
 def test_phase_model_retry_does_not_retry_an_outcome_outside_on(store, tmp_path, worktree):
     # The `on` half of the duck-typed read: gate_failed is not in `on`, so one
     # dispatch only, even with attempts left.
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[CRITIC_RESULT])
     runner, _ = _runner(
-        store, workflow, launcher, tmp_path, worktree, result_models={}
+        store, launcher, tmp_path, worktree, result_models={}
     )
     phase = _model_phase(
         lambda result: {"blocked": "critic"},
@@ -1687,7 +1503,7 @@ async def test_a_launcher_that_declares_on_spawn_gets_the_bridge_calls_hook(
 ):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = SpawnAwareLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = await bridge.call_agent(
         runner, workflow.phase("explore"), _context(worktree), _rendered()
@@ -1703,7 +1519,7 @@ def test_a_launcher_that_declares_on_spawn_gets_none_outside_a_bridge_call(
 ):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = SpawnAwareLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
@@ -1715,7 +1531,7 @@ async def test_a_launcher_without_on_spawn_still_works_inside_a_bridge_call(
 ):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT])
-    runner, _ = _runner(store, workflow, launcher, tmp_path, worktree)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     result = await bridge.call_agent(
         runner, workflow.phase("explore"), _context(worktree), _rendered()
