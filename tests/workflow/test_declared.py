@@ -110,3 +110,8 @@ def test_declared_modules_never_import_pygents():
     for module in (task_module, integrate_module):
         imported = _imported_modules(module)
         assert not any(n == "pygents" or n.startswith("pygents.") for n in imported), module.__name__
+
+
+def test_each_validation_phase_names_its_own_critic():
+    assert TASK.phase("validate_spec").role == "spec_critic"
+    assert TASK.phase("validate_plan").role == "plan_critic"

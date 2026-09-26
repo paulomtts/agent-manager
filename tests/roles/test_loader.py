@@ -6,7 +6,7 @@ no network -- so it sits in the Pure-functions/unit tier alongside
 `tests/test_models.py`, not in the Steps tier (`tests/steps/`, temp git repos)
 and not in the Adapters tier (`harness/*.py`, a sibling card).
 
-Synthetic bundles are built in `tmp_path` for every error path; the seven shipped
+Synthetic bundles are built in `tmp_path` for every error path; the eight shipped
 bundles are exercised through the same public API, because §8 makes the bundles
 themselves part of the contract.
 """
@@ -448,7 +448,6 @@ def test_a_symlinked_methodology_file_is_rejected(tmp_path):
 
 SHIPPED = [
     "coder",
-    "critic",
     "explorer",
     "plan_critic",
     "planner",
@@ -462,7 +461,6 @@ DEFAULT_MODELS = {
     "explorer": "sonnet",
     "spec_author": "opus",
     "planner": "opus",
-    "critic": "sonnet",
     "spec_critic": "sonnet",
     "plan_critic": "sonnet",
     "coder": "sonnet",
@@ -478,8 +476,8 @@ def shipped_lock(role: str) -> list[dict[str, str]]:
     return tomllib.loads(path.read_text(encoding="utf-8"))["vendored"]
 
 
-def test_list_roles_returns_exactly_the_nine_shipped_roles():
-    assert len(SHIPPED) == 9
+def test_list_roles_returns_exactly_the_eight_shipped_roles():
+    assert len(SHIPPED) == 8
     assert loader.list_roles() == SHIPPED
 
 

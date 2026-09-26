@@ -62,7 +62,7 @@ TASK = Workflow("task", (
     ),
     AgentPhase(
         "validate_spec",
-        role="critic",
+        role="spec_critic",
         inputs=("card", "spec_path"),
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),
@@ -78,7 +78,7 @@ TASK = Workflow("task", (
     ),
     AgentPhase(
         "validate_plan",
-        role="critic",
+        role="plan_critic",
         inputs=("spec_path", "plan_path"),
         result=results.CriticResult,
         gates=(reducers.critic_blockers_gate,),

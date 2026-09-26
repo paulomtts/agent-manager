@@ -8,6 +8,7 @@ gate that binds and returns the wrong verdict is the failure this file exists
 to catch."""
 
 import inspect
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from agent_manager.results import (
     Verification,
     resolve_result_model,
 )
+from agent_manager.roles.loader import load_role
 from agent_manager.workflow import load_builtin
 from agent_manager.workflow.loader import (
     AgentPhase,
@@ -330,6 +332,23 @@ def test_both_validation_phases_resolve_to_the_same_critic_model() -> None:
 
     assert spec_model is plan_model
     assert spec_model is CriticResult
+
+
+def test_each_validation_phase_names_its_own_critic_in_the_yaml() -> None:
+    workflow = load_builtin("task")
+    assert workflow.phase("validate_spec").role == "spec_critic"
+    assert workflow.phase("validate_plan").role == "plan_critic"
+
+
+@pytest.mark.parametrize("phase_name", ["validate_spec", "validate_plan"])
+def test_each_critic_brief_names_only_its_phases_inputs(phase_name: str) -> None:
+    """A brief that points at `## card` in a phase that never renders a card
+    section sends the agent looking for text that is not there."""
+    phase = load_builtin("task").phase(phase_name)
+    assert isinstance(phase, AgentPhase)
+    named = set(re.findall(r"`## (\w+)`", load_role(phase.role).system))
+    assert named, "the brief names none of its input sections"
+    assert named <= set(phase.inputs), named - set(phase.inputs)
 
 
 # ── acceptance #2: every gate binds against a real result object ─────────────

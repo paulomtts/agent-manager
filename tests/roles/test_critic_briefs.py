@@ -9,7 +9,7 @@ no git repository, no harness; same tier as `test_loader.py` and
 
 import pytest
 
-from agent_manager.roles.loader import load_role
+from agent_manager.roles.loader import RoleBundleError, load_role
 from agent_manager.steps.plan_check import VALIDATED_MARKER
 
 CRITICS = ("spec_critic", "plan_critic")
@@ -79,3 +79,10 @@ def test_critic_policy_is_the_generic_critic_policy_unchanged(role):
     assert bundle.policy.required_capabilities == []
     assert bundle.policy.default_model == {"claude": "sonnet"}
     assert bundle.methodology == {}
+
+
+def test_the_generic_critic_is_gone():
+    with pytest.raises(RoleBundleError) as excinfo:
+        load_role("critic")
+
+    assert excinfo.value.reason == "no such role bundle"

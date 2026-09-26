@@ -1,6 +1,0 @@
-allowed_tools = ["Read", "Grep", "Glob"]
-max_attempts = 1
-required_capabilities = []
-
-[default_model]
-claude = "sonnet"
