@@ -4326,3 +4326,76 @@ def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
     assert envelope["error"]["type"] == "CheckpointMismatchError"
     assert "workflow changed since checkpoint" in envelope["error"]["message"]
     assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
+    """The factory is patched on the module rather than passed as an option: the
+    injection seam is `cli.default_runner_factory`, and patching it is what
+    proves the command reaches for that name."""
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "done"
+    assert envelope["data"]["resumed_from"] == "plan"
+    assert envelope["data"]["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    assert "\n" not in result.stdout.strip()
+
+
+@requires_git
+@requires_brd
+def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = runner.invoke(
+        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
+    """An escalation is a truthful result, so the envelope stays `ok: true` and
+    the exit code carries the full stop -- exactly as `run` does."""
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(
+        cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
+    )
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == "escalated"
+    assert envelope["data"]["failed_phase"] == "review"
+    assert envelope["data"]["resumed_from"] == "plan"
+
+
+@requires_git
+@requires_brd
+def test_resume_launches_no_harness(project, cards, monkeypatch):
+    """§14's adapter rule at the resume seam: the launcher is injected, so a
+    resume that got as far as launching one has already failed."""
+    run_id = _crash_pygents(project, cards, "plan")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("resume launched a harness process")
+
+    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done"
