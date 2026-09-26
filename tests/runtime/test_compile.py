@@ -6,6 +6,7 @@ real temp SQLite projection plus a real temp JSONL journal, built as
 tests/test_engine.py builds it. No git, no board, no harness process.
 """
 
+import asyncio
 import itertools
 import threading
 from datetime import datetime, timedelta, timezone
@@ -60,8 +61,7 @@ def _deps(workflow, store, runner=None) -> state.RunDeps:
     )
 
 
-async def _drive(workflow, deps) -> Agent:
-    compiled = C.compile_workflow(workflow)
+async def _new_agent(compiled) -> Agent:
     agent = Agent(
         f"run:{next(_agent_names)}",
         "test run",
@@ -71,11 +71,20 @@ async def _drive(workflow, deps) -> Agent:
         tags=["subtask"],
     )
     await agent.context_pool.add(context.seed_item({"worktree": "/w"}))
+    await agent.put(compiled.first_turn())
+    return agent
+
+
+async def _consume(agent) -> None:
+    async for _ in agent.run():
+        pass
+
+
+async def _drive(workflow, deps) -> Agent:
+    agent = await _new_agent(C.compile_workflow(workflow))
     token = state.current_run.set(deps)
     try:
-        await agent.put(compiled.first_turn())
-        async for _ in agent.run():
-            pass
+        await _consume(agent)
     finally:
         state.current_run.reset(token)
     return agent
@@ -367,3 +376,115 @@ async def test_an_agent_phase_with_no_runner_injected_raises_the_old_engines_err
     assert str(info.value) == (
         "phase 'review': is an agent phase, but no agent runner was injected"
     )
+
+
+# Goto revision loops end to end (pygents-engine design G4, §5; card b904b9e7).
+# A critic (`validate_spec`) loops back to the phase it reviews (`spec`) at most
+# once, and a successor (`plan`) only runs once the critic passes -- the shape
+# the built-in task workflow will take.
+
+FEEDBACK_ITEM = {"for": "spec", "from": "validate_spec", "detail": "no error path"}
+LOOP_ORDER = ["spec", "validate_spec", "spec", "validate_spec", "plan"]
+
+
+def _loop_workflow() -> Workflow:
+    return Workflow("loops", (
+        AgentPhase("spec", "spec_author", ("feedback",), None),
+        AgentPhase("validate_spec", "critic", (), None, on_fail=Goto("spec", 1)),
+        AgentPhase("plan", "planner", (), None),
+    ))
+
+
+def _critic_fails(*details: str):
+    """A fake runner whose `validate_spec` fails with each detail in turn, then passes."""
+    calls: list[tuple[str, Any, str]] = []
+    remaining = list(details)
+
+    def runner(phase, ctx, rendered):
+        calls.append((phase.name, ctx.get("feedback"), rendered.text))
+        if phase.name == "validate_spec" and remaining:
+            raise AgentPhaseFailed(
+                "validate_spec", outcome="gate_failed", detail=remaining.pop(0)
+            )
+        return {"ok": True}
+
+    return runner, calls
+
+
+async def test_blockers_loop_back_once_then_pass(store):
+    runner, calls = _critic_fails("no error path")
+    wf = _loop_workflow()
+
+    agent = await _drive(wf, _deps(wf, store, runner))
+
+    assert [name for name, _, _ in calls] == LOOP_ORDER
+    # Review Focus: the critic's re-run and the successor see no feedback meant for spec.
+    assert [feedback for _, feedback, _ in calls] == [[], [], [FEEDBACK_ITEM], [], []]
+    assert calls[0][2] == "# phase: spec\n# role: spec_author\n"
+    assert calls[2][2] == (
+        "# phase: spec\n"
+        "# role: spec_author\n"
+        "\n"
+        "## feedback\n"
+        "Feedback from review\n"
+        "- validate_spec: no error path\n"
+    )
+    assert agent.context_pool.get("plan").content == {"ok": True}
+
+
+async def test_second_failure_escalates_validation(store):
+    runner, calls = _critic_fails("no error path", "still no error path")
+    wf = _loop_workflow()
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.phase == "validate_spec"
+    assert info.value.detail == "still no error path"
+    assert [name for name, _, _ in calls] == LOOP_ORDER[:4]
+    assert "plan" not in [name for name, _, _ in calls]
+
+
+async def _first_queued(agent, timeout: float = 5.0) -> list[dict[str, Any]]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        queue = agent.to_dict()["queue"]
+        if queue:
+            return queue
+        assert loop.time() < deadline, "no turn was queued after the critic failed"
+        await asyncio.sleep(0.01)
+
+
+async def test_loop_count_is_in_the_queued_turn(store):
+    in_critic = threading.Event()
+    release = threading.Event()
+    names: list[str] = []
+
+    def runner(phase, ctx, rendered):
+        names.append(phase.name)
+        if phase.name == "validate_spec" and names.count("validate_spec") == 1:
+            in_critic.set()
+            assert release.wait(5), "the test never released the critic"
+            raise AgentPhaseFailed("validate_spec", outcome="gate_failed", detail="no error path")
+        return {"ok": True}
+
+    wf = _loop_workflow()
+    compiled = C.compile_workflow(wf)
+    agent = await _new_agent(compiled)
+    token = state.current_run.set(_deps(wf, store, runner))
+    run = asyncio.create_task(_consume(agent))  # copies current_run into the task
+    state.current_run.reset(token)
+    try:
+        assert await asyncio.to_thread(in_critic.wait, 5), "the critic was never dispatched"
+        agent.pause()  # hold the next turn in the queue once the critic's turn ends
+        release.set()
+        queue = await _first_queued(agent)
+    finally:
+        release.set()
+        agent.resume()
+        await run
+
+    assert queue[0]["kwargs"] == {"phase": "spec", "loop": 1}
+    assert queue[0]["tool_name"] == compiled.agent_phase.__name__
+    assert names == LOOP_ORDER
