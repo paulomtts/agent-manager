@@ -31,7 +31,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 from agent_manager import dag, models
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.roles.loader import RoleBundle
 
 

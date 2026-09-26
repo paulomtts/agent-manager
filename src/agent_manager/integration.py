@@ -26,9 +26,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_manager import cli, dag, engine, models
+from agent_manager import cli, dag, models
 from agent_manager.census import StoryPlan
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
@@ -133,7 +134,7 @@ def _resolve_conflict(
     store: Store,
     run_id: str,
     runner_factory: cli.RunnerFactory,
-) -> engine.SubtaskSummary:
+) -> SubtaskSummary:
     """Drive the `integrate` workflow once for one conflicting tip.
 
     The synthetic subtask is recorded before `run_subtask` journals its first
@@ -170,7 +171,7 @@ def _resolve_conflict(
 
 
 def _resolver_detail(
-    tip: str, branch: str, worktree: Path, summary: engine.SubtaskSummary
+    tip: str, branch: str, worktree: Path, summary: SubtaskSummary
 ) -> str:
     return (
         f"the resolver did not finish merging {tip} into {branch}: phase "

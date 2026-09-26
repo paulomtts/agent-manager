@@ -21,14 +21,15 @@ from pydantic import BaseModel, ConfigDict
 from agent_manager import (
     cli,
     dispatch,
-    engine,
     models,
     paths,
     prompt,
     results,
     store as store_module,
 )
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
 from agent_manager.runtime import bridge
@@ -491,7 +492,7 @@ def test_a_reserved_key_is_not_overwritten_by_a_same_named_phase():
 
     assert values["worktree"] == Path("/repo/wt")
     assert values["result"] == {"created": True}
-    assert "worktree" in engine.RESERVED_CONTEXT_KEYS
+    assert "worktree" in RESERVED_CONTEXT_KEYS
 
 
 def _model_phase(*gates, **overrides) -> phases.AgentPhase:

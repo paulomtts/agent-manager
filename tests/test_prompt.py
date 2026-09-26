@@ -17,7 +17,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from agent_manager import dag, models, prompt, results
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.roles import loader as roles_loader
 from agent_manager.workflow import phases
 
@@ -111,12 +111,6 @@ def test_an_unknown_input_name_names_the_phase_the_input_and_the_table():
     assert caught.value.parameter == "the_whole_repo"
     assert "'the_whole_repo'" in str(caught.value)
     assert "branch" in str(caught.value)
-
-
-def test_engine_re_exports_the_same_error_class():
-    from agent_manager import engine
-
-    assert engine.EngineError is EngineError
 
 
 def _section(rendered, name: str) -> str:

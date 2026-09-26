@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 
 from agent_manager import cli, dag, dispatch, integration, models
-from agent_manager.engine import SubtaskSummary
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.integration import (

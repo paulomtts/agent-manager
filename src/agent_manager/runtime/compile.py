@@ -27,10 +27,10 @@ from typing import Any
 
 from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
-from agent_manager import engine as old_engine
 from agent_manager import prompt
-from agent_manager.errors import AgentPhaseFailed, EngineError
-from agent_manager.runtime import bridge, context
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime import bridge, context, walk
+from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
 from agent_manager.workflow.phases import AgentPhase, Workflow
 
@@ -154,7 +154,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         except Exception as error:
             # Total, as the old engine's agent branch is: an exception escaping
             # the walk would leave the subtask recorded `started` forever.
-            raise Escalated(phase, old_engine._render_error(error)) from error
+            raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
         nxt = holder["compiled"].after(phase, 0 if phase in fresh_loop_after else loop)
         if nxt is not None:
@@ -167,7 +167,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         # A step never reads feedback, so it gets an empty memory window.
         table = context.binding_table(pool, ContextQueue(limit=1), phase)
         outcome = await bridge.call_step(
-            old_engine.run_one_step,
+            walk.run_one_step,
             {
                 "phase": p,
                 "table": table,

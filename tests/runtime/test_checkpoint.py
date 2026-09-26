@@ -16,7 +16,7 @@ import pytest
 from pygents import Agent, Turn, tool
 
 from agent_manager import models, store as store_module
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.workflow.phases import AgentPhase, Step, Workflow
@@ -211,7 +211,7 @@ def test_an_error_outside_a_phase_writes_an_escalated_row(store):
 
 def test_a_checkpoint_never_reads_the_injected_clock(store):
     """Guard for the plan's `saved_at` deviation: the injected clock stamps phase
-    rows only -- twice per step phase (engine.py `run_one_step`) -- so a
+    rows only -- twice per step phase (runtime/walk.py `run_one_step`) -- so a
     checkpoint must not consume it (G10). Passes before and after Task 2."""
     calls: list[datetime] = []
 

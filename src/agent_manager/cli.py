@@ -31,12 +31,12 @@ from agent_manager import (
     census,
     dag,
     dispatch,
-    engine,
     models,
     prompt,
     store as store_module,
 )
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
@@ -550,7 +550,7 @@ WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
 class RunnerFactory(Protocol):
-    """How the command gets its `engine.AgentPhaseRunner`.
+    """How the command gets its `AgentPhaseRunner`.
 
     A factory rather than a runner, because a real `dispatch.AgentRunner` needs
     the store and three ids that do not exist until the run is
@@ -565,7 +565,7 @@ class RunnerFactory(Protocol):
         run_id: str,
         story_id: str,
         card_id: str,
-    ) -> engine.AgentPhaseRunner: ...
+    ) -> AgentPhaseRunner: ...
 
 
 def default_runner_factory(
@@ -574,7 +574,7 @@ def default_runner_factory(
     run_id: str,
     story_id: str,
     card_id: str,
-) -> engine.AgentPhaseRunner:
+) -> AgentPhaseRunner:
     """The production runner: real adapters, real roles, the direct launcher.
 
     `adapters` and `result_models` keep `AgentRunner`'s own defaults and
@@ -619,7 +619,7 @@ class SubtaskDrive:
     list. Internal state, so a dataclass rather than a pydantic model.
     """
 
-    summary: engine.SubtaskSummary
+    summary: SubtaskSummary
     warnings: list[str]
 
 

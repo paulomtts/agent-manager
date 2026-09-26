@@ -1,6 +1,6 @@
 """Pure-data tier (spec §9): TASK and INTEGRATE are constant phase-model data,
 so these are plain unit tests -- no fakes, no git, no harness. The only I/O is
-load_builtin's read of the shipped YAML and validate()'s role loading."""
+validate()'s role loading."""
 
 import ast
 from datetime import timedelta
@@ -9,59 +9,9 @@ from pathlib import Path
 from agent_manager import dispatch
 from agent_manager.workflow import integrate as integrate_module
 from agent_manager.workflow import task as task_module
-from agent_manager.workflow.loader import load_builtin
-from agent_manager.workflow.phases import AgentPhase, Goto, Step, from_loader
-from agent_manager.workflow.registry import default_registry
+from agent_manager.workflow.phases import AgentPhase, Goto
 from agent_manager.workflow.task import TASK, LAUNCHER_TIMEOUT
 from agent_manager.workflow.integrate import INTEGRATE
-
-
-DECLARED_ONLY_INPUTS = ("feedback",)
-"""Inputs the YAML never had: the critic's reason reaches a looped-to phase
-through `feedback`, which only the pygents engine supplies (G4)."""
-
-
-def _declared_only(converted, mine):
-    """`converted` with the data the YAML never had taken from `mine`.
-
-    Timeouts, `on_fail` loops and the `feedback` input are new in the declared
-    workflow. Each is copied from the declared phase; an extra input is
-    appended only where the declared phase has it, so an input the YAML does
-    have can never be hidden this way.
-    """
-    extra = tuple(
-        name for name in DECLARED_ONLY_INPUTS
-        if name in mine.inputs and name not in converted.inputs
-    )
-    return type(converted)(**{
-        **converted.__dict__,
-        "timeout": mine.timeout,
-        "on_fail": mine.on_fail,
-        "inputs": converted.inputs + extra,
-    })
-
-
-def _shipped(name, like):
-    converted = from_loader(load_builtin(name, default_registry()))
-    return type(converted)(converted.name, tuple(
-        p if not hasattr(p, "timeout") else _declared_only(p, like.phase(p.name))
-        for p in converted.phases))
-
-
-def _assert_same_callables(declared, name):
-    """Identity, not just qualname: every callable is the object the registry binds."""
-    converted = from_loader(load_builtin(name, default_registry()))
-    assert declared.phase_names == converted.phase_names
-    for mine, theirs in zip(declared.phases, converted.phases):
-        assert type(mine) is type(theirs), mine.name
-        assert len(mine.gates) == len(theirs.gates), mine.name
-        for ours, registered in zip(mine.gates, theirs.gates):
-            assert ours is registered, mine.name
-        if isinstance(mine, Step):
-            assert mine.run is theirs.run, mine.name
-            assert mine.when is theirs.when, mine.name
-        else:
-            assert mine.result is theirs.result, mine.name
 
 
 def _imported_modules(module):
@@ -75,25 +25,9 @@ def _imported_modules(module):
     return imported
 
 
-def test_task_equals_the_shipped_yaml():
-    assert TASK.digest() == _shipped("task", TASK).digest()
-
-
-def test_integrate_equals_the_shipped_yaml():
-    assert INTEGRATE.digest() == _shipped("integrate", INTEGRATE).digest()
-
-
 def test_both_validate():
     TASK.validate(launcher_timeout=LAUNCHER_TIMEOUT)
     INTEGRATE.validate(launcher_timeout=LAUNCHER_TIMEOUT)
-
-
-def test_task_callables_are_the_registry_bindings():
-    _assert_same_callables(TASK, "task")
-
-
-def test_integrate_callables_are_the_registry_bindings():
-    _assert_same_callables(INTEGRATE, "integrate")
 
 
 def test_launcher_timeout_is_the_dispatch_default():

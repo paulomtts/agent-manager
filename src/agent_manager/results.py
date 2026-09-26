@@ -19,7 +19,7 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
 
 
 class _Result(BaseModel):

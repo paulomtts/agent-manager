@@ -31,8 +31,8 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, census, cli, dag, engine, integration, models, orchestrate, paths
-from agent_manager import engine as engine_module
+from agent_manager import board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import task as task_workflow
@@ -136,7 +136,7 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
 
 
 def test_the_before_phase_is_read_out_of_a_stopped_detail():
-    """`engine._stop` writes "stopped before <phase>"; the summary has no field
+    """`walk._stop` writes "stopped before <phase>"; the summary has no field
     of its own for that phase, so the helper reads it out of `detail`."""
     assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
     assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
@@ -470,10 +470,10 @@ class FakeDriver:
         if isinstance(outcome, BaseException):
             raise outcome
         if outcome is None:
-            summary = engine_module.SubtaskSummary(status="done")
+            summary = SubtaskSummary(status="done")
         else:
             phase, detail = outcome
-            summary = engine_module.SubtaskSummary(
+            summary = SubtaskSummary(
                 status="escalated", failed_phase=phase, detail=detail
             )
         return cli.SubtaskDrive(summary=summary, warnings=list(self.warnings.get(card.id, [])))
@@ -769,15 +769,15 @@ class GatedDriver:
             warnings = list(self.warnings.get(card.id, []))
             if isinstance(outcome, tuple):
                 phase, detail = outcome
-                summary = engine_module.SubtaskSummary(
+                summary = SubtaskSummary(
                     status="escalated", failed_phase=phase, detail=detail
                 )
             elif outcome != "done" and should_stop is not None and should_stop():
-                summary = engine_module.SubtaskSummary(
+                summary = SubtaskSummary(
                     status="stopped", detail="stopped before implement"
                 )
             else:
-                summary = engine_module.SubtaskSummary(status="done")
+                summary = SubtaskSummary(status="done")
             return cli.SubtaskDrive(summary=summary, warnings=warnings)
         finally:
             with self.lock:

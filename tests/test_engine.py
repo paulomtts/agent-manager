@@ -4,7 +4,7 @@ Engine tier per design §14 lines 477-492: canned fake callables in declared
 phase-model workflows stand in for §14's fake adapter with canned result
 files, and the store is a real temp SQLite projection plus a real temp JSONL
 journal. No git, no `brd`, no harness process. Every walk is
-`runtime.engine.run_subtask`, and each workflow below is the declared twin of
+`runtime.walk.run_subtask`, and each workflow below is the declared twin of
 the YAML document the walk was first specified against, phase for phase.
 """
 
@@ -17,7 +17,8 @@ from typing import Any
 
 import pytest
 
-from agent_manager import dispatch, engine, models, results, store as store_module
+from agent_manager import dispatch, models, results, store as store_module
+from agent_manager.runtime import walk
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime import bridge
@@ -63,7 +64,7 @@ PLAN_PATH = "docs/superpowers/plans/resolve-phase-inputs-968fba15.md"
 
 
 def test_subtask_context_renames_the_model_fields_the_steps_ask_for():
-    context = engine.subtask_context(_subtask(), REPO, ["uv run pytest"])
+    context = walk.subtask_context(_subtask(), REPO, ["uv run pytest"])
 
     assert context == {
         "card": "ed77a917",
@@ -83,7 +84,7 @@ def test_the_cards_land_under_the_details_keys_and_leave_the_id_string_alone():
     `plan_check.find_validated_plan(card)` binds the bare id string, and turning
     that key into a `Card` would break every deterministic step at once.
     """
-    context = engine.subtask_context(
+    context = walk.subtask_context(
         _subtask(), REPO, ["uv run pytest"], card=CARD, parent_story=PARENT
     )
 
@@ -100,14 +101,14 @@ def test_the_new_context_keys_are_reserved_against_a_same_named_phase():
         "plan_path",
         "base_branch",
     ):
-        assert key in engine.RESERVED_CONTEXT_KEYS
+        assert key in walk.RESERVED_CONTEXT_KEYS
 
 
 def test_the_base_branch_alias_is_the_same_string_the_steps_bind_as_base():
     """`review_gate(review, branch, base_branch)` binds by parameter name, and
     the deterministic steps bind the same value as `base`. One value, two keys,
     rather than a second source of truth for the base branch."""
-    context = engine.subtask_context(_subtask(), REPO)
+    context = walk.subtask_context(_subtask(), REPO)
     assert context["base_branch"] == context["base"] == "m1/story-base"
 
 
@@ -115,8 +116,8 @@ def test_a_phase_named_base_branch_cannot_overwrite_the_alias():
     """Same rule as the `worktree` phase: a result must never replace a key a
     later gate binds from. `_bind_result` is called directly here because the
     rule is a property of that function, not of any particular document."""
-    context = engine.subtask_context(_subtask(), REPO)
-    engine._bind_result(context, "base_branch", {"branch": "somewhere/else"})
+    context = walk.subtask_context(_subtask(), REPO)
+    walk._bind_result(context, "base_branch", {"branch": "somewhere/else"})
     assert context["base_branch"] == "m1/story-base"
 
 
@@ -124,9 +125,9 @@ def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
     def step(branch: str, repo_dir: Path) -> dict[str, Any]:
         return {"branch": branch, "repo_dir": repo_dir}
 
-    bound = engine.bind_arguments(
+    bound = walk.bind_arguments(
         step,
-        engine.subtask_context(_subtask(), REPO, ["uv run pytest"]),
+        walk.subtask_context(_subtask(), REPO, ["uv run pytest"]),
         phase="worktree",
         function="worktree.ensure",
     )
@@ -138,7 +139,7 @@ def test_bind_arguments_lets_declared_args_override_the_context():
     def step(card: str, status: str) -> dict[str, Any]:
         return {"card": card, "status": status}
 
-    bound = engine.bind_arguments(
+    bound = walk.bind_arguments(
         step,
         {"card": "ed77a917", "status": "from-context"},
         {"status": "in_progress"},
@@ -153,7 +154,7 @@ def test_bind_arguments_skips_optional_parameters_nothing_supplies():
     def step(card: str, plans_dir: str | None = None) -> dict[str, Any]:
         return {"card": card, "plans_dir": plans_dir}
 
-    bound = engine.bind_arguments(
+    bound = walk.bind_arguments(
         step, {"card": "ed77a917"}, phase="plan_check", function="plan_check.find"
     )
 
@@ -167,8 +168,8 @@ def test_bind_arguments_names_phase_function_and_parameter_for_a_missing_require
         called.append(card)
         return {}
 
-    with pytest.raises(engine.EngineError) as caught:
-        engine.bind_arguments(
+    with pytest.raises(walk.EngineError) as caught:
+        walk.bind_arguments(
             step, {"card": "ed77a917"}, phase="verify", function="verify.run_suite"
         )
 
@@ -186,8 +187,8 @@ def test_bind_arguments_refuses_an_args_key_the_callable_does_not_declare():
     def step(card: str) -> dict[str, Any]:
         return {}
 
-    with pytest.raises(engine.EngineError) as caught:
-        engine.bind_arguments(
+    with pytest.raises(walk.EngineError) as caught:
+        walk.bind_arguments(
             step,
             {"card": "ed77a917"},
             {"stauts": "done"},
@@ -203,8 +204,8 @@ def test_bind_arguments_refuses_a_positional_only_parameter():
     def step(card: str, /) -> dict[str, Any]:
         return {}
 
-    with pytest.raises(engine.EngineError) as caught:
-        engine.bind_arguments(
+    with pytest.raises(walk.EngineError) as caught:
+        walk.bind_arguments(
             step, {"card": "ed77a917"}, phase="plan_check", function="plan_check.find"
         )
 
@@ -217,10 +218,10 @@ def test_bind_arguments_binds_the_merge_completed_gate_from_a_gate_table():
     `_gate_values` builds for a deterministic phase; `git_runner` is keyword-only
     with a default and must never be required or bound from the context."""
     result = {"resolved": True, "files": ["a.js"], "summary": "kept both sides"}
-    context = engine.subtask_context(_subtask(), REPO, ["uv run pytest"])
-    values = engine._gate_values(context, "merge", result)
+    context = walk.subtask_context(_subtask(), REPO, ["uv run pytest"])
+    values = walk._gate_values(context, "merge", result)
 
-    bound = engine.bind_arguments(
+    bound = walk.bind_arguments(
         integrate.merge_completed_gate,
         values,
         phase="merge",
@@ -249,7 +250,7 @@ def store(monkeypatch, tmp_path):
 
 @pytest.fixture
 def run_subtask():
-    """`runtime.engine.run_subtask`, the one walk (pygents-engine design G7)."""
+    """`runtime.walk.run_subtask`, the one walk (pygents-engine design G7)."""
     return new_engine.run_subtask
 
 
@@ -1023,7 +1024,7 @@ def test_an_agent_phase_with_no_runner_is_a_named_engine_error(store, run_subtas
 
     workflow = _workflow(MIXED, {"step.work": work})
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
         )
@@ -1407,7 +1408,7 @@ def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store, run
 
     workflow = _workflow(document, {})
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow,
             store,
@@ -1426,7 +1427,7 @@ def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store, run
 def test_a_document_path_input_with_no_card_is_a_named_error(store, run_subtask):
     workflow = _workflow(DOCUMENT_PATHS, {"step.after": lambda spec_path, plan_path: {}})
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow,
             store,
@@ -1663,7 +1664,7 @@ def test_an_unresolvable_input_raises_out_of_the_walk_before_the_runner(store, r
 
     workflow = _workflow(document, {})
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow,
             store,
@@ -1880,7 +1881,7 @@ def test_a_run_that_raised_leaves_its_agent_name_free_for_the_next_run(
     though it ended by raising."""
     workflow = _workflow(MIXED, {"step.work": lambda card, explore: {}})
 
-    with pytest.raises(engine.EngineError):
+    with pytest.raises(walk.EngineError):
         run_subtask(
             workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
         )
@@ -1966,7 +1967,7 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path, run_subta
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
     store = store_module.Store.open(tmp_path, "run-extra-2")
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow,
             store,
@@ -1985,7 +1986,7 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path, ru
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
     store = store_module.Store.open(tmp_path, "run-extra-3")
 
-    with pytest.raises(engine.EngineError) as caught:
+    with pytest.raises(walk.EngineError) as caught:
         run_subtask(
             workflow,
             store,
@@ -2186,7 +2187,7 @@ def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_run
 
 
 def test_a_subtask_summary_may_report_stopped():
-    hints = typing.get_type_hints(engine.SubtaskSummary)
+    hints = typing.get_type_hints(walk.SubtaskSummary)
     assert typing.get_args(hints["status"]) == ("done", "escalated", "stopped")
 
 
@@ -2441,7 +2442,7 @@ def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
 
     assert calls == ["alpha", "beta", "gamma"]
     assert checks == ["check", "check", "check"]
-    assert summary == engine.SubtaskSummary(
+    assert summary == walk.SubtaskSummary(
         status="done",
         results={
             "alpha": {"phase": "alpha"},

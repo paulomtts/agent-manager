@@ -38,8 +38,9 @@ from agent_manager import (
     prompt,
     store as store_module,
 )
-from agent_manager.engine import SubtaskSummary
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps.reducers import verification_gate
 
 from agent_manager.runtime import engine as runtime_engine

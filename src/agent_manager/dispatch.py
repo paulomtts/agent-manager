@@ -29,8 +29,10 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from agent_manager import engine, models, paths, prompt, results
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager import models, paths, prompt, results
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS, bind_arguments
 from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
@@ -262,14 +264,14 @@ def gate_values(
 ) -> dict[str, Any]:
     """The binding table this phase's gates see.
 
-    The same table `engine._gate_values` builds for a deterministic phase, and
+    The same table `walk._gate_values` builds for a deterministic phase, and
     for the same two reasons: the result appears under `result` (the parameter
     name the ported gates in `steps/reducers.py` declare) and under the phase's
     own name (how §6 says later phases read it), except where that name is one
     of the keys the engine owns.
     """
     values = {**context, "result": result}
-    if phase_name not in engine.RESERVED_CONTEXT_KEYS:
+    if phase_name not in RESERVED_CONTEXT_KEYS:
         values[phase_name] = result
     return values
 
@@ -303,7 +305,7 @@ def evaluate_gates(
     """
     for entry in phase.gates:
         name, gate = getattr(entry, "__name__", repr(entry)), entry
-        kwargs = engine.bind_arguments(gate, values, phase=phase.name, function=name)
+        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
         try:
             verdict = gate(**kwargs)
         except Exception as error:
@@ -345,7 +347,7 @@ def evaluate_gates(
 
 
 def _render_error(error: BaseException) -> str:
-    """`engine._render_error`'s format, so both phase kinds fail the same way."""
+    """`walk._render_error`'s format, so both phase kinds fail the same way."""
     return f"{type(error).__name__}: {error}"
 
 
@@ -376,7 +378,7 @@ Clock = Callable[[], datetime]
 
 @dataclass
 class AgentRunner:
-    """One agent phase, run to a terminal outcome: `engine.AgentPhaseRunner`.
+    """One agent phase, run to a terminal outcome: `walk.AgentPhaseRunner`.
 
     A callable object rather than a function because the seam's signature is
     `(phase, context, rendered)` and a dispatch needs six more things -- the
@@ -455,7 +457,7 @@ class AgentRunner:
                 # composed brief would duplicate the result contract.
                 feedback.append(verdict.detail or verdict.status)
         except Exception as error:
-            # Symmetric with `engine._run_deterministic`, which records its own
+            # Symmetric with `walk.run_one_step`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for
             # "the process gave up here", so a phase left `started` is what a
             # resume reads as work still in flight. The exception itself still

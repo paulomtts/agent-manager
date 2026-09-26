@@ -15,7 +15,7 @@ does nothing when no run is set.
 
 `saved_at` is read from the wall clock, never from the run's injected
 `clock`: that clock stamps phase rows, and a checkpoint reading it would
-shift every stamp the old engine would have written (G10).
+shift every phase-row stamp after it (G10).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 
 from pygents import AgentHook, hook
 
-from agent_manager import engine as old
+from agent_manager.runtime import walk
 from agent_manager.runtime.state import current_run
 
 
@@ -47,7 +47,7 @@ def save(agent: Any, reason: str) -> None:
         digest=deps.workflow.digest(),
         reason=reason,
         agent=agent.to_dict(),
-        saved_at=old._utcnow(),
+        saved_at=walk._utcnow(),
     )
 
 

@@ -17,7 +17,8 @@ import pytest
 from pygents import Agent, ContextPool, ContextQueue, ToolRegistry
 
 from agent_manager import models, store as store_module
-from agent_manager.errors import AgentPhaseFailed, EngineError
+from agent_manager.errors import AgentPhaseFailed
+from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import compile as C, context, state
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 

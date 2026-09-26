@@ -28,9 +28,10 @@ from typing import Any
 
 import pytest
 
-from agent_manager import dispatch, engine, models, prompt
+from agent_manager import dispatch, models, prompt
 from agent_manager import store as store_module
-from agent_manager.errors import EngineError
+from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.harness.base import Outcome
 from agent_manager.steps.integrate import merge_tip
 from agent_manager.runtime import engine as runtime_engine
@@ -269,7 +270,7 @@ def _write_an_invalid_result(attempt: int, worktree: Path, files: list[str]) -> 
 
 @dataclass
 class _Ran:
-    summary: engine.SubtaskSummary
+    summary: SubtaskSummary
     attempts: list[tuple[str, str]]
 
 
