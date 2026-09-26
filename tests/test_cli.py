@@ -4636,3 +4636,74 @@ def test_select_resumable_on_pygents_refuses_a_started_and_a_stopped_subtask_tog
 
     message = str(caught.value)
     assert "2 subtasks recorded 'started' or 'stopped' (card-1, card-2)" in message
+
+
+CHECKPOINT_AT = datetime(2026, 9, 26, 9, 0, tzinfo=timezone.utc)
+
+
+def _checkpoint(
+    reason: str,
+    *,
+    digest: str | None = None,
+    current: str | None = None,
+    queue: tuple[str, ...] = (),
+) -> store_module.Checkpoint:
+    """A hand-built checkpoint row of `TASK`: `current` is the turn in flight, `queue` the turns after it."""
+    return store_module.Checkpoint(
+        run_id="20260926T090000Z-02890d5d",
+        card_id="card-1",
+        seq=4,
+        workflow=task_workflow.TASK.name,
+        digest=task_workflow.TASK.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None if current is None else {"kwargs": {"phase": current, "loop": 0}},
+            "queue": [{"kwargs": {"phase": name, "loop": 0}} for name in queue],
+        },
+        saved_at=CHECKPOINT_AT,
+    )
+
+
+def test_drive_subtask_hands_resume_from_to_the_pygents_walk(monkeypatch):
+    walks = _record_walks(monkeypatch)
+    factory, _runner = _recording_factory([])
+    checkpoint = _checkpoint("parked", queue=("plan",))
+
+    cli.drive_subtask(
+        store=object(),
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=_drive_row(),
+        repo_dir=DRIVE_REPO,
+        runner_factory=factory,
+        engine="pygents",
+        resume_from=checkpoint,
+    )
+
+    assert walks["yaml"] == []
+    ((workflow, _store, kwargs),) = walks["pygents"]
+    assert workflow is task_workflow.TASK
+    assert kwargs["resume_from"] is checkpoint
+
+
+def test_drive_subtask_refuses_resume_from_on_yaml_before_building_a_runner(monkeypatch):
+    walks = _record_walks(monkeypatch)
+    seen: list[dict[str, Any]] = []
+    factory, _ = _recording_factory(seen)
+
+    with pytest.raises(ValueError, match="resume_from"):
+        cli.drive_subtask(
+            store=object(),
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=_drive_row(),
+            repo_dir=DRIVE_REPO,
+            runner_factory=factory,
+            engine="yaml",
+            resume_from=_checkpoint("parked", queue=("plan",)),
+        )
+
+    assert seen == []
+    assert walks == {"yaml": [], "pygents": []}

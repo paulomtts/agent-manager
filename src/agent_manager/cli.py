@@ -710,6 +710,7 @@ def drive_subtask(
     runner_factory: RunnerFactory | None = None,
     should_stop: Callable[[], bool] | None = None,
     engine: Engine = "yaml",
+    resume_from: store_module.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `builtin/task.yaml` under a store the caller owns.
 
@@ -729,9 +730,19 @@ def drive_subtask(
     gates, which `TASK` never produces. The parameter shadows the module-level
     `engine` name here, so the walks are reached as `yaml_engine` and
     `runtime_engine`. Any other value is refused before a runner is built.
+
+    `resume_from` (card 02890d5d) continues a pygents walk from a saved
+    checkpoint. It joins the walk's keywords only when given, so a fresh walk
+    is called exactly as before. With `engine="yaml"` it is refused before a
+    runner is built: the yaml walk has no checkpoints to continue from.
     """
     if engine not in ENGINES:
         raise ValueError(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
+    if resume_from is not None and engine != "pygents":
+        raise ValueError(
+            f"resume_from continues a pygents checkpoint, and engine {engine!r} has"
+            " none; pass engine='pygents' or no resume_from"
+        )
     workflow = load_builtin(WORKFLOW_NAME)
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
@@ -753,6 +764,8 @@ def drive_subtask(
         "should_stop": should_stop,
     }
     if engine == "pygents":
+        if resume_from is not None:
+            walk["resume_from"] = resume_from
         summary = runtime_engine.run_subtask(task_workflow.TASK, store, **walk)
     else:
         summary = yaml_engine.run_subtask(workflow, store, **walk)
