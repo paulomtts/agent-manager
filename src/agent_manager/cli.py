@@ -1450,6 +1450,97 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
+def _resume_from_checkpoint(
+    run: models.Run,
+    *,
+    root: Path,
+    allow_no_verification: bool,
+    commands: Sequence[str],
+    runner_factory: RunnerFactory | None,
+) -> dict[str, Any]:
+    """`resume --engine pygents`: continue the run's one in-flight subtask from its checkpoint.
+
+    The yaml resume's order, kept: every refusal that needs no store --
+    nothing in flight, a card the board lost, a workflow that will not load --
+    comes before `Store.open`. The checkpoint can only be read through the
+    store, so its refusals (`checkpoint_resume_phase`) come right after it is
+    opened and before the first write. Then the orphan attempts are marked
+    `harness_error` and the run, story and subtask recorded `started`, as the
+    yaml resume does, and `drive_subtask` walks `TASK` from the checkpoint.
+    `interrupted_phase` and `resume_start_phase` are never called: the
+    checkpoint's queue says where the walk goes on.
+
+    The preflight loads `WORKFLOW_NAME` (`task`), not `run.workflow`: a
+    milestone run records `workflow="milestone"`, which is no document, and
+    every subtask is walked through `TASK` on this engine either way (card
+    02890d5d).
+    """
+    story, subtask = select_resumable(run, engine="pygents")
+    card = board.show(subtask.card_id, repo_dir=root)
+    parent = board.show(story.card_id, repo_dir=root)
+    load_builtin(WORKFLOW_NAME)
+    orphans = orphan_attempts(subtask)
+    resumed = subtask.model_copy(update={"status": "started"})
+
+    store = Store.open(root, run.id)
+    try:
+        checkpoint = store.latest_checkpoint(subtask.card_id)
+        phase = checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
+        for orphan, attempt in orphans:
+            store.record_attempt(
+                story.card_id,
+                subtask.card_id,
+                orphan.name,
+                attempt.model_copy(update={"status": "harness_error"}),
+            )
+        store.record_run(run.model_copy(update={"status": "started"}))
+        store.record_story(story.model_copy(update={"status": "started"}))
+        store.record_subtask(story.card_id, resumed)
+
+        drive = drive_subtask(
+            store=store,
+            run_id=run.id,
+            card=card,
+            parent=parent,
+            subtask=resumed,
+            repo_dir=root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            engine="pygents",
+            resume_from=checkpoint,
+        )
+        summary = drive.summary
+
+        store.record_run(run.model_copy(update={"status": summary.status}))
+        store.record_story(story.model_copy(update={"status": summary.status}))
+        store.record_subtask(
+            story.card_id, resumed.model_copy(update={"status": summary.status})
+        )
+
+        return {
+            "run_id": run.id,
+            "card_id": subtask.card_id,
+            "story_id": story.card_id,
+            "branch": subtask.branch,
+            "base_branch": subtask.base_branch,
+            "worktree": None
+            if subtask.worktree_path is None
+            else str(subtask.worktree_path),
+            "status": summary.status,
+            "failed_phase": summary.failed_phase,
+            "detail": summary.detail,
+            "skipped": list(summary.skipped),
+            "warnings": drive.warnings,
+            "resumed_from": phase,
+            "discarded_attempts": [
+                {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
+            ],
+        }
+    finally:
+        store.close()
+
+
 def resume_run(
     run_id: str,
     *,
@@ -1458,6 +1549,7 @@ def resume_run(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    engine: Engine = "yaml",
 ) -> dict[str, Any]:
     """Pick one killed run back up at the phase it died in (§9 lines 370-386).
 
@@ -1474,7 +1566,16 @@ def resume_run(
     `models.RunConfig` has no suite commands and no `allow_no_verification` --
     are taken as arguments here rather than grown onto the model, so a resume
     means exactly what a fresh `run` with the same flags means.
+
+    `engine` picks the resume (card 02890d5d). `yaml` is everything described
+    above, unchanged. `pygents` is `_resume_from_checkpoint`, which continues
+    from the subtask's newest checkpoint instead of re-running a phase. An
+    unknown engine is refused before anything is read. `clock` is the yaml
+    walk's; the pygents walk stamps with its own default, as `drive_subtask`
+    does.
     """
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}; expected one of {', '.join(ENGINES)}")
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
     try:
@@ -1486,6 +1587,15 @@ def resume_run(
             )
     finally:
         conn.close()
+
+    if engine == "pygents":
+        return _resume_from_checkpoint(
+            run,
+            root=root,
+            allow_no_verification=allow_no_verification,
+            commands=commands,
+            runner_factory=runner_factory,
+        )
 
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1529,7 +1639,7 @@ def resume_run(
             story_id=story.card_id,
             card_id=subtask.card_id,
         )
-        summary = engine.run_subtask(
+        summary = yaml_engine.run_subtask(
             workflow,
             store,
             story_id=story.card_id,

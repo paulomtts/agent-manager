@@ -3979,6 +3979,7 @@ def recording_runner(
     card_id: str,
     crash_at: str | None = None,
     seen: list[str] | None = None,
+    crash_with: type[BaseException] = KeyboardInterrupt,
 ):
     """A fake `engine.AgentPhaseRunner` that writes the rows a real one writes.
 
@@ -3991,6 +3992,10 @@ def recording_runner(
     `crash_at` raises `KeyboardInterrupt` in the window between the two writes: a
     `BaseException`, so it escapes `engine.run_subtask`'s `except Exception` the
     way `kill -INT` escapes it, leaving subtask, phase and attempt all `started`.
+
+    `crash_with` is the type raised. The pygents walk needs a plain
+    `BaseException` subclass (`_Killed`): asyncio re-raises `KeyboardInterrupt`
+    out of the event loop before the engine unwinds (tests/runtime/test_resume.py).
     """
 
     def runner(phase, context, rendered):
@@ -4018,7 +4023,7 @@ def recording_runner(
         )
         store.record_attempt(story_id, card_id, phase.name, attempt)
         if crash_at is not None and phase.name == crash_at:
-            raise KeyboardInterrupt(f"simulated kill during {phase.name}")
+            raise crash_with(f"simulated kill during {phase.name}")
         store.record_attempt(
             story_id,
             card_id,
@@ -4035,7 +4040,11 @@ def recording_runner(
     return runner
 
 
-def _resume_factory(seen: list[str] | None = None, crash_at: str | None = None):
+def _resume_factory(
+    seen: list[str] | None = None,
+    crash_at: str | None = None,
+    crash_with: type[BaseException] = KeyboardInterrupt,
+):
     """A `cli.RunnerFactory` handing `recording_runner` the store the CLI opened."""
 
     def factory(*, workflow, store, run_id, story_id, card_id):
@@ -4046,6 +4055,7 @@ def _resume_factory(seen: list[str] | None = None, crash_at: str | None = None):
             card_id=card_id,
             crash_at=crash_at,
             seen=seen,
+            crash_with=crash_with,
         )
 
     return factory
@@ -4844,3 +4854,337 @@ def test_continuable_checkpoint_is_the_open_matching_row_or_none(projection):
         "card-escalated": None,
         "card-never-saved": None,
     }
+
+
+class _Killed(BaseException):
+    """A process death mid-phase for the pygents walk. Not `KeyboardInterrupt`:
+    asyncio re-raises that out of the event loop before the engine unwinds."""
+
+
+RESUME_KEYS = {
+    "run_id",
+    "card_id",
+    "story_id",
+    "branch",
+    "base_branch",
+    "worktree",
+    "status",
+    "failed_phase",
+    "detail",
+    "skipped",
+    "warnings",
+    "resumed_from",
+    "discarded_attempts",
+}
+"""Today's resume payload keys; the pygents branch adds and drops none (G10)."""
+
+
+def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
+    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    with pytest.raises(_Killed):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix="m1",
+            clock=lambda: CRASHED_AT,
+            runner_factory=_resume_factory(crash_at=phase, crash_with=_Killed),
+            engine="pygents",
+        )
+    return run_id
+
+
+def _checkpoint_rows(root: Path) -> list[tuple]:
+    conn = sqlite3.connect(paths.project_db_path(root))
+    try:
+        return conn.execute(
+            "SELECT run_id, card_id, seq, reason, digest FROM checkpoints"
+            " ORDER BY run_id, card_id, seq"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _resume_state(root: Path) -> tuple:
+    """Everything a refused resume must leave alone: the run tree on disk (the
+    journal included), the attempt rows and the checkpoint rows."""
+    return (_runs_snapshot(), _attempt_rows(root), _checkpoint_rows(root))
+
+
+def _force_started(project: Path, run_id: str, card_id: str) -> None:
+    """Re-record the subtask `started`: what a crash between the engine's closing
+    checkpoint and the caller's final status write leaves behind."""
+    root = cli.resolve_repo_dir(project)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    found = cli.find_subtask(run, card_id)
+    assert found is not None
+    story, subtask = found
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_subtask(story.card_id, subtask.model_copy(update={"status": "started"}))
+    finally:
+        opened.close()
+
+
+def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
+    """A newer copy of the newest checkpoint, saved under a digest `TASK` does not have."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(card_id)
+        assert newest is not None
+        opened.save_checkpoint(
+            card_id,
+            workflow=newest.workflow,
+            digest="saved-under-another-task",
+            reason=newest.reason,
+            agent=newest.agent,
+            saved_at=datetime.now(timezone.utc),
+        )
+    finally:
+        opened.close()
+
+
+def _park_pygents(project: Path, cards: dict[str, str]) -> str:
+    """A milestone run whose one subtask the run's stop parked on pygents after `spec`.
+
+    Recorded the way `orchestrate.run_story_lane` records it: the run is a
+    `milestone` run, the engine records the subtask `stopped`, the lane
+    records the story `stopped`.
+    """
+    root = cli.resolve_repo_dir(project)
+    parent = board.show(cards["story"], repo_dir=root)
+    card = board.show(cards["subtask"], repo_dir=root)
+    run_id = cli.mint_run_id(cards["milestone"], CRASHED_AT)
+    branch = dag.task_branch("m1", card)
+    subtask = models.SubtaskRun(
+        card_id=card.id,
+        branch=branch,
+        base_branch="main",
+        status="started",
+        worktree_path=cli.worktree_for(root, branch),
+    )
+    story = models.StoryRun(
+        card_id=parent.id, title=parent.title, level=0, status="started", tip_branch=branch
+    )
+    seen: list[str] = []
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=orchestrate.MILESTONE_WORKFLOW,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=CRASHED_AT,
+                config=models.RunConfig(),
+            )
+        )
+        opened.record_story(story)
+        opened.record_subtask(parent.id, subtask)
+        drive = cli.drive_subtask(
+            store=opened,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=root,
+            runner_factory=_resume_factory(seen),
+            should_stop=lambda: seen[-1:] == ["spec"],
+            engine="pygents",
+        )
+        assert drive.summary.status == "stopped"
+        assert drive.summary.detail == "stopped before validate_spec"
+        opened.record_story(story.model_copy(update={"status": "stopped"}))
+    finally:
+        opened.close()
+    return run_id
+
+
+def test_resume_run_refuses_an_unknown_engine_before_reading_anything(tmp_path, monkeypatch):
+    """The engine is checked first: the repo dir does not exist, and the
+    refusal is the engine's `ValueError`, not the repo dir's `RepoDirError`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    with pytest.raises(ValueError, match="unknown engine"):
+        cli.resume_run(
+            "20260923T140506Z-cbe34d00", repo_dir=tmp_path / "missing", engine="bogus"
+        )
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(
+    project, cards, monkeypatch
+):
+    """Spec test 3: the runner sees `plan` next, never `explore` or `spec`, and
+    the yaml back-off helpers are never consulted."""
+    run_id = _crash_pygents(project, cards, "plan")
+    monkeypatch.setattr(cli, "interrupted_phase", _Forbidden("interrupted_phase"))
+    monkeypatch.setattr(cli, "resume_start_phase", _Forbidden("resume_start_phase"))
+    seen: list[str] = []
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, runner_factory=_resume_factory(seen), engine="pygents"
+    )
+
+    assert seen[0] == "plan"
+    assert not {"explore", "spec", "validate_spec"} & set(seen)
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "plan"
+    assert payload["run_id"] == run_id
+    assert payload["card_id"] == cards["subtask"]
+    assert payload["story_id"] == cards["story"]
+    assert set(payload) == RESUME_KEYS
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):
+    """Spec test 5: the orphan is discarded exactly as the yaml resume does it."""
+    run_id = _crash_pygents(project, cards, "plan")
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, runner_factory=_resume_factory(), engine="pygents"
+    )
+
+    assert payload["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    plan = [row for row in _attempt_rows(project) if row[3] == "plan"]
+    assert [(row[4], row[5]) for row in plan] == [(1, "harness_error"), (2, "ok")]
+    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
+    project, cards
+):
+    """Spec test 4, and Review Focus 2: the run is a `milestone` run, which the
+    yaml path cannot load and still refuses with its relaunch remedy."""
+    run_id = _park_pygents(project, cards)
+
+    with pytest.raises(cli.NotResumableError) as refused:
+        cli.resume_run(run_id, repo_dir=project, runner_factory=_Forbidden("runner_factory"))
+    assert "agent-manager run --milestone" in str(refused.value)
+
+    after: list[str] = []
+    payload = cli.resume_run(
+        run_id, repo_dir=project, runner_factory=_resume_factory(after), engine="pygents"
+    )
+
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "validate_spec"
+    assert payload["discarded_attempts"] == []
+    assert after[0] == "validate_spec"
+    assert not {"explore", "spec"} & set(after)
+    assert board.show(cards["subtask"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_yaml_run_has_no_checkpoint_and_a_pygents_resume_writes_nothing(project, cards):
+    """Spec test 7, first half."""
+    run_id = _crash_mid_phase(project, cards, "implement")
+    before = _resume_state(project)
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(
+            run_id,
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+            engine="pygents",
+        )
+
+    assert "no checkpoint" in str(caught.value)
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
+    """Spec test 7, second half: only the final status write was lost."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+        engine="pygents",
+    )
+    assert payload["status"] == "done"
+    _force_started(project, payload["run_id"], cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(
+            payload["run_id"],
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+            engine="pygents",
+        )
+
+    assert "'done'" in str(caught.value)
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project, cards):
+    """Replaces spec test 8 (plan deviation 1): a phase escalation's row holds
+    no turn, so continuing it would record `done` with review never passed."""
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(fail="review"),
+        engine="pygents",
+    )
+    assert payload["status"] == "escalated"
+    _force_started(project, payload["run_id"], cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.resume_run(
+            payload["run_id"],
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+            engine="pygents",
+        )
+
+    message = str(caught.value)
+    assert "'escalated'" in message
+    assert "no turn left" in message
+    assert _resume_state(project) == before
+
+
+@requires_git
+@requires_brd
+def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards):
+    """Spec test 6 at the function, and Review Focus 3: the orphan attempt is
+    still `started` afterwards, because nothing is re-marked before the
+    checkpoint is judged."""
+    run_id = _crash_pygents(project, cards, "plan")
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        cli.resume_run(
+            run_id,
+            repo_dir=project,
+            runner_factory=_Forbidden("runner_factory"),
+            engine="pygents",
+        )
+
+    assert "workflow changed since checkpoint" in str(caught.value)
+    assert _resume_state(project) == before
+    plan = [row for row in _attempt_rows(project) if row[3] == "plan"]
+    assert [(row[4], row[5]) for row in plan] == [(1, "started")]
