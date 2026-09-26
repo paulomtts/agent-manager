@@ -7,6 +7,7 @@ touch is pytest's `tmp_path`, and only where the module itself reads files
 (`repo_docs`) or writes one (`RenderedPrompt.write`).
 """
 
+import inspect
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field
 from agent_manager import dag, models, prompt, results
 from agent_manager.errors import EngineError
 from agent_manager.roles import loader as roles_loader
+from agent_manager.workflow import phases
 from agent_manager.workflow.loader import AgentPhase
 
 CARD = models.Card(
@@ -970,3 +972,25 @@ def test_input_names_are_exactly_the_resolver_table():
     assert isinstance(prompt.INPUT_NAMES, frozenset)
     assert prompt.INPUT_NAMES == frozenset(prompt._TABLE)
     assert "card" in prompt.INPUT_NAMES
+
+
+def test_prompt_reads_phases_through_a_protocol_not_the_yaml_type():
+    # Spec: render_prompt, _assemble and _Request are retyped to a Protocol
+    # carrying name, role and inputs, and the loader import is dropped.
+    assert "AgentPhase" not in vars(prompt)
+    assert inspect.signature(prompt.render_prompt).parameters["phase"].annotation is (
+        prompt.PromptPhase
+    )
+    assert all(
+        isinstance(getattr(prompt.PromptPhase, attr), property)
+        for attr in ("name", "role", "inputs")
+    )
+
+
+def test_a_phase_model_agent_phase_renders_exactly_like_the_yaml_one():
+    declared = phases.AgentPhase("implement", "coder", ("branch", "base_branch"), None)
+
+    rendered = prompt.render_prompt(declared, _context())
+
+    assert rendered == prompt.render_prompt(_phase(["branch", "base_branch"]), _context())
+    assert rendered.text.startswith("# phase: implement\n# role: coder\n")

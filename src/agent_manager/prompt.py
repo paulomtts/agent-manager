@@ -23,17 +23,36 @@ repo docs a `repo_docs` input asks for, and the only file written is the
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from agent_manager import dag, models
 from agent_manager.errors import EngineError
 from agent_manager.roles.loader import RoleBundle
-from agent_manager.workflow.loader import AgentPhase
+
+
+class PromptPhase(Protocol):
+    """The three things rendering reads from an agent phase, and nothing else.
+
+    Structural, so both the YAML `workflow.loader.AgentPhase` and the declared
+    `workflow.phases.AgentPhase` satisfy it without either being imported here.
+    Read-only properties, because a frozen dataclass and a frozen pydantic model
+    both expose these as attributes that must not be assigned.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def role(self) -> str: ...
+
+    @property
+    def inputs(self) -> Sequence[str]: ...
+
 
 _MISSING = object()
 
@@ -90,7 +109,7 @@ class _Request:
     """One input name being resolved, with everything a resolver may read."""
 
     name: str
-    phase: AgentPhase
+    phase: PromptPhase
     context: Mapping[str, Any]
 
 
@@ -307,7 +326,7 @@ process -- the journal never replays the binding table.
 """
 
 
-def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedPrompt:
+def render_prompt(phase: PromptPhase, context: Mapping[str, Any]) -> RenderedPrompt:
     """Resolve every name in `phase.inputs` and assemble the prompt text.
 
     Sections follow the order the document declares, because that order is the
@@ -335,7 +354,7 @@ def render_prompt(phase: AgentPhase, context: Mapping[str, Any]) -> RenderedProm
     )
 
 
-def _assemble(phase: AgentPhase, sections: list[tuple[str, str]]) -> str:
+def _assemble(phase: PromptPhase, sections: list[tuple[str, str]]) -> str:
     head = f"# phase: {phase.name}\n# role: {phase.role}\n"
     return head + "".join(f"\n## {name}\n{body}\n" for name, body in sections)
 
