@@ -461,7 +461,7 @@ phases:
     assert not any(line.event == "attempt_upsert" for line in store.journal.read())
 
 
-def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store):
+def test_a_phase_named_like_a_context_key_runs_but_never_clobbers_it(store, run_subtask):
     """The `worktree` phase of the shipped `builtin/task.yaml` names itself the
     same as the context key `subtask_context` binds the real worktree path
     under. It must still run and record normally; its own result must simply
@@ -492,7 +492,7 @@ phases:
         document, {"worktree.make": make_worktree, "step.after": uses_worktree}
     )
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO
     )
 
@@ -1554,7 +1554,7 @@ phases:
 """
 
 
-def test_document_paths_are_bound_from_the_writes_templates(store):
+def test_document_paths_are_bound_from_the_writes_templates(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def after(spec_path: str, plan_path: str) -> dict[str, Any]:
@@ -1563,7 +1563,7 @@ def test_document_paths_are_bound_from_the_writes_templates(store):
 
     workflow = _workflow(DOCUMENT_PATHS, {"step.after": after})
 
-    engine.run_subtask(
+    run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1576,7 +1576,7 @@ def test_document_paths_are_bound_from_the_writes_templates(store):
     assert seen == {"spec_path": SPEC_PATH, "plan_path": PLAN_PATH}
 
 
-def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store):
+def test_a_document_path_input_with_no_writing_phase_is_a_named_error(store, run_subtask):
     document = """
 name: orphan
 phases:
@@ -1588,7 +1588,7 @@ phases:
     workflow = _workflow(document, {})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -1603,11 +1603,11 @@ phases:
     assert "writes" in str(caught.value)
 
 
-def test_a_document_path_input_with_no_card_is_a_named_error(store):
+def test_a_document_path_input_with_no_card_is_a_named_error(store, run_subtask):
     workflow = _workflow(DOCUMENT_PATHS, {"step.after": lambda spec_path, plan_path: {}})
 
     with pytest.raises(engine.EngineError) as caught:
-        engine.run_subtask(
+        run_subtask(
             workflow,
             store,
             story_id=STORY_ID,
@@ -1848,7 +1848,7 @@ phases:
     assert caught.value.parameter == "explore"
 
 
-def test_a_phase_named_spec_path_never_clobbers_the_document_path(store):
+def test_a_phase_named_spec_path_never_clobbers_the_document_path(store, run_subtask):
     seen: dict[str, Any] = {}
 
     def collide(card: str) -> dict[str, Any]:
@@ -1879,7 +1879,7 @@ phases:
     recorded: dict[str, Any] = {}
     workflow = _workflow(document, {"step.collide": collide, "step.after": after})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1911,7 +1911,9 @@ phases:
 """
 
 
-def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(store):
+def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
+    store, run_subtask
+):
     """The membership check above is only a constant; this is the behaviour it buys.
 
     A document is free to name a phase `card_details`, and its result must not
@@ -1920,7 +1922,7 @@ def test_a_phase_named_card_details_never_clobbers_the_cards_the_prompt_renders(
     recorded: dict[str, Any] = {}
     workflow = _workflow(RESERVED_DETAILS, {"step.collide": lambda card: {"not": "a card"}})
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,

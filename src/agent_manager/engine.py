@@ -122,7 +122,15 @@ document whose plan phase writes into `docs/specs/` resolve backwards.
 """
 
 
-def _document_paths(workflow: Workflow, card: models.Card | None) -> dict[str, str]:
+_AGENT_PHASES = (AgentPhase, phase_model.AgentPhase)
+"""Both agent-phase types: the YAML loader's and the declared phase model's.
+The pygents engine hands `_document_paths` a `phases.Workflow`, and a loader-only
+check would find no agent phase in it and bind no document path at all."""
+
+
+def _document_paths(
+    workflow: Workflow | phase_model.Workflow, card: models.Card | None
+) -> dict[str, str]:
     """`spec_path` / `plan_path` for the whole subtask, computed once, from the document.
 
     Computed at subtask start rather than when the `spec` and `plan` phases run:
@@ -133,7 +141,7 @@ def _document_paths(workflow: Workflow, card: models.Card | None) -> dict[str, s
     declared = {
         name
         for phase in workflow.phases
-        if isinstance(phase, AgentPhase)
+        if isinstance(phase, _AGENT_PHASES)
         for name in phase.inputs
         if name in _DOCUMENT_INPUTS
     }
@@ -153,9 +161,11 @@ def _document_paths(workflow: Workflow, card: models.Card | None) -> dict[str, s
     return paths
 
 
-def _writing_phase(workflow: Workflow, phase_name: str, input_name: str) -> AgentPhase:
+def _writing_phase(
+    workflow: Workflow | phase_model.Workflow, phase_name: str, input_name: str
+) -> AgentPhase | phase_model.AgentPhase:
     found = next((p for p in workflow.phases if p.name == phase_name), None)
-    if not isinstance(found, AgentPhase) or found.writes is None:
+    if not isinstance(found, _AGENT_PHASES) or found.writes is None:
         raise EngineError(
             f"is declared as an input, but this workflow has no agent phase named "
             f"{phase_name!r} with a `writes:` template to take the path from "
