@@ -23,6 +23,7 @@ import os
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -63,7 +64,7 @@ class LauncherFn(Protocol):
     ) -> Outcome: ...
 
 
-def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+def kill_tree(process: subprocess.Popen[bytes]) -> None:
     """SIGKILL the timed-out process and everything it started.
 
     A harness spawns workers of its own, and killing only the process we
@@ -79,6 +80,10 @@ def _kill_tree(process: subprocess.Popen[bytes]) -> None:
     that group would SIGKILL the manager and every other in-flight worktree
     with it. `run_direct` never produces one, and this is what keeps that a
     fact about the timeout path rather than an assumption.
+
+    The bridge (`runtime/bridge.py`) calls this too, on every process a
+    cancelled agent turn spawned: a `to_thread` worker cannot be cancelled, so
+    the process it started has to be.
     """
     try:
         group = os.getpgid(process.pid)
@@ -91,12 +96,17 @@ def _kill_tree(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+_kill_tree = kill_tree
+"""The name this was private under; kept so existing callers are unaffected."""
+
+
 def run_direct(
     argv: list[str],
     *,
     cwd: Path,
     timeout: float,
     stdout_path: Path,
+    on_spawn: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> Outcome:
     """Run `argv` in `cwd`, log to `stdout_path`, kill it after `timeout`.
 
@@ -114,6 +124,11 @@ def run_direct(
     The log is opened for writing, not appending: a resumed run may reuse an
     attempt directory, and a log holding two attempts concatenated is worse
     evidence than a log holding the current one.
+
+    `on_spawn`, when given, is called with the live `Popen` right after it is
+    created and before anything waits on it -- the bridge's way of learning
+    which process a cancelled turn must kill. If it raises, the child is killed
+    and the error propagates: nobody else holds its handle.
     """
     if not argv:
         raise ValueError("launcher argv is empty: there is no program to run")
@@ -139,11 +154,17 @@ def run_direct(
             # and not just the process we spawned.
             start_new_session=True,
         )
+        if on_spawn is not None:
+            try:
+                on_spawn(process)
+            except BaseException:
+                kill_tree(process)
+                raise
         try:
             exit_code: int | None = process.wait(timeout=timeout)
             timed_out = False
         except subprocess.TimeoutExpired:
-            _kill_tree(process)
+            kill_tree(process)
             exit_code = None
             timed_out = True
 
