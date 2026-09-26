@@ -243,8 +243,9 @@ def test_a_review_failure_stops_the_milestone_and_a_relaunch_finishes_it(
         assert board.show(card_id, repo_dir=root).status == "done", card_id
     assert _is_ancestor(root, branches[a2], branches[b1])
     assert _is_ancestor(root, branches[b1], branches[c1])
-    # On pygents too, the relaunch re-drives b1 from its first phase (no
-    # checkpoint continuation here -- that is card 02890d5d's).
+    # On pygents too, the relaunch re-drives b1 from its first phase: its
+    # newest checkpoint is `escalated` with no turn left, which
+    # `cli.continuable_checkpoint` never continues (card 02890d5d).
     engine_parity("milestone-relaunch-finished", engine, finished, tmp=tmp_path, cards=labels)
 
     # Review focus: relaunching a finished milestone drives nothing.
@@ -386,3 +387,132 @@ def test_a_pygents_run_killed_in_plan_resumes_without_redispatching_explore_or_s
         "review": 1,
     }
     assert board.show(a1, repo_dir=root).status == "done"
+
+
+REVIEW_FAIL_MARKER = "fake-claude-review-fail"
+"""Must equal the conftest's `FAKE_REVIEW_FAIL_MARKER` (and `fake_claude.REVIEW_FAIL_MARKER`)."""
+
+WAIT = 120.0
+"""Seconds a held launch waits for the other lane before giving up. Generous:
+it only bounds a broken run, a healthy one never waits this long."""
+
+
+def _phases_in(entries, worktree: Path) -> list[str]:
+    """The phases the fake ran in `worktree`, in log order."""
+    return [entry["phase"] for entry in entries if Path(entry["cwd"]).resolve() == worktree]
+
+
+def _hold_b1_in_plan_until_a1_escalates(monkeypatch, board_shape) -> dict[str, bool]:
+    """Make the first launch park b1 before `validate_plan`, deterministically.
+
+    Test scaffolding in the manager process, never seen by the fake. a1's
+    `review` launch waits until b1 is inside `plan`; b1's `plan` launch waits
+    until the run's stop is set, which a1's review failure (the review-fail
+    marker) does. When b1's plan returns, the stop is set, so the next
+    `BEFORE_TURN` parks b1 before `validate_plan`. `RunStop` is captured by a
+    subclass because `run_milestone` builds it at call time. Returns the
+    switch that turns the hold off for the relaunch.
+    """
+    stops: list[orchestrate.RunStop] = []
+
+    @dataclass
+    class CapturedStop(orchestrate.RunStop):
+        def __post_init__(self) -> None:
+            stops.append(self)
+
+    monkeypatch.setattr(orchestrate, "RunStop", CapturedStop)
+    (a1,) = board_shape["subtasks"]["A"]
+    (b1,) = board_shape["subtasks"]["B"]
+    b1_in_plan = threading.Event()
+    hold = {"on": True}
+    real = launcher.run_direct
+
+    def held(argv, *, cwd, timeout, stdout_path, on_spawn=None):
+        if hold["on"]:
+            attempt = _attempt_of(stdout_path)
+            if attempt == (b1, "plan"):
+                b1_in_plan.set()
+                if not stops[-1].event.wait(WAIT):
+                    raise AssertionError("a1's escalation never set the run's stop")
+            elif attempt == (a1, "review"):
+                if not b1_in_plan.wait(WAIT):
+                    raise AssertionError("b1 never reached plan")
+        return real(
+            argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path, on_spawn=on_spawn
+        )
+
+    monkeypatch.setattr(cli, "run_direct", held)
+    return hold
+
+
+def _pygents_milestone(root: Path, milestone: str):
+    return CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--milestone",
+            milestone,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            PREFIX,
+            "--engine",
+            "pygents",
+            "--verify",
+            VERIFY,
+            "--max-concurrent",
+            "2",
+        ],
+    )
+
+
+def test_a_pygents_relaunch_continues_the_parked_card_from_its_checkpoint(
+    two_story_board, fake_claude_bin, read_fake_log, monkeypatch
+):
+    """Spec test 13, plus Review Focus 1: the parked b1 continues at
+    validate_plan and dispatches nothing it had finished; the escalated a1
+    (newest row `escalated`, no turn left) starts fresh at explore."""
+    root = two_story_board["root"]
+    milestone = two_story_board["milestone"]
+    stories = two_story_board["stories"]
+    branches = two_story_board["branches"]
+    (a1,) = two_story_board["subtasks"]["A"]
+    (b1,) = two_story_board["subtasks"]["B"]
+    a1_worktree = cli.worktree_for(root, branches[a1]).resolve()
+    b1_worktree = cli.worktree_for(root, branches[b1]).resolve()
+    marker = root / ".git" / REVIEW_FAIL_MARKER
+    marker.write_text(f"{branches[a1]}\n", encoding="utf-8")
+    hold = _hold_b1_in_plan_until_a1_escalates(monkeypatch, two_story_board)
+
+    first = _pygents_milestone(root, milestone)
+
+    assert first.exit_code == cli.EXIT_ESCALATED, (first.output, first.exception)
+    stopped = _envelope(first)
+    assert stopped["subtask"] == a1, stopped
+    assert stopped["failed_phase"] == "review"
+    assert stopped["stopped"] == [
+        {"story": stories["B"], "subtask": b1, "before_phase": "validate_plan"}
+    ]
+    assert _phases_in(read_fake_log(stopped["run_id"]), b1_worktree) == [
+        "explore",
+        "spec",
+        "validate_spec",
+        "plan",
+    ]
+
+    marker.unlink()
+    hold["on"] = False
+    second = _pygents_milestone(root, milestone)
+
+    assert second.exit_code == 0, (second.output, second.exception)
+    finished = _envelope(second)
+    assert finished["done"] is True, finished
+    assert finished["run_id"] != stopped["run_id"]
+    assert finished["completed"] == [a1, b1]
+    second_entries = read_fake_log(finished["run_id"])
+    assert _phases_in(second_entries, b1_worktree) == ["validate_plan", "implement", "review"]
+    assert _phases_in(second_entries, a1_worktree)[0] == "explore"
+    for card_id in (a1, b1, *stories.values(), milestone):
+        assert board.show(card_id, repo_dir=root).status == "done", card_id

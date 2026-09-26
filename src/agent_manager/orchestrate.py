@@ -36,7 +36,7 @@ from typing import Any, Literal, Protocol
 
 from agent_manager import board, census, cli, dag, integration, models
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Store
+from agent_manager.store import Checkpoint, Store
 from agent_manager.workflow.loader import load_builtin
 
 MILESTONE_WORKFLOW = "milestone"
@@ -204,6 +204,9 @@ class Driver(Protocol):
 
     The seam the tests replace. Annotations are strings (`from __future__ import
     annotations`), so no `cli` name is resolved when this module is imported.
+
+    `resume_from` (card 02890d5d) is passed only when a pygents relaunch found
+    a checkpoint to continue, so a driver written before it keeps working.
     """
 
     def __call__(
@@ -220,6 +223,7 @@ class Driver(Protocol):
         runner_factory: cli.RunnerFactory | None = None,
         should_stop: Callable[[], bool] | None = None,
         engine: cli.Engine = "yaml",
+        resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
 
 
@@ -414,6 +418,10 @@ def run_story_lane(
     Any other non-`done` result, or an `Exception` raised while handling a
     subtask, escalates through `stop.escalate`. A `BaseException` sets the stop
     so sibling lanes park, and propagates.
+
+    On `engine="pygents"` each subtask's open checkpoint is looked up first
+    (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
+    driver as `resume_from` when it can be continued.
     """
     story_id = planned.story.id
     level = planned.level
@@ -432,6 +440,16 @@ def run_story_lane(
             store.record_subtask(story_id, row)
             if position == 0:
                 store.record_story(story_row.model_copy(update={"status": "started"}))
+            # Relaunch continuation (card 02890d5d): on pygents a card whose
+            # open checkpoint was saved under this `TASK` continues from it; a
+            # changed workflow, a closed card or no row starts it fresh, with
+            # no error. The keyword is passed only when there is a row, so a
+            # driver that predates it keeps working. Yaml looks nothing up.
+            extra: dict[str, Any] = {}
+            if engine == "pygents":
+                checkpoint = cli.continuable_checkpoint(store, subtask.id)
+                if checkpoint is not None:
+                    extra["resume_from"] = checkpoint
             result = drive(
                 store=store,
                 run_id=run_id,
@@ -444,6 +462,7 @@ def run_story_lane(
                 runner_factory=runner_factory,
                 should_stop=stop.event.is_set,
                 engine=engine,
+                **extra,
             )
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             status = "escalated"
