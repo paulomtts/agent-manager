@@ -1168,7 +1168,7 @@ def test_an_unknown_starting_phase_is_an_error_before_anything_is_recorded(store
     assert store.connection.execute("SELECT COUNT(*) FROM phases").fetchone()[0] == 0
 
 
-def test_the_builtin_task_document_walks_against_a_fake_registry(store):
+def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subtask):
     calls: list[str] = []
 
     def set_status(card: str, status: str) -> dict[str, Any]:
@@ -1236,7 +1236,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store):
 
     workflow = load_builtin("task", _registry(functions))
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1700,10 +1700,10 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
     }
 
 
-def _walk_builtin(store, recorded: dict[str, Any], *, validated: bool) -> Any:
+def _walk_builtin(run_subtask, store, recorded: dict[str, Any], *, validated: bool) -> Any:
     calls: list[str] = []
     workflow = load_builtin("task", _registry(_builtin_functions(calls, validated=validated)))
-    return engine.run_subtask(
+    return run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -1753,10 +1753,10 @@ def test_a_resume_started_at_explore_never_re_runs_the_worktree_phase(store):
     ]
 
 
-def test_every_document_path_input_renders_the_expanded_writes_template(store):
+def test_every_document_path_input_renders_the_expanded_writes_template(store, run_subtask):
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     for phase_name in ("validate_spec", "plan", "validate_plan", "implement"):
         assert dict(recorded[phase_name].sections)["spec_path"] == SPEC_PATH
@@ -1764,10 +1764,12 @@ def test_every_document_path_input_renders_the_expanded_writes_template(store):
         assert dict(recorded[phase_name].sections)["plan_path"] == PLAN_PATH
 
 
-def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(store):
+def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(
+    store, run_subtask
+):
     recorded: dict[str, Any] = {}
 
-    summary = _walk_builtin(store, recorded, validated=True)
+    summary = _walk_builtin(run_subtask, store, recorded, validated=True)
 
     assert summary.skipped == [
         "spec",
@@ -1782,11 +1784,11 @@ def test_implement_gets_both_paths_even_when_plan_check_skipped_spec_and_plan(st
     assert sections["plan_path"] == PLAN_PATH
 
 
-def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
+def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store, run_subtask):
     """§13: a phase receives its declared inputs and nothing else."""
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     assert {name: rendered.inputs for name, rendered in recorded.items()} == {
         "explore": ("card", "parent_story", "repo_docs", "verification"),
@@ -1799,10 +1801,10 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store):
     }
 
 
-def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store):
+def test_the_explore_prompt_reads_the_cards_not_the_reserved_card_key(store, run_subtask):
     recorded: dict[str, Any] = {}
 
-    _walk_builtin(store, recorded, validated=False)
+    _walk_builtin(run_subtask, store, recorded, validated=False)
 
     sections = dict(recorded["explore"].sections)
     assert json.loads(sections["card"])["title"] == "Resolve phase inputs"
@@ -2277,7 +2279,9 @@ BLOCKED_IMPLEMENT = json.dumps(
 )
 
 
-def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_runs(store):
+def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_runs(
+    store, run_subtask
+):
     calls: list[str] = []
     functions = _builtin_functions(calls, validated=True)
     functions["implement_blocked_gate"] = reducers.implement_blocked_gate
@@ -2306,7 +2310,7 @@ def test_a_blocked_coder_escalates_the_subtask_at_implement_and_review_never_run
         calls.append(f"agent:{phase.name}")
         return {"role": phase.role}
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2348,7 +2352,9 @@ BLOCKED_REVIEW = json.dumps(
 )
 
 
-def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_runs(store):
+def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_runs(
+    store, run_subtask
+):
     calls: list[str] = []
     functions = _builtin_functions(calls, validated=True)
     # The real gate under test. `review_gate` and `plan_hash_gate` stay
@@ -2379,7 +2385,7 @@ def test_a_reviewer_reporting_a_blocker_escalates_at_review_and_verify_never_run
         calls.append(f"agent:{phase.name}")
         return {"role": phase.role}
 
-    summary = engine.run_subtask(
+    summary = run_subtask(
         workflow,
         store,
         story_id=STORY_ID,
@@ -2935,3 +2941,67 @@ def test_run_one_step_fails_a_named_function_it_has_no_workflow_to_resolve(store
     assert outcome.detail.startswith("EngineError: ")
     assert "'step.alpha'" in outcome.detail
     assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "failed")]
+
+
+# ── parity: the shipped `task` workflow on both engines (spec Tests 3) ──────
+
+
+def test_new_engine_returns_same_summary_for_the_shipped_task(monkeypatch, tmp_path):
+    """One explicit parity check, deliberately not parametrised (spec Tests 3):
+    `builtin/task.yaml`, walked once on each engine against separate temp
+    stores, ends in the same place -- status, result keys, skips, warnings,
+    the steps called, and every phase row. The clock is fixed so the rows'
+    timestamps compare too. Both plan-check outcomes are walked inside the
+    one test: `validated=True` takes the `plan_check` skip, so `skipped` is
+    compared non-empty."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    engines = {
+        "yaml": engine.run_subtask,
+        "pygents": lambda workflow, opened, **kw: new_engine.run_subtask(
+            phase_model.from_loader(workflow), opened, **kw
+        ),
+    }
+    for validated in (False, True):
+        walked: dict[str, Any] = {}
+        for name, run in engines.items():
+            calls: list[str] = []
+            workflow = load_builtin(
+                "task", _registry(_builtin_functions(calls, validated=validated))
+            )
+            label = f"{name}-{'validated' if validated else 'fresh'}"
+            opened = store_module.Store.open(tmp_path / label, f"run-parity-{label}")
+            try:
+                summary = run(
+                    workflow,
+                    opened,
+                    story_id=STORY_ID,
+                    subtask=_subtask(),
+                    repo_dir=REPO,
+                    commands=["uv run pytest"],
+                    card=CARD,
+                    parent_story=PARENT,
+                    agent_runner=_recording_runner({}),
+                    clock=lambda: FIXED,
+                )
+                rows = [
+                    tuple(row)
+                    for row in opened.connection.execute(
+                        "SELECT name, kind, status, started_at, ended_at FROM phases"
+                        " ORDER BY position"
+                    ).fetchall()
+                ]
+            finally:
+                opened.close()
+            walked[name] = (summary, calls, rows)
+
+        old_summary, old_calls, old_rows = walked["yaml"]
+        new_summary, new_calls, new_rows = walked["pygents"]
+        assert old_summary.status == new_summary.status == "done", validated
+        assert sorted(new_summary.results) == sorted(old_summary.results), validated
+        assert new_summary.skipped == old_summary.skipped, validated
+        assert new_summary.warnings == old_summary.warnings, validated
+        assert new_calls == old_calls, validated
+        assert new_rows == old_rows, validated
+        assert new_rows, "the walk recorded no phase rows to compare"
+    assert new_summary.skipped, "the validated walk must exercise a non-empty skip"
