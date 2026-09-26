@@ -424,28 +424,30 @@ def test_under_yaml_a_critic_that_blocks_once_escalates_at_once(
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "runtime/compile.py carries one loop counter along the whole walk, so a "
-        "spec loop leaves validate_plan at loop=1 and its first block escalates; "
-        "G4 says each critic loops at most once. A runtime/ fix, outside card "
-        "058981d3's files."
-    ),
-)
-def test_both_critics_blocking_once_each_should_both_loop(
+def test_both_critics_blocking_once_each_both_loop(
     milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
 ):
-    """Review focus 1: pinned as a known gap, loud the day it is fixed."""
+    """Review focus 1 / G4 "each at most once": the spec loop does not spend
+    validate_plan's, so both critics loop and the run ends done."""
     root = milestone_board["root"]
     card = milestone_board["subtasks"]["A"][0]
-    _arm_critic_blocks(tmp_path, monkeypatch, {"validate_spec": 1, "validate_plan": 1})
+    budget = _arm_critic_blocks(
+        tmp_path, monkeypatch, {"validate_spec": 1, "validate_plan": 1}
+    )
 
     result = _run_one_card(root, card, "pygents")
 
+    assert result.exit_code == 0, (result.output, result.exception)
     data = _envelope(result)
     assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert json.loads(budget.read_text(encoding="utf-8")) == {
+        "validate_plan": 0,
+        "validate_spec": 0,
+    }
+    assert [entry["phase"] for entry in read_fake_log(data["run_id"])] == [
+        "explore", "spec", "validate_spec", "spec", "validate_spec",
+        "plan", "validate_plan", "plan", "validate_plan", "implement", "review",
+    ]
 
 
 def test_with_no_critic_block_no_brief_carries_a_feedback_section(
