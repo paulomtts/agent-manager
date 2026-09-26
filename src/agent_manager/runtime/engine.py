@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
 
@@ -23,6 +23,11 @@ from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
 from agent_manager.runtime.state import RunDeps, current_run
 from agent_manager.workflow.phases import Workflow
+
+if TYPE_CHECKING:
+    # Annotation only (the module has `from __future__ import annotations`);
+    # the name `store` is taken by `run_subtask`'s parameter.
+    from agent_manager.store import Checkpoint
 
 
 def run_subtask(
@@ -39,14 +44,22 @@ def run_subtask(
     agent_runner: Any = None,
     clock: Callable[[], Any] = old._utcnow,
     should_stop: Callable[[], bool] | None = None,
+    resume_from: Checkpoint | None = None,
 ) -> old.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`.
 
-    No `start_phase`: resume belongs to the yaml engine. Every turn is saved as
-    a `turn` checkpoint before it runs, and the run ends with a `done` or
-    `escalated` one (`runtime/checkpoint.py`). `should_stop` is asked before
-    every turn: once it answers true, a `parked` checkpoint is saved, the next
-    phase is not started, and the subtask is recorded `stopped before <phase>`.
+    Every turn is saved as a `turn` checkpoint before it runs, and the run ends
+    with a `done` or `escalated` one (`runtime/checkpoint.py`). `should_stop` is
+    asked before every turn: once it answers true, a `parked` checkpoint is
+    saved, the next phase is not started, and the subtask is recorded
+    `stopped before <phase>`.
+
+    `resume_from` continues from a saved checkpoint instead of the first phase:
+    the agent is rebuilt from it, so the pool (seed and earlier results) and
+    the queue (the pending turn and its loop count) are the checkpoint's, and
+    no seed or first turn is added. A checkpoint saved under another workflow
+    digest is refused with `CheckpointMismatch` before anything runs or is
+    recorded.
     """
     return asyncio.run(
         _drive(
@@ -62,6 +75,7 @@ def run_subtask(
             agent_runner=agent_runner,
             clock=clock,
             should_stop=should_stop,
+            resume_from=resume_from,
         )
     )
 
@@ -80,6 +94,7 @@ async def _drive(
     agent_runner: Any,
     clock: Callable[[], Any],
     should_stop: Callable[[], bool] | None,
+    resume_from: Checkpoint | None,
 ) -> old.SubtaskSummary:
     # The binding, built and refused exactly as the old engine builds it:
     # before any agent exists, so a refusal records nothing.
@@ -97,18 +112,26 @@ async def _drive(
         binding.update(extra_context)
     binding.update(old._document_paths(workflow, card))
 
+    # Compiled first on both paths: it registers the digest-prefixed tools
+    # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
     compiled = C.compile_workflow(workflow)
-    agent = Agent(
-        f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
-        workflow.name,
-        [compiled.agent_phase, compiled.step_phase],
-        context_pool=ContextPool(),
-        context_queue=ContextQueue(limit=10),
-        tags=["subtask"],
-    )
+    if resume_from is None:
+        agent = Agent(
+            f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
+            workflow.name,
+            [compiled.agent_phase, compiled.step_phase],
+            context_pool=ContextPool(),
+            context_queue=ContextQueue(limit=10),
+            tags=["subtask"],
+        )
+    else:
+        # The pool (seed, earlier results) and the queue (pending turn, loop
+        # count) come from the checkpoint: no seed item, no first turn.
+        agent = Agent.from_dict(resume_from.agent)
     try:
-        await agent.context_pool.add(context.seed_item(binding))
-        await agent.put(compiled.first_turn())
+        if resume_from is None:
+            await agent.context_pool.add(context.seed_item(binding))
+            await agent.put(compiled.first_turn())
         deps = RunDeps(workflow, store, story_id, subtask, agent_runner, clock, should_stop)
         return await _run(agent, deps)
     finally:
