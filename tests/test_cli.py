@@ -4575,3 +4575,64 @@ def test_a_resumed_walk_that_stops_is_ok_true_and_exit_zero(tmp_path, monkeypatc
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is True
     assert envelope["data"]["status"] == "stopped"
+
+
+# ── pygents resume and relaunch (card 02890d5d) ──────────────────────────────
+
+
+def test_select_resumable_on_pygents_returns_a_lone_stopped_subtask():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    stopped = _pure_subtask("card-2", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [done]), _pure_story("story-2", [stopped])])
+
+    story, subtask = cli.select_resumable(run, engine="pygents")
+
+    assert story.card_id == "story-2"
+    assert subtask is stopped
+
+
+def test_select_resumable_on_pygents_still_returns_a_lone_started_subtask():
+    started = _pure_subtask("card-1", [])
+    run = _pure_run([_pure_story("story-1", [started])])
+
+    story, subtask = cli.select_resumable(run, engine="pygents")
+
+    assert story.card_id == "story-1"
+    assert subtask is started
+
+
+def test_select_resumable_on_pygents_refuses_nothing_in_flight_without_the_relaunch_remedy():
+    done = _pure_subtask("card-1", []).model_copy(update={"status": "done"})
+    escalated = _pure_subtask("card-2", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [done, escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run, engine="pygents")
+
+    message = str(caught.value)
+    assert "no subtask recorded 'started' or 'stopped'" in message
+    assert "found: card-1=done, card-2=escalated" in message
+    assert "agent-manager status" in message
+    assert "run --milestone" not in message
+
+
+def test_select_resumable_on_pygents_refuses_a_lone_escalated_subtask():
+    escalated = _pure_subtask("card-1", []).model_copy(update={"status": "escalated"})
+    run = _pure_run([_pure_story("story-1", [escalated])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run, engine="pygents")
+
+    assert "card-1=escalated" in str(caught.value)
+
+
+def test_select_resumable_on_pygents_refuses_a_started_and_a_stopped_subtask_together():
+    started = _pure_subtask("card-1", [])
+    stopped = _pure_subtask("card-2", []).model_copy(update={"status": "stopped"})
+    run = _pure_run([_pure_story("story-1", [started]), _pure_story("story-2", [stopped])])
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        cli.select_resumable(run, engine="pygents")
+
+    message = str(caught.value)
+    assert "2 subtasks recorded 'started' or 'stopped' (card-1, card-2)" in message

@@ -393,7 +393,9 @@ def logs_payload(
     }
 
 
-def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRun]:
+def select_resumable(
+    run: models.Run, *, engine: "Engine" = "yaml"
+) -> tuple[models.StoryRun, models.SubtaskRun]:
     """The one subtask of `run` that was in flight, or a refusal naming why not.
 
     Pure over the tree `load_run` assembled, like `find_subtask`: which subtask
@@ -408,16 +410,24 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
     escalations. More than one is a milestone-shaped run: this
     command drives one subtask the way `run --card` does, and choosing between
     them would leave the rest recorded `started` with nothing driving them.
+
+    `engine` (card 02890d5d): on `pygents` a `stopped` subtask counts beside a
+    `started` one, because its parked checkpoint is what `resume --engine
+    pygents` continues from, so the relaunch remedy can never apply there.
+    `escalated` is refused on both engines. The yaml wording is unchanged to
+    the character. `Engine` is quoted because it is defined further down.
     """
-    started = [
+    resumable = ("started", "stopped") if engine == "pygents" else ("started",)
+    wanted = " or ".join(repr(status) for status in resumable)
+    in_flight = [
         (story, subtask)
         for story in run.stories
         for subtask in story.subtasks
-        if subtask.status == "started"
+        if subtask.status in resumable
     ]
-    if len(started) == 1:
-        return started[0]
-    if not started:
+    if len(in_flight) == 1:
+        return in_flight[0]
+    if not in_flight:
         found = (
             ", ".join(
                 f"{subtask.card_id}={subtask.status}"
@@ -440,13 +450,13 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
             else ""
         )
         raise NotResumableError(
-            f"run {run.id!r} has no subtask recorded 'started', so there is no work"
+            f"run {run.id!r} has no subtask recorded {wanted}, so there is no work"
             f" in flight to pick up (found: {found});"
             f" `agent-manager status {run.id}` shows the run as it stands{remedy}"
         )
-    cards = ", ".join(subtask.card_id for _story, subtask in started)
+    cards = ", ".join(subtask.card_id for _story, subtask in in_flight)
     raise NotResumableError(
-        f"run {run.id!r} has {len(started)} subtasks recorded 'started' ({cards}),"
+        f"run {run.id!r} has {len(in_flight)} subtasks recorded {wanted} ({cards}),"
         " and `resume` drives one subtask the way `run --card` does;"
         f" `agent-manager status {run.id}` shows all of them"
     )
