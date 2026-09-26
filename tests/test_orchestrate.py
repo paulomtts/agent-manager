@@ -16,6 +16,7 @@ by a recorder. Tests that request `real_integrate` run the real Integrate over
 branches `BranchingDriver` or `_commit_branch` really commit.
 """
 
+import ast
 import json
 import shlex
 import shutil
@@ -31,6 +32,7 @@ from typing import Any
 import pytest
 
 from agent_manager import board, census, cli, dag, engine, integration, models, orchestrate, paths
+from agent_manager import engine as engine_module
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow.registry import WorkflowLoadError
@@ -447,6 +449,7 @@ class FakeDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
+        engine="yaml",
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -461,6 +464,7 @@ class FakeDriver:
                 "commands": list(commands),
                 "allow_no_verification": allow_no_verification,
                 "runner_factory": runner_factory,
+                "engine": engine,
             }
         )
         self.snapshots.append(store.load_run(run_id))
@@ -468,10 +472,10 @@ class FakeDriver:
         if isinstance(outcome, BaseException):
             raise outcome
         if outcome is None:
-            summary = engine.SubtaskSummary(status="done")
+            summary = engine_module.SubtaskSummary(status="done")
         else:
             phase, detail = outcome
-            summary = engine.SubtaskSummary(
+            summary = engine_module.SubtaskSummary(
                 status="escalated", failed_phase=phase, detail=detail
             )
         return cli.SubtaskDrive(summary=summary, warnings=list(self.warnings.get(card.id, [])))
@@ -517,6 +521,7 @@ class IntegrateRecorder:
         store,
         run_id,
         runner_factory,
+        engine="yaml",
     ):
         stories = list(stories)
         self.calls.append(
@@ -530,6 +535,7 @@ class IntegrateRecorder:
                 "store": store,
                 "run_id": run_id,
                 "runner_factory": runner_factory,
+                "engine": engine,
                 "run_status": store.load_run(run_id).status,
             }
         )
@@ -750,6 +756,7 @@ class GatedDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
+        engine="yaml",
     ) -> cli.SubtaskDrive:
         with self.lock:
             self.calls.append(
@@ -767,15 +774,15 @@ class GatedDriver:
             warnings = list(self.warnings.get(card.id, []))
             if isinstance(outcome, tuple):
                 phase, detail = outcome
-                summary = engine.SubtaskSummary(
+                summary = engine_module.SubtaskSummary(
                     status="escalated", failed_phase=phase, detail=detail
                 )
             elif outcome != "done" and should_stop is not None and should_stop():
-                summary = engine.SubtaskSummary(
+                summary = engine_module.SubtaskSummary(
                     status="stopped", detail="stopped before implement"
                 )
             else:
-                summary = engine.SubtaskSummary(status="done")
+                summary = engine_module.SubtaskSummary(status="done")
             return cli.SubtaskDrive(summary=summary, warnings=warnings)
         finally:
             with self.lock:
@@ -844,6 +851,7 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
         "allow_no_verification": True,
         "run_id": run_id,
         "runner_factory": factory,
+        "engine": "yaml",
         "run_status": "started",
     }
 
@@ -983,6 +991,51 @@ def test_no_runner_factory_gives_integrate_cli_default_runner_factory_at_call_ti
     assert [call["runner_factory"] for call in driver.calls] == [None]
     (integrate_call,) = integrate_recorder.calls
     assert integrate_call["runner_factory"] is sentinel_factory
+
+
+@requires_git
+@requires_brd
+@pytest.mark.parametrize(
+    "given, passed",
+    [({}, "yaml"), ({"engine": "yaml"}, "yaml"), ({"engine": "pygents"}, "pygents")],
+)
+@pytest.mark.parametrize("lanes", [1, 2])
+def test_run_milestone_hands_its_engine_to_every_driver_call_and_to_integrate(
+    project, integrate_recorder, given, passed, lanes
+):
+    """Spec test 3: one engine per run, on every lane thread and on Integrate.
+    With no argument the engine is `yaml`."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=lanes, **given)
+
+    assert result["done"] is True
+    assert len(driver.calls) == 3
+    assert [call["engine"] for call in driver.calls] == [passed] * 3
+    assert [call["engine"] for call in integrate_recorder.calls] == [passed]
+
+
+def _imported_modules(module) -> set[str]:
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_the_engine_selecting_modules_never_import_pygents():
+    """Pygents-engine RULE 1: these three reach pygents through
+    `agent_manager.runtime.engine` only. A guard: it passes before this card
+    and must keep passing after it."""
+    for module in (cli, orchestrate, integration):
+        imported = _imported_modules(module)
+        assert not any(n == "pygents" or n.startswith("pygents.") for n in imported), (
+            module.__name__
+        )
 
 
 @requires_git

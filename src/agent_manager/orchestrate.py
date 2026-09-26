@@ -219,6 +219,7 @@ class Driver(Protocol):
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
         should_stop: Callable[[], bool] | None = None,
+        engine: cli.Engine = "yaml",
     ) -> cli.SubtaskDrive: ...
 
 
@@ -401,6 +402,7 @@ def run_story_lane(
     allow_no_verification: bool,
     runner_factory: cli.RunnerFactory | None,
     stop: RunStop,
+    engine: cli.Engine = "yaml",
 ) -> LaneOutcome:
     """Drive one story's remaining subtasks in order, and say how the lane ended.
 
@@ -441,6 +443,7 @@ def run_story_lane(
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
                 should_stop=stop.event.is_set,
+                engine=engine,
             )
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             status = "escalated"
@@ -509,6 +512,7 @@ def run_milestone(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
+    engine: cli.Engine = "yaml",
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone`, level by level, and report (O6).
 
@@ -531,6 +535,9 @@ def run_milestone(
     Integrate escalation records `escalated` and returns
     `integrate_escalated_payload`. An exception from Integrate propagates and
     the run is never recorded `done`.
+
+    `engine` goes unchanged to every driver call on every lane thread and to
+    Integrate; the preflight loads the YAML document on both engines.
     """
     if max_concurrent < 1:
         raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
@@ -585,6 +592,7 @@ def run_milestone(
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
+                        engine=engine,
                     )
                     for planned in level
                 ]
@@ -617,6 +625,7 @@ def run_milestone(
             store=store,
             run_id=run_id,
             runner_factory=factory,
+            engine=engine,
         )
         if isinstance(outcome, integration.IntegrateEscalation):
             # The branch and worktree stay exactly as Integrate left them (I5).

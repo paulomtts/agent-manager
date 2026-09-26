@@ -27,10 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_manager import cli, dag, engine, models
+from agent_manager import engine as yaml_engine
 from agent_manager.census import StoryPlan
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow.loader import load_builtin
 
 PHASE = "integrate"
@@ -135,12 +138,25 @@ def _resolve_conflict(
     store: Store,
     run_id: str,
     runner_factory: cli.RunnerFactory,
-) -> engine.SubtaskSummary:
-    """Drive `builtin/integrate.yaml` once for one conflicting tip.
+    engine: cli.Engine = "yaml",
+) -> yaml_engine.SubtaskSummary:
+    """Drive the `integrate` workflow once for one conflicting tip.
 
     The synthetic subtask is recorded before `run_subtask` journals its first
     phase. The caller has already recorded the synthetic story.
+
+    `engine` picks the walk as `cli.drive_subtask` does (card 7fdec762): `yaml`
+    walks the loaded `builtin/integrate.yaml`, `pygents` walks
+    `workflow.integrate.INTEGRATE`, with the same keywords. The runner factory
+    gets the loaded YAML document on both. The parameter shadows the
+    module-level `engine` name here, so the walks are reached as `yaml_engine`
+    and `runtime_engine`. Any other value is refused before anything is
+    recorded.
     """
+    if engine not in cli.ENGINES:
+        raise ValueError(
+            f"unknown engine {engine!r}; expected one of {', '.join(cli.ENGINES)}"
+        )
     workflow = load_builtin(WORKFLOW_NAME)
     subtask = models.SubtaskRun(
         card_id=story_id,
@@ -157,20 +173,21 @@ def _resolve_conflict(
         story_id=INTEGRATE_STORY_ID,
         card_id=story_id,
     )
-    return engine.run_subtask(
-        workflow,
-        store,
-        story_id=INTEGRATE_STORY_ID,
-        subtask=subtask,
-        repo_dir=repo_dir,
-        commands=commands,
-        extra_context={
+    walk = {
+        "story_id": INTEGRATE_STORY_ID,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "extra_context": {
             "merge_tip": tip,
             "conflict_files": list(files),
             **cli.gate_context(commands, allow_no_verification),
         },
-        agent_runner=runner,
-    )
+        "agent_runner": runner,
+    }
+    if engine == "pygents":
+        return runtime_engine.run_subtask(integrate_workflow.INTEGRATE, store, **walk)
+    return yaml_engine.run_subtask(workflow, store, **walk)
 
 
 def _resolver_detail(
@@ -194,13 +211,14 @@ def integrate_milestone(
     store: Store,
     run_id: str,
     runner_factory: cli.RunnerFactory,
+    engine: cli.Engine = "yaml",
 ) -> IntegrateOutcome:
     """Merge every story tip into `<branch_prefix>-integrate`, then verify it once.
 
     The caller owns the run: it has recorded the `Run` in `store` under
     `run_id`, and it decides the run's status from the outcome. This function
     records only the synthetic "Integrate" story and its subtasks, and only when
-    a tip conflicts.
+    a tip conflicts. `engine` is handed to every resolver dispatch unchanged.
     """
     root = Path(repo_dir).resolve()
     branch = integration_branch(branch_prefix)
@@ -248,6 +266,7 @@ def integrate_milestone(
                 store=store,
                 run_id=run_id,
                 runner_factory=runner_factory,
+                engine=engine,
             )
             if summary.status != "done":
                 return escalate(
