@@ -18,6 +18,7 @@ from agent_manager.steps.reducers import (
     implement_blocked_gate,
     is_plan_hash,
     plan_hash_gate,
+    plan_hash_gate_adapter,
     plan_hash_mismatch,
     review_gate,
     verification_gate,
@@ -783,3 +784,43 @@ def test_implement_blocked_gate_blocks_anything_that_is_not_a_result_mapping(dea
     verdict = implement_blocked_gate(dead)
     assert verdict["blocked"] == "implement"
     assert "no implement result to judge" in verdict["detail"]
+
+
+def test_plan_hash_gate_adapter_compares_the_two_results():
+    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "aaaaaaaa"}) is None
+    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "bbbbbbbb"}) is not None
+    assert plan_hash_gate_adapter(None, None) is None
+    # digest() hashes `module.qualname`, so the adapter's home is part of the
+    # declared workflow's identity (Review Focus 5).
+    assert plan_hash_gate_adapter.__module__ == "agent_manager.steps.reducers"
+
+
+def test_the_plan_hash_adapter_compares_the_two_phases_plan_hash_fields():
+    gate = plan_hash_gate_adapter(
+        {"plan_hash": "a1b2c3d4", "report": "done"},
+        {"plan_hash": "ffffffff", "porcelain": ""},
+    )
+    assert "plan hash CHANGED mid-run" in gate["detail"]
+    assert "a1b2c3d4" in gate["detail"] and "ffffffff" in gate["detail"]
+    assert "blocked" not in gate
+
+
+def test_the_plan_hash_adapter_passes_when_the_two_hashes_match():
+    assert (
+        plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, {"plan_hash": "a1b2c3d4"})
+        is None
+    )
+
+
+@pytest.mark.parametrize("dead", [None, {}, "implement", 7, [{"plan_hash": "a1b2c3d4"}]])
+def test_the_plan_hash_adapter_passes_when_either_phase_result_is_missing(dead):
+    # A skipped or dead phase has no hash to compare; the reducer's own rule is
+    # "nothing trustworthy to say" -> None.
+    assert plan_hash_gate_adapter(dead, {"plan_hash": "a1b2c3d4"}) is None
+    assert plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, dead) is None
+
+
+def test_the_plan_hash_adapter_binds_with_no_arguments_at_all():
+    """Both parameters default to None so a run that skipped `implement` binds
+    and passes, instead of `bind_arguments` reporting a required parameter."""
+    assert plan_hash_gate_adapter() is None

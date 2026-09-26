@@ -288,6 +288,10 @@ the caller supplies both through `engine.run_subtask(extra_context=...)`.
 """
 
 
+INPUT_NAMES: frozenset[str] = frozenset(_TABLE)
+"""Every input name a phase may declare that a resolver provides (phases.validate)."""
+
+
 INPUT_PRODUCERS: dict[str, str] = {
     name: resolver.produced_by  # type: ignore[attr-defined]
     for name, resolver in _TABLE.items()

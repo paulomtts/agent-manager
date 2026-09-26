@@ -964,3 +964,9 @@ def test_feedback_that_already_ends_in_newlines_does_not_accumulate_blank_lines(
 
     assert retry.startswith(base)
     assert retry.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")
+
+
+def test_input_names_are_exactly_the_resolver_table():
+    assert isinstance(prompt.INPUT_NAMES, frozenset)
+    assert prompt.INPUT_NAMES == frozenset(prompt._TABLE)
+    assert "card" in prompt.INPUT_NAMES

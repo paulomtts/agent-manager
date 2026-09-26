@@ -403,3 +403,39 @@ def critic_blockers_gate(result: object) -> dict[str, str] | None:
         "blocked": "validation",
         "detail": reason or "spec has unresolvable blockers",
     }
+
+
+def _plan_hash_of(result: object) -> object:
+    """The `plan_hash` field of a dumped phase result, or `None`.
+
+    `None` rather than an error for a missing or non-mapping result: a phase
+    that was skipped, escalated or returned nothing has no hash to compare, and
+    `reducers.plan_hash_gate` already answers `None` (pass) for anything that is
+    not an 8-hex-character string.
+    """
+    return result.get("plan_hash") if isinstance(result, Mapping) else None
+
+
+def plan_hash_gate_adapter(
+    implement: object = None, review: object = None
+) -> dict[str, str] | None:
+    """`reducers.plan_hash_gate` bound to the two phase results it compares.
+
+    The document names this gate on the `review` phase, and
+    `engine.bind_arguments` binds strictly by parameter name out of a table of
+    whole values -- nothing in that table is called `impl_hash` or
+    `review_hash`, and the yaml `args:` map holds literals, so neither could be
+    written there either. This adapter takes the two names the table *does*
+    hold, the phase names `implement` and `review`, and does the one field
+    lookup the binder cannot do for itself. The reducer keeps its signature and
+    its tests; nothing about the comparison moves.
+
+    A module-level function rather than a closure built inside
+    `default_registry()`: `resolve(name) is resolve(name)` must hold across two
+    registries, which is the same invariant `_PLACEHOLDERS` exists to preserve.
+
+    Both parameters default to `None` so a run where `implement` never executed
+    in this process (a `plan_check` skip, or a resume started later) still binds
+    and passes, rather than failing to bind and reading as a document bug.
+    """
+    return plan_hash_gate(_plan_hash_of(implement), _plan_hash_of(review))
