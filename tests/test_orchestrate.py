@@ -2399,6 +2399,56 @@ def test_only_orchestrate_imports_grafo():
     assert importers == {"orchestrate.py"}
 
 
+@requires_git
+@requires_brd
+def test_a_lane_bug_keeps_stdout_one_json_line(project, monkeypatch, capsys):
+    """Review Focus 2, through the CLI: grafo logs a failing node with a
+    traceback. A handler on stdout is attached to grafo's logger for this
+    test, so any grafo record would land there; stdout must still be exactly
+    one JSON line, and grafo's own level is back once the run ends."""
+    shape = _milestone(project, {"A": 1})
+
+    async def buggy(**kwargs: Any) -> cli.SubtaskDrive:
+        raise ValueError("lane bug")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", buggy)
+    grafo_logger = logging.getLogger("grafo")
+    level_before = grafo_logger.level
+    loud = logging.StreamHandler(sys.stdout)  # capsys's stdout, captured here
+    grafo_logger.addHandler(loud)
+    try:
+        with pytest.raises(SystemExit) as exited:
+            cli.app(
+                [
+                    "run",
+                    "--milestone",
+                    shape["milestone"],
+                    "--repo-dir",
+                    str(project),
+                    "--base-branch",
+                    "main",
+                    "--branch-prefix",
+                    PREFIX,
+                    "--max-concurrent",
+                    "1",
+                ],
+                prog_name="am",
+            )
+    finally:
+        grafo_logger.removeHandler(loud)
+
+    assert exited.value.code == cli.EXIT_ESCALATED
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 1, out
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is True
+    assert envelope["data"]["escalated"] is True
+    assert envelope["data"]["detail"] == "ValueError: lane bug"
+    assert "Traceback" not in out
+    assert grafo_logger.level == level_before
+
+
 # ── real M6 subtask agents under the tree ───────────────────────────────────
 
 

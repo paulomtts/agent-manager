@@ -36,6 +36,7 @@ created by `run_milestone` for that run. This is the only module that imports
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -51,6 +52,11 @@ from agent_manager.store import Checkpoint, Store
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
+
+
+GRAFO_LOGGER = "grafo"
+"""grafo's logger. It logs every failing node with a traceback on its own
+handler; `supervise` silences it so stdout stays one JSON line (T6)."""
 
 
 STOPPED_PREFIX = "stopped before "
@@ -717,45 +723,55 @@ async def supervise(
     blocker, forwarding the blocker's tip as `tip_<short id>` (Task 3.2 reads
     those for merged bases). The executor's roots are the stories with no
     in-milestone blocker; a milestone with no story has no tree to run.
+
+    The `grafo` logger is at CRITICAL for exactly this call: a lane's
+    escalation is data in the outcomes, never a traceback on a stream, and
+    grafo's own level is restored on every exit.
     """
-    slots = asyncio.Semaphore(max_concurrent)
-    finished: dict[str, LaneOutcome] = {}
+    grafo_logger = logging.getLogger(GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    grafo_logger.setLevel(logging.CRITICAL)
+    try:
+        slots = asyncio.Semaphore(max_concurrent)
+        finished: dict[str, LaneOutcome] = {}
 
-    def node_coroutine(story: census.StoryPlan) -> Callable[..., Any]:
-        async def run(**tips: str) -> str:
-            return await lane(
-                story,
-                plan=plan,
-                store=store,
-                run_id=run_id,
-                root=root,
-                drive=drive,
-                commands=commands,
-                allow_no_verification=allow_no_verification,
-                runner_factory=runner_factory,
-                slots=slots,
-                stop=stop,
-                finished=finished,
-            )
+        def node_coroutine(story: census.StoryPlan) -> Callable[..., Any]:
+            async def run(**tips: str) -> str:
+                return await lane(
+                    story,
+                    plan=plan,
+                    store=store,
+                    run_id=run_id,
+                    root=root,
+                    drive=drive,
+                    commands=commands,
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    slots=slots,
+                    stop=stop,
+                    finished=finished,
+                )
 
-        return run
+            return run
 
-    nodes = {
-        story.id: grafo.Node(coroutine=node_coroutine(story), uuid=story.id, timeout=None)
-        for story in plan.stories
-    }
-    for story in plan.stories:
-        for blocker in plan.roots[story.id].blockers:
-            await nodes[blocker].connect(
-                nodes[story.id], forward=f"tip_{dag.short_id(blocker)}"
-            )
-    roots = [nodes[story.id] for story in plan.stories if not plan.roots[story.id].blockers]
-    errors: list[BaseException] = []
-    if roots:
-        executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
-        await executor.run()
-        errors = list(executor.errors)
-    return collect_outcomes(plan, nodes, errors, finished)
+        nodes = {
+            story.id: grafo.Node(coroutine=node_coroutine(story), uuid=story.id, timeout=None)
+            for story in plan.stories
+        }
+        for story in plan.stories:
+            for blocker in plan.roots[story.id].blockers:
+                await nodes[blocker].connect(
+                    nodes[story.id], forward=f"tip_{dag.short_id(blocker)}"
+                )
+        roots = [nodes[story.id] for story in plan.stories if not plan.roots[story.id].blockers]
+        errors: list[BaseException] = []
+        if roots:
+            executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
+            await executor.run()
+            errors = list(executor.errors)
+        return collect_outcomes(plan, nodes, errors, finished)
+    finally:
+        grafo_logger.setLevel(level_before)
 
 
 def run_milestone(
