@@ -2914,3 +2914,196 @@ def test_an_integrate_escalation_still_lists_the_bases_built(
 
     assert (result["escalated"], result["phase"]) == (True, "integrate"), result
     assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_base_escalates_the_story_at_base_and_parks_a_running_sibling(
+    project, fake_bases
+):
+    """Spec: `BaseFailed(stopped=False)` escalates C at `base` with no
+    subtask, triggers the stop, drives no subtask of C, and D -- held in
+    flight on an Event until the stop fires -- is recorded `stopped`."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 2}, blocked_by={"C": ["A", "B"]}
+    )
+    story_a, story_b, story_c, story_d = (shape["stories"][key] for key in "ABCD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    d1, d2 = shape["subtasks"]["D"]
+    d1_in_flight = asyncio.Event()
+
+    async def hold_d1_until_the_stop(stop: StopSignal | None) -> None:
+        d1_in_flight.set()
+        await _await_stop(stop)
+
+    async def fail_once_d1_is_in_flight(stop: StopSignal | None) -> None:
+        await _within(d1_in_flight.wait(), "d1 in flight beside C's base")
+
+    fake_bases.gates[story_c] = fail_once_d1_is_in_flight
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+    driver = GatedDriver(gates={d1: hold_d1_until_the_stop})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 1,
+        "story": story_c,
+        "subtask": None,
+        "failed_phase": "base",
+        "detail": "conflict nobody could resolve",
+        "warnings": [],
+        "stopped": [{"story": story_d, "subtask": d1, "before_phase": "implement"}],
+    }
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert len(fake_bases.calls) == 1
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_c: "escalated",
+        c1: "pending",
+        story_d: "stopped",
+        d1: "stopped",
+        d2: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_base_whose_resolver_was_stopped_ends_stopped_not_escalated(project, fake_bases):
+    """Spec: `BaseFailed(stopped=True)` -- D escalates while C's base is being
+    built; C's resolver parks, and C is `stopped` with no subtask."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A", "B"]}
+    )
+    story_a, story_b, story_c, story_d = (shape["stories"][key] for key in "ABCD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    c_building = asyncio.Event()
+
+    async def park_with_the_stop(stop: StopSignal | None) -> None:
+        c_building.set()
+        await _await_stop(stop)
+
+    async def escalate_once_c_builds(stop: StopSignal | None) -> None:
+        await _within(c_building.wait(), "C's base to start building")
+
+    fake_bases.gates[story_c] = park_with_the_stop
+    fake_bases.outcomes[story_c] = bases.BaseFailed("the resolver was stopped", stopped=True)
+    driver = GatedDriver(
+        outcomes={d1: ("review", "d broke")}, gates={d1: escalate_once_c_builds}
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_d,
+        "subtask": d1,
+        "failed_phase": "review",
+        "detail": "d broke",
+        "warnings": [],
+        "stopped": [{"story": story_c, "subtask": None, "before_phase": None}],
+    }
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_c: "stopped",
+        c1: "pending",
+        story_d: "escalated",
+        d1: "escalated",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_merged_lane_that_finds_the_stop_fired_never_builds_its_base(project, fake_bases):
+    """Review Focus 1: one slot. The three roots queue on it in census order;
+    `joined` (blocked by the first two) is started only after the second
+    returned, so it queues behind `last`. `last` escalates, and `joined` takes
+    the slot with the stop already fired: stopped at j1, nothing built."""
+    milestone = _add_card(project, "Milestone 3: orchestration")
+    only_subtask: dict[str, str] = {}
+    for key in ("P", "Q", "R"):
+        story = _add_card(project, f"Story {key}", milestone)
+        only_subtask[story] = _add_card(project, f"{key.lower()}1: only subtask of story {key}", story)
+    first, second, last = _census_stories(project, milestone)
+    joined = _add_card(project, "Story J: blocked by the first two", milestone)
+    j1 = _add_card(project, "j1: only subtask of story J", joined)
+    _block(project, joined, first)
+    _block(project, joined, second)
+    driver = GatedDriver(outcomes={only_subtask[last]: ("review", "the last root broke")})
+
+    result = _run(project, milestone, driver, max_concurrent=1)
+
+    assert fake_bases.calls == []
+    assert j1 not in [call["card"] for call in driver.calls]
+    assert (result["story"], result["subtask"]) == (last, only_subtask[last])
+    assert result["stopped"] == [{"story": joined, "subtask": j1, "before_phase": None}]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[joined], statuses[j1]) == ("stopped", "pending")
+
+
+@requires_git
+@requires_brd
+def test_any_other_error_from_the_base_is_a_lane_escalation_with_no_subtask(
+    project, fake_bases
+):
+    """Spec: a non-`BaseFailed` error goes to the catch-all: `"<Type>: <msg>"`,
+    no subtask, no failed phase, and no subtask row escalated."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    fake_bases.outcomes[story_c] = RuntimeError("git fell over")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["escalated"] is True, result
+    assert (result["level"], result["story"], result["subtask"], result["failed_phase"]) == (
+        1,
+        story_c,
+        None,
+        None,
+    )
+    assert result["detail"] == "RuntimeError: git fell over"
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("escalated", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
+    project, fake_bases
+):
+    """Spec: grafo never starts C when B escalated, so C is `pending` and
+    `bases.build` is never called."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_b, story_c = shape["stories"]["B"], shape["stories"]["C"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert fake_bases.calls == []
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert "bases" not in result
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
