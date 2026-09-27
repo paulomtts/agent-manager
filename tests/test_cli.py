@@ -13,12 +13,14 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1412,10 +1414,11 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 
 @requires_git
 @requires_brd
-def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
-    """Addendum P4: the driver passes the stop check straight through. With a
-    stop already requested, the first phase of `TASK` never
-    starts, so the fake runner is never called and no worktree is made."""
+def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards):
+    """Addendum P4, on the one stop: the driver passes the run's `StopSignal`
+    straight through. With the signal already triggered, the first phase of
+    `TASK` never starts, so the fake runner is never called and no worktree is
+    made."""
     root = cli.resolve_repo_dir(project)
     parent = board.show(cards["story"], repo_dir=root)
     card = board.show(cards["subtask"], repo_dir=root)
@@ -1431,6 +1434,8 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
         worktree_path=cli.worktree_for(root, branch),
     )
     seen: list[tuple[str, dict[str, Any]]] = []
+    stop = StopSignal()
+    stop.trigger(parent.id)
     store = store_module.Store.open(root, run_id)
     try:
         store.record_run(
@@ -1456,15 +1461,17 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
         )
         store.record_subtask(parent.id, subtask)
 
-        drive = cli.drive_subtask(
-            store=store,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            runner_factory=lambda **kwargs: fake_runner(seen),
-            should_stop=lambda: True,
+        drive = asyncio.run(
+            cli.drive_subtask_async(
+                store=store,
+                run_id=run_id,
+                card=card,
+                parent=parent,
+                subtask=subtask,
+                repo_dir=root,
+                runner_factory=lambda **kwargs: fake_runner(seen),
+                stop=stop,
+            )
         )
         run = store.load_run(run_id)
     finally:
@@ -1544,9 +1551,6 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
     store = object()
     subtask = _drive_row()
 
-    def stop() -> bool:
-        return False
-
     drive = cli.drive_subtask(
         store=store,
         run_id=DRIVE_RUN_ID,
@@ -1556,7 +1560,6 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         repo_dir=DRIVE_REPO,
         commands=["uv run pytest"],
         runner_factory=factory,
-        should_stop=stop,
     )
 
     ((workflow, passed_store, kwargs),) = walks
@@ -1571,7 +1574,6 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         "parent_story": DRIVE_PARENT,
         "extra_context": cli.gate_context(["uv run pytest"], False),
         "agent_runner": runner,
-        "should_stop": stop,
         "stop": None,
     }
     assert drive.summary.status == "done"
@@ -1583,6 +1585,34 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         "story_id": DRIVE_PARENT.id,
         "card_id": DRIVE_CARD.id,
     }
+
+
+DRIVER_KEYWORDS = [
+    "store",
+    "run_id",
+    "card",
+    "parent",
+    "subtask",
+    "repo_dir",
+    "commands",
+    "allow_no_verification",
+    "runner_factory",
+]
+
+
+def test_the_drivers_take_a_stop_signal_and_no_other_stop():
+    """T5: the `StopSignal` is the only stop. The sync driver takes none; a
+    caller that must stop awaits `drive_subtask_async(stop=...)`. Any other
+    keyword is a `TypeError`."""
+    assert list(inspect.signature(cli.drive_subtask).parameters) == [
+        *DRIVER_KEYWORDS,
+        "resume_from",
+    ]
+    assert list(inspect.signature(cli.drive_subtask_async).parameters) == [
+        *DRIVER_KEYWORDS,
+        "stop",
+        "resume_from",
+    ]
 
 
 # ── drive_subtask_async (card 9b944409) ──────────────────────────────────────
@@ -1676,7 +1706,6 @@ def test_drive_subtask_async_hands_stop_to_the_engine(monkeypatch):
         "parent_story": DRIVE_PARENT,
         "extra_context": cli.gate_context(["uv run pytest"], False),
         "agent_runner": runner,
-        "should_stop": None,
         "stop": stop,
     }
     assert drive.summary.status == "done"
@@ -4356,7 +4385,7 @@ def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
 
 
 def _park_pygents(project: Path, cards: dict[str, str]) -> str:
-    """A milestone run whose one subtask the run's stop parked on pygents after `spec`.
+    """A milestone run whose one subtask the run's `StopSignal` parked on pygents after `spec`.
 
     Recorded the way `orchestrate.run_story_lane` records it: the run is a
     `milestone` run, the engine records the subtask `stopped`, the lane
@@ -4378,6 +4407,33 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
         card_id=parent.id, title=parent.title, level=0, status="started", tip_branch=branch
     )
     seen: list[str] = []
+    stop = StopSignal()
+    record = _resume_factory(seen)
+
+    def stopping_factory(**kwargs: Any):
+        # Called by `drive_subtask_async` on its loop, where the signal lives.
+        loop = asyncio.get_running_loop()
+        run = record(**kwargs)
+
+        def runner(phase, context, rendered):
+            result = run(phase, context, rendered)
+            if phase.name == "spec":
+                # The runner is in a `to_thread` worker: hand `trigger` to the
+                # loop and wait until it has run, so the agent is paused
+                # before this phase returns.
+                fired = threading.Event()
+
+                def fire() -> None:
+                    stop.trigger(parent.id)
+                    fired.set()
+
+                loop.call_soon_threadsafe(fire)
+                if not fired.wait(5):
+                    raise RuntimeError("the stop was never triggered")
+            return result
+
+        return runner
+
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -4394,15 +4450,17 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
         )
         opened.record_story(story)
         opened.record_subtask(parent.id, subtask)
-        drive = cli.drive_subtask(
-            store=opened,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            runner_factory=_resume_factory(seen),
-            should_stop=lambda: seen[-1:] == ["spec"],
+        drive = asyncio.run(
+            cli.drive_subtask_async(
+                store=opened,
+                run_id=run_id,
+                card=card,
+                parent=parent,
+                subtask=subtask,
+                repo_dir=root,
+                runner_factory=stopping_factory,
+                stop=stop,
+            )
         )
         assert drive.summary.status == "stopped"
         assert drive.summary.detail == "stopped before validate_spec"

@@ -636,7 +636,6 @@ async def drive_subtask_async(
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
-    should_stop: Callable[[], bool] | None = None,
     stop: StopSignal | None = None,
     resume_from: store_module.Checkpoint | None = None,
 ) -> SubtaskDrive:
@@ -649,10 +648,9 @@ async def drive_subtask_async(
     nothing -- an escalation is `summary.status == "escalated"`, a stop is
     `"stopped"`, and engine errors propagate.
 
-    `stop` (T5) is the run's `StopSignal`, handed to the engine as is.
-    `should_stop` is here only so `drive_subtask` can forward it; Task 3.3
-    removes it. `resume_from` joins the walk's keywords only when given, so a
-    fresh walk is called exactly as before.
+    `stop` (T5) is the run's `StopSignal`, handed to the engine as is; it is
+    the only stop. `resume_from` joins the walk's keywords only when given, so
+    a fresh walk is called exactly as before.
     """
     factory = default_runner_factory if runner_factory is None else runner_factory
     runner = factory(
@@ -670,7 +668,6 @@ async def drive_subtask_async(
         "parent_story": parent,
         "extra_context": gate_context(commands, allow_no_verification),
         "agent_runner": runner,
-        "should_stop": should_stop,
         "stop": stop,
     }
     if resume_from is not None:
@@ -694,7 +691,6 @@ def drive_subtask(
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
-    should_stop: Callable[[], bool] | None = None,
     resume_from: store_module.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `workflow.task.TASK` under a store the caller owns.
@@ -704,8 +700,8 @@ def drive_subtask(
     everything around the walk: the board reads, the run id, opening and
     closing the store, and the run/story/subtask rows. This function catches
     nothing. An escalation is `summary.status == "escalated"`, not an exception.
-    `should_stop` goes straight to the engine; a stop is
-    `summary.status == "stopped"`.
+    It takes no stop: a caller that must stop awaits
+    `drive_subtask_async(stop=...)`, where a stop is `summary.status == "stopped"`.
 
     One `asyncio.run` around `drive_subtask_async`, whose walk is
     `runtime.engine.run_subtask_async` over `TASK`. `resume_from` (card
@@ -725,7 +721,6 @@ def drive_subtask(
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
-            should_stop=should_stop,
             resume_from=resume_from,
         )
     )
