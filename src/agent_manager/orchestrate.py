@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1096,6 +1096,35 @@ async def lane(
     return planned.tip
 
 
+async def run_until_killed(
+    work: Awaitable[Any], killed: asyncio.Event, fatal: Sequence[BaseException]
+) -> None:
+    """Await `work`, unless a lane dies of a `BaseException` first: then re-raise it.
+
+    grafo's workers catch only `Exception`. asyncio re-raises only
+    `KeyboardInterrupt` and `SystemExit` out of the loop by itself; any other
+    `BaseException` is stored on the grafo worker task, and
+    `TreeExecutor.run` drops it in `gather(..., return_exceptions=True)` --
+    in the pinned grafo release this does not merely leave the lane pending,
+    it hangs `gather()` forever (confirmed with `faulthandler`). So `supervise`
+    records such an exception in `fatal` and sets `killed`, and this re-raises
+    the first one at once: it leaves `asyncio.run`, which cancels every other
+    lane where it stands, and the latest checkpoints stand for `am resume`
+    (supervisor-tree §7, card 949d51a0). It never waits for `work` itself to
+    finish once `killed` fires -- `work` may never finish on its own.
+    """
+    running = asyncio.ensure_future(work)
+    watcher = asyncio.ensure_future(killed.wait())
+    try:
+        await asyncio.wait({running, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        watcher.cancel()
+    if fatal:
+        running.cancel()
+        raise fatal[0]
+    await running
+
+
 async def supervise(
     plan: SupervisorPlan,
     *,
@@ -1126,6 +1155,10 @@ async def supervise(
     executor's roots are therefore the stories with no in-milestone blocker,
     plus every merged-root story; a milestone with no story has no tree to run.
 
+    A lane that dies of a `BaseException` other than a cancellation ends the
+    whole call at once, re-raised by `run_until_killed`: grafo alone would
+    drop it (§7).
+
     The `grafo` logger is at CRITICAL for exactly this call: a lane's
     escalation is data in the outcomes, never a traceback on a stream, and
     grafo's own level is restored on every exit.
@@ -1138,6 +1171,10 @@ async def supervise(
         finished: dict[str, LaneOutcome] = {}
         story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
         story_ok: dict[str, bool] = {}
+        # A lane's `BaseException` that is neither an `Exception` nor a
+        # cancellation: grafo would drop it (`run_until_killed`).
+        fatal: list[BaseException] = []
+        killed = asyncio.Event()
 
         def node_coroutine(story: census.StoryPlan) -> Callable[..., Any]:
             async def run(**tips: str) -> str:
@@ -1158,8 +1195,11 @@ async def supervise(
                         story_done=story_done,
                         story_ok=story_ok,
                     )
-                except BaseException:
+                except BaseException as error:
                     story_ok[story.id] = False
+                    if not isinstance(error, (Exception, asyncio.CancelledError)):
+                        fatal.append(error)
+                        killed.set()
                     raise
                 else:
                     story_ok[story.id] = True
@@ -1189,7 +1229,7 @@ async def supervise(
         errors: list[BaseException] = []
         if roots:
             executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
-            await executor.run()
+            await run_until_killed(executor.run(), killed, fatal)
             errors = list(executor.errors)
         return collect_outcomes(plan, nodes, errors, finished)
     finally:
