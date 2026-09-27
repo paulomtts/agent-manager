@@ -38,14 +38,17 @@ this one only makes sure the subtask engine can be driven by it (§10).
   flight and the next turn is at the head of the queue. Taken in `AFTER_TURN` it is
   not: the finished turn is still `current_turn`, and `from_dict` would replay it.
   Verified with a script against 0.6.7.
+  Fixed in pygents 0.7.0; see the adoption addendum.
 - `ContextItem.content` and `Turn.output` are serialised raw, so everything placed in
   the pool must already be JSON (a Pydantic result must be dumped first).
 - Breaking out of `agent.run()` early (a `return` inside `async for`) raises
   `SafeExecutionError` when the generator closes: its `finally` resets the hooks of a
   turn still marked running. Callers must consume `run()` to the end.
+  Fixed in pygents 0.7.0; see the adoption addendum.
 - `HookRegistry` refuses a *different* function under an existing name, so per-agent
   hooks defined as closures break on the second agent. Global `@hook(..., tags=...)`
   functions defined at module level do not.
+  Fixed in pygents 0.7.0; see the adoption addendum.
 - `ToolRegistry` names are process-wide and unique; `AgentRegistry` names likewise.
 - Every blocking call in agent-manager is synchronous `subprocess.run`/`Popen`:
   `harness/launcher.py`, `board.py`, `steps/worktree.py`, `steps/verify.py`. They are
@@ -373,8 +376,8 @@ The gaps closed (G9):
 | `BaseException` | propagate, write nothing | — | last `turn` row |
 | digest mismatch on resume | refuse before `run()` | — (exit 3) | — |
 
-The engine never breaks out of `agent.run()`; it reads results from the pool after the
-generator ends.
+pygents ≥0.7.0 makes this safe; the engine still consumes `run()` and keeps global
+module-level hooks by design.
 
 ## 9. Testing
 
@@ -419,4 +422,4 @@ completion, parks at a phase boundary with a checkpoint, and returns
 - Exactly-once phases (checkpoint on the next turn's `put`).
 - Benchmarking the rewritten reviewer and critic prompts.
 - Upstream pygents fixes: early exit from `run()` raising `SafeExecutionError`;
-  closure hooks colliding in `HookRegistry`.
+  closure hooks colliding in `HookRegistry`. Done (pygents 0.7.0).

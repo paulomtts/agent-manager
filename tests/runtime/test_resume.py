@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from pygents import Agent, AgentRegistry, ToolRegistry
+from pygents.errors import UnregisteredAgentError
 
 from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
@@ -403,7 +404,8 @@ def test_a_refused_resume_leaves_the_card_runnable(store):
     with pytest.raises(runtime_engine.CheckpointMismatch):
         _go(changed, store, resume_from=parked)
 
-    assert parked.agent["name"] not in AgentRegistry._registry
+    with pytest.raises(UnregisteredAgentError):
+        AgentRegistry.get(parked.agent["name"])
     ran.clear()
     summary = _go(changed, store)
 
@@ -428,7 +430,8 @@ def test_a_stale_registry_entry_does_not_block_a_resume(store):
     assert ran == ["c", "d", "e"]
     assert summary.status == "done"
     assert summary.results == ALL_RESULTS
-    assert crashed.agent["name"] not in AgentRegistry._registry
+    with pytest.raises(UnregisteredAgentError):
+        AgentRegistry.get(crashed.agent["name"])
 
 
 # ── pending_phase (card 02890d5d) ────────────────────────────────────────────
