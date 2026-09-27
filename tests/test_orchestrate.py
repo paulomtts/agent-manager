@@ -7,7 +7,8 @@ Two tiers, per design §14:
 - `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
   real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
   `paths.data_dir()` never touches the developer's own -- with the harness
-  replaced at the injected `driver` seam. No runner, adapter or `claude` is
+  replaced at the injected `driver` seam by an awaitable fake that runs on the
+  run's one event loop (supervisor-tree T3). No runner, adapter or `claude` is
   involved; production wiring under a fake `claude` belongs to tests/e2e.
 
 `FakeDriver` makes no branches, so by default (`integrate_recorder`, autouse)
@@ -17,25 +18,34 @@ branches `BranchingDriver` or `_commit_branch` really commit.
 """
 
 import ast
+import asyncio
+import inspect
 import json
+import logging
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import grafo
 import pytest
 
-from agent_manager import board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager import bases, board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import Step, Workflow
 
 
 # ── pure plans ──────────────────────────────────────────────────────────────
@@ -96,16 +106,23 @@ def test_plan_levels_stacks_on_the_full_list_and_roots_on_a_done_blockers_tip():
     assert c_plan.tip == _branch_of(c.subtasks[-1])
 
 
-def test_plan_levels_refuses_a_story_with_two_in_milestone_blockers():
+def test_plan_levels_roots_a_two_blocker_story_on_its_merged_base():
+    """Supervisor-tree §5: a story with two in-milestone blockers is planned,
+    not refused. Its first subtask stacks on its own merged base
+    `<prefix>/base-<short id>`, the rest on the subtask before them."""
     a = _plan_story(1, [_plan_subtask(11)])
     b = _plan_story(2, [_plan_subtask(21)])
-    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    c = _plan_story(3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[b.id, "outside", a.id])
 
-    with pytest.raises(dag.StackRootError) as caught:
-        orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="main")
+    levels = orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="main")
 
-    assert f"#{a.id}" in str(caught.value)
-    assert f"#{b.id}" in str(caught.value)
+    assert [[planned.story.id for planned in level] for level in levels] == [[a.id, b.id], [c.id]]
+    c_plan = levels[1][0]
+    assert c_plan.bases == {
+        _plan_id(31): "m3/base-00000003",
+        _plan_id(32): _branch_of(c.subtasks[0]),
+    }
+    assert c_plan.tip == _branch_of(c.subtasks[-1])
 
 
 def test_plan_levels_refuses_a_blocker_cycle_before_any_geometry():
@@ -114,6 +131,23 @@ def test_plan_levels_refuses_a_blocker_cycle_before_any_geometry():
 
     with pytest.raises(dag.DependencyCycleError):
         orchestrate.plan_levels([a, b], branch_prefix="m3", base_branch="main")
+
+
+def test_plan_levels_roots_a_story_behind_a_subtask_less_two_blocker_story_on_that_base():
+    """A subtask-less story on two blockers has a merged root, and a story it
+    blocks falls through to it, as `dag.story_tip` does. The joined story has
+    nothing to drive, so it is in no wave, and the story behind it lands in
+    wave 0 and stacks on the joined story's base."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    joined = _plan_story(3, [], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[joined.id])
+
+    levels = orchestrate.plan_levels([a, b, joined, d], branch_prefix="m3", base_branch="main")
+
+    assert [[planned.story.id for planned in level] for level in levels] == [[a.id, b.id, d.id]]
+    d_plan = levels[0][2]
+    assert d_plan.bases == {_plan_id(41): "m3/base-00000003"}
 
 
 def test_a_milestone_with_nothing_pending_plans_no_levels():
@@ -143,18 +177,6 @@ def test_the_before_phase_is_read_out_of_a_stopped_detail():
     assert orchestrate.stopped_before_phase(None) is None
 
 
-def test_the_first_escalation_is_the_primary_and_every_escalation_sets_the_stop():
-    stop = orchestrate.RunStop()
-    assert not stop.event.is_set()
-    assert stop.primary is None
-
-    stop.escalate("story-b")
-    stop.escalate("story-a")
-
-    assert stop.event.is_set()
-    assert stop.primary == "story-b"
-
-
 def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
     also = orchestrate.LaneOutcome(
         kind="escalated",
@@ -176,7 +198,7 @@ def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_or
         detail="RuntimeError: boom",
     )
     done = orchestrate.LaneOutcome(kind="done", story="D", level=2, completed=("d1",))
-    queued = orchestrate.LaneOutcome(kind="not_started", story="E", level=2)
+    queued = orchestrate.LaneOutcome(kind="pending", story="E", level=2)
 
     payload = orchestrate.escalated_payload(
         "run-1", "C", [also, parked, primary, done, queued], ["gate warned"]
@@ -210,7 +232,7 @@ def test_a_lone_escalation_payload_is_exactly_the_sequential_one():
     only = orchestrate.LaneOutcome(
         kind="escalated", story="A", level=0, subtask="a1", failed_phase="verify", detail="red"
     )
-    queued = orchestrate.LaneOutcome(kind="not_started", story="B", level=0)
+    queued = orchestrate.LaneOutcome(kind="pending", story="B", level=0)
 
     payload = orchestrate.escalated_payload("run-1", "A", [only, queued], [])
 
@@ -282,6 +304,198 @@ def test_a_final_verification_escalation_payload_has_no_story():
     payload = orchestrate.integrate_escalated_payload("run-1", outcome, [])
 
     assert (payload["story"], payload["files"], payload["phase"]) == (None, [], "integrate")
+
+
+def test_the_bases_payload_lists_every_built_base_in_outcome_order():
+    """Spec, Report: one entry per lane that built its merged base, in the
+    order `collect_outcomes` gave (wave order), blockers in `root_plan` order.
+    An outcome with no base contributes nothing, whatever its kind."""
+    first = dag.RootPlan("merged", "m3/base-00000003", (_plan_id(2), _plan_id(1)))
+    second = dag.RootPlan("merged", "m3/base-00000005", (_plan_id(4), _plan_id(3)))
+    outcomes = [
+        orchestrate.LaneOutcome(kind="done", story=_plan_id(1), level=0),
+        orchestrate.LaneOutcome(kind="done", story=_plan_id(3), level=1, base=first),
+        orchestrate.LaneOutcome(
+            kind="escalated", story=_plan_id(5), level=2, subtask=_plan_id(51), base=second
+        ),
+        orchestrate.LaneOutcome(kind="pending", story=_plan_id(6), level=2),
+    ]
+
+    assert orchestrate.bases_payload(outcomes) == [
+        {"story": _plan_id(3), "branch": "m3/base-00000003", "blockers": [_plan_id(2), _plan_id(1)]},
+        {"story": _plan_id(5), "branch": "m3/base-00000005", "blockers": [_plan_id(4), _plan_id(3)]},
+    ]
+    assert orchestrate.bases_payload([]) == []
+
+
+def test_the_bases_key_is_added_only_when_a_base_was_built():
+    entry = {"story": _plan_id(3), "branch": "m3/base-00000003", "blockers": [_plan_id(1)]}
+
+    assert orchestrate.with_bases({"done": True}, []) == {"done": True}
+    assert orchestrate.with_bases({"done": True}, [entry]) == {"done": True, "bases": [entry]}
+
+
+def test_a_lane_outcome_has_no_base_by_default():
+    assert orchestrate.LaneOutcome(kind="done", story="A", level=0).base is None
+
+
+def _supervisor_plan(stories: list[census.StoryPlan]) -> orchestrate.SupervisorPlan:
+    levels = orchestrate.plan_levels(stories, branch_prefix="m3", base_branch="main")
+    return orchestrate.supervisor_plan(
+        stories, levels, {}, branch_prefix="m3", base_branch="main"
+    )
+
+
+def test_lane_errors_carry_their_outcome():
+    escalated = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", detail="red"
+    )
+    stopped = orchestrate.LaneOutcome(kind="stopped", story="B", level=0, subtask="b1")
+
+    raised = orchestrate.LaneEscalated(escalated)
+    parked = orchestrate.LaneStopped(stopped)
+
+    assert raised.outcome is escalated
+    assert parked.outcome is stopped
+    assert isinstance(raised, Exception) and isinstance(parked, Exception)
+    assert not isinstance(raised, orchestrate.LaneStopped)
+
+
+def test_the_supervisor_plan_roots_and_tips_every_census_story_done_ones_included():
+    """T1: every census story becomes a node, so every one needs its root and
+    tip; only the pending ones are planned for a lane."""
+    a = _plan_story(1, [_plan_subtask(11, "done")], status="done")
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[a.id])
+
+    plan = _supervisor_plan([a, b])
+
+    assert [story.id for story in plan.stories] == [a.id, b.id]
+    assert plan.roots[a.id] == dag.RootPlan("base", "main", ())
+    assert plan.roots[b.id] == dag.RootPlan("tip", _branch_of(a.subtasks[-1]), (a.id,))
+    assert plan.tips == {
+        a.id: _branch_of(a.subtasks[-1]),
+        b.id: _branch_of(b.subtasks[-1]),
+    }
+    assert list(plan.planned) == [b.id]
+    assert plan.planned[b.id].level == 0
+
+
+def test_outcomes_follow_t6_in_wave_order():
+    """Node output with a finished outcome is `done`; the first LaneEscalated in
+    `errors` is primary and the next is not; LaneStopped gives its outcome; a
+    story with no output and no error is `pending`."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)])
+    e = _plan_story(5, [_plan_subtask(51)])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[a.id])
+    plan = _supervisor_plan([a, b, c, d, e])
+    done_a = orchestrate.LaneOutcome(kind="done", story=a.id, level=0, completed=(_plan_id(11),))
+    b_escalated = orchestrate.LaneOutcome(
+        kind="escalated", story=b.id, level=0, subtask=_plan_id(21), failed_phase="review", detail="b"
+    )
+    c_escalated = orchestrate.LaneOutcome(
+        kind="escalated", story=c.id, level=0, subtask=_plan_id(31), failed_phase="verify", detail="c"
+    )
+    e_stopped = orchestrate.LaneOutcome(
+        kind="stopped", story=e.id, level=0, subtask=_plan_id(51), before_phase="implement"
+    )
+    nodes = {
+        a.id: SimpleNamespace(output="tip of a"),
+        b.id: SimpleNamespace(output=None),
+        c.id: SimpleNamespace(output=None),
+        d.id: SimpleNamespace(output=None),
+        e.id: SimpleNamespace(output=None),
+    }
+    errors = [
+        orchestrate.LaneEscalated(c_escalated),
+        orchestrate.LaneStopped(e_stopped),
+        orchestrate.LaneEscalated(b_escalated),
+    ]
+
+    outcomes = orchestrate.collect_outcomes(plan, nodes, errors, {a.id: done_a})
+
+    assert outcomes == [
+        done_a,
+        b_escalated,
+        replace(c_escalated, primary=True),
+        e_stopped,
+        orchestrate.LaneOutcome(kind="pending", story=d.id, level=1),
+    ]
+
+
+def test_an_error_that_is_no_lane_error_is_escalated_with_its_type_and_message():
+    """T6: an exception that escaped even the lane's own catch-all is tied to no
+    story, so it carries no subtask, failed phase or level."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    plan = _supervisor_plan([a])
+
+    outcomes = orchestrate.collect_outcomes(
+        plan, {a.id: SimpleNamespace(output=None)}, [RuntimeError("grafo broke")], {}
+    )
+
+    foreign = orchestrate.LaneOutcome(
+        kind="escalated", story=None, level=None, detail="RuntimeError: grafo broke"
+    )
+    assert outcomes == [orchestrate.LaneOutcome(kind="pending", story=a.id, level=0), foreign]
+    payload = orchestrate.escalated_payload("run-1", None, outcomes, [])
+    assert (payload["story"], payload["subtask"], payload["failed_phase"], payload["level"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert payload["detail"] == "RuntimeError: grafo broke"
+
+
+def test_only_an_open_subtask_less_story_on_a_merged_root_builds_a_base_alone():
+    merged = dag.RootPlan("merged", "m3/base-00000003", (_plan_id(1), _plan_id(2)))
+    lone = dag.RootPlan("tip", "m3/some-tip", (_plan_id(1),))
+
+    assert orchestrate.builds_a_base_alone(_plan_story(3, []), merged) is True
+    assert orchestrate.builds_a_base_alone(_plan_story(3, [], status="done"), merged) is False
+    assert orchestrate.builds_a_base_alone(_plan_story(3, [_plan_subtask(31)]), merged) is False
+    assert orchestrate.builds_a_base_alone(_plan_story(3, []), lone) is False
+
+
+def test_a_base_only_lanes_outcome_follows_the_waves_in_census_order():
+    """A subtask-less story is in no wave, so its lane's outcome comes after
+    every wave's, before any foreign error; a failure is not dropped."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    joined = _plan_story(3, [], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[joined.id])
+    plan = _supervisor_plan([a, b, joined, d])
+    done_a = orchestrate.LaneOutcome(kind="done", story=a.id, level=0)
+    done_b = orchestrate.LaneOutcome(kind="done", story=b.id, level=0)
+    done_d = orchestrate.LaneOutcome(kind="done", story=d.id, level=0)
+    built = orchestrate.LaneOutcome(
+        kind="done", story=joined.id, level=None, base=plan.roots[joined.id]
+    )
+    every_output = {story.id: SimpleNamespace(output="tip") for story in (a, b, joined, d)}
+
+    assert orchestrate.collect_outcomes(
+        plan, every_output, [], {a.id: done_a, b.id: done_b, d.id: done_d, joined.id: built}
+    ) == [done_a, done_b, done_d, built]
+
+    failed = orchestrate.LaneOutcome(
+        kind="escalated", story=joined.id, level=None, failed_phase="base", detail="broke"
+    )
+    outputs = {
+        a.id: SimpleNamespace(output="tip"),
+        b.id: SimpleNamespace(output="tip"),
+        joined.id: SimpleNamespace(output=None),
+        d.id: SimpleNamespace(output=None),
+    }
+
+    assert orchestrate.collect_outcomes(
+        plan, outputs, [orchestrate.LaneEscalated(failed)], {a.id: done_a, b.id: done_b}
+    ) == [
+        done_a,
+        done_b,
+        orchestrate.LaneOutcome(kind="pending", story=d.id, level=0),
+        replace(failed, primary=True),
+    ]
 
 
 # ── the runner, on a real repo and a real board ─────────────────────────────
@@ -423,7 +637,7 @@ def _branch(project: Path, card_id: str) -> str:
 
 @dataclass
 class FakeDriver:
-    """Stands in for `cli.drive_subtask`. Never touches git or the board.
+    """Stands in for `cli.drive_subtask_async`. Never touches git or the board.
 
     `outcomes` scripts a card: missing means `done`, a `(phase, detail)` tuple
     means escalated at that phase, and an exception instance is raised.
@@ -436,7 +650,7 @@ class FakeDriver:
     calls: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[models.Run | None] = field(default_factory=list)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         store,
@@ -448,7 +662,7 @@ class FakeDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
-        should_stop=None,
+        stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -463,6 +677,7 @@ class FakeDriver:
                 "commands": list(commands),
                 "allow_no_verification": allow_no_verification,
                 "runner_factory": runner_factory,
+                "stop": stop,
             }
         )
         self.snapshots.append(store.load_run(run_id))
@@ -598,8 +813,8 @@ class BranchingDriver(FakeDriver):
     board through the rollup, as `mark_done` does. Sequential runs only.
     """
 
-    def __call__(self, *, store, run_id, card, parent, subtask, repo_dir, **kwargs):
-        drive = super().__call__(
+    async def __call__(self, *, store, run_id, card, parent, subtask, repo_dir, **kwargs):
+        drive = await super().__call__(
             store=store,
             run_id=run_id,
             card=card,
@@ -656,56 +871,80 @@ def _record_git(monkeypatch, fail_on: str | None = None) -> list[list[str]]:
 
 
 WAIT = 10.0
-"""Seconds a lane-pool test waits on a barrier or event before failing instead of hanging."""
+"""Seconds a supervisor test waits on a barrier or event before failing instead of hanging."""
 
 OVERSHOOT_WINDOW = 1.0
 """Seconds the bound test holds each lane in flight, so that queued lanes would
-enter the driver in that window if the pool ignored `max_concurrent`."""
+enter the driver in that window if the lanes ignored `max_concurrent`."""
 
-Gate = Callable[[Any], None]
+PATCHED_NODE_TIMEOUT = 0.05
+"""grafo's default node timeout, patched down by the timeout test."""
+
+LONGER_THAN_PATCHED_TIMEOUT = 0.3
+"""How long that test's lane stays in flight: well past `PATCHED_NODE_TIMEOUT`."""
+
+Gate = Callable[[StopSignal | None], Awaitable[None]]
 
 
-def _await(event: threading.Event) -> None:
-    assert event.wait(timeout=WAIT), "a gated test's event was never set"
+async def _within(awaitable: Awaitable[Any], what: str) -> Any:
+    """Await `awaitable`, failing after WAIT seconds instead of hanging the run.
 
-
-def _await_stop(should_stop: Any) -> None:
-    """Block until the run's stop is set, without sleeping.
-
-    `run_milestone` hands each driver `event.is_set` (spec item 2), so the
-    run's event is that bound method's `__self__`. Waiting on it is
-    synchronisation by event, and it pins that wiring.
+    The failure is an `AssertionError` inside the driver, so the lane turns it
+    into an escalation whose detail names what never happened.
     """
-    assert should_stop is not None, "the lane passed no should_stop"
-    event = should_stop.__self__
-    assert isinstance(event, threading.Event)
-    _await(event)
+    try:
+        return await asyncio.wait_for(awaitable, WAIT)
+    except TimeoutError:
+        raise AssertionError(f"timed out waiting for {what}") from None
 
 
-def _meet(barrier: threading.Barrier) -> Gate:
+class _StopWatch:
+    """A `pause()`-only stand-in registered on the run's `StopSignal`, as a
+    pygents subtask agent is: the signal pauses it when it fires."""
+
+    def __init__(self) -> None:
+        self.paused = asyncio.Event()
+
+    def pause(self) -> None:
+        self.paused.set()
+
+
+async def _await_stop(stop: StopSignal | None) -> None:
+    """Block until the run's stop fires, without sleeping. Pins that the lane
+    handed the driver the run's `StopSignal` (T5)."""
+    assert isinstance(stop, StopSignal), "the lane passed no StopSignal"
+    watch = _StopWatch()
+    stop.register(watch)
+    try:
+        await _within(watch.paused.wait(), "the run's stop")
+    finally:
+        stop.unregister(watch)
+
+
+def _meet(barrier: asyncio.Barrier) -> Gate:
     """A gate that holds a call until every party of `barrier` is in flight."""
 
-    def gate(should_stop: Any) -> None:
-        barrier.wait(timeout=WAIT)
+    async def gate(stop: StopSignal | None) -> None:
+        await _within(barrier.wait(), "every party of the barrier")
 
     return gate
 
 
-def _meet_then_await_stop(barrier: threading.Barrier) -> Gate:
-    """A gate that meets `barrier`, then holds the call until the run's stop is set."""
+def _meet_then_await_stop(barrier: asyncio.Barrier) -> Gate:
+    """A gate that meets `barrier`, then holds the call until the run's stop fires."""
 
-    def gate(should_stop: Any) -> None:
-        barrier.wait(timeout=WAIT)
-        _await_stop(should_stop)
+    async def gate(stop: StopSignal | None) -> None:
+        await _within(barrier.wait(), "every party of the barrier")
+        await _await_stop(stop)
 
     return gate
 
 
 def _census_levels(project: Path, milestone: str) -> list[list[str]]:
-    """Each dispatch level's story ids in census order, the order lanes are submitted in.
+    """Each wave's story ids in census order, the order the tree starts them in.
 
     Sibling stories created in the same second are ordered by id, so a test that
-    gives a lane a role by its queue position must read the order, not assume it.
+    gives a lane a role by its position must read the order, not assume it.
     """
     plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
     levels = orchestrate.plan_levels(plan.stories, branch_prefix=PREFIX, base_branch="main")
@@ -718,28 +957,28 @@ def _subtasks_by_story(shape: dict[str, Any]) -> dict[str, list[str]]:
 
 @dataclass
 class GatedDriver:
-    """A thread-safe stand-in for `cli.drive_subtask`, for the lane-pool tests.
+    """An awaitable stand-in for `cli.drive_subtask_async`, for the supervisor tests.
 
-    `gates[card]` runs first, with the driver's `should_stop`; tests put
-    barriers and events there, never sleeps. Then `outcomes[card]` decides: an
-    exception instance is raised, a `(phase, detail)` tuple escalates, and
-    `"done"` finishes as a phase already running would. With no entry the fake
-    reaches its simulated phase boundary: if `should_stop()` is true it parks
-    as the engine does, with `"stopped before implement"`; otherwise it is
-    done. Calls are recorded under a lock, `high_water` is the most calls ever
-    in flight at once, and `returned[card]` is set when that card's call ends.
+    `gates[card]` is awaited first with the lane's `stop`; tests put
+    `asyncio.Barrier`s and `asyncio.Event`s there, never sleeps. Then
+    `outcomes[card]` decides: an exception instance is raised, a `(phase,
+    detail)` tuple escalates, and `"done"` finishes as a phase already running
+    would. With no entry the fake reaches its simulated phase boundary: if the
+    stop has fired it parks as the engine does, with `"stopped before
+    implement"`; otherwise it is done. Everything runs on the run's one loop,
+    so no lock: `high_water` is the most calls ever in flight at once, and
+    `returned[card]` is set when that card's call ends.
     """
 
     outcomes: dict[str, Any] = field(default_factory=dict)
     gates: dict[str, Gate] = field(default_factory=dict)
     warnings: dict[str, list[str]] = field(default_factory=dict)
-    returned: dict[str, threading.Event] = field(default_factory=dict)
+    returned: dict[str, asyncio.Event] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
     high_water: int = 0
     in_flight: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         store,
@@ -751,18 +990,15 @@ class GatedDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
-        should_stop=None,
+        stop=None,
     ) -> cli.SubtaskDrive:
-        with self.lock:
-            self.calls.append(
-                {"card": card.id, "parent": parent.id, "base": subtask.base_branch}
-            )
-            self.in_flight += 1
-            self.high_water = max(self.high_water, self.in_flight)
+        self.calls.append({"card": card.id, "parent": parent.id, "base": subtask.base_branch})
+        self.in_flight += 1
+        self.high_water = max(self.high_water, self.in_flight)
         try:
             gate = self.gates.get(card.id)
             if gate is not None:
-                gate(should_stop)
+                await gate(stop)
             outcome = self.outcomes.get(card.id)
             if isinstance(outcome, BaseException):
                 raise outcome
@@ -772,7 +1008,7 @@ class GatedDriver:
                 summary = SubtaskSummary(
                     status="escalated", failed_phase=phase, detail=detail
                 )
-            elif outcome != "done" and should_stop is not None and should_stop():
+            elif outcome != "done" and stop is not None and stop.triggered:
                 summary = SubtaskSummary(
                     status="stopped", detail="stopped before implement"
                 )
@@ -780,8 +1016,7 @@ class GatedDriver:
                 summary = SubtaskSummary(status="done")
             return cli.SubtaskDrive(summary=summary, warnings=warnings)
         finally:
-            with self.lock:
-                self.in_flight -= 1
+            self.in_flight -= 1
             if card.id in self.returned:
                 self.returned[card.id].set()
 
@@ -950,18 +1185,30 @@ def test_every_drivers_warnings_reach_the_result_in_order(project):
 
 @requires_git
 @requires_brd
-def test_no_driver_resolves_to_cli_drive_subtask_at_call_time(project, monkeypatch):
-    """The sibling card makes `cli` import this module, so the default driver
-    must be read off `cli` when the run starts, never bound at import."""
+def test_no_driver_resolves_to_cli_drive_subtask_async_at_call_time(project, monkeypatch):
+    """The default driver is the awaitable one (T3), read off `cli` when the run
+    starts, never bound at import. The lane hands it the run's StopSignal and
+    no other stop: `FakeDriver`'s keywords are closed, so any other stop
+    keyword would be a `TypeError` and the run would not finish `done`."""
     shape = _milestone(project, {"A": 1})
     (a1,) = shape["subtasks"]["A"]
     fake = FakeDriver()
-    monkeypatch.setattr(cli, "drive_subtask", fake)
+    monkeypatch.setattr(cli, "drive_subtask_async", fake)
 
     result = _run(project, shape["milestone"], None)
 
     assert [call["card"] for call in fake.calls] == [a1]
+    assert isinstance(fake.calls[0]["stop"], StopSignal)
     assert result["done"] is True
+
+
+def test_the_driver_protocol_mirrors_drive_subtask_async():
+    """`Driver` is `cli.drive_subtask_async`'s keyword signature, so the one
+    stop either takes is the `StopSignal`."""
+    protocol = list(inspect.signature(orchestrate.Driver.__call__).parameters)
+
+    assert protocol[0] == "self"
+    assert protocol[1:] == list(inspect.signature(cli.drive_subtask_async).parameters)
 
 
 @requires_git
@@ -1307,33 +1554,6 @@ def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, inte
 
 @requires_git
 @requires_brd
-def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project, monkeypatch):
-    milestone = _add_card(project, "Milestone 3: orchestration")
-    first = _add_card(project, "Story one", milestone)
-    second = _add_card(project, "Story two", milestone)
-    joined = _add_card(project, "Story three", milestone)
-    for story in (first, second, joined):
-        _add_card(project, f"only subtask of {story}", story)
-    _block(project, joined, first)
-    _block(project, joined, second)
-    porcelain_before = _git(project, "status", "--porcelain")
-    git_calls = _record_git(monkeypatch)
-    driver = FakeDriver()
-
-    with pytest.raises(dag.StackRootError) as caught:
-        _run(project, milestone, driver)
-
-    assert f"#{first}" in str(caught.value)
-    assert f"#{second}" in str(caught.value)
-    assert driver.calls == []
-    assert git_calls == []
-    assert list(paths.data_dir().iterdir()) == []
-    assert not (project / ".claude").exists()
-    assert _git(project, "status", "--porcelain") == porcelain_before
-
-
-@requires_git
-@requires_brd
 def test_an_escalation_stops_the_run_before_the_next_story(project, integrate_recorder):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
@@ -1646,7 +1866,7 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
     a1, a2 = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    all_three = threading.Barrier(3)
+    all_three = asyncio.Barrier(3)
     driver = GatedDriver(gates={a1: _meet(all_three), b1: _meet(all_three), c1: _meet(all_three)})
 
     result = _run(project, shape["milestone"], driver, max_concurrent=3)
@@ -1681,24 +1901,24 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
 
 @requires_git
 @requires_brd
-def test_in_flight_lanes_never_exceed_the_bound(project):
-    shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1})
+def test_at_most_max_concurrent_lanes_run(project):
+    """Five ready stories, two slots. Every lane stays in flight until a third
+    lane enters the driver or the window expires: without the bound all five
+    arrive inside the window together; under it only two can be in flight."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1, "E": 1})
     subtasks = _subtasks_by_story(shape)
     arrivals = 0
-    arrivals_lock = threading.Lock()
-    third_arrived = threading.Event()
+    third_arrived = asyncio.Event()
 
-    def hold_until_a_third_lane_arrives(should_stop: Any) -> None:
-        # Every lane stays in flight until a third lane has entered the driver,
-        # or the window expires. Without the bound, all four lanes arrive
-        # inside the window and are in flight together. Under the bound only
-        # two can be, so the first two wait out the window and then return.
+    async def hold_until_a_third_lane_arrives(stop: StopSignal | None) -> None:
         nonlocal arrivals
-        with arrivals_lock:
-            arrivals += 1
-            if arrivals >= 3:
-                third_arrived.set()
-        third_arrived.wait(timeout=OVERSHOOT_WINDOW)
+        arrivals += 1
+        if arrivals >= 3:
+            third_arrived.set()
+        try:
+            await asyncio.wait_for(third_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
 
     driver = GatedDriver(
         gates={cards[0]: hold_until_a_third_lane_arrives for cards in subtasks.values()}
@@ -1706,7 +1926,7 @@ def test_in_flight_lanes_never_exceed_the_bound(project):
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
-    assert result["done"] is True
+    assert result["done"] is True, result
     assert sorted(call["card"] for call in driver.calls) == sorted(
         card for cards in subtasks.values() for card in cards
     )
@@ -1715,13 +1935,17 @@ def test_in_flight_lanes_never_exceed_the_bound(project):
 
 @requires_git
 @requires_brd
-def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, integrate_recorder):
+def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
+    project, integrate_recorder
+):
+    """C is blocked by A. A escalates, so grafo never releases C: C stays
+    `pending` because its own blocker failed (dataflow), not because of a level."""
     shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
     b1, b2 = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("review", "reviewer found a blocker")},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -1757,14 +1981,15 @@ def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, i
 
 @requires_git
 @requires_brd
-def test_a_lane_whose_first_subtask_finished_parks_its_next_subtask(project):
-    """After a story has started the lane never checks the stop itself: its
-    next subtask is handed to the driver, and the engine parks it (P4)."""
+def test_a_lane_between_subtasks_sees_the_stop_and_never_drives_the_next(project):
+    """The lane checks the stop before every subtask (spec, Observable
+    behavior): b1 finished after A escalated, so b2 is never handed to the
+    driver. It is reported stopped with no phase, and its row stays pending."""
     shape = _milestone(project, {"A": 1, "B": 2})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     b1, b2 = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("verify", "suite red"), b1: "done"},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -1772,31 +1997,29 @@ def test_a_lane_whose_first_subtask_finished_parks_its_next_subtask(project):
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
-    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1, b2])
-    assert next(call for call in driver.calls if call["card"] == b2)["base"] == _branch(
-        project, b1
-    )
+    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1])
     assert (result["story"], result["subtask"]) == (story_a, a1)
-    assert result["stopped"] == [{"story": story_b, "subtask": b2, "before_phase": "implement"}]
+    assert result["stopped"] == [{"story": story_b, "subtask": b2, "before_phase": None}]
+    assert result["completed"] == [b1]
     assert _statuses(_load(project, result["run_id"])) == {
         "run": "escalated",
         story_a: "escalated",
         a1: "escalated",
         story_b: "stopped",
         b1: "done",
-        b2: "stopped",
+        b2: "pending",
     }
 
 
 @requires_git
 @requires_brd
-def test_two_simultaneous_escalations_give_one_primary_and_one_also_escalated(project):
+def test_two_escalations_in_one_tick_give_one_primary(project):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("review", "a blocker"), b1: ("verify", "b suite red")},
         gates={a1: _meet(pair), b1: _meet(pair)},
@@ -1850,7 +2073,7 @@ def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: RuntimeError("harness vanished")},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -1881,12 +2104,15 @@ def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
 
 @requires_git
 @requires_brd
-def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
+def test_stop_while_waiting_for_a_slot_ends_stopped(project):
+    """Three ready stories, two slots. `queued` has been started by the tree and
+    waits for a slot when `first` escalates: it takes the slot, sees the stop,
+    and ends `stopped` without its subtask ever reaching the driver."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
     (first, second, queued) = _census_levels(project, shape["milestone"])[0]
     subtasks = _subtasks_by_story(shape)
     (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={f1: ("review", "reviewer found a blocker")},
         gates={f1: _meet(pair), s1: _meet_then_await_stop(pair)},
@@ -1896,7 +2122,10 @@ def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
 
     assert q1 not in [call["card"] for call in driver.calls]
     assert (result["story"], result["subtask"]) == (first, f1)
-    assert result["stopped"] == [{"story": second, "subtask": s1, "before_phase": "implement"}]
+    assert result["stopped"] == [
+        {"story": second, "subtask": s1, "before_phase": "implement"},
+        {"story": queued, "subtask": q1, "before_phase": None},
+    ]
     assert "also_escalated" not in result
     assert _statuses(_load(project, result["run_id"])) == {
         "run": "escalated",
@@ -1904,35 +2133,169 @@ def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
         f1: "escalated",
         second: "stopped",
         s1: "stopped",
-        queued: "pending",
+        queued: "stopped",
         q1: "pending",
     }
 
 
 @requires_git
 @requires_brd
-def test_a_keyboard_interrupt_in_one_lane_parks_the_other_and_propagates(project):
+def test_a_keyboard_interrupt_in_one_lane_cancels_the_other_and_propagates(project):
+    """A BaseException is not an escalation (§7): it leaves the loop, and
+    `asyncio.run` cancels the other lane where it stands. The rows stay as they
+    were, for `am resume`."""
     shape = _milestone(project, {"A": 1, "B": 1})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
+    cancelled: list[str] = []
+
+    async def meet_then_wait_to_be_cancelled(stop: StopSignal | None) -> None:
+        # The whole body is guarded, not just the inner wait: asyncio.run's
+        # cleanup cancels this coroutine wherever it is currently suspended
+        # (before or after the barrier releases), a race with no bearing on
+        # what this test proves -- that the sibling lane is cancelled, not
+        # left hanging or recorded escalated.
+        try:
+            await _within(pair.wait(), "a1 and b1 in flight together")
+            await _within(asyncio.Event().wait(), "the lane to be cancelled")
+        except asyncio.CancelledError:
+            cancelled.append(b1)
+            raise
+
     driver = GatedDriver(
         outcomes={a1: KeyboardInterrupt()},
-        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+        gates={a1: _meet(pair), b1: meet_then_wait_to_be_cancelled},
     )
 
-    with pytest.raises(KeyboardInterrupt):
-        _run(project, shape["milestone"], driver, max_concurrent=2)
+    # A known level that is not CRITICAL, so a silence left behind is visible.
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    grafo_logger.setLevel(logging.WARNING)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _run(project, shape["milestone"], driver, max_concurrent=2)
+        # `supervise` silences grafo for its duration only, even on this exit.
+        level_after = grafo_logger.level
+    finally:
+        grafo_logger.setLevel(level_before)
 
+    assert level_after == logging.WARNING
+    assert cancelled == [b1]
     run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
     assert _statuses(run) == {
         "run": "started",
         story_a: "started",
         a1: "started",
-        story_b: "stopped",
-        b1: "stopped",
+        story_b: "started",
+        b1: "started",
     }
+
+
+class _LaneKilled(BaseException):
+    """A process death inside a lane, as the e2e resume test injects it (card
+    949d51a0). Not `KeyboardInterrupt`: asyncio re-raises that out of the loop
+    by itself, but stores any other `BaseException` on the task, where grafo's
+    `gather(..., return_exceptions=True)` would drop it."""
+
+
+def _run_or_fail_if_it_hangs(call: Callable[[], Any]) -> Any:
+    """`call()` on a daemon thread: its result or its exception, `BaseException`
+    included, or a failure after a bounded wait instead of hanging the suite.
+
+    Without the fix, grafo's `gather()` never returns once a lane dies of a plain
+    `BaseException` (card 949d51a0), so an unbounded call would hang, not fail.
+    """
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as error:  # re-raised on the test thread
+            outcome["error"] = error
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(WAIT * 3)
+    if worker.is_alive():
+        pytest.fail("the run hung instead of leaving on the lane's BaseException")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+@requires_git
+@requires_brd
+def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
+    project, integrate_recorder
+):
+    """§7 for a BaseException asyncio does not re-raise by itself: it still
+    leaves the run, the other lane is cancelled where it stands, Integrate
+    never runs and the rows stay as they were, for `am resume`."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    pair = asyncio.Barrier(2)
+    cancelled: list[str] = []
+
+    async def meet_then_wait_to_be_cancelled(stop: StopSignal | None) -> None:
+        try:
+            await _within(pair.wait(), "a1 and b1 in flight together")
+            await _within(asyncio.Event().wait(), "the lane to be cancelled")
+        except asyncio.CancelledError:
+            cancelled.append(b1)
+            raise
+
+    driver = GatedDriver(
+        outcomes={a1: _LaneKilled("the manager died while a1 ran")},
+        gates={a1: _meet(pair), b1: meet_then_wait_to_be_cancelled},
+    )
+
+    with pytest.raises(_LaneKilled):
+        _run_or_fail_if_it_hangs(
+            lambda: _run(project, shape["milestone"], driver, max_concurrent=2)
+        )
+
+    assert cancelled == [b1]
+    assert integrate_recorder.calls == []
+    run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
+    assert _statuses(run) == {
+        "run": "started",
+        story_a: "started",
+        a1: "started",
+        story_b: "started",
+        b1: "started",
+    }
+
+
+def test_cancelling_run_until_killed_cancels_the_work_it_awaits():
+    """Cancelling the caller reaches the executor, as a plain `await` would:
+    `run_until_killed` never leaves the tree running behind it."""
+
+    async def scenario() -> tuple[bool, bool]:
+        started = asyncio.Event()
+        work_cancelled = asyncio.Event()
+
+        async def work() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                work_cancelled.set()
+                raise
+
+        caller = asyncio.ensure_future(
+            orchestrate.run_until_killed(work(), asyncio.Event(), [])
+        )
+        await _within(started.wait(), "the work to start")
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        return caller.cancelled(), work_cancelled.is_set()
+
+    assert asyncio.run(scenario()) == (True, True)
 
 
 @requires_git
@@ -1942,19 +2305,462 @@ def test_warnings_and_completed_follow_census_order_not_finish_order(project):
     (first, second) = _census_levels(project, shape["milestone"])[0]
     subtasks = _subtasks_by_story(shape)
     (f1,), (s1,) = subtasks[first], subtasks[second]
-    second_returned = threading.Event()
+    second_returned = asyncio.Event()
+
+    async def after_second_returns(stop: StopSignal | None) -> None:
+        await _within(second_returned.wait(), "the second lane's call to end")
+
     driver = GatedDriver(
         warnings={f1: ["first warned"], s1: ["second warned"]},
-        gates={f1: lambda should_stop: _await(second_returned)},
+        gates={f1: after_second_returns},
         returned={s1: second_returned},
     )
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
     assert sorted(call["card"] for call in driver.calls) == sorted([f1, s1])
-    assert result["done"] is True
+    assert result["done"] is True, result
     assert result["completed"] == [f1, s1]
     assert result["warnings"] == ["first warned", "second warned"]
+
+
+# ── the supervisor tree (supervisor-tree T1-T6) ─────────────────────────────
+
+
+@requires_git
+@requires_brd
+def test_a_story_starts_when_its_blocker_finishes_not_its_level(project):
+    """T1: C (blocked by A) starts the moment A is done, while B -- in A's wave
+    -- is still in flight. b1 cannot finish until c1 has started, so under a
+    level barrier b1 would time out and the run would escalate instead."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    c_started = asyncio.Event()
+
+    async def hold_until_c_starts(stop: StopSignal | None) -> None:
+        await _within(c_started.wait(), "c1 to start while b1 is in flight")
+
+    async def mark_c_started(stop: StopSignal | None) -> None:
+        c_started.set()
+
+    driver = GatedDriver(gates={b1: hold_until_c_starts, c1: mark_c_started})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    cards = [call["card"] for call in driver.calls]
+    assert cards.index(a1) < cards.index(c1)
+    assert next(call for call in driver.calls if call["card"] == c1)["base"] == _branch(
+        project, a1
+    )
+    assert [level["stories"] for level in result["levels"]] == _census_levels(
+        project, shape["milestone"]
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_chain_finishes_with_one_slot(project):
+    """T4: a lane takes its slot only after its blockers finished, so a chain
+    never holds a slot while it waits and cannot deadlock."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1}, blocked_by={"B": ["A"], "C": ["B"]}
+    )
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    driver = GatedDriver()
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=1)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, b1, c1]
+    assert [call["base"] for call in driver.calls] == [
+        "main",
+        _branch(project, a1),
+        _branch(project, b1),
+    ]
+    assert result["completed"] == [a1, b1, c1]
+
+
+@requires_git
+@requires_brd
+def test_a_story_behind_a_subtask_less_story_waits_for_the_blocker_beneath(project):
+    """Review Focus 2: J has no subtasks, so C's stack roots on A's tip through
+    it. `dag.compute_levels` puts C in wave 0 beside A, but C's node waits on
+    J's, which waits on A's: c1 never starts before a1 has returned."""
+    shape = _milestone(project, {"A": 1, "J": 0, "C": 1}, blocked_by={"J": ["A"], "C": ["J"]})
+    (a1,) = shape["subtasks"]["A"]
+    (c1,) = shape["subtasks"]["C"]
+    a1_returned = asyncio.Event()
+
+    async def a1_must_have_returned(stop: StopSignal | None) -> None:
+        assert a1_returned.is_set(), "c1 started before a1, the tip it stacks on, returned"
+
+    driver = GatedDriver(gates={c1: a1_must_have_returned}, returned={a1: a1_returned})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, c1]
+    assert driver.calls[1]["base"] == _branch(project, a1)
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_with_no_stories_finishes_without_a_tree(project, integrate_recorder):
+    """Review Focus 1: no story means no root node, and grafo's executor cannot
+    run an empty tree; the run is still a clean `done` that integrates."""
+    milestone = _add_card(project, "Milestone 3: nothing in it yet")
+    driver = GatedDriver()
+
+    result = _run(project, milestone, driver, max_concurrent=2)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert result["levels"] == []
+    assert result["completed"] == []
+    assert [call["stories"] for call in integrate_recorder.calls] == [[]]
+
+
+@requires_git
+@requires_brd
+def test_a_lane_bug_becomes_escalated_with_type_and_message(project):
+    """A driver that raises is a lane bug: `escalated` at the subtask it was
+    driving, with `"<Type>: <msg>"`, never a crash."""
+    shape = _milestone(project, {"A": 2})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    driver = GatedDriver(outcomes={a2: ValueError("lane bug")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"], result["failed_phase"], result["detail"]) == (
+        story_a,
+        a2,
+        None,
+        "ValueError: lane bug",
+    )
+    assert result["warnings"] == []
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "done",
+        a2: "escalated",
+    }
+
+
+@requires_git
+@requires_brd
+def test_every_node_has_no_timeout(project, monkeypatch):
+    """Review Focus 1: grafo's default node timeout (60 s) would cancel a lane
+    mid-phase, so every node -- done stories' included -- is built with
+    `timeout=None`."""
+    built: list[grafo.Node] = []
+
+    class RecordingNode(grafo.Node):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(grafo, "Node", RecordingNode)
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A"]}
+    )
+    (d1,) = shape["subtasks"]["D"]
+    for card in (d1, shape["stories"]["D"]):
+        board.set_status(card, "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert sorted(node.uuid for node in built) == sorted(shape["stories"].values())
+    assert [node._timeout for node in built] == [None] * len(built)
+
+
+@requires_git
+@requires_brd
+def test_each_blocker_forwards_its_tip_to_its_dependent(project, monkeypatch):
+    """T1: one edge per in-milestone blocker, forwarding the blocker's tip as
+    `tip_<short id>` (Task 3.2 reads it for merged bases). A done blocker's
+    node forwards its existing tip, a pending one the tip its lane finished."""
+    received: dict[str, dict[str, Any]] = {}
+
+    class RecordingNode(grafo.Node):
+        def __init__(self, *args: Any, coroutine: Any, uuid: str, **kwargs: Any) -> None:
+            async def recorded(**forwarded: Any) -> Any:
+                received[uuid] = forwarded
+                return await coroutine(**forwarded)
+
+            super().__init__(*args, coroutine=recorded, uuid=uuid, **kwargs)
+
+    monkeypatch.setattr(grafo, "Node", RecordingNode)
+    shape = _milestone(
+        project, {"A": 1, "C": 1, "D": 1, "E": 1}, blocked_by={"C": ["A"], "E": ["D"]}
+    )
+    stories = shape["stories"]
+    (a1,) = shape["subtasks"]["A"]
+    (d1,) = shape["subtasks"]["D"]
+    for card in (d1, stories["D"]):
+        board.set_status(card, "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert received == {
+        stories["A"]: {},
+        stories["D"]: {},
+        stories["C"]: {f"tip_{dag.short_id(stories['A'])}": _branch(project, a1)},
+        stories["E"]: {f"tip_{dag.short_id(stories['D'])}": _branch(project, d1)},
+    }
+
+
+def _patch_default_node_timeout(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make `grafo.Node`'s default `timeout` `seconds` for this test."""
+    init = grafo.Node.__init__
+    params = list(inspect.signature(init).parameters)
+    defaults = list(init.__defaults__)
+    defaults[params.index("timeout") - (len(params) - len(defaults))] = seconds
+    monkeypatch.setattr(init, "__defaults__", tuple(defaults))
+
+
+async def _noop() -> None:
+    return None
+
+
+@requires_git
+@requires_brd
+def test_a_lane_outlives_the_default_node_timeout(project, monkeypatch):
+    """Review Focus 1: with grafo's default patched to 0.05 s, a lane still in
+    flight well past it is not cancelled and the story ends `done`."""
+    _patch_default_node_timeout(monkeypatch, PATCHED_NODE_TIMEOUT)
+    assert grafo.Node(coroutine=_noop)._timeout == PATCHED_NODE_TIMEOUT  # the patch bites
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+
+    async def outlast_the_default(stop: StopSignal | None) -> None:
+        released = asyncio.Event()
+        asyncio.get_running_loop().call_later(LONGER_THAN_PATCHED_TIMEOUT, released.set)
+        await _within(released.wait(), "the release timer")
+
+    driver = GatedDriver(gates={a1: outlast_the_default})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True, result
+    assert result["completed"] == [a1]
+
+
+@requires_git
+@requires_brd
+def test_report_keeps_levels_as_waves(project):
+    """Levels stop being barriers but stay in the report: `dag.compute_levels`."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A"], "D": ["C"]}
+    )
+    plan = census.flatten_milestone(board.tree(shape["milestone"], repo_dir=project))
+    waves = dag.compute_levels(plan.stories)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert result["levels"] == [
+        {"level": index, "stories": [story.id for story in wave]}
+        for index, wave in enumerate(waves)
+    ]
+    assert len(result["levels"]) == 3
+
+
+def test_only_orchestrate_imports_grafo():
+    """T10: grafo is a runtime dependency of exactly one module."""
+    package = Path(orchestrate.__file__).parent
+    importers: set[str] = set()
+    for path in package.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            else:
+                continue
+            if any(name == "grafo" or name.startswith("grafo.") for name in names):
+                importers.add(path.relative_to(package).as_posix())
+    assert importers == {"orchestrate.py"}
+
+
+@requires_git
+@requires_brd
+def test_a_lane_bug_keeps_stdout_one_json_line(project, monkeypatch, capsys):
+    """Review Focus 2, through the CLI: grafo logs a failing node with a
+    traceback. A handler on stdout is attached to grafo's logger for this
+    test, so any grafo record would land there; stdout must still be exactly
+    one JSON line, and grafo's own level is back once the run ends."""
+    shape = _milestone(project, {"A": 1})
+
+    async def buggy(**kwargs: Any) -> cli.SubtaskDrive:
+        raise ValueError("lane bug")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", buggy)
+    grafo_logger = logging.getLogger("grafo")
+    level_before = grafo_logger.level
+    loud = logging.StreamHandler(sys.stdout)  # capsys's stdout, captured here
+    grafo_logger.addHandler(loud)
+    try:
+        with pytest.raises(SystemExit) as exited:
+            cli.app(
+                [
+                    "run",
+                    "--milestone",
+                    shape["milestone"],
+                    "--repo-dir",
+                    str(project),
+                    "--base-branch",
+                    "main",
+                    "--branch-prefix",
+                    PREFIX,
+                    "--max-concurrent",
+                    "1",
+                ],
+                prog_name="am",
+            )
+    finally:
+        grafo_logger.removeHandler(loud)
+
+    assert exited.value.code == cli.EXIT_ESCALATED
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 1, out
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is True
+    assert envelope["data"]["escalated"] is True
+    assert envelope["data"]["detail"] == "ValueError: lane bug"
+    assert "Traceback" not in out
+    assert grafo_logger.level == level_before
+
+
+# ── real M6 subtask agents under the tree ───────────────────────────────────
+
+
+@pytest.fixture
+def fresh_pygents():
+    """Fresh pygents registries and compile cache, as `tests/runtime/conftest.py`
+    gives every runtime test: this module's agents must not collide with others."""
+    from pygents import AgentRegistry, ToolRegistry
+
+    from agent_manager.runtime import compile as compile_mod
+
+    ToolRegistry.clear()
+    AgentRegistry.clear()
+    compile_mod.clear_cache()
+    yield
+    ToolRegistry.clear()
+    AgentRegistry.clear()
+    compile_mod.clear_cache()
+
+
+class _ThreadWatch:
+    """A `pause()`-only stand-in on the run's StopSignal whose flag a step, in
+    its `to_thread` worker, can wait on."""
+
+    def __init__(self) -> None:
+        self.paused = threading.Event()
+
+    def pause(self) -> None:
+        self.paused.set()
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_parks_running_lanes_and_blocks_new_ones(project, fresh_pygents):
+    """Spec test 4, on real M6 pygents subtask agents over step-only workflows
+    (the fake runner): A's step fails once B's first phase is in flight; the
+    lane triggers the stop; B's agent is paused, finishes its phase and parks
+    before `b_second` through ON_PAUSE; C, blocked by A, is never started."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    b_in = threading.Event()
+    watch = _ThreadWatch()
+    ran: list[str] = []
+
+    def a_work(card: str) -> dict[str, Any]:
+        ran.append("a_work")
+        if not b_in.wait(WAIT):
+            raise RuntimeError("B's first phase never started")
+        raise RuntimeError("a failed on purpose")
+
+    def b_first(card: str) -> dict[str, Any]:
+        ran.append("b_first")
+        b_in.set()
+        if not watch.paused.wait(WAIT):
+            raise RuntimeError("the stop was never triggered")
+        return {"b_first": 1}
+
+    def b_second(card: str) -> dict[str, Any]:
+        ran.append("b_second")
+        return {"b_second": 2}
+
+    def c_work(card: str) -> dict[str, Any]:
+        ran.append("c_work")
+        return {"c_work": 3}
+
+    workflows = {
+        a1: Workflow("m7_supervise_a_escalates", (Step("a_work", a_work),)),
+        b1: Workflow("m7_supervise_b_parks", (Step("b_first", b_first), Step("b_second", b_second))),
+        c1: Workflow("m7_supervise_c_never", (Step("c_work", c_work),)),
+    }
+    called: list[str] = []
+
+    async def drive(*, store, run_id, card, parent, subtask, repo_dir, stop=None, **_: Any):
+        called.append(card.id)
+        if card.id == b1:
+            stop.register(watch)
+        try:
+            summary = await runtime_engine.run_subtask_async(
+                workflows[card.id],
+                store,
+                story_id=parent.id,
+                subtask=subtask,
+                repo_dir=repo_dir,
+                stop=stop,
+            )
+        finally:
+            if card.id == b1:
+                stop.unregister(watch)
+        return cli.SubtaskDrive(summary=summary, warnings=list(summary.warnings))
+
+    result = _run(project, shape["milestone"], drive, max_concurrent=2)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert sorted(called) == sorted([a1, b1])
+    assert sorted(ran) == ["a_work", "b_first"]
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"]) == (story_a, a1)
+    assert "a failed on purpose" in result["detail"]
+    assert "also_escalated" not in result
+    assert result["stopped"] == [{"story": story_b, "subtask": b1, "before_phase": "b_second"}]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+        story_c: "pending",
+        c1: "pending",
+    }
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(b1)
+    finally:
+        opened.close()
+    assert newest.reason == "parked"
+    assert newest.agent["queue"][0]["kwargs"]["phase"] == "b_second"
 
 
 # ── relaunch continues an open checkpoint (card 02890d5d) ───────────────────
@@ -1972,9 +2778,9 @@ class CheckpointDriver(FakeDriver):
 
     resumed: dict[str, Any] = field(default_factory=dict)
 
-    def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
+    async def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
         self.resumed[kwargs["card"].id] = resume_from
-        return super().__call__(**kwargs)
+        return await super().__call__(**kwargs)
 
 
 def _plant(
@@ -2056,3 +2862,1155 @@ def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypa
     assert result["subtask"] == a1
     assert result["detail"] == "RuntimeError: checkpoints table unreadable"
     assert driver.calls == []
+
+
+# ── merged bases (supervisor-tree §5, card 8eca88e2) ────────────────────────
+
+
+@dataclass
+class FakeBases:
+    """Stands in for `bases.build`, which the lane reads off `bases` at call time.
+
+    Every call is recorded. `gates[story]` is awaited first with the call's
+    `stop` (Events and Barriers, never sleeps). `outcomes[story]` is an
+    exception to raise; with none the base counts as built and a
+    `BaseResult` naming `root.branch` comes back. It touches no git: a
+    `FakeDriver` never needs the branch to exist. `resumed[story]` is the
+    `resume_from` it was handed, `_ABSENT` when none was (card 54e4ec29).
+    """
+
+    outcomes: dict[str, BaseException] = field(default_factory=dict)
+    gates: dict[str, Gate] = field(default_factory=dict)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    resumed: dict[str, Any] = field(default_factory=dict)
+
+    async def __call__(
+        self,
+        root,
+        tips,
+        *,
+        repo_dir,
+        commands,
+        allow_no_verification,
+        store,
+        run_id,
+        story_id,
+        runner_factory,
+        stop,
+        resume_from=_ABSENT,
+    ) -> bases.BaseResult:
+        self.resumed[story_id] = resume_from
+        self.calls.append(
+            {
+                "root": root,
+                "tips": list(tips),
+                "repo_dir": repo_dir,
+                "commands": list(commands),
+                "allow_no_verification": allow_no_verification,
+                "store": store,
+                "run_id": run_id,
+                "story_id": story_id,
+                "runner_factory": runner_factory,
+                "stop": stop,
+            }
+        )
+        gate = self.gates.get(story_id)
+        if gate is not None:
+            await gate(stop)
+        error = self.outcomes.get(story_id)
+        if error is not None:
+            raise error
+        return bases.BaseResult(
+            branch=root.branch, merged=list(tips[1:]), already_merged=[], resolved=[]
+        )
+
+
+@pytest.fixture
+def fake_bases(monkeypatch) -> FakeBases:
+    recorder = FakeBases()
+    monkeypatch.setattr(bases, "build", recorder)
+    return recorder
+
+
+def _root_plan(project: Path, milestone: str, story_id: str) -> dag.RootPlan:
+    """The story's `RootPlan` as the run derives it: census order, `PREFIX`, `main`."""
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
+    by_id = {story.id: story for story in plan.stories}
+    return dag.story_root(by_id[story_id], by_id, PREFIX, "main")
+
+
+def _bases_entry(story_id: str, root_plan: dag.RootPlan) -> dict[str, Any]:
+    return {"story": story_id, "branch": root_plan.branch, "blockers": list(root_plan.blockers)}
+
+
+@requires_git
+@requires_brd
+def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
+    project, fake_bases
+):
+    """Spec, Engine tier: C (blocked by A and B) builds its base once, only
+    after both blockers returned, from their tips in
+    `root_plan.blockers` order; c1 stacks on the base, c2 on c1; the report
+    lists the base."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 2}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    c1, c2 = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    a_returned, b_returned = asyncio.Event(), asyncio.Event()
+
+    async def both_blockers_returned(stop: StopSignal | None) -> None:
+        assert a_returned.is_set() and b_returned.is_set(), (
+            "C's base was built before both blockers finished"
+        )
+
+    fake_bases.gates[story_c] = both_blockers_returned
+    driver = GatedDriver(returned={a1: a_returned, b1: b_returned})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert root_plan.kind == "merged"
+    assert root_plan.branch == f"{PREFIX}/base-{dag.short_id(story_c)}"
+    assert sorted(root_plan.blockers) == sorted([story_a, story_b])
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["root"] == root_plan
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert call["story_id"] == story_c
+    assert call["repo_dir"] == cli.resolve_repo_dir(project)
+    assert call["run_id"] == result["run_id"]
+    assert call["commands"] == []
+    assert call["allow_no_verification"] is False
+    assert isinstance(call["stop"], StopSignal)
+    # Production passes no factory; the base's resolver gets production's.
+    assert call["runner_factory"] is cli.default_runner_factory
+    driven_on = {entry["card"]: entry["base"] for entry in driver.calls}
+    assert driven_on[c1] == root_plan.branch
+    assert driven_on[c2] == _branch(project, c1)
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1], statuses[c2]) == ("done", "done", "done")
+
+
+@requires_git
+@requires_brd
+def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+
+    result = _run(project, shape["milestone"], FakeDriver(), runner_factory=_no_resolver)
+
+    assert result["done"] is True, result
+    (call,) = fake_bases.calls
+    assert call["runner_factory"] is _no_resolver
+
+
+@requires_git
+@requires_brd
+def test_a_done_blockers_existing_tip_goes_into_the_base(project, fake_bases):
+    """Review Focus 3: on a relaunch A is already done. Its lane finishes at once
+    with the tip it already has, and that tip is merged in its blocker position."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    for card in (a1, story_a):
+        board.set_status(card, "done", repo_dir=project)
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [b1, c1]
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_run_with_no_merged_root_builds_no_base_and_reports_no_bases(project, fake_bases):
+    """Spec: a lone-blocker story stays the fast path, and the key is absent
+    when no base was built."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"B": ["A"]})
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert fake_bases.calls == []
+    assert "bases" not in result
+
+
+@requires_git
+@requires_brd
+def test_a_lane_that_escalates_after_building_its_base_still_lists_it(project, fake_bases):
+    """Review Focus 5: the base exists once built, so a lane-escalated payload
+    lists it too."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    driver = FakeDriver(outcomes={c1: ("verify", "suite red on the base")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"], result["failed_phase"]) == (story_c, c1, "verify")
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_still_lists_the_bases_built(
+    project, fake_bases, integrate_recorder
+):
+    """Review Focus 5: the integrate-escalated payload carries `bases` too."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=story_c, files=["shared.txt"], detail="the resolver did not finish"
+    )
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["escalated"], result["phase"]) == (True, "integrate"), result
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_base_escalates_the_story_at_base_and_parks_a_running_sibling(
+    project, fake_bases
+):
+    """Spec: `BaseFailed(stopped=False)` escalates C at `base` with no
+    subtask, triggers the stop, drives no subtask of C, and D -- held in
+    flight on an Event until the stop fires -- is recorded `stopped`."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 2}, blocked_by={"C": ["A", "B"]}
+    )
+    story_a, story_b, story_c, story_d = (shape["stories"][key] for key in "ABCD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    d1, d2 = shape["subtasks"]["D"]
+    d1_in_flight = asyncio.Event()
+
+    async def hold_d1_until_the_stop(stop: StopSignal | None) -> None:
+        d1_in_flight.set()
+        await _await_stop(stop)
+
+    async def fail_once_d1_is_in_flight(stop: StopSignal | None) -> None:
+        await _within(d1_in_flight.wait(), "d1 in flight beside C's base")
+
+    fake_bases.gates[story_c] = fail_once_d1_is_in_flight
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+    driver = GatedDriver(gates={d1: hold_d1_until_the_stop})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 1,
+        "story": story_c,
+        "subtask": None,
+        "failed_phase": "base",
+        "detail": "conflict nobody could resolve",
+        "warnings": [],
+        "stopped": [{"story": story_d, "subtask": d1, "before_phase": "implement"}],
+    }
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert len(fake_bases.calls) == 1
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_c: "escalated",
+        c1: "pending",
+        story_d: "stopped",
+        d1: "stopped",
+        d2: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_base_whose_resolver_was_stopped_ends_stopped_not_escalated(project, fake_bases):
+    """Spec: `BaseFailed(stopped=True)` -- D escalates while C's base is being
+    built; C's resolver parks, and C is `stopped` with no subtask."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A", "B"]}
+    )
+    story_a, story_b, story_c, story_d = (shape["stories"][key] for key in "ABCD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    c_building = asyncio.Event()
+
+    async def park_with_the_stop(stop: StopSignal | None) -> None:
+        c_building.set()
+        await _await_stop(stop)
+
+    async def escalate_once_c_builds(stop: StopSignal | None) -> None:
+        await _within(c_building.wait(), "C's base to start building")
+
+    fake_bases.gates[story_c] = park_with_the_stop
+    fake_bases.outcomes[story_c] = bases.BaseFailed("the resolver was stopped", stopped=True)
+    driver = GatedDriver(
+        outcomes={d1: ("review", "d broke")}, gates={d1: escalate_once_c_builds}
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_d,
+        "subtask": d1,
+        "failed_phase": "review",
+        "detail": "d broke",
+        "warnings": [],
+        "stopped": [{"story": story_c, "subtask": None, "before_phase": None}],
+    }
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_c: "stopped",
+        c1: "pending",
+        story_d: "escalated",
+        d1: "escalated",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_merged_lane_that_finds_the_stop_fired_never_builds_its_base(project, fake_bases):
+    """Review Focus 1: one slot. The three roots queue on it in census order;
+    `joined` (blocked by the first two) asks for the slot only after the second
+    returned, so it queues behind `last`. `last` escalates, and `joined` takes
+    the slot with the stop already fired: stopped at j1, nothing built."""
+    milestone = _add_card(project, "Milestone 3: orchestration")
+    only_subtask: dict[str, str] = {}
+    for key in ("P", "Q", "R"):
+        story = _add_card(project, f"Story {key}", milestone)
+        only_subtask[story] = _add_card(project, f"{key.lower()}1: only subtask of story {key}", story)
+    first, second, last = _census_stories(project, milestone)
+    joined = _add_card(project, "Story J: blocked by the first two", milestone)
+    j1 = _add_card(project, "j1: only subtask of story J", joined)
+    _block(project, joined, first)
+    _block(project, joined, second)
+    driver = GatedDriver(outcomes={only_subtask[last]: ("review", "the last root broke")})
+
+    result = _run(project, milestone, driver, max_concurrent=1)
+
+    assert fake_bases.calls == []
+    assert j1 not in [call["card"] for call in driver.calls]
+    assert (result["story"], result["subtask"]) == (last, only_subtask[last])
+    assert result["stopped"] == [{"story": joined, "subtask": j1, "before_phase": None}]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[joined], statuses[j1]) == ("stopped", "pending")
+
+
+@requires_git
+@requires_brd
+def test_any_other_error_from_the_base_is_a_lane_escalation_with_no_subtask(
+    project, fake_bases
+):
+    """Spec: a non-`BaseFailed` error goes to the catch-all: `"<Type>: <msg>"`,
+    no subtask, no failed phase, and no subtask row escalated."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    fake_bases.outcomes[story_c] = RuntimeError("git fell over")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["escalated"] is True, result
+    assert (result["level"], result["story"], result["subtask"], result["failed_phase"]) == (
+        1,
+        story_c,
+        None,
+        None,
+    )
+    assert result["detail"] == "RuntimeError: git fell over"
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("escalated", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
+    project, fake_bases
+):
+    """Spec: C never takes a slot when B escalated, so C is `pending` and
+    `bases.build` is never called."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_b, story_c = shape["stories"]["B"], shape["stories"]["C"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert fake_bases.calls == []
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert "bases" not in result
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_story_on_two_blockers_builds_its_base_and_its_dependent_stacks_on_it(
+    project, fake_bases
+):
+    """Spec: J has no subtasks and two blockers; D (blocked by J) falls through
+    to J's merged base. J's lane builds it before D starts, D's first subtask
+    stacks on it, and the report lists it."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_a, story_b, story_j = (shape["stories"][key] for key in "ABJ")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    root_plan = _root_plan(project, shape["milestone"], story_j)
+
+    async def the_base_is_built(stop: StopSignal | None) -> None:
+        assert [call["story_id"] for call in fake_bases.calls] == [story_j], (
+            "d1 started before J's base was built"
+        )
+
+    driver = GatedDriver(gates={d1: the_base_is_built})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert root_plan.kind == "merged"
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["root"] == root_plan
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert next(entry for entry in driver.calls if entry["card"] == d1)["base"] == root_plan.branch
+    assert result["bases"] == [_bases_entry(story_j, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_failed_base_escalates_the_run_and_its_dependent_stays_pending(
+    project, fake_bases, integrate_recorder
+):
+    """Review Focus 2: J is in no wave and has no store row, yet its failed
+    base must escalate the run, never reach Integrate."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_a, story_b, story_j, story_d = (shape["stories"][key] for key in "ABJD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": None,
+        "story": story_j,
+        "subtask": None,
+        "failed_phase": "base",
+        "detail": "J's base broke",
+        "warnings": [],
+    }
+    assert d1 not in [call["card"] for call in driver.calls]
+    assert integrate_recorder.calls == []
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_d: "pending",
+        d1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_closed_subtask_less_story_builds_no_base(project, fake_bases):
+    """Spec, Out of scope: a done story's missing base is milestone-wide
+    resume's; this lane only returns its tip."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    board.set_status(shape["stories"]["J"], "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert fake_bases.calls == []
+    assert "bases" not in result
+
+
+@requires_git
+@requires_brd
+def test_a_merged_storys_dependent_stays_pending_when_a_blocker_failed(project, fake_bases):
+    """T1: grafo starts no dependent of a lane that did not finish clean. C
+    never ran (B escalated), so E -- blocked by C alone -- is never started
+    either: `pending`, not `stopped`, and never listed as parked."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "E": 1}, blocked_by={"C": ["A", "B"], "E": ["C"]}
+    )
+    story_b, story_c, story_e = (shape["stories"][key] for key in "BCE")
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (e1,) = shape["subtasks"]["E"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert "stopped" not in result, result
+    assert fake_bases.calls == []
+    assert [call["card"] for call in driver.calls if call["card"] in (c1, e1)] == []
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+    assert (statuses[story_e], statuses[e1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_merged_storys_dependent_stays_pending_when_a_blocker_failed(
+    project, fake_bases
+):
+    """J (no subtasks) never builds its base when B escalated, and D -- which
+    falls through to J's base -- is never started: `pending`, not `stopped`."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_b, story_d = shape["stories"]["B"], shape["stories"]["D"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=1)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert "stopped" not in result, result
+    assert fake_bases.calls == []
+    assert d1 not in [call["card"] for call in driver.calls]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_d], statuses[d1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_done_merged_storys_dependent_waits_for_its_blockers(project, fake_bases):
+    """A done story rooted on a merged base still sits behind its blockers,
+    as a done lone-blocker story sits behind its blocker's edge: C is done,
+    B is not, so E (blocked by C) is driven only after b1 returned, and not
+    at all when B escalates."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "E": 1}, blocked_by={"C": ["A", "B"], "E": ["C"]}
+    )
+    story_c, story_e = shape["stories"]["C"], shape["stories"]["E"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (e1,) = shape["subtasks"]["E"]
+    for card in (c1, story_c):
+        board.set_status(card, "done", repo_dir=project)
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    assert e1 not in [call["card"] for call in driver.calls]
+    assert "stopped" not in result, result
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_e], statuses[e1]) == ("pending", "pending")
+
+
+# ── milestone-wide resume helpers (card 54e4ec29) ───────────────────────────
+
+RESUME_RUN_ID = "20260924T120000Z-00000009"
+
+
+def _resume_root(tmp_path: Path, monkeypatch) -> Path:
+    """A project root with its projection under tmp_path; no git, no board."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _record_resume_run(
+    root: Path, run_id: str = RESUME_RUN_ID, *, workflow: str = "milestone", status: str = "escalated"
+) -> None:
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=workflow,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status=status,
+                config=models.RunConfig(max_concurrent_stories=3),
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _save(
+    store: store_module.Store,
+    card_id: str,
+    reason: str,
+    *,
+    phase: str | None = None,
+    workflow: Workflow = task_workflow.TASK,
+    digest: str | None = None,
+) -> store_module.Checkpoint:
+    """One checkpoint of `card_id`; `phase` is the turn in flight, None for a row holding no turn."""
+    return store.save_checkpoint(
+        card_id,
+        workflow=workflow.name,
+        digest=workflow.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None if phase is None else {"kwargs": {"phase": phase, "loop": 0}},
+            "queue": [],
+        },
+        saved_at=EARLIER,
+    )
+
+
+def test_a_resumable_milestone_run_is_the_recorded_run(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root)
+
+    run = orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert (run.id, run.workflow, run.status) == (RESUME_RUN_ID, "milestone", "escalated")
+    assert (run.base_branch, run.branch_prefix) == ("main", PREFIX)
+    assert run.config.max_concurrent_stories == 3
+
+
+def test_a_finished_milestone_run_is_refused_with_the_relaunch_remedy(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, status="done")
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert str(caught.value) == (
+        f"run {RESUME_RUN_ID} finished; start new work with am run --milestone"
+    )
+
+
+def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, workflow="task", status="started")
+
+    with pytest.raises(cli.NotResumableError, match="'task'"):
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+    with pytest.raises(cli.UnknownRunError, match="no-such-run"):
+        orchestrate.resumable_milestone_run(root, "no-such-run")
+
+
+def test_a_resumed_run_names_its_milestone_by_the_short_id_in_its_run_id():
+    wanted = models.CardNode(id=_plan_id(9), title="Milestone 9", status="todo")
+    other = models.CardNode(id=_plan_id(8), title="Milestone 8", status="todo")
+
+    assert orchestrate.find_run_milestone([other, wanted], RESUME_RUN_ID) is wanted
+    with pytest.raises(cli.NotResumableError, match="00000007"):
+        orchestrate.find_run_milestone([other, wanted], "20260924T120000Z-00000007")
+
+
+def _resume_stories() -> list[census.StoryPlan]:
+    """A: 11 done, 12 and 13 open. B: 21 open. C on A and B: 31 open, a merged
+    root. D on A and B is closed, so its base is nobody's to build."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12), _plan_subtask(13)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41, "done")], status="done", blocked_by=[a.id, b.id])
+    return [a, b, c, d]
+
+
+def test_the_open_cards_are_the_remaining_subtasks_and_every_open_merged_roots_resolver():
+    cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+    assert [(card_id, workflow.name) for card_id, workflow in cards] == [
+        (_plan_id(12), "task"),
+        (_plan_id(13), "task"),
+        (_plan_id(21), "task"),
+        (_plan_id(31), "task"),
+        (bases.resolver_card_id(_plan_id(3)), "integrate"),
+    ]
+
+
+def test_each_open_card_resumes_from_its_newest_row_or_the_turn_it_failed_in(
+    tmp_path, monkeypatch
+):
+    """12 escalated with no turn left: rewound to its failed `review` turn. 13
+    parked: that row. 21's newest row is `done`, under another digest even
+    (Review Focus 2): nothing, and no refusal. 31 has none. C's resolver:
+    its parked INTEGRATE row."""
+    root = _resume_root(tmp_path, monkeypatch)
+    base_c = bases.resolver_card_id(_plan_id(3))
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(12), "turn", phase="implement")
+        failed = _save(opened, _plan_id(12), "turn", phase="review")
+        _save(opened, _plan_id(12), "escalated")
+        parked = _save(opened, _plan_id(13), "parked", phase="validate_spec")
+        _save(opened, _plan_id(21), "turn", phase="plan")
+        _save(opened, _plan_id(21), "done", digest="saved-under-another-task")
+        resolver = _save(
+            opened, base_c, "parked", phase="verify", workflow=integrate_workflow.INTEGRATE
+        )
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        found = orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    assert found == {_plan_id(12): failed, _plan_id(13): parked, base_c: resolver}
+
+
+def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_digests(
+    tmp_path, monkeypatch
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(13), "parked", phase="plan", digest="saved-under-another-task")
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        with pytest.raises(cli.CheckpointMismatchError) as caught:
+            orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    message = str(caught.value)
+    assert message.startswith("workflow changed since checkpoint")
+    assert _plan_id(13) in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+
+
+def test_a_resolver_is_judged_against_integrate_not_task(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    base_c = bases.resolver_card_id(_plan_id(3))
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, base_c, "parked", phase="verify", workflow=task_workflow.TASK)
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        with pytest.raises(cli.CheckpointMismatchError) as caught:
+            orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    assert base_c in str(caught.value)
+    assert integrate_workflow.INTEGRATE.digest() in str(caught.value)
+
+
+def test_an_escalation_with_no_turn_row_left_starts_the_card_fresh(tmp_path, monkeypatch):
+    """A phase escalation's newest row holds no turn; with no `turn` row to
+    rewind to, the card is started fresh rather than handed a checkpoint
+    that names no phase to continue."""
+    root = _resume_root(tmp_path, monkeypatch)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(31), "escalated")
+
+        point = orchestrate.resume_point(opened, _plan_id(31), task_workflow.TASK)
+    finally:
+        opened.close()
+
+    assert point is None
+
+
+def _dispatch(root: Path) -> models.Dispatch:
+    return models.Dispatch(
+        harness="fake",
+        model="fake",
+        role="reviewer",
+        cwd=root,
+        prompt_path=root / "prompt.txt",
+        result_path=root / "result.json",
+    )
+
+
+def test_reopening_marks_orphans_harness_error_and_open_rows_started(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    statuses = {
+        "a1": "done",
+        "a2": "escalated",
+        "a3": "stopped",
+        "a4": "started",
+        "a5": "pending",
+        "closed": "escalated",
+    }
+    _record_resume_run(root)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_story(models.StoryRun(card_id="story-a", title="A", level=0, status="escalated"))
+        for card, status in statuses.items():
+            opened.record_subtask(
+                "story-a",
+                models.SubtaskRun(card_id=card, branch=f"m3/{card}", base_branch="main", status=status),
+            )
+        opened.record_phase("story-a", "a2", models.PhaseRun(name="review", kind="agent", status="started"))
+        opened.record_attempt(
+            "story-a", "a2", "review", models.Attempt(n=1, dispatch=_dispatch(root), status="started")
+        )
+        run = opened.load_run(RESUME_RUN_ID)
+
+        orchestrate.reopen_rows(opened, run, {"a2", "a3", "a4", "a5"})
+
+        after = opened.load_run(RESUME_RUN_ID)
+    finally:
+        opened.close()
+
+    [story] = after.stories
+    assert {subtask.card_id: subtask.status for subtask in story.subtasks} == {
+        "a1": "done",
+        "a2": "started",
+        "a3": "started",
+        "a4": "started",
+        "a5": "pending",
+        "closed": "escalated",
+    }
+    [review] = [subtask for subtask in story.subtasks if subtask.card_id == "a2"][0].phases
+    assert [attempt.status for attempt in review.attempts] == ["harness_error"]
+
+
+# ── run_milestone(resume_run_id=...) (card 54e4ec29) ────────────────────────
+
+
+def _resume(project: Path, run_id: str, driver: Any, **overrides: Any) -> dict[str, Any]:
+    """`run_milestone` continuing `run_id`: no milestone, prefix, base or bound given."""
+    kwargs: dict[str, Any] = {"repo_dir": project, "driver": driver, "resume_run_id": run_id}
+    kwargs.update(overrides)
+    return orchestrate.run_milestone(None, **kwargs)
+
+
+def _plant_integrate(
+    project: Path, run_id: str, story_id: str, reason: str, *, digest: str | None = None
+) -> store_module.Checkpoint:
+    """One `INTEGRATE` checkpoint of `story_id`'s resolver, saved by `run_id`."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        return opened.save_checkpoint(
+            bases.resolver_card_id(story_id),
+            workflow=integrate_workflow.INTEGRATE.name,
+            digest=integrate_workflow.INTEGRATE.digest() if digest is None else digest,
+            reason=reason,
+            agent={"current_turn": None, "queue": [{"kwargs": {"phase": "verify", "loop": 0}}]},
+            saved_at=EARLIER,
+        )
+    finally:
+        opened.close()
+
+
+def _record_bounds(monkeypatch) -> list[int]:
+    """Wrap `orchestrate.supervise`, which `run_milestone` reads at call time,
+    and record the lane bound it is given."""
+    bounds: list[int] = []
+    real = orchestrate.supervise
+
+    async def recording(plan, **kwargs):
+        bounds.append(kwargs["max_concurrent"])
+        return await real(plan, **kwargs)
+
+    monkeypatch.setattr(orchestrate, "supervise", recording)
+    return bounds
+
+
+def _run_ids(project: Path) -> list[str]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _checkpoint_rows(project: Path) -> list[tuple]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT run_id, card_id, seq, reason, digest FROM checkpoints"
+                " ORDER BY run_id, card_id, seq"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _runs_tree() -> dict[str, bytes]:
+    """Every path under the data dir's `runs`, with file contents: the journals included."""
+    root = paths.data_dir() / "runs"
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _never_consulted(store, card_id):
+    pytest.fail("a resume consulted the lenient relaunch lookup cli.continuable_checkpoint")
+
+
+@requires_git
+@requires_brd
+def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on(
+    project, fake_bases, monkeypatch
+):
+    """Spec test 2: no prefix, base or bound is given, yet the subtasks stack
+    on `main` under `PREFIX` and the tree runs three lanes; a1 continues from
+    its checkpoint, C's resolver checkpoint reaches `bases.build`, and the
+    lenient relaunch lookup is never read."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}), max_concurrent=3)
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    turn = _plant(project, run_id, a1, "turn", queue=("review",))
+    resolver = _plant_integrate(project, run_id, story_c, "parked")
+    bounds = _record_bounds(monkeypatch)
+    monkeypatch.setattr(cli, "continuable_checkpoint", _never_consulted)
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["run_id"] == run_id
+    assert _run_ids(project) == [run_id]
+    assert bounds == [3]
+    by_card = {call["card"]: call for call in driver.calls}
+    assert by_card[a1]["base"] == "main"
+    assert by_card[a1]["branch"] == _branch(project, a1)
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    assert by_card[c1]["base"] == root_plan.branch
+    got = driver.resumed[a1]
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (run_id, a1, turn.seq, "turn")
+    assert driver.resumed[b1] is _ABSENT
+    assert driver.resumed[c1] is _ABSENT
+    base_got = fake_bases.resumed[story_c]
+    assert (base_got.card_id, base_got.seq, base_got.reason) == (
+        bases.resolver_card_id(story_c),
+        resolver.seq,
+        "parked",
+    )
+    run = _load(project, run_id)
+    assert (run.status, run.branch_prefix, run.base_branch) == ("done", PREFIX, "main")
+    assert run.config.max_concurrent_stories == 3
+
+
+@requires_git
+@requires_brd
+def test_a_resume_hands_a_subtask_less_storys_resolver_checkpoint_to_its_base(
+    project, fake_bases
+):
+    """J has no subtasks, so its base is built by its base-only lane, not a
+    subtask lane; its resolver's checkpoint must reach `bases.build` there too."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's resolver escalated")
+    first = _run(project, shape["milestone"], FakeDriver())
+    assert (first["escalated"], first["story"]) == (True, story_j), first
+    resolver = _plant_integrate(project, first["run_id"], story_j, "parked")
+    fake_bases.outcomes.clear()
+
+    result = _resume(project, first["run_id"], FakeDriver())
+
+    assert result["done"] is True, result
+    got = fake_bases.resumed[story_j]
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (
+        first["run_id"],
+        bases.resolver_card_id(story_j),
+        resolver.seq,
+        "parked",
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_stale_resolver_checkpoint_refuses_the_whole_resume_and_writes_nothing(
+    project, fake_bases, monkeypatch
+):
+    """Spec test 4: one resolver saved under another INTEGRATE refuses the
+    whole resume before anything is driven, recorded or fetched."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}), max_concurrent=3)
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",))
+    _plant_integrate(project, run_id, story_c, "parked", digest="saved-under-another-integrate")
+    before = (
+        _runs_tree(),
+        _statuses(_load(project, run_id)),
+        _checkpoint_rows(project),
+        _local_branches(project),
+    )
+    git_calls = _record_git(monkeypatch)
+    driver = CheckpointDriver()
+
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        _resume(project, run_id, driver)
+
+    message = str(caught.value)
+    assert message.startswith("workflow changed since checkpoint")
+    assert bases.resolver_card_id(story_c) in message
+    assert "saved-under-another-integrate" in message
+    assert integrate_workflow.INTEGRATE.digest() in message
+    assert driver.calls == [] and fake_bases.calls == []
+    assert git_calls == []
+    assert (
+        _runs_tree(),
+        _statuses(_load(project, run_id)),
+        _checkpoint_rows(project),
+        _local_branches(project),
+    ) == before
+
+
+@requires_git
+@requires_brd
+def test_a_merged_base_from_the_interrupted_run_is_reused_and_not_merged_again(project):
+    """Spec test 7, on the real `bases.build`: A and B finished and C's base
+    was merged before c1 escalated. The resume drives c1 only, on the same
+    base commit, and neither the base nor `main` moves."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    first = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(outcomes={c1: ("review", "boom")}),
+        commands=[PASS_CMD],
+    )
+    assert first["escalated"] is True, first
+    assert first["bases"] == [_bases_entry(story_c, root_plan)]
+    base_sha = _sha(project, root_plan.branch)
+    main_sha = _sha(project, "main")
+    driver = BranchingDriver()
+
+    result = _resume(project, first["run_id"], driver, commands=[PASS_CMD])
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [call["card"] for call in driver.calls] == [c1]
+    assert driver.calls[0]["base"] == root_plan.branch
+    assert result["completed"] == [c1]
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    assert _sha(project, root_plan.branch) == base_sha
+    assert _sha(project, "main") == main_sha
+
+
+@requires_git
+@requires_brd
+def test_a_card_finished_by_hand_since_the_interrupt_is_neither_checked_nor_driven(project):
+    """Review Focus 1: a1's checkpoint is stale, but a human finished a1 on the
+    board, so it is not open: no refusal, and only a2 is driven."""
+    shape = _milestone(project, {"A": 2})
+    a1, a2 = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",), digest="saved-under-another-task")
+    rollup.set_status(a1, "done", repo_dir=project)
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [call["card"] for call in driver.calls] == [a2]
+    assert result["completed"] == [a2]
+
+
+@requires_git
+@requires_brd
+def test_a_resume_after_an_integrate_escalation_retries_integrate(project, integrate_recorder):
+    """Review Focus 4: nothing is left to drive, so the resume runs no lane
+    and retries Integrate under the same run id."""
+    shape = _milestone(project, {"A": 1})
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=None, files=[], detail="the suite is red"
+    )
+    first = _run(project, shape["milestone"], BranchingDriver())
+    assert first["escalated"] is True, first
+    integrate_recorder.outcome = None
+    driver = BranchingDriver()
+
+    result = _resume(project, first["run_id"], driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["completed"] == []
+    assert driver.calls == []
+    assert [call["run_id"] for call in integrate_recorder.calls] == [first["run_id"]] * 2
+    assert _load(project, first["run_id"]).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_an_escalated_resume_still_says_it_resumed(project):
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+
+    again = _resume(project, first["run_id"], FakeDriver(outcomes={a1: ("review", "still")}))
+
+    assert again["escalated"] is True
+    assert again["resumed"] is True
+    assert again["run_id"] == first["run_id"]
+    assert again["detail"] == "still"
+
+
+def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(board, "roots", lambda **kwargs: pytest.fail("the board was read"))
+
+    with pytest.raises(ValueError, match="branch prefix"):
+        orchestrate.run_milestone("Milestone 3", repo_dir=tmp_path, base_branch="main")

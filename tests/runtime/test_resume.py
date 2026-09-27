@@ -10,7 +10,11 @@ tests/test_engine.py's `_Abort`, neither `_run` nor pygents may catch it.
 Registry isolation between tests is the autouse `fresh_pygents` fixture.
 """
 
+import asyncio
+import dataclasses
 import json
+import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,7 @@ from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
@@ -68,9 +73,12 @@ def _go(workflow: Workflow, opened, **kwargs: Any):
     )
 
 
-def _five(ran: list[str], crash_in: set[str]) -> Workflow:
+def _five(
+    ran: list[str], crash_in: set[str], after_a: Callable[[], None] | None = None
+) -> Workflow:
     """Steps a..e. Each appends its name to `ran`; a step named in `crash_in`
-    raises `_Crash` once (the name is discarded), so a resume runs it cleanly."""
+    raises `_Crash` once (the name is discarded), so a resume runs it cleanly.
+    `after_a`, when given, is called by step `a` just before it returns."""
 
     def make(name: str):
         def run(card: str) -> dict[str, Any]:
@@ -78,11 +86,65 @@ def _five(ran: list[str], crash_in: set[str]) -> Workflow:
             if name in crash_in:
                 crash_in.discard(name)
                 raise _Crash(f"killed in {name}")
+            if name == "a" and after_a is not None:
+                after_a()
             return {name: name.upper()}
 
         return run
 
     return Workflow("five", tuple(Step(name, make(name)) for name in FIVE))
+
+
+class _StopAfterA:
+    """A `StopSignal` that step `a` triggers, once.
+
+    Steps run in `asyncio.to_thread` workers and the signal lives on the loop,
+    so the trigger is handed to the loop with `call_soon_threadsafe` and the
+    step blocks on a `threading.Event` until it has run -- no sleeps. Only the
+    first call fires: a later fresh run of the same workflow, on a new loop,
+    passes straight through.
+    """
+
+    def __init__(self) -> None:
+        self.signal = StopSignal()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._fired = threading.Event()
+
+    def __call__(self) -> None:
+        if self._fired.is_set():
+            return
+        assert self.loop is not None, "armed by _park_after_a before the run"
+
+        def trigger() -> None:
+            self.signal.trigger(STORY_ID)
+            self._fired.set()
+
+        self.loop.call_soon_threadsafe(trigger)
+        if not self._fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
+
+
+def _park_after_a(opened) -> tuple[list[str], Workflow, Any]:
+    """Run `_five` under a `StopSignal` that step `a` triggers, so the subtask
+    parks before `b`. Returns what ran, the workflow (for a resume) and the
+    summary."""
+    ran: list[str] = []
+    stop = _StopAfterA()
+    wf = _five(ran, set(), after_a=stop)
+
+    async def go():
+        stop.loop = asyncio.get_running_loop()
+        return await runtime_engine.run_subtask_async(
+            wf,
+            opened,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            clock=lambda: FIXED,
+            stop=stop.signal,
+        )
+
+    return ran, wf, asyncio.run(go())
 
 
 def _rows(opened) -> list[tuple[int, str, dict]]:
@@ -204,10 +266,7 @@ def test_loop_count_survives_a_resume(store):
 
 
 def test_a_parked_subtask_resumes(store):
-    ran: list[str] = []
-    wf = _five(ran, set())
-
-    parked_summary = _go(wf, store, should_stop=lambda: ran == ["a"])
+    ran, wf, parked_summary = _park_after_a(store)
 
     assert parked_summary.status == "stopped"
     assert parked_summary.detail == "stopped before b"
@@ -295,12 +354,12 @@ def test_resuming_a_done_checkpoint_dispatches_nothing(store):
 
 def test_a_resume_with_the_stop_still_set_parks_again(store):
     # Review Focus 5.
-    ran: list[str] = []
-    wf = _five(ran, set())
-    _go(wf, store, should_stop=lambda: ran == ["a"])
+    ran, wf, _ = _park_after_a(store)
     parked = store.latest_checkpoint(CARD_ID)
+    still = StopSignal()
+    still.trigger("elsewhere")
 
-    summary = _go(wf, store, resume_from=parked, should_stop=lambda: True)
+    summary = _go(wf, store, resume_from=parked, stop=still)
 
     assert ran == ["a"]
     assert summary.status == "stopped"
@@ -316,9 +375,7 @@ def _extra(card: str) -> dict[str, Any]:
 
 
 def test_a_changed_workflow_is_refused(store):
-    ran: list[str] = []
-    wf = _five(ran, set())
-    _go(wf, store, should_stop=lambda: ran == ["a"])
+    ran, wf, _ = _park_after_a(store)
     parked = store.latest_checkpoint(CARD_ID)
     changed = Workflow("five", wf.phases + (Step("f", _extra),))
     assert changed.digest() != wf.digest()
@@ -339,9 +396,7 @@ def test_a_changed_workflow_is_refused(store):
 def test_a_refused_resume_leaves_the_card_runnable(store):
     # Review Focus 3: the refusal comes before any agent is registered, so a
     # fresh run of the same card in the same process is not refused a name.
-    ran: list[str] = []
-    wf = _five(ran, set())
-    _go(wf, store, should_stop=lambda: ran == ["a"])
+    ran, wf, _ = _park_after_a(store)
     parked = store.latest_checkpoint(CARD_ID)
     changed = Workflow("five", wf.phases + (Step("f", _extra),))
 
@@ -388,8 +443,7 @@ def test_pending_phase_reads_the_turn_a_crashed_checkpoint_would_run_next(store)
 
 
 def test_pending_phase_reads_a_parked_checkpoint(store):
-    ran: list[str] = []
-    _go(_five(ran, set()), store, should_stop=lambda: ran == ["a"])
+    _park_after_a(store)
     parked = store.latest_checkpoint(CARD_ID)
 
     assert parked.reason == "parked"
@@ -439,3 +493,70 @@ def test_a_phase_escalation_leaves_an_escalated_row_with_no_pending_phase(store)
     assert escalated.agent["current_turn"] is None
     assert escalated.agent["queue"] == []
     assert runtime_engine.pending_phase(escalated) is None
+
+
+# ── a StopSignal-parked checkpoint (card 364babde) ───────────────────────────
+
+
+def _park_with_a_triggered_stop(wf: Workflow, opened):
+    """Park `wf`'s subtask through the StopSignal path: a signal already
+    triggered pauses the agent before its first turn, and ON_PAUSE parks it."""
+    stop = StopSignal()
+    stop.trigger("elsewhere")
+    summary = _go(wf, opened, stop=stop)
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before a"
+    parked = opened.latest_checkpoint(CARD_ID)
+    assert parked.reason == "parked"
+    # pygents stores the pause itself in the row.
+    assert parked.agent["is_paused"] is True
+    return parked
+
+
+def test_a_subtask_parked_by_the_stop_signal_resumes(store):
+    # Review Focus 1: the stored pause must not re-park the resumed agent.
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    assert ran == []
+
+    summary = _go(wf, store, resume_from=parked)
+
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS
+    assert store.latest_checkpoint(CARD_ID).reason == "done"
+
+
+def test_a_stop_signal_parked_subtask_resumed_under_a_triggered_stop_parks_again(store):
+    # Review Focus 2: clearing the stored pause must come before the run's
+    # own stop registers the agent, or this resume would run.
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    again = StopSignal()
+    again.trigger("elsewhere")
+
+    summary = _go(wf, store, resume_from=parked, stop=again)
+
+    assert ran == []
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before a"
+    newest = store.latest_checkpoint(CARD_ID)
+    assert (newest.seq, newest.reason) == (parked.seq + 1, "parked")
+    assert _head(newest.agent) == "a"
+
+
+def test_a_row_parked_without_a_pause_still_resumes(store):
+    """Rows `parked` by the deleted M6 stop were saved from an agent that was
+    never paused. One still sitting in an older store resumes like any other."""
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    legacy = dataclasses.replace(parked, agent={**parked.agent, "is_paused": False})
+
+    summary = _go(wf, store, resume_from=legacy)
+
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS

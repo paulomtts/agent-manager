@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING, Any
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
 
 from agent_manager.runtime import walk
-from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN hook
+from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN and ON_PAUSE hooks
 from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
 from agent_manager.runtime.state import RunDeps, current_run
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import Workflow
 
 if TYPE_CHECKING:
@@ -41,8 +42,8 @@ def pending_phase(checkpoint: Checkpoint) -> str | None:
     Read-only: it reads the stored `Agent.to_dict()` and builds nothing, so a
     caller outside `runtime/` can name where a resume would start without
     touching a pygents structure itself (card 02890d5d). The next turn is the
-    turn in flight if there was one, else the queue head -- the reading the
-    `BEFORE_TURN` hook makes. A `done` row holds no turn, and neither does an
+    turn in flight if there was one, else the queue head. A `done` row holds
+    no turn, and neither does an
     `escalated` row written after a phase escalated: `Escalated` enqueues
     nothing and `agent.run()` clears the turn in flight on its way out.
     """
@@ -64,26 +65,13 @@ def run_subtask(
     extra_context: Mapping[str, Any] | None = None,
     agent_runner: Any = None,
     clock: Callable[[], Any] = walk._utcnow,
-    should_stop: Callable[[], bool] | None = None,
+    stop: StopSignal | None = None,
     resume_from: Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
-    """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`.
-
-    Every turn is saved as a `turn` checkpoint before it runs, and the run ends
-    with a `done` or `escalated` one (`runtime/checkpoint.py`). `should_stop` is
-    asked before every turn: once it answers true, a `parked` checkpoint is
-    saved, the next phase is not started, and the subtask is recorded
-    `stopped before <phase>`.
-
-    `resume_from` continues from a saved checkpoint instead of the first phase:
-    the agent is rebuilt from it, so the pool (seed and earlier results) and
-    the queue (the pending turn and its loop count) are the checkpoint's, and
-    no seed or first turn is added. A checkpoint saved under another workflow
-    digest is refused with `CheckpointMismatch` before anything runs or is
-    recorded.
-    """
+    """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`
+    around `run_subtask_async`, which documents the parameters."""
     return asyncio.run(
-        _drive(
+        run_subtask_async(
             workflow,
             store,
             story_id=story_id,
@@ -95,28 +83,47 @@ def run_subtask(
             extra_context=extra_context,
             agent_runner=agent_runner,
             clock=clock,
-            should_stop=should_stop,
+            stop=stop,
             resume_from=resume_from,
         )
     )
 
 
-async def _drive(
+async def run_subtask_async(
     workflow: Workflow,
     store: Any,
     *,
     story_id: str,
     subtask: Any,
     repo_dir: Path,
-    commands: Sequence[str],
-    card: Any,
-    parent_story: Any,
-    extra_context: Mapping[str, Any] | None,
-    agent_runner: Any,
-    clock: Callable[[], Any],
-    should_stop: Callable[[], bool] | None,
-    resume_from: Checkpoint | None,
+    commands: Sequence[str] = (),
+    card: Any = None,
+    parent_story: Any = None,
+    extra_context: Mapping[str, Any] | None = None,
+    agent_runner: Any = None,
+    clock: Callable[[], Any] = walk._utcnow,
+    stop: StopSignal | None = None,
+    resume_from: Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
+    """Walk `workflow`'s phases for one subtask on the running event loop.
+
+    Every turn is saved as a `turn` checkpoint before it runs, and the run ends
+    with a `done` or `escalated` one (`runtime/checkpoint.py`).
+
+    `stop`, a `StopSignal`, is the only stop. The agent is registered with it
+    for the run and unregistered on every exit. A trigger pauses the agent:
+    the turn in flight finishes, a `parked` checkpoint is saved, the next
+    phase is not started, and the subtask is recorded `stopped before
+    <phase>`. A trigger after the last phase finished changes nothing: the
+    subtask ends `done`.
+
+    `resume_from` continues from a saved checkpoint instead of the first phase:
+    the agent is rebuilt from it, so the pool (seed and earlier results) and
+    the queue (the pending turn and its loop count) are the checkpoint's, and
+    no seed or first turn is added. A checkpoint saved under another workflow
+    digest is refused with `CheckpointMismatch` before anything runs or is
+    recorded.
+    """
     # The binding, built and refused before any agent exists, so a refusal
     # records nothing.
     binding = walk.subtask_context(
@@ -159,11 +166,17 @@ async def _drive(
         # The pool (seed, earlier results) and the queue (pending turn, loop
         # count) come from the checkpoint: no seed item, no first turn.
         agent = Agent.from_dict(resume_from.agent)
+        # A row parked by a `StopSignal` was saved while its agent was paused,
+        # and `from_dict` restores that pause; left in place, ON_PAUSE would
+        # park the resumed agent again before it ran anything. That pause
+        # belonged to the stopped run: only this run's `stop`, registered in
+        # `_run` after this line, may pause the agent now.
+        agent.resume()
     try:
         if resume_from is None:
             await agent.context_pool.add(context.seed_item(binding))
             await agent.put(compiled.first_turn())
-        deps = RunDeps(workflow, store, story_id, subtask, agent_runner, clock, should_stop)
+        deps = RunDeps(workflow, store, story_id, subtask, agent_runner, clock, stop=stop)
         return await _run(agent, deps)
     finally:
         _forget(agent.name)
@@ -175,11 +188,15 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
     # Every `checkpoint.save` below runs inside this `try`, while `current_run`
     # is still set: after the `finally` resets it, `save` is a silent no-op.
     try:
+        if deps.stop is not None:
+            # Registered for exactly the life of `run()`: a signal that has
+            # already fired pauses the agent here, before its first turn.
+            deps.stop.register(agent)
         async for _ in agent.run():  # consumed to the end, always
             pass
     except checkpoint.Parked as parked:
-        # The stop, raised by the BEFORE_TURN hook after it saved `parked`:
-        # no further row, so that one stays the newest.
+        # The stop, raised by the ON_PAUSE hook after it saved `parked`: no
+        # further row, so that one stays the newest.
         _collect(agent, deps, summary)
         return walk._stop(
             summary, deps.store, deps.story_id, deps.subtask, parked.before_phase
@@ -214,6 +231,10 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
     finally:
         # A `BaseException` (cancellation, KeyboardInterrupt) passes straight
         # through here and writes nothing: the last `turn` row stands.
+        # Unregistered on every exit, so a later trigger never pauses an
+        # agent whose run is over.
+        if deps.stop is not None:
+            deps.stop.unregister(agent)
         current_run.reset(token)
     walk._record_subtask_status(deps.store, deps.story_id, deps.subtask, summary.status)
     return summary

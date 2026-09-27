@@ -1832,6 +1832,33 @@ def test_latest_checkpoint_is_the_highest_seq_of_this_stores_run(repo):
     assert unknown is None
 
 
+def test_latest_turn_checkpoint_is_the_newest_turn_row_of_this_stores_run(repo):
+    """Card 54e4ec29: a phase escalation's newest row holds no turn, so a
+    milestone resume rewinds to the turn the failing phase ran in."""
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(other, "card-a", reason="turn", saved_at=_at(20))
+    finally:
+        other.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
+        wanted = _save_checkpoint(st, "card-a", reason="turn", agent={"turn": 1}, saved_at=_at(1))
+        _save_checkpoint(st, "card-a", reason="escalated", saved_at=_at(2))
+        _save_checkpoint(st, "card-b", reason="parked", saved_at=_at(3))
+        found = st.latest_turn_checkpoint("card-a")
+        only_parked = st.latest_turn_checkpoint("card-b")
+        unknown = st.latest_turn_checkpoint("card-never-saved")
+    finally:
+        st.close()
+
+    assert found == wanted
+    assert found is not None and found.run_id == RUN_ID and found.seq == 1
+    assert only_parked is None
+    assert unknown is None
+
+
 def test_a_checkpoint_with_an_unknown_reason_is_refused_and_writes_nothing(repo):
     st = store.Store.open(repo, RUN_ID)
     try:

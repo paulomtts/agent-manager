@@ -6,8 +6,10 @@ temp JSONL journal, built as tests/runtime/test_compile.py builds it. The
 checkpoint rows are read straight from the store's `checkpoints` table.
 """
 
+import asyncio
 import itertools
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ from agent_manager import models, store as store_module
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Step, Workflow
 
 RUN_ID = "run-2026-09-26-02"
@@ -171,17 +174,32 @@ def test_an_escalation_writes_an_escalated_row(store):
     assert store.latest_checkpoint(CARD_ID).reason == "escalated"
 
 
+class _SecondSaveBreaks:
+    """The run's store, except that its second `save_checkpoint` raises.
+
+    The first save is `a`'s `turn` row; the second is the `turn` row
+    `before_turn` writes for `b`, so the error comes from the `BEFORE_TURN`
+    hook, outside any phase. Every other attribute is the real store's.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._saves = itertools.count()
+
+    def save_checkpoint(self, *args: Any, **kwargs: Any) -> Any:
+        if next(self._saves) == 1:
+            raise RuntimeError("checkpoint write broke")
+        return self._inner.save_checkpoint(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def test_an_error_outside_a_phase_writes_an_escalated_row(store):
     """The generic `except Exception` branch, not `C.Escalated`: an error raised
-    by the hook itself (here a `should_stop` that breaks on its second call)
-    still leaves an `escalated` row before the subtask is escalated."""
+    by the hook itself (here the store refusing `b`'s `turn` row) still leaves
+    an `escalated` row before the subtask is escalated."""
     ran: list[str] = []
-    asked = itertools.count()
-
-    def should_stop() -> bool:
-        if next(asked) == 1:
-            raise RuntimeError("stop check broke")
-        return False
 
     def a(card: str) -> dict[str, Any]:
         ran.append("a")
@@ -193,20 +211,67 @@ def test_an_error_outside_a_phase_writes_an_escalated_row(store):
 
     summary = runtime_engine.run_subtask(
         Workflow("breaks", (Step("a", a), Step("b", b))),
+        _SecondSaveBreaks(store),
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        clock=lambda: FIXED,
+    )
+
+    assert ran == ["a"]
+    assert summary.status == "escalated"
+    assert "checkpoint write broke" in summary.detail
+    assert [(seq, reason) for seq, reason, _ in _rows(store)] == [
+        (0, "turn"), (1, "escalated"),
+    ]
+
+
+async def test_before_turn_saves_every_turn_and_only_on_pause_parks(store):
+    """`before_turn` saves `turn` for every turn, a triggered `StopSignal`
+    included; the one `parked` row is `on_pause`'s, written before `c`, the
+    turn that never ran. Passes before and after the M6 stop is deleted."""
+    loop = asyncio.get_running_loop()
+    stop = StopSignal()
+    fired = threading.Event()
+    ran: list[str] = []
+
+    def fire() -> None:
+        stop.trigger(STORY_ID)
+        fired.set()
+
+    def a(card: str) -> dict[str, Any]:
+        ran.append("a")
+        return {"a": 1}
+
+    def b(card: str) -> dict[str, Any]:
+        ran.append("b")
+        loop.call_soon_threadsafe(fire)
+        if not fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
+        return {"b": 2}
+
+    def c(card: str) -> dict[str, Any]:
+        ran.append("c")
+        return {"c": 3}
+
+    summary = await runtime_engine.run_subtask_async(
+        Workflow("parks", (Step("a", a), Step("b", b), Step("c", c))),
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
         clock=lambda: FIXED,
-        should_stop=should_stop,
+        stop=stop,
     )
 
-    assert ran == ["a"]
-    assert summary.status == "escalated"
-    assert "stop check broke" in summary.detail
-    assert [(seq, reason) for seq, reason, _ in _rows(store)] == [
-        (0, "turn"), (1, "escalated"),
+    assert ran == ["a", "b"]
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before c"
+    rows = _rows(store)
+    assert [(seq, reason) for seq, reason, _ in rows] == [
+        (0, "turn"), (1, "turn"), (2, "parked"),
     ]
+    assert [_head(agent) for _, _, agent in rows] == ["a", "b", "c"]
 
 
 def test_a_checkpoint_never_reads_the_injected_clock(store):

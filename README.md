@@ -22,7 +22,7 @@ am run --card 19efcddc-0000-0000-0000-000000000000 \
   --verify "uv run ruff check"
 ```
 
-Pick a stopped or killed subtask back up at the phase it was interrupted in. There is no `--base-branch` and no `--branch-prefix` here: both were decided when the run started and are recorded on the run. `--verify` and `--allow-no-verification` are still accepted but have no effect: the checkpoint carries the verification suite and the opt-out the run started with. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
+Pick a run back up where it was interrupted: a `--card` run's one stopped or killed subtask, at the phase it was interrupted in, or a `--milestone` run's whole milestone, under the same run id. There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here: they were decided when the run started and are recorded on the run. The verification suite is not recorded. A walk continued from a checkpoint keeps the suite and the opt-out the run started with, so on a `--card` run `--verify` and `--allow-no-verification` have no effect. On a milestone run, pass the same `--verify` commands (or `--allow-no-verification`) again: they are what every subtask with no checkpoint, every merged base and Integrate run. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
 
 ```bash
 am resume 20260923T140506Z-19efcddc
@@ -33,10 +33,7 @@ Every command prints one line of JSON — `{"ok": true, "data": ...}` on success
 
 ### Milestone runs
 
-Drive every remaining subtask of one milestone. Stories in the same dependency
-level run side by side, up to `--max-concurrent` of them at once. Inside a
-story, subtasks always run in order, each on its own local branch stacked on
-the branch before it:
+Drive every remaining subtask of one milestone. A story starts as soon as every story it is blocked by has finished clean, and up to `--max-concurrent` stories run at once. Inside a story, subtasks always run in order, each on its own local branch stacked on the branch before it:
 
 ```bash
 am run --milestone "document milestone runs" \
@@ -45,10 +42,7 @@ am run --milestone "document milestone runs" \
   [--max-concurrent N]
 ```
 
-`--max-concurrent N` is how many of a level's stories run at once. It defaults
-to 4. `--max-concurrent 1` runs a level's stories one at a time, as the runner
-did before parallel runs. See [Parallel runs](#parallel-runs) for what runs
-together, how a run stops, and the limits.
+`--max-concurrent N` is how many stories run at once, across the whole milestone. It defaults to 4, and `--max-concurrent 1` runs one story at a time. See [Parallel runs](#parallel-runs) for what runs together, how a run stops, and the limits, and [Multiple blockers](#multiple-blockers) for a story with two or more blockers.
 
 `--milestone` takes the milestone card's id, its exact title (case does not
 matter), or a piece of its title that matches exactly one root card. A piece
@@ -78,37 +72,32 @@ am run --milestone "document milestone runs" --branch-prefix m3 --dry-run --pret
 
 The preview reads the board and writes nothing: no run directory, no branch, no
 worktree, no board change. It exits 0. It takes `--max-concurrent` too, and
-`data.max_concurrent` echoes it (4 when not given). `data.levels` is a list of
-`{"level", "concurrent", "stories"}`, where `concurrent` is how many of that
-level's stories would run at once. Each story is `{"story", "title", "root", "subtasks"}`,
-and each subtask is `{"id", "title", "status", "branch", "base"}`. Only the
+`data.max_concurrent` echoes it (4 when not given). `data.levels` groups the stories still to run into waves, as a list of `{"level", "concurrent", "stories"}`. It is a preview only: the real run starts each story as soon as its own blockers have finished, not when a whole level has. `concurrent` is how many of that level's stories could run at once, `min(stories in the level, max_concurrent)`. Each story is `{"story", "title", "root", "subtasks"}`, plus `merged_from` when its root is a merged base (see below), and each subtask is `{"id", "title", "status", "branch", "base"}`. Only the
 subtasks still to run are listed. `data.already_done` lists what will not run:
 `{"kind": "story", "id", "title"}` for a story with nothing left, and
 `{"kind": "subtask", "id", "title", "story"}` for a done subtask of a story that
 still has work.
 
-`data.integrate` is the plan for [Integrate](#integrate), the step that runs after the last level: `{"branch", "worktree", "order"}`. `branch` is `<prefix>-integrate`, `worktree` is its worktree, `<repo>/.claude/worktrees/<prefix>-integrate`, and `order` lists `{"story", "tip"}` in the order the tips will be merged. It names every story that has subtasks, done or not, because Integrate merges them all. The preview creates neither the branch nor the worktree.
+`data.integrate` is the plan for [Integrate](#integrate), the step that runs after every story has finished: `{"branch", "worktree", "order"}`. `branch` is `<prefix>-integrate`, `worktree` is its worktree, `<repo>/.claude/worktrees/<prefix>-integrate`, and `order` lists `{"story", "tip"}` in the order the tips will be merged. It names every story that has subtasks, done or not, because Integrate merges them all. The preview creates neither the branch nor the worktree.
 
 Read the `base` column before a real run:
 
 - A story with no blocker inside the milestone has `root` equal to
   `--base-branch`, and its first subtask builds on it.
-- A story blocked by another story in the milestone roots on that story's tip,
+- A story with exactly one blocker in the milestone roots on that story's tip,
   the branch of its last subtask, even when that story is already done.
+- A story with two or more blockers in the milestone roots on its own merged base, `<prefix>/base-<short id of the story>`, and its first subtask builds on it. Its row gains `merged_from`, the ids of those blockers in the order its `blocked_by` lists them, which is the order their tips are merged. Every other row has no `merged_from` key. See [Multiple blockers](#multiple-blockers).
 - Every later subtask builds on the previous subtask's branch in the story's
   full order. A done subtask is not listed, but its branch still anchors the
   next one.
 - A story you expected to wait on another, whose `root` is the base branch, is
   missing a `blocked_by` edge on the board. Add it with
   `brd block <story> --by <blocker>` and preview again.
-- A cycle between stories, or a story blocked by two or more stories in the
-  milestone, is refused with exit code 3 before anything is written. A stack
-  roots on one branch only.
+- A cycle between stories is refused with exit code 3 before anything is written. A story with two or more blockers is not refused.
 
 #### What a clean run leaves behind
 
-Levels run one after another, a level's stories run on up to `--max-concurrent`
-lanes, and each story's subtasks run in order. Before the first subtask the run
+Each story starts as soon as its blockers have finished clean, up to `--max-concurrent` stories run at once, and each story's subtasks run in order. Before the first subtask the run
 does `git fetch origin` once (only when
 a remote named `origin` exists) and `git worktree prune` once. Each finished
 subtask is `done` on the board, and the rollup moves its story and the
@@ -119,19 +108,21 @@ A clean run exits 0, and `data` holds:
 - `done`: `true`, reported only once [Integrate](#integrate) has merged every tip and passed its final check.
 - `run_id`: the run, for `am status <run_id>` and `am logs`.
 - `levels`: the stories this run had work for, as `{"level", "stories"}` with
-  story ids.
+  story ids, grouped into waves the way `--dry-run` groups them. The grouping is for reading the report only: no story waited for the rest of its wave.
 - `completed`: the subtask ids finished in this run, in order.
 - `tips`: `{"story", "tip"}` for every story in the milestone that has
   subtasks, naming the branch its stack ends on. These are the branches
   Integrate merged.
 - `warnings`: board writes that failed but did not stop the run, as text.
 - `integrated`: `{"branch", "worktree", "merged", "resolved"}`. `branch` is `<prefix>-integrate` and `worktree` is its worktree. `merged` lists, in merge order, the story ids whose tip is in `branch`, including tips an earlier run already merged. `resolved` lists the story ids whose conflict a resolver fixed in this run.
+- `bases`: `{"story", "branch", "blockers"}` for every merged base this run built, only when there is one. See [Multiple blockers](#multiple-blockers).
+- `resumed`: `true`, only on a run continued by `am resume`, on every report shape. `completed` then lists only what finished in that invocation.
 
 The tips are merged into `<prefix>-integrate` and nowhere else. The story branches stay local and stacked, the base branch does not move, and nothing is pushed. Merging the integration branch into the base branch is left to you (see [Integrate](#integrate)).
 
 #### Integrate
 
-After the last level, the run merges every story's tip into one local branch, `<prefix>-integrate`, and checks the result once. This step is Integrate. It runs only when every level finished clean: an escalation or a stop ends the run before it. It also runs when there was nothing left to drive, so every relaunch of the milestone runs it again.
+After every story has finished, the run merges every story's tip into one local branch, `<prefix>-integrate`, and checks the result once. This step is Integrate. It runs only when every story finished clean: an escalation or a stop ends the run before it. It also runs when there was nothing left to drive, so every relaunch of the milestone runs it again.
 
 Where, and in what order:
 
@@ -171,25 +162,16 @@ Limits, stated plainly:
 
 #### Parallel runs
 
-`--max-concurrent N` bounds how many stories of one level run at once. It
-defaults to 4, and `--max-concurrent 1` runs them in sequence, exactly as the
-sequential runner did. The run records the value in its config as
-`max_concurrent_stories`.
+`--max-concurrent N` bounds how many stories run at once, across the whole milestone. It defaults to 4, and `--max-concurrent 1` runs one story at a time. The run records the value in its config as `max_concurrent_stories`.
 
 What runs together:
 
-- Only stories in the same dependency level. Levels are barriers: level N+1
-  starts only after every story of level N has finished.
-- Never two subtasks of one story. A story's subtasks run in order, each
-  stacked on the branch before it.
+- A story starts as soon as every story it is blocked by inside the milestone has finished clean. It does not wait for the rest of its level: with A blocking C and an unrelated B still running, C starts the moment A is done. Levels, or waves, remain only as a way to read the plan, in `--dry-run` and in the report's `levels`.
+- A story that has started takes one of the `--max-concurrent` slots, and waits for one if all are taken. A story still waiting for its blockers holds no slot.
+- Never two subtasks of one story. A story's subtasks run in order, each stacked on the branch before it.
+- A story with two or more blockers first builds a merged base from their tips, after they have all finished clean. See [Multiple blockers](#multiple-blockers).
 
-How a run stops. The first escalation in any lane, or an exception raised
-inside a lane, sets the run's stop. Every other lane checks the stop before it
-starts its next phase. A phase already running is never interrupted, so
-a stop waits for the running phase to finish: a lane in the middle of a long
-`implement` finishes it and then parks. The subtask that lane was on is
-recorded `stopped`, and so is its story. A story of the same level that had
-not started yet stays `pending`, and no later level starts.
+How a run stops. The first escalation in any lane, an exception raised inside a lane, or a merged base that fails, sets the run's stop. Every other lane checks the stop before each subtask and before it starts its next phase. A phase already running is never interrupted, so a stop waits for the running phase to finish: a lane in the middle of a long `implement` finishes it and then parks. The subtask that lane was on is recorded `stopped`, and so is its story. A lane that is between two subtasks, or that only gets its slot after the stop, ends `stopped` too, without driving anything more. A story whose blocker escalated or stopped never starts, and stays `pending`. Integrate does not run.
 
 `stopped` is not `escalated`:
 
@@ -198,7 +180,7 @@ not started yet stays `pending`, and no later level starts.
 - `stopped` is a clean park between two phases. Nothing failed, and the work
   done so far is kept.
 
-To continue, fix the escalation and relaunch the same `am run --milestone` command (see [Relaunching resumes](#relaunching-resumes)). The stopped subtask picks up where it parked, and every card already `done` on the board is skipped. `am resume <run-id>` is not the way to continue a milestone. It drives exactly one subtask and nothing after it: a run with more than one subtask recorded `started` or `stopped` is refused with `{"ok": false, "error": {...}}` and exit code 3, and a resume never starts a later subtask, story, level or Integrate.
+To continue, fix the escalation, then either relaunch the same `am run --milestone` command, which starts a new run, or run `am resume <run-id>`, which continues this run under the same run id (see [Relaunching resumes](#relaunching-resumes)). Either way the stopped subtask picks up where it parked, and every card already `done` on the board is skipped.
 
 Run one `am` process per repository. Two `am` processes on the same repository
 or on the same run are not supported.
@@ -214,13 +196,31 @@ Limits, stated plainly:
 - **Machine load.** N lanes means up to N `claude -p` processes at once, and
   nothing rate-limits them.
 
+#### Multiple blockers
+
+A story with two or more blockers in the milestone does not root on any one of their tips. It roots on its own merged base, a local branch named `<prefix>/base-<short id of the story>` (with `--branch-prefix m3` and story `4f1c2a9e-…`, `m3/base-4f1c2a9e`), in the worktree `<repo>/.claude/worktrees/<prefix>/base-<short id of the story>`. `--dry-run` shows that branch as the story's `root` and lists the blockers under `merged_from`.
+
+The story's lane builds the base after every blocker has finished clean and the lane has taken its slot, before its first subtask:
+
+1. The branch is cut from the first blocker's tip. Blockers are taken in the order the story's `blocked_by` lists them. Only blockers inside the milestone count, and a blocker listed twice counts once.
+2. Every other blocker's tip is merged in, one at a time, in that order. A tip that merges cleanly is merged with no agent and nothing reported. A tip the base already contains is skipped, so a relaunch or a resume never merges anything twice.
+3. Your `--verify` commands run once on the base. With `--allow-no-verification` and no `--verify`, this check is skipped. A failed check fails the base.
+
+A tip that conflicts is left mid-merge, and the same resolver [Integrate](#integrate) uses (role `resolver`, the builtin `integrate` workflow: `resolve`, then `verify`) is dispatched into the base's worktree with the tip and the conflicting files. In `am status <run_id>` it shows up under a story titled `Merged bases` (story id `bases`), with one subtask `base-<story id>` per story whose base needed a resolver. A resolver that does not finish fails the base, and the merge is left in progress in the worktree.
+
+If the base's worktree already holds an unfinished merge from an earlier run (`MergeInProgressError`), the base fails and nothing in the worktree is touched. Finish the merge there by hand, `git add` the files and `git commit`, then run `am resume <run-id>` or relaunch.
+
+A failed base escalates its story before any of the story's subtasks run, and the run stops as for any escalation (see [What an escalation report contains](#what-an-escalation-report-contains)). A resolver parked by the stop is not a failure: the story is recorded `stopped`, and `am resume` continues the resolver from its checkpoint.
+
+A story with one blocker keeps the fast path: it roots directly on that blocker's tip, with no base branch and no extra verify. A story with two or more blockers and no subtasks of its own still builds its base, because a story it blocks roots there.
+
+Every merged base a lane built in this run, including one an earlier run had already built, is listed in `data.bases` as `{"story", "branch", "blockers"}`, in wave order, where `blockers` is the order the tips were merged. The key is present only when the list is not empty, on a clean run and on an escalation alike.
+
+The merged base is one more local branch. The milestone's base branch is never checked out, merged into or moved, and nothing is pushed. Integrate later finds each blocker's tip already inside the story's tip, so those merges are no-ops.
+
 #### What an escalation report contains
 
-The first escalation stops the run: the other lanes of its level park at their
-next phase boundary, and no later level starts (see
-[Parallel runs](#parallel-runs)). The run exits 1, and `data` holds `escalated`
-(`true`), `run_id`, `level`, `story`, `subtask`, `failed_phase`, `detail` and
-`warnings`. These top-level fields describe the first escalation.
+The first escalation stops the run: the other lanes park at their next phase boundary, no new story starts, and Integrate does not run (see [Parallel runs](#parallel-runs)). The run exits 1, and `data` holds `escalated` (`true`), `run_id`, `level`, `story`, `subtask`, `failed_phase`, `detail` and `warnings`. These top-level fields describe the first escalation. `level` is the story's wave, the level `--dry-run` lists it under; nothing waited on it.
 `failed_phase` is the phase that gave up (for example `review`) and `detail`
 says why. When the subtask's driver raised instead, `failed_phase` is `null`
 and `detail` is `<ExceptionType>: <message>`. The escalated subtask, its story
@@ -228,16 +228,19 @@ and the run are recorded `escalated`, and `am status <run_id>` shows the whole
 plan. A coder that reports `blocked` ends its subtask escalated at `implement`,
 and review never runs.
 
+A merged base that fails (see [Multiple blockers](#multiple-blockers)) escalates with `failed_phase` `"base"` and `subtask` `null`, because no subtask of the story ran. `detail` says why and names the base branch and its worktree. The story is recorded `escalated`. When that story has no subtasks of its own, `level` is `null` too. A merged base that raised an unexpected error instead has `failed_phase` `null` and `detail` `<ExceptionType>: <message>`.
+
 When a critic, `validate_spec` or `validate_plan`, reports blockers, the subtask gets one revision: `spec` (or `plan`) runs again with the critic's reason as feedback, and then the critic runs again. A second block escalates at that critic's phase, so `failed_phase` is `validate_spec` or `validate_plan`. `review` has no revision loop. The report's shape is the same either way.
 
-Two more keys appear only when they are not empty:
+Three more keys appear only when they are not empty:
 
 - `also_escalated`: a list of
   {"level", "story", "subtask", "failed_phase", "detail"}, one for each other
   lane that failed before it saw the stop.
 - `stopped`: a list of {"story", "subtask", "before_phase"}, one for each lane
-  the stop parked. `before_phase` is the phase it would have run next. A
+  the stop parked. `before_phase` is the phase it would have run next, or `null` for a lane that stopped before starting its subtask. `subtask` is `null` for a lane whose merged base's resolver was parked. A
   stopped subtask and its story are recorded `stopped`, not `escalated`.
+- `bases`: the merged bases built before the run stopped, as on a clean run.
 
 An escalation at [Integrate](#integrate) has its own shape. The run exits 1, and `data` holds `escalated` (`true`), `phase` (`"integrate"`), `story`, `files`, `detail`, `run_id` and `warnings`. There is no `integrated` key.
 
@@ -258,28 +261,35 @@ skips every card already `done` on the board. A subtask that was stopped or
 killed part way picks up in its existing worktree and does not redo a plan
 that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first.
 
-`am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done` or `stopped` exits 0, and one that escalates exits 1.
+`am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. Pass your `--verify` commands again: the suite is not recorded, and it is what every subtask with no checkpoint, every merged base and Integrate run. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished and 1 when it escalated again.
 
-Resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
+A milestone resume refuses before anything is written and before git is fetched, with `{"ok": false, "error": {...}}` and exit code 3, when:
+
+- the run is `done`. Start new work with `am run --milestone`.
+- any open subtask, or any open `base-<story id>` resolver, has a checkpoint saved under a workflow that has changed since (its digest no longer matches). One stale checkpoint refuses the whole resume, and nothing is written. Relaunch with `am run --milestone` instead: a relaunch starts such a card again from its first phase rather than refusing.
+- the run id's milestone is not on the board, or more than one root card has its short id, or the stories now have a blocker cycle.
+
+On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done` or `stopped` exits 0, and one that escalates exits 1.
+
+A `task` run's resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
 - the workflow changed since the checkpoint was saved (its digest no longer matches). Start a fresh `am run --card`.
-- the subtask has no checkpoint (the run died before its first turn, or it predates checkpoints), its newest checkpoint is `done`, or its newest checkpoint was left by a phase escalation. An escalated subtask is never resumed.
-- the run has no subtask recorded `started` or `stopped`, or more than one of them (a milestone-shaped run).
-
-`am resume` is not milestone-aware: it drives that one subtask and stops, and never runs a later subtask, story, level or Integrate. To continue a milestone, relaunch the `am run --milestone` command.
+- the subtask has no checkpoint (the run died before its first turn, or it predates checkpoints), its newest checkpoint is `done`, or its newest checkpoint was left by a phase escalation. An escalated subtask of a `task` run is never resumed.
+- the run has no subtask recorded `started` or `stopped`, or more than one of them.
 
 #### Not there yet
 
-- `am resume` is not milestone-aware.
 - `watch`, `retry` and `cancel` do not exist.
 - There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate.
 
 See section 4 of the
 [orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet),
 section 5 of the
-[parallel-stories addendum](docs/superpowers/specs/2026-09-24-parallel-stories-design.md#5-deferred)
-and section 6 of the
+[parallel-stories addendum](docs/superpowers/specs/2026-09-24-parallel-stories-design.md#5-deferred),
+section 6 of the
 [Integrate addendum](docs/superpowers/specs/2026-09-25-integrate-design.md#6-deferred)
+and section 10 of the
+[supervisor-tree addendum](docs/superpowers/specs/2026-09-25-supervisor-tree-design.md#10-deferred)
 for everything deferred.
 
 ## Develop

@@ -12,14 +12,18 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
   launcher are never constructed.
 """
 
+import asyncio
+import inspect
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,6 +48,7 @@ from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps.reducers import verification_gate
 
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow import task as task_workflow
 
 
@@ -963,16 +968,36 @@ def test_the_dry_run_checks_for_blocker_cycles_before_any_geometry():
     assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
 
 
-def test_the_dry_run_refuses_a_story_with_two_in_milestone_blockers():
+def test_the_dry_run_roots_a_story_with_two_in_milestone_blockers_on_a_merged_base():
+    """Not refused: the joined story's root is its own merged base branch and
+    `merged_from` names its in-milestone blockers in `blocked_by` order, an
+    outside id left out. Rows rooted on the base or on one tip have no
+    `merged_from` key."""
     a = _plan_story(1, [_plan_subtask(11)])
     b = _plan_story(2, [_plan_subtask(21)])
-    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    c = _plan_story(
+        3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[a.id, "outside", b.id]
+    )
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[a.id])
 
-    with pytest.raises(dag.StackRootError) as caught:
-        cli.dry_run_payload([a, b, c], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
+    payload = cli.dry_run_payload(
+        [a, b, c, d], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
 
-    assert f"#{a.id}" in str(caught.value)
-    assert f"#{b.id}" in str(caught.value)
+    rows = {row["story"]: row for level in payload["levels"] for row in level["stories"]}
+    assert rows[c.id]["root"] == f"m3/base-{dag.short_id(c.id)}" == "m3/base-00000003"
+    assert rows[c.id]["merged_from"] == [a.id, b.id]
+    assert [row["base"] for row in rows[c.id]["subtasks"]] == [
+        "m3/base-00000003",
+        dag.subtask_branch("m3", c.subtasks[0]),
+    ]
+    assert rows[a.id]["root"] == rows[b.id]["root"] == "main"
+    assert rows[d.id]["root"] == dag.subtask_branch("m3", a.subtasks[-1])
+    for story in (a, b, d):
+        assert "merged_from" not in rows[story.id]
+    # The row survives the one-line JSON render untouched.
+    rendered = json.loads(cli.render(cli.ok_envelope(payload)))["data"]
+    assert rendered == payload
 
 
 def test_a_milestone_with_nothing_left_has_no_levels_and_lists_every_story_as_done():
@@ -1389,10 +1414,11 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 
 @requires_git
 @requires_brd
-def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
-    """Addendum P4: the driver passes the stop check straight through. With a
-    stop already requested, the first phase of `TASK` never
-    starts, so the fake runner is never called and no worktree is made."""
+def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards):
+    """Addendum P4, on the one stop: the driver passes the run's `StopSignal`
+    straight through. With the signal already triggered, the first phase of
+    `TASK` never starts, so the fake runner is never called and no worktree is
+    made."""
     root = cli.resolve_repo_dir(project)
     parent = board.show(cards["story"], repo_dir=root)
     card = board.show(cards["subtask"], repo_dir=root)
@@ -1408,6 +1434,8 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
         worktree_path=cli.worktree_for(root, branch),
     )
     seen: list[tuple[str, dict[str, Any]]] = []
+    stop = StopSignal()
+    stop.trigger(parent.id)
     store = store_module.Store.open(root, run_id)
     try:
         store.record_run(
@@ -1433,15 +1461,17 @@ def test_drive_subtask_hands_should_stop_to_the_engine(project, cards):
         )
         store.record_subtask(parent.id, subtask)
 
-        drive = cli.drive_subtask(
-            store=store,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            runner_factory=lambda **kwargs: fake_runner(seen),
-            should_stop=lambda: True,
+        drive = asyncio.run(
+            cli.drive_subtask_async(
+                store=store,
+                run_id=run_id,
+                card=card,
+                parent=parent,
+                subtask=subtask,
+                repo_dir=root,
+                runner_factory=lambda **kwargs: fake_runner(seen),
+                stop=stop,
+            )
         )
         run = store.load_run(run_id)
     finally:
@@ -1484,18 +1514,18 @@ def _drive_row() -> models.SubtaskRun:
 
 
 def _record_walks(monkeypatch) -> list[tuple[Any, Any, dict[str, Any]]]:
-    """Stub `runtime.engine.run_subtask`; every call is recorded.
+    """Stub `runtime.engine.run_subtask_async`; every call is recorded.
 
-    Patched on the module itself, so the stub is what `drive_subtask` reaches
-    through its `runtime_engine` alias.
+    Patched on the module itself, so the stub is what `drive_subtask_async`
+    (and `drive_subtask`, through it) reaches via its `runtime_engine` alias.
     """
     walks: list[tuple[Any, Any, dict[str, Any]]] = []
 
-    def run_subtask(workflow, store, **kwargs):
+    async def run_subtask_async(workflow, store, **kwargs):
         walks.append((workflow, store, kwargs))
         return SubtaskSummary(status="done")
 
-    monkeypatch.setattr(runtime_engine, "run_subtask", run_subtask)
+    monkeypatch.setattr(runtime_engine, "run_subtask_async", run_subtask_async)
     return walks
 
 
@@ -1511,17 +1541,15 @@ def _recording_factory(seen: list[dict[str, Any]]):
 
 
 def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
-    """Spec test 2: the walk is `runtime.engine.run_subtask` over `TASK`. The
-    keywords are compared whole, so a `start_phase` or a `resume_from`
-    sneaking into the call fails here."""
+    """Spec test 2: the walk is `runtime.engine.run_subtask_async` over `TASK`.
+    The keywords are compared whole, so a `start_phase` or a `resume_from`
+    sneaking into the call fails here. The sync driver has no `stop`, so it
+    forwards `stop=None`."""
     walks = _record_walks(monkeypatch)
     seen: list[dict[str, Any]] = []
     factory, runner = _recording_factory(seen)
     store = object()
     subtask = _drive_row()
-
-    def stop() -> bool:
-        return False
 
     drive = cli.drive_subtask(
         store=store,
@@ -1532,7 +1560,6 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         repo_dir=DRIVE_REPO,
         commands=["uv run pytest"],
         runner_factory=factory,
-        should_stop=stop,
     )
 
     ((workflow, passed_store, kwargs),) = walks
@@ -1547,7 +1574,7 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         "parent_story": DRIVE_PARENT,
         "extra_context": cli.gate_context(["uv run pytest"], False),
         "agent_runner": runner,
-        "should_stop": stop,
+        "stop": None,
     }
     assert drive.summary.status == "done"
     assert drive.warnings == []
@@ -1558,6 +1585,233 @@ def test_drive_subtask_walks_task_with_the_same_arguments(monkeypatch):
         "story_id": DRIVE_PARENT.id,
         "card_id": DRIVE_CARD.id,
     }
+
+
+DRIVER_KEYWORDS = [
+    "store",
+    "run_id",
+    "card",
+    "parent",
+    "subtask",
+    "repo_dir",
+    "commands",
+    "allow_no_verification",
+    "runner_factory",
+]
+
+
+def test_the_drivers_take_a_stop_signal_and_no_other_stop():
+    """T5: the `StopSignal` is the only stop. The sync driver takes none; a
+    caller that must stop awaits `drive_subtask_async(stop=...)`. Any other
+    keyword is a `TypeError`."""
+    assert list(inspect.signature(cli.drive_subtask).parameters) == [
+        *DRIVER_KEYWORDS,
+        "resume_from",
+    ]
+    assert list(inspect.signature(cli.drive_subtask_async).parameters) == [
+        *DRIVER_KEYWORDS,
+        "stop",
+        "resume_from",
+    ]
+
+
+# ── drive_subtask_async (card 9b944409) ──────────────────────────────────────
+
+
+def test_drive_subtask_async_runs_inside_a_running_loop(monkeypatch):
+    """T2: a supervisor lane awaits the driver on its own loop, so the driver
+    must not open one. The sync form is the oracle, computed first with no loop
+    running; the async form, awaited inside a running loop, must return the
+    same drive and reach the engine on that caller's loop. The canned summary
+    escalates and carries a warning, and the runner carries an out-of-band
+    one, so the merge order is checked too."""
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    async def run_subtask_async(workflow, store, **kwargs):
+        loops.append(asyncio.get_running_loop())
+        return SubtaskSummary(
+            status="escalated",
+            results={"explore": {"ok": True}},
+            warnings=["summary warning"],
+            failed_phase="validate_spec",
+            detail="canned escalation",
+        )
+
+    monkeypatch.setattr(runtime_engine, "run_subtask_async", run_subtask_async)
+
+    def factory(**kwargs: Any) -> Any:
+        return SimpleNamespace(warnings=["runner warning"])
+
+    drive_args: dict[str, Any] = {
+        "store": object(),
+        "run_id": DRIVE_RUN_ID,
+        "card": DRIVE_CARD,
+        "parent": DRIVE_PARENT,
+        "subtask": _drive_row(),
+        "repo_dir": DRIVE_REPO,
+        "commands": ["uv run pytest"],
+        "runner_factory": factory,
+    }
+
+    expected = cli.drive_subtask(**drive_args)
+
+    async def inside() -> tuple[cli.SubtaskDrive, asyncio.AbstractEventLoop]:
+        drive = await cli.drive_subtask_async(**drive_args)
+        return drive, asyncio.get_running_loop()
+
+    drive, outer = asyncio.run(inside())
+
+    assert len(loops) == 2
+    assert loops[1] is outer
+    assert drive.summary.status == expected.summary.status == "escalated"
+    assert drive.summary.results.keys() == expected.summary.results.keys() == {"explore"}
+    assert drive.warnings == expected.warnings == ["summary warning", "runner warning"]
+    assert drive == expected
+
+
+def test_drive_subtask_async_hands_stop_to_the_engine(monkeypatch):
+    """T5: the lane's `StopSignal` reaches the pygents walk as the same object,
+    and every other keyword is what the sync driver sends today."""
+    walks = _record_walks(monkeypatch)
+    seen: list[dict[str, Any]] = []
+    factory, runner = _recording_factory(seen)
+    store = object()
+    subtask = _drive_row()
+    stop = StopSignal()
+
+    drive = asyncio.run(
+        cli.drive_subtask_async(
+            store=store,
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=subtask,
+            repo_dir=DRIVE_REPO,
+            commands=["uv run pytest"],
+            runner_factory=factory,
+            stop=stop,
+        )
+    )
+
+    ((workflow, passed_store, kwargs),) = walks
+    assert workflow is task_workflow.TASK
+    assert passed_store is store
+    assert kwargs["stop"] is stop
+    assert kwargs == {
+        "story_id": DRIVE_PARENT.id,
+        "subtask": subtask,
+        "repo_dir": DRIVE_REPO,
+        "commands": ["uv run pytest"],
+        "card": DRIVE_CARD,
+        "parent_story": DRIVE_PARENT,
+        "extra_context": cli.gate_context(["uv run pytest"], False),
+        "agent_runner": runner,
+        "stop": stop,
+    }
+    assert drive.summary.status == "done"
+    assert drive.warnings == []
+    (factory_call,) = seen
+    assert factory_call == {
+        "store": store,
+        "run_id": DRIVE_RUN_ID,
+        "story_id": DRIVE_PARENT.id,
+        "card_id": DRIVE_CARD.id,
+    }
+
+
+async def test_drive_subtask_async_hands_stop_and_resume_from_together(monkeypatch):
+    """A lane relaunching a parked subtask passes both; both arrive untouched."""
+    walks = _record_walks(monkeypatch)
+    factory, _runner = _recording_factory([])
+    stop = StopSignal()
+    checkpoint = _checkpoint("parked", queue=("plan",))
+
+    await cli.drive_subtask_async(
+        store=object(),
+        run_id=DRIVE_RUN_ID,
+        card=DRIVE_CARD,
+        parent=DRIVE_PARENT,
+        subtask=_drive_row(),
+        repo_dir=DRIVE_REPO,
+        runner_factory=factory,
+        stop=stop,
+        resume_from=checkpoint,
+    )
+
+    ((_workflow, _store, kwargs),) = walks
+    assert kwargs["stop"] is stop
+    assert kwargs["resume_from"] is checkpoint
+
+
+async def test_two_async_drives_on_one_loop_each_hand_their_own_stop(monkeypatch):
+    """Supervisor lanes share one loop; each walk must get its own signal."""
+    walks = _record_walks(monkeypatch)
+    factory, _runner = _recording_factory([])
+    first_row, second_row = _drive_row(), _drive_row()
+    first_stop, second_stop = StopSignal(), StopSignal()
+
+    def drive(row: models.SubtaskRun, stop: StopSignal):
+        return cli.drive_subtask_async(
+            store=object(),
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=row,
+            repo_dir=DRIVE_REPO,
+            runner_factory=factory,
+            stop=stop,
+        )
+
+    drives = await asyncio.gather(drive(first_row, first_stop), drive(second_row, second_stop))
+
+    assert [d.summary.status for d in drives] == ["done", "done"]
+    stops = {id(kwargs["subtask"]): kwargs["stop"] for _w, _s, kwargs in walks}
+    assert len(stops) == 2
+    assert stops[id(first_row)] is first_stop
+    assert stops[id(second_row)] is second_stop
+
+
+async def test_drive_subtask_async_lets_an_engine_error_out(monkeypatch):
+    """The driver catches nothing: an engine error escapes the `await` as is."""
+
+    async def exploding(*args, **kwargs):
+        raise EngineError("no value for a required parameter", phase="explore")
+
+    monkeypatch.setattr(runtime_engine, "run_subtask_async", exploding)
+    factory, _runner = _recording_factory([])
+
+    with pytest.raises(EngineError, match="explore"):
+        await cli.drive_subtask_async(
+            store=object(),
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=_drive_row(),
+            repo_dir=DRIVE_REPO,
+            runner_factory=factory,
+        )
+
+
+@pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
+async def test_drive_subtask_inside_a_running_loop_still_raises(monkeypatch):
+    """The sync form is `asyncio.run` and stays so: inside a loop it refuses
+    before the engine is reached. Callers inside a loop use the async form.
+    A characterization pin: it passes before and after this card."""
+    walks = _record_walks(monkeypatch)
+    factory, _runner = _recording_factory([])
+
+    with pytest.raises(RuntimeError, match="cannot be called from a running event loop"):
+        cli.drive_subtask(
+            store=object(),
+            run_id=DRIVE_RUN_ID,
+            card=DRIVE_CARD,
+            parent=DRIVE_PARENT,
+            subtask=_drive_row(),
+            repo_dir=DRIVE_REPO,
+            runner_factory=factory,
+        )
+
+    assert walks == []
 
 
 runner = CliRunner()
@@ -1926,13 +2180,14 @@ def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
 @requires_git
 @requires_brd
 def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, monkeypatch):
-    """`run_subtask` deliberately lets `EngineError` out rather than journalling
-    it as a phase failure: an unbindable gate is a document bug, not an attempt."""
+    """`run_subtask_async` deliberately lets `EngineError` out rather than
+    journalling it as a phase failure: an unbindable gate is a document bug,
+    not an attempt."""
 
-    def exploding(*args, **kwargs):
+    async def exploding(*args, **kwargs):
         raise EngineError("no value for a required parameter", phase="explore")
 
-    monkeypatch.setattr(cli.runtime_engine, "run_subtask", exploding)
+    monkeypatch.setattr(cli.runtime_engine, "run_subtask_async", exploding)
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, cards["subtask"])
 
@@ -2642,7 +2897,7 @@ def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
 
 @requires_git
 @requires_brd
-def test_a_story_blocked_by_two_stories_is_an_envelope_naming_both(project, monkeypatch):
+def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monkeypatch):
     milestone = _add_card(project, "Milestone 8: diamond")
     first = _add_card(project, "Story one", milestone)
     second = _add_card(project, "Story two", milestone)
@@ -2651,14 +2906,29 @@ def test_a_story_blocked_by_two_stories_is_an_envelope_naming_both(project, monk
         _add_card(project, f"only subtask of {story}", story)
     _block(project, joined, first)
     _block(project, joined, second)
+    # `merged_from` follows the joined story's `blocked_by` as brd reports it,
+    # which the census copies through untouched.
+    joined_node = next(
+        node for node in board.tree(milestone, repo_dir=project).children if node.id == joined
+    )
+    census_order = [dep for dep in joined_node.blocked_by if dep in (first, second)]
+    assert sorted(census_order) == sorted([first, second])
     porcelain_before = _git(project, "status", "--porcelain")
     _forbid_writes(monkeypatch)
 
-    error = _refusal(_dry_run(project, milestone))
+    result = _dry_run(project, milestone)
 
-    assert error["type"] == "StackRootError"
-    assert f"#{first}" in error["message"]
-    assert f"#{second}" in error["message"]
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    rows = {
+        row["story"]: row for level in envelope["data"]["levels"] for row in level["stories"]
+    }
+    assert rows[joined]["merged_from"] == census_order
+    assert rows[joined]["root"] == f"m2/base-{dag.short_id(joined)}"
+    assert rows[joined]["subtasks"][0]["base"] == rows[joined]["root"]
+    assert "merged_from" not in rows[first]
+    assert "merged_from" not in rows[second]
     _assert_nothing_written(project, porcelain_before)
 
 
@@ -4115,7 +4385,7 @@ def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
 
 
 def _park_pygents(project: Path, cards: dict[str, str]) -> str:
-    """A milestone run whose one subtask the run's stop parked on pygents after `spec`.
+    """A milestone run whose one subtask the run's `StopSignal` parked on pygents after `spec`.
 
     Recorded the way `orchestrate.run_story_lane` records it: the run is a
     `milestone` run, the engine records the subtask `stopped`, the lane
@@ -4137,6 +4407,33 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
         card_id=parent.id, title=parent.title, level=0, status="started", tip_branch=branch
     )
     seen: list[str] = []
+    stop = StopSignal()
+    record = _resume_factory(seen)
+
+    def stopping_factory(**kwargs: Any):
+        # Called by `drive_subtask_async` on its loop, where the signal lives.
+        loop = asyncio.get_running_loop()
+        run = record(**kwargs)
+
+        def runner(phase, context, rendered):
+            result = run(phase, context, rendered)
+            if phase.name == "spec":
+                # The runner is in a `to_thread` worker: hand `trigger` to the
+                # loop and wait until it has run, so the agent is paused
+                # before this phase returns.
+                fired = threading.Event()
+
+                def fire() -> None:
+                    stop.trigger(parent.id)
+                    fired.set()
+
+                loop.call_soon_threadsafe(fire)
+                if not fired.wait(5):
+                    raise RuntimeError("the stop was never triggered")
+            return result
+
+        return runner
+
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -4153,15 +4450,17 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
         )
         opened.record_story(story)
         opened.record_subtask(parent.id, subtask)
-        drive = cli.drive_subtask(
-            store=opened,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            runner_factory=_resume_factory(seen),
-            should_stop=lambda: seen[-1:] == ["spec"],
+        drive = asyncio.run(
+            cli.drive_subtask_async(
+                store=opened,
+                run_id=run_id,
+                card=card,
+                parent=parent,
+                subtask=subtask,
+                repo_dir=root,
+                runner_factory=stopping_factory,
+                stop=stop,
+            )
         )
         assert drive.summary.status == "stopped"
         assert drive.summary.detail == "stopped before validate_spec"
@@ -4210,20 +4509,25 @@ def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards)
 @requires_git
 @requires_brd
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
-    project, cards
+    project, cards, monkeypatch
 ):
-    """Spec test 4: the run is a `milestone` run, and its parked subtask
-    continues from its checkpoint instead of being refused."""
+    """Spec test 1, parked half (card 54e4ec29): the run is a `milestone` run,
+    so `resume` continues the milestone, and its parked subtask goes on from
+    its checkpoint at `validate_spec`."""
     run_id = _park_pygents(project, cards)
+    integrate = _integrate_ok(monkeypatch)
 
     after: list[str] = []
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(after))
 
-    assert payload["status"] == "done"
-    assert payload["resumed_from"] == "validate_spec"
-    assert payload["discarded_attempts"] == []
+    assert payload["done"] is True, payload
+    assert payload["resumed"] is True
+    assert payload["run_id"] == run_id
+    assert payload["completed"] == [cards["subtask"]]
     assert after[0] == "validate_spec"
     assert not {"explore", "spec"} & set(after)
+    assert [call["run_id"] for call in integrate] == [run_id]
+    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
@@ -4430,3 +4734,347 @@ def test_the_help_offers_no_engine_flag(command):
 
     assert result.exit_code == 0, result.output
     assert "--engine" not in result.output
+
+
+# ── am resume on a milestone run (card 54e4ec29) ─────────────────────────────
+
+MILESTONE_AT = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+"""The interrupted milestone run's clock, so its run id is known."""
+
+
+def _integrate_ok(monkeypatch) -> list[dict[str, Any]]:
+    """Replace `integration.integrate_milestone`, which `run_milestone` reads at
+    call time, with a success that merges nothing; record every call."""
+    calls: list[dict[str, Any]] = []
+
+    def succeed(**kwargs: Any) -> integration.IntegrateSuccess:
+        calls.append(kwargs)
+        branch = integration.integration_branch(kwargs["branch_prefix"])
+        return integration.IntegrateSuccess(
+            branch=branch,
+            worktree=cli.worktree_for(kwargs["repo_dir"], branch),
+            merged=[story.id for story in kwargs["stories"] if story.subtasks],
+        )
+
+    monkeypatch.setattr(integration, "integrate_milestone", succeed)
+    return calls
+
+
+def _milestone_factory(seen: dict[str, list[str]], fail: dict[str, str] | None = None):
+    """A `cli.RunnerFactory` for a whole milestone: `fake_runner` per card, each
+    agent phase recorded under its card, and `fail[card]` failing that phase."""
+    failing = dict(fail or {})
+
+    def factory(*, store, run_id, story_id, card_id):
+        inner = fake_runner(fail=failing.get(card_id))
+
+        def runner(phase, context, rendered):
+            seen.setdefault(card_id, []).append(phase.name)
+            return inner(phase, context, rendered)
+
+        return runner
+
+    return factory
+
+
+@pytest.fixture
+def resume_board(project) -> dict[str, str]:
+    """Milestone 4: story A (a1 then a2) and story B (b1), B blocked by A."""
+    milestone = _add_card(project, "Milestone 4: resume")
+    story_a = _add_card(project, "Story A: first", milestone)
+    a1 = _add_card(project, "a1: first of A", story_a)
+    a2 = _add_card(project, "a2: second of A", story_a)
+    _block(project, a2, a1)
+    story_b = _add_card(project, "Story B: second", milestone)
+    b1 = _add_card(project, "b1: only of B", story_b)
+    _block(project, story_b, story_a)
+    return {
+        "milestone": milestone,
+        "story_a": story_a,
+        "a1": a1,
+        "a2": a2,
+        "story_b": story_b,
+        "b1": b1,
+    }
+
+
+def _escalate_milestone(project: Path, shape: dict[str, str]) -> str:
+    """A real milestone run on the fake runner: a1 done, a2 escalated at
+    `review`, B never started. Returns the run id."""
+    payload = orchestrate.run_milestone(
+        shape["milestone"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m4",
+        runner_factory=_milestone_factory({}, fail={shape["a2"]: "review"}),
+        clock=lambda: MILESTONE_AT,
+        max_concurrent=2,
+    )
+    assert payload["escalated"] is True, payload
+    assert (payload["subtask"], payload["failed_phase"]) == (shape["a2"], "review")
+    return payload["run_id"]
+
+
+def _plant_orphan(project: Path, run_id: str, story_id: str, card_id: str, phase: str) -> None:
+    """An attempt left `started` by a kill mid-dispatch, as `dispatch.AgentRunner` records it."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.record_phase(
+            story_id, card_id, models.PhaseRun(name=phase, kind="agent", status="started")
+        )
+        opened.record_attempt(
+            story_id,
+            card_id,
+            phase,
+            models.Attempt(n=1, dispatch=_recorded_dispatch(run_id), status="started"),
+        )
+    finally:
+        opened.close()
+
+
+def _project_run_ids(project: Path) -> list[str]:
+    conn = sqlite3.connect(paths.project_db_path(project))
+    try:
+        return [row[0] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _loaded(project: Path, run_id: str) -> models.Run:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    return run
+
+
+def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "milestone") -> None:
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=workflow,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m4",
+                status=status,
+                started_at=RECORDED_AT,
+            )
+        )
+    finally:
+        opened.close()
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
+    project, resume_board, monkeypatch
+):
+    """Spec test 1, escalated half: a2 resumes at `review` with nothing before
+    it re-dispatched, a1 (done) is not driven, b1 starts fresh, Integrate
+    runs, and only this invocation's work is `completed`."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    integrate = _integrate_ok(monkeypatch)
+    seen: dict[str, list[str]] = {}
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_milestone_factory(seen))
+
+    assert payload["done"] is True, payload
+    assert payload["resumed"] is True
+    assert payload["run_id"] == run_id
+    assert payload["completed"] == [shape["a2"], shape["b1"]]
+    assert shape["a1"] not in seen
+    assert seen[shape["a2"]][0] == "review"
+    assert not {
+        "explore",
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "implement",
+    } & set(seen[shape["a2"]])
+    assert seen[shape["b1"]][0] == "explore"
+    assert [call["run_id"] for call in integrate] == [run_id]
+    assert _project_run_ids(project) == [run_id]
+    run = _loaded(project, run_id)
+    assert run.status == "done"
+    assert run.config.max_concurrent_stories == 2
+    assert board.show(shape["a2"], repo_dir=project).status == "done"
+    assert board.show(shape["b1"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
+    project, resume_board, monkeypatch
+):
+    """Spec test 6: an attempt still `started` from the interrupted run."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    _plant_orphan(project, run_id, shape["story_a"], shape["a2"], "review")
+    _integrate_ok(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_milestone_factory({}))
+
+    assert payload["done"] is True, payload
+    rows = [row for row in _attempt_rows(project) if row[2] == shape["a2"]]
+    assert [(row[3], row[4], row[5]) for row in rows] == [("review", 1, "harness_error")]
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_resume_across_a_workflow_change_is_exit_three_and_writes_nothing(
+    project, resume_board, monkeypatch
+):
+    """Spec test 3: one stale subtask refuses the whole resume; the orphan is
+    still `started`, and no row, attempt, checkpoint, journal line or branch changed."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    _plant_orphan(project, run_id, shape["story_a"], shape["a2"], "review")
+    _plant_changed_digest(project, run_id, shape["a2"])
+    before = _resume_state(project)
+    branches = _git(project, "branch", "--format=%(refname:short)")
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    message = envelope["error"]["message"]
+    assert message.startswith("workflow changed since checkpoint")
+    assert shape["a2"] in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+    assert _resume_state(project) == before
+    assert _git(project, "branch", "--format=%(refname:short)") == branches
+    assert [row[5] for row in _attempt_rows(project) if row[2] == shape["a2"]] == ["started"]
+
+
+def test_resuming_a_finished_milestone_run_is_exit_three_and_writes_nothing(
+    projection, monkeypatch
+):
+    """Spec test 5: refused before the board is read or the store opened."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="done")
+    before = (_runs_snapshot(), _attempt_rows(projection))
+    monkeypatch.setattr(cli.board, "roots", _Forbidden("board.roots"))
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "NotResumableError"
+    assert envelope["error"]["message"] == (
+        f"run {run_id} finished; start new work with am run --milestone"
+    )
+    assert (_runs_snapshot(), _attempt_rows(projection)) == before
+
+
+def test_resume_routes_a_task_run_to_the_single_subtask_path(projection, monkeypatch):
+    """Spec test 8: a `task` run goes where it always went, with the same arguments."""
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(projection, run_id, started_at=RECORDED_AT, status="started")
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append((run.id, run.workflow, kwargs))
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    assert payload == {"status": "done"}
+    assert seen == [
+        (
+            run_id,
+            "task",
+            {
+                "root": projection.resolve(),
+                "allow_no_verification": False,
+                "commands": (),
+                "runner_factory": None,
+            },
+        )
+    ]
+
+
+def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
+    projection, monkeypatch
+):
+    """Review Focus 5: `--verify` and the opt-out reach the milestone resume."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append((milestone, kwargs))
+        return {"done": True, "run_id": run_id, "resumed": True}
+
+    def factory(**kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=projection,
+        commands=("uv run pytest",),
+        allow_no_verification=True,
+        runner_factory=factory,
+    )
+
+    assert payload == {"done": True, "run_id": run_id, "resumed": True}
+    assert calls == [
+        (
+            None,
+            {
+                "repo_dir": projection.resolve(),
+                "commands": ["uv run pytest"],
+                "allow_no_verification": True,
+                "runner_factory": factory,
+                "resume_run_id": run_id,
+            },
+        )
+    ]
+
+
+def test_resume_refuses_a_run_of_a_workflow_it_does_not_know(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="started", workflow="integrate")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    with pytest.raises(cli.NotResumableError, match="'integrate'"):
+        cli.resume_run(run_id, repo_dir=projection)
+
+
+@pytest.mark.parametrize(
+    "payload, code",
+    [
+        ({"done": True, "run_id": "r", "resumed": True}, 0),
+        ({"escalated": True, "run_id": "r", "resumed": True}, cli.EXIT_ESCALATED),
+    ],
+    ids=["done", "escalated"],
+)
+def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
+    tmp_path, monkeypatch, payload, code
+):
+    """A milestone payload has no `status` key, as for `run --milestone`."""
+    monkeypatch.setattr(cli, "resume_run", lambda run_id, **kwargs: payload)
+
+    result = runner.invoke(
+        cli.app, ["resume", "20260927T100000Z-cbe34d00", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == code, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)

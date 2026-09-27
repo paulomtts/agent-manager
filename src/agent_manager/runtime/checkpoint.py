@@ -1,17 +1,22 @@
-"""Checkpoint hooks (pygents-engine design G5, G8, §6).
+"""Checkpoint hooks (pygents-engine design G5, G8, §6; supervisor-tree T5).
 
-Every turn of a subtask's agent is saved as `Agent.to_dict()` in the store's
-`checkpoints` table *before* it runs, and the run's cooperative stop is read
-at the same moment: a set stop saves `parked` and raises `Parked`, which
-propagates out of `agent.run()` and ends it cleanly -- nothing breaks or
-returns out of the loop. The after-run rows (`done`, `escalated`) are
-written by `runtime/engine.py` through `save`.
+Every turn of a subtask's agent is saved by `before_turn` as
+`Agent.to_dict()` in the store's `checkpoints` table *before* it runs. The
+after-run rows (`done`, `escalated`) are written by `runtime/engine.py`
+through `save`.
 
-The hook is module-level on purpose: pygents' `HookRegistry` is process-wide
+The run's one stop is a `StopSignal` (`runtime/stop.py`) that pauses the
+agent; pygents then fires `ON_PAUSE` at the top of its loop, between turns,
+and `on_pause` saves `parked` and raises `Parked`, which propagates out of
+`agent.run()` and ends it cleanly -- nothing breaks or returns out of the
+loop. The raise is what ends the run: `pause()` alone would leave `run()`
+waiting forever for a `resume()`.
+
+The hooks are module-level on purpose: pygents' `HookRegistry` is process-wide
 and keyed on the function's name, and closures from one factory collide in
-it (design §11). It is global and tagged `subtask`, so it fires for every
-agent tagged `subtask`; it finds its run through `state.current_run` and
-does nothing when no run is set.
+it (design §11). They are global and tagged `subtask`, so they fire for every
+agent tagged `subtask`; they find their run through `state.current_run` and
+do nothing when no run is set.
 
 `saved_at` is read from the wall clock, never from the run's injected
 `clock`: that clock stamps phase rows, and a checkpoint reading it would
@@ -29,7 +34,7 @@ from agent_manager.runtime.state import current_run
 
 
 class Parked(Exception):
-    """The run's stop was set: the subtask stopped before `.before_phase`."""
+    """The run's `StopSignal` parked the subtask before `.before_phase`."""
 
     def __init__(self, before_phase: str) -> None:
         self.before_phase = before_phase
@@ -53,12 +58,17 @@ def save(agent: Any, reason: str) -> None:
 
 @hook(AgentHook.BEFORE_TURN, tags={"subtask"})
 async def before_turn(agent: Any) -> None:
+    """Save the turn about to run. `save` writes nothing with no run set."""
+    save(agent, "turn")
+
+
+@hook(AgentHook.ON_PAUSE, tags={"subtask"})
+async def on_pause(agent: Any) -> None:
     deps = current_run.get(None)
     if deps is None:
         return
-    snapshot = agent.to_dict()
-    head = (snapshot["current_turn"] or snapshot["queue"][0])["kwargs"]["phase"]
-    if deps.should_stop is not None and deps.should_stop():
-        save(agent, "parked")
-        raise Parked(head)
-    save(agent, "turn")
+    # ON_PAUSE fires between turns, so no turn is in flight: the next phase
+    # is the queue head.
+    head = agent.to_dict()["queue"][0]["kwargs"]["phase"]
+    save(agent, "parked")
+    raise Parked(head)

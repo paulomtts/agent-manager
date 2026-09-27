@@ -903,6 +903,22 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
+    def latest_turn_checkpoint(self, card_id: str) -> Checkpoint | None:
+        """The highest-`seq` `turn` checkpoint of `card_id` in this store's run.
+
+        A phase escalation's closing `escalated` row holds no turn
+        (`runtime_engine.pending_phase`); the turn the failing phase ran in
+        is the newest `turn` row, saved by `BEFORE_TURN` before it ran. A
+        milestone resume rewinds to it (card 54e4ec29).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
+                " AND reason = 'turn' ORDER BY seq DESC LIMIT 1",
+                (self.run_id, card_id),
+            ).fetchone()
+            return None if row is None else _checkpoint_from_row(row)
+
     def latest_open_checkpoint(self, card_id: str, workflow: str) -> Checkpoint | None:
         """The newest open checkpoint of `card_id` for `workflow`, across every run.
 

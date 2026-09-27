@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dag, models, paths, store
+from agent_manager import board, census, cli, dag, models, paths, store
 
 FAKE_CLAUDE_SOURCE = Path(__file__).with_name("fake_claude.py")
 """The script copied to a tmp dir as the `claude` the adapter will find."""
@@ -395,6 +395,58 @@ def parallel_board(fresh_project) -> dict[str, Any]:
         "subtasks": subtasks,
         "branches": branches,
         "review_fail_marker": root / ".git" / FAKE_REVIEW_FAIL_MARKER,
+    }
+
+
+@pytest.fixture
+def merged_base_board(fresh_project) -> dict[str, Any]:
+    """One milestone: A (a1) and B (b1) independent, C (c1) blocked by BOTH, D (d1 -> d2 -> d3) independent.
+
+    C is the only multi-blocker story, so its lane builds the merged base from
+    A's and B's tips before c1 runs (supervisor-tree §5). D is a sibling lane
+    with more work than A and B, so it is still running when C's base is
+    built. This is a new fixture beside `parallel_board`, which keeps covering
+    the lone-blocker fast path. `base_branch` and `merged_from` come from
+    `dag.story_root` over the census, never retyped: `merged_from` is C's
+    blockers in the order brd reports them, the order their tips are merged
+    in. `UNION_ATTRIBUTE` folds the fake coder's `IMPLEMENTATION.md`, so only
+    the implement-edits marker's own files can make A's and B's tips conflict.
+    """
+    root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
+    milestone = _add_card(root, "Milestone 7: a merged base under a fake claude")
+    a = _add_card(root, "Story A: one blocker of story C", milestone)
+    b = _add_card(root, "Story B: the other blocker of story C", milestone)
+    c = _add_card(root, "Story C: blocked by stories A and B", milestone, blocked_by=[a, b])
+    d = _add_card(root, "Story D: a sibling lane beside them", milestone)
+    a1 = _add_card(root, "a1: only subtask of story A", a)
+    b1 = _add_card(root, "b1: only subtask of story B", b)
+    c1 = _add_card(root, "c1: only subtask of story C", c)
+    d1 = _add_card(root, "d1: first subtask of story D", d)
+    d2 = _add_card(root, "d2: second subtask of story D", d, blocked_by=[d1])
+    d3 = _add_card(root, "d3: third subtask of story D", d, blocked_by=[d2])
+    subtasks = {"A": [a1], "B": [b1], "C": [c1], "D": [d1, d2, d3]}
+    branches = {
+        card_id: dag.task_branch(MILESTONE_PREFIX, board.show(card_id, repo_dir=root))
+        for chain in subtasks.values()
+        for card_id in chain
+    }
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=root))
+    by_id = {story.id: story for story in plan.stories}
+    c_root = dag.story_root(by_id[c], by_id, MILESTONE_PREFIX, "main")
+    assert c_root.kind == "merged", c_root
+    return {
+        "root": root,
+        "milestone": milestone,
+        "stories": {"A": a, "B": b, "C": c, "D": d},
+        "subtasks": subtasks,
+        "branches": branches,
+        "base_branch": c_root.branch,
+        "merged_from": list(c_root.blockers),
+        "review_fail_marker": root / ".git" / FAKE_REVIEW_FAIL_MARKER,
+        "implement_edits_marker": root / ".git" / FAKE_IMPLEMENT_EDITS_MARKER,
     }
 
 

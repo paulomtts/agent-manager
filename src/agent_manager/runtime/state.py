@@ -14,6 +14,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from agent_manager.runtime.stop import StopSignal
+
 
 @dataclass
 class RunDeps:
@@ -23,7 +25,9 @@ class RunDeps:
     subtask: Any
     agent_runner: Callable[..., Any] | None
     clock: Callable[[], Any]
-    should_stop: Callable[[], bool] | None = None
+    stop: StopSignal | None = None
+    """The milestone's `StopSignal` (supervisor-tree T5), the run's only stop.
+    `engine._run` registers the agent with it for the life of `run()`."""
     warnings: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     running: str | None = None
