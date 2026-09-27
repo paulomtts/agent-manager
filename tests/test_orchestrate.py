@@ -2193,6 +2193,56 @@ def test_a_keyboard_interrupt_in_one_lane_cancels_the_other_and_propagates(proje
     }
 
 
+class _LaneKilled(BaseException):
+    """A process death inside a lane, as the e2e resume test injects it (card
+    949d51a0). Not `KeyboardInterrupt`: asyncio re-raises that out of the loop
+    by itself, but stores any other `BaseException` on the task, where grafo's
+    `gather(..., return_exceptions=True)` would drop it."""
+
+
+@requires_git
+@requires_brd
+def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
+    project, integrate_recorder
+):
+    """§7 for a BaseException asyncio does not re-raise by itself: it still
+    leaves the run, the other lane is cancelled where it stands, Integrate
+    never runs and the rows stay as they were, for `am resume`."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    pair = asyncio.Barrier(2)
+    cancelled: list[str] = []
+
+    async def meet_then_wait_to_be_cancelled(stop: StopSignal | None) -> None:
+        try:
+            await _within(pair.wait(), "a1 and b1 in flight together")
+            await _within(asyncio.Event().wait(), "the lane to be cancelled")
+        except asyncio.CancelledError:
+            cancelled.append(b1)
+            raise
+
+    driver = GatedDriver(
+        outcomes={a1: _LaneKilled("the manager died while a1 ran")},
+        gates={a1: _meet(pair), b1: meet_then_wait_to_be_cancelled},
+    )
+
+    with pytest.raises(_LaneKilled):
+        _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert cancelled == [b1]
+    assert integrate_recorder.calls == []
+    run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
+    assert _statuses(run) == {
+        "run": "started",
+        story_a: "started",
+        a1: "started",
+        story_b: "started",
+        b1: "started",
+    }
+
+
 @requires_git
 @requires_brd
 def test_warnings_and_completed_follow_census_order_not_finish_order(project):
