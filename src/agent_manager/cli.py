@@ -1040,7 +1040,16 @@ def _check_run_targets(
         )
 
 
-@app.command("run")
+RUN_EXAMPLES = """\
+Examples:
+  am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
+  am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
+  am status <run-id> --pretty                                         # watch it (another terminal)
+  am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
+"""
+
+
+@app.command("run", epilog=RUN_EXAMPLES)
 def run(
     card: str | None = typer.Option(
         None, "--card", help="The subtask card id to drive. Exclusive with --milestone."
@@ -1056,21 +1065,30 @@ def run(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="With --milestone: print the levels and stack bases, and write nothing.",
+        help=(
+            "With --milestone: show the plan (story order, each subtask's branch "
+            "and base, merged bases) and write nothing."
+        ),
     ),
     max_concurrent: int | None = typer.Option(
         None,
         "--max-concurrent",
         help=(
-            "With --milestone: how many of a level's stories run at once "
-            f"(default {DEFAULT_MAX_CONCURRENT}). 1 runs them one at a time."
+            "With --milestone: how many stories run at once "
+            f"(default {DEFAULT_MAX_CONCURRENT}). A story starts as soon as its "
+            "blockers finish."
         ),
     ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
     ),
     base_branch: str = typer.Option(
-        "master", "--base-branch", help="The branch this subtask's branch is cut from."
+        "master",
+        "--base-branch",
+        help=(
+            "Where unblocked stories start (and --card's branch is cut from). "
+            "Never modified."
+        ),
     ),
     branch_prefix: str = typer.Option(
         ...,
@@ -1080,7 +1098,7 @@ def run(
     allow_no_verification: bool = typer.Option(
         False,
         "--allow-no-verification",
-        help="Proceed even when no verification suite is available (§12's opt-out).",
+        help="Proceed without any --verify command, on purpose.",
     ),
     verify: list[str] = typer.Option(
         [],
@@ -1485,7 +1503,7 @@ def resume(
     """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
-    started and are recorded (§9). A `task` run continues its one subtask; a
+    started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
     try:
