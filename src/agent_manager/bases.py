@@ -157,6 +157,29 @@ async def _resolve_conflict(
     )
 
 
+def _resolver_detail(
+    tip: str, branch: str, worktree: Path, summary: SubtaskSummary
+) -> str:
+    """Why a resolver that escalated failed the base. Modelled on `integration._resolver_detail`."""
+    return (
+        f"the resolver did not finish merging {tip} into the merged base {branch}: "
+        f"phase {summary.failed_phase!r} ended {summary.status} ({summary.detail}). "
+        f"The branch and worktree are left as they are in {worktree}; a human must "
+        "finish the merge there, then relaunch."
+    )
+
+
+def _stopped_detail(
+    tip: str, branch: str, worktree: Path, summary: SubtaskSummary
+) -> str:
+    """Why a stopped resolver cut the base short. `summary.detail` is `stopped before <phase>`."""
+    return (
+        f"the resolver merging {tip} into the merged base {branch} was stopped "
+        f"({summary.detail}). The branch and worktree are left as they are in "
+        f"{worktree}, with a parked checkpoint to continue from."
+    )
+
+
 async def build(
     root: RootPlan,
     tips: list[str],
@@ -228,7 +251,7 @@ async def build(
                     )
                 )
                 story_recorded = True
-            await _resolve_conflict(
+            summary = await _resolve_conflict(
                 story_id=story_id,
                 tip=tip,
                 files=files,
@@ -243,6 +266,12 @@ async def build(
                 runner_factory=runner_factory,
                 stop=stop,
             )
+            if summary.status == "stopped":
+                raise BaseFailed(
+                    _stopped_detail(tip, root.branch, worktree, summary), stopped=True
+                )
+            if summary.status != "done":
+                raise BaseFailed(_resolver_detail(tip, root.branch, worktree, summary))
             resolved.append(tip)
         if result["already_merged"]:
             already_merged.append(tip)

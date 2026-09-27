@@ -694,6 +694,129 @@ async def test_a_missing_run_id_falls_back_to_the_stores(
 
 
 @requires_git
+async def test_a_resolver_that_gives_up_fails_the_base(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    factory = FakeFactory(resolver=FakeResolver(refuse=True))
+
+    with pytest.raises(bases.BaseFailed) as excinfo:
+        await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=factory)
+
+    failed = excinfo.value
+    assert failed.stopped is False
+    assert "m7/b" in failed.detail
+    assert BASE in failed.detail
+    assert "'resolve'" in failed.detail
+    assert "escalated" in failed.detail
+    assert "MERGE_HEAD exists" in failed.detail
+    wt = base_worktree(repo)
+    assert str(wt) in failed.detail
+    assert "relaunch" in failed.detail
+    # One dispatch; the runner's own gate retry is inside it.
+    assert [call["card_id"] for call in factory.calls] == [CARD_C]
+    assert factory.resolver.calls == [["shared.txt"], ["shared.txt"]]
+    [subtask] = _bases_story(store).subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "escalated")
+    assert store.latest_checkpoint(CARD_C).reason == "escalated"
+    # Left exactly as it is for a human.
+    assert _merge_head(wt) == rev(repo, "m7/b")
+    assert rev(repo, BASE) == rev(repo, "m7/a")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_stop_during_the_resolver_parks_it(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    loop = asyncio.get_running_loop()
+    stop = StopSignal()
+    fired = threading.Event()
+
+    def fire() -> None:
+        # On the loop, where the signal lives.
+        stop.trigger(STORY_C)
+        fired.set()
+
+    def during() -> None:
+        # In the launcher's thread, while `resolve` is in flight.
+        loop.call_soon_threadsafe(fire)
+        if not fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
+
+    factory = FakeFactory(resolver=FakeResolver(during=during))
+
+    with pytest.raises(bases.BaseFailed) as excinfo:
+        await _resolve_build(
+            repo, ["m7/a", "m7/b"], store=store, factory=factory, stop=stop
+        )
+
+    failed = excinfo.value
+    assert failed.stopped is True
+    assert "m7/b" in failed.detail
+    assert BASE in failed.detail
+    assert "stopped before verify" in failed.detail
+    assert stop.primary == STORY_C
+    assert factory.resolver.calls == [["shared.txt"]]
+    assert store.latest_checkpoint(CARD_C).reason == "parked"
+    [subtask] = _bases_story(store).subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "stopped")
+    # The turn in flight finished; the next phase never started.
+    assert [phase.name for phase in subtask.phases] == ["resolve"]
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_relaunch_after_an_escalation_does_not_re_dispatch(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    # Review Focus 4: nobody finished the merge, so the relaunch finds it in progress.
+    repo = conflicting_repo
+    with pytest.raises(bases.BaseFailed):
+        await _resolve_build(
+            repo,
+            ["m7/a", "m7/b"],
+            store=store,
+            factory=FakeFactory(resolver=FakeResolver(refuse=True)),
+        )
+    again = FakeFactory()
+
+    with pytest.raises(bases.BaseFailed, match="never resolved") as excinfo:
+        await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=again)
+
+    assert excinfo.value.stopped is False
+    assert again.calls == [] and again.resolver.calls == []
+    assert _merge_head(base_worktree(repo)) == rev(repo, "m7/b")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_red_suite_after_a_resolved_conflict_fails_the_base(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    # Review Focus 5: the resolver's own `verify` phase runs the red suite first.
+    repo = conflicting_repo
+    factory = FakeFactory()
+
+    with pytest.raises(bases.BaseFailed) as excinfo:
+        await _resolve_build(
+            repo, ["m7/a", "m7/b"], store=store, factory=factory, commands=["false"]
+        )
+
+    failed = excinfo.value
+    assert failed.stopped is False
+    assert "'verify'" in failed.detail
+    assert factory.resolver.calls == [["shared.txt"]]
+    # The resolved merge commit stands; only the verdict failed.
+    assert is_ancestor(repo, "m7/b", BASE)
+    assert _merge_head(base_worktree(repo)) is None
+    [subtask] = _bases_story(store).subtasks
+    assert subtask.status == "escalated"
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
 async def test_a_merge_in_progress_fails_for_a_human(
     two_story_repo: Path, tmp_path: Path, MASTER_BEFORE: str
 ):
