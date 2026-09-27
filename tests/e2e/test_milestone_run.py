@@ -15,7 +15,6 @@ import json
 import subprocess
 import threading
 from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -23,6 +22,7 @@ from typer.testing import CliRunner
 
 from agent_manager import board, cli, models, orchestrate, store
 from agent_manager.harness import launcher
+from agent_manager.runtime.stop import StopSignal
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -376,20 +376,28 @@ def _hold_b1_in_plan_until_a1_escalates(monkeypatch, board_shape) -> dict[str, b
 
     Test scaffolding in the manager process, never seen by the fake. a1's
     `review` launch waits until b1 is inside `plan`; b1's `plan` launch waits
-    until the run's stop is set, which a1's review failure (the review-fail
-    marker) does. When b1's plan returns, the stop is set, so the next
-    `BEFORE_TURN` parks b1 before `validate_plan`. `RunStop` is captured by a
-    subclass because `run_milestone` builds it at call time. Returns the
-    switch that turns the hold off for the relaunch.
+    until the run's `StopSignal` fires, which a1's review failure (the
+    review-fail marker) does. When b1's plan returns, its agent has been
+    paused, so ON_PAUSE parks b1 before `validate_plan`. The signal is
+    captured by a subclass because `run_milestone` builds it at call time;
+    its `fired` is a `threading.Event` because the held launch runs in a
+    `to_thread` worker. Returns the switch that turns the hold off for the
+    relaunch.
     """
-    stops: list[orchestrate.RunStop] = []
+    stops: list[StopSignal] = []
 
-    @dataclass
-    class CapturedStop(orchestrate.RunStop):
-        def __post_init__(self) -> None:
+    class CapturedStop(StopSignal):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fired = threading.Event()
             stops.append(self)
 
-    monkeypatch.setattr(orchestrate, "RunStop", CapturedStop)
+        def trigger(self, story_id: str) -> bool:
+            first = super().trigger(story_id)
+            self.fired.set()
+            return first
+
+    monkeypatch.setattr(orchestrate, "StopSignal", CapturedStop)
     (a1,) = board_shape["subtasks"]["A"]
     (b1,) = board_shape["subtasks"]["B"]
     b1_in_plan = threading.Event()
@@ -401,8 +409,8 @@ def _hold_b1_in_plan_until_a1_escalates(monkeypatch, board_shape) -> dict[str, b
             attempt = _attempt_of(stdout_path)
             if attempt == (b1, "plan"):
                 b1_in_plan.set()
-                if not stops[-1].event.wait(WAIT):
-                    raise AssertionError("a1's escalation never set the run's stop")
+                if not stops[-1].fired.wait(WAIT):
+                    raise AssertionError("a1's escalation never triggered the run's stop")
             elif attempt == (a1, "review"):
                 if not b1_in_plan.wait(WAIT):
                     raise AssertionError("b1 never reached plan")
