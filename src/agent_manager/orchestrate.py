@@ -1111,12 +1111,17 @@ async def run_until_killed(
     the first one at once: it leaves `asyncio.run`, which cancels every other
     lane where it stands, and the latest checkpoints stand for `am resume`
     (supervisor-tree §7, card 949d51a0). It never waits for `work` itself to
-    finish once `killed` fires -- `work` may never finish on its own.
+    finish once `killed` fires -- `work` may never finish on its own. If the
+    caller is cancelled first, `work` is cancelled with it, as a plain `await`
+    would do: the tree is never left running behind it.
     """
     running = asyncio.ensure_future(work)
     watcher = asyncio.ensure_future(killed.wait())
     try:
         await asyncio.wait({running, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        running.cancel()
+        raise
     finally:
         watcher.cancel()
     if fatal:
