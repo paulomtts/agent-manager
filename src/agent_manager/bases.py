@@ -26,13 +26,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_manager import cli
+from agent_manager import cli, models
 from agent_manager.dag import RootPlan
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
+from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, _ref_exists, merge_tip
 from agent_manager.steps.worktree import ensure, run_git
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
+
+BASES_STORY_ID = "bases"
+"""The synthetic story every base-resolver subtask hangs from."""
+
+BASES_STORY_TITLE = "Merged bases"
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,59 @@ def _verify(
     )
 
 
+async def _resolve_conflict(
+    *,
+    story_id: str,
+    tip: str,
+    files: list[str],
+    branch: str,
+    base_branch: str,
+    worktree: Path,
+    repo_dir: Path,
+    commands: list[str],
+    allow_no_verification: bool,
+    store: Store,
+    run_id: str,
+    runner_factory: cli.RunnerFactory,
+    stop: StopSignal | None,
+) -> SubtaskSummary:
+    """Walk `workflow.integrate.INTEGRATE` once for one conflicting tip.
+
+    Mirrors `integration._resolve_conflict`, awaited on the running loop and
+    stop-aware. The synthetic subtask `base-<story id>` is recorded before the
+    engine journals its first phase, because `store.rebuild_from_journal`
+    refuses a phase whose subtask no earlier line created. The caller has
+    already recorded the `bases` story.
+    """
+    card_id = f"base-{story_id}"
+    subtask = models.SubtaskRun(
+        card_id=card_id,
+        branch=branch,
+        base_branch=base_branch,
+        status="started",
+        worktree_path=worktree,
+    )
+    store.record_subtask(BASES_STORY_ID, subtask)
+    runner = runner_factory(
+        store=store, run_id=run_id, story_id=BASES_STORY_ID, card_id=card_id
+    )
+    return await runtime_engine.run_subtask_async(
+        integrate_workflow.INTEGRATE,
+        store,
+        story_id=BASES_STORY_ID,
+        subtask=subtask,
+        repo_dir=repo_dir,
+        commands=commands,
+        extra_context={
+            "merge_tip": tip,
+            "conflict_files": list(files),
+            **cli.gate_context(commands, allow_no_verification),
+        },
+        agent_runner=runner,
+        stop=stop,
+    )
+
+
 async def build(
     root: RootPlan,
     tips: list[str],
@@ -136,6 +197,8 @@ async def build(
 
     merged: list[str] = []
     already_merged: list[str] = []
+    resolved: list[str] = []
+    story_recorded = False
     for tip in tips[1:]:
         try:
             result = await asyncio.to_thread(
@@ -148,12 +211,39 @@ async def build(
                 f"cannot build the merged base {root.branch}: {error}"
             ) from error
         if result["conflict"]:
-            files = ", ".join(str(name) for name in result["files"])
-            raise BaseFailed(
-                f"conflict merging {tip} into the merged base {root.branch} "
-                f"({files}): resolver not wired, so the merge is left in progress "
-                f"in {worktree} for a human"
+            files = [str(name) for name in result["files"]]
+            if store is None or story_id is None or runner_factory is None:
+                raise BaseFailed(
+                    f"conflict merging {tip} into the merged base {root.branch} "
+                    f"({', '.join(files)}): no resolver is available, so the merge "
+                    f"is left in progress in {worktree} for a human"
+                )
+            if not story_recorded:
+                store.record_story(
+                    models.StoryRun(
+                        card_id=BASES_STORY_ID,
+                        title=BASES_STORY_TITLE,
+                        level=0,
+                        status="started",
+                    )
+                )
+                story_recorded = True
+            await _resolve_conflict(
+                story_id=story_id,
+                tip=tip,
+                files=files,
+                branch=root.branch,
+                base_branch=tips[0],
+                worktree=worktree,
+                repo_dir=repo,
+                commands=suite,
+                allow_no_verification=allow_no_verification,
+                store=store,
+                run_id=run_id if run_id is not None else store.run_id,
+                runner_factory=runner_factory,
+                stop=stop,
             )
+            resolved.append(tip)
         if result["already_merged"]:
             already_merged.append(tip)
         else:
@@ -166,5 +256,8 @@ async def build(
         raise BaseFailed(failure)
 
     return BaseResult(
-        branch=root.branch, merged=merged, already_merged=already_merged, resolved=[]
+        branch=root.branch,
+        merged=merged,
+        already_merged=already_merged,
+        resolved=resolved,
     )

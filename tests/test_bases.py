@@ -8,17 +8,25 @@ helpers are ported from `tests/steps/test_integrate.py` (there is no
 `master`, never moves. No test sleeps.
 """
 
+import asyncio
 import dataclasses
 import inspect
+import json
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from agent_manager import bases
+from agent_manager import bases, dispatch, models
 from agent_manager.dag import RootPlan
+from agent_manager.harness.base import Outcome
+from agent_manager.runtime.stop import StopSignal
+from agent_manager.store import Store
 
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -296,6 +304,172 @@ def conflicting_repo(repo: Path, tmp_path: Path) -> Path:
     return repo
 
 
+# ── the resolver path (card 8fe30578) ────────────────────────────────────────
+
+RUN_ID = "run-2026-09-26-merged-bases"
+STORY_C = "cccccccc-0000-4000-8000-00000000000c"
+STORY_D = "dddddddd-0000-4000-8000-00000000000d"
+CARD_C = f"base-{STORY_C}"
+CARD_D = f"base-{STORY_D}"
+BASE_D = "m7/base-dddddddd"
+ROOT_D = RootPlan("merged", BASE_D, ("A", "B"))
+_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
+
+
+@pytest.fixture
+def store(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Store]:
+    """A real store with the run recorded, as the milestone runner records it."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    opened = Store.open(repo, RUN_ID)
+    opened.record_run(
+        models.Run(
+            id=RUN_ID,
+            workflow="milestone",
+            repo_dir=repo,
+            base_branch="master",
+            branch_prefix="m7",
+            status="started",
+        )
+    )
+    yield opened
+    opened.close()
+
+
+class _FakeAdapter:
+    """A `HarnessAdapter` by shape. Its argv names the brief and nothing else."""
+
+    name = "fake"
+    capabilities = frozenset({"bash", "edit"})
+
+    def build_command(self, d: models.Dispatch) -> list[str]:
+        return ["fake-resolver", "--prompt", str(d.prompt_path)]
+
+    def parse_usage(self, stdout: str) -> None:
+        return None
+
+
+_CONFLICT_HEADING = "\n## conflict_files\n"
+_RESULT_LEAD = "write your result as valid JSON to exactly this path:\n\n"
+
+
+def _conflict_files_from(brief: str) -> list[str]:
+    start = brief.index(_CONFLICT_HEADING) + len(_CONFLICT_HEADING)
+    files, _end = json.JSONDecoder().raw_decode(brief, start)
+    return files
+
+
+def _result_path_from(brief: str) -> Path:
+    start = brief.index(_RESULT_LEAD) + len(_RESULT_LEAD)
+    return Path(brief[start : brief.index("\n", start)])
+
+
+def _keep_both_sides(text: str) -> str:
+    """Fake claude's resolve mode: drop the conflict markers, keep every side's lines."""
+    return "".join(
+        line for line in text.splitlines(keepends=True) if not line.startswith(_MARKERS)
+    )
+
+
+@dataclass
+class FakeResolver:
+    """A `LauncherFn` double playing fake `claude`'s resolver mode in its cwd.
+
+    It learns the conflicting files and its result path only from the brief
+    (rule 5). Resolve keeps both sides, stages and commits the merge. Refuse
+    claims `resolved: true` but touches nothing, so `MERGE_HEAD` stays and
+    `merge_completed_gate` blocks. `during` runs in the launcher's thread after
+    the work is done, before the call returns: the stop test triggers there.
+    """
+
+    refuse: bool = False
+    during: Callable[[], None] | None = None
+    calls: list[list[str]] = field(default_factory=list)
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        brief = Path(argv[argv.index("--prompt") + 1]).read_text(encoding="utf-8")
+        files = _conflict_files_from(brief)
+        self.calls.append(files)
+        worktree = Path(cwd)
+        if self.refuse:
+            result: dict[str, Any] = {"resolved": True, "summary": "said it was resolved"}
+        else:
+            for name in files:
+                path = worktree / name
+                path.write_text(_keep_both_sides(path.read_text(encoding="utf-8")), encoding="utf-8")
+            _git(worktree, "add", *files)
+            _git(worktree, "commit", "--no-edit")
+            result = {"resolved": True, "summary": f"kept both sides of {', '.join(files)}"}
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_text("", encoding="utf-8")
+        _result_path_from(brief).write_text(json.dumps(result), encoding="utf-8")
+        if self.during is not None:
+            self.during()
+        return Outcome(
+            argv=list(argv),
+            exit_code=0,
+            timed_out=False,
+            duration=0.1,
+            stdout_path=stdout_path,
+        )
+
+
+@dataclass
+class FakeFactory:
+    """A `cli.RunnerFactory` that records every call and wires in `FakeResolver`."""
+
+    resolver: FakeResolver = field(default_factory=FakeResolver)
+    calls: list[dict[str, str]] = field(default_factory=list)
+
+    def __call__(self, *, store, run_id, story_id, card_id):
+        self.calls.append({"run_id": run_id, "story_id": story_id, "card_id": card_id})
+        adapter = _FakeAdapter()
+        return dispatch.AgentRunner(
+            store=store,
+            launcher=self.resolver,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            adapters={adapter.name: adapter},
+            harness_map={
+                "resolver": models.HarnessAssignment(harness=adapter.name, model="fake-model")
+            },
+        )
+
+
+async def _resolve_build(
+    repo: Path,
+    tips: list[str],
+    *,
+    store: Store | None,
+    factory: FakeFactory | None,
+    root: RootPlan = ROOT,
+    story_id: str | None = STORY_C,
+    run_id: str | None = RUN_ID,
+    commands: tuple[str, ...] | list[str] = ("true",),
+    stop: StopSignal | None = None,
+) -> bases.BaseResult:
+    """`bases.build` with the resolver parameters filled in."""
+    return await bases.build(
+        root,
+        list(tips),
+        repo_dir=repo,
+        commands=list(commands),
+        allow_no_verification=False,
+        store=store,
+        run_id=run_id,
+        story_id=story_id,
+        runner_factory=factory,
+        stop=stop,
+    )
+
+
+def _bases_story(store: Store) -> models.StoryRun:
+    run = store.load_run(RUN_ID)
+    assert [story.card_id for story in run.stories] == ["bases"]
+    return run.stories[0]
+
+
 @requires_git
 @pytest.mark.parametrize(
     "tips",
@@ -333,20 +507,189 @@ async def test_no_tips_is_refused_before_any_git(two_story_repo: Path, MASTER_BE
 
 
 @requires_git
-async def test_a_conflict_is_not_resolved_yet(conflicting_repo: Path, MASTER_BEFORE: str):
+async def test_a_conflict_is_resolved_by_the_integrate_resolver(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    factory = FakeFactory()
+
+    result = await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=factory)
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=["m7/b"], already_merged=[], resolved=["m7/b"]
+    )
+    assert is_ancestor(repo, "m7/a", BASE) and is_ancestor(repo, "m7/b", BASE)
+    wt = base_worktree(repo)
+    assert _merge_head(wt) is None
+    assert _git(wt, "show", f"{BASE}:shared.txt") == "from story a\nfrom story b\n"
+    assert factory.resolver.calls == [["shared.txt"]]
+    assert factory.calls == [{"run_id": RUN_ID, "story_id": "bases", "card_id": CARD_C}]
+    assert _git(repo, "symbolic-ref", "HEAD").strip() == "refs/heads/master"
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_the_resolver_walk_is_journalled_under_the_bases_story(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    assert (bases.BASES_STORY_ID, bases.BASES_STORY_TITLE) == ("bases", "Merged bases")
+
+    await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=FakeFactory())
+
+    story = _bases_story(store)
+    assert (story.title, story.level, story.status) == ("Merged bases", 0, "started")
+    [subtask] = story.subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "done")
+    assert subtask.branch == BASE
+    assert subtask.base_branch == "m7/a"
+    assert subtask.worktree_path == base_worktree(repo)
+    assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
+    events = [(line.event, line.story, line.card) for line in store.journal.read()]
+    story_at = events.index(("story_upsert", "bases", None))
+    subtask_at = events.index(("subtask_upsert", "bases", CARD_C))
+    first_phase_at = next(
+        index
+        for index, (event, _story, card) in enumerate(events)
+        if event == "phase_upsert" and card == CARD_C
+    )
+    assert story_at < subtask_at < first_phase_at
+    assert store.latest_checkpoint(CARD_C).reason == "done"
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_clean_build_records_no_bases_story(
+    two_story_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    factory = FakeFactory()
+
+    result = await _resolve_build(two_story_repo, ["m7/a", "m7/b"], store=store, factory=factory)
+
+    assert result.resolved == []
+    assert factory.calls == []
+    assert store.load_run(RUN_ID).stories == []
+    assert rev(two_story_repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_two_bases_in_one_run_share_one_bases_story(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    factory = FakeFactory()
+
+    first = await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=factory)
+    second = await _resolve_build(
+        repo, ["m7/a", "m7/b"], store=store, factory=factory, root=ROOT_D, story_id=STORY_D
+    )
+
+    assert first.resolved == ["m7/b"] and second.resolved == ["m7/b"]
+    assert second.branch == BASE_D
+    story = _bases_story(store)
+    assert [(s.card_id, s.status) for s in story.subtasks] == [
+        (CARD_C, "done"),
+        (CARD_D, "done"),
+    ]
+    assert [call["card_id"] for call in factory.calls] == [CARD_C, CARD_D]
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_conflict_without_a_resolver_fails_for_a_human(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
     repo = conflicting_repo
 
-    with pytest.raises(bases.BaseFailed, match="conflict.*resolver not wired") as excinfo:
-        await _build(repo, ["m7/a", "m7/b"])
+    with pytest.raises(bases.BaseFailed, match="no resolver is available") as excinfo:
+        await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=None)
 
     assert excinfo.value.stopped is False
     assert "m7/b" in excinfo.value.detail
     assert "shared.txt" in excinfo.value.detail
-    # Left in progress for Task 2.2's resolver or a human: never aborted.
     wt = base_worktree(repo)
+    assert str(wt) in excinfo.value.detail
+    # Left in progress for a human: never aborted, and nothing recorded.
     assert _merge_head(wt) == rev(repo, "m7/b")
     assert "<<<<<<< " in (wt / "shared.txt").read_text()
+    assert store.load_run(RUN_ID).stories == []
     assert rev(repo, BASE) == rev(repo, "m7/a")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_conflict_with_no_store_fails_for_a_human(
+    conflicting_repo: Path, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+
+    with pytest.raises(bases.BaseFailed, match="no resolver is available") as excinfo:
+        await _build(repo, ["m7/a", "m7/b"])
+
+    assert excinfo.value.stopped is False
+    assert _merge_head(base_worktree(repo)) == rev(repo, "m7/b")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_two_conflicts_in_one_base_are_each_resolved(
+    conflicting_repo: Path, tmp_path: Path, store: Store, MASTER_BEFORE: str
+):
+    # Review Focus 1: the same card, `base-<C>`, walks INTEGRATE twice.
+    repo = conflicting_repo
+    _make_tip(repo, tmp_path, "m7/c", {"shared.txt": "from story c\n"})
+    factory = FakeFactory()
+
+    result = await _resolve_build(
+        repo, ["m7/a", "m7/b", "m7/c"], store=store, factory=factory
+    )
+
+    assert result.merged == ["m7/b", "m7/c"]
+    assert result.resolved == ["m7/b", "m7/c"]
+    assert factory.resolver.calls == [["shared.txt"], ["shared.txt"]]
+    assert [call["card_id"] for call in factory.calls] == [CARD_C, CARD_C]
+    for tip in ("m7/a", "m7/b", "m7/c"):
+        assert is_ancestor(repo, tip, BASE)
+    assert _merge_head(base_worktree(repo)) is None
+    [subtask] = _bases_story(store).subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "done")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_relaunch_after_a_resolved_conflict_dispatches_nothing(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    # Review Focus 2.
+    repo = conflicting_repo
+    await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=FakeFactory())
+    built = rev(repo, BASE)
+    again = FakeFactory()
+
+    result = await _resolve_build(repo, ["m7/a", "m7/b"], store=store, factory=again)
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=[], already_merged=["m7/b"], resolved=[]
+    )
+    assert again.calls == [] and again.resolver.calls == []
+    assert rev(repo, BASE) == built
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_missing_run_id_falls_back_to_the_stores(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    # Review Focus 3: `run_id` is typed `str | None`; the runner needs a real id.
+    repo = conflicting_repo
+    factory = FakeFactory()
+
+    result = await _resolve_build(
+        repo, ["m7/a", "m7/b"], store=store, factory=factory, run_id=None
+    )
+
+    assert result.resolved == ["m7/b"]
+    assert factory.calls == [{"run_id": RUN_ID, "story_id": "bases", "card_id": CARD_C}]
     assert rev(repo, "master") == MASTER_BEFORE
 
 
