@@ -52,9 +52,13 @@ from typing import Any, Literal, Protocol
 import grafo
 
 from agent_manager import bases, board, census, cli, dag, integration, models
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Checkpoint, Store
+from agent_manager.store import Checkpoint, Store, load_run, open_db
+from agent_manager.workflow import integrate as integrate_workflow
+from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import Workflow
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
@@ -483,6 +487,156 @@ def refresh_git(root: Path) -> None:
     if "origin" in remotes:
         worktree.run_git(["-C", str(root), "fetch", "origin"])
     worktree.run_git(["-C", str(root), "worktree", "prune"])
+
+
+REOPENED_STATUSES = ("stopped", "escalated", "started")
+"""The row statuses a resume records `started` again (spec, point 2)."""
+
+
+def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
+    """The recorded milestone run `run_id`, or the refusal that says why not.
+
+    Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
+    `Store.open` would construct a `Journal`. An unknown run, a run of
+    another workflow, and a `done` run are refused (card 54e4ec29).
+    """
+    conn = open_db(root)
+    try:
+        run = load_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        raise cli.UnknownRunError(
+            f"run {run_id!r} is not in the projection for {root}"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    if run.workflow != MILESTONE_WORKFLOW:
+        raise cli.NotResumableError(
+            f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
+        )
+    if run.status == "done":
+        raise cli.NotResumableError(
+            f"run {run.id} finished; start new work with am run --milestone"
+        )
+    return run
+
+
+def find_run_milestone(
+    roots: Sequence[models.CardNode] | None, run_id: str
+) -> models.CardNode:
+    """The one root card whose short id ends `run_id`.
+
+    `cli.mint_run_id` builds a milestone run's id as `<timestamp>-<short
+    milestone id>`, and `models.Run` records no milestone id of its own, so
+    the id is how a resume finds its milestone. A title edit cannot break it.
+    """
+    short = run_id.rsplit("-", 1)[-1]
+    matches = [node for node in roots or [] if dag.short_id(node.id) == short]
+    if len(matches) != 1:
+        raise cli.NotResumableError(
+            f"run {run_id!r} belongs to milestone {short}, and {len(matches)} root"
+            " cards on the board have that short id"
+        )
+    return matches[0]
+
+
+def open_cards(
+    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+) -> list[tuple[str, Workflow]]:
+    """Every card a resume may continue, with the workflow its checkpoint must match.
+
+    Each remaining subtask under `TASK`, then, for a story that is not closed
+    and roots on a merged base, its resolver `base-<story id>` under
+    `INTEGRATE`. Census order. `dag.assert_no_blocker_cycles` must have run.
+    """
+    stories = list(stories)
+    by_id = {story.id: story for story in stories}
+    cards: list[tuple[str, Workflow]] = []
+    for story in stories:
+        for subtask in dag.remaining_subtasks(story):
+            cards.append((subtask.id, task_workflow.TASK))
+        root_plan = dag.story_root(story, by_id, branch_prefix, base_branch)
+        if root_plan.kind == "merged" and not dag.is_story_closed(story):
+            cards.append((bases.resolver_card_id(story.id), integrate_workflow.INTEGRATE))
+    return cards
+
+
+def _refuse_changed_workflow(checkpoint: Checkpoint, workflow: Workflow, run_id: str) -> None:
+    """`cli.CheckpointMismatchError` when `checkpoint` was saved under another digest.
+
+    Worded like `cli.checkpoint_resume_phase`'s refusal, with the milestone
+    remedy.
+    """
+    digest = workflow.digest()
+    if checkpoint.digest != digest:
+        raise cli.CheckpointMismatchError(
+            f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
+            f" {checkpoint.card_id} in run {run_id!r} was saved under digest"
+            f" {checkpoint.digest}, but workflow {workflow.name!r} now has digest"
+            f" {digest}; start new work with am run --milestone"
+        )
+
+
+def resume_point(store: Store, card_id: str, workflow: Workflow) -> Checkpoint | None:
+    """The checkpoint a resume continues `card_id` from, None to start it fresh, or a refusal.
+
+    The newest row of `card_id` in this store's run decides. None, or `done`
+    (only a board write was lost), starts the card fresh. Any other newest row
+    is judged against `workflow`'s digest and refused on a mismatch. A row
+    that holds a turn is continued as is; one that does not -- a phase
+    escalation -- is rewound to the card's newest `turn` row, the turn the
+    failing phase ran in, judged the same way.
+    """
+    newest = store.latest_checkpoint(card_id)
+    if newest is None or newest.reason == "done":
+        return None
+    _refuse_changed_workflow(newest, workflow, store.run_id)
+    if runtime_engine.pending_phase(newest) is not None:
+        return newest
+    turn = store.latest_turn_checkpoint(card_id)
+    if turn is None:
+        return None
+    _refuse_changed_workflow(turn, workflow, store.run_id)
+    return turn
+
+
+def resume_checkpoints(
+    store: Store, cards: Sequence[tuple[str, Workflow]]
+) -> dict[str, Checkpoint]:
+    """`resume_point` for every open card, keyed by card id, only where there is one.
+
+    Reads only, so a refusal on any card leaves everything as it was: the
+    whole resume is refused (spec, Error paths).
+    """
+    found: dict[str, Checkpoint] = {}
+    for card_id, workflow in cards:
+        checkpoint = resume_point(store, card_id, workflow)
+        if checkpoint is not None:
+            found[card_id] = checkpoint
+    return found
+
+
+def reopen_rows(store: Store, run: models.Run, open_card_ids: set[str]) -> None:
+    """Mark every orphan attempt `harness_error`, then reopen the open rows.
+
+    `run` is the tree as the interrupted run left it. An orphan is
+    `cli.orphan_attempts`' in-flight attempt, marked as `cli`'s
+    `_resume_from_checkpoint` marks it. A subtask or resolver row of an open
+    card that is stopped, escalated or started is recorded `started`.
+    """
+    for story in run.stories:
+        for subtask in story.subtasks:
+            for phase, attempt in cli.orphan_attempts(subtask):
+                store.record_attempt(
+                    story.card_id,
+                    subtask.card_id,
+                    phase.name,
+                    attempt.model_copy(update={"status": "harness_error"}),
+                )
+            if subtask.card_id in open_card_ids and subtask.status in REOPENED_STATUSES:
+                store.record_subtask(
+                    story.card_id, subtask.model_copy(update={"status": "started"})
+                )
 
 
 def stale_story_anchors(

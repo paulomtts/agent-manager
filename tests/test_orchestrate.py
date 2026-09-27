@@ -43,6 +43,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import Step, Workflow
 
@@ -3345,3 +3346,245 @@ def test_a_done_merged_storys_dependent_waits_for_its_blockers(project, fake_bas
     assert "stopped" not in result, result
     statuses = _statuses(_load(project, result["run_id"]))
     assert (statuses[story_e], statuses[e1]) == ("pending", "pending")
+
+
+# ── milestone-wide resume helpers (card 54e4ec29) ───────────────────────────
+
+RESUME_RUN_ID = "20260924T120000Z-00000009"
+
+
+def _resume_root(tmp_path: Path, monkeypatch) -> Path:
+    """A project root with its projection under tmp_path; no git, no board."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _record_resume_run(
+    root: Path, run_id: str = RESUME_RUN_ID, *, workflow: str = "milestone", status: str = "escalated"
+) -> None:
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=workflow,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status=status,
+                config=models.RunConfig(max_concurrent_stories=3),
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _save(
+    store: store_module.Store,
+    card_id: str,
+    reason: str,
+    *,
+    phase: str | None = None,
+    workflow: Workflow = task_workflow.TASK,
+    digest: str | None = None,
+) -> store_module.Checkpoint:
+    """One checkpoint of `card_id`; `phase` is the turn in flight, None for a row holding no turn."""
+    return store.save_checkpoint(
+        card_id,
+        workflow=workflow.name,
+        digest=workflow.digest() if digest is None else digest,
+        reason=reason,
+        agent={
+            "current_turn": None if phase is None else {"kwargs": {"phase": phase, "loop": 0}},
+            "queue": [],
+        },
+        saved_at=EARLIER,
+    )
+
+
+def test_a_resumable_milestone_run_is_the_recorded_run(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root)
+
+    run = orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert (run.id, run.workflow, run.status) == (RESUME_RUN_ID, "milestone", "escalated")
+    assert (run.base_branch, run.branch_prefix) == ("main", PREFIX)
+    assert run.config.max_concurrent_stories == 3
+
+
+def test_a_finished_milestone_run_is_refused_with_the_relaunch_remedy(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, status="done")
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert str(caught.value) == (
+        f"run {RESUME_RUN_ID} finished; start new work with am run --milestone"
+    )
+
+
+def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, workflow="task", status="started")
+
+    with pytest.raises(cli.NotResumableError, match="'task'"):
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+    with pytest.raises(cli.UnknownRunError, match="no-such-run"):
+        orchestrate.resumable_milestone_run(root, "no-such-run")
+
+
+def test_a_resumed_run_names_its_milestone_by_the_short_id_in_its_run_id():
+    wanted = models.CardNode(id=_plan_id(9), title="Milestone 9", status="todo")
+    other = models.CardNode(id=_plan_id(8), title="Milestone 8", status="todo")
+
+    assert orchestrate.find_run_milestone([other, wanted], RESUME_RUN_ID) is wanted
+    with pytest.raises(cli.NotResumableError, match="00000007"):
+        orchestrate.find_run_milestone([other, wanted], "20260924T120000Z-00000007")
+
+
+def _resume_stories() -> list[census.StoryPlan]:
+    """A: 11 done, 12 and 13 open. B: 21 open. C on A and B: 31 open, a merged
+    root. D on A and B is closed, so its base is nobody's to build."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12), _plan_subtask(13)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41, "done")], status="done", blocked_by=[a.id, b.id])
+    return [a, b, c, d]
+
+
+def test_the_open_cards_are_the_remaining_subtasks_and_every_open_merged_roots_resolver():
+    cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+    assert [(card_id, workflow.name) for card_id, workflow in cards] == [
+        (_plan_id(12), "task"),
+        (_plan_id(13), "task"),
+        (_plan_id(21), "task"),
+        (_plan_id(31), "task"),
+        (bases.resolver_card_id(_plan_id(3)), "integrate"),
+    ]
+
+
+def test_each_open_card_resumes_from_its_newest_row_or_the_turn_it_failed_in(
+    tmp_path, monkeypatch
+):
+    """12 escalated with no turn left: rewound to its failed `review` turn. 13
+    parked: that row. 21's newest row is `done`, under another digest even
+    (Review Focus 2): nothing, and no refusal. 31 has none. C's resolver:
+    its parked INTEGRATE row."""
+    root = _resume_root(tmp_path, monkeypatch)
+    base_c = bases.resolver_card_id(_plan_id(3))
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(12), "turn", phase="implement")
+        failed = _save(opened, _plan_id(12), "turn", phase="review")
+        _save(opened, _plan_id(12), "escalated")
+        parked = _save(opened, _plan_id(13), "parked", phase="validate_spec")
+        _save(opened, _plan_id(21), "turn", phase="plan")
+        _save(opened, _plan_id(21), "done", digest="saved-under-another-task")
+        resolver = _save(
+            opened, base_c, "parked", phase="verify", workflow=integrate_workflow.INTEGRATE
+        )
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        found = orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    assert found == {_plan_id(12): failed, _plan_id(13): parked, base_c: resolver}
+
+
+def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_digests(
+    tmp_path, monkeypatch
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(13), "parked", phase="plan", digest="saved-under-another-task")
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        with pytest.raises(cli.CheckpointMismatchError) as caught:
+            orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    message = str(caught.value)
+    assert message.startswith("workflow changed since checkpoint")
+    assert _plan_id(13) in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+
+
+def test_a_resolver_is_judged_against_integrate_not_task(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    base_c = bases.resolver_card_id(_plan_id(3))
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, base_c, "parked", phase="verify", workflow=task_workflow.TASK)
+        cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
+
+        with pytest.raises(cli.CheckpointMismatchError) as caught:
+            orchestrate.resume_checkpoints(opened, cards)
+    finally:
+        opened.close()
+
+    assert base_c in str(caught.value)
+    assert integrate_workflow.INTEGRATE.digest() in str(caught.value)
+
+
+def _dispatch(root: Path) -> models.Dispatch:
+    return models.Dispatch(
+        harness="fake",
+        model="fake",
+        role="reviewer",
+        cwd=root,
+        prompt_path=root / "prompt.txt",
+        result_path=root / "result.json",
+    )
+
+
+def test_reopening_marks_orphans_harness_error_and_open_rows_started(tmp_path, monkeypatch):
+    root = _resume_root(tmp_path, monkeypatch)
+    statuses = {
+        "a1": "done",
+        "a2": "escalated",
+        "a3": "stopped",
+        "a4": "started",
+        "a5": "pending",
+        "closed": "escalated",
+    }
+    _record_resume_run(root)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_story(models.StoryRun(card_id="story-a", title="A", level=0, status="escalated"))
+        for card, status in statuses.items():
+            opened.record_subtask(
+                "story-a",
+                models.SubtaskRun(card_id=card, branch=f"m3/{card}", base_branch="main", status=status),
+            )
+        opened.record_phase("story-a", "a2", models.PhaseRun(name="review", kind="agent", status="started"))
+        opened.record_attempt(
+            "story-a", "a2", "review", models.Attempt(n=1, dispatch=_dispatch(root), status="started")
+        )
+        run = opened.load_run(RESUME_RUN_ID)
+
+        orchestrate.reopen_rows(opened, run, {"a2", "a3", "a4", "a5"})
+
+        after = opened.load_run(RESUME_RUN_ID)
+    finally:
+        opened.close()
+
+    [story] = after.stories
+    assert {subtask.card_id: subtask.status for subtask in story.subtasks} == {
+        "a1": "done",
+        "a2": "started",
+        "a3": "started",
+        "a4": "started",
+        "a5": "pending",
+        "closed": "escalated",
+    }
+    [review] = [subtask for subtask in story.subtasks if subtask.card_id == "a2"][0].phases
+    assert [attempt.status for attempt in review.attempts] == ["harness_error"]
