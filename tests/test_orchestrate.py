@@ -2128,9 +2128,19 @@ def test_a_keyboard_interrupt_in_one_lane_cancels_the_other_and_propagates(proje
         gates={a1: _meet(pair), b1: meet_then_wait_to_be_cancelled},
     )
 
-    with pytest.raises(KeyboardInterrupt):
-        _run(project, shape["milestone"], driver, max_concurrent=2)
+    # A known level that is not CRITICAL, so a silence left behind is visible.
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    grafo_logger.setLevel(logging.WARNING)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _run(project, shape["milestone"], driver, max_concurrent=2)
+        # `supervise` silences grafo for its duration only, even on this exit.
+        level_after = grafo_logger.level
+    finally:
+        grafo_logger.setLevel(level_before)
 
+    assert level_after == logging.WARNING
     assert cancelled == [b1]
     run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
     assert _statuses(run) == {
