@@ -32,7 +32,7 @@ from agent_manager import bases, dispatch, models
 from agent_manager.dag import RootPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime.stop import StopSignal
-from agent_manager.store import Store
+from agent_manager.store import Checkpoint, Store
 
 requires_git = pytest.mark.skipif(
     shutil.which("git") is None,
@@ -209,6 +209,7 @@ def test_build_is_a_plain_coroutine_that_does_not_import_grafo():
         "story_id",
         "runner_factory",
         "stop",
+        "resume_from",
     ]
     assert all(
         params[name].kind is inspect.Parameter.KEYWORD_ONLY
@@ -454,8 +455,11 @@ async def _resolve_build(
     run_id: str | None = RUN_ID,
     commands: tuple[str, ...] | list[str] = ("true",),
     stop: StopSignal | None = None,
+    resume_from: Checkpoint | None = None,
 ) -> bases.BaseResult:
-    """`bases.build` with the resolver parameters filled in."""
+    """`bases.build` with the resolver parameters filled in. `resume_from` is
+    passed only when given, so every earlier call is made exactly as before."""
+    extra: dict[str, Any] = {} if resume_from is None else {"resume_from": resume_from}
     return await bases.build(
         root,
         list(tips),
@@ -467,6 +471,7 @@ async def _resolve_build(
         story_id=story_id,
         runner_factory=factory,
         stop=stop,
+        **extra,
     )
 
 
@@ -863,6 +868,123 @@ async def test_a_merge_in_progress_fails_for_a_human(
     assert str(wt) in excinfo.value.detail
     assert _merge_head(wt) == rev(repo, "m7/c")
     assert rev(repo, BASE) == head
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+# ── continuing a resolver on a milestone resume (card 54e4ec29) ─────────────
+
+
+def test_the_resolver_card_is_base_and_the_story_id():
+    assert bases.resolver_card_id(STORY_C) == CARD_C
+
+
+@requires_git
+async def test_a_resumed_resolver_parked_after_its_merge_continues_at_verify(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    """Review Focus 3: the merge is committed and the resolver was parked
+    before `verify`. The resume runs `verify` only, re-dispatches no resolve,
+    and merges nothing again."""
+    repo = conflicting_repo
+    loop = asyncio.get_running_loop()
+    stop = StopSignal()
+    fired = threading.Event()
+
+    def fire() -> None:
+        stop.trigger(STORY_C)
+        fired.set()
+
+    def during() -> None:
+        loop.call_soon_threadsafe(fire)
+        if not fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
+
+    with pytest.raises(bases.BaseFailed):
+        await _resolve_build(
+            repo,
+            ["m7/a", "m7/b"],
+            store=store,
+            factory=FakeFactory(resolver=FakeResolver(during=during)),
+            stop=stop,
+        )
+    parked = store.latest_checkpoint(CARD_C)
+    assert parked is not None and parked.reason == "parked"
+    built = rev(repo, BASE)
+    again = FakeFactory()
+
+    result = await _resolve_build(
+        repo, ["m7/a", "m7/b"], store=store, factory=again, resume_from=parked
+    )
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=[], already_merged=["m7/b"], resolved=[]
+    )
+    assert again.resolver.calls == []
+    assert again.calls == [{"run_id": RUN_ID, "story_id": "bases", "card_id": CARD_C}]
+    [subtask] = _bases_story(store).subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "done")
+    assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
+    assert store.latest_checkpoint(CARD_C).reason == "done"
+    assert rev(repo, BASE) == built
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_resumed_resolver_rewound_to_its_failed_turn_finishes_the_merge(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    """The resolver escalated and left the merge in progress. Resumed from
+    the `resolve` turn it failed in, it resolves once and the tip is merged."""
+    repo = conflicting_repo
+    with pytest.raises(bases.BaseFailed):
+        await _resolve_build(
+            repo,
+            ["m7/a", "m7/b"],
+            store=store,
+            factory=FakeFactory(resolver=FakeResolver(refuse=True)),
+        )
+    assert store.latest_checkpoint(CARD_C).reason == "escalated"
+    turn = store.latest_turn_checkpoint(CARD_C)
+    assert turn is not None
+    again = FakeFactory()
+
+    result = await _resolve_build(
+        repo, ["m7/a", "m7/b"], store=store, factory=again, resume_from=turn
+    )
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=["m7/b"], already_merged=[], resolved=["m7/b"]
+    )
+    assert again.resolver.calls == [["shared.txt"]]
+    assert _merge_head(base_worktree(repo)) is None
+    assert is_ancestor(repo, "m7/a", BASE) and is_ancestor(repo, "m7/b", BASE)
+    [subtask] = _bases_story(store).subtasks
+    assert (subtask.card_id, subtask.status) == (CARD_C, "done")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_a_resumed_resolver_with_no_runner_factory_fails_for_a_human(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    repo = conflicting_repo
+    with pytest.raises(bases.BaseFailed):
+        await _resolve_build(
+            repo,
+            ["m7/a", "m7/b"],
+            store=store,
+            factory=FakeFactory(resolver=FakeResolver(refuse=True)),
+        )
+    turn = store.latest_turn_checkpoint(CARD_C)
+
+    with pytest.raises(bases.BaseFailed, match="continuing it needs") as excinfo:
+        await _resolve_build(
+            repo, ["m7/a", "m7/b"], store=store, factory=None, resume_from=turn
+        )
+
+    assert excinfo.value.stopped is False
+    assert BASE in excinfo.value.detail
+    assert _merge_head(base_worktree(repo)) == rev(repo, "m7/b")
     assert rev(repo, "master") == MASTER_BEFORE
 
 
