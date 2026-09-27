@@ -638,6 +638,26 @@ async def test_a_conflict_with_no_store_fails_for_a_human(
 
 
 @requires_git
+async def test_a_conflict_with_no_story_id_fails_for_a_human(
+    conflicting_repo: Path, store: Store, MASTER_BEFORE: str
+):
+    # Without a story id there is no `base-<story id>` card to walk.
+    repo = conflicting_repo
+    factory = FakeFactory()
+
+    with pytest.raises(bases.BaseFailed, match="no resolver is available") as excinfo:
+        await _resolve_build(
+            repo, ["m7/a", "m7/b"], store=store, factory=factory, story_id=None
+        )
+
+    assert excinfo.value.stopped is False
+    assert factory.calls == [] and factory.resolver.calls == []
+    assert store.load_run(RUN_ID).stories == []
+    assert _merge_head(base_worktree(repo)) == rev(repo, "m7/b")
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
 async def test_two_conflicts_in_one_base_are_each_resolved(
     conflicting_repo: Path, tmp_path: Path, store: Store, MASTER_BEFORE: str
 ):
