@@ -9,9 +9,12 @@ runs through `typer.testing.CliRunner` on the real `cli.app` with no
 armed with an implement-only rendezvous: at count 2 a run can only finish if
 two lanes were inside implement at the same time. Unmarked on purpose.
 
-Each test builds its own repo and board (`parallel_board`): A (a1 -> a2) and B
-(b1 -> b2) are independent roots, C (c1) is blocked by A. Levels are waves in
-the report only; C is scheduled by its blocker A (supervisor-tree T1).
+Each test builds its own repo and board. On `parallel_board`, A (a1 -> a2) and
+B (b1 -> b2) are independent roots and C (c1) is blocked by A alone: the
+lone-blocker fast path. Levels are waves in the report only; C is scheduled by
+its blocker A (supervisor-tree T1). On `merged_base_board`, C (c1) is blocked
+by both A (a1) and B (b1), so its lane builds a merged base from their tips
+before c1 runs (supervisor-tree §5), while D (d1 -> d2 -> d3) runs beside.
 """
 
 import json
@@ -413,6 +416,168 @@ def test_the_lanes_await_drive_subtask_async_on_the_runs_loop(
     assert sorted(awaited) == sorted(
         card for chain in parallel_board["subtasks"].values() for card in chain
     )
+
+
+SHARED = "shared.txt"
+BASE_LINE = "the line both blockers rewrite\n"
+A_LINE = "story A rewrote this line\n"
+B_LINE = "story B rewrote this line\n"
+
+
+def _local_branches(root: Path) -> list[str]:
+    return _git(root, "branch", "--format=%(refname:short)").split()
+
+
+def _merge_in_progress(worktree: Path) -> bool:
+    """Whether git holds a MERGE_HEAD in `worktree`."""
+    probe = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0
+
+
+def test_a_story_blocked_by_two_stories_runs_on_their_merged_base(
+    merged_base_board, run_milestone_cli
+):
+    """C runs only after A and B both finished, on its merged base: both
+    finished tips are inside the base, c1 descends from it, and the report
+    lists it. A clean merge dispatches no resolver; main never moves."""
+    root = merged_base_board["root"]
+    stories = merged_base_board["stories"]
+    branches = merged_base_board["branches"]
+    base = merged_base_board["base_branch"]
+    (a1,) = merged_base_board["subtasks"]["A"]
+    (b1,) = merged_base_board["subtasks"]["B"]
+    (c1,) = merged_base_board["subtasks"]["C"]
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    result = run_milestone_cli(root, merged_base_board["milestone"], max_concurrent=3)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["done"] is True, data
+    assert data["bases"] == [
+        {"story": stories["C"], "branch": base, "blockers": merged_base_board["merged_from"]}
+    ]
+    assert base in _local_branches(root)
+    assert _is_ancestor(root, branches[a1], base)
+    assert _is_ancestor(root, branches[b1], base)
+    assert _is_ancestor(root, base, branches[c1])
+    run = _load_run(root, data["run_id"])
+    assert _subtask_rows(run)[c1].base_branch == base
+    assert "bases" not in {story.card_id for story in run.stories}
+    assert stories["C"] in data["integrated"]["merged"]
+    for card_id in _all_cards(merged_base_board):
+        assert board.show(card_id, repo_dir=root).status == "done", card_id
+    assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def test_a_failed_blocker_leaves_the_merged_story_pending_with_no_base(
+    merged_base_board, run_milestone_cli
+):
+    """B's review fails: grafo never starts C, so C stays pending, and no
+    merged base branch or worktree is ever made."""
+    root = merged_base_board["root"]
+    stories = merged_base_board["stories"]
+    branches = merged_base_board["branches"]
+    base = merged_base_board["base_branch"]
+    (b1,) = merged_base_board["subtasks"]["B"]
+    (c1,) = merged_base_board["subtasks"]["C"]
+    merged_base_board["review_fail_marker"].write_text(f"{branches[b1]}\n", encoding="utf-8")
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    result = run_milestone_cli(root, merged_base_board["milestone"], max_concurrent=3)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, (result.output, result.exception)
+    data = _envelope(result)
+    assert (data["story"], data["subtask"], data["failed_phase"]) == (
+        stories["B"],
+        b1,
+        "review",
+    ), data
+    assert "bases" not in data
+    run = _load_run(root, data["run_id"])
+    story_status = {story.card_id: story.status for story in run.stories}
+    assert story_status[stories["C"]] == "pending"
+    rows = _subtask_rows(run)
+    assert rows[c1].status == "pending"
+    assert rows[c1].phases == []
+    assert base not in _local_branches(root)
+    assert not cli.worktree_for(root, base).exists()
+    assert "bases" not in story_status
+    assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def test_a_base_the_resolver_cannot_finish_escalates_the_story_at_base_and_parks_a_sibling(
+    merged_base_board, rendezvous, fake_resolver, run_milestone_cli, read_fake_log
+):
+    """A's and B's tips rewrite the same line; the base's resolver (the fake,
+    told to refuse) leaves the merge unfinished. C escalates at `base` with no
+    subtask, the merge is left in the base worktree, and D -- still running,
+    with far more work left than C's single resolve -- is parked.
+
+    The rendezvous (count 3) makes a1, b1 and d1 leave implement together, so
+    D has d1's later phases plus every phase of d2 and d3 left when C's base
+    fails; the assertions read which boundary D parked at out of the report.
+    """
+    root = merged_base_board["root"]
+    stories = merged_base_board["stories"]
+    branches = merged_base_board["branches"]
+    base = merged_base_board["base_branch"]
+    (a1,) = merged_base_board["subtasks"]["A"]
+    (b1,) = merged_base_board["subtasks"]["B"]
+    (c1,) = merged_base_board["subtasks"]["C"]
+    (root / SHARED).write_text(BASE_LINE, encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "seed the line both blockers rewrite")
+    main_before = _git(root, "rev-parse", "main").strip()
+    merged_base_board["implement_edits_marker"].write_text(
+        json.dumps({branches[a1]: {SHARED: A_LINE}, branches[b1]: {SHARED: B_LINE}}),
+        encoding="utf-8",
+    )
+    fake_resolver.refuse()
+    rendezvous.arm(3)
+
+    result = run_milestone_cli(root, merged_base_board["milestone"], max_concurrent=3)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["escalated"] is True, data
+    assert (data["level"], data["story"], data["subtask"], data["failed_phase"]) == (
+        1,
+        stories["C"],
+        None,
+        "base",
+    ), data
+    assert base in data["detail"]
+    assert "also_escalated" not in data, data
+    assert "bases" not in data
+    assert "stopped" in data, (
+        "lane D finished before C's base failed, so nothing was stopped; the "
+        "ordering margin this test relies on was lost",
+        data,
+    )
+    (parked,) = data["stopped"]
+    assert parked["story"] == stories["D"]
+    assert parked["subtask"] in merged_base_board["subtasks"]["D"]
+
+    run = _load_run(root, data["run_id"])
+    story_status = {story.card_id: story.status for story in run.stories}
+    assert story_status[stories["C"]] == "escalated"
+    assert story_status[stories["D"]] == "stopped"
+    rows = _subtask_rows(run)
+    assert rows[c1].status == "pending"
+    assert rows[c1].phases == []
+    assert not cli.worktree_for(root, branches[c1]).exists()
+
+    base_worktree = cli.worktree_for(root, base)
+    assert _merge_in_progress(base_worktree)
+    resolves = [entry for entry in read_fake_log(data["run_id"]) if entry["phase"] == "resolve"]
+    assert resolves  # non-vacuity: production's resolver really was dispatched
+    assert {Path(entry["cwd"]).resolve() for entry in resolves} == {base_worktree.resolve()}
+    assert _git(root, "rev-parse", "main").strip() == main_before
 
 
 def test_no_rendezvous_is_left_armed_for_later_tests():
