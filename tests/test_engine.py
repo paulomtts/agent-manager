@@ -8,8 +8,10 @@ journal. No git, no `brd`, no harness process. Every walk is
 the YAML document the walk was first specified against, phase for phase.
 """
 
+import asyncio
 import dataclasses
 import json
+import threading
 import typing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +25,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as new_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import (
     docs_commit,
     integrate,
@@ -2315,28 +2318,40 @@ def _projected_subtask_status(opened, card: str = "ed77a917") -> str | None:
     return None if row is None else row[0]
 
 
-class _StopFlag:
-    """A `should_stop` whose answer a canned step flips mid-walk."""
+class _StepStop:
+    """A `StopSignal` a canned step or fake runner triggers mid-walk.
 
-    def __init__(self, value: bool = False) -> None:
-        self.value = value
+    Steps and agent runners run in `asyncio.to_thread` workers, and the signal
+    lives on the loop, so `fire` hands `trigger` to the loop with
+    `call_soon_threadsafe` and blocks on a `threading.Event` until it has run:
+    the agent is paused before the phase returns. No sleeps.
+    """
 
-    def set(self) -> None:
-        self.value = True
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.signal = StopSignal()
+        self._loop = loop
 
-    def __call__(self) -> bool:
-        return self.value
+    def fire(self) -> None:
+        fired = threading.Event()
+
+        def trigger() -> None:
+            self.signal.trigger(STORY_ID)
+            fired.set()
+
+        self._loop.call_soon_threadsafe(trigger)
+        if not fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
 
 
-def test_a_stop_requested_during_phase_three_stops_before_phase_four(store, run_subtask):
+async def test_a_stop_requested_during_phase_three_stops_before_phase_four(store):
     calls: list[str] = []
-    flag = _StopFlag()
+    stop = _StepStop(asyncio.get_running_loop())
 
-    def make(name: str, *, stop: bool = False):
+    def make(name: str, *, fire: bool = False):
         def step(card: str) -> dict[str, Any]:
             calls.append(name)
-            if stop:
-                flag.set()
+            if fire:
+                stop.fire()
             return {"phase": name}
 
         return step
@@ -2346,18 +2361,18 @@ def test_a_stop_requested_during_phase_three_stops_before_phase_four(store, run_
         {
             "step.alpha": make("alpha"),
             "step.beta": make("beta"),
-            "step.gamma": make("gamma", stop=True),
+            "step.gamma": make("gamma", fire=True),
             "step.delta": make("delta"),
         },
     )
 
-    summary = run_subtask(
+    summary = await new_engine.run_subtask_async(
         workflow,
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
-        should_stop=flag,
+        stop=stop.signal,
     )
 
     assert calls == ["alpha", "beta", "gamma"]
@@ -2377,6 +2392,8 @@ def test_a_stop_requested_during_phase_three_stops_before_phase_four(store, run_
 
 def test_a_stop_already_requested_runs_no_phase_at_all(store, run_subtask):
     calls: list[str] = []
+    stop = StopSignal()
+    stop.trigger(STORY_ID)
 
     def step(card: str) -> dict[str, Any]:
         calls.append("ran")
@@ -2392,7 +2409,7 @@ def test_a_stop_already_requested_runs_no_phase_at_all(store, run_subtask):
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
-        should_stop=lambda: True,
+        stop=stop,
     )
 
     assert calls == []
@@ -2406,9 +2423,9 @@ def test_a_stop_already_requested_runs_no_phase_at_all(store, run_subtask):
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store, run_subtask):
+async def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store):
     calls: list[str] = []
-    flag = _StopFlag()
+    stop = _StepStop(asyncio.get_running_loop())
 
     def prepare(card: str) -> dict[str, Any]:
         calls.append("prepare")
@@ -2420,19 +2437,19 @@ def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store, run_subt
 
     def agent_runner(phase, context, rendered):
         calls.append(f"agent:{phase.name}")
-        flag.set()
+        stop.fire()
         return {"summary": "explored"}
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = run_subtask(
+    summary = await new_engine.run_subtask_async(
         workflow,
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
         agent_runner=agent_runner,
-        should_stop=flag,
+        stop=stop.signal,
     )
 
     assert calls == ["prepare", "agent:explore"]
@@ -2443,12 +2460,12 @@ def test_a_stop_before_a_deterministic_phase_leaves_it_unstarted(store, run_subt
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store, run_subtask):
+async def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store):
     recorded: dict[str, Any] = {}
-    flag = _StopFlag()
+    stop = _StepStop(asyncio.get_running_loop())
 
     def prepare(card: str) -> dict[str, Any]:
-        flag.set()
+        stop.fire()
         return {}
 
     def finish(card: str) -> dict[str, Any]:
@@ -2456,14 +2473,14 @@ def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store, run_subt
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = run_subtask(
+    summary = await new_engine.run_subtask_async(
         workflow,
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
         agent_runner=_recording_runner(recorded),
-        should_stop=flag,
+        stop=stop.signal,
     )
 
     assert recorded == {}
@@ -2474,14 +2491,15 @@ def test_a_stop_before_an_agent_phase_leaves_the_runner_uncalled(store, run_subt
     assert _subtask_journal_statuses(store) == ["stopped"]
 
 
-def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store, run_subtask):
-    """The check sits before the `agent_runner is None` error: a walk that
-    stops before its agent phase never reaches that phase, so it has nothing
-    to complain about."""
-    flag = _StopFlag()
+async def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store):
+    """The stop parks the agent before the `explore` turn, and the
+    `agent_runner is None` error is raised only inside that turn: a walk that
+    stops before its agent phase never reaches it, so it has nothing to
+    complain about."""
+    stop = _StepStop(asyncio.get_running_loop())
 
     def prepare(card: str) -> dict[str, Any]:
-        flag.set()
+        stop.fire()
         return {}
 
     def finish(card: str) -> dict[str, Any]:
@@ -2489,13 +2507,13 @@ def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store, run_subt
 
     workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
 
-    summary = run_subtask(
+    summary = await new_engine.run_subtask_async(
         workflow,
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
-        should_stop=flag,
+        stop=stop.signal,
     )
 
     assert summary.status == "stopped"
@@ -2503,9 +2521,9 @@ def test_a_stop_before_an_agent_phase_wins_over_a_missing_runner(store, run_subt
     assert _projected_subtask_status(store) == "stopped"
 
 
-def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
+def test_a_stop_signal_that_never_fires_changes_nothing(store, run_subtask):
     calls: list[str] = []
-    checks: list[str] = []
+    stop = StopSignal()
 
     def make(name: str):
         def step(card: str) -> dict[str, Any]:
@@ -2513,10 +2531,6 @@ def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
             return {"phase": name}
 
         return step
-
-    def never() -> bool:
-        checks.append("check")
-        return False
 
     workflow = _workflow(
         THREE_PHASES,
@@ -2529,11 +2543,11 @@ def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
-        should_stop=never,
+        stop=stop,
     )
 
+    assert not stop.triggered
     assert calls == ["alpha", "beta", "gamma"]
-    assert checks == ["check", "check", "check"]
     assert summary == walk.SubtaskSummary(
         status="done",
         results={
@@ -2555,37 +2569,9 @@ def test_a_should_stop_that_never_fires_changes_nothing(store, run_subtask):
     assert _projected_subtask_status(store) == "done"
 
 
-def test_should_stop_is_checked_only_at_visited_phases(store, run_subtask):
-    """`plan_check` jumps to `implement`; `spec` and `plan` are never visited,
-    so never checked, and nothing is checked after the last phase."""
+async def test_an_escalation_during_the_stop_request_wins_over_the_stop(store):
     calls: list[str] = []
-
-    def has(result: dict[str, Any]) -> bool:
-        return True
-
-    def never() -> bool:
-        calls.append("check")
-        return False
-
-    workflow = _skipping_workflow(has, calls)
-
-    summary = run_subtask(
-        workflow,
-        store,
-        story_id=STORY_ID,
-        subtask=_subtask(),
-        repo_dir=REPO,
-        should_stop=never,
-    )
-
-    assert calls == ["check", "plan_check", "check", "implement"]
-    assert summary.status == "done"
-    assert summary.skipped == ["spec", "plan"]
-
-
-def test_an_escalation_during_the_stop_request_wins_over_the_stop(store, run_subtask):
-    calls: list[str] = []
-    flag = _StopFlag()
+    stop = _StepStop(asyncio.get_running_loop())
 
     def alpha(card: str) -> dict[str, Any]:
         calls.append("alpha")
@@ -2593,7 +2579,7 @@ def test_an_escalation_during_the_stop_request_wins_over_the_stop(store, run_sub
 
     def beta(card: str) -> dict[str, Any]:
         calls.append("beta")
-        flag.set()
+        stop.fire()
         raise OSError("disk went away")
 
     def gamma(card: str) -> dict[str, Any]:
@@ -2604,15 +2590,16 @@ def test_an_escalation_during_the_stop_request_wins_over_the_stop(store, run_sub
         THREE_PHASES, {"step.alpha": alpha, "step.beta": beta, "step.gamma": gamma}
     )
 
-    summary = run_subtask(
+    summary = await new_engine.run_subtask_async(
         workflow,
         store,
         story_id=STORY_ID,
         subtask=_subtask(),
         repo_dir=REPO,
-        should_stop=flag,
+        stop=stop.signal,
     )
 
+    assert stop.signal.triggered
     assert calls == ["alpha", "beta"]
     assert summary.status == "escalated"
     assert summary.failed_phase == "beta"
