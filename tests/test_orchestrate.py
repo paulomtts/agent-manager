@@ -37,7 +37,7 @@ from typing import Any
 import grafo
 import pytest
 
-from agent_manager import board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager import bases, board, census, cli, dag, integration, models, orchestrate, paths
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -2700,3 +2700,217 @@ def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypa
     assert result["subtask"] == a1
     assert result["detail"] == "RuntimeError: checkpoints table unreadable"
     assert driver.calls == []
+
+
+# ── merged bases (supervisor-tree §5, card 8eca88e2) ────────────────────────
+
+
+@dataclass
+class FakeBases:
+    """Stands in for `bases.build`, which the lane reads off `bases` at call time.
+
+    Every call is recorded. `gates[story]` is awaited first with the call's
+    `stop` (Events and Barriers, never sleeps). `outcomes[story]` is an
+    exception to raise; with none the base counts as built and a
+    `BaseResult` naming `root.branch` comes back. It touches no git: a
+    `FakeDriver` never needs the branch to exist.
+    """
+
+    outcomes: dict[str, BaseException] = field(default_factory=dict)
+    gates: dict[str, Gate] = field(default_factory=dict)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    async def __call__(
+        self,
+        root,
+        tips,
+        *,
+        repo_dir,
+        commands,
+        allow_no_verification,
+        store,
+        run_id,
+        story_id,
+        runner_factory,
+        stop,
+    ) -> bases.BaseResult:
+        self.calls.append(
+            {
+                "root": root,
+                "tips": list(tips),
+                "repo_dir": repo_dir,
+                "commands": list(commands),
+                "allow_no_verification": allow_no_verification,
+                "store": store,
+                "run_id": run_id,
+                "story_id": story_id,
+                "runner_factory": runner_factory,
+                "stop": stop,
+            }
+        )
+        gate = self.gates.get(story_id)
+        if gate is not None:
+            await gate(stop)
+        error = self.outcomes.get(story_id)
+        if error is not None:
+            raise error
+        return bases.BaseResult(
+            branch=root.branch, merged=list(tips[1:]), already_merged=[], resolved=[]
+        )
+
+
+@pytest.fixture
+def fake_bases(monkeypatch) -> FakeBases:
+    recorder = FakeBases()
+    monkeypatch.setattr(bases, "build", recorder)
+    return recorder
+
+
+def _root_plan(project: Path, milestone: str, story_id: str) -> dag.RootPlan:
+    """The story's `RootPlan` as the run derives it: census order, `PREFIX`, `main`."""
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
+    by_id = {story.id: story for story in plan.stories}
+    return dag.story_root(by_id[story_id], by_id, PREFIX, "main")
+
+
+def _bases_entry(story_id: str, root_plan: dag.RootPlan) -> dict[str, Any]:
+    return {"story": story_id, "branch": root_plan.branch, "blockers": list(root_plan.blockers)}
+
+
+@requires_git
+@requires_brd
+def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
+    project, fake_bases
+):
+    """Spec, Engine tier: C (blocked by A and B) builds its base once, only
+    after both blockers returned, from their forwarded tips in
+    `root_plan.blockers` order; c1 stacks on the base, c2 on c1; the report
+    lists the base."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 2}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    c1, c2 = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    a_returned, b_returned = asyncio.Event(), asyncio.Event()
+
+    async def both_blockers_returned(stop: StopSignal | None) -> None:
+        assert a_returned.is_set() and b_returned.is_set(), (
+            "C's base was built before both blockers finished"
+        )
+
+    fake_bases.gates[story_c] = both_blockers_returned
+    driver = GatedDriver(returned={a1: a_returned, b1: b_returned})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert root_plan.kind == "merged"
+    assert root_plan.branch == f"{PREFIX}/base-{dag.short_id(story_c)}"
+    assert sorted(root_plan.blockers) == sorted([story_a, story_b])
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["root"] == root_plan
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert call["story_id"] == story_c
+    assert call["repo_dir"] == cli.resolve_repo_dir(project)
+    assert call["run_id"] == result["run_id"]
+    assert call["commands"] == []
+    assert call["allow_no_verification"] is False
+    assert isinstance(call["stop"], StopSignal)
+    # Production passes no factory; the base's resolver gets production's.
+    assert call["runner_factory"] is cli.default_runner_factory
+    driven_on = {entry["card"]: entry["base"] for entry in driver.calls}
+    assert driven_on[c1] == root_plan.branch
+    assert driven_on[c2] == _branch(project, c1)
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1], statuses[c2]) == ("done", "done", "done")
+
+
+@requires_git
+@requires_brd
+def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+
+    result = _run(project, shape["milestone"], FakeDriver(), runner_factory=_no_resolver)
+
+    assert result["done"] is True, result
+    (call,) = fake_bases.calls
+    assert call["runner_factory"] is _no_resolver
+
+
+@requires_git
+@requires_brd
+def test_a_done_blockers_existing_tip_goes_into_the_base(project, fake_bases):
+    """Review Focus 3: on a relaunch A is already done. Its node forwards the
+    tip it already has, and that tip is merged in its blocker position."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    for card in (a1, story_a):
+        board.set_status(card, "done", repo_dir=project)
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [b1, c1]
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_run_with_no_merged_root_builds_no_base_and_reports_no_bases(project, fake_bases):
+    """Spec: a lone-blocker story stays the fast path, and the key is absent
+    when no base was built."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"B": ["A"]})
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert fake_bases.calls == []
+    assert "bases" not in result
+
+
+@requires_git
+@requires_brd
+def test_a_lane_that_escalates_after_building_its_base_still_lists_it(project, fake_bases):
+    """Review Focus 5: the base exists once built, so a lane-escalated payload
+    lists it too."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    driver = FakeDriver(outcomes={c1: ("verify", "suite red on the base")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"], result["failed_phase"]) == (story_c, c1, "verify")
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_still_lists_the_bases_built(
+    project, fake_bases, integrate_recorder
+):
+    """Review Focus 5: the integrate-escalated payload carries `bases` too."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=story_c, files=["shared.txt"], detail="the resolver did not finish"
+    )
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["escalated"], result["phase"]) == (True, "integrate"), result
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]

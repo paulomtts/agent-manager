@@ -12,6 +12,12 @@ A lane fails by raising `LaneEscalated` or `LaneStopped`, so grafo never
 releases the dependents of a lane that did not finish clean, and
 `collect_outcomes` reads every story's outcome after the tree ran (T6).
 
+A story with two or more in-milestone blockers roots on a merged base
+(supervisor-tree §5): its lane awaits `bases.build` with the tips grafo
+forwarded, after it took its slot and before its first subtask, so that
+subtask stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the
+fast path: no base branch and no extra verify.
+
 Every derivation belongs to a collaborator: the milestone and its census to
 `census`, waves, stack bases, roots and tips to `dag`, board reads to `board`,
 rollup to `steps.rollup`, git to `steps.worktree.run_git`, run state to
@@ -44,7 +50,7 @@ from typing import Any, Literal, Protocol
 
 import grafo
 
-from agent_manager import board, census, cli, dag, integration, models
+from agent_manager import bases, board, census, cli, dag, integration, models
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Checkpoint, Store
@@ -550,6 +556,42 @@ def record_plan(
     return rows
 
 
+async def build_merged_base(
+    story: census.StoryPlan,
+    root_plan: dag.RootPlan,
+    forwarded_tips: Mapping[str, str],
+    *,
+    store: Store,
+    run_id: str,
+    root: Path,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: cli.RunnerFactory | None,
+    stop: StopSignal,
+) -> None:
+    """Await `bases.build` for one merged-root story (supervisor-tree §5).
+
+    The tips are the ones grafo forwarded as `tip_<short id>`, taken in
+    `root_plan.blockers` order. `bases.build` is read off its module at call
+    time so a test can replace it. A `None` factory is production's,
+    `cli.default_runner_factory`, read at call time as Integrate reads it, so
+    a conflicting tip reaches the resolver instead of failing for a human.
+    """
+    factory = cli.default_runner_factory if runner_factory is None else runner_factory
+    await bases.build(
+        root_plan,
+        [forwarded_tips[f"tip_{dag.short_id(blocker)}"] for blocker in root_plan.blockers],
+        repo_dir=root,
+        commands=list(commands),
+        allow_no_verification=allow_no_verification,
+        store=store,
+        run_id=run_id,
+        story_id=story.id,
+        runner_factory=factory,
+        stop=stop,
+    )
+
+
 async def lane(
     story: census.StoryPlan,
     *,
@@ -564,31 +606,40 @@ async def lane(
     slots: asyncio.Semaphore,
     stop: StopSignal,
     finished: dict[str, LaneOutcome],
+    forwarded_tips: Mapping[str, str],
 ) -> str:
     """One story's node coroutine (T1, T4, T6): drive its remaining subtasks, return its tip.
 
-    A story with nothing left to run returns its tip without taking a slot.
-    Otherwise the lane takes a slot -- grafo started it, so every blocker
-    already succeeded -- and drives the remaining subtasks in census order,
-    each on the base `record_plan` recorded for it. Before each subtask it
-    checks the stop: if it fired, the story is recorded `stopped` and
-    `LaneStopped` is raised with that subtask never driven. A `stopped`
+    A story with nothing left to run returns its tip without taking a slot,
+    unless `builds_a_base_alone` says it must first build its merged base
+    (`base_only_lane`). Otherwise the lane takes a slot -- grafo started it, so
+    every blocker already succeeded -- and drives the remaining subtasks in
+    census order, each on the base `record_plan` recorded for it. Before each
+    subtask it checks the stop: if it fired, the story is recorded `stopped`
+    and `LaneStopped` is raised with that subtask never driven. A `stopped`
     summary records the subtask and story `stopped` and raises `LaneStopped`.
     Any other non-`done` summary, or any `Exception` while handling a
     subtask (a lane bug), triggers the stop first and raises `LaneEscalated`
     at that subtask. `LaneEscalated`/`LaneStopped` pass through the catch-all
     unchanged. A `BaseException` is never caught.
 
+    A story whose root is `merged` awaits `build_merged_base` with
+    `forwarded_tips` after it took its slot and before its first subtask; that
+    subtask's recorded base is the merged base branch. The outcome then carries
+    the story's `RootPlan` as `base`, whatever happens after.
+
     Each subtask's open checkpoint is looked up first
     (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
     """
+    root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
     if planned is None:
         return plan.tips[story.id]
     story_row, subtask_rows = plan.rows[story.id]
     completed: list[str] = []
     warnings: list[str] = []
+    built: dag.RootPlan | None = None
 
     def outcome(kind: LaneKind, subtask: str | None, **fields: Any) -> LaneOutcome:
         return LaneOutcome(
@@ -598,12 +649,27 @@ async def lane(
             subtask=subtask,
             completed=tuple(completed),
             warnings=tuple(warnings),
+            base=built,
             **fields,
         )
 
     async with slots:
         current: census.SubtaskPlan | None = None
         try:
+            if root_plan.kind == "merged":
+                await build_merged_base(
+                    story,
+                    root_plan,
+                    forwarded_tips,
+                    store=store,
+                    run_id=run_id,
+                    root=root,
+                    commands=commands,
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    stop=stop,
+                )
+                built = root_plan
             for position, subtask in enumerate(planned.remaining):
                 current = subtask
                 if stop.triggered:
@@ -702,9 +768,10 @@ async def supervise(
 
     One `grafo.Node` per story, `uuid=story.id`, `timeout=None` always (grafo's
     60 s default would cancel a lane mid-phase). One edge per in-milestone
-    blocker, forwarding the blocker's tip as `tip_<short id>` (Task 3.2 reads
-    those for merged bases). The executor's roots are the stories with no
-    in-milestone blocker; a milestone with no story has no tree to run.
+    blocker, forwarding the blocker's tip as `tip_<short id>`, which a
+    merged-root story's lane hands to `bases.build`. The executor's roots are
+    the stories with no in-milestone blocker; a milestone with no story has no
+    tree to run.
 
     The `grafo` logger is at CRITICAL for exactly this call: a lane's
     escalation is data in the outcomes, never a traceback on a stream, and
@@ -732,6 +799,7 @@ async def supervise(
                     slots=slots,
                     stop=stop,
                     finished=finished,
+                    forwarded_tips=tips,
                 )
 
             return run
@@ -851,10 +919,13 @@ def run_milestone(
         for outcome in outcomes:
             completed.extend(outcome.completed)
             warnings.extend(outcome.warnings)
+        built_bases = bases_payload(outcomes)
         if any(outcome.kind == "escalated" for outcome in outcomes):
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
             primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-            return escalated_payload(run_id, primary, outcomes, warnings)
+            return with_bases(
+                escalated_payload(run_id, primary, outcomes, warnings), built_bases
+            )
 
         # Integrate (addendum I6) runs only once every lane finished clean,
         # and also when there was nothing left to drive: that is how a relaunch
@@ -877,20 +948,23 @@ def run_milestone(
         if isinstance(outcome, integration.IntegrateEscalation):
             # The branch and worktree stay exactly as Integrate left them (I5).
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
-            return integrate_escalated_payload(run_id, outcome, warnings)
+            return with_bases(integrate_escalated_payload(run_id, outcome, warnings), built_bases)
 
         store.record_run(run_record.model_copy(update={"status": "done"}))
-        return {
-            "done": True,
-            "run_id": run_id,
-            "levels": [
-                {"level": index, "stories": [planned.story.id for planned in level]}
-                for index, level in enumerate(levels)
-            ],
-            "completed": completed,
-            "tips": tips,
-            "warnings": warnings,
-            "integrated": integrated_payload(outcome),
-        }
+        return with_bases(
+            {
+                "done": True,
+                "run_id": run_id,
+                "levels": [
+                    {"level": index, "stories": [planned.story.id for planned in level]}
+                    for index, level in enumerate(levels)
+                ],
+                "completed": completed,
+                "tips": tips,
+                "warnings": warnings,
+                "integrated": integrated_payload(outcome),
+            },
+            built_bases,
+        )
     finally:
         store.close()
