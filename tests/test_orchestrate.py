@@ -447,6 +447,56 @@ def test_an_error_that_is_no_lane_error_is_escalated_with_its_type_and_message()
     assert payload["detail"] == "RuntimeError: grafo broke"
 
 
+def test_only_an_open_subtask_less_story_on_a_merged_root_builds_a_base_alone():
+    merged = dag.RootPlan("merged", "m3/base-00000003", (_plan_id(1), _plan_id(2)))
+    lone = dag.RootPlan("tip", "m3/some-tip", (_plan_id(1),))
+
+    assert orchestrate.builds_a_base_alone(_plan_story(3, []), merged) is True
+    assert orchestrate.builds_a_base_alone(_plan_story(3, [], status="done"), merged) is False
+    assert orchestrate.builds_a_base_alone(_plan_story(3, [_plan_subtask(31)]), merged) is False
+    assert orchestrate.builds_a_base_alone(_plan_story(3, []), lone) is False
+
+
+def test_a_base_only_lanes_outcome_follows_the_waves_in_census_order():
+    """A subtask-less story is in no wave, so its lane's outcome comes after
+    every wave's, before any foreign error; a failure is not dropped."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    joined = _plan_story(3, [], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[joined.id])
+    plan = _supervisor_plan([a, b, joined, d])
+    done_a = orchestrate.LaneOutcome(kind="done", story=a.id, level=0)
+    done_b = orchestrate.LaneOutcome(kind="done", story=b.id, level=0)
+    done_d = orchestrate.LaneOutcome(kind="done", story=d.id, level=0)
+    built = orchestrate.LaneOutcome(
+        kind="done", story=joined.id, level=None, base=plan.roots[joined.id]
+    )
+    every_output = {story.id: SimpleNamespace(output="tip") for story in (a, b, joined, d)}
+
+    assert orchestrate.collect_outcomes(
+        plan, every_output, [], {a.id: done_a, b.id: done_b, d.id: done_d, joined.id: built}
+    ) == [done_a, done_b, done_d, built]
+
+    failed = orchestrate.LaneOutcome(
+        kind="escalated", story=joined.id, level=None, failed_phase="base", detail="broke"
+    )
+    outputs = {
+        a.id: SimpleNamespace(output="tip"),
+        b.id: SimpleNamespace(output="tip"),
+        joined.id: SimpleNamespace(output=None),
+        d.id: SimpleNamespace(output=None),
+    }
+
+    assert orchestrate.collect_outcomes(
+        plan, outputs, [orchestrate.LaneEscalated(failed)], {a.id: done_a, b.id: done_b}
+    ) == [
+        done_a,
+        done_b,
+        orchestrate.LaneOutcome(kind="pending", story=d.id, level=0),
+        replace(failed, primary=True),
+    ]
+
+
 # ── the runner, on a real repo and a real board ─────────────────────────────
 
 
@@ -3107,3 +3157,105 @@ def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
     assert "bases" not in result
     statuses = _statuses(_load(project, result["run_id"]))
     assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_story_on_two_blockers_builds_its_base_and_its_dependent_stacks_on_it(
+    project, fake_bases
+):
+    """Spec: J has no subtasks and two blockers; D (blocked by J) falls through
+    to J's merged base. J's lane builds it before D starts, D's first subtask
+    stacks on it, and the report lists it."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_a, story_b, story_j = (shape["stories"][key] for key in "ABJ")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    root_plan = _root_plan(project, shape["milestone"], story_j)
+
+    async def the_base_is_built(stop: StopSignal | None) -> None:
+        assert [call["story_id"] for call in fake_bases.calls] == [story_j], (
+            "d1 started before J's base was built"
+        )
+
+    driver = GatedDriver(gates={d1: the_base_is_built})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert root_plan.kind == "merged"
+    tips = {story_a: _branch(project, a1), story_b: _branch(project, b1)}
+    (call,) = fake_bases.calls
+    assert call["root"] == root_plan
+    assert call["tips"] == [tips[blocker] for blocker in root_plan.blockers]
+    assert next(entry for entry in driver.calls if entry["card"] == d1)["base"] == root_plan.branch
+    assert result["bases"] == [_bases_entry(story_j, root_plan)]
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_failed_base_escalates_the_run_and_its_dependent_stays_pending(
+    project, fake_bases, integrate_recorder
+):
+    """Review Focus 2: J is in no wave and has no store row, yet its failed
+    base must escalate the run, never reach Integrate."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_a, story_b, story_j, story_d = (shape["stories"][key] for key in "ABJD")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+    driver = FakeDriver()
+
+    result = _run(project, shape["milestone"], driver)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": None,
+        "story": story_j,
+        "subtask": None,
+        "failed_phase": "base",
+        "detail": "J's base broke",
+        "warnings": [],
+    }
+    assert d1 not in [call["card"] for call in driver.calls]
+    assert integrate_recorder.calls == []
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "done",
+        a1: "done",
+        story_b: "done",
+        b1: "done",
+        story_d: "pending",
+        d1: "pending",
+    }
+
+
+@requires_git
+@requires_brd
+def test_a_closed_subtask_less_story_builds_no_base(project, fake_bases):
+    """Spec, Out of scope: a done story's missing base is milestone-wide
+    resume's; this lane only returns its tip."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    board.set_status(shape["stories"]["J"], "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert fake_bases.calls == []
+    assert "bases" not in result

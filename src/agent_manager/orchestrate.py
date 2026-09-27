@@ -418,7 +418,8 @@ def collect_outcomes(
     errors: Sequence[BaseException],
     finished: Mapping[str, LaneOutcome],
 ) -> list[LaneOutcome]:
-    """One outcome per pending story in wave order, then one per foreign error (T6).
+    """One outcome per pending story in wave order, then one per base-only lane
+    that ran, in census order, then one per foreign error (T6).
 
     A node with an output is `done` (its lane's finished outcome). A
     `LaneEscalated` gives its outcome, the first in `errors` marked `primary`.
@@ -457,6 +458,17 @@ def collect_outcomes(
                 outcomes.append(stopped[story_id])
             else:
                 outcomes.append(LaneOutcome(kind="pending", story=story_id, level=planned.level))
+    # A base-only lane (`base_only_lane`) belongs to no wave: its outcome
+    # follows the waves, in census order, so a failed base is never dropped.
+    for story in plan.stories:
+        if story.id in plan.planned:
+            continue
+        if story.id in finished:
+            outcomes.append(finished[story.id])
+        elif story.id in escalated:
+            outcomes.append(escalated[story.id])
+        elif story.id in stopped:
+            outcomes.append(stopped[story.id])
     return outcomes + foreign
 
 
@@ -619,6 +631,81 @@ async def blocker_tips(
     return [plan.tips[blocker] for blocker in root_plan.blockers]
 
 
+def builds_a_base_alone(story: census.StoryPlan, root_plan: dag.RootPlan) -> bool:
+    """Whether a story with no subtasks must still build its merged base.
+
+    Such a story is in no wave (`dag.compute_levels` drops it), but a story it
+    blocks falls through to its root, so the branch must exist before that
+    dependent runs. A closed story is left alone: a done story whose base was
+    never built is milestone-wide resume's.
+    """
+    return (
+        root_plan.kind == "merged"
+        and not story.subtasks
+        and not dag.is_story_closed(story)
+    )
+
+
+async def base_only_lane(
+    story: census.StoryPlan,
+    root_plan: dag.RootPlan,
+    tips: Sequence[str],
+    *,
+    plan: SupervisorPlan,
+    store: Store,
+    run_id: str,
+    root: Path,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: cli.RunnerFactory | None,
+    slots: asyncio.Semaphore,
+    stop: StopSignal,
+    finished: dict[str, LaneOutcome],
+) -> str:
+    """A subtask-less story's lane: build its merged base, return it as its tip.
+
+    It takes a slot, since a base can dispatch a resolver, and checks the stop
+    first. The failure paths are `lane`'s for a merged base, but with no
+    subtask to name and no store row to write -- `record_plan` records only
+    stories with work -- so every outcome has `level=None` and
+    `collect_outcomes` reports it after the waves.
+    """
+
+    def outcome(kind: LaneKind, **fields: Any) -> LaneOutcome:
+        return LaneOutcome(kind=kind, story=story.id, level=None, **fields)
+
+    async with slots:
+        if stop.triggered:
+            raise LaneStopped(outcome("stopped"))
+        try:
+            await build_merged_base(
+                story,
+                root_plan,
+                tips,
+                store=store,
+                run_id=run_id,
+                root=root,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                stop=stop,
+            )
+        except bases.BaseFailed as error:
+            if error.stopped:
+                raise LaneStopped(outcome("stopped")) from error
+            stop.trigger(story.id)
+            raise LaneEscalated(
+                outcome("escalated", failed_phase="base", detail=error.detail)
+            ) from error
+        except Exception as error:  # not BaseException: Ctrl-C must still stop
+            stop.trigger(story.id)
+            raise LaneEscalated(
+                outcome("escalated", detail=f"{type(error).__name__}: {error}")
+            ) from error
+    finished[story.id] = outcome("done", base=root_plan)
+    return plan.tips[story.id]
+
+
 async def lane(
     story: census.StoryPlan,
     *,
@@ -673,13 +760,29 @@ async def lane(
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
-    if planned is None:
+    if planned is None and not builds_a_base_alone(story, root_plan):
         return plan.tips[story.id]
     tips: list[str] | None = None
     if root_plan.kind == "merged":
         tips = await blocker_tips(root_plan, plan, story_done, story_ok)
         if tips is None:
             return plan.tips[story.id]
+    if planned is None:
+        return await base_only_lane(
+            story,
+            root_plan,
+            tips,
+            plan=plan,
+            store=store,
+            run_id=run_id,
+            root=root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            slots=slots,
+            stop=stop,
+            finished=finished,
+        )
     story_row, subtask_rows = plan.rows[story.id]
     completed: list[str] = []
     warnings: list[str] = []
