@@ -2200,6 +2200,31 @@ class _LaneKilled(BaseException):
     `gather(..., return_exceptions=True)` would drop it."""
 
 
+def _run_or_fail_if_it_hangs(call: Callable[[], Any]) -> Any:
+    """`call()` on a daemon thread: its result or its exception, `BaseException`
+    included, or a failure after a bounded wait instead of hanging the suite.
+
+    Without the fix, grafo's `gather()` never returns once a lane dies of a plain
+    `BaseException` (card 949d51a0), so an unbounded call would hang, not fail.
+    """
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as error:  # re-raised on the test thread
+            outcome["error"] = error
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(WAIT * 3)
+    if worker.is_alive():
+        pytest.fail("the run hung instead of leaving on the lane's BaseException")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
 @requires_git
 @requires_brd
 def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
@@ -2229,7 +2254,9 @@ def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
     )
 
     with pytest.raises(_LaneKilled):
-        _run(project, shape["milestone"], driver, max_concurrent=2)
+        _run_or_fail_if_it_hangs(
+            lambda: _run(project, shape["milestone"], driver, max_concurrent=2)
+        )
 
     assert cancelled == [b1]
     assert integrate_recorder.calls == []
