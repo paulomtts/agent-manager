@@ -24,9 +24,10 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -215,7 +216,7 @@ def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_or
         detail="RuntimeError: boom",
     )
     done = orchestrate.LaneOutcome(kind="done", story="D", level=2, completed=("d1",))
-    queued = orchestrate.LaneOutcome(kind="not_started", story="E", level=2)
+    queued = orchestrate.LaneOutcome(kind="pending", story="E", level=2)
 
     payload = orchestrate.escalated_payload(
         "run-1", "C", [also, parked, primary, done, queued], ["gate warned"]
@@ -249,7 +250,7 @@ def test_a_lone_escalation_payload_is_exactly_the_sequential_one():
     only = orchestrate.LaneOutcome(
         kind="escalated", story="A", level=0, subtask="a1", failed_phase="verify", detail="red"
     )
-    queued = orchestrate.LaneOutcome(kind="not_started", story="B", level=0)
+    queued = orchestrate.LaneOutcome(kind="pending", story="B", level=0)
 
     payload = orchestrate.escalated_payload("run-1", "A", [only, queued], [])
 
@@ -321,6 +322,115 @@ def test_a_final_verification_escalation_payload_has_no_story():
     payload = orchestrate.integrate_escalated_payload("run-1", outcome, [])
 
     assert (payload["story"], payload["files"], payload["phase"]) == (None, [], "integrate")
+
+
+def _supervisor_plan(stories: list[census.StoryPlan]) -> orchestrate.SupervisorPlan:
+    levels = orchestrate.plan_levels(stories, branch_prefix="m3", base_branch="main")
+    return orchestrate.supervisor_plan(
+        stories, levels, {}, branch_prefix="m3", base_branch="main"
+    )
+
+
+def test_lane_errors_carry_their_outcome():
+    escalated = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", detail="red"
+    )
+    stopped = orchestrate.LaneOutcome(kind="stopped", story="B", level=0, subtask="b1")
+
+    raised = orchestrate.LaneEscalated(escalated)
+    parked = orchestrate.LaneStopped(stopped)
+
+    assert raised.outcome is escalated
+    assert parked.outcome is stopped
+    assert isinstance(raised, Exception) and isinstance(parked, Exception)
+    assert not isinstance(raised, orchestrate.LaneStopped)
+
+
+def test_the_supervisor_plan_roots_and_tips_every_census_story_done_ones_included():
+    """T1: every census story becomes a node, so every one needs its root and
+    tip; only the pending ones are planned for a lane."""
+    a = _plan_story(1, [_plan_subtask(11, "done")], status="done")
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[a.id])
+
+    plan = _supervisor_plan([a, b])
+
+    assert [story.id for story in plan.stories] == [a.id, b.id]
+    assert plan.roots[a.id] == dag.RootPlan("base", "main", ())
+    assert plan.roots[b.id] == dag.RootPlan("tip", _branch_of(a.subtasks[-1]), (a.id,))
+    assert plan.tips == {
+        a.id: _branch_of(a.subtasks[-1]),
+        b.id: _branch_of(b.subtasks[-1]),
+    }
+    assert list(plan.planned) == [b.id]
+    assert plan.planned[b.id].level == 0
+
+
+def test_outcomes_follow_t6_in_wave_order():
+    """Node output with a finished outcome is `done`; the first LaneEscalated in
+    `errors` is primary and the next is not; LaneStopped gives its outcome; a
+    story with no output and no error is `pending`."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)])
+    e = _plan_story(5, [_plan_subtask(51)])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[a.id])
+    plan = _supervisor_plan([a, b, c, d, e])
+    done_a = orchestrate.LaneOutcome(kind="done", story=a.id, level=0, completed=(_plan_id(11),))
+    b_escalated = orchestrate.LaneOutcome(
+        kind="escalated", story=b.id, level=0, subtask=_plan_id(21), failed_phase="review", detail="b"
+    )
+    c_escalated = orchestrate.LaneOutcome(
+        kind="escalated", story=c.id, level=0, subtask=_plan_id(31), failed_phase="verify", detail="c"
+    )
+    e_stopped = orchestrate.LaneOutcome(
+        kind="stopped", story=e.id, level=0, subtask=_plan_id(51), before_phase="implement"
+    )
+    nodes = {
+        a.id: SimpleNamespace(output="tip of a"),
+        b.id: SimpleNamespace(output=None),
+        c.id: SimpleNamespace(output=None),
+        d.id: SimpleNamespace(output=None),
+        e.id: SimpleNamespace(output=None),
+    }
+    errors = [
+        orchestrate.LaneEscalated(c_escalated),
+        orchestrate.LaneStopped(e_stopped),
+        orchestrate.LaneEscalated(b_escalated),
+    ]
+
+    outcomes = orchestrate.collect_outcomes(plan, nodes, errors, {a.id: done_a})
+
+    assert outcomes == [
+        done_a,
+        b_escalated,
+        replace(c_escalated, primary=True),
+        e_stopped,
+        orchestrate.LaneOutcome(kind="pending", story=d.id, level=1),
+    ]
+
+
+def test_an_error_that_is_no_lane_error_is_escalated_with_its_type_and_message():
+    """T6: an exception that escaped even the lane's own catch-all is tied to no
+    story, so it carries no subtask, failed phase or level."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    plan = _supervisor_plan([a])
+
+    outcomes = orchestrate.collect_outcomes(
+        plan, {a.id: SimpleNamespace(output=None)}, [RuntimeError("grafo broke")], {}
+    )
+
+    foreign = orchestrate.LaneOutcome(
+        kind="escalated", story=None, level=None, detail="RuntimeError: grafo broke"
+    )
+    assert outcomes == [orchestrate.LaneOutcome(kind="pending", story=a.id, level=0), foreign]
+    payload = orchestrate.escalated_payload("run-1", None, outcomes, [])
+    assert (payload["story"], payload["subtask"], payload["failed_phase"], payload["level"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert payload["detail"] == "RuntimeError: grafo broke"
 
 
 # ── the runner, on a real repo and a real board ─────────────────────────────

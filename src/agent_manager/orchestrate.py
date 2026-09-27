@@ -27,9 +27,9 @@ live in a `RunStop` that `run_milestone` creates for that run.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -58,30 +58,51 @@ def stopped_before_phase(detail: str | None) -> str | None:
     return detail[len(STOPPED_PREFIX):]
 
 
-LaneKind = Literal["done", "escalated", "stopped", "not_started"]
-"""How one story's lane ended: finished, escalated, parked by the stop after it
-had started, or never started because the stop was already set."""
+LaneKind = Literal["done", "escalated", "stopped", "pending"]
+"""How one story's lane ended (supervisor-tree T6): finished, escalated, stopped
+(parked by the stop, or saw it before a subtask), or never started by the tree."""
 
 
 @dataclass(frozen=True)
 class LaneOutcome:
     """What one story's lane did. Internal state, so a dataclass (CLAUDE.md).
 
-    `subtask` is the subtask that escalated or was parked. `failed_phase` and
-    `detail` describe an escalation, `before_phase` a stop. `completed` and
+    `subtask` is the subtask that escalated or was stopped before. `failed_phase`
+    and `detail` describe an escalation, `before_phase` a stop. `completed` and
     `warnings` are this lane's own, in the order they arrived; `run_milestone`
-    merges them across lanes in census order.
+    merges them across lanes in wave order. `story` and `level` are `None` only
+    for an error no lane raised, which nothing ties to one story (T6).
+    `primary` marks the first escalation in `executor.errors`.
     """
 
     kind: LaneKind
-    story: str
-    level: int
+    story: str | None
+    level: int | None
     subtask: str | None = None
     failed_phase: str | None = None
     detail: str | None = None
     before_phase: str | None = None
     completed: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    primary: bool = False
+
+
+class LaneEscalated(Exception):
+    """A lane's escalation, raised so grafo never releases its dependents (T6)."""
+
+    def __init__(self, outcome: LaneOutcome) -> None:
+        super().__init__(
+            f"story {outcome.story} escalated at {outcome.subtask}: {outcome.detail}"
+        )
+        self.outcome = outcome
+
+
+class LaneStopped(Exception):
+    """A lane that parked, or saw the stop before a subtask (T6)."""
+
+    def __init__(self, outcome: LaneOutcome) -> None:
+        super().__init__(f"story {outcome.story} stopped before {outcome.subtask}")
+        self.outcome = outcome
 
 
 @dataclass
@@ -342,6 +363,106 @@ def story_tips(
     ]
 
 
+@dataclass(frozen=True)
+class SupervisorPlan:
+    """What `supervise` schedules (T1). Internal state, so a dataclass.
+
+    `stories` is every census story, done ones included, in census order: each
+    becomes a node. `roots` and `tips` cover all of them. `levels` are the
+    pending stories' waves from `plan_levels`, and `rows` their store rows from
+    `record_plan`.
+    """
+
+    stories: tuple[census.StoryPlan, ...]
+    levels: tuple[tuple[PlannedStory, ...], ...]
+    roots: dict[str, dag.RootPlan]
+    tips: dict[str, str]
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
+
+    @property
+    def planned(self) -> dict[str, PlannedStory]:
+        """The pending stories by id, in wave order."""
+        return {planned.story.id: planned for level in self.levels for planned in level}
+
+
+def supervisor_plan(
+    stories: Sequence[census.StoryPlan],
+    levels: Sequence[Sequence[PlannedStory]],
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]],
+    *,
+    branch_prefix: str,
+    base_branch: str,
+) -> SupervisorPlan:
+    """Every census story's root and tip beside the pending waves and their rows.
+
+    Pure. `plan_levels` has already run the cycle check and refused `merged`
+    roots for every pending story, so this derives geometry and refuses nothing.
+    """
+    stories = tuple(stories)
+    by_id = {story.id: story for story in stories}
+    return SupervisorPlan(
+        stories=stories,
+        levels=tuple(tuple(level) for level in levels),
+        roots={
+            story.id: dag.story_root(story, by_id, branch_prefix, base_branch)
+            for story in stories
+        },
+        tips={
+            story.id: dag.story_tip(story, by_id, branch_prefix, base_branch)
+            for story in stories
+        },
+        rows=rows,
+    )
+
+
+def collect_outcomes(
+    plan: SupervisorPlan,
+    nodes: Mapping[str, Any],
+    errors: Sequence[BaseException],
+    finished: Mapping[str, LaneOutcome],
+) -> list[LaneOutcome]:
+    """One outcome per pending story in wave order, then one per foreign error (T6).
+
+    A node with an output is `done` (its lane's finished outcome). A
+    `LaneEscalated` gives its outcome, the first in `errors` marked `primary`.
+    A `LaneStopped` gives its outcome. Anything else in `errors` escaped every
+    lane's catch-all, so it is `escalated` with `"<Type>: <msg>"` and tied to no
+    story. No output and no error is `pending`.
+    """
+    escalated: dict[str, LaneOutcome] = {}
+    stopped: dict[str, LaneOutcome] = {}
+    foreign: list[LaneOutcome] = []
+    for error in errors:
+        if isinstance(error, LaneEscalated):
+            outcome = error.outcome if escalated else replace(error.outcome, primary=True)
+            escalated.setdefault(outcome.story, outcome)
+        elif isinstance(error, LaneStopped):
+            stopped.setdefault(error.outcome.story, error.outcome)
+        else:
+            foreign.append(
+                LaneOutcome(
+                    kind="escalated",
+                    story=None,
+                    level=None,
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            )
+    outcomes: list[LaneOutcome] = []
+    for level in plan.levels:
+        for planned in level:
+            story_id = planned.story.id
+            node = nodes.get(story_id)
+            if node is not None and node.output is not None and story_id in finished:
+                outcomes.append(finished[story_id])
+            elif story_id in escalated:
+                outcomes.append(escalated[story_id])
+            elif story_id in stopped:
+                outcomes.append(stopped[story_id])
+            else:
+                outcomes.append(LaneOutcome(kind="pending", story=story_id, level=planned.level))
+    return outcomes + foreign
+
+
 def refresh_git(root: Path) -> None:
     """Once per run: `git fetch origin` if an `origin` remote exists, then `git worktree prune`.
 
@@ -469,7 +590,7 @@ def run_story_lane(
     story_id = planned.story.id
     level = planned.level
     if stop.event.is_set():
-        return LaneOutcome(kind="not_started", story=story_id, level=level)
+        return LaneOutcome(kind="pending", story=story_id, level=level)
 
     story_row, subtask_rows = rows[story_id]
     completed: list[str] = []
