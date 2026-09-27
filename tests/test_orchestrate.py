@@ -105,16 +105,23 @@ def test_plan_levels_stacks_on_the_full_list_and_roots_on_a_done_blockers_tip():
     assert c_plan.tip == _branch_of(c.subtasks[-1])
 
 
-def test_plan_levels_refuses_a_story_with_two_in_milestone_blockers():
+def test_plan_levels_roots_a_two_blocker_story_on_its_merged_base():
+    """Supervisor-tree §5: a story with two in-milestone blockers is planned,
+    not refused. Its first subtask stacks on its own merged base
+    `<prefix>/base-<short id>`, the rest on the subtask before them."""
     a = _plan_story(1, [_plan_subtask(11)])
     b = _plan_story(2, [_plan_subtask(21)])
-    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    c = _plan_story(3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[b.id, "outside", a.id])
 
-    with pytest.raises(dag.StackRootError) as caught:
-        orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="main")
+    levels = orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="main")
 
-    assert f"#{a.id}" in str(caught.value)
-    assert f"#{b.id}" in str(caught.value)
+    assert [[planned.story.id for planned in level] for level in levels] == [[a.id, b.id], [c.id]]
+    c_plan = levels[1][0]
+    assert c_plan.bases == {
+        _plan_id(31): "m3/base-00000003",
+        _plan_id(32): _branch_of(c.subtasks[0]),
+    }
+    assert c_plan.tip == _branch_of(c.subtasks[-1])
 
 
 def test_plan_levels_refuses_a_blocker_cycle_before_any_geometry():
@@ -125,43 +132,21 @@ def test_plan_levels_refuses_a_blocker_cycle_before_any_geometry():
         orchestrate.plan_levels([a, b], branch_prefix="m3", base_branch="main")
 
 
-def test_plan_levels_refuses_a_story_rooted_through_a_subtask_less_story_on_two_blockers():
-    """A subtask-less story blocked by two stories has a merged root, and a
-    story it blocks falls through to that root. Until merged bases are built
-    (Task 3.2), the real run refuses it, naming the two-blocker story and
-    both of its blockers."""
+def test_plan_levels_roots_a_story_behind_a_subtask_less_two_blocker_story_on_that_base():
+    """A subtask-less story on two blockers has a merged root, and a story it
+    blocks falls through to it, as `dag.story_tip` does. The joined story has
+    nothing to drive, so it is in no wave, and the story behind it lands in
+    wave 0 and stacks on the joined story's base."""
     a = _plan_story(1, [_plan_subtask(11)])
     b = _plan_story(2, [_plan_subtask(21)])
     joined = _plan_story(3, [], blocked_by=[a.id, b.id])
     d = _plan_story(4, [_plan_subtask(41)], blocked_by=[joined.id])
 
-    with pytest.raises(dag.StackRootError) as caught:
-        orchestrate.plan_levels([a, b, joined, d], branch_prefix="m3", base_branch="main")
+    levels = orchestrate.plan_levels([a, b, joined, d], branch_prefix="m3", base_branch="main")
 
-    message = str(caught.value)
-    assert f"#{joined.id}" in message
-    assert f"#{a.id}" in message
-    assert f"#{b.id}" in message
-    assert "ONE parent branch" in message
-
-
-def test_plan_levels_refuses_a_two_blocker_story_with_todays_message_word_for_word():
-    """The refusal moved out of `dag.story_root` into `plan_levels`; its text
-    must not drift. It counts and names only in-milestone blockers, in
-    `blocked_by` order, and names the base branch it was given."""
-    a = _plan_story(1, [_plan_subtask(11)])
-    b = _plan_story(2, [_plan_subtask(21)])
-    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[b.id, "outside", a.id])
-
-    with pytest.raises(dag.StackRootError) as caught:
-        orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="trunk")
-
-    assert str(caught.value) == (
-        f"dag: story #{c.id} is blocked by 2 stories (#{b.id}, #{a.id}), "
-        "and a stack can only root on ONE parent branch. Merge those blockers into "
-        "trunk first, or restructure the dependencies so this story has "
-        "a single blocker."
-    )
+    assert [[planned.story.id for planned in level] for level in levels] == [[a.id, b.id, d.id]]
+    d_plan = levels[0][2]
+    assert d_plan.bases == {_plan_id(41): "m3/base-00000003"}
 
 
 def test_a_milestone_with_nothing_pending_plans_no_levels():
@@ -1475,40 +1460,6 @@ def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, inte
     assert [call["stories"] for call in integrate_recorder.calls] == [[story_a]]
     run = _load(project, result["run_id"])
     assert _statuses(run) == {"run": "done"}
-
-
-@requires_git
-@requires_brd
-def test_merged_root_is_refused(project, monkeypatch):
-    """A story whose `RootPlan` is `merged` is refused before anything is
-    written: no git call, no run directory, no worktree (Task 3.2 lifts this)."""
-    milestone = _add_card(project, "Milestone 3: orchestration")
-    first = _add_card(project, "Story one", milestone)
-    second = _add_card(project, "Story two", milestone)
-    joined = _add_card(project, "Story three", milestone)
-    for story in (first, second, joined):
-        _add_card(project, f"only subtask of {story}", story)
-    _block(project, joined, first)
-    _block(project, joined, second)
-    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
-    by_id = {story.id: story for story in plan.stories}
-    root = dag.story_root(by_id[joined], by_id, PREFIX, "main")
-    assert root.kind == "merged"
-    assert set(root.blockers) == {first, second}
-    porcelain_before = _git(project, "status", "--porcelain")
-    git_calls = _record_git(monkeypatch)
-    driver = FakeDriver()
-
-    with pytest.raises(dag.StackRootError) as caught:
-        _run(project, milestone, driver)
-
-    assert f"#{first}" in str(caught.value)
-    assert f"#{second}" in str(caught.value)
-    assert driver.calls == []
-    assert git_calls == []
-    assert list(paths.data_dir().iterdir()) == []
-    assert not (project / ".claude").exists()
-    assert _git(project, "status", "--porcelain") == porcelain_before
 
 
 @requires_git
