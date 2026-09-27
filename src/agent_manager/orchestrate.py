@@ -88,7 +88,9 @@ class LaneOutcome:
     `warnings` are this lane's own, in the order they arrived; `run_milestone`
     merges them across lanes in wave order. `story` and `level` are `None` only
     for an error no lane raised, which nothing ties to one story (T6).
-    `primary` marks the first escalation in `executor.errors`.
+    `primary` marks the first escalation in `executor.errors`. `base` is the
+    merged base this lane built, as the story's `dag.RootPlan`, or None when it
+    built none; `run_milestone` reports it under `bases` (supervisor-tree §5).
     """
 
     kind: LaneKind
@@ -101,6 +103,7 @@ class LaneOutcome:
     completed: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     primary: bool = False
+    base: dag.RootPlan | None = None
 
 
 class LaneEscalated(Exception):
@@ -215,6 +218,31 @@ def integrate_escalated_payload(
         "run_id": run_id,
         "warnings": warnings,
     }
+
+
+def bases_payload(outcomes: Sequence[LaneOutcome]) -> list[dict[str, Any]]:
+    """Every merged base a lane built this run, in the order the outcomes come.
+
+    `collect_outcomes` gives wave order, so this is wave order. `blockers` is
+    the story's `root_plan.blockers`, the order the tips were merged in.
+    """
+    return [
+        {
+            "story": outcome.story,
+            "branch": outcome.base.branch,
+            "blockers": list(outcome.base.blockers),
+        }
+        for outcome in outcomes
+        if outcome.base is not None
+    ]
+
+
+def with_bases(payload: dict[str, Any], built: list[dict[str, Any]]) -> dict[str, Any]:
+    """`payload` with `bases` set, only when a base was built: every payload
+    shape carries the key on the same terms (spec, Report)."""
+    if built:
+        payload["bases"] = built
+    return payload
 
 
 def _utcnow() -> datetime:

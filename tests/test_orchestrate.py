@@ -305,6 +305,39 @@ def test_a_final_verification_escalation_payload_has_no_story():
     assert (payload["story"], payload["files"], payload["phase"]) == (None, [], "integrate")
 
 
+def test_the_bases_payload_lists_every_built_base_in_outcome_order():
+    """Spec, Report: one entry per lane that built its merged base, in the
+    order `collect_outcomes` gave (wave order), blockers in `root_plan` order.
+    An outcome with no base contributes nothing, whatever its kind."""
+    first = dag.RootPlan("merged", "m3/base-00000003", (_plan_id(2), _plan_id(1)))
+    second = dag.RootPlan("merged", "m3/base-00000005", (_plan_id(4), _plan_id(3)))
+    outcomes = [
+        orchestrate.LaneOutcome(kind="done", story=_plan_id(1), level=0),
+        orchestrate.LaneOutcome(kind="done", story=_plan_id(3), level=1, base=first),
+        orchestrate.LaneOutcome(
+            kind="escalated", story=_plan_id(5), level=2, subtask=_plan_id(51), base=second
+        ),
+        orchestrate.LaneOutcome(kind="pending", story=_plan_id(6), level=2),
+    ]
+
+    assert orchestrate.bases_payload(outcomes) == [
+        {"story": _plan_id(3), "branch": "m3/base-00000003", "blockers": [_plan_id(2), _plan_id(1)]},
+        {"story": _plan_id(5), "branch": "m3/base-00000005", "blockers": [_plan_id(4), _plan_id(3)]},
+    ]
+    assert orchestrate.bases_payload([]) == []
+
+
+def test_the_bases_key_is_added_only_when_a_base_was_built():
+    entry = {"story": _plan_id(3), "branch": "m3/base-00000003", "blockers": [_plan_id(1)]}
+
+    assert orchestrate.with_bases({"done": True}, []) == {"done": True}
+    assert orchestrate.with_bases({"done": True}, [entry]) == {"done": True, "bases": [entry]}
+
+
+def test_a_lane_outcome_has_no_base_by_default():
+    assert orchestrate.LaneOutcome(kind="done", story="A", level=0).base is None
+
+
 def _supervisor_plan(stories: list[census.StoryPlan]) -> orchestrate.SupervisorPlan:
     levels = orchestrate.plan_levels(stories, branch_prefix="m3", base_branch="main")
     return orchestrate.supervisor_plan(
