@@ -1311,7 +1311,7 @@ def _resume_from_checkpoint(
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
 ) -> dict[str, Any]:
-    """Continue the run's one in-flight subtask from its newest checkpoint.
+    """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
     Every refusal that needs no store -- nothing in flight, a card the board
     lost -- comes before `Store.open`. The checkpoint can only be read through
@@ -1319,8 +1319,8 @@ def _resume_from_checkpoint(
     is opened and before the first write. Then the orphan attempts are marked
     `harness_error`, the run, story and subtask are recorded `started`, and
     `drive_subtask` walks `TASK` from the checkpoint, whose queue says where the
-    walk goes on. A milestone run records `workflow="milestone"`, which names no
-    workflow; every subtask is walked through `TASK` either way (card 02890d5d).
+    walk goes on. A `milestone` run never comes here: `resume_run` hands it to
+    `orchestrate.run_milestone` (card 54e4ec29).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1394,7 +1394,13 @@ def resume_run(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
 ) -> dict[str, Any]:
-    """Pick one stopped or killed subtask back up from its checkpoint (§9, card 02890d5d).
+    """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
+
+    The run's recorded `workflow` decides. A `task` run continues its one
+    in-flight subtask (`_resume_from_checkpoint`, card 02890d5d), exactly as
+    before. A `milestone` run continues the whole milestone under the same
+    run id (`orchestrate.run_milestone(resume_run_id=...)`, card 54e4ec29).
+    Any other workflow is refused.
 
     The order is load-bearing in the same way `run_card`'s is, only inverted:
     every refusal -- unknown run, nothing in flight, a card the board lost --
@@ -1402,14 +1408,14 @@ def resume_run(
     and therefore mints a run directory, and a refusal that left one behind
     would be this command writing state for a run it declined to touch.
 
-    Branch, base branch and worktree come from the recorded `SubtaskRun` and
-    never from a flag: §9's "the run records what it was started with" is the
+    Branch, base branch and worktree come from the recorded run and never
+    from a flag: §9's "the run records what it was started with" is the
     reason the record exists. The two knobs the record does *not* carry --
     `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are still taken as arguments, but a walk continued from a checkpoint never
-    reads them: its binding comes from the checkpoint's pool, which holds the
-    suite and the opt-out the run *started* with. Whether a resume should be
-    able to change them is a follow-up decision, not this function's.
+    are still taken as arguments. A walk continued from a checkpoint never
+    reads them: its binding comes from the checkpoint's pool. On a milestone
+    they also reach what starts afresh -- subtasks with no checkpoint, merged
+    bases and Integrate.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1422,12 +1428,31 @@ def resume_run(
             )
     finally:
         conn.close()
-    return _resume_from_checkpoint(
-        run,
-        root=root,
-        allow_no_verification=allow_no_verification,
-        commands=commands,
-        runner_factory=runner_factory,
+    if run.workflow == WORKFLOW_NAME:
+        return _resume_from_checkpoint(
+            run,
+            root=root,
+            allow_no_verification=allow_no_verification,
+            commands=commands,
+            runner_factory=runner_factory,
+        )
+    # Imported here for the reason `run` gives: `orchestrate` imports this
+    # module at load time. Read as `orchestrate.run_milestone` so a test can
+    # patch it there.
+    from agent_manager import orchestrate
+
+    if run.workflow == orchestrate.MILESTONE_WORKFLOW:
+        return orchestrate.run_milestone(
+            None,
+            repo_dir=root,
+            commands=list(commands),
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            resume_run_id=run.id,
+        )
+    raise NotResumableError(
+        f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+        f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
     )
 
 
@@ -1441,27 +1466,27 @@ def resume(
         False,
         "--allow-no-verification",
         help=(
-            "Accepted for compatibility and currently has no effect: the checkpoint "
-            "carries the opt-out the run started with."
+            "A walk continued from a checkpoint keeps the opt-out the run started "
+            "with. On a milestone run, this applies to what starts afresh: "
+            "subtasks with no checkpoint, merged bases and Integrate."
         ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "Accepted for compatibility and currently has no effect: the checkpoint "
-            "carries the verification suite the run started with."
+            "A walk continued from a checkpoint keeps the suite the run started "
+            "with. On a milestone run, this is the suite for what starts afresh: "
+            "subtasks with no checkpoint, merged bases and Integrate."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Continue a stopped or killed subtask from its checkpoint, and drive it to the end.
+    """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
 
     No `--base-branch` and no `--branch-prefix`: both were decided when the run
-    started and are recorded on the subtask (§9). `--allow-no-verification` and
-    `--verify` are still accepted, but the continued walk binds the suite and
-    the opt-out out of the checkpoint the run started with, so neither changes
-    what a resume verifies.
+    started and are recorded (§9). A `task` run continues its one subtask; a
+    `milestone` run continues the whole milestone under the same run id.
     """
     try:
         payload = resume_run(
@@ -1474,7 +1499,9 @@ def resume(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
-    # Strict equality on purpose: a `stopped` walk (addendum P4) is not an
+    # A task payload reports `status`; a milestone payload has none and
+    # carries `escalated: true` only when it stopped, as for `run`. Both
+    # checks are strict on purpose: a `stopped` walk (addendum P4) is not an
     # escalation, so it exits 0 with an ok envelope.
-    if payload["status"] == "escalated":
+    if payload.get("status") == "escalated" or payload.get("escalated") is True:
         raise typer.Exit(EXIT_ESCALATED)

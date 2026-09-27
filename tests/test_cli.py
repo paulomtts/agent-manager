@@ -4509,20 +4509,25 @@ def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards)
 @requires_git
 @requires_brd
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
-    project, cards
+    project, cards, monkeypatch
 ):
-    """Spec test 4: the run is a `milestone` run, and its parked subtask
-    continues from its checkpoint instead of being refused."""
+    """Spec test 1, parked half (card 54e4ec29): the run is a `milestone` run,
+    so `resume` continues the milestone, and its parked subtask goes on from
+    its checkpoint at `validate_spec`."""
     run_id = _park_pygents(project, cards)
+    integrate = _integrate_ok(monkeypatch)
 
     after: list[str] = []
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(after))
 
-    assert payload["status"] == "done"
-    assert payload["resumed_from"] == "validate_spec"
-    assert payload["discarded_attempts"] == []
+    assert payload["done"] is True, payload
+    assert payload["resumed"] is True
+    assert payload["run_id"] == run_id
+    assert payload["completed"] == [cards["subtask"]]
     assert after[0] == "validate_spec"
     assert not {"explore", "spec"} & set(after)
+    assert [call["run_id"] for call in integrate] == [run_id]
+    assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
@@ -4729,3 +4734,347 @@ def test_the_help_offers_no_engine_flag(command):
 
     assert result.exit_code == 0, result.output
     assert "--engine" not in result.output
+
+
+# ── am resume on a milestone run (card 54e4ec29) ─────────────────────────────
+
+MILESTONE_AT = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+"""The interrupted milestone run's clock, so its run id is known."""
+
+
+def _integrate_ok(monkeypatch) -> list[dict[str, Any]]:
+    """Replace `integration.integrate_milestone`, which `run_milestone` reads at
+    call time, with a success that merges nothing; record every call."""
+    calls: list[dict[str, Any]] = []
+
+    def succeed(**kwargs: Any) -> integration.IntegrateSuccess:
+        calls.append(kwargs)
+        branch = integration.integration_branch(kwargs["branch_prefix"])
+        return integration.IntegrateSuccess(
+            branch=branch,
+            worktree=cli.worktree_for(kwargs["repo_dir"], branch),
+            merged=[story.id for story in kwargs["stories"] if story.subtasks],
+        )
+
+    monkeypatch.setattr(integration, "integrate_milestone", succeed)
+    return calls
+
+
+def _milestone_factory(seen: dict[str, list[str]], fail: dict[str, str] | None = None):
+    """A `cli.RunnerFactory` for a whole milestone: `fake_runner` per card, each
+    agent phase recorded under its card, and `fail[card]` failing that phase."""
+    failing = dict(fail or {})
+
+    def factory(*, store, run_id, story_id, card_id):
+        inner = fake_runner(fail=failing.get(card_id))
+
+        def runner(phase, context, rendered):
+            seen.setdefault(card_id, []).append(phase.name)
+            return inner(phase, context, rendered)
+
+        return runner
+
+    return factory
+
+
+@pytest.fixture
+def resume_board(project) -> dict[str, str]:
+    """Milestone 4: story A (a1 then a2) and story B (b1), B blocked by A."""
+    milestone = _add_card(project, "Milestone 4: resume")
+    story_a = _add_card(project, "Story A: first", milestone)
+    a1 = _add_card(project, "a1: first of A", story_a)
+    a2 = _add_card(project, "a2: second of A", story_a)
+    _block(project, a2, a1)
+    story_b = _add_card(project, "Story B: second", milestone)
+    b1 = _add_card(project, "b1: only of B", story_b)
+    _block(project, story_b, story_a)
+    return {
+        "milestone": milestone,
+        "story_a": story_a,
+        "a1": a1,
+        "a2": a2,
+        "story_b": story_b,
+        "b1": b1,
+    }
+
+
+def _escalate_milestone(project: Path, shape: dict[str, str]) -> str:
+    """A real milestone run on the fake runner: a1 done, a2 escalated at
+    `review`, B never started. Returns the run id."""
+    payload = orchestrate.run_milestone(
+        shape["milestone"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m4",
+        runner_factory=_milestone_factory({}, fail={shape["a2"]: "review"}),
+        clock=lambda: MILESTONE_AT,
+        max_concurrent=2,
+    )
+    assert payload["escalated"] is True, payload
+    assert (payload["subtask"], payload["failed_phase"]) == (shape["a2"], "review")
+    return payload["run_id"]
+
+
+def _plant_orphan(project: Path, run_id: str, story_id: str, card_id: str, phase: str) -> None:
+    """An attempt left `started` by a kill mid-dispatch, as `dispatch.AgentRunner` records it."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.record_phase(
+            story_id, card_id, models.PhaseRun(name=phase, kind="agent", status="started")
+        )
+        opened.record_attempt(
+            story_id,
+            card_id,
+            phase,
+            models.Attempt(n=1, dispatch=_recorded_dispatch(run_id), status="started"),
+        )
+    finally:
+        opened.close()
+
+
+def _project_run_ids(project: Path) -> list[str]:
+    conn = sqlite3.connect(paths.project_db_path(project))
+    try:
+        return [row[0] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _loaded(project: Path, run_id: str) -> models.Run:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    return run
+
+
+def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "milestone") -> None:
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow=workflow,
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m4",
+                status=status,
+                started_at=RECORDED_AT,
+            )
+        )
+    finally:
+        opened.close()
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
+    project, resume_board, monkeypatch
+):
+    """Spec test 1, escalated half: a2 resumes at `review` with nothing before
+    it re-dispatched, a1 (done) is not driven, b1 starts fresh, Integrate
+    runs, and only this invocation's work is `completed`."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    integrate = _integrate_ok(monkeypatch)
+    seen: dict[str, list[str]] = {}
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_milestone_factory(seen))
+
+    assert payload["done"] is True, payload
+    assert payload["resumed"] is True
+    assert payload["run_id"] == run_id
+    assert payload["completed"] == [shape["a2"], shape["b1"]]
+    assert shape["a1"] not in seen
+    assert seen[shape["a2"]][0] == "review"
+    assert not {
+        "explore",
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "implement",
+    } & set(seen[shape["a2"]])
+    assert seen[shape["b1"]][0] == "explore"
+    assert [call["run_id"] for call in integrate] == [run_id]
+    assert _project_run_ids(project) == [run_id]
+    run = _loaded(project, run_id)
+    assert run.status == "done"
+    assert run.config.max_concurrent_stories == 2
+    assert board.show(shape["a2"], repo_dir=project).status == "done"
+    assert board.show(shape["b1"], repo_dir=project).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
+    project, resume_board, monkeypatch
+):
+    """Spec test 6: an attempt still `started` from the interrupted run."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    _plant_orphan(project, run_id, shape["story_a"], shape["a2"], "review")
+    _integrate_ok(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_milestone_factory({}))
+
+    assert payload["done"] is True, payload
+    rows = [row for row in _attempt_rows(project) if row[2] == shape["a2"]]
+    assert [(row[3], row[4], row[5]) for row in rows] == [("review", 1, "harness_error")]
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_resume_across_a_workflow_change_is_exit_three_and_writes_nothing(
+    project, resume_board, monkeypatch
+):
+    """Spec test 3: one stale subtask refuses the whole resume; the orphan is
+    still `started`, and no row, attempt, checkpoint, journal line or branch changed."""
+    shape = resume_board
+    run_id = _escalate_milestone(project, shape)
+    _plant_orphan(project, run_id, shape["story_a"], shape["a2"], "review")
+    _plant_changed_digest(project, run_id, shape["a2"])
+    before = _resume_state(project)
+    branches = _git(project, "branch", "--format=%(refname:short)")
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    message = envelope["error"]["message"]
+    assert message.startswith("workflow changed since checkpoint")
+    assert shape["a2"] in message
+    assert "saved-under-another-task" in message
+    assert task_workflow.TASK.digest() in message
+    assert _resume_state(project) == before
+    assert _git(project, "branch", "--format=%(refname:short)") == branches
+    assert [row[5] for row in _attempt_rows(project) if row[2] == shape["a2"]] == ["started"]
+
+
+def test_resuming_a_finished_milestone_run_is_exit_three_and_writes_nothing(
+    projection, monkeypatch
+):
+    """Spec test 5: refused before the board is read or the store opened."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="done")
+    before = (_runs_snapshot(), _attempt_rows(projection))
+    monkeypatch.setattr(cli.board, "roots", _Forbidden("board.roots"))
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "NotResumableError"
+    assert envelope["error"]["message"] == (
+        f"run {run_id} finished; start new work with am run --milestone"
+    )
+    assert (_runs_snapshot(), _attempt_rows(projection)) == before
+
+
+def test_resume_routes_a_task_run_to_the_single_subtask_path(projection, monkeypatch):
+    """Spec test 8: a `task` run goes where it always went, with the same arguments."""
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(projection, run_id, started_at=RECORDED_AT, status="started")
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append((run.id, run.workflow, kwargs))
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    assert payload == {"status": "done"}
+    assert seen == [
+        (
+            run_id,
+            "task",
+            {
+                "root": projection.resolve(),
+                "allow_no_verification": False,
+                "commands": (),
+                "runner_factory": None,
+            },
+        )
+    ]
+
+
+def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
+    projection, monkeypatch
+):
+    """Review Focus 5: `--verify` and the opt-out reach the milestone resume."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append((milestone, kwargs))
+        return {"done": True, "run_id": run_id, "resumed": True}
+
+    def factory(**kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=projection,
+        commands=("uv run pytest",),
+        allow_no_verification=True,
+        runner_factory=factory,
+    )
+
+    assert payload == {"done": True, "run_id": run_id, "resumed": True}
+    assert calls == [
+        (
+            None,
+            {
+                "repo_dir": projection.resolve(),
+                "commands": ["uv run pytest"],
+                "allow_no_verification": True,
+                "runner_factory": factory,
+                "resume_run_id": run_id,
+            },
+        )
+    ]
+
+
+def test_resume_refuses_a_run_of_a_workflow_it_does_not_know(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="started", workflow="integrate")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    with pytest.raises(cli.NotResumableError, match="'integrate'"):
+        cli.resume_run(run_id, repo_dir=projection)
+
+
+@pytest.mark.parametrize(
+    "payload, code",
+    [
+        ({"done": True, "run_id": "r", "resumed": True}, 0),
+        ({"escalated": True, "run_id": "r", "resumed": True}, cli.EXIT_ESCALATED),
+    ],
+    ids=["done", "escalated"],
+)
+def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
+    tmp_path, monkeypatch, payload, code
+):
+    """A milestone payload has no `status` key, as for `run --milestone`."""
+    monkeypatch.setattr(cli, "resume_run", lambda run_id, **kwargs: payload)
+
+    result = runner.invoke(
+        cli.app, ["resume", "20260927T100000Z-cbe34d00", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == code, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)
