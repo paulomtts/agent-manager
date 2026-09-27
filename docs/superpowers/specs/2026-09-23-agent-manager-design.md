@@ -433,6 +433,8 @@ bounded by `max_concurrent_stories` (default 4, set with
 starts only after every story of the current one has finished. See the
 parallel-stories addendum, `2026-09-24-parallel-stories-design.md`.
 
+**Status (milestone 7):** superseded by the supervisor-tree addendum, `2026-09-25-supervisor-tree-design.md`: levels are no longer barriers (a story starts once its own blockers finish), a story with two or more blockers roots on a merged base, and `am resume` continues a milestone run.
+
 Stories within a dependency level run in parallel, bounded by
 `max_concurrent_stories` (default 4). Subtasks within a story run
 **sequentially**, each branch stacked on the previous subtask's branch. This is
