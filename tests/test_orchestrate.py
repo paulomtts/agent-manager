@@ -2325,6 +2325,43 @@ def test_every_node_has_no_timeout(project, monkeypatch):
     assert [node._timeout for node in built] == [None] * len(built)
 
 
+@requires_git
+@requires_brd
+def test_each_blocker_forwards_its_tip_to_its_dependent(project, monkeypatch):
+    """T1: one edge per in-milestone blocker, forwarding the blocker's tip as
+    `tip_<short id>` (Task 3.2 reads it for merged bases). A done blocker's
+    node forwards its existing tip, a pending one the tip its lane finished."""
+    received: dict[str, dict[str, Any]] = {}
+
+    class RecordingNode(grafo.Node):
+        def __init__(self, *args: Any, coroutine: Any, uuid: str, **kwargs: Any) -> None:
+            async def recorded(**forwarded: Any) -> Any:
+                received[uuid] = forwarded
+                return await coroutine(**forwarded)
+
+            super().__init__(*args, coroutine=recorded, uuid=uuid, **kwargs)
+
+    monkeypatch.setattr(grafo, "Node", RecordingNode)
+    shape = _milestone(
+        project, {"A": 1, "C": 1, "D": 1, "E": 1}, blocked_by={"C": ["A"], "E": ["D"]}
+    )
+    stories = shape["stories"]
+    (a1,) = shape["subtasks"]["A"]
+    (d1,) = shape["subtasks"]["D"]
+    for card in (d1, stories["D"]):
+        board.set_status(card, "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert received == {
+        stories["A"]: {},
+        stories["D"]: {},
+        stories["C"]: {f"tip_{dag.short_id(stories['A'])}": _branch(project, a1)},
+        stories["E"]: {f"tip_{dag.short_id(stories['D'])}": _branch(project, d1)},
+    }
+
+
 def _patch_default_node_timeout(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
     """Make `grafo.Node`'s default `timeout` `seconds` for this test."""
     init = grafo.Node.__init__
