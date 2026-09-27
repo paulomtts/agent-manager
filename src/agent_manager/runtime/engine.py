@@ -10,11 +10,13 @@ tools, one `Agent` runs them, and `agent.run()` is always consumed to the end
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pygents import Agent, AgentRegistry, ContextPool, ContextQueue
+from pygents.errors import UnregisteredAgentError
 
 from agent_manager.runtime import walk
 from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN and ON_PAUSE hooks
@@ -251,12 +253,12 @@ def _collect(agent: Agent, deps: RunDeps, summary: walk.SubtaskSummary) -> None:
 
 
 def _forget(name: str) -> None:
-    """Free `name` in pygents' process-wide `AgentRegistry` for the next run.
+    """Free `name` in pygents' process-wide `AgentRegistry` so it can be reused.
 
-    The installed pygents 0.7.0 has `AgentRegistry.unregister`, but switching
-    to it is decision A2 of
-    docs/superpowers/specs/2026-09-25-pygents-070-adoption-design.md, a card of
-    its own. Until then this is the pre-0.7.0 workaround the milestone spec
-    (§11) describes: pop the registry's dict, tolerating a name already gone.
+    The name may legitimately be absent: a resumed checkpoint's agent was
+    never registered in this process, or a run's own name is already gone.
+    Only `UnregisteredAgentError` is tolerated; any other error is a real
+    fault and propagates.
     """
-    AgentRegistry._registry.pop(name, None)
+    with contextlib.suppress(UnregisteredAgentError):
+        AgentRegistry.unregister(name)
