@@ -232,3 +232,110 @@ async def test_cancelling_mid_agent_phase_kills_the_process_and_leaves_a_resumab
     assert summary.status == "done"
     assert set(summary.results) == {"a", "spec", "b"}
     assert _reasons(store)[2:] == [(2, "turn"), (3, "turn"), (4, "done")]
+
+
+# ── cancel mid-step-phase (A3) ───────────────────────────────────────────────
+
+
+class _Gate:
+    """Holds step `slow` until `opened`. `entered` and `left` bracket its worker."""
+
+    def __init__(self, *, opened: bool = False) -> None:
+        self.entered = threading.Event()
+        self.opened = threading.Event()
+        self.left = threading.Event()
+        if opened:
+            self.opened.set()
+
+
+def _gated(ran: list[str], gate: _Gate) -> Workflow:
+    """Steps `a`, `slow`, `b`. Each appends its name to `ran`; `slow` waits on
+    `gate`. Every call builds closures with the same qualified names, so every
+    `_gated` workflow has the same digest and resumes another's checkpoint."""
+
+    def make(name: str):
+        def run(card: str) -> dict[str, Any]:
+            ran.append(name)
+            if name == "slow":
+                gate.entered.set()
+                try:
+                    if not gate.opened.wait(10):
+                        raise RuntimeError("the gate was never opened")
+                finally:
+                    gate.left.set()
+            return {name: name.upper()}
+
+        return run
+
+    return Workflow("gated", tuple(Step(n, make(n)) for n in ("a", "slow", "b")))
+
+
+async def _cancel_in_slow(wf: Workflow, gate: _Gate, opened, **kwargs: Any) -> Agent:
+    """Run `wf` as a task, cancel it while `slow` is in flight, and let the
+    abandoned worker finish. Returns the cancelled run's agent."""
+    task = asyncio.create_task(_run(wf, opened, **kwargs))
+    assert await asyncio.to_thread(gate.entered.wait, 5)
+    agent = AgentRegistry.get(AGENT_NAME)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # A `to_thread` worker cannot be cancelled, only abandoned: release it and
+    # wait it out, so whatever it does after the cancel has been done.
+    gate.opened.set()
+    assert await asyncio.to_thread(gate.left.wait, 5)
+    return agent
+
+
+async def test_cancelling_mid_step_phase_leaves_a_resumable_turn(store, completions):
+    ran: list[str] = []
+    gate = _Gate()
+
+    agent = await _cancel_in_slow(_gated(ran, gate), gate, store)
+
+    assert completions == [("a", StopReason.COMPLETED), ("slow", StopReason.CANCELLED)]
+    _assert_stopped(agent)
+    _assert_free(AGENT_NAME)
+    # Review Focus 1: the abandoned worker has finished, and still no row
+    # follows the `turn` row saved before `slow`.
+    assert _reasons(store) == [(0, "turn"), (1, "turn")]
+    latest = store.latest_checkpoint(CARD_ID)
+    assert latest.reason == "turn"
+    assert runtime_engine.pending_phase(latest) == "slow"
+
+    ran.clear()
+    rebuilt = _gated(ran, _Gate(opened=True))
+    assert rebuilt.digest() == latest.digest
+    summary = await _run(rebuilt, store, resume_from=latest)
+
+    assert ran == ["slow", "b"]
+    assert summary.status == "done"
+    assert summary.results == {"a": {"a": "A"}, "slow": {"slow": "SLOW"}, "b": {"b": "B"}}
+    assert _reasons(store)[2:] == [(2, "turn"), (3, "turn"), (4, "done")]
+
+
+async def test_a_resumed_run_cancelled_again_resumes_from_its_own_turn(store, completions):
+    # Review Focus 2.
+    ran: list[str] = []
+    first_gate = _Gate()
+    await _cancel_in_slow(_gated(ran, first_gate), first_gate, store)
+    first = store.latest_checkpoint(CARD_ID)
+
+    second_gate = _Gate()
+    await _cancel_in_slow(_gated(ran, second_gate), second_gate, store, resume_from=first)
+
+    _assert_free(AGENT_NAME)
+    assert completions == [
+        ("a", StopReason.COMPLETED),
+        ("slow", StopReason.CANCELLED),
+        ("slow", StopReason.CANCELLED),
+    ]
+    assert _reasons(store) == [(0, "turn"), (1, "turn"), (2, "turn")]
+    second = store.latest_checkpoint(CARD_ID)
+    assert runtime_engine.pending_phase(second) == "slow"
+
+    ran.clear()
+    summary = await _run(_gated(ran, _Gate(opened=True)), store, resume_from=second)
+
+    assert ran == ["slow", "b"]
+    assert summary.status == "done"
+    assert _reasons(store)[3:] == [(3, "turn"), (4, "turn"), (5, "done")]
