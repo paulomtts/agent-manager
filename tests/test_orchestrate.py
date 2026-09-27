@@ -2270,6 +2270,34 @@ def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
     }
 
 
+def test_cancelling_run_until_killed_cancels_the_work_it_awaits():
+    """Cancelling the caller reaches the executor, as a plain `await` would:
+    `run_until_killed` never leaves the tree running behind it."""
+
+    async def scenario() -> tuple[bool, bool]:
+        started = asyncio.Event()
+        work_cancelled = asyncio.Event()
+
+        async def work() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                work_cancelled.set()
+                raise
+
+        caller = asyncio.ensure_future(
+            orchestrate.run_until_killed(work(), asyncio.Event(), [])
+        )
+        await _within(started.wait(), "the work to start")
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        return caller.cancelled(), work_cancelled.is_set()
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
 @requires_git
 @requires_brd
 def test_warnings_and_completed_follow_census_order_not_finish_order(project):
