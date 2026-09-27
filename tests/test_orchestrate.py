@@ -3539,6 +3539,22 @@ def test_a_resolver_is_judged_against_integrate_not_task(tmp_path, monkeypatch):
     assert integrate_workflow.INTEGRATE.digest() in str(caught.value)
 
 
+def test_an_escalation_with_no_turn_row_left_starts_the_card_fresh(tmp_path, monkeypatch):
+    """A phase escalation's newest row holds no turn; with no `turn` row to
+    rewind to, the card is started fresh rather than handed a checkpoint
+    that names no phase to continue."""
+    root = _resume_root(tmp_path, monkeypatch)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, _plan_id(31), "escalated")
+
+        point = orchestrate.resume_point(opened, _plan_id(31), task_workflow.TASK)
+    finally:
+        opened.close()
+
+    assert point is None
+
+
 def _dispatch(root: Path) -> models.Dispatch:
     return models.Dispatch(
         harness="fake",
@@ -3719,6 +3735,37 @@ def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on
     run = _load(project, run_id)
     assert (run.status, run.branch_prefix, run.base_branch) == ("done", PREFIX, "main")
     assert run.config.max_concurrent_stories == 3
+
+
+@requires_git
+@requires_brd
+def test_a_resume_hands_a_subtask_less_storys_resolver_checkpoint_to_its_base(
+    project, fake_bases
+):
+    """J has no subtasks, so its base is built by its base-only lane, not a
+    subtask lane; its resolver's checkpoint must reach `bases.build` there too."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's resolver escalated")
+    first = _run(project, shape["milestone"], FakeDriver())
+    assert (first["escalated"], first["story"]) == (True, story_j), first
+    resolver = _plant_integrate(project, first["run_id"], story_j, "parked")
+    fake_bases.outcomes.clear()
+
+    result = _resume(project, first["run_id"], FakeDriver())
+
+    assert result["done"] is True, result
+    got = fake_bases.resumed[story_j]
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (
+        first["run_id"],
+        bases.resolver_card_id(story_j),
+        resolver.seq,
+        "parked",
+    )
 
 
 @requires_git
