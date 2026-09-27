@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -420,4 +421,38 @@ async def test_verification_runs_in_the_base_worktree(
 
     assert (base_worktree(repo) / "verified-here.txt").is_file()
     assert not (repo / "verified-here.txt").exists()
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_every_git_and_verify_call_runs_off_the_event_loop_thread(
+    two_story_repo: Path, MASTER_BEFORE: str, monkeypatch: pytest.MonkeyPatch
+):
+    # Spies, not mocks: each wrapper records the thread it was called on and
+    # then delegates to the real step, so real git and a real suite still run.
+    repo = two_story_repo
+    loop_thread = threading.get_ident()
+    calls: dict[str, list[int]] = {}
+
+    def spy(name: str, real):
+        def wrapper(*args, **kwargs):
+            calls.setdefault(name, []).append(threading.get_ident())
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(bases, "_ref_exists", spy("_ref_exists", bases._ref_exists))
+    monkeypatch.setattr(bases, "ensure", spy("ensure", bases.ensure))
+    monkeypatch.setattr(bases, "merge_tip", spy("merge_tip", bases.merge_tip))
+    monkeypatch.setattr(
+        bases.verify, "run_suite", spy("run_suite", bases.verify.run_suite)
+    )
+
+    result = await _build(repo, ["m7/a", "m7/b"], commands=["true"])
+
+    assert result.merged == ["m7/b"]
+    assert sorted(calls) == ["_ref_exists", "ensure", "merge_tip", "run_suite"]
+    assert all(
+        thread != loop_thread for threads in calls.values() for thread in threads
+    ), calls
     assert rev(repo, "master") == MASTER_BEFORE
