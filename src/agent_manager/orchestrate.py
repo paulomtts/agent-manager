@@ -1,17 +1,25 @@
-"""The milestone runner (orchestration addendum O6, parallel-stories P1/P4/P6).
+"""The milestone runner (orchestration addendum O6; supervisor-tree T1-T6).
 
 `run_milestone` drives every remaining subtask of one milestone through the
-shared per-subtask driver (O4). Each dependency level's stories run as lanes on
-a pool bounded by `max_concurrent`; a story's subtasks stay strictly sequential
-and level N+1 starts only after every lane of level N returns. Every derivation
-belongs to a collaborator: the milestone and its census to `census`, levels,
-stack bases and tips to `dag`, board reads to `board`, rollup to
-`steps.rollup`, git to `steps.worktree.run_git`, run state to `Store`. The
-terminal merge of every story tip belongs to `integration`. This module decides only the
-order of those calls and what a run records.
+shared per-subtask driver (O4) on one event loop: `asyncio.run(supervise(...))`.
+`supervise` builds one `grafo.Node` per census story -- done ones included,
+every one with `timeout=None` -- and one edge per in-milestone blocker, so a
+`grafo.TreeExecutor` starts each story the moment all its blockers succeeded.
+A story's lane takes one of `max_concurrent` slots only once it has started,
+so a waiting story never holds a slot, and its subtasks stay strictly
+sequential. Levels are no longer barriers; they stay in the report as waves.
+A lane fails by raising `LaneEscalated` or `LaneStopped`, so grafo never
+releases the dependents of a lane that did not finish clean, and
+`collect_outcomes` reads every story's outcome after the tree ran (T6).
+
+Every derivation belongs to a collaborator: the milestone and its census to
+`census`, waves, stack bases, roots and tips to `dag`, board reads to `board`,
+rollup to `steps.rollup`, git to `steps.worktree.run_git`, run state to
+`Store`. The terminal merge of every story tip belongs to `integration`. This
+module decides only the order of those calls and what a run records.
 
 The order is load-bearing. Everything that can refuse -- an unknown milestone,
-a blocker cycle, a story with two in-milestone blockers -- runs before the
+a blocker cycle, a story whose root would be a merged base -- runs before the
 first write, so a refusal leaves no run directory, no store, no fetch and no
 prune behind.
 
@@ -20,21 +28,24 @@ CLI wiring card makes `cli` import this module, and binding a `cli` name at
 import or definition time would break under that circular import. The clock
 default is this module's own `_utcnow` for the same reason.
 
-The module holds no mutable state of its own (O4). A run's lock and stop event
-live in a `RunStop` that `run_milestone` creates for that run.
+The module holds no mutable state of its own (O4). A run's `StopSignal` is
+created by `run_milestone` for that run. This is the only module that imports
+`grafo`.
 """
 
 from __future__ import annotations
 
-import threading
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import grafo
+
 from agent_manager import board, census, cli, dag, integration, models
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Checkpoint, Store
 
@@ -105,41 +116,21 @@ class LaneStopped(Exception):
         self.outcome = outcome
 
 
-@dataclass
-class RunStop:
-    """One run's cooperative stop, shared by every lane of that run (P4, P6).
-
-    `run_milestone` creates one per run, so this module still holds no mutable
-    state of its own. Each lane hands `event.is_set` to the driver as
-    `should_stop`. `lock` decides which escalation came first, so `primary` is
-    well defined however the lanes interleave.
-    """
-
-    event: threading.Event = field(default_factory=threading.Event)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    primary: str | None = None
-
-    def escalate(self, story_id: str) -> None:
-        """Set the stop, and name `story_id` the primary escalation if none is yet."""
-        with self.lock:
-            if self.primary is None:
-                self.primary = story_id
-            self.event.set()
-
-
 def escalated_payload(
     run_id: str,
     primary_story: str | None,
     outcomes: Sequence[LaneOutcome],
     warnings: list[str],
 ) -> dict[str, Any]:
-    """The escalated result for one level's lane outcomes, given in census order.
+    """The escalated result for a run's lane outcomes, given in wave order.
 
     The top-level keys describe the primary escalation, as the sequential
     runner always did. `also_escalated` lists the other escalations and
-    `stopped` the parked lanes, both in census order, and each key is present
-    only when its list is non-empty. A `primary_story` that names no escalated
-    outcome falls back to the first escalation in census order.
+    `stopped` the parked lanes, both in census order; `completed` is every
+    subtask a stopped lane finished before it saw the stop, in the same order.
+    Each key is present only when its list is non-empty. A `primary_story`
+    that names no escalated outcome falls back to the first escalation in
+    census order.
     """
     escalations = [outcome for outcome in outcomes if outcome.kind == "escalated"]
     primary = next(
@@ -172,10 +163,18 @@ def escalated_payload(
         for outcome in outcomes
         if outcome.kind == "stopped"
     ]
+    completed = [
+        subtask
+        for outcome in outcomes
+        if outcome.kind == "stopped"
+        for subtask in outcome.completed
+    ]
     if also:
         payload["also_escalated"] = also
     if stopped:
         payload["stopped"] = stopped
+    if completed:
+        payload["completed"] = completed
     return payload
 
 
@@ -220,16 +219,19 @@ def _utcnow() -> datetime:
 
 
 class Driver(Protocol):
-    """`cli.drive_subtask`'s keyword signature: drive one subtask, report the result.
+    """`cli.drive_subtask_async`'s keyword signature: drive one subtask, report the result.
 
-    The seam the tests replace. Annotations are strings (`from __future__ import
-    annotations`), so no `cli` name is resolved when this module is imported.
+    The seam the tests replace. Awaited by the lane on the run's one event
+    loop (T3). Annotations are strings (`from __future__ import annotations`),
+    so no `cli` name is resolved when this module is imported.
 
-    `resume_from` (card 02890d5d) is passed only when a relaunch found a
-    checkpoint to continue, so a driver written before it keeps working.
+    `stop` is the run's `StopSignal`, passed on every call. `should_stop` stays
+    until Task 3.3 deletes it; the lane never passes it. `resume_from` (card
+    02890d5d) is passed only when a relaunch found a checkpoint to continue,
+    so a driver written before it keeps working.
     """
 
-    def __call__(
+    async def __call__(
         self,
         *,
         store: Store,
@@ -242,6 +244,7 @@ class Driver(Protocol):
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
         should_stop: Callable[[], bool] | None = None,
+        stop: StopSignal | None = None,
         resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
 
@@ -559,126 +562,200 @@ def record_plan(
     return rows
 
 
-def run_story_lane(
-    planned: PlannedStory,
+async def lane(
+    story: census.StoryPlan,
     *,
+    plan: SupervisorPlan,
     store: Store,
     run_id: str,
-    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]],
     root: Path,
     drive: Driver,
     commands: Sequence[str],
     allow_no_verification: bool,
     runner_factory: cli.RunnerFactory | None,
-    stop: RunStop,
-) -> LaneOutcome:
-    """Drive one story's remaining subtasks in order, and say how the lane ended.
+    slots: asyncio.Semaphore,
+    stop: StopSignal,
+    finished: dict[str, LaneOutcome],
+) -> str:
+    """One story's node coroutine (T1, T4, T6): drive its remaining subtasks, return its tip.
 
-    The stop is checked here once, before the story's first subtask: if it is
-    already set the story never starts and its rows stay `pending`. After that
-    the lane never checks it itself; it hands `stop.event.is_set` to the driver
-    and the engine parks between phases (P4), so a running phase is never
-    interrupted. A `stopped` summary records the subtask and story `stopped`.
-    Any other non-`done` result, or an `Exception` raised while handling a
-    subtask, escalates through `stop.escalate`. A `BaseException` sets the stop
-    so sibling lanes park, and propagates.
+    A story with nothing left to run returns its tip without taking a slot.
+    Otherwise the lane takes a slot -- grafo started it, so every blocker
+    already succeeded -- and drives the remaining subtasks in census order,
+    each on the base `record_plan` recorded for it. Before each subtask it
+    checks the stop: if it fired, the story is recorded `stopped` and
+    `LaneStopped` is raised with that subtask never driven. A `stopped`
+    summary records the subtask and story `stopped` and raises `LaneStopped`.
+    Any other non-`done` summary, or any `Exception` while handling a
+    subtask (a lane bug), triggers the stop first and raises `LaneEscalated`
+    at that subtask. `LaneEscalated`/`LaneStopped` pass through the catch-all
+    unchanged. A `BaseException` is never caught.
 
     Each subtask's open checkpoint is looked up first
     (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
     """
-    story_id = planned.story.id
-    level = planned.level
-    if stop.event.is_set():
-        return LaneOutcome(kind="pending", story=story_id, level=level)
-
-    story_row, subtask_rows = rows[story_id]
+    planned = plan.planned.get(story.id)
+    if planned is None:
+        return plan.tips[story.id]
+    story_row, subtask_rows = plan.rows[story.id]
     completed: list[str] = []
     warnings: list[str] = []
-    for position, subtask in enumerate(planned.remaining):
-        row = subtask_rows[subtask.id]
+
+    def outcome(kind: LaneKind, subtask: str | None, **fields: Any) -> LaneOutcome:
+        return LaneOutcome(
+            kind=kind,
+            story=story.id,
+            level=planned.level,
+            subtask=subtask,
+            completed=tuple(completed),
+            warnings=tuple(warnings),
+            **fields,
+        )
+
+    async with slots:
+        current: census.SubtaskPlan | None = None
         try:
-            card = board.show(subtask.id, repo_dir=root)
-            parent = board.show(story_id, repo_dir=root)
-            row = row.model_copy(update={"status": "started"})
-            store.record_subtask(story_id, row)
-            if position == 0:
-                store.record_story(story_row.model_copy(update={"status": "started"}))
-            # Relaunch continuation (card 02890d5d): a card whose open
-            # checkpoint was saved under this `TASK` continues from it; a
-            # changed workflow, a closed card or no row starts it fresh, with
-            # no error. The keyword is passed only when there is a row, so a
-            # driver that predates it keeps working.
-            extra: dict[str, Any] = {}
-            checkpoint = cli.continuable_checkpoint(store, subtask.id)
-            if checkpoint is not None:
-                extra["resume_from"] = checkpoint
-            result = drive(
+            for position, subtask in enumerate(planned.remaining):
+                current = subtask
+                if stop.triggered:
+                    store.record_story(story_row.model_copy(update={"status": "stopped"}))
+                    raise LaneStopped(outcome("stopped", subtask.id))
+                row = subtask_rows[subtask.id]
+                card = await asyncio.to_thread(board.show, subtask.id, repo_dir=root)
+                parent = await asyncio.to_thread(board.show, story.id, repo_dir=root)
+                row = row.model_copy(update={"status": "started"})
+                store.record_subtask(story.id, row)
+                if position == 0:
+                    store.record_story(story_row.model_copy(update={"status": "started"}))
+                # Relaunch continuation (card 02890d5d): the keyword is passed
+                # only when there is a row, so a driver that predates it works.
+                extra: dict[str, Any] = {}
+                checkpoint = cli.continuable_checkpoint(store, subtask.id)
+                if checkpoint is not None:
+                    extra["resume_from"] = checkpoint
+                result = await drive(
+                    store=store,
+                    run_id=run_id,
+                    card=card,
+                    parent=parent,
+                    subtask=row,
+                    repo_dir=root,
+                    commands=list(commands),
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    stop=stop,
+                    **extra,
+                )
+                warnings.extend(result.warnings)
+                summary = result.summary
+                # A `stopped` summary is handled before the non-`done` branch:
+                # a stop is not an escalation (P4).
+                if summary.status == "stopped":
+                    store.record_subtask(story.id, row.model_copy(update={"status": "stopped"}))
+                    store.record_story(story_row.model_copy(update={"status": "stopped"}))
+                    raise LaneStopped(
+                        outcome(
+                            "stopped",
+                            subtask.id,
+                            before_phase=stopped_before_phase(summary.detail),
+                        )
+                    )
+                if summary.status != "done":
+                    stop.trigger(story.id)
+                    store.record_subtask(story.id, row.model_copy(update={"status": "escalated"}))
+                    store.record_story(story_row.model_copy(update={"status": "escalated"}))
+                    raise LaneEscalated(
+                        outcome(
+                            "escalated",
+                            subtask.id,
+                            failed_phase=summary.failed_phase,
+                            detail=summary.detail,
+                        )
+                    )
+                store.record_subtask(story.id, row.model_copy(update={"status": "done"}))
+                completed.append(subtask.id)
+            store.record_story(story_row.model_copy(update={"status": "done"}))
+        except (LaneEscalated, LaneStopped):
+            raise
+        except Exception as error:  # not BaseException: Ctrl-C must still stop
+            stop.trigger(story.id)
+            if current is not None:
+                store.record_subtask(
+                    story.id,
+                    subtask_rows[current.id].model_copy(update={"status": "escalated"}),
+                )
+            store.record_story(story_row.model_copy(update={"status": "escalated"}))
+            raise LaneEscalated(
+                outcome(
+                    "escalated",
+                    None if current is None else current.id,
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            ) from error
+    finished[story.id] = outcome("done", None)
+    return planned.tip
+
+
+async def supervise(
+    plan: SupervisorPlan,
+    *,
+    store: Store,
+    run_id: str,
+    root: Path,
+    drive: Driver,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: cli.RunnerFactory | None,
+    max_concurrent: int,
+    stop: StopSignal,
+) -> list[LaneOutcome]:
+    """Run every census story as a grafo node and collect the outcomes (T1, T6).
+
+    One `grafo.Node` per story, `uuid=story.id`, `timeout=None` always (grafo's
+    60 s default would cancel a lane mid-phase). One edge per in-milestone
+    blocker, forwarding the blocker's tip as `tip_<short id>` (Task 3.2 reads
+    those for merged bases). The executor's roots are the stories with no
+    in-milestone blocker; a milestone with no story has no tree to run.
+    """
+    slots = asyncio.Semaphore(max_concurrent)
+    finished: dict[str, LaneOutcome] = {}
+
+    def node_coroutine(story: census.StoryPlan) -> Callable[..., Any]:
+        async def run(**tips: str) -> str:
+            return await lane(
+                story,
+                plan=plan,
                 store=store,
                 run_id=run_id,
-                card=card,
-                parent=parent,
-                subtask=row,
-                repo_dir=root,
-                commands=list(commands),
+                root=root,
+                drive=drive,
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
-                should_stop=stop.event.is_set,
-                **extra,
-            )
-        except Exception as error:  # not BaseException: Ctrl-C must still stop
-            status = "escalated"
-            failed_phase: str | None = None
-            detail: str | None = f"{type(error).__name__}: {error}"
-        except BaseException:
-            stop.event.set()
-            raise
-        else:
-            warnings.extend(result.warnings)
-            status = result.summary.status
-            failed_phase = result.summary.failed_phase
-            detail = result.summary.detail
-
-        # A `stopped` summary is handled before the non-`done` branch: a stop
-        # is not an escalation (P4).
-        if status == "stopped":
-            store.record_subtask(story_id, row.model_copy(update={"status": "stopped"}))
-            store.record_story(story_row.model_copy(update={"status": "stopped"}))
-            return LaneOutcome(
-                kind="stopped",
-                story=story_id,
-                level=level,
-                subtask=subtask.id,
-                before_phase=stopped_before_phase(detail),
-                completed=tuple(completed),
-                warnings=tuple(warnings),
-            )
-        if status != "done":
-            stop.escalate(story_id)
-            store.record_subtask(story_id, row.model_copy(update={"status": "escalated"}))
-            store.record_story(story_row.model_copy(update={"status": "escalated"}))
-            return LaneOutcome(
-                kind="escalated",
-                story=story_id,
-                level=level,
-                subtask=subtask.id,
-                failed_phase=failed_phase,
-                detail=detail,
-                completed=tuple(completed),
-                warnings=tuple(warnings),
+                slots=slots,
+                stop=stop,
+                finished=finished,
             )
 
-        store.record_subtask(story_id, row.model_copy(update={"status": "done"}))
-        completed.append(subtask.id)
+        return run
 
-    store.record_story(story_row.model_copy(update={"status": "done"}))
-    return LaneOutcome(
-        kind="done",
-        story=story_id,
-        level=level,
-        completed=tuple(completed),
-        warnings=tuple(warnings),
-    )
+    nodes = {
+        story.id: grafo.Node(coroutine=node_coroutine(story), uuid=story.id, timeout=None)
+        for story in plan.stories
+    }
+    for story in plan.stories:
+        for blocker in plan.roots[story.id].blockers:
+            await nodes[blocker].connect(
+                nodes[story.id], forward=f"tip_{dag.short_id(blocker)}"
+            )
+    roots = [nodes[story.id] for story in plan.stories if not plan.roots[story.id].blockers]
+    errors: list[BaseException] = []
+    if roots:
+        executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
+        await executor.run()
+        errors = list(executor.errors)
+    return collect_outcomes(plan, nodes, errors, finished)
 
 
 def run_milestone(
@@ -694,22 +771,25 @@ def run_milestone(
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
 ) -> dict[str, Any]:
-    """Drive every remaining subtask of `milestone`, level by level, and report (O6).
+    """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
     `milestone` is a card id or a title needle (O1). Everything that can refuse,
     `max_concurrent < 1` included, runs before the store is opened. Then one
-    `milestone` run is recorded with its whole plan `pending`, and each level's
-    stories run as lanes on a pool of `max_concurrent` threads, with a barrier
-    between levels. A subtask already `done` on the board is never driven, but
-    its branch still anchors the next subtask's base. The card and its story
-    are read fresh from the board before each subtask.
+    `milestone` run is recorded with its whole plan `pending`, and
+    `asyncio.run(supervise(...))` runs every story the moment its blockers
+    succeeded, at most `max_concurrent` at once. A subtask already `done` on
+    the board is never driven, but its branch still anchors the next
+    subtask's base. The card and its story are read fresh from the board
+    before each subtask. The default driver is `cli.drive_subtask_async`,
+    read at call time.
 
-    The first escalation sets the run's stop: lanes already running park at
-    their next phase boundary and are recorded `stopped`, lanes not yet started
-    leave their story `pending`, and no later level is scheduled. At
-    `max_concurrent=1` the result is exactly the sequential runner's.
+    The first escalation triggers the run's `StopSignal`: running subtasks
+    park at their next phase boundary and are recorded `stopped`, a lane
+    between subtasks or waiting for a slot ends `stopped` without driving
+    anything more, and grafo starts no dependent of a failed lane, so those
+    stories stay `pending`.
 
-    When every level finished clean -- or none had anything to run --
+    When every lane finished clean -- or none had anything to run --
     Integrate folds every story tip into `<branch_prefix>-integrate` before
     the run is recorded. Success records `done` and adds `integrated`; an
     Integrate escalation records `escalated` and returns
@@ -723,7 +803,7 @@ def run_milestone(
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    drive = cli.drive_subtask if driver is None else driver
+    drive = cli.drive_subtask_async if driver is None else driver
 
     # The first side effect. It runs after every refusal and before the store
     # is opened, so a failed fetch leaves no run directory behind.
@@ -747,41 +827,38 @@ def run_milestone(
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
         warnings = reroll_stale_stories(plan.stories, root)
         completed: list[str] = []
-        stop = RunStop()
+        stop = StopSignal()
 
-        for level in levels:
-            with ThreadPoolExecutor(
-                max_workers=max_concurrent, thread_name_prefix="am-lane"
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        run_story_lane,
-                        planned,
-                        store=store,
-                        run_id=run_id,
-                        rows=rows,
-                        root=root,
-                        drive=drive,
-                        commands=list(commands),
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        stop=stop,
-                    )
-                    for planned in level
-                ]
-            # Leaving the `with` block is the level barrier: every lane has
-            # returned. `result()` re-raises a lane's BaseException here, after
-            # the pool has shut down, in census order.
-            outcomes = [future.result() for future in futures]
-            # Census order, never completion order: deterministic at any bound.
-            for outcome in outcomes:
-                completed.extend(outcome.completed)
-                warnings.extend(outcome.warnings)
-            if any(outcome.kind == "escalated" for outcome in outcomes):
-                store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                return escalated_payload(run_id, stop.primary, outcomes, warnings)
+        outcomes = asyncio.run(
+            supervise(
+                supervisor_plan(
+                    plan.stories,
+                    levels,
+                    rows,
+                    branch_prefix=branch_prefix,
+                    base_branch=base_branch,
+                ),
+                store=store,
+                run_id=run_id,
+                root=root,
+                drive=drive,
+                commands=list(commands),
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                max_concurrent=max_concurrent,
+                stop=stop,
+            )
+        )
+        # Wave order, census order within a wave, never finish order.
+        for outcome in outcomes:
+            completed.extend(outcome.completed)
+            warnings.extend(outcome.warnings)
+        if any(outcome.kind == "escalated" for outcome in outcomes):
+            store.record_run(run_record.model_copy(update={"status": "escalated"}))
+            primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
+            return escalated_payload(run_id, primary, outcomes, warnings)
 
-        # Integrate (addendum I6) runs only once every level finished clean,
+        # Integrate (addendum I6) runs only once every lane finished clean,
         # and also when there was nothing left to drive: that is how a relaunch
         # retries an Integrate escalation, and why a finished milestone's
         # relaunch is a no-op merge. Read as `integration.integrate_milestone`

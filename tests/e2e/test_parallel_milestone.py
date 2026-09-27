@@ -3,13 +3,15 @@
 Addendum P7 and main spec section 14: `am run --milestone --max-concurrent N`
 runs through `typer.testing.CliRunner` on the real `cli.app` with no
 `runner_factory` and no `driver`, so `orchestrate.run_milestone` reaches
-`cli.drive_subtask`, `cli.default_runner_factory`, the real `ClaudeAdapter` and
+`asyncio.run(supervise(...))`, the grafo tree, `cli.drive_subtask_async`,
+`cli.default_runner_factory`, the real `ClaudeAdapter` and
 `launcher.run_direct`. The only stand-in is the fake `claude` first on `PATH`,
 armed with an implement-only rendezvous: at count 2 a run can only finish if
 two lanes were inside implement at the same time. Unmarked on purpose.
 
 Each test builds its own repo and board (`parallel_board`): A (a1 -> a2) and B
-(b1 -> b2) are independent roots, C (c1) is blocked by A.
+(b1 -> b2) are independent roots, C (c1) is blocked by A. Levels are waves in
+the report only; C is scheduled by its blocker A (supervisor-tree T1).
 """
 
 import json
@@ -236,10 +238,12 @@ def _launch_with_a1_review_failing(parallel_board, rendezvous, run_milestone_cli
     )
 
 
-def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_starts(
+def test_an_escalation_in_one_lane_stops_the_other_and_its_dependent_never_starts(
     parallel_board, rendezvous, run_milestone_cli, read_fake_log
 ):
-    """Spec test 4 (P4, P5)."""
+    """Spec test 4 (P4, P5), as dataflow (T1, T6): C never starts because its
+    own blocker A escalated and grafo does not release a failed lane's
+    dependents, not because a level barrier held it."""
     root = parallel_board["root"]
     stories = parallel_board["stories"]
     branches = parallel_board["branches"]
@@ -271,8 +275,13 @@ def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_star
     assert parked["subtask"] in (b1, b2)
     phase_names = task_workflow.TASK.phase_names
     before = parked["before_phase"]
-    assert before in phase_names, parked
-    later = set(phase_names[phase_names.index(before):])
+    if before is None:
+        # The lane saw the stop between b1 and b2 and never drove b2 (T6).
+        assert parked["subtask"] == b2, parked
+        later = set(phase_names)
+    else:
+        assert before in phase_names, parked
+        later = set(phase_names[phase_names.index(before):])
 
     run = _load_run(root, data["run_id"])
     rows = _subtask_rows(run)
@@ -285,7 +294,7 @@ def test_an_escalation_in_one_lane_stops_the_other_and_the_next_level_never_star
     assert rows[a1].status == "escalated"
     assert rows[a2].status == "pending" and rows[a2].phases == []
     stopped_row = rows[parked["subtask"]]
-    assert stopped_row.status == "stopped"
+    assert stopped_row.status == ("pending" if before is None else "stopped")
     # Nothing ran at or after the phase it was parked before: no phase row, so
     # no attempt, and no fake process in its worktree for any such phase.
     assert not ({phase.name for phase in stopped_row.phases} & later), (

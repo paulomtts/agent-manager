@@ -7,7 +7,8 @@ Two tiers, per design §14:
 - `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
   real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
   `paths.data_dir()` never touches the developer's own -- with the harness
-  replaced at the injected `driver` seam. No runner, adapter or `claude` is
+  replaced at the injected `driver` seam by an awaitable fake that runs on the
+  run's one event loop (supervisor-tree T3). No runner, adapter or `claude` is
   involved; production wiring under a fake `claude` belongs to tests/e2e.
 
 `FakeDriver` makes no branches, so by default (`integrate_recorder`, autouse)
@@ -17,26 +18,33 @@ branches `BranchingDriver` or `_commit_branch` really commit.
 """
 
 import ast
+import asyncio
+import inspect
 import json
+import logging
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import grafo
 import pytest
 
 from agent_manager import board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import Step, Workflow
 
 
 # ── pure plans ──────────────────────────────────────────────────────────────
@@ -181,18 +189,6 @@ def test_the_before_phase_is_read_out_of_a_stopped_detail():
     assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
     assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
     assert orchestrate.stopped_before_phase(None) is None
-
-
-def test_the_first_escalation_is_the_primary_and_every_escalation_sets_the_stop():
-    stop = orchestrate.RunStop()
-    assert not stop.event.is_set()
-    assert stop.primary is None
-
-    stop.escalate("story-b")
-    stop.escalate("story-a")
-
-    assert stop.event.is_set()
-    assert stop.primary == "story-b"
 
 
 def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
@@ -572,7 +568,7 @@ def _branch(project: Path, card_id: str) -> str:
 
 @dataclass
 class FakeDriver:
-    """Stands in for `cli.drive_subtask`. Never touches git or the board.
+    """Stands in for `cli.drive_subtask_async`. Never touches git or the board.
 
     `outcomes` scripts a card: missing means `done`, a `(phase, detail)` tuple
     means escalated at that phase, and an exception instance is raised.
@@ -585,7 +581,7 @@ class FakeDriver:
     calls: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[models.Run | None] = field(default_factory=list)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         store,
@@ -598,6 +594,7 @@ class FakeDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
+        stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append(
             {
@@ -612,6 +609,8 @@ class FakeDriver:
                 "commands": list(commands),
                 "allow_no_verification": allow_no_verification,
                 "runner_factory": runner_factory,
+                "should_stop": should_stop,
+                "stop": stop,
             }
         )
         self.snapshots.append(store.load_run(run_id))
@@ -747,8 +746,8 @@ class BranchingDriver(FakeDriver):
     board through the rollup, as `mark_done` does. Sequential runs only.
     """
 
-    def __call__(self, *, store, run_id, card, parent, subtask, repo_dir, **kwargs):
-        drive = super().__call__(
+    async def __call__(self, *, store, run_id, card, parent, subtask, repo_dir, **kwargs):
+        drive = await super().__call__(
             store=store,
             run_id=run_id,
             card=card,
@@ -805,56 +804,80 @@ def _record_git(monkeypatch, fail_on: str | None = None) -> list[list[str]]:
 
 
 WAIT = 10.0
-"""Seconds a lane-pool test waits on a barrier or event before failing instead of hanging."""
+"""Seconds a supervisor test waits on a barrier or event before failing instead of hanging."""
 
 OVERSHOOT_WINDOW = 1.0
 """Seconds the bound test holds each lane in flight, so that queued lanes would
-enter the driver in that window if the pool ignored `max_concurrent`."""
+enter the driver in that window if the lanes ignored `max_concurrent`."""
 
-Gate = Callable[[Any], None]
+PATCHED_NODE_TIMEOUT = 0.05
+"""grafo's default node timeout, patched down by the timeout test."""
+
+LONGER_THAN_PATCHED_TIMEOUT = 0.3
+"""How long that test's lane stays in flight: well past `PATCHED_NODE_TIMEOUT`."""
+
+Gate = Callable[[StopSignal | None], Awaitable[None]]
 
 
-def _await(event: threading.Event) -> None:
-    assert event.wait(timeout=WAIT), "a gated test's event was never set"
+async def _within(awaitable: Awaitable[Any], what: str) -> Any:
+    """Await `awaitable`, failing after WAIT seconds instead of hanging the run.
 
-
-def _await_stop(should_stop: Any) -> None:
-    """Block until the run's stop is set, without sleeping.
-
-    `run_milestone` hands each driver `event.is_set` (spec item 2), so the
-    run's event is that bound method's `__self__`. Waiting on it is
-    synchronisation by event, and it pins that wiring.
+    The failure is an `AssertionError` inside the driver, so the lane turns it
+    into an escalation whose detail names what never happened.
     """
-    assert should_stop is not None, "the lane passed no should_stop"
-    event = should_stop.__self__
-    assert isinstance(event, threading.Event)
-    _await(event)
+    try:
+        return await asyncio.wait_for(awaitable, WAIT)
+    except TimeoutError:
+        raise AssertionError(f"timed out waiting for {what}") from None
 
 
-def _meet(barrier: threading.Barrier) -> Gate:
+class _StopWatch:
+    """A `pause()`-only stand-in registered on the run's `StopSignal`, as a
+    pygents subtask agent is: the signal pauses it when it fires."""
+
+    def __init__(self) -> None:
+        self.paused = asyncio.Event()
+
+    def pause(self) -> None:
+        self.paused.set()
+
+
+async def _await_stop(stop: StopSignal | None) -> None:
+    """Block until the run's stop fires, without sleeping. Pins that the lane
+    handed the driver the run's `StopSignal` (T5)."""
+    assert isinstance(stop, StopSignal), "the lane passed no StopSignal"
+    watch = _StopWatch()
+    stop.register(watch)
+    try:
+        await _within(watch.paused.wait(), "the run's stop")
+    finally:
+        stop.unregister(watch)
+
+
+def _meet(barrier: asyncio.Barrier) -> Gate:
     """A gate that holds a call until every party of `barrier` is in flight."""
 
-    def gate(should_stop: Any) -> None:
-        barrier.wait(timeout=WAIT)
+    async def gate(stop: StopSignal | None) -> None:
+        await _within(barrier.wait(), "every party of the barrier")
 
     return gate
 
 
-def _meet_then_await_stop(barrier: threading.Barrier) -> Gate:
-    """A gate that meets `barrier`, then holds the call until the run's stop is set."""
+def _meet_then_await_stop(barrier: asyncio.Barrier) -> Gate:
+    """A gate that meets `barrier`, then holds the call until the run's stop fires."""
 
-    def gate(should_stop: Any) -> None:
-        barrier.wait(timeout=WAIT)
-        _await_stop(should_stop)
+    async def gate(stop: StopSignal | None) -> None:
+        await _within(barrier.wait(), "every party of the barrier")
+        await _await_stop(stop)
 
     return gate
 
 
 def _census_levels(project: Path, milestone: str) -> list[list[str]]:
-    """Each dispatch level's story ids in census order, the order lanes are submitted in.
+    """Each wave's story ids in census order, the order the tree starts them in.
 
     Sibling stories created in the same second are ordered by id, so a test that
-    gives a lane a role by its queue position must read the order, not assume it.
+    gives a lane a role by its position must read the order, not assume it.
     """
     plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
     levels = orchestrate.plan_levels(plan.stories, branch_prefix=PREFIX, base_branch="main")
@@ -867,28 +890,28 @@ def _subtasks_by_story(shape: dict[str, Any]) -> dict[str, list[str]]:
 
 @dataclass
 class GatedDriver:
-    """A thread-safe stand-in for `cli.drive_subtask`, for the lane-pool tests.
+    """An awaitable stand-in for `cli.drive_subtask_async`, for the supervisor tests.
 
-    `gates[card]` runs first, with the driver's `should_stop`; tests put
-    barriers and events there, never sleeps. Then `outcomes[card]` decides: an
-    exception instance is raised, a `(phase, detail)` tuple escalates, and
-    `"done"` finishes as a phase already running would. With no entry the fake
-    reaches its simulated phase boundary: if `should_stop()` is true it parks
-    as the engine does, with `"stopped before implement"`; otherwise it is
-    done. Calls are recorded under a lock, `high_water` is the most calls ever
-    in flight at once, and `returned[card]` is set when that card's call ends.
+    `gates[card]` is awaited first with the lane's `stop`; tests put
+    `asyncio.Barrier`s and `asyncio.Event`s there, never sleeps. Then
+    `outcomes[card]` decides: an exception instance is raised, a `(phase,
+    detail)` tuple escalates, and `"done"` finishes as a phase already running
+    would. With no entry the fake reaches its simulated phase boundary: if the
+    stop has fired it parks as the engine does, with `"stopped before
+    implement"`; otherwise it is done. Everything runs on the run's one loop,
+    so no lock: `high_water` is the most calls ever in flight at once, and
+    `returned[card]` is set when that card's call ends.
     """
 
     outcomes: dict[str, Any] = field(default_factory=dict)
     gates: dict[str, Gate] = field(default_factory=dict)
     warnings: dict[str, list[str]] = field(default_factory=dict)
-    returned: dict[str, threading.Event] = field(default_factory=dict)
+    returned: dict[str, asyncio.Event] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
     high_water: int = 0
     in_flight: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         store,
@@ -901,17 +924,15 @@ class GatedDriver:
         allow_no_verification=False,
         runner_factory=None,
         should_stop=None,
+        stop=None,
     ) -> cli.SubtaskDrive:
-        with self.lock:
-            self.calls.append(
-                {"card": card.id, "parent": parent.id, "base": subtask.base_branch}
-            )
-            self.in_flight += 1
-            self.high_water = max(self.high_water, self.in_flight)
+        self.calls.append({"card": card.id, "parent": parent.id, "base": subtask.base_branch})
+        self.in_flight += 1
+        self.high_water = max(self.high_water, self.in_flight)
         try:
             gate = self.gates.get(card.id)
             if gate is not None:
-                gate(should_stop)
+                await gate(stop)
             outcome = self.outcomes.get(card.id)
             if isinstance(outcome, BaseException):
                 raise outcome
@@ -921,7 +942,7 @@ class GatedDriver:
                 summary = SubtaskSummary(
                     status="escalated", failed_phase=phase, detail=detail
                 )
-            elif outcome != "done" and should_stop is not None and should_stop():
+            elif outcome != "done" and stop is not None and stop.triggered:
                 summary = SubtaskSummary(
                     status="stopped", detail="stopped before implement"
                 )
@@ -929,8 +950,7 @@ class GatedDriver:
                 summary = SubtaskSummary(status="done")
             return cli.SubtaskDrive(summary=summary, warnings=warnings)
         finally:
-            with self.lock:
-                self.in_flight -= 1
+            self.in_flight -= 1
             if card.id in self.returned:
                 self.returned[card.id].set()
 
@@ -1099,17 +1119,20 @@ def test_every_drivers_warnings_reach_the_result_in_order(project):
 
 @requires_git
 @requires_brd
-def test_no_driver_resolves_to_cli_drive_subtask_at_call_time(project, monkeypatch):
-    """The sibling card makes `cli` import this module, so the default driver
-    must be read off `cli` when the run starts, never bound at import."""
+def test_no_driver_resolves_to_cli_drive_subtask_async_at_call_time(project, monkeypatch):
+    """The default driver is the awaitable one (T3), read off `cli` when the run
+    starts, never bound at import. The lane hands it the run's StopSignal and
+    no `should_stop` (Task 3.3 deletes that parameter)."""
     shape = _milestone(project, {"A": 1})
     (a1,) = shape["subtasks"]["A"]
     fake = FakeDriver()
-    monkeypatch.setattr(cli, "drive_subtask", fake)
+    monkeypatch.setattr(cli, "drive_subtask_async", fake)
 
     result = _run(project, shape["milestone"], None)
 
     assert [call["card"] for call in fake.calls] == [a1]
+    assert isinstance(fake.calls[0]["stop"], StopSignal)
+    assert fake.calls[0]["should_stop"] is None
     assert result["done"] is True
 
 
@@ -1456,7 +1479,9 @@ def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, inte
 
 @requires_git
 @requires_brd
-def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project, monkeypatch):
+def test_merged_root_is_refused(project, monkeypatch):
+    """A story whose `RootPlan` is `merged` is refused before anything is
+    written: no git call, no run directory, no worktree (Task 3.2 lifts this)."""
     milestone = _add_card(project, "Milestone 3: orchestration")
     first = _add_card(project, "Story one", milestone)
     second = _add_card(project, "Story two", milestone)
@@ -1465,6 +1490,11 @@ def test_a_story_with_two_blockers_is_refused_before_anything_is_written(project
         _add_card(project, f"only subtask of {story}", story)
     _block(project, joined, first)
     _block(project, joined, second)
+    plan = census.flatten_milestone(board.tree(milestone, repo_dir=project))
+    by_id = {story.id: story for story in plan.stories}
+    root = dag.story_root(by_id[joined], by_id, PREFIX, "main")
+    assert root.kind == "merged"
+    assert set(root.blockers) == {first, second}
     porcelain_before = _git(project, "status", "--porcelain")
     git_calls = _record_git(monkeypatch)
     driver = FakeDriver()
@@ -1795,7 +1825,7 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
     a1, a2 = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    all_three = threading.Barrier(3)
+    all_three = asyncio.Barrier(3)
     driver = GatedDriver(gates={a1: _meet(all_three), b1: _meet(all_three), c1: _meet(all_three)})
 
     result = _run(project, shape["milestone"], driver, max_concurrent=3)
@@ -1830,24 +1860,24 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
 
 @requires_git
 @requires_brd
-def test_in_flight_lanes_never_exceed_the_bound(project):
-    shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1})
+def test_at_most_max_concurrent_lanes_run(project):
+    """Five ready stories, two slots. Every lane stays in flight until a third
+    lane enters the driver or the window expires: without the bound all five
+    arrive inside the window together; under it only two can be in flight."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1, "D": 1, "E": 1})
     subtasks = _subtasks_by_story(shape)
     arrivals = 0
-    arrivals_lock = threading.Lock()
-    third_arrived = threading.Event()
+    third_arrived = asyncio.Event()
 
-    def hold_until_a_third_lane_arrives(should_stop: Any) -> None:
-        # Every lane stays in flight until a third lane has entered the driver,
-        # or the window expires. Without the bound, all four lanes arrive
-        # inside the window and are in flight together. Under the bound only
-        # two can be, so the first two wait out the window and then return.
+    async def hold_until_a_third_lane_arrives(stop: StopSignal | None) -> None:
         nonlocal arrivals
-        with arrivals_lock:
-            arrivals += 1
-            if arrivals >= 3:
-                third_arrived.set()
-        third_arrived.wait(timeout=OVERSHOOT_WINDOW)
+        arrivals += 1
+        if arrivals >= 3:
+            third_arrived.set()
+        try:
+            await asyncio.wait_for(third_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
 
     driver = GatedDriver(
         gates={cards[0]: hold_until_a_third_lane_arrives for cards in subtasks.values()}
@@ -1855,7 +1885,7 @@ def test_in_flight_lanes_never_exceed_the_bound(project):
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
-    assert result["done"] is True
+    assert result["done"] is True, result
     assert sorted(call["card"] for call in driver.calls) == sorted(
         card for cards in subtasks.values() for card in cards
     )
@@ -1864,13 +1894,17 @@ def test_in_flight_lanes_never_exceed_the_bound(project):
 
 @requires_git
 @requires_brd
-def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, integrate_recorder):
+def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
+    project, integrate_recorder
+):
+    """C is blocked by A. A escalates, so grafo never releases C: C stays
+    `pending` because its own blocker failed (dataflow), not because of a level."""
     shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
     b1, b2 = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("review", "reviewer found a blocker")},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -1906,14 +1940,15 @@ def test_an_escalation_parks_the_other_lane_and_no_later_level_starts(project, i
 
 @requires_git
 @requires_brd
-def test_a_lane_whose_first_subtask_finished_parks_its_next_subtask(project):
-    """After a story has started the lane never checks the stop itself: its
-    next subtask is handed to the driver, and the engine parks it (P4)."""
+def test_a_lane_between_subtasks_sees_the_stop_and_never_drives_the_next(project):
+    """The lane checks the stop before every subtask (spec, Observable
+    behavior): b1 finished after A escalated, so b2 is never handed to the
+    driver. It is reported stopped with no phase, and its row stays pending."""
     shape = _milestone(project, {"A": 1, "B": 2})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     b1, b2 = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("verify", "suite red"), b1: "done"},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -1921,31 +1956,29 @@ def test_a_lane_whose_first_subtask_finished_parks_its_next_subtask(project):
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
-    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1, b2])
-    assert next(call for call in driver.calls if call["card"] == b2)["base"] == _branch(
-        project, b1
-    )
+    assert sorted(call["card"] for call in driver.calls) == sorted([a1, b1])
     assert (result["story"], result["subtask"]) == (story_a, a1)
-    assert result["stopped"] == [{"story": story_b, "subtask": b2, "before_phase": "implement"}]
+    assert result["stopped"] == [{"story": story_b, "subtask": b2, "before_phase": None}]
+    assert result["completed"] == [b1]
     assert _statuses(_load(project, result["run_id"])) == {
         "run": "escalated",
         story_a: "escalated",
         a1: "escalated",
         story_b: "stopped",
         b1: "done",
-        b2: "stopped",
+        b2: "pending",
     }
 
 
 @requires_git
 @requires_brd
-def test_two_simultaneous_escalations_give_one_primary_and_one_also_escalated(project):
+def test_two_escalations_in_one_tick_give_one_primary(project):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
     (c1,) = shape["subtasks"]["C"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: ("review", "a blocker"), b1: ("verify", "b suite red")},
         gates={a1: _meet(pair), b1: _meet(pair)},
@@ -1999,7 +2032,7 @@ def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={a1: RuntimeError("harness vanished")},
         gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
@@ -2030,12 +2063,15 @@ def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
 
 @requires_git
 @requires_brd
-def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
+def test_stop_while_waiting_for_a_slot_ends_stopped(project):
+    """Three ready stories, two slots. `queued` has been started by the tree and
+    waits for a slot when `first` escalates: it takes the slot, sees the stop,
+    and ends `stopped` without its subtask ever reaching the driver."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
     (first, second, queued) = _census_levels(project, shape["milestone"])[0]
     subtasks = _subtasks_by_story(shape)
     (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
     driver = GatedDriver(
         outcomes={f1: ("review", "reviewer found a blocker")},
         gates={f1: _meet(pair), s1: _meet_then_await_stop(pair)},
@@ -2045,7 +2081,10 @@ def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
 
     assert q1 not in [call["card"] for call in driver.calls]
     assert (result["story"], result["subtask"]) == (first, f1)
-    assert result["stopped"] == [{"story": second, "subtask": s1, "before_phase": "implement"}]
+    assert result["stopped"] == [
+        {"story": second, "subtask": s1, "before_phase": "implement"},
+        {"story": queued, "subtask": q1, "before_phase": None},
+    ]
     assert "also_escalated" not in result
     assert _statuses(_load(project, result["run_id"])) == {
         "run": "escalated",
@@ -2053,34 +2092,53 @@ def test_a_story_queued_behind_the_bound_stays_pending_after_a_stop(project):
         f1: "escalated",
         second: "stopped",
         s1: "stopped",
-        queued: "pending",
+        queued: "stopped",
         q1: "pending",
     }
 
 
 @requires_git
 @requires_brd
-def test_a_keyboard_interrupt_in_one_lane_parks_the_other_and_propagates(project):
+def test_a_keyboard_interrupt_in_one_lane_cancels_the_other_and_propagates(project):
+    """A BaseException is not an escalation (§7): it leaves the loop, and
+    `asyncio.run` cancels the other lane where it stands. The rows stay as they
+    were, for `am resume`."""
     shape = _milestone(project, {"A": 1, "B": 1})
     story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
     (a1,) = shape["subtasks"]["A"]
     (b1,) = shape["subtasks"]["B"]
-    pair = threading.Barrier(2)
+    pair = asyncio.Barrier(2)
+    cancelled: list[str] = []
+
+    async def meet_then_wait_to_be_cancelled(stop: StopSignal | None) -> None:
+        # The whole body is guarded, not just the inner wait: asyncio.run's
+        # cleanup cancels this coroutine wherever it is currently suspended
+        # (before or after the barrier releases), a race with no bearing on
+        # what this test proves -- that the sibling lane is cancelled, not
+        # left hanging or recorded escalated.
+        try:
+            await _within(pair.wait(), "a1 and b1 in flight together")
+            await _within(asyncio.Event().wait(), "the lane to be cancelled")
+        except asyncio.CancelledError:
+            cancelled.append(b1)
+            raise
+
     driver = GatedDriver(
         outcomes={a1: KeyboardInterrupt()},
-        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+        gates={a1: _meet(pair), b1: meet_then_wait_to_be_cancelled},
     )
 
     with pytest.raises(KeyboardInterrupt):
         _run(project, shape["milestone"], driver, max_concurrent=2)
 
+    assert cancelled == [b1]
     run = _load(project, cli.mint_run_id(shape["milestone"], STARTED_AT))
     assert _statuses(run) == {
         "run": "started",
         story_a: "started",
         a1: "started",
-        story_b: "stopped",
-        b1: "stopped",
+        story_b: "started",
+        b1: "started",
     }
 
 
@@ -2091,19 +2149,375 @@ def test_warnings_and_completed_follow_census_order_not_finish_order(project):
     (first, second) = _census_levels(project, shape["milestone"])[0]
     subtasks = _subtasks_by_story(shape)
     (f1,), (s1,) = subtasks[first], subtasks[second]
-    second_returned = threading.Event()
+    second_returned = asyncio.Event()
+
+    async def after_second_returns(stop: StopSignal | None) -> None:
+        await _within(second_returned.wait(), "the second lane's call to end")
+
     driver = GatedDriver(
         warnings={f1: ["first warned"], s1: ["second warned"]},
-        gates={f1: lambda should_stop: _await(second_returned)},
+        gates={f1: after_second_returns},
         returned={s1: second_returned},
     )
 
     result = _run(project, shape["milestone"], driver, max_concurrent=2)
 
     assert sorted(call["card"] for call in driver.calls) == sorted([f1, s1])
-    assert result["done"] is True
+    assert result["done"] is True, result
     assert result["completed"] == [f1, s1]
     assert result["warnings"] == ["first warned", "second warned"]
+
+
+# ── the supervisor tree (supervisor-tree T1-T6) ─────────────────────────────
+
+
+@requires_git
+@requires_brd
+def test_a_story_starts_when_its_blocker_finishes_not_its_level(project):
+    """T1: C (blocked by A) starts the moment A is done, while B -- in A's wave
+    -- is still in flight. b1 cannot finish until c1 has started, so under a
+    level barrier b1 would time out and the run would escalate instead."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    c_started = asyncio.Event()
+
+    async def hold_until_c_starts(stop: StopSignal | None) -> None:
+        await _within(c_started.wait(), "c1 to start while b1 is in flight")
+
+    async def mark_c_started(stop: StopSignal | None) -> None:
+        c_started.set()
+
+    driver = GatedDriver(gates={b1: hold_until_c_starts, c1: mark_c_started})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    cards = [call["card"] for call in driver.calls]
+    assert cards.index(a1) < cards.index(c1)
+    assert next(call for call in driver.calls if call["card"] == c1)["base"] == _branch(
+        project, a1
+    )
+    assert [level["stories"] for level in result["levels"]] == _census_levels(
+        project, shape["milestone"]
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_chain_finishes_with_one_slot(project):
+    """T4: a lane takes its slot only after its blockers finished, so a chain
+    never holds a slot while it waits and cannot deadlock."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1}, blocked_by={"B": ["A"], "C": ["B"]}
+    )
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    driver = GatedDriver()
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=1)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, b1, c1]
+    assert [call["base"] for call in driver.calls] == [
+        "main",
+        _branch(project, a1),
+        _branch(project, b1),
+    ]
+    assert result["completed"] == [a1, b1, c1]
+
+
+@requires_git
+@requires_brd
+def test_a_story_behind_a_subtask_less_story_waits_for_the_blocker_beneath(project):
+    """Review Focus 2: J has no subtasks, so C's stack roots on A's tip through
+    it. `dag.compute_levels` puts C in wave 0 beside A, but C's node waits on
+    J's, which waits on A's: c1 never starts before a1 has returned."""
+    shape = _milestone(project, {"A": 1, "J": 0, "C": 1}, blocked_by={"J": ["A"], "C": ["J"]})
+    (a1,) = shape["subtasks"]["A"]
+    (c1,) = shape["subtasks"]["C"]
+    a1_returned = asyncio.Event()
+
+    async def a1_must_have_returned(stop: StopSignal | None) -> None:
+        assert a1_returned.is_set(), "c1 started before a1, the tip it stacks on, returned"
+
+    driver = GatedDriver(gates={c1: a1_must_have_returned}, returned={a1: a1_returned})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, c1]
+    assert driver.calls[1]["base"] == _branch(project, a1)
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_with_no_stories_finishes_without_a_tree(project, integrate_recorder):
+    """Review Focus 1: no story means no root node, and grafo's executor cannot
+    run an empty tree; the run is still a clean `done` that integrates."""
+    milestone = _add_card(project, "Milestone 3: nothing in it yet")
+    driver = GatedDriver()
+
+    result = _run(project, milestone, driver, max_concurrent=2)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert result["levels"] == []
+    assert result["completed"] == []
+    assert [call["stories"] for call in integrate_recorder.calls] == [[]]
+
+
+@requires_git
+@requires_brd
+def test_a_lane_bug_becomes_escalated_with_type_and_message(project):
+    """A driver that raises is a lane bug: `escalated` at the subtask it was
+    driving, with `"<Type>: <msg>"`, never a crash."""
+    shape = _milestone(project, {"A": 2})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    driver = GatedDriver(outcomes={a2: ValueError("lane bug")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"], result["failed_phase"], result["detail"]) == (
+        story_a,
+        a2,
+        None,
+        "ValueError: lane bug",
+    )
+    assert result["warnings"] == []
+    assert _statuses(_load(project, result["run_id"])) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "done",
+        a2: "escalated",
+    }
+
+
+@requires_git
+@requires_brd
+def test_every_node_has_no_timeout(project, monkeypatch):
+    """Review Focus 1: grafo's default node timeout (60 s) would cancel a lane
+    mid-phase, so every node -- done stories' included -- is built with
+    `timeout=None`."""
+    built: list[grafo.Node] = []
+
+    class RecordingNode(grafo.Node):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(grafo, "Node", RecordingNode)
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A"]}
+    )
+    (d1,) = shape["subtasks"]["D"]
+    for card in (d1, shape["stories"]["D"]):
+        board.set_status(card, "done", repo_dir=project)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert sorted(node.uuid for node in built) == sorted(shape["stories"].values())
+    assert [node._timeout for node in built] == [None] * len(built)
+
+
+def _patch_default_node_timeout(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make `grafo.Node`'s default `timeout` `seconds` for this test."""
+    init = grafo.Node.__init__
+    params = list(inspect.signature(init).parameters)
+    defaults = list(init.__defaults__)
+    defaults[params.index("timeout") - (len(params) - len(defaults))] = seconds
+    monkeypatch.setattr(init, "__defaults__", tuple(defaults))
+
+
+async def _noop() -> None:
+    return None
+
+
+@requires_git
+@requires_brd
+def test_a_lane_outlives_the_default_node_timeout(project, monkeypatch):
+    """Review Focus 1: with grafo's default patched to 0.05 s, a lane still in
+    flight well past it is not cancelled and the story ends `done`."""
+    _patch_default_node_timeout(monkeypatch, PATCHED_NODE_TIMEOUT)
+    assert grafo.Node(coroutine=_noop)._timeout == PATCHED_NODE_TIMEOUT  # the patch bites
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+
+    async def outlast_the_default(stop: StopSignal | None) -> None:
+        released = asyncio.Event()
+        asyncio.get_running_loop().call_later(LONGER_THAN_PATCHED_TIMEOUT, released.set)
+        await _within(released.wait(), "the release timer")
+
+    driver = GatedDriver(gates={a1: outlast_the_default})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True, result
+    assert result["completed"] == [a1]
+
+
+@requires_git
+@requires_brd
+def test_report_keeps_levels_as_waves(project):
+    """Levels stop being barriers but stay in the report: `dag.compute_levels`."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A"], "D": ["C"]}
+    )
+    plan = census.flatten_milestone(board.tree(shape["milestone"], repo_dir=project))
+    waves = dag.compute_levels(plan.stories)
+
+    result = _run(project, shape["milestone"], GatedDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    assert result["levels"] == [
+        {"level": index, "stories": [story.id for story in wave]}
+        for index, wave in enumerate(waves)
+    ]
+    assert len(result["levels"]) == 3
+
+
+def test_only_orchestrate_imports_grafo():
+    """T10: grafo is a runtime dependency of exactly one module."""
+    package = Path(orchestrate.__file__).parent
+    importers: set[str] = set()
+    for path in package.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            else:
+                continue
+            if any(name == "grafo" or name.startswith("grafo.") for name in names):
+                importers.add(path.relative_to(package).as_posix())
+    assert importers == {"orchestrate.py"}
+
+
+# ── real M6 subtask agents under the tree ───────────────────────────────────
+
+
+@pytest.fixture
+def fresh_pygents():
+    """Fresh pygents registries and compile cache, as `tests/runtime/conftest.py`
+    gives every runtime test: this module's agents must not collide with others."""
+    from pygents import AgentRegistry, ToolRegistry
+
+    from agent_manager.runtime import compile as compile_mod
+
+    ToolRegistry.clear()
+    AgentRegistry.clear()
+    compile_mod.clear_cache()
+    yield
+    ToolRegistry.clear()
+    AgentRegistry.clear()
+    compile_mod.clear_cache()
+
+
+class _ThreadWatch:
+    """A `pause()`-only stand-in on the run's StopSignal whose flag a step, in
+    its `to_thread` worker, can wait on."""
+
+    def __init__(self) -> None:
+        self.paused = threading.Event()
+
+    def pause(self) -> None:
+        self.paused.set()
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_parks_running_lanes_and_blocks_new_ones(project, fresh_pygents):
+    """Spec test 4, on real M6 pygents subtask agents over step-only workflows
+    (the fake runner): A's step fails once B's first phase is in flight; the
+    lane triggers the stop; B's agent is paused, finishes its phase and parks
+    before `b_second` through ON_PAUSE; C, blocked by A, is never started."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    b_in = threading.Event()
+    watch = _ThreadWatch()
+    ran: list[str] = []
+
+    def a_work(card: str) -> dict[str, Any]:
+        ran.append("a_work")
+        if not b_in.wait(WAIT):
+            raise RuntimeError("B's first phase never started")
+        raise RuntimeError("a failed on purpose")
+
+    def b_first(card: str) -> dict[str, Any]:
+        ran.append("b_first")
+        b_in.set()
+        if not watch.paused.wait(WAIT):
+            raise RuntimeError("the stop was never triggered")
+        return {"b_first": 1}
+
+    def b_second(card: str) -> dict[str, Any]:
+        ran.append("b_second")
+        return {"b_second": 2}
+
+    def c_work(card: str) -> dict[str, Any]:
+        ran.append("c_work")
+        return {"c_work": 3}
+
+    workflows = {
+        a1: Workflow("m7_supervise_a_escalates", (Step("a_work", a_work),)),
+        b1: Workflow("m7_supervise_b_parks", (Step("b_first", b_first), Step("b_second", b_second))),
+        c1: Workflow("m7_supervise_c_never", (Step("c_work", c_work),)),
+    }
+    called: list[str] = []
+
+    async def drive(*, store, run_id, card, parent, subtask, repo_dir, stop=None, **_: Any):
+        called.append(card.id)
+        if card.id == b1:
+            stop.register(watch)
+        try:
+            summary = await runtime_engine.run_subtask_async(
+                workflows[card.id],
+                store,
+                story_id=parent.id,
+                subtask=subtask,
+                repo_dir=repo_dir,
+                stop=stop,
+            )
+        finally:
+            if card.id == b1:
+                stop.unregister(watch)
+        return cli.SubtaskDrive(summary=summary, warnings=list(summary.warnings))
+
+    result = _run(project, shape["milestone"], drive, max_concurrent=2)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert sorted(called) == sorted([a1, b1])
+    assert sorted(ran) == ["a_work", "b_first"]
+    assert result["escalated"] is True, result
+    assert (result["story"], result["subtask"]) == (story_a, a1)
+    assert "a failed on purpose" in result["detail"]
+    assert "also_escalated" not in result
+    assert result["stopped"] == [{"story": story_b, "subtask": b1, "before_phase": "b_second"}]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+        story_c: "pending",
+        c1: "pending",
+    }
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(b1)
+    finally:
+        opened.close()
+    assert newest.reason == "parked"
+    assert newest.agent["queue"][0]["kwargs"]["phase"] == "b_second"
 
 
 # ── relaunch continues an open checkpoint (card 02890d5d) ───────────────────
@@ -2121,9 +2535,9 @@ class CheckpointDriver(FakeDriver):
 
     resumed: dict[str, Any] = field(default_factory=dict)
 
-    def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
+    async def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
         self.resumed[kwargs["card"].id] = resume_from
-        return super().__call__(**kwargs)
+        return await super().__call__(**kwargs)
 
 
 def _plant(
