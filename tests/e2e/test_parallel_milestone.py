@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, cli, models, store
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow import task as task_workflow
 
 
@@ -383,6 +384,35 @@ def test_a_relaunch_after_the_escalation_finishes_and_skips_done_subtasks(
     assert _is_ancestor(root, branches[b1], branches[b2])
     assert _is_ancestor(root, branches[a2], branches[c1])
     assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+def test_the_lanes_await_drive_subtask_async_on_the_runs_loop(
+    parallel_board, rendezvous, run_milestone_cli, monkeypatch
+):
+    """T3: one event loop per run. Every subtask goes through the awaitable
+    `cli.drive_subtask_async`, handed the run's `StopSignal`; the sync
+    `cli.drive_subtask` (its own `asyncio.run`) is never reached."""
+    awaited: list[str] = []
+    real = cli.drive_subtask_async
+
+    async def spy(**kwargs):
+        awaited.append(kwargs["card"].id)
+        assert isinstance(kwargs["stop"], StopSignal), kwargs.get("stop")
+        return await real(**kwargs)
+
+    def forbidden(**kwargs):
+        raise AssertionError("the sync cli.drive_subtask was reached from a milestone run")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", spy)
+    monkeypatch.setattr(cli, "drive_subtask", forbidden)
+
+    result = _run_two_lanes(parallel_board, rendezvous, run_milestone_cli)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert _envelope(result)["done"] is True
+    assert sorted(awaited) == sorted(
+        card for chain in parallel_board["subtasks"].values() for card in chain
+    )
 
 
 def test_no_rendezvous_is_left_armed_for_later_tests():
