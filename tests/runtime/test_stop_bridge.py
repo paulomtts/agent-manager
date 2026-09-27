@@ -12,6 +12,7 @@ the `StopSignal` hands `trigger` to the loop with `call_soon_threadsafe`
 """
 
 import asyncio
+import inspect
 import json
 import threading
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ import pytest
 from agent_manager import models, store as store_module
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.state import RunDeps
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Step, Workflow
 
@@ -59,6 +61,43 @@ def _reasons(opened) -> list[tuple[int, str]]:
             "SELECT seq, reason FROM checkpoints ORDER BY seq"
         ).fetchall()
     ]
+
+
+WALK_PARAMETERS = [
+    "workflow",
+    "store",
+    "story_id",
+    "subtask",
+    "repo_dir",
+    "commands",
+    "card",
+    "parent_story",
+    "extra_context",
+    "agent_runner",
+    "clock",
+    "stop",
+    "resume_from",
+]
+
+
+@pytest.mark.parametrize(
+    "walk",
+    [runtime_engine.run_subtask, runtime_engine.run_subtask_async],
+    ids=["sync", "async"],
+)
+def test_the_walk_takes_a_stop_signal_and_no_other_stop(walk):
+    """T5: `stop` is the only stop; any other stop keyword is a `TypeError`."""
+    assert list(inspect.signature(walk).parameters) == WALK_PARAMETERS
+
+
+def test_run_deps_binds_the_stop_signal_seventh():
+    """The engine builds `RunDeps` positionally up to `clock`; the seventh
+    field must be `stop`, so nothing after `clock` shifts."""
+    stop = StopSignal()
+
+    deps = RunDeps("workflow", "store", STORY_ID, "subtask", None, lambda: FIXED, stop)
+
+    assert deps.stop is stop
 
 
 # ── StopSignal (supervisor-tree T5, card 364babde) ───────────────────────────

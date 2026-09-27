@@ -1,18 +1,16 @@
 """Checkpoint hooks (pygents-engine design G5, G8, §6; supervisor-tree T5).
 
-Every turn of a subtask's agent is saved as `Agent.to_dict()` in the store's
-`checkpoints` table *before* it runs, and the run's cooperative stop is read
-at the same moment: a set stop saves `parked` and raises `Parked`, which
-propagates out of `agent.run()` and ends it cleanly -- nothing breaks or
-returns out of the loop. The after-run rows (`done`, `escalated`) are
-written by `runtime/engine.py` through `save`.
+Every turn of a subtask's agent is saved by `before_turn` as
+`Agent.to_dict()` in the store's `checkpoints` table *before* it runs. The
+after-run rows (`done`, `escalated`) are written by `runtime/engine.py`
+through `save`.
 
-There are two stops until Task 3.3. The M6 one is `RunDeps.should_stop`,
-read by `before_turn`. The M7 one is a `StopSignal` (`runtime/stop.py`) that
-pauses the agent; pygents then fires `ON_PAUSE` at the top of its loop,
-between turns, and `on_pause` saves `parked` and raises `Parked`. The raise
-is what ends the run: `pause()` alone would leave `run()` waiting forever
-for a `resume()`.
+The run's one stop is a `StopSignal` (`runtime/stop.py`) that pauses the
+agent; pygents then fires `ON_PAUSE` at the top of its loop, between turns,
+and `on_pause` saves `parked` and raises `Parked`, which propagates out of
+`agent.run()` and ends it cleanly -- nothing breaks or returns out of the
+loop. The raise is what ends the run: `pause()` alone would leave `run()`
+waiting forever for a `resume()`.
 
 The hooks are module-level on purpose: pygents' `HookRegistry` is process-wide
 and keyed on the function's name, and closures from one factory collide in
@@ -36,7 +34,7 @@ from agent_manager.runtime.state import current_run
 
 
 class Parked(Exception):
-    """The run's stop was set: the subtask stopped before `.before_phase`."""
+    """The run's `StopSignal` parked the subtask before `.before_phase`."""
 
     def __init__(self, before_phase: str) -> None:
         self.before_phase = before_phase
@@ -60,14 +58,7 @@ def save(agent: Any, reason: str) -> None:
 
 @hook(AgentHook.BEFORE_TURN, tags={"subtask"})
 async def before_turn(agent: Any) -> None:
-    deps = current_run.get(None)
-    if deps is None:
-        return
-    snapshot = agent.to_dict()
-    head = (snapshot["current_turn"] or snapshot["queue"][0])["kwargs"]["phase"]
-    if deps.should_stop is not None and deps.should_stop():
-        save(agent, "parked")
-        raise Parked(head)
+    """Save the turn about to run. `save` writes nothing with no run set."""
     save(agent, "turn")
 
 
