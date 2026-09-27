@@ -2833,7 +2833,7 @@ def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
     project, fake_bases
 ):
     """Spec, Engine tier: C (blocked by A and B) builds its base once, only
-    after both blockers returned, from their forwarded tips in
+    after both blockers returned, from their tips in
     `root_plan.blockers` order; c1 stacks on the base, c2 on c1; the report
     lists the base."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 2}, blocked_by={"C": ["A", "B"]})
@@ -2893,8 +2893,8 @@ def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
 @requires_git
 @requires_brd
 def test_a_done_blockers_existing_tip_goes_into_the_base(project, fake_bases):
-    """Review Focus 3: on a relaunch A is already done. Its node forwards the
-    tip it already has, and that tip is merged in its blocker position."""
+    """Review Focus 3: on a relaunch A is already done. Its lane finishes at once
+    with the tip it already has, and that tip is merged in its blocker position."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
     (a1,) = shape["subtasks"]["A"]
@@ -3085,7 +3085,7 @@ def test_a_base_whose_resolver_was_stopped_ends_stopped_not_escalated(project, f
 @requires_brd
 def test_a_merged_lane_that_finds_the_stop_fired_never_builds_its_base(project, fake_bases):
     """Review Focus 1: one slot. The three roots queue on it in census order;
-    `joined` (blocked by the first two) is started only after the second
+    `joined` (blocked by the first two) asks for the slot only after the second
     returned, so it queues behind `last`. `last` escalates, and `joined` takes
     the slot with the stop already fired: stopped at j1, nothing built."""
     milestone = _add_card(project, "Milestone 3: orchestration")
@@ -3141,7 +3141,7 @@ def test_any_other_error_from_the_base_is_a_lane_escalation_with_no_subtask(
 def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
     project, fake_bases
 ):
-    """Spec: grafo never starts C when B escalated, so C is `pending` and
+    """Spec: C never takes a slot when B escalated, so C is `pending` and
     `bases.build` is never called."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
     story_b, story_c = shape["stories"]["B"], shape["stories"]["C"]
@@ -3259,3 +3259,83 @@ def test_a_closed_subtask_less_story_builds_no_base(project, fake_bases):
     assert result["done"] is True, result
     assert fake_bases.calls == []
     assert "bases" not in result
+
+
+@requires_git
+@requires_brd
+def test_a_merged_storys_dependent_stays_pending_when_a_blocker_failed(project, fake_bases):
+    """T1: grafo starts no dependent of a lane that did not finish clean. C
+    never ran (B escalated), so E -- blocked by C alone -- is never started
+    either: `pending`, not `stopped`, and never listed as parked."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "E": 1}, blocked_by={"C": ["A", "B"], "E": ["C"]}
+    )
+    story_b, story_c, story_e = (shape["stories"][key] for key in "BCE")
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (e1,) = shape["subtasks"]["E"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert "stopped" not in result, result
+    assert fake_bases.calls == []
+    assert [call["card"] for call in driver.calls if call["card"] in (c1, e1)] == []
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+    assert (statuses[story_e], statuses[e1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_merged_storys_dependent_stays_pending_when_a_blocker_failed(
+    project, fake_bases
+):
+    """J (no subtasks) never builds its base when B escalated, and D -- which
+    falls through to J's base -- is never started: `pending`, not `stopped`."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_b, story_d = shape["stories"]["B"], shape["stories"]["D"]
+    (b1,) = shape["subtasks"]["B"]
+    (d1,) = shape["subtasks"]["D"]
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=1)
+
+    assert (result["story"], result["subtask"]) == (story_b, b1), result
+    assert "stopped" not in result, result
+    assert fake_bases.calls == []
+    assert d1 not in [call["card"] for call in driver.calls]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_d], statuses[d1]) == ("pending", "pending")
+
+
+@requires_git
+@requires_brd
+def test_a_done_merged_storys_dependent_waits_for_its_blockers(project, fake_bases):
+    """A done story rooted on a merged base still sits behind its blockers,
+    as a done lone-blocker story sits behind its blocker's edge: C is done,
+    B is not, so E (blocked by C) is driven only after b1 returned, and not
+    at all when B escalates."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "E": 1}, blocked_by={"C": ["A", "B"], "E": ["C"]}
+    )
+    story_c, story_e = shape["stories"]["C"], shape["stories"]["E"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (e1,) = shape["subtasks"]["E"]
+    for card in (c1, story_c):
+        board.set_status(card, "done", repo_dir=project)
+    driver = FakeDriver(outcomes={b1: ("review", "b broke")})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    assert e1 not in [call["card"] for call in driver.calls]
+    assert "stopped" not in result, result
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_e], statuses[e1]) == ("pending", "pending")

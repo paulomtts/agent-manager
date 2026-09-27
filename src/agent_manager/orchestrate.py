@@ -13,8 +13,9 @@ releases the dependents of a lane that did not finish clean, and
 `collect_outcomes` reads every story's outcome after the tree ran (T6).
 
 A story with two or more in-milestone blockers roots on a merged base
-(supervisor-tree §5): its lane awaits `bases.build` with the tips grafo
-forwarded, after it took its slot and before its first subtask, so that
+(supervisor-tree §5): its lane waits for every blocker to finish clean, then
+awaits `bases.build` with their tips (`blocker_tips`), after it took its slot
+and before its first subtask, so that
 subtask stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the
 fast path: no base branch and no extra verify.
 
@@ -727,7 +728,7 @@ async def lane(
 
     A story with nothing left to run returns its tip without taking a slot,
     unless `builds_a_base_alone` says it must first build its merged base
-    (`base_only_lane`). Otherwise the lane takes a slot -- grafo started it, so
+    (`base_only_lane`); a `merged` one still waits for its blockers first. Otherwise the lane takes a slot -- grafo started it, so
     every blocker already succeeded -- and drives the remaining subtasks in
     census order, each on the base `record_plan` recorded for it. Before each
     subtask it checks the stop: if it fired, the story is recorded `stopped`
@@ -760,13 +761,15 @@ async def lane(
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
-    if planned is None and not builds_a_base_alone(story, root_plan):
-        return plan.tips[story.id]
     tips: list[str] | None = None
     if root_plan.kind == "merged":
+        # Waited for even with nothing left to run: grafo would have held a
+        # blocked story, done or not, behind its blockers' edges.
         tips = await blocker_tips(root_plan, plan, story_done, story_ok)
         if tips is None:
             return plan.tips[story.id]
+    if planned is None and not builds_a_base_alone(story, root_plan):
+        return plan.tips[story.id]
     if planned is None:
         return await base_only_lane(
             story,
