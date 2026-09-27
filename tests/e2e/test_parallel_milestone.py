@@ -477,7 +477,7 @@ def test_a_story_blocked_by_two_stories_runs_on_their_merged_base(
 def test_a_failed_blocker_leaves_the_merged_story_pending_with_no_base(
     merged_base_board, run_milestone_cli
 ):
-    """B's review fails: grafo never starts C, so C stays pending, and no
+    """B's review fails: C never drives c1 or builds its base, so C stays pending, and no
     merged base branch or worktree is ever made."""
     root = merged_base_board["root"]
     stories = merged_base_board["stories"]
