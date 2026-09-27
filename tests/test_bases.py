@@ -1,4 +1,4 @@
-"""Behaviour of `bases.build` (supervisor-tree plan Task 2.1, card 06bf46bb).
+"""Behaviour of `bases.build` (supervisor-tree plan Tasks 2.1 and 2.2, cards 06bf46bb and 8fe30578).
 
 Placement follows design §14: `bases.py` wraps the worktree, merge and verify
 steps, so it is a Steps component and is exercised against real temporary git
@@ -6,6 +6,12 @@ repositories created in `tmp_path` -- no network and no mocks of git. The repo
 helpers are ported from `tests/steps/test_integrate.py` (there is no
 `tests/conftest.py`). Every scenario asserts the milestone's base branch,
 `master`, never moves. No test sleeps.
+
+The resolver path uses a real `Store` and `dispatch.AgentRunner` with an
+injected launcher double, `FakeResolver`, ported from
+`tests/test_integration.py`. It plays fake `claude`'s resolver mode (pinned by
+`tests/e2e/test_fake_claude.py`'s `test_the_resolver_*`) and learns what to do
+only from its brief.
 """
 
 import asyncio
@@ -917,6 +923,47 @@ async def test_every_git_and_verify_call_runs_off_the_event_loop_thread(
     result = await _build(repo, ["m7/a", "m7/b"], commands=["true"])
 
     assert result.merged == ["m7/b"]
+    assert sorted(calls) == ["_ref_exists", "ensure", "merge_tip", "run_suite"]
+    assert all(
+        thread != loop_thread for threads in calls.values() for thread in threads
+    ), calls
+    assert rev(repo, "master") == MASTER_BEFORE
+
+
+@requires_git
+async def test_git_and_verify_around_a_resolved_conflict_run_off_the_loop_thread(
+    conflicting_repo: Path,
+    store: Store,
+    MASTER_BEFORE: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The conflict-path twin of the test above: same spies, real git, a real
+    # suite, and the resolver in between.
+    repo = conflicting_repo
+    loop_thread = threading.get_ident()
+    calls: dict[str, list[int]] = {}
+
+    def spy(name: str, real):
+        def wrapper(*args, **kwargs):
+            calls.setdefault(name, []).append(threading.get_ident())
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(bases, "_ref_exists", spy("_ref_exists", bases._ref_exists))
+    monkeypatch.setattr(bases, "ensure", spy("ensure", bases.ensure))
+    monkeypatch.setattr(bases, "merge_tip", spy("merge_tip", bases.merge_tip))
+    monkeypatch.setattr(
+        bases.verify, "run_suite", spy("run_suite", bases.verify.run_suite)
+    )
+    factory = FakeFactory()
+
+    result = await _resolve_build(
+        repo, ["m7/a", "m7/b"], store=store, factory=factory, commands=["true"]
+    )
+
+    assert result.resolved == ["m7/b"]
+    assert factory.resolver.calls == [["shared.txt"]]
     assert sorted(calls) == ["_ref_exists", "ensure", "merge_tip", "run_suite"]
     assert all(
         thread != loop_thread for threads in calls.values() for thread in threads

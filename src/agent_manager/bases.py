@@ -11,9 +11,14 @@ A plain async function, not a pygents Agent (milestone rule 2), and grafo is
 not imported here. Every git and verify call runs in a thread through
 `asyncio.to_thread`, so a lane awaiting its base never blocks the loop.
 
-Task 2.2 (card 8fe30578) wires conflicts to the Integrate resolver and is the
-first user of `store`, `run_id`, `story_id`, `runner_factory` and `stop`,
-which `build` already accepts so its call site never changes.
+A conflicting tip is handed to `workflow.integrate.INTEGRATE` (resolve, then
+verify) through `runtime.engine.run_subtask_async`, awaited on the running
+loop with the run's `StopSignal` (plan Task 2.2, card 8fe30578). It runs under
+a synthetic "Merged bases" story (`BASES_STORY_ID`), recorded on the first
+conflict only, with one synthetic subtask `base-<story id>` recorded before
+the engine journals a phase. A resolver that escalates fails the base; one
+parked by the stop fails it with `stopped=True`. Either way the merge is left
+in the worktree for a human or a later resume.
 
 Nothing is pushed, and the milestone's base branch is never checked out,
 merged into or moved: every git write is `ensure`'s or `merge_tip`'s, in the
@@ -48,8 +53,8 @@ class BaseResult:
     """The merged base is built and verified.
 
     `merged` and `already_merged` list the tips after the first, in the order
-    given; `resolved` lists the tips a resolver fixed (always empty until
-    Task 2.2).
+    given; `resolved` lists the tips a resolver fixed, which are in `merged`
+    too.
     """
 
     branch: str
@@ -61,8 +66,8 @@ class BaseResult:
 class BaseFailed(Exception):
     """The merged base could not be built. A human reads `detail`.
 
-    `stopped` is True only when a stop signal cut the build short (Task 2.2);
-    every failure a clean-merge build raises is a real failure.
+    `stopped` is True only when a stop signal parked the base's resolver;
+    every other failure is a real failure.
     """
 
     def __init__(self, detail: str, *, stopped: bool = False) -> None:
@@ -197,8 +202,10 @@ async def build(
 
     `tips` are the blockers' tips in `root.blockers` order. An existing branch
     or worktree is reused, and a tip already inside the base is reported as
-    `already_merged`, so a relaunch re-merges nothing. `store`, `run_id`,
-    `story_id`, `runner_factory` and `stop` are unused until Task 2.2.
+    `already_merged`, so a relaunch re-merges nothing. A conflict needs
+    `store`, `story_id` and `runner_factory` to reach the resolver, and fails
+    for a human without them; `run_id` defaults to the store's, and `stop=None`
+    means nothing can stop the resolver.
     """
     tips = list(tips)
     if not tips:
