@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -370,7 +370,9 @@ class SupervisorPlan:
     `stories` is every census story, done ones included, in census order: each
     becomes a node. `roots` and `tips` cover all of them. `levels` are the
     pending stories' waves from `plan_levels`, and `rows` their store rows from
-    `record_plan`.
+    `record_plan`. `resuming` is set on a milestone resume (card 54e4ec29),
+    whose validated checkpoints, keyed by card id -- subtasks and
+    `base-<story>` resolvers -- are `checkpoints`.
     """
 
     stories: tuple[census.StoryPlan, ...]
@@ -378,6 +380,8 @@ class SupervisorPlan:
     roots: dict[str, dag.RootPlan]
     tips: dict[str, str]
     rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
+    checkpoints: Mapping[str, Checkpoint] = field(default_factory=dict)
+    resuming: bool = False
 
     @property
     def planned(self) -> dict[str, PlannedStory]:
@@ -392,11 +396,13 @@ def supervisor_plan(
     *,
     branch_prefix: str,
     base_branch: str,
+    checkpoints: Mapping[str, Checkpoint] | None = None,
 ) -> SupervisorPlan:
     """Every census story's root and tip beside the pending waves and their rows.
 
     Pure. `plan_levels` has already run the cycle check, so this derives
-    geometry and refuses nothing.
+    geometry and refuses nothing. `checkpoints` is given only on a resume,
+    and marks the plan `resuming` even when it is empty.
     """
     stories = tuple(stories)
     by_id = {story.id: story for story in stories}
@@ -412,6 +418,8 @@ def supervisor_plan(
             for story in stories
         },
         rows=rows,
+        checkpoints=dict(checkpoints or {}),
+        resuming=checkpoints is not None,
     )
 
 
@@ -733,6 +741,7 @@ async def build_merged_base(
     allow_no_verification: bool,
     runner_factory: cli.RunnerFactory | None,
     stop: StopSignal,
+    resume_from: Checkpoint | None = None,
 ) -> None:
     """Await `bases.build` for one merged-root story (supervisor-tree §5).
 
@@ -741,9 +750,13 @@ async def build_merged_base(
     module at call time so a test can replace it. A `None` factory is
     production's, `cli.default_runner_factory`, read at call time as
     Integrate reads it, so a conflicting tip reaches the resolver instead of
-    failing for a human.
+    failing for a human. `resume_from` is the resolver's checkpoint on a
+    resume (card 54e4ec29), passed only when there is one.
     """
     factory = cli.default_runner_factory if runner_factory is None else runner_factory
+    extra: dict[str, Any] = {}
+    if resume_from is not None:
+        extra["resume_from"] = resume_from
     await bases.build(
         root_plan,
         list(tips),
@@ -755,6 +768,7 @@ async def build_merged_base(
         story_id=story.id,
         runner_factory=factory,
         stop=stop,
+        **extra,
     )
 
 
@@ -842,6 +856,7 @@ async def base_only_lane(
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
                 stop=stop,
+                resume_from=plan.checkpoints.get(bases.resolver_card_id(story.id)),
             )
         except bases.BaseFailed as error:
             if error.stopped:
@@ -910,6 +925,10 @@ async def lane(
     Each subtask's open checkpoint is looked up first
     (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
+
+    On a resume (`plan.resuming`, card 54e4ec29) the subtask's checkpoint is
+    `plan.checkpoints`' and the lenient relaunch lookup is never read; a
+    merged base gets its resolver's checkpoint the same way.
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
@@ -977,6 +996,7 @@ async def lane(
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
+                        resume_from=plan.checkpoints.get(bases.resolver_card_id(story.id)),
                     )
                 except bases.BaseFailed as error:
                     # A parked resolver is a stop, not an escalation (P4).
@@ -1001,10 +1021,16 @@ async def lane(
                 store.record_subtask(story.id, row)
                 if position == 0:
                     store.record_story(story_row.model_copy(update={"status": "started"}))
-                # Relaunch continuation (card 02890d5d): the keyword is passed
-                # only when there is a row, so a driver that predates it works.
+                # Relaunch continuation (card 02890d5d) is lenient and reads
+                # across runs; a resume (card 54e4ec29) hands on exactly the
+                # checkpoints `resume_checkpoints` already validated. Either
+                # way the keyword is passed only when there is a row, so a
+                # driver that predates it works.
                 extra: dict[str, Any] = {}
-                checkpoint = cli.continuable_checkpoint(store, subtask.id)
+                if plan.resuming:
+                    checkpoint = plan.checkpoints.get(subtask.id)
+                else:
+                    checkpoint = cli.continuable_checkpoint(store, subtask.id)
                 if checkpoint is not None:
                     extra["resume_from"] = checkpoint
                 result = await drive(
@@ -1171,17 +1197,18 @@ async def supervise(
 
 
 def run_milestone(
-    milestone: str,
+    milestone: str | None,
     *,
     repo_dir: Path,
-    base_branch: str,
-    branch_prefix: str,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: cli.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
+    resume_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
@@ -1207,24 +1234,50 @@ def run_milestone(
     Integrate escalation records `escalated` and returns
     `integrate_escalated_payload`. An exception from Integrate propagates and
     the run is never recorded `done`.
+
+    `resume_run_id` continues that milestone run instead (card 54e4ec29).
+    `milestone`, `base_branch`, `branch_prefix`, `max_concurrent` and
+    `clock` are then not read: the milestone is the one the run id names
+    (`find_run_milestone`) and the rest is what the run recorded. The plan is
+    re-derived from the board as a fresh run derives it. Every refusal -- an
+    unknown, non-milestone or `done` run, an unknown milestone, a blocker
+    cycle, and a checkpoint saved under another workflow digest -- comes
+    before the first write and before git is refreshed. Then the run is
+    recorded `started`, the plan is re-recorded, orphan attempts are marked
+    `harness_error` and every open stopped, escalated or started row is
+    recorded `started` (`reopen_rows`), and `supervise` runs under the same
+    run id with each open checkpoint handed on as `resume_from`. Every
+    payload gains `resumed: true`; `completed` is this invocation's work.
     """
-    if max_concurrent < 1:
-        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+    if resume_run_id is None:
+        if max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+        if milestone is None or base_branch is None or branch_prefix is None:
+            raise ValueError(
+                "a fresh milestone run needs a milestone, a base branch and a branch prefix"
+            )
     root = cli.resolve_repo_dir(repo_dir)
-    milestone_card = census.find_milestone(board.roots(repo_dir=root), milestone)
+    resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
+    if resumed is not None:
+        base_branch = resumed.base_branch
+        branch_prefix = resumed.branch_prefix
+        max_concurrent = resumed.config.max_concurrent_stories
+    roots = board.roots(repo_dir=root)
+    if resumed is None:
+        milestone_card = census.find_milestone(roots, milestone)
+    else:
+        milestone_card = find_run_milestone(roots, resumed.id)
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     drive = cli.drive_subtask_async if driver is None else driver
 
-    # The first side effect. It runs after every refusal and before the store
-    # is opened, so a failed fetch leaves no run directory behind.
-    refresh_git(root)
-
-    started_at = clock()
-    run_id = cli.mint_run_id(milestone_card.id, started_at)
-    store = Store.open(root, run_id)
-    try:
+    if resumed is None:
+        # The first side effect. It runs after every refusal and before the store
+        # is opened, so a failed fetch leaves no run directory behind.
+        refresh_git(root)
+        started_at = clock()
+        run_id = cli.mint_run_id(milestone_card.id, started_at)
         run_record = models.Run(
             id=run_id,
             workflow=MILESTONE_WORKFLOW,
@@ -1235,8 +1288,24 @@ def run_milestone(
             started_at=started_at,
             config=models.RunConfig(max_concurrent_stories=max_concurrent),
         )
+    else:
+        run_id = resumed.id
+        run_record = resumed.model_copy(update={"status": "started"})
+    store = Store.open(root, run_id)
+    try:
+        checkpoints: dict[str, Checkpoint] | None = None
+        cards: list[tuple[str, Workflow]] = []
+        if resumed is not None:
+            cards = open_cards(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+            # The store's own refusal, a checkpoint saved under another
+            # workflow, comes before the first write and before git is touched.
+            checkpoints = resume_checkpoints(store, cards)
+            refresh_git(root)
         store.record_run(run_record)
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
+        if resumed is not None:
+            # After `record_plan`, which records every planned row `pending`.
+            reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
         warnings = reroll_stale_stories(plan.stories, root)
         completed: list[str] = []
         stop = StopSignal()
@@ -1249,6 +1318,7 @@ def run_milestone(
                     rows,
                     branch_prefix=branch_prefix,
                     base_branch=base_branch,
+                    checkpoints=checkpoints,
                 ),
                 store=store,
                 run_id=run_id,
@@ -1266,12 +1336,17 @@ def run_milestone(
             completed.extend(outcome.completed)
             warnings.extend(outcome.warnings)
         built_bases = bases_payload(outcomes)
+
+        def report(payload: dict[str, Any]) -> dict[str, Any]:
+            """Every payload shape on the same terms: `bases` when built, `resumed` on a resume."""
+            if resumed is not None:
+                payload["resumed"] = True
+            return with_bases(payload, built_bases)
+
         if any(outcome.kind == "escalated" for outcome in outcomes):
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
             primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-            return with_bases(
-                escalated_payload(run_id, primary, outcomes, warnings), built_bases
-            )
+            return report(escalated_payload(run_id, primary, outcomes, warnings))
 
         # Integrate (addendum I6) runs only once every lane finished clean,
         # and also when there was nothing left to drive: that is how a relaunch
@@ -1294,10 +1369,10 @@ def run_milestone(
         if isinstance(outcome, integration.IntegrateEscalation):
             # The branch and worktree stay exactly as Integrate left them (I5).
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
-            return with_bases(integrate_escalated_payload(run_id, outcome, warnings), built_bases)
+            return report(integrate_escalated_payload(run_id, outcome, warnings))
 
         store.record_run(run_record.model_copy(update={"status": "done"}))
-        return with_bases(
+        return report(
             {
                 "done": True,
                 "run_id": run_id,
@@ -1309,8 +1384,7 @@ def run_milestone(
                 "tips": tips,
                 "warnings": warnings,
                 "integrated": integrated_payload(outcome),
-            },
-            built_bases,
+            }
         )
     finally:
         store.close()

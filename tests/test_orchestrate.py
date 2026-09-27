@@ -2770,12 +2770,14 @@ class FakeBases:
     `stop` (Events and Barriers, never sleeps). `outcomes[story]` is an
     exception to raise; with none the base counts as built and a
     `BaseResult` naming `root.branch` comes back. It touches no git: a
-    `FakeDriver` never needs the branch to exist.
+    `FakeDriver` never needs the branch to exist. `resumed[story]` is the
+    `resume_from` it was handed, `_ABSENT` when none was (card 54e4ec29).
     """
 
     outcomes: dict[str, BaseException] = field(default_factory=dict)
     gates: dict[str, Gate] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    resumed: dict[str, Any] = field(default_factory=dict)
 
     async def __call__(
         self,
@@ -2790,7 +2792,9 @@ class FakeBases:
         story_id,
         runner_factory,
         stop,
+        resume_from=_ABSENT,
     ) -> bases.BaseResult:
+        self.resumed[story_id] = resume_from
         self.calls.append(
             {
                 "root": root,
@@ -3588,3 +3592,273 @@ def test_reopening_marks_orphans_harness_error_and_open_rows_started(tmp_path, m
     }
     [review] = [subtask for subtask in story.subtasks if subtask.card_id == "a2"][0].phases
     assert [attempt.status for attempt in review.attempts] == ["harness_error"]
+
+
+# ── run_milestone(resume_run_id=...) (card 54e4ec29) ────────────────────────
+
+
+def _resume(project: Path, run_id: str, driver: Any, **overrides: Any) -> dict[str, Any]:
+    """`run_milestone` continuing `run_id`: no milestone, prefix, base or bound given."""
+    kwargs: dict[str, Any] = {"repo_dir": project, "driver": driver, "resume_run_id": run_id}
+    kwargs.update(overrides)
+    return orchestrate.run_milestone(None, **kwargs)
+
+
+def _plant_integrate(
+    project: Path, run_id: str, story_id: str, reason: str, *, digest: str | None = None
+) -> store_module.Checkpoint:
+    """One `INTEGRATE` checkpoint of `story_id`'s resolver, saved by `run_id`."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        return opened.save_checkpoint(
+            bases.resolver_card_id(story_id),
+            workflow=integrate_workflow.INTEGRATE.name,
+            digest=integrate_workflow.INTEGRATE.digest() if digest is None else digest,
+            reason=reason,
+            agent={"current_turn": None, "queue": [{"kwargs": {"phase": "verify", "loop": 0}}]},
+            saved_at=EARLIER,
+        )
+    finally:
+        opened.close()
+
+
+def _record_bounds(monkeypatch) -> list[int]:
+    """Wrap `orchestrate.supervise`, which `run_milestone` reads at call time,
+    and record the lane bound it is given."""
+    bounds: list[int] = []
+    real = orchestrate.supervise
+
+    async def recording(plan, **kwargs):
+        bounds.append(kwargs["max_concurrent"])
+        return await real(plan, **kwargs)
+
+    monkeypatch.setattr(orchestrate, "supervise", recording)
+    return bounds
+
+
+def _run_ids(project: Path) -> list[str]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _checkpoint_rows(project: Path) -> list[tuple]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT run_id, card_id, seq, reason, digest FROM checkpoints"
+                " ORDER BY run_id, card_id, seq"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _runs_tree() -> dict[str, bytes]:
+    """Every path under the data dir's `runs`, with file contents: the journals included."""
+    root = paths.data_dir() / "runs"
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _never_consulted(store, card_id):
+    pytest.fail("a resume consulted the lenient relaunch lookup cli.continuable_checkpoint")
+
+
+@requires_git
+@requires_brd
+def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on(
+    project, fake_bases, monkeypatch
+):
+    """Spec test 2: no prefix, base or bound is given, yet the subtasks stack
+    on `main` under `PREFIX` and the tree runs three lanes; a1 continues from
+    its checkpoint, C's resolver checkpoint reaches `bases.build`, and the
+    lenient relaunch lookup is never read."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}), max_concurrent=3)
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    turn = _plant(project, run_id, a1, "turn", queue=("review",))
+    resolver = _plant_integrate(project, run_id, story_c, "parked")
+    bounds = _record_bounds(monkeypatch)
+    monkeypatch.setattr(cli, "continuable_checkpoint", _never_consulted)
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["run_id"] == run_id
+    assert _run_ids(project) == [run_id]
+    assert bounds == [3]
+    by_card = {call["card"]: call for call in driver.calls}
+    assert by_card[a1]["base"] == "main"
+    assert by_card[a1]["branch"] == _branch(project, a1)
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    assert by_card[c1]["base"] == root_plan.branch
+    got = driver.resumed[a1]
+    assert (got.run_id, got.card_id, got.seq, got.reason) == (run_id, a1, turn.seq, "turn")
+    assert driver.resumed[b1] is _ABSENT
+    assert driver.resumed[c1] is _ABSENT
+    base_got = fake_bases.resumed[story_c]
+    assert (base_got.card_id, base_got.seq, base_got.reason) == (
+        bases.resolver_card_id(story_c),
+        resolver.seq,
+        "parked",
+    )
+    run = _load(project, run_id)
+    assert (run.status, run.branch_prefix, run.base_branch) == ("done", PREFIX, "main")
+    assert run.config.max_concurrent_stories == 3
+
+
+@requires_git
+@requires_brd
+def test_a_stale_resolver_checkpoint_refuses_the_whole_resume_and_writes_nothing(
+    project, fake_bases, monkeypatch
+):
+    """Spec test 4: one resolver saved under another INTEGRATE refuses the
+    whole resume before anything is driven, recorded or fetched."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}), max_concurrent=3)
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",))
+    _plant_integrate(project, run_id, story_c, "parked", digest="saved-under-another-integrate")
+    before = (
+        _runs_tree(),
+        _statuses(_load(project, run_id)),
+        _checkpoint_rows(project),
+        _local_branches(project),
+    )
+    git_calls = _record_git(monkeypatch)
+    driver = CheckpointDriver()
+
+    with pytest.raises(cli.CheckpointMismatchError) as caught:
+        _resume(project, run_id, driver)
+
+    message = str(caught.value)
+    assert message.startswith("workflow changed since checkpoint")
+    assert bases.resolver_card_id(story_c) in message
+    assert "saved-under-another-integrate" in message
+    assert integrate_workflow.INTEGRATE.digest() in message
+    assert driver.calls == [] and fake_bases.calls == []
+    assert git_calls == []
+    assert (
+        _runs_tree(),
+        _statuses(_load(project, run_id)),
+        _checkpoint_rows(project),
+        _local_branches(project),
+    ) == before
+
+
+@requires_git
+@requires_brd
+def test_a_merged_base_from_the_interrupted_run_is_reused_and_not_merged_again(project):
+    """Spec test 7, on the real `bases.build`: A and B finished and C's base
+    was merged before c1 escalated. The resume drives c1 only, on the same
+    base commit, and neither the base nor `main` moves."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    first = _run(
+        project,
+        shape["milestone"],
+        BranchingDriver(outcomes={c1: ("review", "boom")}),
+        commands=[PASS_CMD],
+    )
+    assert first["escalated"] is True, first
+    assert first["bases"] == [_bases_entry(story_c, root_plan)]
+    base_sha = _sha(project, root_plan.branch)
+    main_sha = _sha(project, "main")
+    driver = BranchingDriver()
+
+    result = _resume(project, first["run_id"], driver, commands=[PASS_CMD])
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [call["card"] for call in driver.calls] == [c1]
+    assert driver.calls[0]["base"] == root_plan.branch
+    assert result["completed"] == [c1]
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    assert _sha(project, root_plan.branch) == base_sha
+    assert _sha(project, "main") == main_sha
+
+
+@requires_git
+@requires_brd
+def test_a_card_finished_by_hand_since_the_interrupt_is_neither_checked_nor_driven(project):
+    """Review Focus 1: a1's checkpoint is stale, but a human finished a1 on the
+    board, so it is not open: no refusal, and only a2 is driven."""
+    shape = _milestone(project, {"A": 2})
+    a1, a2 = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",), digest="saved-under-another-task")
+    rollup.set_status(a1, "done", repo_dir=project)
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [call["card"] for call in driver.calls] == [a2]
+    assert result["completed"] == [a2]
+
+
+@requires_git
+@requires_brd
+def test_a_resume_after_an_integrate_escalation_retries_integrate(project, integrate_recorder):
+    """Review Focus 4: nothing is left to drive, so the resume runs no lane
+    and retries Integrate under the same run id."""
+    shape = _milestone(project, {"A": 1})
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=None, files=[], detail="the suite is red"
+    )
+    first = _run(project, shape["milestone"], BranchingDriver())
+    assert first["escalated"] is True, first
+    integrate_recorder.outcome = None
+    driver = BranchingDriver()
+
+    result = _resume(project, first["run_id"], driver)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["completed"] == []
+    assert driver.calls == []
+    assert [call["run_id"] for call in integrate_recorder.calls] == [first["run_id"]] * 2
+    assert _load(project, first["run_id"]).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_an_escalated_resume_still_says_it_resumed(project):
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+
+    again = _resume(project, first["run_id"], FakeDriver(outcomes={a1: ("review", "still")}))
+
+    assert again["escalated"] is True
+    assert again["resumed"] is True
+    assert again["run_id"] == first["run_id"]
+    assert again["detail"] == "still"
+
+
+def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(board, "roots", lambda **kwargs: pytest.fail("the board was read"))
+
+    with pytest.raises(ValueError, match="branch prefix"):
+        orchestrate.run_milestone("Milestone 3", repo_dir=tmp_path, base_branch="main")
