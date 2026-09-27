@@ -17,6 +17,7 @@ stays `ok: true` -- and `3` for "this tool could not run that", leaving `2` to
 Typer's own usage errors.
 """
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from agent_manager import (
     store as store_module,
 )
 from agent_manager.runtime.errors import EngineError
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
@@ -623,6 +625,64 @@ class SubtaskDrive:
     warnings: list[str]
 
 
+async def drive_subtask_async(
+    *,
+    store: Store,
+    run_id: str,
+    card: models.Card,
+    parent: models.Card,
+    subtask: models.SubtaskRun,
+    repo_dir: Path,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    stop: StopSignal | None = None,
+    resume_from: store_module.Checkpoint | None = None,
+) -> SubtaskDrive:
+    """Walk one subtask through `workflow.task.TASK` on the caller's event loop.
+
+    The awaitable form of `drive_subtask` (supervisor-tree T2): a supervisor
+    lane awaits it, so it must not open a loop of its own. A plain coroutine,
+    not a pygents Agent. The contract is `drive_subtask`'s: the caller owns the
+    store, the run id and every row around the walk, and this function catches
+    nothing -- an escalation is `summary.status == "escalated"`, a stop is
+    `"stopped"`, and engine errors propagate.
+
+    `stop` (T5) is the run's `StopSignal`, handed to the engine as is.
+    `should_stop` is here only so `drive_subtask` can forward it; Task 3.3
+    removes it. `resume_from` joins the walk's keywords only when given, so a
+    fresh walk is called exactly as before.
+    """
+    factory = default_runner_factory if runner_factory is None else runner_factory
+    runner = factory(
+        store=store,
+        run_id=run_id,
+        story_id=parent.id,
+        card_id=card.id,
+    )
+    walk: dict[str, Any] = {
+        "story_id": parent.id,
+        "subtask": subtask,
+        "repo_dir": repo_dir,
+        "commands": commands,
+        "card": card,
+        "parent_story": parent,
+        "extra_context": gate_context(commands, allow_no_verification),
+        "agent_runner": runner,
+        "should_stop": should_stop,
+        "stop": stop,
+    }
+    if resume_from is not None:
+        walk["resume_from"] = resume_from
+    summary = await runtime_engine.run_subtask_async(task_workflow.TASK, store, **walk)
+    # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
+    # its signature returns a result, so a warning has nowhere else to go,
+    # and dropping them is the §12 failure this whole list exists to prevent.
+    warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
+    return SubtaskDrive(summary=summary, warnings=warnings)
+
+
 def drive_subtask(
     *,
     store: Store,
@@ -647,36 +707,28 @@ def drive_subtask(
     `should_stop` goes straight to the engine; a stop is
     `summary.status == "stopped"`.
 
-    The walk is `runtime.engine.run_subtask` over `TASK`. `resume_from` (card
+    One `asyncio.run` around `drive_subtask_async`, whose walk is
+    `runtime.engine.run_subtask_async` over `TASK`. `resume_from` (card
     02890d5d) continues it from a saved checkpoint; it joins the walk's
     keywords only when given, so a fresh walk is called exactly as before.
+    Being `asyncio.run`, it raises `RuntimeError` inside a running loop;
+    callers there await `drive_subtask_async` instead.
     """
-    factory = default_runner_factory if runner_factory is None else runner_factory
-    runner = factory(
-        store=store,
-        run_id=run_id,
-        story_id=parent.id,
-        card_id=card.id,
+    return asyncio.run(
+        drive_subtask_async(
+            store=store,
+            run_id=run_id,
+            card=card,
+            parent=parent,
+            subtask=subtask,
+            repo_dir=repo_dir,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            should_stop=should_stop,
+            resume_from=resume_from,
+        )
     )
-    walk: dict[str, Any] = {
-        "story_id": parent.id,
-        "subtask": subtask,
-        "repo_dir": repo_dir,
-        "commands": commands,
-        "card": card,
-        "parent_story": parent,
-        "extra_context": gate_context(commands, allow_no_verification),
-        "agent_runner": runner,
-        "should_stop": should_stop,
-    }
-    if resume_from is not None:
-        walk["resume_from"] = resume_from
-    summary = runtime_engine.run_subtask(task_workflow.TASK, store, **walk)
-    # `AgentRunner` collects gate warnings out of band (dispatch.py:375):
-    # its signature returns a result, so a warning has nowhere else to go,
-    # and dropping them is the §12 failure this whole list exists to prevent.
-    warnings = list(summary.warnings) + list(getattr(runner, "warnings", []))
-    return SubtaskDrive(summary=summary, warnings=warnings)
 
 
 def run_card(
@@ -832,6 +884,12 @@ def dry_run_payload(
     level row says how many of its stories would run together:
     `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
 
+    A story's `root` is `dag.story_root(...).branch`. A story with two or more
+    in-milestone blockers is not refused here: its `root` is its own merged
+    base branch and its row gains `merged_from`, the blockers in `blocked_by`
+    order. The key is absent for every other row. The real run still refuses
+    such a story (`orchestrate.plan_levels`).
+
     `integrate` is the terminal phase's plan (Integrate addendum I6): the
     branch every tip is merged into, its worktree under `repo_dir`, and the
     merge order `integration.merge_order` gives -- every story with subtasks,
@@ -850,25 +908,25 @@ def dry_run_payload(
         story_rows: list[dict[str, Any]] = []
         for story in level:
             bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
-            story_rows.append(
-                {
-                    "story": story.id,
-                    "title": story.title,
-                    "root": dag.story_root(
-                        story, stories_by_id, branch_prefix, base_branch
-                    ),
-                    "subtasks": [
-                        {
-                            "id": subtask.id,
-                            "title": subtask.title,
-                            "status": subtask.status,
-                            "branch": dag.subtask_branch(branch_prefix, subtask),
-                            "base": bases[subtask.id],
-                        }
-                        for subtask in dag.remaining_subtasks(story)
-                    ],
-                }
-            )
+            root = dag.story_root(story, stories_by_id, branch_prefix, base_branch)
+            row: dict[str, Any] = {
+                "story": story.id,
+                "title": story.title,
+                "root": root.branch,
+                "subtasks": [
+                    {
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "status": subtask.status,
+                        "branch": dag.subtask_branch(branch_prefix, subtask),
+                        "base": bases[subtask.id],
+                    }
+                    for subtask in dag.remaining_subtasks(story)
+                ],
+            }
+            if root.kind == "merged":
+                row["merged_from"] = list(root.blockers)
+            story_rows.append(row)
         level_rows.append(
             {
                 "level": index,

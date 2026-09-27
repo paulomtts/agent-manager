@@ -1,10 +1,14 @@
+import dataclasses
+
 import pytest
 
 from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
     DependencyCycleError,
+    RootPlan,
     StackRootError,
     assert_no_blocker_cycles,
+    base_branch_name,
     compute_integrate_levels,
     compute_levels,
     is_story_closed,
@@ -365,6 +369,34 @@ def _by_id(*stories: StoryPlan) -> dict[str, StoryPlan]:
     return {story.id: story for story in stories}
 
 
+def _story_id(n: int) -> str:
+    """A UUID-shaped STORY id whose short id is ``n`` in eight hex digits.
+
+    ``base_branch_name`` goes through ``short_id``, which refuses the letter
+    ids ``_story`` uses elsewhere, so a story that roots on a merged base needs
+    a real-shaped id of its own. Distinct from ``_gsub``'s subtask ids.
+    """
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def test_base_branch_name_is_the_prefix_then_base_then_the_short_id():
+    c = _story(_story_id(0xC), subtasks=[])
+    assert base_branch_name(PREFIX, c) == "m3/base-0000000c"
+    assert base_branch_name(PREFIX, c) == f"{PREFIX}/base-{short_id(c.id)}"
+
+
+def test_base_branch_name_refuses_a_story_whose_id_is_not_a_card_id():
+    with pytest.raises(ValueError, match="not a card id"):
+        base_branch_name(PREFIX, _story("c", subtasks=[]))
+
+
+def test_a_root_plan_is_frozen_and_compares_by_value():
+    root = RootPlan(kind="base", branch="main", blockers=())
+    assert root == RootPlan("base", "main", ())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        root.branch = "other"  # type: ignore[misc]
+
+
 def test_subtask_branch_is_task_branch_so_names_have_one_source():
     sub = _gsub("a1", "aaaa0001")
     assert subtask_branch(PREFIX, sub) == task_branch(PREFIX, sub) == "m3/task-a1-aaaa0001"
@@ -377,19 +409,19 @@ def test_subtask_branch_passes_task_branchs_bad_id_error_through():
 
 def test_a_story_with_no_blockers_roots_on_the_base_branch():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
-    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+    assert story_root(a, _by_id(a), PREFIX, BASE) == RootPlan("base", "main", ())
 
 
 def test_a_story_blocked_only_outside_the_milestone_roots_on_the_base_branch():
     a = _story("a", ["not-in-this-milestone"], subtasks=[_gsub("a1", "aaaa0001")])
-    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+    assert story_root(a, _by_id(a), PREFIX, BASE) == RootPlan("base", "main", ())
 
 
 def test_a_missing_blocked_by_is_read_as_no_blockers():
     a = StoryPlan(
         id="a", title="a", status="todo", blocked_by=None, subtasks=[_gsub("a1", "aaaa0001")]
     )
-    assert story_root(a, _by_id(a), PREFIX, BASE) == "main"
+    assert story_root(a, _by_id(a), PREFIX, BASE) == RootPlan("base", "main", ())
 
 
 def test_a_story_tip_is_the_branch_of_its_last_subtask():
@@ -400,13 +432,17 @@ def test_a_story_tip_is_the_branch_of_its_last_subtask():
 def test_one_in_milestone_blocker_roots_on_that_blockers_last_subtask():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001"), _gsub("a2", "aaaa0002")])
     b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
-    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == RootPlan(
+        "tip", "m3/task-a2-aaaa0002", ("a",)
+    )
 
 
 def test_external_blockers_beside_one_in_milestone_blocker_are_ignored():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
     b = _story("b", ["outside-1", "a", "outside-2"], subtasks=[_gsub("b1", "bbbb0001")])
-    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == RootPlan(
+        "tip", "m3/task-a1-aaaa0001", ("a",)
+    )
 
 
 def test_a_done_blocker_still_yields_its_tip_because_done_is_not_landed():
@@ -417,7 +453,7 @@ def test_a_done_blocker_still_yields_its_tip_because_done_is_not_landed():
     )
     b = _story("b", ["a"], subtasks=[_gsub("b1", "bbbb0001")])
     assert story_tip(a, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
-    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE).branch == "m3/task-a2-aaaa0002"
 
 
 def test_a_subtask_less_blocker_falls_through_to_its_own_root():
@@ -426,7 +462,9 @@ def test_a_subtask_less_blocker_falls_through_to_its_own_root():
     c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
     stories = _by_id(a, b, c)
     assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
-    assert story_root(c, stories, PREFIX, BASE) == "m3/task-a2-aaaa0002"
+    assert story_root(c, stories, PREFIX, BASE) == RootPlan(
+        "tip", "m3/task-a2-aaaa0002", ("b",)
+    )
 
 
 def test_a_subtask_less_story_with_no_blockers_has_the_base_as_its_tip():
@@ -456,23 +494,45 @@ def test_repeated_top_level_calls_each_get_a_fresh_seen():
     c = _story("c", ["b"], subtasks=[_gsub("c1", "cccc0001")])
     stories = _by_id(a, b, c)
     for _ in range(2):
-        assert story_root(c, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
+        assert story_root(c, stories, PREFIX, BASE).branch == "m3/task-a1-aaaa0001"
         assert story_tip(b, stories, PREFIX, BASE) == "m3/task-a1-aaaa0001"
 
 
-def test_two_in_milestone_blockers_refuse_to_guess_a_root():
+def test_two_in_milestone_blockers_root_on_a_merged_base_in_blocked_by_order():
+    """No longer refused: the story roots on its own merged base, and the
+    blockers keep the order ``blocked_by`` lists them, not id order."""
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
     b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
-    c = _story("c", ["a", "outside", "b"], subtasks=[_gsub("c1", "cccc0001")])
-    with pytest.raises(StackRootError) as caught:
-        story_root(c, _by_id(a, b, c), PREFIX, BASE)
-    message = str(caught.value)
-    assert "story #c is blocked by 2 stories (#a, #b)" in message
-    assert "ONE parent branch" in message
-    assert "Merge those blockers into main first" in message
-    assert "single blocker" in message
-    assert "#outside" not in message
-    assert isinstance(caught.value, ValueError)
+    c = _story(_story_id(0xC), ["b", "outside", "a"], subtasks=[_gsub("c1", "cccc0001")])
+    root = story_root(c, _by_id(a, b, c), PREFIX, BASE)
+    assert root == RootPlan("merged", "m3/base-0000000c", ("b", "a"))
+
+
+def test_two_blockers_give_a_merged_root():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story(_story_id(0xC), ["a", "outside", "b"], subtasks=[_gsub("c1", "cccc0001")])
+    assert story_root(c, _by_id(a, b, c), PREFIX, BASE) == RootPlan(
+        kind="merged", branch=f"{PREFIX}/base-{short_id(c.id)}", blockers=("a", "b")
+    )
+
+
+def test_a_duplicated_blocker_in_a_merged_root_is_listed_once():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c = _story(_story_id(0xC), ["a", "b", "a"], subtasks=[_gsub("c1", "cccc0001")])
+    assert story_root(c, _by_id(a, b, c), PREFIX, BASE).blockers == ("a", "b")
+
+
+def test_three_blockers_one_done_all_count_toward_the_merged_root():
+    """Done is not landed, so a done blocker still has to be merged in."""
+    a = _story("a", status="done", subtasks=[_gsub("a1", "aaaa0001", "done")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    d = _story("d", subtasks=[_gsub("d1", "dddd0001")])
+    c = _story(_story_id(0xC), ["a", "b", "d"], subtasks=[_gsub("c1", "cccc0001")])
+    assert story_root(c, _by_id(a, b, d, c), PREFIX, BASE) == RootPlan(
+        "merged", "m3/base-0000000c", ("a", "b", "d")
+    )
 
 
 def test_a_stack_root_error_is_a_value_error():
@@ -482,7 +542,9 @@ def test_a_stack_root_error_is_a_value_error():
 def test_a_blocker_listed_twice_counts_once():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
     b = _story("b", ["a", "a"], subtasks=[_gsub("b1", "bbbb0001")])
-    assert story_root(b, _by_id(a, b), PREFIX, BASE) == "m3/task-a1-aaaa0001"
+    assert story_root(b, _by_id(a, b), PREFIX, BASE) == RootPlan(
+        "tip", "m3/task-a1-aaaa0001", ("a",)
+    )
 
 
 def test_stack_bases_anchor_on_the_full_list_even_past_a_done_first_subtask():
@@ -514,12 +576,25 @@ def test_stack_bases_of_a_story_with_no_subtasks_is_empty():
     assert stack_bases(a, _by_id(a), PREFIX, BASE) == {}
 
 
-def test_stack_bases_of_a_subtask_less_story_still_surfaces_a_root_error():
+def test_a_subtask_less_story_on_two_blockers_has_no_bases_and_its_merged_base_as_tip():
     a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
     b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
-    c = _story("c", ["a", "b"], subtasks=[])
-    with pytest.raises(StackRootError, match="#c"):
-        stack_bases(c, _by_id(a, b, c), PREFIX, BASE)
+    c = _story(_story_id(0xC), ["a", "b"], subtasks=[])
+    stories = _by_id(a, b, c)
+    assert stack_bases(c, stories, PREFIX, BASE) == {}
+    assert story_root(c, stories, PREFIX, BASE).kind == "merged"
+    assert story_tip(c, stories, PREFIX, BASE) == "m3/base-0000000c"
+
+
+def test_stack_bases_of_a_two_blocker_story_root_its_first_subtask_on_the_merged_base():
+    a = _story("a", subtasks=[_gsub("a1", "aaaa0001")])
+    b = _story("b", subtasks=[_gsub("b1", "bbbb0001")])
+    c1, c2 = _gsub("c1", "cccc0001"), _gsub("c2", "cccc0002")
+    c = _story(_story_id(0xC), ["a", "b"], subtasks=[c1, c2])
+    assert stack_bases(c, _by_id(a, b, c), PREFIX, BASE) == {
+        c1.id: "m3/base-0000000c",
+        c2.id: "m3/task-c1-cccc0001",
+    }
 
 
 def test_stack_bases_surfaces_a_malformed_subtask_id():

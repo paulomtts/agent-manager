@@ -116,6 +116,45 @@ def test_plan_levels_refuses_a_blocker_cycle_before_any_geometry():
         orchestrate.plan_levels([a, b], branch_prefix="m3", base_branch="main")
 
 
+def test_plan_levels_refuses_a_story_rooted_through_a_subtask_less_story_on_two_blockers():
+    """A subtask-less story blocked by two stories has a merged root, and a
+    story it blocks falls through to that root. Until merged bases are built
+    (Task 3.2), the real run refuses it, naming the two-blocker story and
+    both of its blockers."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    joined = _plan_story(3, [], blocked_by=[a.id, b.id])
+    d = _plan_story(4, [_plan_subtask(41)], blocked_by=[joined.id])
+
+    with pytest.raises(dag.StackRootError) as caught:
+        orchestrate.plan_levels([a, b, joined, d], branch_prefix="m3", base_branch="main")
+
+    message = str(caught.value)
+    assert f"#{joined.id}" in message
+    assert f"#{a.id}" in message
+    assert f"#{b.id}" in message
+    assert "ONE parent branch" in message
+
+
+def test_plan_levels_refuses_a_two_blocker_story_with_todays_message_word_for_word():
+    """The refusal moved out of `dag.story_root` into `plan_levels`; its text
+    must not drift. It counts and names only in-milestone blockers, in
+    `blocked_by` order, and names the base branch it was given."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[b.id, "outside", a.id])
+
+    with pytest.raises(dag.StackRootError) as caught:
+        orchestrate.plan_levels([a, b, c], branch_prefix="m3", base_branch="trunk")
+
+    assert str(caught.value) == (
+        f"dag: story #{c.id} is blocked by 2 stories (#{b.id}, #{a.id}), "
+        "and a stack can only root on ONE parent branch. Merge those blockers into "
+        "trunk first, or restructure the dependencies so this story has "
+        "a single blocker."
+    )
+
+
 def test_a_milestone_with_nothing_pending_plans_no_levels():
     a = _plan_story(1, [_plan_subtask(11, "done")], status="done")
 

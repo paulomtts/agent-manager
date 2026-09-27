@@ -22,6 +22,7 @@ from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
@@ -439,3 +440,55 @@ def test_a_phase_escalation_leaves_an_escalated_row_with_no_pending_phase(store)
     assert escalated.agent["current_turn"] is None
     assert escalated.agent["queue"] == []
     assert runtime_engine.pending_phase(escalated) is None
+
+
+# ── a StopSignal-parked checkpoint (card 364babde) ───────────────────────────
+
+
+def _park_with_a_triggered_stop(wf: Workflow, opened):
+    """Park `wf`'s subtask through the StopSignal path: a signal already
+    triggered pauses the agent before its first turn, and ON_PAUSE parks it."""
+    stop = StopSignal()
+    stop.trigger("elsewhere")
+    summary = _go(wf, opened, stop=stop)
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before a"
+    parked = opened.latest_checkpoint(CARD_ID)
+    assert parked.reason == "parked"
+    # pygents stores the pause itself in the row.
+    assert parked.agent["is_paused"] is True
+    return parked
+
+
+def test_a_subtask_parked_by_the_stop_signal_resumes(store):
+    # Review Focus 1: the stored pause must not re-park the resumed agent.
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    assert ran == []
+
+    summary = _go(wf, store, resume_from=parked)
+
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS
+    assert store.latest_checkpoint(CARD_ID).reason == "done"
+
+
+def test_a_stop_signal_parked_subtask_resumed_under_a_triggered_stop_parks_again(store):
+    # Review Focus 2: clearing the stored pause must come before the run's
+    # own stop registers the agent, or this resume would run.
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    again = StopSignal()
+    again.trigger("elsewhere")
+
+    summary = _go(wf, store, resume_from=parked, stop=again)
+
+    assert ran == []
+    assert summary.status == "stopped"
+    assert summary.detail == "stopped before a"
+    newest = store.latest_checkpoint(CARD_ID)
+    assert (newest.seq, newest.reason) == (parked.seq + 1, "parked")
+    assert _head(newest.agent) == "a"

@@ -14,6 +14,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from agent_manager.runtime.stop import StopSignal
+
 
 @dataclass
 class RunDeps:
@@ -24,6 +26,10 @@ class RunDeps:
     agent_runner: Callable[..., Any] | None
     clock: Callable[[], Any]
     should_stop: Callable[[], bool] | None = None
+    stop: StopSignal | None = None
+    """The milestone's `StopSignal` (supervisor-tree T5). Declared after
+    `should_stop` so the positional construction still binds; `should_stop`
+    stays until Task 3.3."""
     warnings: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     running: str | None = None

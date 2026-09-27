@@ -69,7 +69,7 @@ async def _new_agent(compiled) -> Agent:
         [compiled.agent_phase, compiled.step_phase],
         context_pool=ContextPool(),
         context_queue=ContextQueue(limit=10),
-        tags=["subtask"],
+        tags=["compile-unit"],
     )
     await agent.context_pool.add(context.seed_item({"worktree": "/w"}))
     await agent.put(compiled.first_turn())
