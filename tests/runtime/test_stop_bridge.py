@@ -2,10 +2,8 @@
 supervisor-tree design T5).
 
 Runtime tier: `runtime.engine.run_subtask` / `run_subtask_async` over fake
-steps and a real temp store. Two stops are covered. The M6 one is a plain
-`threading.Event`, as orchestrate.py's `RunStop` is; the engine only ever
-calls its `is_set` (kept until Task 3.3). The M7 one is a `StopSignal`, which
-pauses the registered pygents agent; its `ON_PAUSE` hook parks the subtask.
+steps and a real temp store. The one stop is a `StopSignal`, which pauses the
+registered pygents agent; its `ON_PAUSE` hook parks the subtask.
 
 Steps run off the loop in `asyncio.to_thread` workers, so a step that fires
 the `StopSignal` hands `trigger` to the loop with `call_soon_threadsafe`
@@ -61,69 +59,6 @@ def _reasons(opened) -> list[tuple[int, str]]:
             "SELECT seq, reason FROM checkpoints ORDER BY seq"
         ).fetchall()
     ]
-
-
-def _head(agent: dict) -> str:
-    return (agent["current_turn"] or agent["queue"][0])["kwargs"]["phase"]
-
-
-def test_stop_set_during_a_phase_parks_before_the_next(store):
-    stop = threading.Event()
-    ran: list[str] = []
-
-    def a(card: str) -> dict[str, Any]:
-        ran.append("a")
-        stop.set()
-        return {"a": 1}
-
-    def b(card: str) -> dict[str, Any]:
-        ran.append("b")
-        return {"b": 2}
-
-    summary = runtime_engine.run_subtask(
-        Workflow("stops", (Step("a", a), Step("b", b))),
-        store,
-        story_id=STORY_ID,
-        subtask=_subtask(),
-        repo_dir=REPO,
-        clock=lambda: FIXED,
-        should_stop=stop.is_set,
-    )
-
-    assert ran == ["a"]
-    assert summary.status == "stopped"
-    assert summary.detail == "stopped before b"
-    assert summary.failed_phase is None
-    assert summary.results == {"a": {"a": 1}}
-    assert _reasons(store) == [(0, "turn"), (1, "parked")]
-    newest = store.latest_checkpoint(CARD_ID)
-    assert newest.reason == "parked"
-    assert _head(newest.agent) == "b"
-
-
-def test_a_stop_set_before_the_run_parks_before_the_first_phase(store):
-    ran: list[str] = []
-
-    def a(card: str) -> dict[str, Any]:
-        ran.append("a")
-        return {"a": 1}
-
-    summary = runtime_engine.run_subtask(
-        Workflow("never", (Step("a", a),)),
-        store,
-        story_id=STORY_ID,
-        subtask=_subtask(),
-        repo_dir=REPO,
-        clock=lambda: FIXED,
-        should_stop=lambda: True,
-    )
-
-    assert ran == []
-    assert summary.status == "stopped"
-    assert summary.detail == "stopped before a"
-    assert summary.results == {}
-    assert _reasons(store) == [(0, "parked")]
-    assert _head(store.latest_checkpoint(CARD_ID).agent) == "a"
 
 
 # ── StopSignal (supervisor-tree T5, card 364babde) ───────────────────────────
@@ -338,23 +273,41 @@ def test_a_crash_unregisters_its_agent(store):
     assert spy.calls == PAIR
 
 
-def test_a_refused_resume_never_registers(store):
+async def test_a_refused_resume_never_registers(store):
+    loop = asyncio.get_running_loop()
+    stop = StopSignal()
+    fired = threading.Event()
     ran: list[str] = []
+
+    def fire() -> None:
+        stop.trigger("A")
+        fired.set()
 
     def a(card: str) -> dict[str, Any]:
         ran.append("a")
+        loop.call_soon_threadsafe(fire)
+        if not fired.wait(5):
+            raise RuntimeError("the stop was never triggered")
         return {"a": 1}
 
     wf = Workflow("refused", (Step("a", a), Step("b", _ok)))
-    runtime_engine.run_subtask(
-        wf, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO,
-        clock=lambda: FIXED, should_stop=lambda: ran == ["a"],
-    )
+    await _async_go(wf, store, CARD_ID, stop)
     parked = store.latest_checkpoint(CARD_ID)
+    assert parked.reason == "parked"
     changed = Workflow("refused", wf.phases + (Step("c", _ok),))
     spy = _Spy()
 
     with pytest.raises(runtime_engine.CheckpointMismatch):
-        _spy_go(changed, store, spy, resume_from=parked)
+        await runtime_engine.run_subtask_async(
+            changed,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            clock=lambda: FIXED,
+            stop=spy,
+            resume_from=parked,
+        )
 
+    assert ran == ["a"]
     assert spy.calls == []
