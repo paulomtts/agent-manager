@@ -412,3 +412,73 @@ async def test_cancelling_one_subtask_leaves_a_concurrent_one_running(
     assert _reasons(store, OTHER_CARD) == [(0, "turn"), (1, "turn"), (2, "turn"), (3, "done")]
     _assert_free(AGENT_NAME)
     _assert_free(f"{RUN_ID}:{OTHER_CARD}")
+
+
+# ── no instance hooks on engine-built agents (A5) ────────────────────────────
+
+
+class _Crash(BaseException):
+    """A process death mid-phase: not an `Exception`, so nothing may catch it."""
+
+
+def _capturing(seen: list[Agent], crash_in: set[str]) -> Workflow:
+    """Steps `a` and `b`. Each appends the agent running it to `seen`, looked
+    up by name while the run holds it. A step named in `crash_in` raises
+    `_Crash` once (the name is discarded), so a resume runs it cleanly."""
+
+    def make(name: str):
+        def run(card: str) -> dict[str, Any]:
+            seen.append(AgentRegistry.get(AGENT_NAME))
+            if name in crash_in:
+                crash_in.discard(name)
+                raise _Crash(f"killed in {name}")
+            return {name: name.upper()}
+
+        return run
+
+    return Workflow("captures", (Step("a", make("a")), Step("b", make("b"))))
+
+
+def _assert_no_instance_hooks(agent: Agent) -> None:
+    assert agent.hooks == [], (
+        f"instance hooks attached: {[h.__name__ for h in agent.hooks]}"
+    )
+    assert agent.turn_hooks == [], (
+        f"instance turn hooks attached: {[h.__name__ for h in agent.turn_hooks]}"
+    )
+    # Raises `UnserializableHookError` if a closure hook slipped in.
+    data = agent.to_dict()
+    assert data["hooks"] == {}
+    assert data["turn_hooks"] == {}
+
+
+def test_a_fresh_engine_built_agent_has_no_instance_hooks(store):
+    seen: list[Agent] = []
+
+    summary = _go(_capturing(seen, set()), store)
+
+    assert summary.status == "done"
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
+    _assert_no_instance_hooks(seen[0])
+    stored = _stored_agents(store)
+    assert [(a["hooks"], a["turn_hooks"]) for a in stored] == [({}, {})] * len(stored)
+
+
+def test_an_agent_rebuilt_on_resume_has_no_instance_hooks(store):
+    crashed_seen: list[Agent] = []
+    with pytest.raises(_Crash):
+        _go(_capturing(crashed_seen, {"b"}), store)
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert crashed.reason == "turn"
+    assert runtime_engine.pending_phase(crashed) == "b"
+
+    seen: list[Agent] = []
+    summary = _go(_capturing(seen, set()), store, resume_from=crashed)
+
+    assert summary.status == "done"
+    assert len(seen) == 1
+    assert seen[0] is not crashed_seen[0]
+    _assert_no_instance_hooks(seen[0])
+    stored = _stored_agents(store)
+    assert [(a["hooks"], a["turn_hooks"]) for a in stored] == [({}, {})] * len(stored)
