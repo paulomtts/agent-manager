@@ -661,7 +661,6 @@ class FakeDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
-        should_stop=None,
         stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append(
@@ -677,7 +676,6 @@ class FakeDriver:
                 "commands": list(commands),
                 "allow_no_verification": allow_no_verification,
                 "runner_factory": runner_factory,
-                "should_stop": should_stop,
                 "stop": stop,
             }
         )
@@ -991,7 +989,6 @@ class GatedDriver:
         commands=(),
         allow_no_verification=False,
         runner_factory=None,
-        should_stop=None,
         stop=None,
     ) -> cli.SubtaskDrive:
         self.calls.append({"card": card.id, "parent": parent.id, "base": subtask.base_branch})
@@ -1190,7 +1187,8 @@ def test_every_drivers_warnings_reach_the_result_in_order(project):
 def test_no_driver_resolves_to_cli_drive_subtask_async_at_call_time(project, monkeypatch):
     """The default driver is the awaitable one (T3), read off `cli` when the run
     starts, never bound at import. The lane hands it the run's StopSignal and
-    no `should_stop` (Task 3.3 deletes that parameter)."""
+    no other stop: `FakeDriver`'s keywords are closed, so any other stop
+    keyword would be a `TypeError` and the run would not finish `done`."""
     shape = _milestone(project, {"A": 1})
     (a1,) = shape["subtasks"]["A"]
     fake = FakeDriver()
@@ -1200,8 +1198,16 @@ def test_no_driver_resolves_to_cli_drive_subtask_async_at_call_time(project, mon
 
     assert [call["card"] for call in fake.calls] == [a1]
     assert isinstance(fake.calls[0]["stop"], StopSignal)
-    assert fake.calls[0]["should_stop"] is None
     assert result["done"] is True
+
+
+def test_the_driver_protocol_mirrors_drive_subtask_async():
+    """`Driver` is `cli.drive_subtask_async`'s keyword signature, so the one
+    stop either takes is the `StopSignal`."""
+    protocol = list(inspect.signature(orchestrate.Driver.__call__).parameters)
+
+    assert protocol[0] == "self"
+    assert protocol[1:] == list(inspect.signature(cli.drive_subtask_async).parameters)
 
 
 @requires_git

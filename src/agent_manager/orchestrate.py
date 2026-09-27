@@ -265,10 +265,9 @@ class Driver(Protocol):
     loop (T3). Annotations are strings (`from __future__ import annotations`),
     so no `cli` name is resolved when this module is imported.
 
-    `stop` is the run's `StopSignal`, passed on every call. `should_stop` stays
-    until Task 3.3 deletes it; the lane never passes it. `resume_from` (card
-    02890d5d) is passed only when a relaunch found a checkpoint to continue,
-    so a driver written before it keeps working.
+    `stop` is the run's `StopSignal`, passed on every call; it is the only
+    stop. `resume_from` (card 02890d5d) is passed only when a relaunch found a
+    checkpoint to continue, so a driver written before it keeps working.
     """
 
     async def __call__(
@@ -283,7 +282,6 @@ class Driver(Protocol):
         commands: Sequence[str] = (),
         allow_no_verification: bool = False,
         runner_factory: cli.RunnerFactory | None = None,
-        should_stop: Callable[[], bool] | None = None,
         stop: StopSignal | None = None,
         resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
