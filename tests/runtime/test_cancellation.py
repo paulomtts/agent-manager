@@ -339,3 +339,76 @@ async def test_a_resumed_run_cancelled_again_resumes_from_its_own_turn(store, co
     assert ran == ["slow", "b"]
     assert summary.status == "done"
     assert _reasons(store)[3:] == [(3, "turn"), (4, "turn"), (5, "done")]
+
+
+# ── cancel with a StopSignal registered, and beside another subtask (A3) ─────
+
+
+class _Spy(StopSignal):
+    """A `StopSignal` that records every register/unregister by agent name."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str]] = []
+
+    def register(self, agent: Any) -> None:
+        self.calls.append(("register", agent.name))
+        super().register(agent)
+
+    def unregister(self, agent: Any) -> None:
+        self.calls.append(("unregister", agent.name))
+        super().unregister(agent)
+
+
+async def test_a_cancel_unregisters_the_agent_from_the_stop_signal(store, tmp_path):
+    spy = _Spy()
+    claude = _Launcher(tmp_path)
+    task = asyncio.create_task(
+        _run(_with_agent_phase([]), store, agent_runner=claude, stop=spy)
+    )
+    assert await asyncio.to_thread(claude.spawned.wait, 5)
+    agent = AgentRegistry.get(AGENT_NAME)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(claude.left.wait, 10)
+
+    assert spy.calls == [("register", AGENT_NAME), ("unregister", AGENT_NAME)]
+    # Review Focus 4: a trigger after the cancel reaches no dead agent.
+    assert spy.trigger("late") is True
+    assert agent.is_paused is False
+    assert _reasons(store) == [(0, "turn"), (1, "turn")]
+    _assert_free(AGENT_NAME)
+
+
+async def test_cancelling_one_subtask_leaves_a_concurrent_one_running(
+    store, tmp_path, completions
+):
+    # Review Focus 3.
+    claude = _Launcher(tmp_path)
+    cancelled = asyncio.create_task(_run(_with_agent_phase([]), store, agent_runner=claude))
+    gate = _Gate()
+    other_ran: list[str] = []
+    other = asyncio.create_task(_run(_gated(other_ran, gate), store, card_id=OTHER_CARD))
+    assert await asyncio.to_thread(claude.spawned.wait, 5)
+    assert await asyncio.to_thread(gate.entered.wait, 5)
+
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    # The other subtask is still in `slow`, and its agent is still registered.
+    assert not other.done()
+    AgentRegistry.get(f"{RUN_ID}:{OTHER_CARD}")
+    gate.opened.set()
+    summary = await other
+
+    assert await asyncio.to_thread(claude.left.wait, 10)
+    assert summary.status == "done"
+    assert other_ran == ["a", "slow", "b"]
+    assert ("spec", StopReason.CANCELLED) in completions
+    assert ("slow", StopReason.COMPLETED) in completions
+    assert _reasons(store) == [(0, "turn"), (1, "turn")]
+    assert _reasons(store, OTHER_CARD) == [(0, "turn"), (1, "turn"), (2, "turn"), (3, "done")]
+    _assert_free(AGENT_NAME)
+    _assert_free(f"{RUN_ID}:{OTHER_CARD}")
