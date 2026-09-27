@@ -43,8 +43,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -52,9 +52,13 @@ from typing import Any, Literal, Protocol
 import grafo
 
 from agent_manager import bases, board, census, cli, dag, integration, models
+from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Checkpoint, Store
+from agent_manager.store import Checkpoint, Store, load_run, open_db
+from agent_manager.workflow import integrate as integrate_workflow
+from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import Workflow
 
 MILESTONE_WORKFLOW = "milestone"
 """The run's `workflow` field: a milestone run, distinct from `run --card`'s `task`."""
@@ -366,7 +370,9 @@ class SupervisorPlan:
     `stories` is every census story, done ones included, in census order: each
     becomes a node. `roots` and `tips` cover all of them. `levels` are the
     pending stories' waves from `plan_levels`, and `rows` their store rows from
-    `record_plan`.
+    `record_plan`. `resuming` is set on a milestone resume (card 54e4ec29),
+    whose validated checkpoints, keyed by card id -- subtasks and
+    `base-<story>` resolvers -- are `checkpoints`.
     """
 
     stories: tuple[census.StoryPlan, ...]
@@ -374,6 +380,8 @@ class SupervisorPlan:
     roots: dict[str, dag.RootPlan]
     tips: dict[str, str]
     rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
+    checkpoints: Mapping[str, Checkpoint] = field(default_factory=dict)
+    resuming: bool = False
 
     @property
     def planned(self) -> dict[str, PlannedStory]:
@@ -388,11 +396,13 @@ def supervisor_plan(
     *,
     branch_prefix: str,
     base_branch: str,
+    checkpoints: Mapping[str, Checkpoint] | None = None,
 ) -> SupervisorPlan:
     """Every census story's root and tip beside the pending waves and their rows.
 
     Pure. `plan_levels` has already run the cycle check, so this derives
-    geometry and refuses nothing.
+    geometry and refuses nothing. `checkpoints` is given only on a resume,
+    and marks the plan `resuming` even when it is empty.
     """
     stories = tuple(stories)
     by_id = {story.id: story for story in stories}
@@ -408,6 +418,8 @@ def supervisor_plan(
             for story in stories
         },
         rows=rows,
+        checkpoints=dict(checkpoints or {}),
+        resuming=checkpoints is not None,
     )
 
 
@@ -483,6 +495,156 @@ def refresh_git(root: Path) -> None:
     if "origin" in remotes:
         worktree.run_git(["-C", str(root), "fetch", "origin"])
     worktree.run_git(["-C", str(root), "worktree", "prune"])
+
+
+REOPENED_STATUSES = ("stopped", "escalated", "started")
+"""The row statuses a resume records `started` again (spec, point 2)."""
+
+
+def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
+    """The recorded milestone run `run_id`, or the refusal that says why not.
+
+    Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
+    `Store.open` would construct a `Journal`. An unknown run, a run of
+    another workflow, and a `done` run are refused (card 54e4ec29).
+    """
+    conn = open_db(root)
+    try:
+        run = load_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        raise cli.UnknownRunError(
+            f"run {run_id!r} is not in the projection for {root}"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    if run.workflow != MILESTONE_WORKFLOW:
+        raise cli.NotResumableError(
+            f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
+        )
+    if run.status == "done":
+        raise cli.NotResumableError(
+            f"run {run.id} finished; start new work with am run --milestone"
+        )
+    return run
+
+
+def find_run_milestone(
+    roots: Sequence[models.CardNode] | None, run_id: str
+) -> models.CardNode:
+    """The one root card whose short id ends `run_id`.
+
+    `cli.mint_run_id` builds a milestone run's id as `<timestamp>-<short
+    milestone id>`, and `models.Run` records no milestone id of its own, so
+    the id is how a resume finds its milestone. A title edit cannot break it.
+    """
+    short = run_id.rsplit("-", 1)[-1]
+    matches = [node for node in roots or [] if dag.short_id(node.id) == short]
+    if len(matches) != 1:
+        raise cli.NotResumableError(
+            f"run {run_id!r} belongs to milestone {short}, and {len(matches)} root"
+            " cards on the board have that short id"
+        )
+    return matches[0]
+
+
+def open_cards(
+    stories: Sequence[census.StoryPlan], *, branch_prefix: str, base_branch: str
+) -> list[tuple[str, Workflow]]:
+    """Every card a resume may continue, with the workflow its checkpoint must match.
+
+    Each remaining subtask under `TASK`, then, for a story that is not closed
+    and roots on a merged base, its resolver `base-<story id>` under
+    `INTEGRATE`. Census order. `dag.assert_no_blocker_cycles` must have run.
+    """
+    stories = list(stories)
+    by_id = {story.id: story for story in stories}
+    cards: list[tuple[str, Workflow]] = []
+    for story in stories:
+        for subtask in dag.remaining_subtasks(story):
+            cards.append((subtask.id, task_workflow.TASK))
+        root_plan = dag.story_root(story, by_id, branch_prefix, base_branch)
+        if root_plan.kind == "merged" and not dag.is_story_closed(story):
+            cards.append((bases.resolver_card_id(story.id), integrate_workflow.INTEGRATE))
+    return cards
+
+
+def _refuse_changed_workflow(checkpoint: Checkpoint, workflow: Workflow, run_id: str) -> None:
+    """`cli.CheckpointMismatchError` when `checkpoint` was saved under another digest.
+
+    Worded like `cli.checkpoint_resume_phase`'s refusal, with the milestone
+    remedy.
+    """
+    digest = workflow.digest()
+    if checkpoint.digest != digest:
+        raise cli.CheckpointMismatchError(
+            f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
+            f" {checkpoint.card_id} in run {run_id!r} was saved under digest"
+            f" {checkpoint.digest}, but workflow {workflow.name!r} now has digest"
+            f" {digest}; start new work with am run --milestone"
+        )
+
+
+def resume_point(store: Store, card_id: str, workflow: Workflow) -> Checkpoint | None:
+    """The checkpoint a resume continues `card_id` from, None to start it fresh, or a refusal.
+
+    The newest row of `card_id` in this store's run decides. None, or `done`
+    (only a board write was lost), starts the card fresh. Any other newest row
+    is judged against `workflow`'s digest and refused on a mismatch. A row
+    that holds a turn is continued as is; one that does not -- a phase
+    escalation -- is rewound to the card's newest `turn` row, the turn the
+    failing phase ran in, judged the same way.
+    """
+    newest = store.latest_checkpoint(card_id)
+    if newest is None or newest.reason == "done":
+        return None
+    _refuse_changed_workflow(newest, workflow, store.run_id)
+    if runtime_engine.pending_phase(newest) is not None:
+        return newest
+    turn = store.latest_turn_checkpoint(card_id)
+    if turn is None:
+        return None
+    _refuse_changed_workflow(turn, workflow, store.run_id)
+    return turn
+
+
+def resume_checkpoints(
+    store: Store, cards: Sequence[tuple[str, Workflow]]
+) -> dict[str, Checkpoint]:
+    """`resume_point` for every open card, keyed by card id, only where there is one.
+
+    Reads only, so a refusal on any card leaves everything as it was: the
+    whole resume is refused (spec, Error paths).
+    """
+    found: dict[str, Checkpoint] = {}
+    for card_id, workflow in cards:
+        checkpoint = resume_point(store, card_id, workflow)
+        if checkpoint is not None:
+            found[card_id] = checkpoint
+    return found
+
+
+def reopen_rows(store: Store, run: models.Run, open_card_ids: set[str]) -> None:
+    """Mark every orphan attempt `harness_error`, then reopen the open rows.
+
+    `run` is the tree as the interrupted run left it. An orphan is
+    `cli.orphan_attempts`' in-flight attempt, marked as `cli`'s
+    `_resume_from_checkpoint` marks it. A subtask or resolver row of an open
+    card that is stopped, escalated or started is recorded `started`.
+    """
+    for story in run.stories:
+        for subtask in story.subtasks:
+            for phase, attempt in cli.orphan_attempts(subtask):
+                store.record_attempt(
+                    story.card_id,
+                    subtask.card_id,
+                    phase.name,
+                    attempt.model_copy(update={"status": "harness_error"}),
+                )
+            if subtask.card_id in open_card_ids and subtask.status in REOPENED_STATUSES:
+                store.record_subtask(
+                    story.card_id, subtask.model_copy(update={"status": "started"})
+                )
 
 
 def stale_story_anchors(
@@ -579,6 +741,7 @@ async def build_merged_base(
     allow_no_verification: bool,
     runner_factory: cli.RunnerFactory | None,
     stop: StopSignal,
+    resume_from: Checkpoint | None = None,
 ) -> None:
     """Await `bases.build` for one merged-root story (supervisor-tree §5).
 
@@ -587,9 +750,13 @@ async def build_merged_base(
     module at call time so a test can replace it. A `None` factory is
     production's, `cli.default_runner_factory`, read at call time as
     Integrate reads it, so a conflicting tip reaches the resolver instead of
-    failing for a human.
+    failing for a human. `resume_from` is the resolver's checkpoint on a
+    resume (card 54e4ec29), passed only when there is one.
     """
     factory = cli.default_runner_factory if runner_factory is None else runner_factory
+    extra: dict[str, Any] = {}
+    if resume_from is not None:
+        extra["resume_from"] = resume_from
     await bases.build(
         root_plan,
         list(tips),
@@ -601,6 +768,7 @@ async def build_merged_base(
         story_id=story.id,
         runner_factory=factory,
         stop=stop,
+        **extra,
     )
 
 
@@ -688,6 +856,7 @@ async def base_only_lane(
                 allow_no_verification=allow_no_verification,
                 runner_factory=runner_factory,
                 stop=stop,
+                resume_from=plan.checkpoints.get(bases.resolver_card_id(story.id)),
             )
         except bases.BaseFailed as error:
             if error.stopped:
@@ -756,6 +925,10 @@ async def lane(
     Each subtask's open checkpoint is looked up first
     (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
+
+    On a resume (`plan.resuming`, card 54e4ec29) the subtask's checkpoint is
+    `plan.checkpoints`' and the lenient relaunch lookup is never read; a
+    merged base gets its resolver's checkpoint the same way.
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
@@ -823,6 +996,7 @@ async def lane(
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
+                        resume_from=plan.checkpoints.get(bases.resolver_card_id(story.id)),
                     )
                 except bases.BaseFailed as error:
                     # A parked resolver is a stop, not an escalation (P4).
@@ -847,10 +1021,16 @@ async def lane(
                 store.record_subtask(story.id, row)
                 if position == 0:
                     store.record_story(story_row.model_copy(update={"status": "started"}))
-                # Relaunch continuation (card 02890d5d): the keyword is passed
-                # only when there is a row, so a driver that predates it works.
+                # Relaunch continuation (card 02890d5d) is lenient and reads
+                # across runs; a resume (card 54e4ec29) hands on exactly the
+                # checkpoints `resume_checkpoints` already validated. Either
+                # way the keyword is passed only when there is a row, so a
+                # driver that predates it works.
                 extra: dict[str, Any] = {}
-                checkpoint = cli.continuable_checkpoint(store, subtask.id)
+                if plan.resuming:
+                    checkpoint = plan.checkpoints.get(subtask.id)
+                else:
+                    checkpoint = cli.continuable_checkpoint(store, subtask.id)
                 if checkpoint is not None:
                     extra["resume_from"] = checkpoint
                 result = await drive(
@@ -916,6 +1096,40 @@ async def lane(
     return planned.tip
 
 
+async def run_until_killed(
+    work: Awaitable[Any], killed: asyncio.Event, fatal: Sequence[BaseException]
+) -> None:
+    """Await `work`, unless a lane dies of a `BaseException` first: then re-raise it.
+
+    grafo's workers catch only `Exception`. asyncio re-raises only
+    `KeyboardInterrupt` and `SystemExit` out of the loop by itself; any other
+    `BaseException` is stored on the grafo worker task, and
+    `TreeExecutor.run` drops it in `gather(..., return_exceptions=True)` --
+    in the pinned grafo release this does not merely leave the lane pending,
+    it hangs `gather()` forever (confirmed with `faulthandler`). So `supervise`
+    records such an exception in `fatal` and sets `killed`, and this re-raises
+    the first one at once: it leaves `asyncio.run`, which cancels every other
+    lane where it stands, and the latest checkpoints stand for `am resume`
+    (supervisor-tree §7, card 949d51a0). It never waits for `work` itself to
+    finish once `killed` fires -- `work` may never finish on its own. If the
+    caller is cancelled first, `work` is cancelled with it, as a plain `await`
+    would do: the tree is never left running behind it.
+    """
+    running = asyncio.ensure_future(work)
+    watcher = asyncio.ensure_future(killed.wait())
+    try:
+        await asyncio.wait({running, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        running.cancel()
+        raise
+    finally:
+        watcher.cancel()
+    if fatal:
+        running.cancel()
+        raise fatal[0]
+    await running
+
+
 async def supervise(
     plan: SupervisorPlan,
     *,
@@ -946,6 +1160,10 @@ async def supervise(
     executor's roots are therefore the stories with no in-milestone blocker,
     plus every merged-root story; a milestone with no story has no tree to run.
 
+    A lane that dies of a `BaseException` other than a cancellation ends the
+    whole call at once, re-raised by `run_until_killed`: grafo alone would
+    drop it (§7).
+
     The `grafo` logger is at CRITICAL for exactly this call: a lane's
     escalation is data in the outcomes, never a traceback on a stream, and
     grafo's own level is restored on every exit.
@@ -958,6 +1176,10 @@ async def supervise(
         finished: dict[str, LaneOutcome] = {}
         story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
         story_ok: dict[str, bool] = {}
+        # A lane's `BaseException` that is neither an `Exception` nor a
+        # cancellation: grafo would drop it (`run_until_killed`).
+        fatal: list[BaseException] = []
+        killed = asyncio.Event()
 
         def node_coroutine(story: census.StoryPlan) -> Callable[..., Any]:
             async def run(**tips: str) -> str:
@@ -978,8 +1200,11 @@ async def supervise(
                         story_done=story_done,
                         story_ok=story_ok,
                     )
-                except BaseException:
+                except BaseException as error:
                     story_ok[story.id] = False
+                    if not isinstance(error, (Exception, asyncio.CancelledError)):
+                        fatal.append(error)
+                        killed.set()
                     raise
                 else:
                     story_ok[story.id] = True
@@ -1009,7 +1234,7 @@ async def supervise(
         errors: list[BaseException] = []
         if roots:
             executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
-            await executor.run()
+            await run_until_killed(executor.run(), killed, fatal)
             errors = list(executor.errors)
         return collect_outcomes(plan, nodes, errors, finished)
     finally:
@@ -1017,17 +1242,18 @@ async def supervise(
 
 
 def run_milestone(
-    milestone: str,
+    milestone: str | None,
     *,
     repo_dir: Path,
-    base_branch: str,
-    branch_prefix: str,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: cli.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
+    resume_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
@@ -1053,24 +1279,50 @@ def run_milestone(
     Integrate escalation records `escalated` and returns
     `integrate_escalated_payload`. An exception from Integrate propagates and
     the run is never recorded `done`.
+
+    `resume_run_id` continues that milestone run instead (card 54e4ec29).
+    `milestone`, `base_branch`, `branch_prefix`, `max_concurrent` and
+    `clock` are then not read: the milestone is the one the run id names
+    (`find_run_milestone`) and the rest is what the run recorded. The plan is
+    re-derived from the board as a fresh run derives it. Every refusal -- an
+    unknown, non-milestone or `done` run, an unknown milestone, a blocker
+    cycle, and a checkpoint saved under another workflow digest -- comes
+    before the first write and before git is refreshed. Then the run is
+    recorded `started`, the plan is re-recorded, orphan attempts are marked
+    `harness_error` and every open stopped, escalated or started row is
+    recorded `started` (`reopen_rows`), and `supervise` runs under the same
+    run id with each open checkpoint handed on as `resume_from`. Every
+    payload gains `resumed: true`; `completed` is this invocation's work.
     """
-    if max_concurrent < 1:
-        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+    if resume_run_id is None:
+        if max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+        if milestone is None or base_branch is None or branch_prefix is None:
+            raise ValueError(
+                "a fresh milestone run needs a milestone, a base branch and a branch prefix"
+            )
     root = cli.resolve_repo_dir(repo_dir)
-    milestone_card = census.find_milestone(board.roots(repo_dir=root), milestone)
+    resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
+    if resumed is not None:
+        base_branch = resumed.base_branch
+        branch_prefix = resumed.branch_prefix
+        max_concurrent = resumed.config.max_concurrent_stories
+    roots = board.roots(repo_dir=root)
+    if resumed is None:
+        milestone_card = census.find_milestone(roots, milestone)
+    else:
+        milestone_card = find_run_milestone(roots, resumed.id)
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     drive = cli.drive_subtask_async if driver is None else driver
 
-    # The first side effect. It runs after every refusal and before the store
-    # is opened, so a failed fetch leaves no run directory behind.
-    refresh_git(root)
-
-    started_at = clock()
-    run_id = cli.mint_run_id(milestone_card.id, started_at)
-    store = Store.open(root, run_id)
-    try:
+    if resumed is None:
+        # The first side effect. It runs after every refusal and before the store
+        # is opened, so a failed fetch leaves no run directory behind.
+        refresh_git(root)
+        started_at = clock()
+        run_id = cli.mint_run_id(milestone_card.id, started_at)
         run_record = models.Run(
             id=run_id,
             workflow=MILESTONE_WORKFLOW,
@@ -1081,8 +1333,24 @@ def run_milestone(
             started_at=started_at,
             config=models.RunConfig(max_concurrent_stories=max_concurrent),
         )
+    else:
+        run_id = resumed.id
+        run_record = resumed.model_copy(update={"status": "started"})
+    store = Store.open(root, run_id)
+    try:
+        checkpoints: dict[str, Checkpoint] | None = None
+        cards: list[tuple[str, Workflow]] = []
+        if resumed is not None:
+            cards = open_cards(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+            # The store's own refusal, a checkpoint saved under another
+            # workflow, comes before the first write and before git is touched.
+            checkpoints = resume_checkpoints(store, cards)
+            refresh_git(root)
         store.record_run(run_record)
         rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
+        if resumed is not None:
+            # After `record_plan`, which records every planned row `pending`.
+            reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
         warnings = reroll_stale_stories(plan.stories, root)
         completed: list[str] = []
         stop = StopSignal()
@@ -1095,6 +1363,7 @@ def run_milestone(
                     rows,
                     branch_prefix=branch_prefix,
                     base_branch=base_branch,
+                    checkpoints=checkpoints,
                 ),
                 store=store,
                 run_id=run_id,
@@ -1112,12 +1381,17 @@ def run_milestone(
             completed.extend(outcome.completed)
             warnings.extend(outcome.warnings)
         built_bases = bases_payload(outcomes)
+
+        def report(payload: dict[str, Any]) -> dict[str, Any]:
+            """Every payload shape on the same terms: `bases` when built, `resumed` on a resume."""
+            if resumed is not None:
+                payload["resumed"] = True
+            return with_bases(payload, built_bases)
+
         if any(outcome.kind == "escalated" for outcome in outcomes):
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
             primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-            return with_bases(
-                escalated_payload(run_id, primary, outcomes, warnings), built_bases
-            )
+            return report(escalated_payload(run_id, primary, outcomes, warnings))
 
         # Integrate (addendum I6) runs only once every lane finished clean,
         # and also when there was nothing left to drive: that is how a relaunch
@@ -1140,10 +1414,10 @@ def run_milestone(
         if isinstance(outcome, integration.IntegrateEscalation):
             # The branch and worktree stay exactly as Integrate left them (I5).
             store.record_run(run_record.model_copy(update={"status": "escalated"}))
-            return with_bases(integrate_escalated_payload(run_id, outcome, warnings), built_bases)
+            return report(integrate_escalated_payload(run_id, outcome, warnings))
 
         store.record_run(run_record.model_copy(update={"status": "done"}))
-        return with_bases(
+        return report(
             {
                 "done": True,
                 "run_id": run_id,
@@ -1155,8 +1429,7 @@ def run_milestone(
                 "tips": tips,
                 "warnings": warnings,
                 "integrated": integrated_payload(outcome),
-            },
-            built_bases,
+            }
         )
     finally:
         store.close()
