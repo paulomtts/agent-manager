@@ -2064,3 +2064,55 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
         assert st.latest_open_checkpoint("card-a", "task") == opened
     finally:
         st.close()
+
+
+# -- run controls and leases -----------------------------------------------------
+#
+# Row-only tables outside the journal (live-control spec C1/C2), like
+# `checkpoints`. A "second process" is a second `store.open_db` connection.
+# Steps tier: real temp DB and journal, no harness.
+
+
+def test_the_control_tables_appear_on_an_existing_database(repo):
+    # A pre-M9 database: every table but the two new ones, with a row in it.
+    first = store.open_db(repo)
+    first.execute("DROP TABLE IF EXISTS run_controls")
+    first.execute("DROP TABLE IF EXISTS run_leases")
+    first.execute(
+        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+    )
+    first.commit()
+    first.close()
+
+    conn = store.open_db(repo)
+    try:
+        names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        controls = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_controls)").fetchall()
+        ]
+        leases = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_leases)").fetchall()
+        ]
+        kept = [row["id"] for row in conn.execute("SELECT id FROM runs").fetchall()]
+    finally:
+        conn.close()
+
+    assert {"run_controls", "run_leases"} <= names
+    assert controls == ["run_id", "seq", "lease", "command", "requested_at", "handled_at"]
+    assert leases == [
+        "run_id",
+        "token",
+        "pid",
+        "host",
+        "acquired_at",
+        "heartbeat_at",
+        "accepting",
+    ]
+    assert kept == [RUN_ID]

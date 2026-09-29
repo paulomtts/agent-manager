@@ -103,6 +103,26 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     saved_at  TEXT NOT NULL,
     PRIMARY KEY (run_id, card_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS run_controls (
+    run_id       TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    lease        TEXT NOT NULL,
+    command      TEXT NOT NULL CHECK (command IN ('pause', 'cancel')),
+    requested_at TEXT NOT NULL,
+    handled_at   TEXT,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_leases (
+    run_id       TEXT PRIMARY KEY,
+    token        TEXT NOT NULL,
+    pid          INTEGER NOT NULL,
+    host         TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    accepting    INTEGER NOT NULL
+);
 """
 
 
