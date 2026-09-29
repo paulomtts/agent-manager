@@ -1318,6 +1318,14 @@ def run_milestone(
     anything more, and grafo starts no dependent of a failed lane, so those
     stories stay `pending`.
 
+    An applied `am cancel` or `am pause` fires the same `StopSignal` through
+    `stop.request`, so lanes park exactly as for an escalation. Once the tree
+    returns, the first match wins (C6): a cancel records the run `cancelled`
+    and returns `controlled_payload`; an escalation records `escalated` as
+    below, with `control: "pause"` added when a pause was applied; a pause
+    records `stopped` and returns `controlled_payload` with its `resume`
+    hint. Only a run with none of these reaches Integrate.
+
     When every lane finished clean -- or none had anything to run --
     Integrate folds every story tip into `<branch_prefix>-integrate` before
     the run is recorded. Success records `done` and adds `integrated`; an
@@ -1451,10 +1459,22 @@ def run_milestone(
                     payload["resumed"] = True
                 return with_bases(payload, built_bases)
 
+            # Outcome precedence (live control C6): the first match wins. A
+            # control is never an escalation, and a paused or cancelled run
+            # never reaches Integrate in this invocation.
+            if stop.requested == "cancel":
+                store.record_run(run_record.model_copy(update={"status": "cancelled"}))
+                return report(controlled_payload(run_id, "cancel", outcomes, warnings))
             if any(outcome.kind == "escalated" for outcome in outcomes):
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
                 primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-                return report(escalated_payload(run_id, primary, outcomes, warnings))
+                payload = escalated_payload(run_id, primary, outcomes, warnings)
+                if stop.requested == "pause":
+                    payload["control"] = "pause"
+                return report(payload)
+            if stop.requested == "pause":
+                store.record_run(run_record.model_copy(update={"status": "stopped"}))
+                return report(controlled_payload(run_id, "pause", outcomes, warnings))
 
             # Integrate (addendum I6) runs only once every lane finished clean,
             # and also when there was nothing left to drive: that is how a relaunch

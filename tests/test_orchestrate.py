@@ -4282,3 +4282,365 @@ def test_an_integrate_that_raises_still_releases_the_lease(project, integrate_re
 
     assert _lease(project, run_id) is None
     assert _load(project, run_id).status == "started"
+
+
+@requires_git
+@requires_brd
+def test_a_paused_milestone_parks_records_stopped_and_skips_integrate(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [story_b],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+        story_b: "pending",
+        b1: "pending",
+    }
+    assert integrate_recorder.calls == []
+    assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
+        ("pause", True)
+    ]
+
+
+@requires_git
+@requires_brd
+def test_a_pause_applied_after_the_last_lane_already_finished_still_skips_integrate(
+    project, integrate_recorder, monkeypatch
+):
+    """C6 case 3 applies even when every lane had already finished: the
+    request lands after the watcher stopped and before the window closed, so
+    only `controlled`'s final sweep applies it."""
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    real_close_window = control.Lease.close_window
+
+    def the_request_lands_then_the_window_closes(self: control.Lease) -> None:
+        _send(project, run_id, "pause")
+        real_close_window(self)
+
+    monkeypatch.setattr(control.Lease, "close_window", the_request_lands_then_the_window_closes)
+    driver = GatedDriver()
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [],
+        "completed": [a1],
+        "pending": [],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _statuses(_load(project, run_id)) == {"run": "stopped", story_a: "done", a1: "done"}
+    assert integrate_recorder.calls == []
+    assert [row.handled_at is not None for row in _controls(project, run_id)] == [True]
+
+
+@requires_git
+@requires_brd
+def test_a_lane_waiting_for_a_slot_ends_stopped_on_a_pause(project, integrate_recorder):
+    """Three ready stories, two slots: `queued` waits for a slot when the
+    pause lands, takes it, sees the stop and never reaches the driver."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    (first, second, queued) = _census_levels(project, shape["milestone"])[0]
+    subtasks = _subtasks_by_story(shape)
+    (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_then_pause(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "both slotted lanes in flight")
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+
+    driver = GatedDriver(gates={f1: meet_then_pause, s1: _meet_then_await_stop(pair)})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert q1 not in [call["card"] for call in driver.calls]
+    assert result["paused"] is True, result
+    assert result["stopped"] == [
+        {"story": first, "subtask": f1, "before_phase": "implement"},
+        {"story": second, "subtask": s1, "before_phase": "implement"},
+        {"story": queued, "subtask": q1, "before_phase": None},
+    ]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        first: "stopped",
+        f1: "stopped",
+        second: "stopped",
+        s1: "stopped",
+        queued: "stopped",
+        q1: "pending",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+
+    async def pause_then_cancel(stop: StopSignal | None) -> None:
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+        _send(project, run_id, "cancel")
+
+    driver = GatedDriver(gates={a1: pause_then_cancel})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert "paused" not in result and "resume" not in result
+    assert _load(project, run_id).status == "cancelled"
+    assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
+        ("pause", True),
+        ("cancel", True),
+    ]
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_under_pause_stays_escalated_and_carries_control_pause(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_pause_then_escalate(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a1 and b1 in flight together")
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: meet_pause_then_escalate, b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_a,
+        "subtask": a1,
+        "failed_phase": "review",
+        "detail": "reviewer found a blocker",
+        "warnings": [],
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+        "control": "pause",
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_cancel_then_escalate(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a1 and b1 in flight together")
+        _send(project, run_id, "cancel")
+        await _await_stop(stop)
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: meet_cancel_then_escalate, b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "escalations": [
+            {
+                "level": 0,
+                "story": story_a,
+                "subtask": a1,
+                "failed_phase": "review",
+                "detail": "reviewer found a blocker",
+            }
+        ],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_paused_run_reports_resumed_and_bases_through_report(project, fake_bases):
+    """Every branch goes through `report`: a pause on a resume carries
+    `resumed` and the merged base C built in this invocation."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    driver = GatedDriver(gates={c1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _resume(project, run_id, driver, control_interval=0)
+
+    assert result["paused"] is True, result
+    assert result["resumed"] is True
+    assert result["resume"] == f"am resume {run_id}"
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    assert result["stopped"] == [{"story": story_c, "subtask": c1, "before_phase": "implement"}]
+    assert sorted(result["completed"]) == sorted([a1, b1])
+    assert _load(project, run_id).status == "stopped"
+
+
+@requires_git
+@requires_brd
+def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
+    project, fresh_pygents, integrate_recorder
+):
+    """Success Criterion 1, on a real M6 pygents subtask agent over a
+    step-only workflow: the pause lands while `first` runs; `first` finishes;
+    the agent parks through ON_PAUSE with `second` at the queue head; `second`
+    never runs; the run records `stopped`."""
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    watch = _ThreadWatch()
+    ran: list[str] = []
+
+    def first(card: str) -> dict[str, Any]:
+        ran.append("first")
+        _send(project, run_id, "pause")
+        if not watch.paused.wait(WAIT):
+            raise RuntimeError("the pause never reached the run")
+        return {"first": 1}
+
+    def second(card: str) -> dict[str, Any]:
+        ran.append("second")
+        return {"second": 2}
+
+    workflow = Workflow("m9_pause_parks", (Step("first", first), Step("second", second)))
+
+    async def drive(*, store, run_id, card, parent, subtask, repo_dir, stop=None, **_: Any):
+        stop.register(watch)
+        try:
+            summary = await runtime_engine.run_subtask_async(
+                workflow,
+                store,
+                story_id=parent.id,
+                subtask=subtask,
+                repo_dir=repo_dir,
+                stop=stop,
+            )
+        finally:
+            stop.unregister(watch)
+        return cli.SubtaskDrive(summary=summary, warnings=list(summary.warnings))
+
+    result = _run(project, shape["milestone"], drive, control_interval=0)
+
+    assert ran == ["first"]
+    assert result["paused"] is True, result
+    assert result["stopped"] == [{"story": story_a, "subtask": a1, "before_phase": "second"}]
+    assert result["resume"] == f"am resume {run_id}"
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        story_a: "stopped",
+        a1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(a1)
+    finally:
+        opened.close()
+    assert newest.reason == "parked"
+    assert newest.agent["queue"][0]["kwargs"]["phase"] == "second"
