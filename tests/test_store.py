@@ -2186,3 +2186,140 @@ def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched
     finally:
         st.close()
         other.close()
+
+
+def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
+    st = store.Store.open(repo, RUN_ID)
+    other = store.open_db(repo)
+    try:
+        with store.immediate(other):
+            first = store.add_control(
+                other, RUN_ID, lease="t1", command="pause", requested_at=_at(0)
+            )
+            second = store.add_control(
+                other, RUN_ID, lease="old", command="cancel", requested_at=_at(0)
+            )
+        assert first == store.ControlRow(
+            run_id=RUN_ID,
+            seq=0,
+            lease="t1",
+            command="pause",
+            requested_at=_at(0),
+            handled_at=None,
+        )
+        assert second.seq == 1
+
+        assert [row.command for row in st.pending_controls("t1")] == ["pause"]
+        assert st.pending_controls("t1") == [first]
+
+        st.mark_control_handled(0, _at(1))
+        assert st.pending_controls("t1") == []
+        assert [row.handled_at for row in store.control_requests(other, RUN_ID)] == [
+            _at(1),
+            None,
+        ]
+        assert [row.seq for row in store.control_requests(other, RUN_ID, lease="old")] == [1]
+        assert store.control_requests(other, "run-never-controlled") == []
+    finally:
+        other.close()
+        st.close()
+
+
+def test_control_seqs_are_numbered_and_handled_per_run(repo):
+    # Review Focus 4.
+    conn = store.open_db(repo)
+    try:
+        with store.immediate(conn):
+            a = store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+            b = store.add_control(
+                conn, OTHER_RUN_ID, lease="t9", command="cancel", requested_at=_at(0)
+            )
+            c = store.add_control(conn, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+        assert (a.seq, b.seq, c.seq) == (0, 0, 1)
+
+        st = store.Store.open(repo, RUN_ID)
+        try:
+            st.mark_control_handled(0, _at(2))
+        finally:
+            st.close()
+
+        assert [row.handled_at for row in store.control_requests(conn, RUN_ID)] == [_at(2), None]
+        assert [row.handled_at for row in store.control_requests(conn, OTHER_RUN_ID)] == [None]
+    finally:
+        conn.close()
+
+
+def test_immediate_rolls_back_on_error(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with store.immediate(conn):
+                store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+                raise RuntimeError("boom")
+
+        assert conn.in_transaction is False
+        assert store.control_requests(conn, RUN_ID) == []
+        # Nothing was spent: the next request is still seq 0.
+        with store.immediate(conn):
+            again = store.add_control(
+                conn, RUN_ID, lease="t1", command="pause", requested_at=_at(1)
+            )
+        assert again.seq == 0
+        assert len(store.control_requests(conn, RUN_ID)) == 1
+    finally:
+        conn.close()
+
+
+def test_an_unknown_command_is_refused_by_the_check(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            with store.immediate(conn):
+                store.add_control(
+                    conn, RUN_ID, lease="t1", command="resume", requested_at=_at(0)
+                )
+        assert conn.in_transaction is False
+        assert store.control_requests(conn, RUN_ID) == []
+    finally:
+        conn.close()
+
+
+def test_immediate_commits_an_implicit_transaction_first(repo):
+    # Review Focus 1: Python's legacy sqlite3 mode opens an implicit
+    # transaction on the first INSERT; `immediate` must not trip over it.
+    conn = store.open_db(repo)
+    try:
+        conn.execute(
+            "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+            " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (RUN_ID, "milestone", str(repo), "main", "m9/", "started", None, "{}"),
+        )
+        assert conn.in_transaction is True
+        with store.immediate(conn):
+            store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+    reader = store.open_db(repo)
+    try:
+        assert reader.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert [row.command for row in store.control_requests(reader, RUN_ID)] == ["pause"]
+    finally:
+        reader.close()
+
+
+def test_immediate_holds_the_write_lock_from_begin(repo):
+    # Review Focus 2: BEGIN IMMEDIATE, not a deferred BEGIN, so no second
+    # writer can land between reading MAX(seq) and the insert.
+    conn = store.open_db(repo)
+    blocker = sqlite3.connect(paths.project_db_path(repo), timeout=0)
+    try:
+        with store.immediate(conn):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.rollback()
+    finally:
+        blocker.close()
+        conn.close()

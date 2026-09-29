@@ -15,7 +15,8 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -598,6 +599,109 @@ def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
     return None if row is None else _lease_from_row(row)
 
 
+@dataclass(frozen=True)
+class ControlRow:
+    """One `am pause`/`am cancel` request: a row of `run_controls` (live control C1).
+
+    Row-only and outside the journal. `lease` is the token the request was
+    addressed to, so a row under an old lease never reaches a resumed run.
+    """
+
+    run_id: str
+    seq: int
+    lease: str
+    command: str
+    requested_at: datetime
+    handled_at: datetime | None
+
+
+def _control_from_row(row: sqlite3.Row) -> ControlRow:
+    handled = row["handled_at"]
+    return ControlRow(
+        run_id=row["run_id"],
+        seq=row["seq"],
+        lease=row["lease"],
+        command=row["command"],
+        requested_at=datetime.fromisoformat(row["requested_at"]),
+        handled_at=None if handled is None else datetime.fromisoformat(handled),
+    )
+
+
+def control_requests(
+    conn: sqlite3.Connection, run_id: str, *, lease: str | None = None
+) -> list[ControlRow]:
+    """Every control request of `run_id` in `seq` order, handled or not.
+
+    With `lease=None` every lease's rows are returned; otherwise only the rows
+    addressed to that token.
+    """
+    if lease is None:
+        rows = conn.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? ORDER BY seq", (run_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? AND lease = ? ORDER BY seq",
+            (run_id, lease),
+        ).fetchall()
+    return [_control_from_row(row) for row in rows]
+
+
+@contextmanager
+def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One write transaction that holds the database write lock from `BEGIN`.
+
+    Python's `sqlite3` in legacy transaction mode opens an implicit
+    transaction on the first DML statement, and `BEGIN` inside one raises; so
+    any open implicit transaction is committed first. The body then runs under
+    `BEGIN IMMEDIATE` and is committed on a normal exit, or rolled back and
+    the exception re-raised on any error, leaving no partial rows.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def add_control(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease: str,
+    command: str,
+    requested_at: datetime,
+) -> ControlRow:
+    """Insert the next control request of `run_id`, addressed to `lease`.
+
+    `seq` is 0 for the run's first request and one past the highest after
+    that. Does not commit: run it inside `immediate` so the `MAX(seq)` read
+    and the insert are one locked write. An unknown `command` is refused by
+    the table's `CHECK` as `sqlite3.IntegrityError`; that is the only guard.
+    """
+    highest = conn.execute(
+        "SELECT MAX(seq) FROM run_controls WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
+    seq = 0 if highest is None else highest + 1
+    conn.execute(
+        "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
+        " handled_at) VALUES (?, ?, ?, ?, ?, NULL)",
+        (run_id, seq, lease, command, _iso(requested_at)),
+    )
+    return ControlRow(
+        run_id=run_id,
+        seq=seq,
+        lease=lease,
+        command=command,
+        requested_at=requested_at,
+        handled_at=None,
+    )
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
@@ -1005,7 +1109,7 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
-    # -- leases --------------------------------------------------------------
+    # -- leases and control requests -------------------------------------------
     #
     # A row-only table outside the journal (live control C2): nothing here
     # calls `self._journal`, and `rebuild_from_journal` leaves the rows alone.
@@ -1061,6 +1165,25 @@ class Store:
             self._conn.execute(
                 "DELETE FROM run_leases WHERE run_id = ? AND token = ?",
                 (self.run_id, token),
+            )
+            self._conn.commit()
+
+    def pending_controls(self, token: str) -> list[ControlRow]:
+        """This run's unhandled requests addressed to `token`, in `seq` order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM run_controls WHERE run_id = ? AND lease = ?"
+                " AND handled_at IS NULL ORDER BY seq",
+                (self.run_id, token),
+            ).fetchall()
+            return [_control_from_row(row) for row in rows]
+
+    def mark_control_handled(self, seq: int, now: datetime) -> None:
+        """Record that this run's request `seq` has been applied."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
+                (_iso(now), self.run_id, seq),
             )
             self._conn.commit()
 
