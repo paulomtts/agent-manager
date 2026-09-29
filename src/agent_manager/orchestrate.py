@@ -548,8 +548,9 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     """The recorded milestone run `run_id`, or the refusal that says why not.
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
-    `Store.open` would construct a `Journal`. An unknown run, a run of
-    another workflow, and a `done` run are refused (card 54e4ec29).
+    `Store.open` would construct a `Journal`. Refused, in this order (live
+    control C9): an unknown run, a run of another workflow, then a
+    `cancelled` run and a `done` run (card 54e4ec29, card 0e1edf31).
     """
     conn = open_db(root)
     try:
@@ -564,6 +565,10 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     if run.workflow != MILESTONE_WORKFLOW:
         raise cli.NotResumableError(
             f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
+        )
+    if run.status == "cancelled":
+        raise cli.NotResumableError(
+            f"run {run_id} was cancelled; start new work with am run --milestone"
         )
     if run.status == "done":
         raise cli.NotResumableError(
@@ -1338,7 +1343,7 @@ def run_milestone(
     `clock` are then not read: the milestone is the one the run id names
     (`find_run_milestone`) and the rest is what the run recorded. The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
-    unknown, non-milestone or `done` run, an unknown milestone, a blocker
+    unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
     before the first write and before git is refreshed. Then the run is
     recorded `started`, the plan is re-recorded, orphan attempts are marked

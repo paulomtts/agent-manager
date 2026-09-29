@@ -3638,6 +3638,26 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
+def test_a_cancelled_milestone_run_is_refused_for_resume(tmp_path, monkeypatch):
+    """C9: unknown run, then wrong workflow, then cancelled -- the earlier
+    refusals still win for a run that is also cancelled."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, status="cancelled")
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert str(caught.value) == (
+        f"run {RESUME_RUN_ID} was cancelled; start new work with am run --milestone"
+    )
+    task_run = "20260924T120000Z-00000008"
+    _record_resume_run(root, task_run, workflow="task", status="cancelled")
+    with pytest.raises(cli.NotResumableError, match="'task'"):
+        orchestrate.resumable_milestone_run(root, task_run)
+    with pytest.raises(cli.UnknownRunError, match="no-such-run"):
+        orchestrate.resumable_milestone_run(root, "no-such-run")
+
+
 def test_a_resumed_run_names_its_milestone_by_the_short_id_in_its_run_id():
     wanted = models.CardNode(id=_plan_id(9), title="Milestone 9", status="todo")
     other = models.CardNode(id=_plan_id(8), title="Milestone 8", status="todo")
