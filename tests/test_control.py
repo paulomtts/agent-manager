@@ -382,3 +382,135 @@ async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_s
 
     with pytest.raises(RuntimeError, match="not a lock"):
         await _within(control.watch(Broken(opened_store), StopSignal(), "t1", interval=0))
+
+
+# -- controlled ----------------------------------------------------------------
+
+
+async def _blocked_forever(started: asyncio.Event, cancelled: list[bool]) -> str:
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        cancelled.append(True)
+        raise
+    return "unreachable"
+
+
+async def test_controlled_returns_work_result_and_applies_a_request_sent_mid_run(
+    root, opened_store
+):
+    stop, agent = StopSignal(), FakeAgent()
+    stop.register(agent)
+    with control.Lease(opened_store) as lease:
+
+        async def work() -> str:
+            _send(root, lease.token, "pause")
+            await _until(lambda: stop.requested == "pause")
+            return "done"
+
+        result = await _within(
+            control.controlled(work(), store=opened_store, stop=stop, lease=lease, interval=0)
+        )
+    assert result == "done"
+    assert agent.paused >= 1 and stop.primary is None
+    assert [row.handled_at is not None for row in _requests(root)] == [True]
+
+
+async def test_controlled_cancels_work_and_reraises_when_the_watcher_crashes(opened_store):
+    started, cancelled = asyncio.Event(), []
+
+    class Exploding(Wrapped):
+        exploded = False
+
+        def pending_controls(self, token: str) -> list[store.ControlRow]:
+            if started.is_set() and not Exploding.exploded:
+                Exploding.exploded = True
+                raise RuntimeError("boom")
+            return self._inner.pending_controls(token)
+
+    with control.Lease(opened_store) as lease:
+        with pytest.raises(RuntimeError, match="boom"):
+            await _within(
+                control.controlled(
+                    _blocked_forever(started, cancelled),
+                    store=Exploding(opened_store),
+                    stop=StopSignal(),
+                    lease=lease,
+                    interval=0,
+                )
+            )
+    assert cancelled == [True]
+
+
+async def test_controlled_closes_the_window_then_sweeps_once_on_exit(root, opened_store):
+    events: list[str] = []
+
+    class Recording(Wrapped):
+        def pending_controls(self, token: str) -> list[store.ControlRow]:
+            events.append("pending")
+            return self._inner.pending_controls(token)
+
+        def close_window(self, token: str) -> None:
+            events.append("close_window")
+            self._inner.close_window(token)
+
+    recording, stop = Recording(opened_store), StopSignal()
+    with control.Lease(recording) as lease:
+
+        async def work() -> str:
+            # The watcher's first tick has run and it is now parked on a long
+            # interval, so only the final sweep can see this request.
+            await _until(lambda: "pending" in events)
+            _send(root, lease.token, "pause")
+            return "done"
+
+        assert (
+            await _within(
+                control.controlled(work(), store=recording, stop=stop, lease=lease, interval=3600)
+            )
+            == "done"
+        )
+        assert events == ["pending", "close_window", "pending"]
+        assert stop.requested == "pause"
+        row = _read_lease(root)
+        assert row is not None and row.accepting is False
+    assert [row.handled_at is not None for row in _requests(root)] == [True]
+
+
+async def test_controlled_cancels_work_on_exception_and_always_stops_the_watcher(
+    root, opened_store
+):
+    before = asyncio.all_tasks()
+    stop = StopSignal()
+    with control.Lease(opened_store) as lease:
+        # Review Focus 5: the task running `controlled` is cancelled from outside.
+        started, cancelled = asyncio.Event(), []
+        outer = asyncio.create_task(
+            control.controlled(
+                _blocked_forever(started, cancelled),
+                store=opened_store,
+                stop=stop,
+                lease=lease,
+                interval=0,
+            )
+        )
+        await _within(started.wait())
+        _send(root, lease.token, "cancel")
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        assert cancelled == [True]
+        assert asyncio.all_tasks() == before
+        row = _read_lease(root)
+        assert row is not None and row.accepting is False
+        assert stop.requested == "cancel"
+
+        async def failing() -> str:
+            raise ValueError("work failed")
+
+        with pytest.raises(ValueError, match="work failed"):
+            await _within(
+                control.controlled(failing(), store=opened_store, stop=stop, lease=lease, interval=0)
+            )
+        assert asyncio.all_tasks() == before

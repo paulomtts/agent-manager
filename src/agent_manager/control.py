@@ -19,10 +19,10 @@ import os
 import socket
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import NoReturn, cast
+from typing import NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from agent_manager.runtime.stop import Command, StopSignal
@@ -36,6 +36,8 @@ HEARTBEAT_SECONDS = 5.0
 
 LEASE_STALE_SECONDS = 30.0
 """A lease whose heartbeat is older than this is dead (C2)."""
+
+T = TypeVar("T")
 
 
 def _utcnow() -> datetime:
@@ -184,3 +186,43 @@ async def watch(
         except sqlite3.OperationalError:
             pass
         await asyncio.sleep(interval)
+
+
+async def controlled(
+    work: Awaitable[T],
+    *,
+    store: Store,
+    stop: StopSignal,
+    lease: Lease,
+    interval: float = CONTROL_POLL_SECONDS,
+    clock: Callable[[], datetime] = _utcnow,
+) -> T:
+    """Run `work` with `watch` beside it and return `work`'s result.
+
+    A control never cancels `work`; it only parks the run through `stop`.
+    `work` is cancelled only when the watcher crashes (its error is re-raised)
+    or on any other exception, including this task being cancelled. On every
+    exit the watcher is stopped, then the window is closed, then one final
+    sweep runs. In that order, no request can be accepted after the sweep.
+    """
+    work_task = asyncio.ensure_future(work)
+    watcher = asyncio.create_task(
+        watch(store, stop, lease.token, interval=interval, clock=clock)
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {work_task, watcher}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if work_task in done:
+            return work_task.result()
+        watcher.result()
+        raise RuntimeError("the control watcher stopped without an error")
+    except BaseException:
+        work_task.cancel()
+        await asyncio.gather(work_task, return_exceptions=True)
+        raise
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        lease.close_window()
+        apply_pending(store, stop, lease.token, clock=clock)
