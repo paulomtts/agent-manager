@@ -883,7 +883,7 @@ def test_every_status_carrying_model_accepts_stopped():
     )
 
 
-def test_status_grew_by_exactly_stopped_and_still_rejects_unknown_values():
+def test_status_is_exactly_the_lifecycle_set_and_still_rejects_unknown_values():
     assert typing.get_args(models.Status) == (
         "pending",
         "started",
@@ -891,16 +891,47 @@ def test_status_grew_by_exactly_stopped_and_still_rejects_unknown_values():
         "failed",
         "escalated",
         "stopped",
+        "cancelled",
     )
     with pytest.raises(ValidationError) as excinfo:
         models.SubtaskRun(
             card_id="a3dd82f4", branch="m4/x-a3dd82f4", base_branch="main", status="halted"
         )
     message = str(excinfo.value)
-    for allowed in ("pending", "started", "done", "failed", "escalated", "stopped"):
+    for allowed in ("pending", "started", "done", "failed", "escalated", "stopped", "cancelled"):
         assert allowed in message
 
 
 def test_attempt_status_does_not_pick_up_stopped():
     with pytest.raises(ValidationError):
         models.Attempt(n=1, dispatch=_dispatch(), status="stopped")
+
+
+def test_every_status_carrying_model_accepts_cancelled():
+    assert models.PhaseRun(name="implement", kind="agent", status="cancelled").status == "cancelled"
+    assert (
+        models.SubtaskRun(
+            card_id="a3dd82f4", branch="m9/x-a3dd82f4", base_branch="main", status="cancelled"
+        ).status
+        == "cancelled"
+    )
+    assert (
+        models.StoryRun(card_id="9bfb5ac2", title="Cancel", level=0, status="cancelled").status
+        == "cancelled"
+    )
+    assert (
+        models.Run(
+            id="run-2026-09-29-01",
+            workflow="milestone",
+            repo_dir=Path("/home/dev/agent-manager"),
+            base_branch="main",
+            branch_prefix="m9/",
+            status="cancelled",
+        ).status
+        == "cancelled"
+    )
+
+
+def test_attempt_status_does_not_pick_up_cancelled():
+    with pytest.raises(ValidationError):
+        models.Attempt(n=1, dispatch=_dispatch(), status="cancelled")
