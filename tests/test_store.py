@@ -2116,3 +2116,73 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
         "accepting",
     ]
     assert kept == [RUN_ID]
+
+
+def test_a_lease_is_touched_only_through_its_own_token(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        assert lease == store.LeaseRow(
+            run_id=RUN_ID,
+            token="t1",
+            pid=42,
+            host="h",
+            acquired_at=_at(0),
+            heartbeat_at=_at(0),
+            accepting=True,
+        )
+        assert store.read_lease(st.connection, RUN_ID) == lease
+
+        st.beat("other", _at(1))
+        st.close_window("other")
+        st.release_lease("other")
+        assert store.read_lease(st.connection, RUN_ID) == lease
+
+        st.beat("t1", _at(1))
+        st.close_window("t1")
+        row = store.read_lease(st.connection, RUN_ID)
+        assert row is not None
+        assert row.heartbeat_at == _at(1)
+        assert row.acquired_at == _at(0)
+        assert row.accepting is False
+
+        st.release_lease("t1")
+        assert store.read_lease(st.connection, RUN_ID) is None
+        assert store.read_lease(st.connection, "run-never-leased") is None
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        lease.token = "t2"  # type: ignore[misc]
+
+
+def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched(repo):
+    # Review Focus 3: a resumed run takes a new token; the old one is dead, and
+    # a token string shared with another run never reaches that run's row.
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        theirs = other.acquire_lease(token="new", pid=7, host="h", now=_at(0))
+        st.acquire_lease(token="old", pid=1, host="h", now=_at(0))
+        st.close_window("old")
+        fresh = st.acquire_lease(token="new", pid=2, host="h", now=_at(5))
+
+        st.beat("old", _at(9))
+        st.close_window("old")
+        st.release_lease("old")
+        assert store.read_lease(st.connection, RUN_ID) == fresh
+        assert fresh.accepting is True
+        assert (
+            st.connection.execute(
+                "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (RUN_ID,)
+            ).fetchone()[0]
+            == 1
+        )
+
+        st.release_lease("new")
+        assert store.read_lease(st.connection, RUN_ID) is None
+        assert store.read_lease(st.connection, OTHER_RUN_ID) == theirs
+    finally:
+        st.close()
+        other.close()

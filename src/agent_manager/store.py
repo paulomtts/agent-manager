@@ -556,6 +556,48 @@ def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
     )
 
 
+@dataclass(frozen=True)
+class LeaseRow:
+    """The running process's claim on a run: a row of `run_leases` (live control C2).
+
+    Row-only and outside the journal, like `Checkpoint`. `accepting` is a real
+    `bool`: once the control window closes it is `False` and a new request
+    must be refused by the requester.
+    """
+
+    run_id: str
+    token: str
+    pid: int
+    host: str
+    acquired_at: datetime
+    heartbeat_at: datetime
+    accepting: bool
+
+
+def _lease_from_row(row: sqlite3.Row) -> LeaseRow:
+    return LeaseRow(
+        run_id=row["run_id"],
+        token=row["token"],
+        pid=row["pid"],
+        host=row["host"],
+        acquired_at=datetime.fromisoformat(row["acquired_at"]),
+        heartbeat_at=datetime.fromisoformat(row["heartbeat_at"]),
+        accepting=bool(row["accepting"]),
+    )
+
+
+def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
+    """The lease row of `run_id`, or `None` if no process holds one.
+
+    A free function over a connection so a second process (`am pause`,
+    `am status`) can read it without a `Store`, as with `load_run`.
+    """
+    row = conn.execute(
+        "SELECT * FROM run_leases WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return None if row is None else _lease_from_row(row)
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
@@ -962,6 +1004,65 @@ class Store:
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
+
+    # -- leases --------------------------------------------------------------
+    #
+    # A row-only table outside the journal (live control C2): nothing here
+    # calls `self._journal`, and `rebuild_from_journal` leaves the rows alone.
+    # Every method but `acquire_lease` touches only the row whose token
+    # matches; any other token is a silent no-op.
+
+    def acquire_lease(
+        self, *, token: str, pid: int, host: str, now: datetime
+    ) -> LeaseRow:
+        """Claim this run under `token`, replacing any earlier claim, window open."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT(run_id) DO UPDATE SET"
+                " token=excluded.token, pid=excluded.pid, host=excluded.host,"
+                " acquired_at=excluded.acquired_at,"
+                " heartbeat_at=excluded.heartbeat_at, accepting=1",
+                (self.run_id, token, pid, host, _iso(now), _iso(now)),
+            )
+            self._conn.commit()
+            return LeaseRow(
+                run_id=self.run_id,
+                token=token,
+                pid=pid,
+                host=host,
+                acquired_at=now,
+                heartbeat_at=now,
+                accepting=True,
+            )
+
+    def beat(self, token: str, now: datetime) -> None:
+        """Move the heartbeat of this run's lease, if `token` still holds it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET heartbeat_at = ? WHERE run_id = ? AND token = ?",
+                (_iso(now), self.run_id, token),
+            )
+            self._conn.commit()
+
+    def close_window(self, token: str) -> None:
+        """Stop accepting control requests under `token` (`accepting = 0`)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET accepting = 0 WHERE run_id = ? AND token = ?",
+                (self.run_id, token),
+            )
+            self._conn.commit()
+
+    def release_lease(self, token: str) -> None:
+        """Delete this run's lease, if `token` still holds it."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM run_leases WHERE run_id = ? AND token = ?",
+                (self.run_id, token),
+            )
+            self._conn.commit()
 
     # -- rebuild -------------------------------------------------------------
 
