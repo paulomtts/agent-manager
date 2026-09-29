@@ -29,6 +29,7 @@ from typing import Any, Iterator, TypeVar
 import pytest
 
 from agent_manager import control, store
+from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
 HEARTBEAT_THREAD = "am-lease-heartbeat"
@@ -101,6 +102,14 @@ def _requests(root: Path) -> list[store.ControlRow]:
 
 def _heartbeat_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD]
+
+
+class FakeAgent:
+    def __init__(self) -> None:
+        self.paused = 0
+
+    def pause(self) -> None:
+        self.paused += 1
 
 
 class Wrapped:
@@ -290,3 +299,40 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
     assert _heartbeat_threads() == []
+
+
+# -- apply_pending (C4) --------------------------------------------------------
+
+
+def test_apply_pending_requests_each_row_in_order_and_marks_handled(root, opened_store):
+    # Review Focus 4: a repeated pause, then cancel.
+    stop, agent = StopSignal(), FakeAgent()
+    stop.register(agent)
+    with control.Lease(opened_store) as lease:
+        for command in ("pause", "pause", "cancel"):
+            _send(root, lease.token, command)
+
+        applied = control.apply_pending(opened_store, stop, lease.token, clock=lambda: _at(7))
+
+        assert [(row.seq, row.command) for row in applied] == [
+            (0, "pause"),
+            (1, "pause"),
+            (2, "cancel"),
+        ]
+        assert stop.requested == "cancel" and stop.primary is None
+        assert agent.paused == 3
+        assert [row.handled_at for row in _requests(root)] == [_at(7)] * 3
+        assert control.apply_pending(opened_store, stop, lease.token) == []
+
+
+def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store):
+    stop = StopSignal()
+    with control.Lease(opened_store) as old:
+        old_token = old.token
+    _send(root, old_token, "cancel")
+
+    with control.Lease(opened_store) as lease:
+        assert control.apply_pending(opened_store, stop, lease.token) == []
+
+    assert stop.requested is None and not stop.triggered
+    assert [(row.lease, row.handled_at) for row in _requests(root)] == [(old_token, None)]

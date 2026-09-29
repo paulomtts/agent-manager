@@ -21,9 +21,11 @@ import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from types import TracebackType
+from typing import cast
 from uuid import uuid4
 
-from agent_manager.store import LeaseRow, Store
+from agent_manager.runtime.stop import Command, StopSignal
+from agent_manager.store import ControlRow, LeaseRow, Store
 
 CONTROL_POLL_SECONDS = 1.0
 """How often `watch` looks for new requests."""
@@ -140,3 +142,23 @@ class Lease:
             except sqlite3.OperationalError:
                 # A second process holds the database; the next beat retries.
                 continue
+
+
+def apply_pending(
+    store: Store,
+    stop: StopSignal,
+    token: str,
+    *,
+    clock: Callable[[], datetime] = _utcnow,
+) -> list[ControlRow]:
+    """Apply this lease's unhandled requests in `seq` order and mark each handled.
+
+    Only rows addressed to `token` are read (C4), so a request sent to an
+    earlier life of the run never reaches this one. Returns the rows applied.
+    """
+    applied: list[ControlRow] = []
+    for row in store.pending_controls(token):
+        stop.request(cast(Command, row.command))
+        store.mark_control_handled(row.seq, clock())
+        applied.append(row)
+    return applied
