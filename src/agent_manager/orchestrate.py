@@ -1,7 +1,8 @@
 """The milestone runner (orchestration addendum O6; supervisor-tree T1-T6).
 
 `run_milestone` drives every remaining subtask of one milestone through the
-shared per-subtask driver (O4) on one event loop: `asyncio.run(control.controlled(supervise(...)))`, under the run's `control.Lease`.
+shared per-subtask driver (O4) on one event loop, under the run's
+`control.Lease`: `asyncio.run(control.controlled(supervise(...)))`.
 `supervise` builds one `grafo.Node` per census story -- done ones included,
 every one with `timeout=None` -- and one edge per in-milestone blocker, so a
 `grafo.TreeExecutor` starts each story the moment all its blockers succeeded.
@@ -1308,10 +1309,10 @@ def run_milestone(
 
     `milestone` is a card id or a title needle (O1). Everything that can refuse,
     `max_concurrent < 1` included, runs before the store is opened. Then the
-    run takes a `control.Lease`, one `milestone` run is recorded
-    with its whole plan `pending`, and `asyncio.run(control.controlled(
-    supervise(...)))` runs every story the moment its blockers
-    succeeded, at most `max_concurrent` at once. A subtask already `done` on
+    run takes a `control.Lease`, one `milestone` run is recorded with its
+    whole plan `pending`, and `asyncio.run(control.controlled(supervise(...)))`
+    runs every story the moment its blockers succeeded, at most
+    `max_concurrent` at once. A subtask already `done` on
     the board is never driven, but its branch still anchors the next
     subtask's base. The card and its story are read fresh from the board
     before each subtask. The default driver is `cli.drive_subtask_async`,
