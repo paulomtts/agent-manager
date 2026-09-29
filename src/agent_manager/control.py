@@ -14,6 +14,7 @@ module imports only `store`, `runtime.stop` and the stdlib; never `cli`,
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sqlite3
@@ -21,7 +22,7 @@ import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import cast
+from typing import NoReturn, cast
 from uuid import uuid4
 
 from agent_manager.runtime.stop import Command, StopSignal
@@ -162,3 +163,24 @@ def apply_pending(
         store.mark_control_handled(row.seq, clock())
         applied.append(row)
     return applied
+
+
+async def watch(
+    store: Store,
+    stop: StopSignal,
+    token: str,
+    *,
+    interval: float = CONTROL_POLL_SECONDS,
+    clock: Callable[[], datetime] = _utcnow,
+) -> NoReturn:
+    """Apply this lease's requests every `interval` seconds, forever.
+
+    A `sqlite3.OperationalError` (a second process holding the database) is
+    swallowed and retried on the next tick; any other error ends the watcher.
+    """
+    while True:
+        try:
+            apply_pending(store, stop, token, clock=clock)
+        except sqlite3.OperationalError:
+            pass
+        await asyncio.sleep(interval)

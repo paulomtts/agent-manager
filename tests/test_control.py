@@ -16,12 +16,14 @@ defined here, after `tests/test_store.py`'s `repo` + `Store.open` pattern.
 from __future__ import annotations
 
 import ast
+import asyncio
 import itertools
 import os
 import socket
 import sqlite3
 import sys
 import threading
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
@@ -98,6 +100,18 @@ def _requests(root: Path) -> list[store.ControlRow]:
         return store.control_requests(conn, RUN_ID)
     finally:
         conn.close()
+
+
+async def _within(awaitable: Awaitable[T], limit: float = 5.0) -> T:
+    """Await `awaitable`, failing the test instead of hanging past `limit`."""
+    return await asyncio.wait_for(awaitable, limit)
+
+
+async def _until(predicate: Callable[[], bool], limit: float = 5.0) -> None:
+    """Yield to the loop until `predicate()` holds; a bound, not a sleep."""
+    async with asyncio.timeout(limit):
+        while not predicate():
+            await asyncio.sleep(0)
 
 
 def _heartbeat_threads() -> list[threading.Thread]:
@@ -336,3 +350,35 @@ def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store)
 
     assert stop.requested is None and not stop.triggered
     assert [(row.lease, row.handled_at) for row in _requests(root)] == [(old_token, None)]
+
+
+# -- watch ---------------------------------------------------------------------
+
+
+async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_store):
+    class Locked(Wrapped):
+        calls = 0
+
+        def pending_controls(self, token: str) -> list[store.ControlRow]:
+            Locked.calls += 1
+            if Locked.calls <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return self._inner.pending_controls(token)
+
+    stop = StopSignal()
+    _send(root, "t1", "pause")
+    task = asyncio.create_task(control.watch(Locked(opened_store), stop, "t1", interval=0))
+    try:
+        await _until(lambda: stop.requested == "pause")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert Locked.calls >= 3
+    assert task.cancelled()
+
+    class Broken(Wrapped):
+        def pending_controls(self, token: str) -> list[store.ControlRow]:
+            raise RuntimeError("not a lock")
+
+    with pytest.raises(RuntimeError, match="not a lock"):
+        await _within(control.watch(Broken(opened_store), StopSignal(), "t1", interval=0))
