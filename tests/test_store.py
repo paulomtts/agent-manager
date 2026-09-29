@@ -2384,3 +2384,42 @@ def test_latest_open_checkpoint_skips_a_cancelled_runs_row_when_it_is_not_newest
         st.close()
 
     assert found == older
+
+
+def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    other = store.open_db(repo)
+    try:
+        st.record_run(_run_with_status(repo, RUN_ID, "cancelled"))
+        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        with store.immediate(other):
+            store.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+        controls = store.control_requests(other, RUN_ID)
+        journal_before = [line.event for line in st.journal.read()]
+
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+
+        # Nothing journals the control tables, and the rebuild leaves them alone.
+        assert [line.event for line in st.journal.read()] == journal_before
+        assert journal_before == ["run_upsert"]
+        assert store.read_lease(st.connection, RUN_ID) == lease
+        assert store.control_requests(st.connection, RUN_ID) == controls
+        assert rebuilt.status == "cancelled"
+        assert store.run_status(st.connection, RUN_ID) == "cancelled"
+        assert store.run_status(st.connection, "run-never-recorded") is None
+    finally:
+        other.close()
+        st.close()
+
+    # From the journal alone: a wiped projection replays `cancelled`.
+    _truncate_db(repo)
+    replayed = store.Store.open(repo, RUN_ID)
+    try:
+        replayed.rebuild_from_journal(RUN_ID)
+        summaries = store.list_runs(replayed.connection)
+        status = store.run_status(replayed.connection, RUN_ID)
+    finally:
+        replayed.close()
+
+    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "cancelled")]
+    assert status == "cancelled"

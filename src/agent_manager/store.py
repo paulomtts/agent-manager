@@ -524,6 +524,16 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
     return run
 
 
+def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
+    """`runs.status` of `run_id`, or `None` if the run was never recorded.
+
+    A free function over a connection, like `load_run`, for a reader in
+    another process that needs the status alone (`am pause`, `am resume`).
+    """
+    row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return None if row is None else row["status"]
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
@@ -707,9 +717,10 @@ class Store:
 
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
-    The one exception is `checkpoints` (pygents spec §6): a row-only table
-    outside the journal. `save_checkpoint` writes its row and never touches the
-    journal, and `rebuild_from_journal` leaves those rows alone.
+    The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
+    `run_leases` (live control C1/C2): row-only tables outside the journal.
+    Their methods write rows and never touch the journal, and
+    `rebuild_from_journal` leaves those rows alone.
 
     One process writes a given run (P2), and its threads share one `Store`. A
     single re-entrant lock serialises every use of the shared connection. Each
