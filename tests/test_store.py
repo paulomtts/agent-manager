@@ -2323,3 +2323,64 @@ def test_immediate_holds_the_write_lock_from_begin(repo):
     finally:
         blocker.close()
         conn.close()
+
+
+def _run_with_status(repo: Path, run_id: str, status: str) -> models.Run:
+    return models.Run.model_validate({**_run(repo, run_id).model_dump(), "status": status})
+
+
+def _checkpoint_in_run(
+    repo: Path,
+    run_id: str,
+    status: str,
+    card_id: str,
+    *,
+    reason: str,
+    saved_at: datetime,
+    workflow: str = "task",
+) -> store.Checkpoint:
+    """Record `run_id` with `status`, then save one checkpoint of `card_id` under it."""
+    st = store.Store.open(repo, run_id)
+    try:
+        st.record_run(_run_with_status(repo, run_id, status))
+        return _save_checkpoint(st, card_id, reason=reason, workflow=workflow, saved_at=saved_at)
+    finally:
+        st.close()
+
+
+def test_a_cancelled_runs_checkpoints_are_never_open(repo):
+    # Review Focus 4 of the milestone plan.
+    _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r2", "cancelled", "c1", reason="parked", saved_at=_at(1))
+    unrelated = _checkpoint_in_run(
+        repo, "run-r3", "stopped", "c2", reason="parked", saved_at=_at(0)
+    )
+
+    st = store.Store.open(repo, "run-r4")
+    try:
+        closed = st.latest_open_checkpoint("c1", "task")
+        found = st.latest_open_checkpoint("c2", "task")
+    finally:
+        st.close()
+
+    assert closed is None
+    assert found == unrelated
+    assert found is not None and found.run_id == "run-r3"
+
+
+def test_latest_open_checkpoint_skips_a_cancelled_runs_row_when_it_is_not_newest(repo):
+    # Review Focus 5: the newest row is open (another workflow, a live run), so
+    # the card is not closed; the cancelled run's parked row is still skipped.
+    older = _checkpoint_in_run(repo, "run-r1", "stopped", "c3", reason="turn", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r2", "cancelled", "c3", reason="parked", saved_at=_at(1))
+    _checkpoint_in_run(
+        repo, "run-r3", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(2)
+    )
+
+    st = store.Store.open(repo, "run-r4")
+    try:
+        found = st.latest_open_checkpoint("c3", "task")
+    finally:
+        st.close()
+
+    assert found == older

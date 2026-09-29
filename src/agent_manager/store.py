@@ -1089,21 +1089,31 @@ class Store:
         """The newest open checkpoint of `card_id` for `workflow`, across every run.
 
         The card's newest row in any run and any workflow decides first: if it
-        is `done`, the card is closed and this returns `None`. Otherwise it is
-        the newest `turn`/`parked`/`escalated` row of `workflow`, or `None`.
-        "Newest" is `saved_at` descending, then `seq` descending.
+        is `done`, or it belongs to a run whose status is `cancelled` (live
+        control C9), the card is closed and this returns `None`. Otherwise it
+        is the newest `turn`/`parked`/`escalated` row of `workflow` that does
+        not belong to a cancelled run, or `None`. A checkpoint whose run has no
+        `runs` row counts as not cancelled. "Newest" is `saved_at` descending,
+        then `seq` descending.
         """
         with self._lock:
             newest = self._conn.execute(
-                "SELECT reason FROM checkpoints WHERE card_id = ?"
-                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                "SELECT c.reason, r.status FROM checkpoints c"
+                " LEFT JOIN runs r ON r.id = c.run_id"
+                " WHERE c.card_id = ?"
+                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
                 (card_id,),
             ).fetchone()
-            if newest is None or newest["reason"] == "done":
+            if (
+                newest is None
+                or newest["reason"] == "done"
+                or newest["status"] == "cancelled"
+            ):
                 return None
             row = self._conn.execute(
                 "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
                 " AND reason IN ('turn', 'parked', 'escalated')"
+                " AND run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
                 " ORDER BY saved_at DESC, seq DESC LIMIT 1",
                 (card_id, workflow),
             ).fetchone()
