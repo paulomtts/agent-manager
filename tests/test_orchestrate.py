@@ -264,6 +264,98 @@ def test_an_unnamed_primary_falls_back_to_the_first_escalation_in_census_order()
     ]
 
 
+def test_controlled_payload_on_pause_lists_stopped_completed_pending_and_the_resume_hint():
+    """C12: every stopped lane in census order, every lane's completed work in
+    wave order (not only a stopped lane's), the pending stories, and the hint."""
+    parked = orchestrate.LaneOutcome(
+        kind="stopped",
+        story="A",
+        level=0,
+        subtask="a2",
+        before_phase="implement",
+        completed=("a1",),
+    )
+    finished = orchestrate.LaneOutcome(kind="done", story="B", level=0, completed=("b1", "b2"))
+    between = orchestrate.LaneOutcome(kind="stopped", story="C", level=1, subtask="c1")
+    queued = orchestrate.LaneOutcome(kind="pending", story="D", level=1)
+
+    payload = orchestrate.controlled_payload(
+        "run-1", "pause", [parked, finished, between, queued], ["gate warned"]
+    )
+
+    assert payload == {
+        "paused": True,
+        "run_id": "run-1",
+        "stopped": [
+            {"story": "A", "subtask": "a2", "before_phase": "implement"},
+            {"story": "C", "subtask": "c1", "before_phase": None},
+        ],
+        "completed": ["a1", "b1", "b2"],
+        "pending": ["D"],
+        "warnings": ["gate warned"],
+        "resume": "am resume run-1",
+    }
+    assert list(payload) == [
+        "paused", "run_id", "stopped", "completed", "pending", "warnings", "resume"
+    ]
+
+
+def test_controlled_payload_on_cancel_has_no_resume_and_lists_escalations_primary_first():
+    first = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", failed_phase="review", detail="x"
+    )
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="B", level=0, subtask="b1", before_phase="implement"
+    )
+    primary = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="C",
+        level=0,
+        subtask="c1",
+        failed_phase="verify",
+        detail="y",
+        primary=True,
+    )
+
+    payload = orchestrate.controlled_payload("run-1", "cancel", [first, parked, primary], [])
+
+    assert payload == {
+        "cancelled": True,
+        "run_id": "run-1",
+        "stopped": [{"story": "B", "subtask": "b1", "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "escalations": [
+            {"level": 0, "story": "C", "subtask": "c1", "failed_phase": "verify", "detail": "y"},
+            {"level": 0, "story": "A", "subtask": "a1", "failed_phase": "review", "detail": "x"},
+        ],
+    }
+    assert list(payload) == [
+        "cancelled", "run_id", "stopped", "completed", "pending", "warnings", "escalations"
+    ]
+    # No outcome marked primary: the first in census order leads, as in `escalated_payload`.
+    unmarked = orchestrate.controlled_payload(
+        "run-1", "cancel", [first, replace(primary, primary=False)], []
+    )
+    assert [row["story"] for row in unmarked["escalations"]] == ["A", "C"]
+
+
+def test_controlled_payload_on_cancel_without_escalations_omits_escalations_and_never_has_escalated():
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="A", level=0, subtask="a1", before_phase="plan"
+    )
+
+    for command in ("pause", "cancel"):
+        payload = orchestrate.controlled_payload("run-1", command, [parked], [])
+        assert "escalated" not in payload
+        assert "failed_phase" not in payload
+    cancelled = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
+    assert "escalations" not in cancelled
+    assert "resume" not in cancelled
+    assert "paused" not in cancelled
+
+
 def test_the_integrated_payload_is_plain_json_with_the_worktree_as_a_string():
     outcome = integration.IntegrateSuccess(
         branch="m3-integrate",

@@ -53,7 +53,7 @@ import grafo
 
 from agent_manager import bases, board, census, cli, dag, integration, models
 from agent_manager.runtime import engine as runtime_engine
-from agent_manager.runtime.stop import StopSignal
+from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import Checkpoint, Store, load_run, open_db
 from agent_manager.workflow import integrate as integrate_workflow
@@ -135,6 +135,63 @@ class LaneStopped(Exception):
         self.outcome = outcome
 
 
+def stopped_row(outcome: LaneOutcome) -> dict[str, Any]:
+    """A stopped lane as every payload lists it: the subtask it stopped at and
+    the phase it parked before (None when it stopped between subtasks)."""
+    return {
+        "story": outcome.story,
+        "subtask": outcome.subtask,
+        "before_phase": outcome.before_phase,
+    }
+
+
+def escalation_row(outcome: LaneOutcome) -> dict[str, Any]:
+    """An escalated lane as `also_escalated` and `escalations` list it."""
+    return {
+        "level": outcome.level,
+        "story": outcome.story,
+        "subtask": outcome.subtask,
+        "failed_phase": outcome.failed_phase,
+        "detail": outcome.detail,
+    }
+
+
+def controlled_payload(
+    run_id: str,
+    command: Command,
+    outcomes: Sequence[LaneOutcome],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The result of a run a control ended (live control C12), outcomes in wave order.
+
+    `paused` or `cancelled`, then `run_id`, `stopped` (census order, the
+    `escalated_payload` row shape), `completed` (every lane's finished
+    subtasks, wave order), `pending` (story ids) and `warnings`. A pause adds
+    the `resume` hint. A cancel adds `escalations` only when a lane really
+    escalated, primary first -- the outcome marked `primary`, else the first
+    in census order. There is never an `escalated` key: a control is not an
+    escalation.
+    """
+    payload: dict[str, Any] = {
+        "paused" if command == "pause" else "cancelled": True,
+        "run_id": run_id,
+        "stopped": [stopped_row(outcome) for outcome in outcomes if outcome.kind == "stopped"],
+        "completed": [subtask for outcome in outcomes for subtask in outcome.completed],
+        "pending": [outcome.story for outcome in outcomes if outcome.kind == "pending"],
+        "warnings": warnings,
+    }
+    if command == "pause":
+        payload["resume"] = f"am resume {run_id}"
+        return payload
+    escalations = [outcome for outcome in outcomes if outcome.kind == "escalated"]
+    if escalations:
+        primary = next((outcome for outcome in escalations if outcome.primary), escalations[0])
+        payload["escalations"] = [escalation_row(primary)] + [
+            escalation_row(outcome) for outcome in escalations if outcome is not primary
+        ]
+    return payload
+
+
 def escalated_payload(
     run_id: str,
     primary_story: str | None,
@@ -166,22 +223,8 @@ def escalated_payload(
         "detail": primary.detail,
         "warnings": warnings,
     }
-    also = [
-        {
-            "level": outcome.level,
-            "story": outcome.story,
-            "subtask": outcome.subtask,
-            "failed_phase": outcome.failed_phase,
-            "detail": outcome.detail,
-        }
-        for outcome in escalations
-        if outcome is not primary
-    ]
-    stopped = [
-        {"story": outcome.story, "subtask": outcome.subtask, "before_phase": outcome.before_phase}
-        for outcome in outcomes
-        if outcome.kind == "stopped"
-    ]
+    also = [escalation_row(outcome) for outcome in escalations if outcome is not primary]
+    stopped = [stopped_row(outcome) for outcome in outcomes if outcome.kind == "stopped"]
     completed = [
         subtask
         for outcome in outcomes
