@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import os
 import socket
+import sqlite3
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
+from types import TracebackType
+from uuid import uuid4
 
-from agent_manager.store import LeaseRow
+from agent_manager.store import LeaseRow, Store
 
 CONTROL_POLL_SECONDS = 1.0
 """How often `watch` looks for new requests."""
@@ -65,3 +69,74 @@ def lease_is_live(
     if (now - lease.heartbeat_at).total_seconds() > stale_after:
         return False
     return lease.host != host or alive(lease.pid)
+
+
+class Lease:
+    """This process's claim on a run, held for the length of a `with` block (C2).
+
+    `__enter__` takes a fresh token and starts a daemon heartbeat thread. That
+    thread waits on a `threading.Event`, never `time.sleep`, so `__exit__`
+    wakes it at once. `__exit__` stops and joins it and releases the lease on
+    any exit, and never swallows the exception.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        heartbeat: float = HEARTBEAT_SECONDS,
+        clock: Callable[[], datetime] = _utcnow,
+        pid: int | None = None,
+        host: str | None = None,
+    ) -> None:
+        self._store = store
+        self._heartbeat = heartbeat
+        self._clock = clock
+        self._pid = pid
+        self._host = host
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.token = ""
+
+    def __enter__(self) -> Lease:
+        self.token = uuid4().hex
+        self._store.acquire_lease(
+            token=self.token,
+            pid=os.getpid() if self._pid is None else self._pid,
+            host=socket.gethostname() if self._host is None else self._host,
+            now=self._clock(),
+        )
+        self._stopped.clear()
+        self._thread = threading.Thread(
+            target=self._keep_beating, name="am-lease-heartbeat", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        self._store.release_lease(self.token)
+
+    def beat(self) -> None:
+        """Move this lease's heartbeat to `clock()`."""
+        self._store.beat(self.token, self._clock())
+
+    def close_window(self) -> None:
+        """Stop accepting control requests under this lease."""
+        self._store.close_window(self.token)
+
+    def _keep_beating(self) -> None:
+        while not self._stopped.wait(self._heartbeat):
+            try:
+                self.beat()
+            except sqlite3.OperationalError:
+                # A second process holds the database; the next beat retries.
+                continue

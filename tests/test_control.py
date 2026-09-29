@@ -16,9 +16,12 @@ defined here, after `tests/test_store.py`'s `repo` + `Store.open` pattern.
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 import socket
+import sqlite3
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
@@ -94,6 +97,10 @@ def _requests(root: Path) -> list[store.ControlRow]:
         return store.control_requests(conn, RUN_ID)
     finally:
         conn.close()
+
+
+def _heartbeat_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD]
 
 
 class Wrapped:
@@ -198,3 +205,88 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
     theirs = {name.split(".")[0] for name in modules} - {"agent_manager"}
     assert ours <= {"agent_manager.store", "agent_manager.runtime.stop"}
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
+
+
+# -- Lease ----------------------------------------------------------------------
+
+
+def test_lease_acquires_on_enter_and_releases_on_exit(root, opened_store):
+    with control.Lease(opened_store, pid=4242, host="build-box", clock=lambda: _at(0)) as lease:
+        assert len(lease.token) == 32 and int(lease.token, 16) >= 0
+        assert _read_lease(root) == store.LeaseRow(
+            run_id=RUN_ID,
+            token=lease.token,
+            pid=4242,
+            host="build-box",
+            acquired_at=_at(0),
+            heartbeat_at=_at(0),
+            accepting=True,
+        )
+    assert _read_lease(root) is None
+    assert _heartbeat_threads() == []
+
+    with control.Lease(opened_store) as mine:
+        row = _read_lease(root)
+        assert row is not None
+        assert (row.pid, row.host) == (os.getpid(), socket.gethostname())
+    assert mine.token != lease.token
+
+
+def test_lease_releases_on_exception_and_reraises(root, opened_store):
+    with pytest.raises(RuntimeError, match="inside the run"):
+        with control.Lease(opened_store):
+            assert _read_lease(root) is not None
+            raise RuntimeError("inside the run")
+    assert _read_lease(root) is None
+    assert _heartbeat_threads() == []
+
+
+def test_lease_close_window_stops_accepting(root, opened_store):
+    with control.Lease(opened_store) as lease:
+        lease.close_window()
+        row = _read_lease(root)
+        assert row is not None and row.accepting is False
+
+
+def test_lease_heartbeat_thread_beats_and_stops_on_exit(root, opened_store):
+    ticks = itertools.count()
+    beaten = threading.Event()
+
+    class Counting(Wrapped):
+        beats = 0
+
+        def beat(self, token: str, now: datetime) -> None:
+            self._inner.beat(token, now)
+            Counting.beats += 1
+            if Counting.beats >= 2:
+                beaten.set()
+
+    with control.Lease(Counting(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
+        assert beaten.wait(timeout=5.0)
+        threads = _heartbeat_threads()
+        assert len(threads) == 1 and threads[0].daemon
+        row = _read_lease(root)
+        assert row is not None and row.heartbeat_at > row.acquired_at == _at(0)
+    assert not threads[0].is_alive()
+    assert _read_lease(root) is None
+
+
+def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
+    # Review Focus 3: a locked database must not kill the heartbeat thread.
+    recovered = threading.Event()
+
+    class Flaky(Wrapped):
+        calls = 0
+
+        def beat(self, token: str, now: datetime) -> None:
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            self._inner.beat(token, now)
+            recovered.set()
+
+    ticks = itertools.count()
+    with control.Lease(Flaky(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
+        assert recovered.wait(timeout=5.0)
+        assert _heartbeat_threads()[0].is_alive()
+    assert _heartbeat_threads() == []
