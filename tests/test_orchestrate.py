@@ -37,7 +37,7 @@ from typing import Any
 import grafo
 import pytest
 
-from agent_manager import bases, board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager import bases, board, census, cli, control, dag, integration, models, orchestrate, paths
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -4106,3 +4106,179 @@ def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monke
 
     with pytest.raises(ValueError, match="branch prefix"):
         orchestrate.run_milestone("Milestone 3", repo_dir=tmp_path, base_branch="main")
+
+
+# ── live control: pause and cancel (card 0e1edf31) ──────────────────────────
+
+
+def _lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+    """The run's lease row, read over a second connection as `am status` would."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.read_lease(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _send(project: Path, run_id: str, command: str, *, token: str | None = None) -> None:
+    """Insert one request over a second connection, as `am pause`/`am cancel` would.
+
+    Addressed to the live lease's token unless `token` names another one.
+    """
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        if token is None:
+            lease = store_module.read_lease(conn, run_id)
+            assert lease is not None and lease.accepting, "no open lease to address the request to"
+            token = lease.token
+        with store_module.immediate(conn):
+            store_module.add_control(
+                conn, run_id, lease=token, command=command, requested_at=STARTED_AT
+            )
+    finally:
+        conn.close()
+
+
+def _controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.control_requests(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _send_then_await_stop(project: Path, run_id: str, command: str) -> Gate:
+    """A gate that sends `command` mid-subtask, then holds the call until the
+    run's watcher has applied it and the stop fired (no sleeps)."""
+
+    async def gate(stop: StopSignal | None) -> None:
+        _send(project, run_id, command)
+        await _await_stop(stop)
+
+    return gate
+
+
+@requires_git
+@requires_brd
+def test_a_run_with_no_control_integrates_as_before(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+
+    result = _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result["done"] is True, result
+    assert not {"paused", "cancelled", "control", "escalated"} & set(result)
+    assert len(integrate_recorder.calls) == 1
+    assert _statuses(_load(project, run_id)) == {"run": "done", story_a: "done", a1: "done"}
+    assert _controls(project, run_id) == []
+
+
+@requires_git
+@requires_brd
+def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
+    project, integrate_recorder, monkeypatch
+):
+    """C2/C4: the lease is held through Integrate with its window already
+    closed (`controlled` closed it when the tree returned), and gone once
+    `run_milestone` returns."""
+    shape = _milestone(project, {"A": 1})
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    seen: list[store_module.LeaseRow | None] = []
+
+    def integrate_reading_the_lease(**kwargs: Any) -> Any:
+        seen.append(_lease(project, run_id))
+        return integrate_recorder(**kwargs)
+
+    monkeypatch.setattr(integration, "integrate_milestone", integrate_reading_the_lease)
+
+    result = _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    assert result["done"] is True, result
+    (during,) = seen
+    assert during is not None, "no lease was held while Integrate ran"
+    assert during.run_id == run_id
+    assert during.accepting is False
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_crash_after_a_pause_propagates_releases_the_lease_and_records_neither(
+    project, integrate_recorder
+):
+    """Error paths: a lane's BaseException leaves the run as §7 says; the
+    pause already applied does not turn it into `stopped`, and the lease is
+    released on the way out."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(
+        outcomes={a1: _LaneKilled("the manager died after the pause")},
+        gates={a1: _send_then_await_stop(project, run_id, "pause")},
+    )
+
+    with pytest.raises(_LaneKilled):
+        _run_or_fail_if_it_hangs(
+            lambda: _run(project, shape["milestone"], driver, control_interval=0)
+        )
+
+    assert _load(project, run_id).status == "started"
+    assert _lease(project, run_id) is None
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_refused_resume_never_takes_a_lease(project, monkeypatch):
+    """Error paths: `resume_checkpoints`' refusal comes before `record_run`,
+    so before the lease."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",), digest="saved-under-another-task")
+
+    def never(self: control.Lease) -> control.Lease:
+        pytest.fail("a lease was taken before the resume was refused")
+
+    monkeypatch.setattr(control.Lease, "__enter__", never)
+
+    with pytest.raises(cli.CheckpointMismatchError):
+        _resume(project, run_id, CheckpointDriver(), control_interval=0)
+
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_request_left_under_an_earlier_lease_never_reaches_the_resumed_run(project):
+    """C4: a pause addressed to the interrupted process's token stays unhandled
+    and the resumed run, under its own fresh lease, finishes clean."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _send(project, run_id, "pause", token="the-interrupted-processes-lease")
+
+    result = _resume(project, run_id, FakeDriver(), control_interval=0)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [row.handled_at for row in _controls(project, run_id)] == [None]
+    assert _load(project, run_id).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_that_raises_still_releases_the_lease(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    integrate_recorder.outcome = RuntimeError("integrate blew up")
+
+    with pytest.raises(RuntimeError, match="integrate blew up"):
+        _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    assert _lease(project, run_id) is None
+    assert _load(project, run_id).status == "started"

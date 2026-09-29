@@ -1,7 +1,7 @@
 """The milestone runner (orchestration addendum O6; supervisor-tree T1-T6).
 
 `run_milestone` drives every remaining subtask of one milestone through the
-shared per-subtask driver (O4) on one event loop: `asyncio.run(supervise(...))`.
+shared per-subtask driver (O4) on one event loop: `asyncio.run(control.controlled(supervise(...)))`, under the run's `control.Lease`.
 `supervise` builds one `grafo.Node` per census story -- done ones included,
 every one with `timeout=None` -- and one edge per in-milestone blocker, so a
 `grafo.TreeExecutor` starts each story the moment all its blockers succeeded.
@@ -51,7 +51,7 @@ from typing import Any, Literal, Protocol
 
 import grafo
 
-from agent_manager import bases, board, census, cli, dag, integration, models
+from agent_manager import bases, board, census, cli, control, dag, integration, models
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
@@ -1297,13 +1297,15 @@ def run_milestone(
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
     resume_run_id: str | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
     `milestone` is a card id or a title needle (O1). Everything that can refuse,
-    `max_concurrent < 1` included, runs before the store is opened. Then one
-    `milestone` run is recorded with its whole plan `pending`, and
-    `asyncio.run(supervise(...))` runs every story the moment its blockers
+    `max_concurrent < 1` included, runs before the store is opened. Then the
+    run takes a `control.Lease`, one `milestone` run is recorded
+    with its whole plan `pending`, and `asyncio.run(control.controlled(
+    supervise(...)))` runs every story the moment its blockers
     succeeded, at most `max_concurrent` at once. A subtask already `done` on
     the board is never driven, but its branch still anchors the next
     subtask's base. The card and its story are read fresh from the board
@@ -1336,6 +1338,13 @@ def run_milestone(
     recorded `started` (`reopen_rows`), and `supervise` runs under the same
     run id with each open checkpoint handed on as `resume_from`. Every
     payload gains `resumed: true`; `completed` is this invocation's work.
+
+    The lease (live control C2) is held from `record_run` to the run's final
+    record, and released before the store closes; every refusal comes before
+    it. `controlled` polls this lease's `am pause`/`am cancel` requests every
+    `control_interval` seconds and applies them to the run's one
+    `StopSignal`; it closes the window and sweeps once more when the tree
+    returns, before Integrate. A crash propagates and releases the lease.
     """
     if resume_run_id is None:
         if max_concurrent < 1:
@@ -1389,90 +1398,101 @@ def run_milestone(
             # workflow, comes before the first write and before git is touched.
             checkpoints = resume_checkpoints(store, cards)
             refresh_git(root)
-        store.record_run(run_record)
-        rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
-        if resumed is not None:
-            # After `record_plan`, which records every planned row `pending`.
-            reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
-        warnings = reroll_stale_stories(plan.stories, root)
-        completed: list[str] = []
-        stop = StopSignal()
+        # After every refusal, and inside the `try` that closes the store, so
+        # the lease is released before `store.close()` (live control C2).
+        with control.Lease(store) as lease:
+            store.record_run(run_record)
+            rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
+            if resumed is not None:
+                # After `record_plan`, which records every planned row `pending`.
+                reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
+            warnings = reroll_stale_stories(plan.stories, root)
+            completed: list[str] = []
+            stop = StopSignal()
 
-        outcomes = asyncio.run(
-            supervise(
-                supervisor_plan(
-                    plan.stories,
-                    levels,
-                    rows,
-                    branch_prefix=branch_prefix,
-                    base_branch=base_branch,
-                    checkpoints=checkpoints,
-                ),
-                store=store,
-                run_id=run_id,
-                root=root,
-                drive=drive,
+            # `controlled` only ever parks the run through `stop` (C3); it
+            # closes the window and runs a final sweep before returning.
+            outcomes = asyncio.run(
+                control.controlled(
+                    supervise(
+                        supervisor_plan(
+                            plan.stories,
+                            levels,
+                            rows,
+                            branch_prefix=branch_prefix,
+                            base_branch=base_branch,
+                            checkpoints=checkpoints,
+                        ),
+                        store=store,
+                        run_id=run_id,
+                        root=root,
+                        drive=drive,
+                        commands=list(commands),
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        max_concurrent=max_concurrent,
+                        stop=stop,
+                    ),
+                    store=store,
+                    stop=stop,
+                    lease=lease,
+                    interval=control_interval,
+                )
+            )
+            # Wave order, census order within a wave, never finish order.
+            for outcome in outcomes:
+                completed.extend(outcome.completed)
+                warnings.extend(outcome.warnings)
+            built_bases = bases_payload(outcomes)
+
+            def report(payload: dict[str, Any]) -> dict[str, Any]:
+                """Every payload shape on the same terms: `bases` when built, `resumed` on a resume."""
+                if resumed is not None:
+                    payload["resumed"] = True
+                return with_bases(payload, built_bases)
+
+            if any(outcome.kind == "escalated" for outcome in outcomes):
+                store.record_run(run_record.model_copy(update={"status": "escalated"}))
+                primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
+                return report(escalated_payload(run_id, primary, outcomes, warnings))
+
+            # Integrate (addendum I6) runs only once every lane finished clean,
+            # and also when there was nothing left to drive: that is how a relaunch
+            # retries an Integrate escalation, and why a finished milestone's
+            # relaunch is a no-op merge. Read as `integration.integrate_milestone`
+            # so a test can replace it, as `driver` is. It needs a factory for a
+            # conflicting tip; `None` is production's, read off `cli` now.
+            factory = cli.default_runner_factory if runner_factory is None else runner_factory
+            outcome = integration.integrate_milestone(
+                stories=plan.stories,
+                repo_dir=root,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
                 commands=list(commands),
                 allow_no_verification=allow_no_verification,
-                runner_factory=runner_factory,
-                max_concurrent=max_concurrent,
-                stop=stop,
+                store=store,
+                run_id=run_id,
+                runner_factory=factory,
             )
-        )
-        # Wave order, census order within a wave, never finish order.
-        for outcome in outcomes:
-            completed.extend(outcome.completed)
-            warnings.extend(outcome.warnings)
-        built_bases = bases_payload(outcomes)
+            if isinstance(outcome, integration.IntegrateEscalation):
+                # The branch and worktree stay exactly as Integrate left them (I5).
+                store.record_run(run_record.model_copy(update={"status": "escalated"}))
+                return report(integrate_escalated_payload(run_id, outcome, warnings))
 
-        def report(payload: dict[str, Any]) -> dict[str, Any]:
-            """Every payload shape on the same terms: `bases` when built, `resumed` on a resume."""
-            if resumed is not None:
-                payload["resumed"] = True
-            return with_bases(payload, built_bases)
-
-        if any(outcome.kind == "escalated" for outcome in outcomes):
-            store.record_run(run_record.model_copy(update={"status": "escalated"}))
-            primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-            return report(escalated_payload(run_id, primary, outcomes, warnings))
-
-        # Integrate (addendum I6) runs only once every lane finished clean,
-        # and also when there was nothing left to drive: that is how a relaunch
-        # retries an Integrate escalation, and why a finished milestone's
-        # relaunch is a no-op merge. Read as `integration.integrate_milestone`
-        # so a test can replace it, as `driver` is. It needs a factory for a
-        # conflicting tip; `None` is production's, read off `cli` now.
-        factory = cli.default_runner_factory if runner_factory is None else runner_factory
-        outcome = integration.integrate_milestone(
-            stories=plan.stories,
-            repo_dir=root,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            commands=list(commands),
-            allow_no_verification=allow_no_verification,
-            store=store,
-            run_id=run_id,
-            runner_factory=factory,
-        )
-        if isinstance(outcome, integration.IntegrateEscalation):
-            # The branch and worktree stay exactly as Integrate left them (I5).
-            store.record_run(run_record.model_copy(update={"status": "escalated"}))
-            return report(integrate_escalated_payload(run_id, outcome, warnings))
-
-        store.record_run(run_record.model_copy(update={"status": "done"}))
-        return report(
-            {
-                "done": True,
-                "run_id": run_id,
-                "levels": [
-                    {"level": index, "stories": [planned.story.id for planned in level]}
-                    for index, level in enumerate(levels)
-                ],
-                "completed": completed,
-                "tips": tips,
-                "warnings": warnings,
-                "integrated": integrated_payload(outcome),
-            }
-        )
+            store.record_run(run_record.model_copy(update={"status": "done"}))
+            return report(
+                {
+                    "done": True,
+                    "run_id": run_id,
+                    "levels": [
+                        {"level": index, "stories": [planned.story.id for planned in level]}
+                        for index, level in enumerate(levels)
+                    ],
+                    "completed": completed,
+                    "tips": tips,
+                    "warnings": warnings,
+                    "integrated": integrated_payload(outcome),
+                }
+            )
     finally:
         store.close()
