@@ -105,11 +105,13 @@ class Lease:
 
     def __enter__(self) -> Lease:
         self.token = uuid4().hex
-        self._store.acquire_lease(
+        self._store.take_lease(
             token=self.token,
             pid=os.getpid() if self._pid is None else self._pid,
             host=socket.gethostname() if self._host is None else self._host,
             now=self._clock(),
+            # M9's unconditional replace; ec7ae954 injects `lease_is_live` and claims.
+            is_live=lambda row: False,
         )
         self._stopped.clear()
         self._thread = threading.Thread(

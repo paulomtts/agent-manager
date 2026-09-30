@@ -14,7 +14,10 @@ writes nowhere real.
 import dataclasses
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import get_args
@@ -2121,7 +2124,9 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
 def test_a_lease_is_touched_only_through_its_own_token(repo):
     st = store.Store.open(repo, RUN_ID)
     try:
-        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        lease = st.take_lease(
+            token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
+        ).lease
         assert lease == store.LeaseRow(
             run_id=RUN_ID,
             token="t1",
@@ -2163,10 +2168,14 @@ def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched
     other = store.Store.open(repo, OTHER_RUN_ID)
     st = store.Store.open(repo, RUN_ID)
     try:
-        theirs = other.acquire_lease(token="new", pid=7, host="h", now=_at(0))
-        st.acquire_lease(token="old", pid=1, host="h", now=_at(0))
+        theirs = other.take_lease(
+            token="new", pid=7, host="h", now=_at(0), is_live=lambda row: False
+        ).lease
+        st.take_lease(token="old", pid=1, host="h", now=_at(0), is_live=lambda row: False)
         st.close_window("old")
-        fresh = st.acquire_lease(token="new", pid=2, host="h", now=_at(5))
+        fresh = st.take_lease(
+            token="new", pid=2, host="h", now=_at(5), is_live=lambda row: False
+        ).lease
 
         st.beat("old", _at(9))
         st.close_window("old")
@@ -2391,7 +2400,9 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     other = store.open_db(repo)
     try:
         st.record_run(_run_with_status(repo, RUN_ID, "cancelled"))
-        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        lease = st.take_lease(
+            token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
+        ).lease
         with store.immediate(other):
             store.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
         controls = store.control_requests(other, RUN_ID)
@@ -2589,3 +2600,232 @@ def test_held_claims_lists_one_tokens_keys_in_key_order(repo):
     assert nobody == []
     with pytest.raises(dataclasses.FrozenInstanceError):
         rows[0].token = "other"  # type: ignore[misc]
+
+
+@pytest.fixture
+def stores(repo) -> Iterator[Callable[..., store.Store]]:
+    """Open any number of `Store`s on `repo`, each on its own connection; close them all."""
+    opened: list[store.Store] = []
+
+    def open_store(run_id: str = RUN_ID) -> store.Store:
+        st = store.Store.open(repo, run_id)
+        opened.append(st)
+        return st
+
+    yield open_store
+    for st in opened:
+        st.close()
+
+
+def test_take_lease_refuses_a_live_foreign_lease(stores):
+    mine = stores()
+    mine.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    other = stores()
+
+    with pytest.raises(store.LeaseHeldError) as caught:
+        other.take_lease(
+            token="t2", pid=2, host="h", now=_at(1), is_live=_alive, claims=["card:x"]
+        )
+
+    assert caught.value.holder.token == "t1"
+    kept = store.read_lease(other.connection, RUN_ID)
+    assert kept is not None and kept.token == "t1"
+    assert store.held_claims(other.connection, RUN_ID, "t2") == []
+    assert other.connection.in_transaction is False
+
+
+def test_take_lease_takes_over_a_dead_lease(stores):
+    first = stores()
+    first.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    first.close_window("t1")
+    second = stores()
+
+    took = second.take_lease(token="t2", pid=2, host="h2", now=_at(5), is_live=_dead)
+
+    assert took.displaced is not None and took.displaced.token == "t1"
+    assert took.lease == store.LeaseRow(
+        run_id=RUN_ID,
+        token="t2",
+        pid=2,
+        host="h2",
+        acquired_at=_at(5),
+        heartbeat_at=_at(5),
+        accepting=True,
+    )
+    assert store.read_lease(second.connection, RUN_ID) == took.lease
+    # A run nobody ever leased has nothing to displace.
+    fresh = stores(OTHER_RUN_ID).take_lease(
+        token="t3", pid=3, host="h", now=_at(0), is_live=_alive
+    )
+    assert fresh.displaced is None
+
+
+def test_claims_are_all_or_nothing(stores):
+    a, b = stores("run-a"), stores("run-b")
+    a.take_lease(token="ta", pid=1, host="h", now=_at(0), is_live=_alive, claims=["card:x"])
+
+    with pytest.raises(store.ClaimHeldError) as caught:
+        b.take_lease(
+            token="tb",
+            pid=2,
+            host="h",
+            now=_at(0),
+            is_live=_alive,
+            claims=["card:y", "card:x"],
+        )
+
+    assert caught.value.key == "card:x"
+    assert (caught.value.holder.run_id, caught.value.holder.token) == ("run-a", "ta")
+    assert store.read_lease(b.connection, "run-b") is None
+    assert store.held_claims(b.connection, "run-b", "tb") == []  # card:y rolled back too
+    assert [claim.key for claim in store.held_claims(b.connection, "run-a", "ta")] == [
+        "card:x"
+    ]
+    assert b.connection.in_transaction is False
+
+
+def test_a_claim_under_a_dead_lease_is_overwritten(stores):
+    a, b = stores("run-a"), stores("run-b")
+    a.take_lease(token="ta", pid=1, host="h", now=_at(0), is_live=_alive, claims=["card:x"])
+
+    took = b.take_lease(
+        token="tb", pid=2, host="h", now=_at(3), is_live=_dead, claims=["card:x"]
+    )
+
+    assert took.displaced is None
+    assert store.held_claims(b.connection, "run-b", "tb") == [
+        store.ClaimRow(key="card:x", run_id="run-b", token="tb", claimed_at=_at(3))
+    ]
+    assert store.held_claims(b.connection, "run-a", "ta") == []
+    # run-a's lease row itself is not b's to touch.
+    other_lease = store.read_lease(b.connection, "run-a")
+    assert other_lease is not None and other_lease.token == "ta"
+
+
+def test_a_resume_rewrites_its_own_runs_claims(stores):
+    keys = ["card:x", "branch:m10/x"]
+    first = stores()
+    first.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive, claims=keys)
+    second = stores()
+
+    took = second.take_lease(
+        token="t2", pid=2, host="h", now=_at(4), is_live=_dead, claims=keys
+    )
+
+    assert took.displaced is not None and took.displaced.token == "t1"
+    assert [
+        (claim.key, claim.token, claim.claimed_at)
+        for claim in store.held_claims(second.connection, RUN_ID, "t2")
+    ] == [("branch:m10/x", "t2", _at(4)), ("card:x", "t2", _at(4))]
+    assert store.held_claims(second.connection, RUN_ID, "t1") == []
+
+
+def test_release_claims_deletes_only_its_own_tokens_rows(repo, stores):
+    a, b = stores("run-a"), stores("run-b")
+    a.take_lease(
+        token="ta", pid=1, host="h", now=_at(0), is_live=_alive, claims=["card:x", "card:y"]
+    )
+    b.take_lease(token="tb", pid=2, host="h", now=_at(0), is_live=_alive, claims=["card:z"])
+    _plant_claim(repo, "card:q", run_id="run-a", token="stale")
+
+    a.release_claims("nobody")
+    a.release_claims("ta")
+
+    conn = a.connection
+    assert store.held_claims(conn, "run-a", "ta") == []
+    assert [claim.key for claim in store.held_claims(conn, "run-a", "stale")] == ["card:q"]
+    assert [claim.key for claim in store.held_claims(conn, "run-b", "tb")] == ["card:z"]
+    # The lease itself is `release_lease`'s business.
+    kept = store.read_lease(conn, "run-a")
+    assert kept is not None and kept.token == "ta"
+    assert conn.in_transaction is False
+
+
+def test_the_new_owner_continues_the_sequence(repo, stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()  # opened, its seq cached at 0, before a's write
+    assert a.record_run(_run(repo)).seq == 1  # a writes seq 1 while still the owner
+
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    assert b.record_run(_run_with_status(repo, RUN_ID, "stopped")).seq == 2
+    assert [line.seq for line in b.journal.read()] == [1, 2]
+
+
+_TAKER = """
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from agent_manager import store
+
+root, run_id, token = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+st = store.Store.open(root, run_id)
+try:
+    print("ready", flush=True)
+    if sys.stdin.readline().strip() != "go":
+        raise SystemExit("no go")
+    try:
+        st.take_lease(
+            token=token,
+            pid=0,
+            host="h",
+            now=datetime.now(timezone.utc),
+            is_live=lambda row: row.token != "t0",
+        )
+    except store.LeaseHeldError as error:
+        print(type(error).__name__, flush=True)
+    else:
+        print("took", flush=True)
+finally:
+    st.close()
+"""
+
+
+def _taker(repo: Path, run_id: str, token: str) -> "subprocess.Popen[str]":
+    """A real second process that takes `run_id`'s lease once told "go" on stdin.
+
+    It inherits `XDG_DATA_HOME`/`HOME` from the `repo` fixture's monkeypatched
+    environment, so it opens the same projection and journal as this test.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", _TAKER, str(repo), run_id, token],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("attempt", range(20))
+def test_two_processes_taking_one_dead_lease_leave_exactly_one_owner(repo, attempt):
+    _plant_lease(repo, RUN_ID, token="t0")  # a dead owner: t0 is dead to both children
+    tokens = ("ta", "tb")
+    children = [_taker(repo, RUN_ID, token) for token in tokens]
+    try:
+        for child in children:
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == "ready"
+        for child in children:
+            assert child.stdin is not None
+            child.stdin.write("go\n")
+            child.stdin.flush()
+        outcomes = {
+            token: child.communicate(timeout=60)[0].strip()
+            for token, child in zip(tokens, children)
+        }
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    assert sorted(outcomes.values()) == ["LeaseHeldError", "took"]
+    assert [child.returncode for child in children] == [0, 0]
+    winner = next(token for token, outcome in outcomes.items() if outcome == "took")
+    conn = store.open_db(repo)
+    try:
+        lease = store.read_lease(conn, RUN_ID)
+    finally:
+        conn.close()
+    assert lease is not None and lease.token == winner

@@ -212,9 +212,11 @@ class JournalLine(BaseModel):
 class Journal:
     """Append-only JSONL log for one run: the truth the projection is built from.
 
-    One process writes a given run (P2), and its threads share one `Journal`.
-    The highest sequence number on disk is read once, when the journal is
-    opened, and cached; a lock serialises appends from those threads.
+    The threads of the process that holds a run's lease share one `Journal`.
+    The highest sequence number on disk is read when the journal is opened and
+    cached; a lock serialises appends from those threads. A process that takes
+    the lease over calls `reseek`, because the previous owner may have appended
+    after this journal was opened (multi-process X4).
     """
 
     def __init__(self, run_id: str) -> None:
@@ -228,6 +230,16 @@ class Journal:
         if not self.path.exists():
             return 0
         return max((line.seq for line in self.read()), default=0)
+
+    def reseek(self) -> None:
+        """Re-read the highest `seq` on disk into the cache, under the append lock.
+
+        Called by `Store.take_lease` once the lease is this process's: a stuck
+        previous owner may have appended lines after `__init__` cached `_seq`,
+        and the new owner must number its first line after them.
+        """
+        with self._lock:
+            self._seq = self.last_seq()
 
     def read(self) -> list[JournalLine]:
         """Every line, validated, in sequence order.
@@ -853,6 +865,8 @@ class Store:
         self._conn = conn
         self._journal = journal
         self._lock = threading.RLock()
+        self._token: str | None = None
+        self._in_fence = False
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
@@ -1249,37 +1263,91 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
-    # -- leases and control requests -------------------------------------------
+    # -- leases, claims and control requests -----------------------------------
     #
-    # A row-only table outside the journal (live control C2): nothing here
-    # calls `self._journal`, and `rebuild_from_journal` leaves the rows alone.
-    # Every method but `acquire_lease` touches only the row whose token
-    # matches; any other token is a silent no-op.
+    # Row-only tables outside the journal (live control C2, multi-process X5):
+    # nothing here calls `self._journal`, and `rebuild_from_journal` leaves the
+    # rows alone. `take_lease` is the only check-and-set; every other method
+    # touches only the rows whose token matches, and any other token is a
+    # silent no-op.
 
-    def acquire_lease(
-        self, *, token: str, pid: int, host: str, now: datetime
-    ) -> LeaseRow:
-        """Claim this run under `token`, replacing any earlier claim, window open."""
+    def take_lease(
+        self,
+        *,
+        token: str,
+        pid: int,
+        host: str,
+        now: datetime,
+        is_live: Callable[[LeaseRow], bool],
+        claims: Iterable[str] = (),
+    ) -> LeaseTake:
+        """Take this run's lease under `token`, with every key of `claims`, atomically.
+
+        One `BEGIN IMMEDIATE` transaction (X5, X9): a live lease under another
+        token raises `LeaseHeldError`; otherwise that row, or `None`, is the
+        `displaced` one. Then the first key another run holds under a live
+        lease raises `ClaimHeldError`. Only then are the lease (window open)
+        and every claim upserted and committed. Any raise rolls all of it
+        back and leaves the bound token as it was. On success the store is
+        bound to `token` and the journal re-reads its highest `seq`.
+        """
+        keys = list(claims)
+        with self._lock:
+            with immediate(self._conn):
+                current = read_lease(self._conn, self.run_id)
+                if current is not None and current.token != token and is_live(current):
+                    raise LeaseHeldError(current)
+                conflicts = claim_conflicts(
+                    self._conn, keys, is_live=is_live, run_id=self.run_id
+                )
+                if conflicts:
+                    key, holder = conflicts[0]
+                    raise ClaimHeldError(key, holder)
+                self._conn.execute(
+                    "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                    " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                    " ON CONFLICT(run_id) DO UPDATE SET"
+                    " token=excluded.token, pid=excluded.pid, host=excluded.host,"
+                    " acquired_at=excluded.acquired_at,"
+                    " heartbeat_at=excluded.heartbeat_at, accepting=1",
+                    (self.run_id, token, pid, host, _iso(now), _iso(now)),
+                )
+                for key in keys:
+                    self._conn.execute(
+                        "INSERT INTO run_claims (key, run_id, token, claimed_at)"
+                        " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                        " run_id=excluded.run_id, token=excluded.token,"
+                        " claimed_at=excluded.claimed_at",
+                        (key, self.run_id, token, _iso(now)),
+                    )
+            self.bind_lease(token)
+            self._journal.reseek()
+            return LeaseTake(
+                lease=LeaseRow(
+                    run_id=self.run_id,
+                    token=token,
+                    pid=pid,
+                    host=host,
+                    acquired_at=now,
+                    heartbeat_at=now,
+                    accepting=True,
+                ),
+                displaced=current,
+            )
+
+    def bind_lease(self, token: str | None) -> None:
+        """Fence this store's run writes to `token`, or stop fencing with `None`."""
+        with self._lock:
+            self._token = token
+
+    def release_claims(self, token: str) -> None:
+        """Delete this run's claims held under `token`; any other row is untouched."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
-                " ON CONFLICT(run_id) DO UPDATE SET"
-                " token=excluded.token, pid=excluded.pid, host=excluded.host,"
-                " acquired_at=excluded.acquired_at,"
-                " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                (self.run_id, token, pid, host, _iso(now), _iso(now)),
+                "DELETE FROM run_claims WHERE run_id = ? AND token = ?",
+                (self.run_id, token),
             )
             self._conn.commit()
-            return LeaseRow(
-                run_id=self.run_id,
-                token=token,
-                pid=pid,
-                host=host,
-                acquired_at=now,
-                heartbeat_at=now,
-                accepting=True,
-            )
 
     def beat(self, token: str, now: datetime) -> None:
         """Move the heartbeat of this run's lease, if `token` still holds it."""
