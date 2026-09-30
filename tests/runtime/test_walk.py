@@ -10,8 +10,15 @@ transitive import through `runtime/__init__.py`.
 
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
+
+from agent_manager import models, store as store_module
+from agent_manager.runtime import walk
+from agent_manager.runtime.errors import EngineError
+from agent_manager.workflow.phases import AgentPhase, Step
 
 PYGENTS_FREE = (
     "agent_manager.runtime",
@@ -38,3 +45,115 @@ def test_importing_the_module_loads_no_pygents(module):
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "", f"{module} loaded {done.stdout.strip()}"
+
+
+# ── gate evaluation (architecture-cleanup S3) ────────────────────────────────
+#
+# Unit tier per design §14: the evaluator and GateVerdict are pure. The
+# run_one_step tests use a real temp Store and a fixed clock -- the same
+# lightweight setup tests/test_engine.py's run_one_step tests use -- with no
+# git and no harness.
+
+RUN_ID = "run-2026-09-30-01"
+STORY_ID = "223f9973"
+CARD_ID = "4957ac74"
+FIXED = datetime(2026, 9, 30, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def store(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    yield opened
+    opened.close()
+
+
+def _subtask() -> models.SubtaskRun:
+    return models.SubtaskRun(
+        card_id=CARD_ID,
+        branch=f"m13/task-add-gateverdict-and-the-{CARD_ID}",
+        base_branch="m13/story-base",
+        status="started",
+        worktree_path=Path("/w"),
+    )
+
+
+def _phase_rows(opened) -> list[tuple[str | None, str, str | None]]:
+    return [
+        (line.phase, line.payload["status"], line.payload["detail"])
+        for line in opened.journal.read()
+        if line.event == "phase_upsert"
+    ]
+
+
+def _run(store, step: Step, table=None):
+    return walk.run_one_step(
+        phase=step,
+        table={} if table is None else table,
+        store=store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        clock=lambda: FIXED,
+    )
+
+
+def test_run_one_step_records_a_raising_gate_as_failed_with_the_error_text(store):
+    """Spec test 7: walk's own outcome for a broken gate (S3 §6)."""
+    later_calls: list[object] = []
+
+    def exploding(result):
+        raise ValueError("gate blew up")
+
+    def later(result):
+        later_calls.append(result)
+
+    outcome = _run(store, Step("verify", lambda: {"ok": True}, gates=(exploding, later)))
+
+    assert outcome.ok is False
+    assert outcome.detail == "ValueError: gate blew up"
+    assert later_calls == []
+    assert _phase_rows(store) == [
+        ("verify", "started", None),
+        ("verify", "failed", "ValueError: gate blew up"),
+    ]
+
+
+def test_run_one_step_records_a_non_mapping_gate_as_failed_engine_error(store):
+    """Review Focus 1: the recorded text is today's, byte for byte."""
+
+    def chatty(result):
+        return 3
+
+    outcome = _run(store, Step("a", lambda: {}, gates=(chatty,)))
+
+    expected = (
+        "EngineError: phase 'a', function 'chatty': gate returned int; a gate "
+        "returns None to pass or a mapping verdict to fail, and anything else "
+        "would be read as a pass by accident"
+    )
+    assert outcome.ok is False
+    assert outcome.detail == expected
+    assert _phase_rows(store)[-1] == ("a", "failed", expected)
+
+
+def test_run_one_step_keeps_earlier_warnings_when_a_later_gate_breaks(store):
+    """Review Focus 2: warnings gathered before the break stay on the outcome."""
+
+    def first(result):
+        return {"warn": "one"}
+
+    def second(result):
+        return {"warn": "two"}
+
+    def exploding(result):
+        raise OSError("disk went away")
+
+    outcome = _run(store, Step("a", lambda: {}, gates=(first, second, exploding)))
+
+    assert outcome.ok is False
+    assert outcome.detail == "OSError: disk went away"
+    assert outcome.warnings == [
+        "phase 'a' gate 'first' warned: one",
+        "phase 'a' gate 'second' warned: two",
+    ]
