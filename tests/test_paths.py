@@ -125,6 +125,88 @@ def test_project_db_path_accepts_a_root_that_does_not_exist(monkeypatch, tmp_pat
     assert not absent.exists()
 
 
+def test_project_lock_path_sits_beside_the_project_db(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    digest = hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()
+    result = paths.project_lock_path(project_root, "board")
+    assert result.name == f"{digest}.board.lock"
+    assert result.parent == paths.project_db_path(project_root).parent
+    assert result.parent == tmp_path / "data" / "agent-manager" / "projects"
+
+
+def test_project_lock_path_creates_the_projects_dir_but_not_the_file(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    projects_dir = tmp_path / "data" / "agent-manager" / "projects"
+    assert not projects_dir.exists()
+
+    result = paths.project_lock_path(project_root, "git")
+    assert projects_dir.is_dir()
+    assert not result.exists()
+
+
+def test_project_lock_path_differs_per_name_and_per_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+
+    assert paths.project_lock_path(repo1, "board") != paths.project_lock_path(
+        repo1, "git"
+    )
+    assert paths.project_lock_path(repo1, "git") != paths.project_lock_path(
+        repo2, "git"
+    )
+    assert paths.project_lock_path(repo1, "git") == paths.project_lock_path(
+        repo1, "git"
+    )
+
+
+def test_project_lock_path_resolves_relative_and_symlinked_spelling(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(project_root)
+    monkeypatch.chdir(tmp_path)
+
+    expected = paths.project_lock_path(project_root, "git")
+    assert paths.project_lock_path(Path("repo"), "git") == expected
+    assert paths.project_lock_path(project_root / "sub" / "..", "git") == expected
+    assert paths.project_lock_path(link, "git") == expected
+
+
+def test_project_lock_path_digest_matches_a_fixed_vector(monkeypatch, tmp_path):
+    # Same literal digest as test_project_db_path_digest_matches_a_fixed_vector:
+    # the lock file and the database share one digest per root.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    assert paths.project_lock_path(Path("/nonexistent/repo"), "git").name == (
+        "5b6e8e2d129e523b4fabf8a73dcdc18cb7f253565385fd9e6e5c0888ba865785.git.lock"
+    )
+
+
+def test_project_lock_path_never_lands_inside_the_repository(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    monkeypatch.chdir(project_root)
+
+    result = paths.project_lock_path(project_root, "board")
+    assert result.is_relative_to(paths.data_dir())
+    assert not result.is_relative_to(project_root)
+    assert list(project_root.iterdir()) == []
+
+
 def test_run_dir_is_under_data_dir_and_exists(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     result = paths.run_dir("run-abc")

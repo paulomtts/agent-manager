@@ -19,11 +19,29 @@ def data_dir() -> Path:
     return result
 
 
+def _project_digest(root: Path) -> str:
+    """The per-project file stem: sha256 of the resolved root path."""
+    return hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+
+
+def _projects_dir() -> Path:
+    result = data_dir() / "projects"
+    result.mkdir(parents=True, exist_ok=True)
+    return result
+
+
 def project_db_path(root: Path) -> Path:
-    projects_dir = data_dir() / "projects"
-    projects_dir.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
-    return projects_dir / f"{digest}.db"
+    return _projects_dir() / f"{_project_digest(root)}.db"
+
+
+def project_lock_path(root: Path, name: str) -> Path:
+    """The file a process-wide lock named `name` flocks for the project at `root`.
+
+    Beside the project's database under the data directory, never inside the
+    repository. Creates the `projects` directory; the lock file itself is created
+    by whoever first opens it (`locks.ProcessLock`).
+    """
+    return _projects_dir() / f"{_project_digest(root)}.{name}.lock"
 
 
 def run_dir(run_id: str) -> Path:
