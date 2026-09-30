@@ -6613,6 +6613,33 @@ def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
 
 @requires_git
 @requires_brd
+def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
+    project, cards, monkeypatch
+):
+    """The resume preflight is read-only and runs before `Store.open` (X5):
+    `run_lease` alone would refuse too, but only after opening the store."""
+    run_id = _crash_pygents(project, cards, "plan")
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=now - timedelta(seconds=7),
+        claims=(key,),
+    )
+    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _resume_card_run(project, run_id, _Forbidden("runner_factory"))
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
 def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     project, cards, monkeypatch
 ):
