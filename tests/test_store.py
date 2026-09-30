@@ -2943,3 +2943,37 @@ def test_a_bound_store_commits_each_write_inside_its_fence(repo, stores):
     ]
     assert (first.seq, second.seq) == (0, 1)
     assert seqs == [0, 1]
+
+
+def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, stores):
+    # The fence makes the delete and every rewrite one transaction: a rewrite
+    # the database refuses must not leave the run's rows deleted.
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    _record_full_run(st, repo)
+
+    saboteur = store.open_db(repo)
+    try:
+        saboteur.execute(
+            "CREATE TRIGGER refuse_stories BEFORE INSERT ON stories"
+            " BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        )
+        saboteur.commit()
+    finally:
+        saboteur.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        st.rebuild_from_journal(RUN_ID)
+    assert st.connection.in_transaction is False
+
+    reader = store.open_db(repo)
+    try:
+        assert store.run_status(reader, RUN_ID) == "started"
+        projected = store.load_run(reader, RUN_ID)
+    finally:
+        reader.close()
+    assert projected is not None
+    assert [subtask.card_id for subtask in projected.stories[0].subtasks] == [
+        "fdebc746",
+        "ef248597",
+    ]
