@@ -790,6 +790,19 @@ def drive_subtask(
     )
 
 
+def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
+    """The run row's status after a `task` walk (live control C6, C11).
+
+    A cancel closes the run for good whatever the walk ended as, so it wins
+    even over an escalation. A pause changes nothing: the walk already parked
+    as `stopped`, and an escalation it met stays `escalated`. The story and
+    subtask rows always keep `summary.status`.
+    """
+    if stop.requested == "cancel":
+        return "cancelled"
+    return summary.status
+
+
 def run_card(
     card_id: str,
     *,
@@ -800,6 +813,7 @@ def run_card(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
@@ -807,6 +821,13 @@ def run_card(
     a run id exists (so a bad card leaves no run directory), and the run, story
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
+
+    Live control (C11): from the `started` rows through the final ones the run
+    holds a `control.Lease`, and the walk runs under `control.controlled`,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request`. A pause parks the walk before its next
+    phase (`stopped`, resumable); a cancel parks it the same way and records
+    the run `cancelled` (`card_run_status`). No control cancels a running phase.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -848,30 +869,45 @@ def run_card(
             status="started",
             worktree_path=worktree,
         )
-        store.record_run(run_record)
-        store.record_story(story)
-        store.record_subtask(story.card_id, subtask)
+        # Inside the `try` that closes the store, so the lease is released
+        # before `store.close()` on every exit, a raising walk included (C2).
+        with control.Lease(store) as lease:
+            store.record_run(run_record)
+            store.record_story(story)
+            store.record_subtask(story.card_id, subtask)
 
-        drive = drive_subtask(
-            store=store,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-        )
-        summary = drive.summary
+            stop = StopSignal()
+            # `controlled` only ever parks the walk through `stop` (C3); it
+            # closes the window and runs a final sweep before returning.
+            drive = asyncio.run(
+                control.controlled(
+                    drive_subtask_async(
+                        store=store,
+                        run_id=run_id,
+                        card=card,
+                        parent=parent,
+                        subtask=subtask,
+                        repo_dir=root,
+                        commands=commands,
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                    ),
+                    store=store,
+                    stop=stop,
+                    lease=lease,
+                    interval=control_interval,
+                )
+            )
+            summary = drive.summary
+            run_status = card_run_status(summary, stop)
 
-        store.record_run(run_record.model_copy(update={"status": summary.status}))
-        store.record_story(story.model_copy(update={"status": summary.status}))
-        store.record_subtask(
-            story.card_id, subtask.model_copy(update={"status": summary.status})
-        )
+            store.record_run(run_record.model_copy(update={"status": run_status}))
+            store.record_story(story.model_copy(update={"status": summary.status}))
+            store.record_subtask(
+                story.card_id, subtask.model_copy(update={"status": summary.status})
+            )
 
-        warnings = drive.warnings
         return {
             "run_id": run_id,
             "card_id": card.id,
@@ -879,11 +915,11 @@ def run_card(
             "branch": branch,
             "base_branch": base_branch,
             "worktree": str(worktree),
-            "status": summary.status,
+            "status": run_status,
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": warnings,
+            "warnings": drive.warnings,
         }
     finally:
         store.close()
