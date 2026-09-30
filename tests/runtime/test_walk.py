@@ -8,6 +8,7 @@ runtime conftest imports it), and a static scan of one file would miss a
 transitive import through `runtime/__init__.py`.
 """
 
+import functools
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -363,3 +364,32 @@ def test_run_one_step_sends_a_broken_verdict_through_the_catch_all(store, monkey
     assert outcome.ok is False
     assert outcome.detail == "KeyError: 'gone'"
     assert _phase_rows(store)[-1] == ("a", "failed", "KeyError: 'gone'")
+
+
+# ── moved from tests/test_dispatch.py when dispatch's copy was deleted (S3) ──
+
+
+def test_a_reserved_key_is_not_overwritten_by_a_same_named_phase():
+    values = walk.gate_values({"worktree": Path("/repo/wt")}, "worktree", {"created": True})
+
+    assert values["worktree"] == Path("/repo/wt")
+    assert values["result"] == {"created": True}
+    assert "worktree" in walk.RESERVED_CONTEXT_KEYS
+
+
+def _blocking_gate(result, blocked):
+    return {"blocked": blocked}
+
+
+def test_a_callable_gate_without_a_name_is_named_by_its_repr():
+    # A functools.partial has no __name__; the display name falls back to repr.
+    gate = functools.partial(_blocking_gate, blocked="x")
+    name = repr(gate)
+    phase = AgentPhase("explore", "explorer", (), None, gates=(gate,))
+
+    verdict = walk.evaluate_gates(
+        phase, walk.gate_values({}, "explore", {"summary": "ok"}), []
+    )
+
+    assert verdict.kind == "fail"
+    assert verdict.detail["message"] == f"phase 'explore' gate {name!r} failed: blocked=x"

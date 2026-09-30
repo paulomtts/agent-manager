@@ -30,7 +30,6 @@ from agent_manager import (
 )
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
-from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
 from agent_manager.runtime import bridge
@@ -478,22 +477,6 @@ def _agentic(*gates, **overrides) -> phases.Workflow:
 
 def _workflow(document, functions: dict[str, object]) -> phases.Workflow:
     return document(functions)
-
-
-def test_the_result_is_bound_under_both_result_and_the_phase_name():
-    values = dispatch.gate_values({"card": CARD}, "explore", {"summary": "ok"})
-
-    assert values["result"] == {"summary": "ok"}
-    assert values["explore"] == {"summary": "ok"}
-    assert values["card"] == CARD
-
-
-def test_a_reserved_key_is_not_overwritten_by_a_same_named_phase():
-    values = dispatch.gate_values({"worktree": Path("/repo/wt")}, "worktree", {"created": True})
-
-    assert values["worktree"] == Path("/repo/wt")
-    assert values["result"] == {"created": True}
-    assert "worktree" in RESERVED_CONTEXT_KEYS
 
 
 def _model_phase(*gates, **overrides) -> phases.AgentPhase:
