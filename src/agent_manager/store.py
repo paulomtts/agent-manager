@@ -932,9 +932,8 @@ class Store:
     # across its whole body: the journal line is appended first and the row
     # written second (§9), with no other record able to land in between. A
     # store whose lease was lost raises `LeaseLostError` before appending. If
-    # the row write raises, the line stays on disk and the exception
-    # propagates unchanged.
-    # the exception propagates unchanged and the `with` block releases the lock.
+    # the row write raises, the line stays on disk, the exception propagates
+    # unchanged and the `with` block releases the lock.
 
     def record_run(self, run: models.Run) -> JournalLine:
         with self._lock, self._fenced():
