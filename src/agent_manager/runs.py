@@ -1,10 +1,13 @@
 """Run helpers with no Typer in them (architecture cleanup, decision S1).
 
 `cli.py` composes and renders; the plain pieces a run needs -- where its repo
-is, what it is called, where its worktree goes, how a runner is made, and which
-gate parameters it binds -- live here so the modules downstream of `cli` can
-reach them without importing the Typer app. `cli.py` re-exports every name
-defined here, so `cli.X is runs.X`. This module never imports `cli`.
+is, what it is called, where its worktree goes, how a runner is made, which
+gate parameters it binds, and how an interrupted run is picked back up (which
+subtask is resumable, which attempts were orphaned, which checkpoint a relaunch
+continues from, and the refusals those raise) -- live here so the modules
+downstream of `cli` can reach them without importing the Typer app. `cli.py`
+re-exports every name defined here, so `cli.X is runs.X`. This module never
+imports `cli`.
 """
 
 from collections.abc import Sequence
@@ -12,10 +15,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent_manager import dag
+from agent_manager import dag, models, store as store_module
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import AgentPhaseRunner
 from agent_manager.store import Store
+from agent_manager.workflow import task as task_workflow
 
 RUN_ID_TIME_FORMAT = "%Y%m%dT%H%M%SZ"
 """Sortable, path-safe, second-resolution UTC. Run ids are directory names."""
@@ -137,3 +141,88 @@ def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[s
         "caller_provided": False,
         "provided_verification": None,
     }
+
+
+def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRun]:
+    """The one subtask of `run` that was in flight, or a refusal naming why not.
+
+    Pure over the tree `load_run` assembled, like `find_subtask`: which subtask
+    is resumable is a question about recorded state, and answering it before any
+    store is opened is what keeps a refusal from minting a run directory.
+
+    Exactly one `started` or `stopped` subtask is the resumable shape. A
+    `stopped` subtask (addendum P4) was parked between phases, and its parked
+    checkpoint is what `resume` continues from (card 02890d5d). Zero means the
+    run finished, escalated or never started, and the statuses are listed
+    because the fix differs for each; an escalation is `retry`'s, never this
+    command's. More than one is a milestone-shaped run: this command drives one
+    subtask the way `run --card` does, and choosing between them would leave the
+    rest recorded in flight with nothing driving them.
+    """
+    resumable = ("started", "stopped")
+    wanted = " or ".join(repr(status) for status in resumable)
+    in_flight = [
+        (story, subtask)
+        for story in run.stories
+        for subtask in story.subtasks
+        if subtask.status in resumable
+    ]
+    if len(in_flight) == 1:
+        return in_flight[0]
+    if not in_flight:
+        found = (
+            ", ".join(
+                f"{subtask.card_id}={subtask.status}"
+                for story in run.stories
+                for subtask in story.subtasks
+            )
+            or "no subtask at all"
+        )
+        raise NotResumableError(
+            f"run {run.id!r} has no subtask recorded {wanted}, so there is no work"
+            f" in flight to pick up (found: {found});"
+            f" `agent-manager status {run.id}` shows the run as it stands"
+        )
+    cards = ", ".join(subtask.card_id for _story, subtask in in_flight)
+    raise NotResumableError(
+        f"run {run.id!r} has {len(in_flight)} subtasks recorded {wanted} ({cards}),"
+        " and `resume` drives one subtask the way `run --card` does;"
+        f" `agent-manager status {run.id}` shows all of them"
+    )
+
+
+def orphan_attempts(
+    subtask: models.SubtaskRun,
+) -> list[tuple[models.PhaseRun, models.Attempt]]:
+    """Every attempt recorded `started` with no terminal event, in tree order.
+
+    §9's "in-flight attempt": the manager was killed between the row that says a
+    dispatch began and the row that says how it ended. The owning phase comes
+    back with it because `Store.record_attempt` is keyed by phase name and an
+    `Attempt` carries no back-reference, exactly as `find_subtask` returns the
+    owning story.
+    """
+    return [
+        (phase, attempt)
+        for phase in subtask.phases
+        for attempt in phase.attempts
+        if attempt.status == "started"
+    ]
+
+
+def continuable_checkpoint(
+    store: Store, card_id: str
+) -> store_module.Checkpoint | None:
+    """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
+
+    `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row
+    saved under another digest, or one holding no turn (a phase escalation,
+    see `runtime_engine.pending_phase`), is `None` too: a relaunch never
+    refuses, it starts the card from its first phase (card 02890d5d).
+    """
+    found = store.latest_open_checkpoint(card_id, task_workflow.TASK.name)
+    if found is None or found.digest != task_workflow.TASK.digest():
+        return None
+    if runtime_engine.pending_phase(found) is None:
+        return None
+    return found

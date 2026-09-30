@@ -57,9 +57,12 @@ from agent_manager.runs import (
     RepoDirError,
     RunnerFactory,
     UnknownRunError,
+    continuable_checkpoint,
     gate_context,
     mint_run_id,
+    orphan_attempts,
     resolve_repo_dir,
+    select_resumable,
     worktree_for,
 )
 
@@ -402,73 +405,6 @@ def logs_payload(
     }
 
 
-def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRun]:
-    """The one subtask of `run` that was in flight, or a refusal naming why not.
-
-    Pure over the tree `load_run` assembled, like `find_subtask`: which subtask
-    is resumable is a question about recorded state, and answering it before any
-    store is opened is what keeps a refusal from minting a run directory.
-
-    Exactly one `started` or `stopped` subtask is the resumable shape. A
-    `stopped` subtask (addendum P4) was parked between phases, and its parked
-    checkpoint is what `resume` continues from (card 02890d5d). Zero means the
-    run finished, escalated or never started, and the statuses are listed
-    because the fix differs for each; an escalation is `retry`'s, never this
-    command's. More than one is a milestone-shaped run: this command drives one
-    subtask the way `run --card` does, and choosing between them would leave the
-    rest recorded in flight with nothing driving them.
-    """
-    resumable = ("started", "stopped")
-    wanted = " or ".join(repr(status) for status in resumable)
-    in_flight = [
-        (story, subtask)
-        for story in run.stories
-        for subtask in story.subtasks
-        if subtask.status in resumable
-    ]
-    if len(in_flight) == 1:
-        return in_flight[0]
-    if not in_flight:
-        found = (
-            ", ".join(
-                f"{subtask.card_id}={subtask.status}"
-                for story in run.stories
-                for subtask in story.subtasks
-            )
-            or "no subtask at all"
-        )
-        raise NotResumableError(
-            f"run {run.id!r} has no subtask recorded {wanted}, so there is no work"
-            f" in flight to pick up (found: {found});"
-            f" `agent-manager status {run.id}` shows the run as it stands"
-        )
-    cards = ", ".join(subtask.card_id for _story, subtask in in_flight)
-    raise NotResumableError(
-        f"run {run.id!r} has {len(in_flight)} subtasks recorded {wanted} ({cards}),"
-        " and `resume` drives one subtask the way `run --card` does;"
-        f" `agent-manager status {run.id}` shows all of them"
-    )
-
-
-def orphan_attempts(
-    subtask: models.SubtaskRun,
-) -> list[tuple[models.PhaseRun, models.Attempt]]:
-    """Every attempt recorded `started` with no terminal event, in tree order.
-
-    §9's "in-flight attempt": the manager was killed between the row that says a
-    dispatch began and the row that says how it ended. The owning phase comes
-    back with it because `Store.record_attempt` is keyed by phase name and an
-    `Attempt` carries no back-reference, exactly as `find_subtask` returns the
-    owning story.
-    """
-    return [
-        (phase, attempt)
-        for phase in subtask.phases
-        for attempt in phase.attempts
-        if attempt.status == "started"
-    ]
-
-
 def checkpoint_resume_phase(
     checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
 ) -> str:
@@ -511,24 +447,6 @@ def checkpoint_resume_phase(
             " ended the walk; start a fresh run with `agent-manager run --card`"
         )
     return phase
-
-
-def continuable_checkpoint(
-    store: Store, card_id: str
-) -> store_module.Checkpoint | None:
-    """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
-
-    `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row
-    saved under another digest, or one holding no turn (a phase escalation,
-    see `runtime_engine.pending_phase`), is `None` too: a relaunch never
-    refuses, it starts the card from its first phase (card 02890d5d).
-    """
-    found = store.latest_open_checkpoint(card_id, task_workflow.TASK.name)
-    if found is None or found.digest != task_workflow.TASK.digest():
-        return None
-    if runtime_engine.pending_phase(found) is None:
-        return None
-    return found
 
 
 app = typer.Typer(

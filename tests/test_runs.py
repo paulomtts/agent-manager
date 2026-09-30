@@ -131,6 +131,9 @@ MOVED_NAMES = (
     "UnknownRunError",
     "NotResumableError",
     "CheckpointMismatchError",
+    "select_resumable",
+    "orphan_attempts",
+    "continuable_checkpoint",
 )
 
 
@@ -168,3 +171,10 @@ def test_resume_error_types_are_defined_in_runs():
         assert error_type.__module__ == "agent_manager.runs"
         assert issubclass(error_type, runs.CliError)
     assert issubclass(runs.CheckpointMismatchError, runtime_engine.CheckpointMismatch)
+
+
+def test_checkpoint_resume_phase_stays_in_cli():
+    from agent_manager import cli
+
+    assert cli.checkpoint_resume_phase.__module__ == "agent_manager.cli"
+    assert not hasattr(runs, "checkpoint_resume_phase")
