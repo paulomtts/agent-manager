@@ -37,6 +37,7 @@ from agent_manager import (
     dag,
     dispatch,
     integration,
+    locks,
     models,
     orchestrate,
     paths,
@@ -3198,8 +3199,11 @@ def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeyp
         cli.CliError("no milestone matches 'Milestone 3'"),
         board.BoardError("brd refused", argv=["brd", "tree"]),
         ValueError("not a card id: 'x'"),
+        # Spec X7: another process held a project lock past its timeout before
+        # the run started (e.g. `refresh_git`'s git lock).
+        locks.LockTimeoutError(Path("/data/projects/abc.git.lock"), 600.0),
     ],
-    ids=["CliError", "BoardError", "ValueError"],
+    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError"],
 )
 def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""
