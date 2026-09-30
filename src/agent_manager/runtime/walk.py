@@ -389,38 +389,6 @@ def evaluate_gates(
     return GateVerdict("pass", None)
 
 
-def _evaluate_gates(
-    phase: phase_model.Step,
-    values: Mapping[str, Any],
-    warnings: list[str],
-) -> None:
-    """Run every gate in order; append warnings, raise `_GateFailed` on a verdict."""
-    for gate in phase.gates:
-        name = _label(gate)
-        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
-        verdict = gate(**kwargs)
-        if verdict is None:
-            continue
-        if not isinstance(verdict, Mapping):
-            raise EngineError(
-                f"gate returned {type(verdict).__name__}; a gate returns None to pass "
-                "or a mapping verdict to fail, and anything else would be read as a "
-                "pass by accident",
-                phase=phase.name,
-                function=name,
-            )
-        if "warn" in verdict:
-            warnings.append(
-                f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
-            )
-            continue
-        raise _GateFailed(f"phase {phase.name!r} gate {name!r} failed: {_render_verdict(verdict)}")
-
-
-def _render_verdict(verdict: Mapping[str, Any]) -> str:
-    return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
-
-
 def _skip_target(phase: phase_model.Step, values: Mapping[str, Any]) -> str | None:
     """The phase to jump to, or `None` to fall through to the next one.
 
@@ -485,8 +453,15 @@ def run_one_step(
                 phase=phase.name,
                 function=label,
             )
-        _evaluate_gates(phase, _gate_values(table, phase.name, result), warnings)
-        skip_to = _skip_target(phase, _gate_values(table, phase.name, result))
+        verdict = evaluate_gates(phase, gate_values(table, phase.name, result), warnings)
+        if verdict.kind == "fail":
+            raise _GateFailed(verdict.detail["message"])
+        if verdict.kind == "broken":
+            # Re-raised into the catch-all below on purpose: it records
+            # `_render_error(error)`, the exact string a broken gate recorded
+            # before the evaluator was shared.
+            raise verdict.detail["error"]
+        skip_to = _skip_target(phase, gate_values(table, phase.name, result))
     except _GateFailed as failure:
         _record_phase(
             store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail

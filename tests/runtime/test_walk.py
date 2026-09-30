@@ -330,3 +330,36 @@ def test_evaluate_gates_does_not_swallow_a_base_exception():
 
     with pytest.raises(_Signal):
         walk.evaluate_gates(_step(signalling), {"result": {}}, [])
+
+
+def test_run_one_step_records_a_fail_verdict_with_its_message(store, monkeypatch):
+    """run_one_step takes its gate outcome from evaluate_gates, not a private copy."""
+    monkeypatch.setattr(
+        walk,
+        "evaluate_gates",
+        lambda phase, values, warnings: walk.GateVerdict(
+            "fail", {"gate": "g", "verdict": {"k": "v"}, "message": "from the verdict"}
+        ),
+    )
+
+    outcome = _run(store, Step("a", lambda: {}))
+
+    assert outcome.ok is False
+    assert outcome.detail == "from the verdict"
+    assert _phase_rows(store)[-1] == ("a", "failed", "from the verdict")
+
+
+def test_run_one_step_sends_a_broken_verdict_through_the_catch_all(store, monkeypatch):
+    monkeypatch.setattr(
+        walk,
+        "evaluate_gates",
+        lambda phase, values, warnings: walk.GateVerdict(
+            "broken", {"gate": "g", "reason": "raised", "error": KeyError("gone")}
+        ),
+    )
+
+    outcome = _run(store, Step("a", lambda: {}))
+
+    assert outcome.ok is False
+    assert outcome.detail == "KeyError: 'gone'"
+    assert _phase_rows(store)[-1] == ("a", "failed", "KeyError: 'gone'")
