@@ -35,6 +35,7 @@ from agent_manager import (
     dag,
     dispatch,
     models,
+    orchestrate,
     prompt,
     store as store_module,
 )
@@ -990,14 +991,9 @@ def run(
                 max_concurrent=lanes,
             )
         elif milestone is not None:
-            # `orchestrate` imports this module at load time and reads its names
-            # at call time, so importing it at the top of this module would be
-            # circular. By the time a command runs, both are fully loaded. Read
-            # as `orchestrate.run_milestone` so a test can patch it there. No
-            # runner_factory and no driver: production gets
+            # Read as `orchestrate.run_milestone` so a test can patch it there.
+            # No runner_factory and no driver: production gets
             # `default_runner_factory` and `drive_subtask`.
-            from agent_manager import orchestrate
-
             payload = orchestrate.run_milestone(
                 milestone,
                 repo_dir=repo_dir,
@@ -1360,11 +1356,7 @@ def resume_run(
             commands=commands,
             runner_factory=runner_factory,
         )
-    # Imported here for the reason `run` gives: `orchestrate` imports this
-    # module at load time. Read as `orchestrate.run_milestone` so a test can
-    # patch it there.
-    from agent_manager import orchestrate
-
+    # Read as `orchestrate.run_milestone` so a test can patch it there.
     if run.workflow == orchestrate.MILESTONE_WORKFLOW:
         return orchestrate.run_milestone(
             None,
