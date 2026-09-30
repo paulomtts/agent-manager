@@ -118,6 +118,7 @@ class ProcessLock:
                 f"{sorted(str(lock.path) for lock in held)}"
             )
         wait = self._timeout if timeout is None else timeout
+        start = time.monotonic()
         # `RLock.acquire(timeout=0)` raises, so a zero timeout is "try once".
         got = (
             self._local.acquire(timeout=wait)
@@ -127,8 +128,14 @@ class ProcessLock:
         if not got:
             raise LockTimeoutError(self.path, wait)
         if self._depth == 0:
+            # One budget for both layers: the flock gets what the in-process
+            # wait left over, and a timeout reports the caller's `wait`.
+            left = max(wait - (time.monotonic() - start), 0.0)
             try:
-                self._fd = _flock(self.path, wait)
+                self._fd = _flock(self.path, left)
+            except LockTimeoutError:
+                self._local.release()
+                raise LockTimeoutError(self.path, wait) from None
             except BaseException:
                 self._local.release()
                 raise

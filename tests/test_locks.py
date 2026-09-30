@@ -16,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,38 @@ def test_a_positive_timeout_retries_and_gets_the_lock_once_it_is_freed(
         assert not worker.is_alive()
         assert outcome == [None]
     finally:
+        _reap(child)
+
+
+def test_the_timeout_bounds_the_wait_across_both_layers(tmp_path):
+    # `local` is held by another thread for most of the timeout, and the flock
+    # by another process for all of it: the two waits share one budget.
+    local = threading.RLock()
+    held = threading.Event()
+    done = threading.Event()
+
+    def hog() -> None:
+        with local:
+            held.set()
+            threading.Event().wait(0.8)
+        done.set()
+
+    child = _holder(tmp_path, "git")
+    worker = threading.Thread(target=hog)
+    try:
+        lock = locks.project_lock(tmp_path, "git", local=local)
+        worker.start()
+        assert held.wait(timeout=30)
+        start = time.monotonic()
+        with pytest.raises(locks.LockTimeoutError) as caught:
+            lock.acquire(timeout=1.0)
+        elapsed = time.monotonic() - start
+        assert done.is_set()  # the in-process wait really was spent
+        assert elapsed < 1.5
+        assert caught.value.timeout == 1.0
+        assert _free_to_another_thread(local)
+    finally:
+        worker.join(timeout=30)
         _reap(child)
 
 
