@@ -3,8 +3,14 @@
 Placement follows design §14: `rollup.py` is a Steps component whose behaviour
 is brd reads and writes -- write the card, then walk its ancestors -- so it is
 exercised against a real temporary brd board over subprocess. brd is not
-mocked, and neither is any `board` function. The pure status computation
-(`stored_status`, `rollup_status`) gets plain unit tests at the end of the file.
+mocked, and neither is any `board` function, with one exception: the
+`fake_brd` fixture, used only by the process-lock tests (spec X7, card
+43043f10). Those tests must show that no `brd` call ran while another process
+held the board lock, and a real `brd` gives no way to observe from outside that
+an `update` has not yet started. The fake logs every call together with whether
+the release marker file existed and whether the board lock's flock was held at
+that moment. The pure status computation (`stored_status`, `rollup_status`)
+gets plain unit tests at the end of the file.
 
 `tests/steps/` has no `conftest.py` (`test_verify.py` defines its own
 `requires_git` marker locally), so the brd helpers are lifted from
@@ -17,14 +23,19 @@ run against the real board.
 """
 
 import json
+import os
 import shutil
 import subprocess
+import sys
+import textwrap
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from lockhelpers import _holder, _probe, _reap, _release
 
-from agent_manager import board
+from agent_manager import board, locks, paths
 from agent_manager.steps import rollup
 
 requires_brd = pytest.mark.skipif(
@@ -469,6 +480,258 @@ def test_concurrent_rollups_reach_done(temp_board):
                 story,
             )
         assert _brd_json(temp_board, "show", milestone)["status"] == "done", iteration
+
+
+# --- Process-wide board lock (spec X7, card 43043f10): a fake brd on PATH. ---
+
+FAKE_BRD_SOURCE = textwrap.dedent(
+    """
+    import fcntl, json, os, sys
+    from pathlib import Path
+
+    home = Path(os.environ["FAKE_BRD_HOME"])
+    state_file = home / "board.json"
+    argv = sys.argv[1:]
+
+    fd = os.open(os.environ["FAKE_BRD_LOCK"], os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        flock = "busy"
+    else:
+        flock = "free"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+    with (home / "calls.log").open("a") as log:
+        entry = {"argv": argv, "marker": (home / "released").exists(), "flock": flock}
+        print(json.dumps(entry), file=log)
+
+    cards = json.loads(state_file.read_text())
+
+    def card(card_id):
+        stored = cards[card_id]
+        return {
+            "id": card_id,
+            "title": stored["title"],
+            "status": stored["status"],
+            "parent_id": stored["parent_id"],
+        }
+
+    def node(card_id):
+        stored = cards[card_id]
+        return {
+            "id": card_id,
+            "title": stored["title"],
+            "status": stored["status"],
+            "children": [
+                node(child) for child, row in cards.items() if row["parent_id"] == card_id
+            ],
+        }
+
+    verb, card_id = argv[0], argv[1]
+    if card_id not in cards:
+        error = {"type": "CardNotFoundError", "message": f"no card {card_id}"}
+        print(json.dumps({"ok": False, "error": error}))
+        sys.exit(1)
+    if verb == "show":
+        data = card(card_id)
+    elif verb == "tree":
+        data = [node(card_id)]
+    elif verb == "update":
+        cards[card_id]["status"] = argv[3]
+        state_file.write_text(json.dumps(cards))
+        data = card(card_id)
+    else:
+        print(json.dumps({"ok": False, "error": {"type": "Usage", "message": verb}}))
+        sys.exit(2)
+    print(json.dumps({"ok": True, "data": data}))
+    """
+)
+
+CANNED_BOARD = {
+    "m1": {"title": "Milestone 10", "status": "todo", "parent_id": None},
+    "st1": {"title": "Process-wide locks", "status": "todo", "parent_id": "m1"},
+    "sub1": {"title": "Put board writes under the lock", "status": "todo", "parent_id": "st1"},
+    "sub2": {"title": "A sibling subtask", "status": "todo", "parent_id": "st1"},
+}
+"""sub1 going done rolls st1 and m1 up to in_progress: three writes, one walk."""
+
+
+@dataclass
+class FakeBrd:
+    """Handle on the `fake_brd` fixture: the project dir brd runs in, and its log."""
+
+    root: Path
+    home: Path
+
+    @property
+    def marker(self) -> Path:
+        """The release marker; outside `root`, so nothing lands in the project."""
+        return self.home / "released"
+
+    def calls(self) -> list[dict[str, object]]:
+        """Every logged call, in order: `argv`, `marker` (bool), `flock` ("busy"/"free")."""
+        log = self.home / "calls.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+@pytest.fixture
+def fake_brd(tmp_path, monkeypatch) -> FakeBrd:
+    """A `brd` on PATH answering from `CANNED_BOARD` and logging every call.
+
+    Each log line records whether the release marker existed and whether the
+    project's board flock was held (probed non-blocking) when that call ran.
+    The lock path is computed here, after tests/conftest.py pointed
+    XDG_DATA_HOME at this test's own directory, and handed to the script.
+    """
+    home = tmp_path / "fake-brd"
+    bin_dir = home / "bin"
+    bin_dir.mkdir(parents=True)
+    root = tmp_path / "project"
+    root.mkdir()
+    (home / "board.json").write_text(json.dumps(CANNED_BOARD))
+    script = bin_dir / "brd"
+    script.write_text(f"#!{sys.executable}\n{FAKE_BRD_SOURCE}")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_BRD_HOME", str(home))
+    monkeypatch.setenv("FAKE_BRD_LOCK", str(paths.project_lock_path(root, "board")))
+    return FakeBrd(root=root, home=home)
+
+
+def _signal_first_flock_miss(monkeypatch) -> threading.Event:
+    """An Event set the first time any ProcessLock finds its flock taken.
+
+    `locks._flock` asks `_backoff` for a delay only after a failed
+    non-blocking attempt, so the Event means "a thread is now waiting on
+    another process's flock" -- no timing involved.
+    """
+    progressed = threading.Event()
+    real_backoff = locks._backoff
+
+    def signalling_backoff(attempt: int) -> float:
+        progressed.set()
+        return real_backoff(attempt)
+
+    monkeypatch.setattr(locks, "_backoff", signalling_backoff)
+    return progressed
+
+
+def _roll_in_thread(
+    fake_brd: FakeBrd, card: str, status: str, done: threading.Event | None = None
+) -> tuple[threading.Thread, dict[str, object]]:
+    """Start `rollup.set_status` on a daemon thread; its outcome lands in the dict.
+
+    `done`, when given, is set as the call returns or raises.
+    """
+    outcome: dict[str, object] = {}
+
+    def roll() -> None:
+        try:
+            outcome["result"] = rollup.set_status(card, status, repo_dir=fake_brd.root)
+        except BaseException as exc:  # surfaced by the caller's assertions
+            outcome["error"] = exc
+        finally:
+            if done is not None:
+                done.set()
+
+    worker = threading.Thread(target=roll, daemon=True)
+    worker.start()
+    return worker, outcome
+
+
+def test_a_rollup_waits_for_another_process_holding_the_board_lock(
+    fake_brd, monkeypatch
+):
+    # `progressed` fires on the worker's first failed flock attempt (it is now
+    # waiting on the child) or, if nothing locks, when the worker finishes.
+    # Only then is the marker written and the child released, so a call logged
+    # without the marker can only have run while the child held the lock.
+    progressed = _signal_first_flock_miss(monkeypatch)
+    child = _holder(fake_brd.root, "board")
+    try:
+        worker, outcome = _roll_in_thread(fake_brd, "sub1", "done", done=progressed)
+        assert progressed.wait(timeout=30)
+        fake_brd.marker.touch()
+        _release(child)
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+    finally:
+        _reap(child)
+
+    assert "error" not in outcome, outcome
+    calls = fake_brd.calls()
+    assert calls
+    assert all(call["marker"] for call in calls), calls
+
+
+def test_a_nested_rollup_walk_runs_every_brd_call_under_one_flock(fake_brd):
+    # Three writes (sub1, st1, m1) re-enter the lock the walk already holds; a
+    # second flock on a new descriptor would block its own process forever,
+    # so the worker thread's join timeout is the deadlock detector.
+    worker, outcome = _roll_in_thread(fake_brd, "sub1", "done")
+    worker.join(timeout=60)
+    assert not worker.is_alive()
+
+    assert "error" not in outcome, outcome
+    assert outcome["result"] == {
+        "card": "sub1",
+        "status": "done",
+        "rolled_up": [
+            {"card": "st1", "status": "in_progress"},
+            {"card": "m1", "status": "in_progress"},
+        ],
+    }
+    calls = fake_brd.calls()
+    assert [call["argv"][0] for call in calls] == [
+        "update", "show", "tree", "update", "show", "tree", "update", "show",
+    ]
+    assert all(call["flock"] == "busy" for call in calls), calls
+    assert _probe(fake_brd.root, "board") == "free"
+    assert list(fake_brd.root.iterdir()) == []  # no lock file in the project
+
+
+def test_a_board_lock_timeout_propagates_before_any_brd_call(fake_brd, monkeypatch):
+    lock = board.write_lock(fake_brd.root)
+    monkeypatch.setattr(lock, "_timeout", 0)
+    child = _holder(fake_brd.root, "board")
+    try:
+        with pytest.raises(locks.LockTimeoutError):
+            rollup.set_status("sub1", "done", repo_dir=fake_brd.root)
+    finally:
+        _reap(child)
+
+    assert fake_brd.calls() == []
+    assert not _write_lock_held_by_another_thread()
+
+
+def test_a_failed_rollup_releases_the_board_flock(fake_brd):
+    with pytest.raises(board.BoardError):
+        rollup.set_status("no-such-card", "done", repo_dir=fake_brd.root)
+
+    assert _probe(fake_brd.root, "board") == "free"
+    assert not _write_lock_held_by_another_thread()
+
+
+def test_the_board_lock_is_one_per_resolved_repository_and_defaults_to_the_cwd(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    lock = board.write_lock(repo)
+
+    assert lock is locks.project_lock(repo, "board")
+    assert board.write_lock(repo / "x" / "..") is lock
+    assert board.write_lock(Path(f"{repo}{os.sep}")) is lock
+    assert lock.path == paths.project_lock_path(repo, "board")
+    assert lock._local is board.WRITE_LOCK
+    monkeypatch.chdir(repo)
+    assert board.write_lock(None) is lock
 
 
 # --- Pure-function tier (design §14): the status computation, no board. ---
