@@ -2064,3 +2064,362 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
         assert st.latest_open_checkpoint("card-a", "task") == opened
     finally:
         st.close()
+
+
+# -- run controls and leases -----------------------------------------------------
+#
+# Row-only tables outside the journal (live-control spec C1/C2), like
+# `checkpoints`. A "second process" is a second `store.open_db` connection.
+# Steps tier: real temp DB and journal, no harness.
+
+
+def test_the_control_tables_appear_on_an_existing_database(repo):
+    # A pre-M9 database: every table but the two new ones, with a row in it.
+    first = store.open_db(repo)
+    first.execute("DROP TABLE IF EXISTS run_controls")
+    first.execute("DROP TABLE IF EXISTS run_leases")
+    first.execute(
+        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+    )
+    first.commit()
+    first.close()
+
+    conn = store.open_db(repo)
+    try:
+        names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        controls = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_controls)").fetchall()
+        ]
+        leases = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_leases)").fetchall()
+        ]
+        kept = [row["id"] for row in conn.execute("SELECT id FROM runs").fetchall()]
+    finally:
+        conn.close()
+
+    assert {"run_controls", "run_leases"} <= names
+    assert controls == ["run_id", "seq", "lease", "command", "requested_at", "handled_at"]
+    assert leases == [
+        "run_id",
+        "token",
+        "pid",
+        "host",
+        "acquired_at",
+        "heartbeat_at",
+        "accepting",
+    ]
+    assert kept == [RUN_ID]
+
+
+def test_a_lease_is_touched_only_through_its_own_token(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        assert lease == store.LeaseRow(
+            run_id=RUN_ID,
+            token="t1",
+            pid=42,
+            host="h",
+            acquired_at=_at(0),
+            heartbeat_at=_at(0),
+            accepting=True,
+        )
+        assert store.read_lease(st.connection, RUN_ID) == lease
+
+        st.beat("other", _at(1))
+        st.close_window("other")
+        st.release_lease("other")
+        assert store.read_lease(st.connection, RUN_ID) == lease
+
+        st.beat("t1", _at(1))
+        st.close_window("t1")
+        row = store.read_lease(st.connection, RUN_ID)
+        assert row is not None
+        assert row.heartbeat_at == _at(1)
+        assert row.acquired_at == _at(0)
+        assert row.accepting is False
+
+        st.release_lease("t1")
+        assert store.read_lease(st.connection, RUN_ID) is None
+        assert store.read_lease(st.connection, "run-never-leased") is None
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        lease.token = "t2"  # type: ignore[misc]
+
+
+def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched(repo):
+    # Review Focus 3: a resumed run takes a new token; the old one is dead, and
+    # a token string shared with another run never reaches that run's row.
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        theirs = other.acquire_lease(token="new", pid=7, host="h", now=_at(0))
+        st.acquire_lease(token="old", pid=1, host="h", now=_at(0))
+        st.close_window("old")
+        fresh = st.acquire_lease(token="new", pid=2, host="h", now=_at(5))
+
+        st.beat("old", _at(9))
+        st.close_window("old")
+        st.release_lease("old")
+        assert store.read_lease(st.connection, RUN_ID) == fresh
+        assert fresh.accepting is True
+        assert (
+            st.connection.execute(
+                "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (RUN_ID,)
+            ).fetchone()[0]
+            == 1
+        )
+
+        st.release_lease("new")
+        assert store.read_lease(st.connection, RUN_ID) is None
+        assert store.read_lease(st.connection, OTHER_RUN_ID) == theirs
+    finally:
+        st.close()
+        other.close()
+
+
+def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
+    st = store.Store.open(repo, RUN_ID)
+    other = store.open_db(repo)
+    try:
+        with store.immediate(other):
+            first = store.add_control(
+                other, RUN_ID, lease="t1", command="pause", requested_at=_at(0)
+            )
+            second = store.add_control(
+                other, RUN_ID, lease="old", command="cancel", requested_at=_at(0)
+            )
+        assert first == store.ControlRow(
+            run_id=RUN_ID,
+            seq=0,
+            lease="t1",
+            command="pause",
+            requested_at=_at(0),
+            handled_at=None,
+        )
+        assert second.seq == 1
+
+        assert [row.command for row in st.pending_controls("t1")] == ["pause"]
+        assert st.pending_controls("t1") == [first]
+
+        st.mark_control_handled(0, _at(1))
+        assert st.pending_controls("t1") == []
+        assert [row.handled_at for row in store.control_requests(other, RUN_ID)] == [
+            _at(1),
+            None,
+        ]
+        assert [row.seq for row in store.control_requests(other, RUN_ID, lease="old")] == [1]
+        assert store.control_requests(other, "run-never-controlled") == []
+    finally:
+        other.close()
+        st.close()
+
+
+def test_control_seqs_are_numbered_and_handled_per_run(repo):
+    # Review Focus 4.
+    conn = store.open_db(repo)
+    try:
+        with store.immediate(conn):
+            a = store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+            b = store.add_control(
+                conn, OTHER_RUN_ID, lease="t9", command="cancel", requested_at=_at(0)
+            )
+            c = store.add_control(conn, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+        assert (a.seq, b.seq, c.seq) == (0, 0, 1)
+
+        st = store.Store.open(repo, RUN_ID)
+        try:
+            st.mark_control_handled(0, _at(2))
+        finally:
+            st.close()
+
+        assert [row.handled_at for row in store.control_requests(conn, RUN_ID)] == [_at(2), None]
+        assert [row.handled_at for row in store.control_requests(conn, OTHER_RUN_ID)] == [None]
+    finally:
+        conn.close()
+
+
+def test_immediate_rolls_back_on_error(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with store.immediate(conn):
+                store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+                raise RuntimeError("boom")
+
+        assert conn.in_transaction is False
+        assert store.control_requests(conn, RUN_ID) == []
+        # Nothing was spent: the next request is still seq 0.
+        with store.immediate(conn):
+            again = store.add_control(
+                conn, RUN_ID, lease="t1", command="pause", requested_at=_at(1)
+            )
+        assert again.seq == 0
+        assert len(store.control_requests(conn, RUN_ID)) == 1
+    finally:
+        conn.close()
+
+
+def test_an_unknown_command_is_refused_by_the_check(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            with store.immediate(conn):
+                store.add_control(
+                    conn, RUN_ID, lease="t1", command="resume", requested_at=_at(0)
+                )
+        assert conn.in_transaction is False
+        assert store.control_requests(conn, RUN_ID) == []
+    finally:
+        conn.close()
+
+
+def test_immediate_commits_an_implicit_transaction_first(repo):
+    # Review Focus 1: Python's legacy sqlite3 mode opens an implicit
+    # transaction on the first INSERT; `immediate` must not trip over it.
+    conn = store.open_db(repo)
+    try:
+        conn.execute(
+            "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+            " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (RUN_ID, "milestone", str(repo), "main", "m9/", "started", None, "{}"),
+        )
+        assert conn.in_transaction is True
+        with store.immediate(conn):
+            store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+    reader = store.open_db(repo)
+    try:
+        assert reader.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert [row.command for row in store.control_requests(reader, RUN_ID)] == ["pause"]
+    finally:
+        reader.close()
+
+
+def test_immediate_holds_the_write_lock_from_begin(repo):
+    # Review Focus 2: BEGIN IMMEDIATE, not a deferred BEGIN, so no second
+    # writer can land between reading MAX(seq) and the insert.
+    conn = store.open_db(repo)
+    blocker = sqlite3.connect(paths.project_db_path(repo), timeout=0)
+    try:
+        with store.immediate(conn):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.rollback()
+    finally:
+        blocker.close()
+        conn.close()
+
+
+def _run_with_status(repo: Path, run_id: str, status: str) -> models.Run:
+    return models.Run.model_validate({**_run(repo, run_id).model_dump(), "status": status})
+
+
+def _checkpoint_in_run(
+    repo: Path,
+    run_id: str,
+    status: str,
+    card_id: str,
+    *,
+    reason: str,
+    saved_at: datetime,
+    workflow: str = "task",
+) -> store.Checkpoint:
+    """Record `run_id` with `status`, then save one checkpoint of `card_id` under it."""
+    st = store.Store.open(repo, run_id)
+    try:
+        st.record_run(_run_with_status(repo, run_id, status))
+        return _save_checkpoint(st, card_id, reason=reason, workflow=workflow, saved_at=saved_at)
+    finally:
+        st.close()
+
+
+def test_a_cancelled_runs_checkpoints_are_never_open(repo):
+    # Review Focus 4 of the milestone plan.
+    _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r2", "cancelled", "c1", reason="parked", saved_at=_at(1))
+    unrelated = _checkpoint_in_run(
+        repo, "run-r3", "stopped", "c2", reason="parked", saved_at=_at(0)
+    )
+
+    st = store.Store.open(repo, "run-r4")
+    try:
+        closed = st.latest_open_checkpoint("c1", "task")
+        found = st.latest_open_checkpoint("c2", "task")
+    finally:
+        st.close()
+
+    assert closed is None
+    assert found == unrelated
+    assert found is not None and found.run_id == "run-r3"
+
+
+def test_latest_open_checkpoint_skips_a_cancelled_runs_row_when_it_is_not_newest(repo):
+    # Review Focus 5: the newest row is open (another workflow, a live run), so
+    # the card is not closed; the cancelled run's parked row is still skipped.
+    older = _checkpoint_in_run(repo, "run-r1", "stopped", "c3", reason="turn", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r2", "cancelled", "c3", reason="parked", saved_at=_at(1))
+    _checkpoint_in_run(
+        repo, "run-r3", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(2)
+    )
+
+    st = store.Store.open(repo, "run-r4")
+    try:
+        found = st.latest_open_checkpoint("c3", "task")
+    finally:
+        st.close()
+
+    assert found == older
+
+
+def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    other = store.open_db(repo)
+    try:
+        st.record_run(_run_with_status(repo, RUN_ID, "cancelled"))
+        lease = st.acquire_lease(token="t1", pid=42, host="h", now=_at(0))
+        with store.immediate(other):
+            store.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+        controls = store.control_requests(other, RUN_ID)
+        journal_before = [line.event for line in st.journal.read()]
+
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+
+        # Nothing journals the control tables, and the rebuild leaves them alone.
+        assert [line.event for line in st.journal.read()] == journal_before
+        assert journal_before == ["run_upsert"]
+        assert store.read_lease(st.connection, RUN_ID) == lease
+        assert store.control_requests(st.connection, RUN_ID) == controls
+        assert rebuilt.status == "cancelled"
+        assert store.run_status(st.connection, RUN_ID) == "cancelled"
+        assert store.run_status(st.connection, "run-never-recorded") is None
+    finally:
+        other.close()
+        st.close()
+
+    # From the journal alone: a wiped projection replays `cancelled`.
+    _truncate_db(repo)
+    replayed = store.Store.open(repo, RUN_ID)
+    try:
+        replayed.rebuild_from_journal(RUN_ID)
+        summaries = store.list_runs(replayed.connection)
+        status = store.run_status(replayed.connection, RUN_ID)
+    finally:
+        replayed.close()
+
+    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "cancelled")]
+    assert status == "cancelled"

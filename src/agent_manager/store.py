@@ -15,7 +15,8 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,6 +103,26 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     agent     TEXT NOT NULL,
     saved_at  TEXT NOT NULL,
     PRIMARY KEY (run_id, card_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_controls (
+    run_id       TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    lease        TEXT NOT NULL,
+    command      TEXT NOT NULL CHECK (command IN ('pause', 'cancel')),
+    requested_at TEXT NOT NULL,
+    handled_at   TEXT,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_leases (
+    run_id       TEXT PRIMARY KEY,
+    token        TEXT NOT NULL,
+    pid          INTEGER NOT NULL,
+    host         TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    accepting    INTEGER NOT NULL
 );
 """
 
@@ -503,6 +524,16 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
     return run
 
 
+def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
+    """`runs.status` of `run_id`, or `None` if the run was never recorded.
+
+    A free function over a connection, like `load_run`, for a reader in
+    another process that needs the status alone (`am pause`, `am resume`).
+    """
+    row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return None if row is None else row["status"]
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
@@ -536,14 +567,160 @@ def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
     )
 
 
+@dataclass(frozen=True)
+class LeaseRow:
+    """The running process's claim on a run: a row of `run_leases` (live control C2).
+
+    Row-only and outside the journal, like `Checkpoint`. `accepting` is a real
+    `bool`: once the control window closes it is `False` and a new request
+    must be refused by the requester.
+    """
+
+    run_id: str
+    token: str
+    pid: int
+    host: str
+    acquired_at: datetime
+    heartbeat_at: datetime
+    accepting: bool
+
+
+def _lease_from_row(row: sqlite3.Row) -> LeaseRow:
+    return LeaseRow(
+        run_id=row["run_id"],
+        token=row["token"],
+        pid=row["pid"],
+        host=row["host"],
+        acquired_at=datetime.fromisoformat(row["acquired_at"]),
+        heartbeat_at=datetime.fromisoformat(row["heartbeat_at"]),
+        accepting=bool(row["accepting"]),
+    )
+
+
+def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
+    """The lease row of `run_id`, or `None` if no process holds one.
+
+    A free function over a connection so a second process (`am pause`,
+    `am status`) can read it without a `Store`, as with `load_run`.
+    """
+    row = conn.execute(
+        "SELECT * FROM run_leases WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return None if row is None else _lease_from_row(row)
+
+
+@dataclass(frozen=True)
+class ControlRow:
+    """One `am pause`/`am cancel` request: a row of `run_controls` (live control C1).
+
+    Row-only and outside the journal. `lease` is the token the request was
+    addressed to, so a row under an old lease never reaches a resumed run.
+    """
+
+    run_id: str
+    seq: int
+    lease: str
+    command: str
+    requested_at: datetime
+    handled_at: datetime | None
+
+
+def _control_from_row(row: sqlite3.Row) -> ControlRow:
+    handled = row["handled_at"]
+    return ControlRow(
+        run_id=row["run_id"],
+        seq=row["seq"],
+        lease=row["lease"],
+        command=row["command"],
+        requested_at=datetime.fromisoformat(row["requested_at"]),
+        handled_at=None if handled is None else datetime.fromisoformat(handled),
+    )
+
+
+def control_requests(
+    conn: sqlite3.Connection, run_id: str, *, lease: str | None = None
+) -> list[ControlRow]:
+    """Every control request of `run_id` in `seq` order, handled or not.
+
+    With `lease=None` every lease's rows are returned; otherwise only the rows
+    addressed to that token.
+    """
+    if lease is None:
+        rows = conn.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? ORDER BY seq", (run_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? AND lease = ? ORDER BY seq",
+            (run_id, lease),
+        ).fetchall()
+    return [_control_from_row(row) for row in rows]
+
+
+@contextmanager
+def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One write transaction that holds the database write lock from `BEGIN`.
+
+    Python's `sqlite3` in legacy transaction mode opens an implicit
+    transaction on the first DML statement, and `BEGIN` inside one raises; so
+    any open implicit transaction is committed first. The body then runs under
+    `BEGIN IMMEDIATE` and is committed on a normal exit, or rolled back and
+    the exception re-raised on any error, leaving no partial rows.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def add_control(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease: str,
+    command: str,
+    requested_at: datetime,
+) -> ControlRow:
+    """Insert the next control request of `run_id`, addressed to `lease`.
+
+    `seq` is 0 for the run's first request and one past the highest after
+    that. Does not commit: run it inside `immediate` so the `MAX(seq)` read
+    and the insert are one locked write. An unknown `command` is refused by
+    the table's `CHECK` as `sqlite3.IntegrityError`; that is the only guard.
+    """
+    highest = conn.execute(
+        "SELECT MAX(seq) FROM run_controls WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
+    seq = 0 if highest is None else highest + 1
+    conn.execute(
+        "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
+        " handled_at) VALUES (?, ?, ?, ?, ?, NULL)",
+        (run_id, seq, lease, command, _iso(requested_at)),
+    )
+    return ControlRow(
+        run_id=run_id,
+        seq=seq,
+        lease=lease,
+        command=command,
+        requested_at=requested_at,
+        handled_at=None,
+    )
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
-    The one exception is `checkpoints` (pygents spec §6): a row-only table
-    outside the journal. `save_checkpoint` writes its row and never touches the
-    journal, and `rebuild_from_journal` leaves those rows alone.
+    The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
+    `run_leases` (live control C1/C2): row-only tables outside the journal.
+    Their methods write rows and never touch the journal, and
+    `rebuild_from_journal` leaves those rows alone.
 
     One process writes a given run (P2), and its threads share one `Store`. A
     single re-entrant lock serialises every use of the shared connection. Each
@@ -923,25 +1100,113 @@ class Store:
         """The newest open checkpoint of `card_id` for `workflow`, across every run.
 
         The card's newest row in any run and any workflow decides first: if it
-        is `done`, the card is closed and this returns `None`. Otherwise it is
-        the newest `turn`/`parked`/`escalated` row of `workflow`, or `None`.
-        "Newest" is `saved_at` descending, then `seq` descending.
+        is `done`, or it belongs to a run whose status is `cancelled` (live
+        control C9), the card is closed and this returns `None`. Otherwise it
+        is the newest `turn`/`parked`/`escalated` row of `workflow` that does
+        not belong to a cancelled run, or `None`. A checkpoint whose run has no
+        `runs` row counts as not cancelled. "Newest" is `saved_at` descending,
+        then `seq` descending.
         """
         with self._lock:
             newest = self._conn.execute(
-                "SELECT reason FROM checkpoints WHERE card_id = ?"
-                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                "SELECT c.reason, r.status FROM checkpoints c"
+                " LEFT JOIN runs r ON r.id = c.run_id"
+                " WHERE c.card_id = ?"
+                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
                 (card_id,),
             ).fetchone()
-            if newest is None or newest["reason"] == "done":
+            if (
+                newest is None
+                or newest["reason"] == "done"
+                or newest["status"] == "cancelled"
+            ):
                 return None
             row = self._conn.execute(
                 "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
                 " AND reason IN ('turn', 'parked', 'escalated')"
+                " AND run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
                 " ORDER BY saved_at DESC, seq DESC LIMIT 1",
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
+
+    # -- leases and control requests -------------------------------------------
+    #
+    # A row-only table outside the journal (live control C2): nothing here
+    # calls `self._journal`, and `rebuild_from_journal` leaves the rows alone.
+    # Every method but `acquire_lease` touches only the row whose token
+    # matches; any other token is a silent no-op.
+
+    def acquire_lease(
+        self, *, token: str, pid: int, host: str, now: datetime
+    ) -> LeaseRow:
+        """Claim this run under `token`, replacing any earlier claim, window open."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT(run_id) DO UPDATE SET"
+                " token=excluded.token, pid=excluded.pid, host=excluded.host,"
+                " acquired_at=excluded.acquired_at,"
+                " heartbeat_at=excluded.heartbeat_at, accepting=1",
+                (self.run_id, token, pid, host, _iso(now), _iso(now)),
+            )
+            self._conn.commit()
+            return LeaseRow(
+                run_id=self.run_id,
+                token=token,
+                pid=pid,
+                host=host,
+                acquired_at=now,
+                heartbeat_at=now,
+                accepting=True,
+            )
+
+    def beat(self, token: str, now: datetime) -> None:
+        """Move the heartbeat of this run's lease, if `token` still holds it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET heartbeat_at = ? WHERE run_id = ? AND token = ?",
+                (_iso(now), self.run_id, token),
+            )
+            self._conn.commit()
+
+    def close_window(self, token: str) -> None:
+        """Stop accepting control requests under `token` (`accepting = 0`)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET accepting = 0 WHERE run_id = ? AND token = ?",
+                (self.run_id, token),
+            )
+            self._conn.commit()
+
+    def release_lease(self, token: str) -> None:
+        """Delete this run's lease, if `token` still holds it."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM run_leases WHERE run_id = ? AND token = ?",
+                (self.run_id, token),
+            )
+            self._conn.commit()
+
+    def pending_controls(self, token: str) -> list[ControlRow]:
+        """This run's unhandled requests addressed to `token`, in `seq` order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM run_controls WHERE run_id = ? AND lease = ?"
+                " AND handled_at IS NULL ORDER BY seq",
+                (self.run_id, token),
+            ).fetchall()
+            return [_control_from_row(row) for row in rows]
+
+    def mark_control_handled(self, seq: int, now: datetime) -> None:
+        """Record that this run's request `seq` has been applied."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
+                (_iso(now), self.run_id, seq),
+            )
+            self._conn.commit()
 
     # -- rebuild -------------------------------------------------------------
 

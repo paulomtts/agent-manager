@@ -17,11 +17,12 @@ import inspect
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -5078,3 +5079,1052 @@ def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
 
     assert result.exit_code == code, result.output
     assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+# -- live control: am pause / am cancel / status control / resume guard -------
+#
+# Live control spec section 7 puts CLI refusals, idempotence, status and the
+# resume guard here. Runs, leases and requests are planted straight into the
+# projection through `store_module.open_db`, which is exactly how a second
+# `am` process reaches them. No sleeps: `cli._utcnow` is frozen and every
+# heartbeat is planted relative to it.
+
+CONTROL_RUN_ID = "20260929T090000Z-cbe34d00"
+CONTROL_NOW = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+HERE = socket.gethostname()
+CONTROL_KEYS = {
+    "run_id",
+    "command",
+    "effective",
+    "requested_at",
+    "already_requested",
+    "message",
+}
+
+
+def _at(seconds: float) -> datetime:
+    return CONTROL_NOW + timedelta(seconds=seconds)
+
+
+def _freeze_clock(monkeypatch, at: datetime = CONTROL_NOW) -> None:
+    """Every `cli._utcnow()` call site reads the module global at call time."""
+    monkeypatch.setattr(cli, "_utcnow", lambda: at)
+
+
+def _plant_run(root: Path, *, status: str = "started", workflow: str = "task") -> None:
+    if workflow == "task":
+        _record(root, CONTROL_RUN_ID, started_at=RECORDED_AT, status=status, with_phases=False)
+    else:
+        _record_milestone(root, CONTROL_RUN_ID, status=status, workflow=workflow)
+
+
+def _plant_lease(
+    root: Path,
+    *,
+    token: str = "life-2",
+    pid: int | None = None,
+    host: str | None = None,
+    heartbeat_at: datetime = CONTROL_NOW,
+    accepting: bool = True,
+) -> None:
+    """A `run_leases` row, as another process's `Lease` would have left it.
+
+    Defaults to this process on this host with a heartbeat at the frozen
+    clock: live by C2.
+    """
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        conn.execute(
+            "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+            " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
+            " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
+            " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
+            (
+                CONTROL_RUN_ID,
+                token,
+                os.getpid() if pid is None else pid,
+                HERE if host is None else host,
+                _at(-60).isoformat(),
+                heartbeat_at.isoformat(),
+                int(accepting),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _plant_control(
+    root: Path,
+    *,
+    lease: str,
+    command: str,
+    requested_at: datetime,
+    handled_at: datetime | None = None,
+) -> None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        with store_module.immediate(conn):
+            row = store_module.add_control(
+                conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
+            )
+            if handled_at is not None:
+                conn.execute(
+                    "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
+                    (handled_at.isoformat(), CONTROL_RUN_ID, row.seq),
+                )
+    finally:
+        conn.close()
+
+
+def _controls(root: Path) -> list[tuple[str, str]]:
+    """Every `run_controls` row of the run as `(lease, command)`, in seq order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            (row.lease, row.command)
+            for row in store_module.control_requests(conn, CONTROL_RUN_ID)
+        ]
+    finally:
+        conn.close()
+
+
+def _lease(root: Path) -> store_module.LeaseRow | None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return store_module.read_lease(conn, CONTROL_RUN_ID)
+    finally:
+        conn.close()
+
+
+def _invoke_control(root: Path, command: str, run_id: str = CONTROL_RUN_ID, *extra: str):
+    return runner.invoke(cli.app, [command, run_id, "--repo-dir", str(root), *extra])
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_an_unknown_run_is_refused(projection, monkeypatch, command):
+    """Spec test 1."""
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, command, "no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+@pytest.mark.parametrize("status", ["stopped", "escalated", "done", "cancelled"])
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_a_run_that_is_not_started_is_refused_and_names_its_status(
+    projection, monkeypatch, command, status
+):
+    """Spec test 2. C8 order: the status is judged before the lease, so a live
+    lease left on the row does not turn this into a different refusal."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status=status)
+    _plant_lease(projection)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotRunningError"
+    assert status in error["message"]
+    assert "am status" in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize(
+    "lease, expected",
+    [
+        (None, ["no process holds its lease"]),
+        (
+            {"heartbeat_at": CONTROL_NOW - timedelta(seconds=31)},
+            [f"pid {os.getpid()}", HERE, "31s ago"],
+        ),
+        ({"pid": 0}, ["pid 0", HERE, "0s ago"]),
+    ],
+    ids=["no-lease", "stale-heartbeat", "dead-pid-on-this-host"],
+)
+def test_a_request_to_a_started_run_with_no_live_lease_is_refused(
+    projection, monkeypatch, lease, expected
+):
+    """Spec test 3: nobody is left to honour the request, so none is recorded."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    if lease is not None:
+        _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    for piece in expected:
+        assert piece in error["message"]
+    assert CONTROL_RUN_ID in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_a_run_whose_window_has_closed_is_refused(
+    projection, monkeypatch, command
+):
+    """Spec test 4 (C3): a live lease with `accepting=0` is finishing."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, accepting=False)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotAcceptingError"
+    assert CONTROL_RUN_ID in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_dead_lease_is_refused_as_dead_even_when_its_window_has_closed(
+    projection, monkeypatch, command
+):
+    """C8 order: liveness is judged before the window, so a crashed run that
+    had begun finishing points at `am resume`, not at `am status`."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(-31), accepting=False)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize(
+    "command, lease",
+    [
+        ("pause", {}),
+        ("cancel", {}),
+        ("pause", {"heartbeat_at": CONTROL_NOW - timedelta(seconds=30)}),
+        ("pause", {"pid": 0, "host": "am-test-other-host.invalid"}),
+    ],
+    ids=["pause", "cancel", "heartbeat-on-the-boundary", "fresh-lease-on-another-host"],
+)
+def test_a_request_to_a_live_accepting_run_is_recorded_under_its_lease(
+    projection, monkeypatch, command, lease
+):
+    """Spec test 5, plus Review Focus: C2's 30s boundary is inclusive, and a
+    fresh heartbeat from another host is live whatever its pid."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == CONTROL_KEYS
+    assert {key: data[key] for key in CONTROL_KEYS - {"message"}} == {
+        "run_id": CONTROL_RUN_ID,
+        "command": command,
+        "effective": command,
+        "requested_at": CONTROL_NOW.isoformat(),
+        "already_requested": False,
+    }
+    assert CONTROL_RUN_ID in data["message"]
+    assert _controls(projection) == [("life-2", command)]
+
+
+def test_request_control_stamps_the_row_with_the_injected_clock(projection):
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(100))
+
+    data = cli.request_control(
+        CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(110)
+    )
+
+    assert data["requested_at"] == _at(110).isoformat()
+    assert _controls(projection) == [("life-2", "pause")]
+
+
+def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
+    projection,
+):
+    """Review Focus: a `ValueError` (in `HANDLED`), never the table CHECK's
+    `sqlite3.IntegrityError`."""
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    with pytest.raises(ValueError, match="'resume'"):
+        cli.request_control(
+            CONTROL_RUN_ID, "resume", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_pause_and_cancel_pretty_indent_the_same_envelope(projection, monkeypatch, command):
+    """Spec test 9."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    result = _invoke_control(projection, command, CONTROL_RUN_ID, "--pretty")
+
+    assert result.exit_code == 0, result.output
+    assert "\n  " in result.stdout
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == CONTROL_KEYS
+    assert envelope["data"]["command"] == command
+
+    refusal = _invoke_control(projection, command, "no-such-run", "--pretty")
+
+    assert refusal.exit_code == cli.EXIT_ERROR, refusal.output
+    assert "\n  " in refusal.stdout
+    refused = json.loads(refusal.stdout)
+    assert refused["ok"] is False
+    assert refused["error"]["type"] == "UnknownRunError"
+
+
+def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
+    """Spec test 6, first half."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _freeze_clock(monkeypatch)
+    assert _invoke_control(projection, "pause").exit_code == 0
+
+    _freeze_clock(monkeypatch, _at(5))
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "pause"
+    assert data["requested_at"] == CONTROL_NOW.isoformat()
+    assert _controls(projection) == [("life-2", "pause")]
+
+
+def test_a_pause_after_a_cancel_is_a_no_op_and_the_cancel_stays_effective(
+    projection, monkeypatch
+):
+    """Spec test 6, second half: a pause never weakens a cancel."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _plant_control(projection, lease="life-2", command="cancel", requested_at=_at(-3))
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(-3).isoformat()
+    assert _controls(projection) == [("life-2", "cancel")]
+
+
+def test_a_cancel_after_a_pause_upgrades_it_and_a_repeated_cancel_is_a_no_op(
+    projection, monkeypatch
+):
+    """Spec test 7."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _freeze_clock(monkeypatch)
+    assert _invoke_control(projection, "pause").exit_code == 0
+
+    _freeze_clock(monkeypatch, _at(1))
+    upgrade = _invoke_control(projection, "cancel")
+
+    assert upgrade.exit_code == 0, upgrade.output
+    data = json.loads(upgrade.stdout)["data"]
+    assert data["already_requested"] is False
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(1).isoformat()
+    assert _controls(projection) == [("life-2", "pause"), ("life-2", "cancel")]
+
+    _freeze_clock(monkeypatch, _at(2))
+    repeat = _invoke_control(projection, "cancel")
+
+    assert repeat.exit_code == 0, repeat.output
+    data = json.loads(repeat.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(1).isoformat()
+    assert _controls(projection) == [("life-2", "pause"), ("life-2", "cancel")]
+
+
+def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
+    projection, monkeypatch
+):
+    """Spec test 8: a resumed run starts clean (C4)."""
+    _plant_run(projection)
+    _plant_control(
+        projection,
+        lease="life-1",
+        command="pause",
+        requested_at=_at(-300),
+        handled_at=_at(-299),
+    )
+    _plant_control(projection, lease="life-1", command="cancel", requested_at=_at(-200))
+    _plant_lease(projection, token="life-2")
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is False
+    assert data["effective"] == "pause"
+    assert data["requested_at"] == CONTROL_NOW.isoformat()
+    assert _controls(projection) == [
+        ("life-1", "pause"),
+        ("life-1", "cancel"),
+        ("life-2", "pause"),
+    ]
+
+
+def test_the_status_payload_defaults_to_an_empty_control():
+    assert cli.status_payload(_pure_run([]))["control"] == {"lease": None, "requests": []}
+
+
+def test_status_of_a_run_with_no_lease_shows_an_empty_control(projection, monkeypatch):
+    """Spec test 10, first half; Review Focus: the no-RUN_ID default too."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+
+    for args in (["status", CONTROL_RUN_ID], ["status"]):
+        result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["control"] == {
+            "lease": None,
+            "requests": [],
+        }
+
+
+@pytest.mark.parametrize(
+    "heartbeat_at, live",
+    [
+        (CONTROL_NOW - timedelta(seconds=5), True),
+        (CONTROL_NOW - timedelta(seconds=31), False),
+    ],
+    ids=["live", "stale"],
+)
+def test_status_shows_the_lease_and_every_lifes_requests_in_seq_order(
+    projection, monkeypatch, heartbeat_at, live
+):
+    """Spec test 10, second half: C12's exact shape, `live` worked out at read
+    time, and `status` stays read-only."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_control(
+        projection,
+        lease="life-1",
+        command="pause",
+        requested_at=_at(-300),
+        handled_at=_at(-299),
+    )
+    _plant_control(projection, lease="life-1", command="cancel", requested_at=_at(-200))
+    _plant_control(projection, lease="life-2", command="pause", requested_at=_at(-10))
+    _plant_lease(projection, heartbeat_at=heartbeat_at)
+    before = (_controls(projection), _lease(projection))
+
+    for args in (["status", CONTROL_RUN_ID], ["status"]):
+        result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["control"] == {
+            "lease": {
+                "pid": os.getpid(),
+                "host": HERE,
+                "acquired_at": _at(-60).isoformat(),
+                "heartbeat_at": heartbeat_at.isoformat(),
+                "accepting": True,
+                "live": live,
+            },
+            "requests": [
+                {
+                    "command": "pause",
+                    "requested_at": _at(-300).isoformat(),
+                    "handled_at": _at(-299).isoformat(),
+                },
+                {
+                    "command": "cancel",
+                    "requested_at": _at(-200).isoformat(),
+                    "handled_at": None,
+                },
+                {
+                    "command": "pause",
+                    "requested_at": _at(-10).isoformat(),
+                    "handled_at": None,
+                },
+            ],
+        }
+    assert (_controls(projection), _lease(projection)) == before
+
+
+def _forbid_resume(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+
+def _resume_guard_state(root: Path) -> tuple:
+    return (_runs_snapshot(), _attempt_rows(root), _controls(root), _lease(root))
+
+
+@pytest.mark.parametrize("leased", [False, True], ids=["no-lease", "live-lease"])
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_cancelled_run_and_writes_nothing(
+    projection, monkeypatch, workflow, leased
+):
+    """Spec test 11 (C9), both workflows. Review Focus: a cancelled run that
+    still holds a live lease is refused as cancelled."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="cancelled", workflow=workflow)
+    if leased:
+        _plant_lease(projection)
+    before = _resume_guard_state(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResumableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} was cancelled;"
+            " start new work with `am run --milestone`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_run_whose_lease_is_live_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """Spec test 12 (C10), both workflows."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started", workflow=workflow)
+    _plant_lease(projection, heartbeat_at=_at(-5))
+    before = _resume_guard_state(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "RunIsLiveError",
+        "message": (
+            f"run {CONTROL_RUN_ID} is still running in pid {os.getpid()} on {HERE}"
+            " (heartbeat 5s ago); wait for it to exit,"
+            f" or `am status {CONTROL_RUN_ID}`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+
+
+def test_resume_is_not_blocked_by_a_dead_lease(projection, monkeypatch):
+    """Spec test 12, last clause: a stale lease is a crashed run, which is
+    exactly what `resume` is for."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started")
+    _plant_lease(projection, heartbeat_at=_at(-31))
+    seen: list[str] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append(run.id)
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope({"status": "done"})
+    assert seen == [CONTROL_RUN_ID]
+
+
+# ── live control in --card runs (card 9f5467e3) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command, summary_status, expected",
+    [
+        (None, "done", "done"),
+        (None, "escalated", "escalated"),
+        (None, "stopped", "stopped"),
+        ("pause", "stopped", "stopped"),
+        ("pause", "escalated", "escalated"),
+        ("cancel", "stopped", "cancelled"),
+        ("cancel", "escalated", "cancelled"),
+        ("cancel", "done", "cancelled"),
+    ],
+)
+def test_card_run_status_follows_c6_precedence(command, summary_status, expected):
+    """A cancel closes the run whatever the walk ended as; a pause never
+    changes it, so a paused escalation stays `escalated`."""
+    stop = StopSignal()
+    if command is not None:
+        stop.request(command)
+
+    assert cli.card_run_status(SubtaskSummary(status=summary_status), stop) == expected
+
+
+CONTROL_TICK = 0.01
+"""How often the run's watcher polls in these tests. The request is inserted
+mid-phase and the fake waits on `control_applied`, so this sets only how soon
+the watcher notices, never the ordering."""
+
+
+@pytest.fixture
+def control_applied(monkeypatch) -> threading.Event:
+    """Set once the running `am` process's watcher has applied a request.
+
+    `run_card` builds its `StopSignal` by the module name `cli.StopSignal`, so
+    this subclass is the one it gets. `request` pauses every registered agent
+    before the event is set, so a fake that waits on it returns from its phase
+    with the agent already paused -- no sleep decides the order.
+    """
+    applied = threading.Event()
+
+    class SignalledStop(StopSignal):
+        def request(self, command):
+            changed = super().request(command)
+            applied.set()
+            return changed
+
+    monkeypatch.setattr(cli, "StopSignal", SignalledStop)
+    return applied
+
+
+def _card_lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+    """The run's lease row, read over a second connection as `am status` would."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.read_lease(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _card_controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.control_requests(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _card_statuses(project: Path, run_id: str) -> dict[str, str]:
+    """The run, its one story and its one subtask, as recorded."""
+    run = _loaded(project, run_id)
+    (story,) = run.stories
+    (subtask,) = story.subtasks
+    return {"run": run.status, "story": story.status, "subtask": subtask.status}
+
+
+def _newest_checkpoint_reason(project: Path, run_id: str) -> str:
+    rows = [row for row in _checkpoint_rows(project) if row[0] == run_id]
+    assert rows, f"run {run_id} saved no checkpoint"
+    return rows[-1][3]
+
+
+def _controlling_factory(
+    project: Path,
+    applied: threading.Event,
+    *,
+    command: str | None,
+    at: str,
+    seen: list[str],
+    fail: bool = False,
+    leases: list[store_module.LeaseRow | None] | None = None,
+):
+    """A `cli.RunnerFactory` whose runner, inside phase `at`, acts as a second process.
+
+    The runner runs in the engine's `to_thread` worker, so blocking it never
+    blocks the loop the watcher runs on. In phase `at` it records the lease
+    as another process sees it (`leases`), sends `command` through
+    `cli.request_control` (the `am pause`/`am cancel` path, over its own
+    connection), waits until the watcher applied it, and then finishes the
+    phase -- or, with `fail`, escalates it with a gate failure. Every other
+    phase is `recording_runner`'s.
+    """
+    record = _resume_factory(seen)
+
+    def factory(*, store, run_id, story_id, card_id):
+        run = record(store=store, run_id=run_id, story_id=story_id, card_id=card_id)
+
+        def runner(phase, context, rendered):
+            if phase.name != at:
+                return run(phase, context, rendered)
+            if leases is not None:
+                leases.append(_card_lease(project, run_id))
+            if command is not None:
+                cli.request_control(run_id, command, repo_dir=project)
+                if not applied.wait(5):
+                    raise RuntimeError(f"the {command} request was never applied")
+            if fail:
+                seen.append(phase.name)
+                raise AgentPhaseFailed(
+                    phase.name, outcome="gate_failed", detail="canned gate failure"
+                )
+            return run(phase, context, rendered)
+
+        return runner
+
+    return factory
+
+
+def _controlled_card_run(project: Path, cards: dict[str, str], factory) -> dict[str, Any]:
+    return cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=factory,
+        control_interval=CONTROL_TICK,
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_paused_card_run_parks_after_the_running_phase(project, cards, control_applied):
+    """Spec test 1: the running phase finishes, nothing after it is
+    dispatched, the park is `parked`, every row is `stopped`, and the request
+    is marked handled."""
+    seen: list[str] = []
+    factory = _controlling_factory(
+        project, control_applied, command="pause", at="spec", seen=seen
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    run_id = payload["run_id"]
+    assert payload["status"] == "stopped", payload
+    assert payload["failed_phase"] is None
+    assert payload["detail"] == "stopped before validate_spec"
+    assert seen[-1] == "spec"
+    assert "validate_spec" not in seen
+    assert _card_statuses(project, run_id) == {
+        "run": "stopped",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _newest_checkpoint_reason(project, run_id) == "parked"
+    controls = _card_controls(project, run_id)
+    assert [row.command for row in controls] == ["pause"]
+    assert all(row.handled_at is not None for row in controls)
+    assert _card_lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
+    project, cards, control_applied
+):
+    """Spec test 2: `am resume` continues at the phase the pause parked
+    before, and ends `done`."""
+    factory = _controlling_factory(
+        project, control_applied, command="pause", at="spec", seen=[]
+    )
+    run_id = _controlled_card_run(project, cards, factory)["run_id"]
+
+    after: list[str] = []
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(after))
+
+    assert payload["status"] == "done", payload
+    assert payload["resumed_from"] == "validate_spec"
+    assert after[0] == "validate_spec"
+    assert not {"explore", "spec"} & set(after)
+    assert _card_statuses(project, run_id) == {
+        "run": "done",
+        "story": "done",
+        "subtask": "done",
+    }
+    assert _card_lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
+    project, cards, control_applied
+):
+    """Spec test 3, plus Review Focus 3: the run is `cancelled`, its story and
+    subtask stay `stopped` as the park left them, `am resume` refuses it, and
+    a pause sent afterwards is refused rather than queued."""
+    seen: list[str] = []
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=seen
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    run_id = payload["run_id"]
+    assert payload["status"] == "cancelled", payload
+    assert payload["failed_phase"] is None
+    assert "validate_spec" not in seen
+    assert _card_statuses(project, run_id) == {
+        "run": "cancelled",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _newest_checkpoint_reason(project, run_id) == "parked"
+    assert _card_lease(project, run_id) is None
+
+    resumed = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+    assert resumed.exit_code == cli.EXIT_ERROR, resumed.output
+    error = json.loads(resumed.stdout)["error"]
+    assert error["type"] == "NotResumableError"
+    assert "cancelled" in error["message"]
+
+    late = runner.invoke(cli.app, ["pause", run_id, "--repo-dir", str(project)])
+    assert late.exit_code == cli.EXIT_ERROR, late.output
+    assert json.loads(late.stdout)["error"]["type"] == "NotRunningError"
+    assert [row.command for row in _card_controls(project, run_id)] == ["cancel"]
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
+    project, cards, control_applied
+):
+    """Review Focus 1 at the function: C6 puts the cancel first for the run,
+    while the story and subtask rows keep the escalation the walk ended in."""
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=[], fail=True
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    assert payload["status"] == "cancelled", payload
+    assert _card_statuses(project, payload["run_id"]) == {
+        "run": "cancelled",
+        "story": "escalated",
+        "subtask": "escalated",
+    }
+
+
+@pytest.mark.parametrize(
+    "command, fail, exit_code, status",
+    [
+        ("pause", False, 0, "stopped"),
+        ("cancel", False, 0, "cancelled"),
+        ("cancel", True, 0, "cancelled"),
+        ("pause", True, cli.EXIT_ESCALATED, "escalated"),
+    ],
+    ids=["pause", "cancel", "cancel-over-escalation", "pause-keeps-escalation"],
+)
+@requires_git
+@requires_brd
+def test_a_control_and_an_escalation_follow_c6_at_the_command(
+    project, cards, control_applied, monkeypatch, command, fail, exit_code, status
+):
+    """Spec's exit codes and Review Focus 1-2: the command's mapping still keys
+    off `escalated`, so `stopped` and `cancelled` exit 0 with an ok envelope
+    and a paused escalation still exits 1. `run` passes no interval, so the
+    real `run_card` is wrapped to add a short one and the fake factory."""
+    real_run_card = cli.run_card
+    factory = _controlling_factory(
+        project, control_applied, command=command, at="spec", seen=[], fail=fail
+    )
+
+    def run_card_with_control(card_id, **kwargs):
+        return real_run_card(
+            card_id, **kwargs, runner_factory=factory, control_interval=CONTROL_TICK
+        )
+
+    monkeypatch.setattr(cli, "run_card", run_card_with_control)
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == exit_code, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert envelope["data"]["status"] == status
+
+
+@requires_git
+@requires_brd
+def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, cards):
+    """Spec tests 4 and 6: the lease is held, window open, while a phase runs;
+    it is gone afterwards; the payload is today's, key for key."""
+    leases: list[store_module.LeaseRow | None] = []
+    factory = _controlling_factory(
+        project, threading.Event(), command=None, at="explore", seen=[], leases=leases
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    run_id = payload["run_id"]
+    (during,) = leases
+    assert during is not None, "no lease was held while the walk ran"
+    assert during.run_id == run_id
+    assert during.accepting is True
+    assert _card_lease(project, run_id) is None
+    assert payload["status"] == "done"
+    assert set(payload) == {
+        "run_id",
+        "card_id",
+        "story_id",
+        "branch",
+        "base_branch",
+        "worktree",
+        "status",
+        "failed_phase",
+        "detail",
+        "skipped",
+        "warnings",
+    }
+    assert _card_statuses(project, run_id) == {
+        "run": "done",
+        "story": "done",
+        "subtask": "done",
+    }
+    assert _card_controls(project, run_id) == []
+
+
+@requires_git
+@requires_brd
+def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
+    """Spec test 4 and the error path: the lease was held when the walk blew
+    up, it is released on the way out, the error surfaces as is, and no final
+    status row is written."""
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    held: list[store_module.LeaseRow | None] = []
+
+    async def exploding(*args, **kwargs):
+        held.append(_card_lease(project, run_id))
+        raise EngineError("no value for a required parameter", phase="explore")
+
+    monkeypatch.setattr(cli.runtime_engine, "run_subtask_async", exploding)
+
+    with pytest.raises(EngineError, match="explore"):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix="m1",
+            clock=lambda: CRASHED_AT,
+            runner_factory=lambda **kwargs: fake_runner(),
+            control_interval=CONTROL_TICK,
+        )
+
+    (during,) = held
+    assert during is not None, "no lease was held while the walk ran"
+    assert _card_lease(project, run_id) is None
+    assert _loaded(project, run_id).status == "started"
+
+
+def _resume_card_run(project: Path, run_id: str, factory) -> dict[str, Any]:
+    """`_resume_from_checkpoint` called as `resume_run` calls it, plus a short
+    interval. `resume_run` passes none and is not this card's to change."""
+    return cli._resume_from_checkpoint(
+        _loaded(project, run_id),
+        root=cli.resolve_repo_dir(project),
+        allow_no_verification=False,
+        commands=(),
+        runner_factory=factory,
+        control_interval=CONTROL_TICK,
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
+    project, cards, control_applied
+):
+    """Spec test 5: the resumed walk starts at `plan`, is paused there, finishes
+    `plan`, parks before the next phase, and gives its lease back."""
+    run_id = _crash_pygents(project, cards, "plan")
+    seen: list[str] = []
+    leases: list[store_module.LeaseRow | None] = []
+    factory = _controlling_factory(
+        project, control_applied, command="pause", at="plan", seen=seen, leases=leases
+    )
+
+    payload = _resume_card_run(project, run_id, factory)
+
+    assert payload["status"] == "stopped", payload
+    assert payload["failed_phase"] is None
+    assert payload["resumed_from"] == "plan"
+    assert payload["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    assert set(payload) == RESUME_KEYS
+    assert seen == ["plan"]
+    assert payload["detail"] == "stopped before validate_plan"
+    (during,) = leases
+    assert during is not None and during.run_id == run_id and during.accepting is True
+    assert _card_lease(project, run_id) is None
+    assert _card_statuses(project, run_id) == {
+        "run": "stopped",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _newest_checkpoint_reason(project, run_id) == "parked"
+    assert all(row.handled_at is not None for row in _card_controls(project, run_id))
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
+    project, cards, control_applied
+):
+    """Review Focus 5: a cancel reaches a resumed `task` run too, and a second
+    `am resume` refuses it."""
+    run_id = _crash_pygents(project, cards, "plan")
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="plan", seen=[]
+    )
+
+    payload = _resume_card_run(project, run_id, factory)
+
+    assert payload["status"] == "cancelled", payload
+    assert _card_statuses(project, run_id) == {
+        "run": "cancelled",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _card_lease(project, run_id) is None
+
+    again = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+    assert again.exit_code == cli.EXIT_ERROR, again.output
+    assert json.loads(again.stdout)["error"]["type"] == "NotResumableError"
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
+    """Error path on resume: the lease was held when the walk blew up and is
+    released on the way out; the run stays `started` as it does today."""
+    run_id = _crash_pygents(project, cards, "plan")
+    held: list[store_module.LeaseRow | None] = []
+
+    async def exploding(*args, **kwargs):
+        held.append(_card_lease(project, run_id))
+        raise EngineError("no value for a required parameter", phase="plan")
+
+    monkeypatch.setattr(cli.runtime_engine, "run_subtask_async", exploding)
+
+    with pytest.raises(EngineError, match="plan"):
+        _resume_card_run(project, run_id, _resume_factory())
+
+    (during,) = held
+    assert during is not None, "no lease was held while the resumed walk ran"
+    assert _card_lease(project, run_id) is None
+    assert _loaded(project, run_id).status == "started"

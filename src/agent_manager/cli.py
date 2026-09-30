@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ import typer
 from agent_manager import (
     board,
     census,
+    control,
     dag,
     dispatch,
     models,
@@ -135,6 +137,30 @@ class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
     write, rather than letting `run_subtask` raise it after the orphan
     attempts and the `started` rows were already recorded.
     """
+
+
+class NotRunningError(CliError):
+    """`am pause`/`am cancel` was asked to steer a run that is not `started` (C8).
+
+    The message names the recorded status and what to run instead, because
+    a stopped run wants `am resume` and a finished one wants nothing.
+    """
+
+
+class DeadRunError(CliError):
+    """The run is recorded `started`, but no live process holds its lease (C2, C8).
+
+    Nobody is left to honour a request, so none is recorded. The message
+    names the lease's pid, host and heartbeat age, or says there is no lease.
+    """
+
+
+class NotAcceptingError(CliError):
+    """The run's control window has closed: it is finishing (C3, C8)."""
+
+
+class RunIsLiveError(CliError):
+    """`am resume` was asked for a run another live process still holds (C10)."""
 
 
 def resolve_repo_dir(repo_dir: Path) -> Path:
@@ -252,19 +278,57 @@ def status_rows(run: models.Run) -> list[dict[str, Any]]:
     return rows
 
 
-def status_payload(run: models.Run) -> dict[str, Any]:
-    """The run's identity, the §9 tree, and the flat table over it.
+def control_view(
+    lease: store_module.LeaseRow | None,
+    requests: Sequence[store_module.ControlRow],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """C12's `control` key: the lease or `None`, and every life's requests in seq order.
+
+    `live` is worked out here, at read time, by `control.lease_is_live`; it
+    is never stored. Timestamps are ISO strings.
+    """
+    return {
+        "lease": None
+        if lease is None
+        else {
+            "pid": lease.pid,
+            "host": lease.host,
+            "acquired_at": lease.acquired_at.isoformat(),
+            "heartbeat_at": lease.heartbeat_at.isoformat(),
+            "accepting": lease.accepting,
+            "live": control.lease_is_live(lease, now=now),
+        },
+        "requests": [
+            {
+                "command": row.command,
+                "requested_at": row.requested_at.isoformat(),
+                "handled_at": None if row.handled_at is None else row.handled_at.isoformat(),
+            }
+            for row in requests
+        ],
+    }
+
+
+def status_payload(
+    run: models.Run, control: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The run's identity, the §9 tree, the flat table over it, and live control.
 
     `model_dump()` rather than `model_dump(mode="json")`: the payload keeps its
     `Path` and `datetime` objects and `render`'s `default=str` stringifies them
     once, at the edge, the same way `run_card`'s `worktree` is handled. Field
-    names are `models.py`'s and are not renamed for display.
+    names are `models.py`'s and are not renamed for display. `control` is
+    `control_view`'s result; `None` renders as no lease and no requests, so
+    the key is always present (C12).
     """
     tree = run.model_dump()
     return {
         "run": {field: tree[field] for field in RUN_IDENTITY},
         "stories": tree["stories"],
         "rows": status_rows(run),
+        "control": {"lease": None, "requests": []} if control is None else control,
     }
 
 
@@ -726,6 +790,19 @@ def drive_subtask(
     )
 
 
+def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
+    """The run row's status after a `task` walk (live control C6, C11).
+
+    A cancel closes the run for good whatever the walk ended as, so it wins
+    even over an escalation. A pause changes nothing: the walk already parked
+    as `stopped`, and an escalation it met stays `escalated`. The story and
+    subtask rows always keep `summary.status`.
+    """
+    if stop.requested == "cancel":
+        return "cancelled"
+    return summary.status
+
+
 def run_card(
     card_id: str,
     *,
@@ -736,6 +813,7 @@ def run_card(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
@@ -743,6 +821,13 @@ def run_card(
     a run id exists (so a bad card leaves no run directory), and the run, story
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
+
+    Live control (C11): from the `started` rows through the final ones the run
+    holds a `control.Lease`, and the walk runs under `control.controlled`,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request`. A pause parks the walk before its next
+    phase (`stopped`, resumable); a cancel parks it the same way and records
+    the run `cancelled` (`card_run_status`). No control cancels a running phase.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -784,30 +869,45 @@ def run_card(
             status="started",
             worktree_path=worktree,
         )
-        store.record_run(run_record)
-        store.record_story(story)
-        store.record_subtask(story.card_id, subtask)
+        # Inside the `try` that closes the store, so the lease is released
+        # before `store.close()` on every exit, a raising walk included (C2).
+        with control.Lease(store) as lease:
+            store.record_run(run_record)
+            store.record_story(story)
+            store.record_subtask(story.card_id, subtask)
 
-        drive = drive_subtask(
-            store=store,
-            run_id=run_id,
-            card=card,
-            parent=parent,
-            subtask=subtask,
-            repo_dir=root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-        )
-        summary = drive.summary
+            stop = StopSignal()
+            # `controlled` only ever parks the walk through `stop` (C3); it
+            # closes the window and runs a final sweep before returning.
+            drive = asyncio.run(
+                control.controlled(
+                    drive_subtask_async(
+                        store=store,
+                        run_id=run_id,
+                        card=card,
+                        parent=parent,
+                        subtask=subtask,
+                        repo_dir=root,
+                        commands=commands,
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                    ),
+                    store=store,
+                    stop=stop,
+                    lease=lease,
+                    interval=control_interval,
+                )
+            )
+            summary = drive.summary
+            run_status = card_run_status(summary, stop)
 
-        store.record_run(run_record.model_copy(update={"status": summary.status}))
-        store.record_story(story.model_copy(update={"status": summary.status}))
-        store.record_subtask(
-            story.card_id, subtask.model_copy(update={"status": summary.status})
-        )
+            store.record_run(run_record.model_copy(update={"status": run_status}))
+            store.record_story(story.model_copy(update={"status": summary.status}))
+            store.record_subtask(
+                story.card_id, subtask.model_copy(update={"status": summary.status})
+            )
 
-        warnings = drive.warnings
         return {
             "run_id": run_id,
             "card_id": card.id,
@@ -815,11 +915,11 @@ def run_card(
             "branch": branch,
             "base_branch": base_branch,
             "worktree": str(worktree),
-            "status": summary.status,
+            "status": run_status,
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": warnings,
+            "warnings": drive.warnings,
         }
     finally:
         store.close()
@@ -1178,7 +1278,8 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     path including the refusals, the way `run_card` closes its store. The default
     run id comes from `store_module.latest_run_id`, which is the head of the very
     listing `runs` prints, so the two commands cannot disagree about which run is
-    the most recent one.
+    the most recent one. The lease and every control request are read on the
+    same connection and rendered by `control_view`, still without a write.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1197,7 +1298,12 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
                 f"run {wanted!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
-        return status_payload(run)
+        state = control_view(
+            store_module.read_lease(conn, wanted),
+            store_module.control_requests(conn, wanted),
+            now=_utcnow(),
+        )
+        return status_payload(run, state)
     finally:
         conn.close()
 
@@ -1328,6 +1434,7 @@ def _resume_from_checkpoint(
     allow_no_verification: bool,
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
@@ -1336,9 +1443,14 @@ def _resume_from_checkpoint(
     the store, so its refusals (`checkpoint_resume_phase`) come right after it
     is opened and before the first write. Then the orphan attempts are marked
     `harness_error`, the run, story and subtask are recorded `started`, and
-    `drive_subtask` walks `TASK` from the checkpoint, whose queue says where the
-    walk goes on. A `milestone` run never comes here: `resume_run` hands it to
-    `orchestrate.run_milestone` (card 54e4ec29).
+    `drive_subtask_async` walks `TASK` from the checkpoint, whose queue says
+    where the walk goes on. A `milestone` run never comes here: `resume_run`
+    hands it to `orchestrate.run_milestone` (card 54e4ec29).
+
+    Live control (C11), as in `run_card`: from the `started` rows through the
+    final ones this life of the run holds a fresh `control.Lease`, and the walk
+    runs under `control.controlled`. A pause parks it `stopped`; a cancel
+    parks it and records the run `cancelled` (`card_run_status`).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1357,29 +1469,43 @@ def _resume_from_checkpoint(
                 orphan.name,
                 attempt.model_copy(update={"status": "harness_error"}),
             )
-        store.record_run(run.model_copy(update={"status": "started"}))
-        store.record_story(story.model_copy(update={"status": "started"}))
-        store.record_subtask(story.card_id, resumed)
+        # After every refusal, and inside the `try` that closes the store, so
+        # the lease is released before `store.close()` on every exit (C2).
+        with control.Lease(store) as lease:
+            store.record_run(run.model_copy(update={"status": "started"}))
+            store.record_story(story.model_copy(update={"status": "started"}))
+            store.record_subtask(story.card_id, resumed)
 
-        drive = drive_subtask(
-            store=store,
-            run_id=run.id,
-            card=card,
-            parent=parent,
-            subtask=resumed,
-            repo_dir=root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-            resume_from=checkpoint,
-        )
-        summary = drive.summary
+            stop = StopSignal()
+            drive = asyncio.run(
+                control.controlled(
+                    drive_subtask_async(
+                        store=store,
+                        run_id=run.id,
+                        card=card,
+                        parent=parent,
+                        subtask=resumed,
+                        repo_dir=root,
+                        commands=commands,
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                        resume_from=checkpoint,
+                    ),
+                    store=store,
+                    stop=stop,
+                    lease=lease,
+                    interval=control_interval,
+                )
+            )
+            summary = drive.summary
+            run_status = card_run_status(summary, stop)
 
-        store.record_run(run.model_copy(update={"status": summary.status}))
-        store.record_story(story.model_copy(update={"status": summary.status}))
-        store.record_subtask(
-            story.card_id, resumed.model_copy(update={"status": summary.status})
-        )
+            store.record_run(run.model_copy(update={"status": run_status}))
+            store.record_story(story.model_copy(update={"status": summary.status}))
+            store.record_subtask(
+                story.card_id, resumed.model_copy(update={"status": summary.status})
+            )
 
         return {
             "run_id": run.id,
@@ -1390,7 +1516,7 @@ def _resume_from_checkpoint(
             "worktree": None
             if subtask.worktree_path is None
             else str(subtask.worktree_path),
-            "status": summary.status,
+            "status": run_status,
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
@@ -1434,6 +1560,10 @@ def resume_run(
     reads them: its binding comes from the checkpoint's pool. On a milestone
     they also reach what starts afresh -- subtasks with no checkpoint, merged
     bases and Integrate.
+
+    A cancelled run is refused for both workflows (live control C9), and so
+    is a run whose lease is still live (C10): both refusals read only the
+    connection that loaded the run.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1443,6 +1573,20 @@ def resume_run(
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
+            )
+        # C9, then C10: both read-only and before anything is written, so a
+        # refusal leaves no run directory, row or journal line behind.
+        if run.status == "cancelled":
+            raise NotResumableError(
+                f"run {run.id} was cancelled; start new work with `am run --milestone`"
+            )
+        lease = store_module.read_lease(conn, run.id)
+        now = _utcnow()
+        if lease is not None and control.lease_is_live(lease, now=now):
+            raise RunIsLiveError(
+                f"run {run.id} is still running in pid {lease.pid} on {lease.host}"
+                f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
+                f" or `am status {run.id}`"
             )
     finally:
         conn.close()
@@ -1523,3 +1667,188 @@ def resume(
     # escalation, so it exits 0 with an ok envelope.
     if payload.get("status") == "escalated" or payload.get("escalated") is True:
         raise typer.Exit(EXIT_ESCALATED)
+
+
+CONTROL_COMMANDS: tuple[str, ...] = ("pause", "cancel")
+"""What `am pause` and `am cancel` record, weakest first (live control C6)."""
+
+
+def _heartbeat_age(lease: store_module.LeaseRow, now: datetime) -> int:
+    """Whole seconds since `lease` last beat, for a refusal message."""
+    return int((now - lease.heartbeat_at).total_seconds())
+
+
+def _controllable_lease(
+    conn: sqlite3.Connection, run_id: str, *, command: str, now: datetime
+) -> store_module.LeaseRow:
+    """The lease a request to `run_id` is addressed to, or C8's refusal.
+
+    The order is C8's: unknown run, not `started`, no live lease, window
+    closed. Runs inside `request_control`'s transaction, so a refusal rolls
+    back and leaves no row.
+    """
+    status = store_module.run_status(conn, run_id)
+    if status is None:
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    if status != "started":
+        raise NotRunningError(
+            f"run {run_id} is {status}, not started, so there is nothing to {command};"
+            f" `am status {run_id}` shows it, and `am resume {run_id}` continues a"
+            " stopped or escalated run"
+        )
+    lease = store_module.read_lease(conn, run_id)
+    if lease is None:
+        raise DeadRunError(
+            f"run {run_id} is recorded started but no process holds its lease;"
+            f" it is not running, so `am resume {run_id}` picks it up"
+        )
+    if not control.lease_is_live(lease, now=now):
+        raise DeadRunError(
+            f"run {run_id} is not running: its lease is held by pid {lease.pid}"
+            f" on {lease.host}, last heartbeat {_heartbeat_age(lease, now)}s ago;"
+            f" `am resume {run_id}` picks it up"
+        )
+    if not lease.accepting:
+        raise NotAcceptingError(
+            f"run {run_id} is finishing and no longer accepts pause or cancel;"
+            f" `am status {run_id}` shows how it ends"
+        )
+    return lease
+
+
+CONTROL_SUBSUMES: dict[str, tuple[str, ...]] = {
+    "pause": ("pause", "cancel"),
+    "cancel": ("cancel",),
+}
+"""Requests already recorded that make a new one a no-op (C8). A pause is
+covered by any pause or cancel, a cancel only by a cancel, so a cancel after a
+pause is recorded and upgrades it."""
+
+
+def _record_control(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease: store_module.LeaseRow,
+    command: str,
+    now: datetime,
+) -> tuple[store_module.ControlRow, bool]:
+    """Record `command` for this life of the run; the flag says it was already there.
+
+    Only rows addressed to `lease.token` count, so a request sent to an
+    earlier life never makes one to a resumed run a no-op. A no-op returns
+    the first row that covers it, whose time is reported as `requested_at`.
+    """
+    for row in store_module.control_requests(conn, run_id, lease=lease.token):
+        if row.command in CONTROL_SUBSUMES[command]:
+            return row, True
+    row = store_module.add_control(
+        conn, run_id, lease=lease.token, command=command, requested_at=now
+    )
+    return row, False
+
+
+def _effective_command(rows: Sequence[store_module.ControlRow]) -> str:
+    """The strongest command recorded for one life: `cancel` beats `pause` (C6)."""
+    return "cancel" if any(row.command == "cancel" for row in rows) else "pause"
+
+
+def _control_message(run_id: str, command: str, *, effective: str, already: bool) -> str:
+    if already:
+        return (
+            f"{command} was already requested for run {run_id};"
+            f" the effective request is {effective}"
+        )
+    if command == "pause":
+        return (
+            f"pause requested for run {run_id}; it parks at its next phase"
+            f" boundary, and `am resume {run_id}` continues it"
+        )
+    return (
+        f"cancel requested for run {run_id}; it stops at its next phase"
+        " boundary and cannot be resumed"
+    )
+
+
+def request_control(
+    run_id: str,
+    command: str,
+    *,
+    repo_dir: Path,
+    clock: Callable[[], datetime] = _utcnow,
+) -> dict[str, Any]:
+    """Record `am pause` or `am cancel` for the process holding `run_id` (C8).
+
+    One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
+    check and the insert, so two requesters cannot both insert and a refusal
+    leaves no row. The process holding the lease applies the request at its
+    next poll; this function only records it. SQLite is the only channel (C1).
+    """
+    if command not in CONTROL_COMMANDS:
+        raise ValueError(
+            f"unknown control command {command!r};"
+            f" expected one of {', '.join(CONTROL_COMMANDS)}"
+        )
+    root = resolve_repo_dir(repo_dir)
+    now = clock()
+    conn = store_module.open_db(root)
+    try:
+        with store_module.immediate(conn):
+            lease = _controllable_lease(conn, run_id, command=command, now=now)
+            row, already = _record_control(
+                conn, run_id, lease=lease, command=command, now=now
+            )
+            effective = _effective_command(
+                store_module.control_requests(conn, run_id, lease=lease.token)
+            )
+    finally:
+        conn.close()
+    return {
+        "run_id": run_id,
+        "command": command,
+        "effective": effective,
+        "requested_at": row.requested_at.isoformat(),
+        "already_requested": already,
+        "message": _control_message(run_id, command, effective=effective, already=already),
+    }
+
+
+def _control(command: str, run_id: str, *, repo_dir: Path, pretty: bool) -> None:
+    """`resume`'s envelope pattern for `pause` and `cancel`.
+
+    `clock=_utcnow` reads the module global at call time, so a test that
+    freezes `cli._utcnow` freezes this command too.
+    """
+    try:
+        payload = request_control(run_id, command, repo_dir=repo_dir, clock=_utcnow)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+@app.command("pause")
+def pause(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The running run to park."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Ask a running run to park at its next phase boundary; `am resume` continues it."""
+    _control("pause", run_id, repo_dir=repo_dir, pretty=pretty)
+
+
+@app.command("cancel")
+def cancel(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The running run to stop."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Ask a running run to stop at its next phase boundary and close it for good."""
+    _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
