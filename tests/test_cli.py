@@ -6032,7 +6032,6 @@ def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch)
     assert _loaded(project, run_id).status == "started"
 
 
-
 def _resume_card_run(project: Path, run_id: str, factory) -> dict[str, Any]:
     """`_resume_from_checkpoint` called as `resume_run` calls it, plus a short
     interval. `resume_run` passes none and is not this card's to change."""
