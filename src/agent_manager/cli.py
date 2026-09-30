@@ -53,10 +53,12 @@ from agent_manager.runs import (
     WORKTREE_PARTS,
     CheckpointMismatchError,
     CliError,
+    DryRunPlan,
     NotResumableError,
     RepoDirError,
     RunnerFactory,
     UnknownRunError,
+    compute_dry_run_plan,
     continuable_checkpoint,
     gate_context,
     mint_run_id,
@@ -781,84 +783,29 @@ def dry_run_payload(
     base_branch: str,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
-    """O3's preview: dispatch levels with each subtask's branch and base, then Integrate.
+    """O3's preview envelope: `runs.compute_dry_run_plan`'s levels and Integrate plan.
 
-    Pure over the census, and every derivation belongs to `dag`. The cycle
-    check runs first because a cycle is what breaks the geometry, and
-    `story_root`'s own guard misses a cycle between two populated stories.
-    `stories_by_id` covers every story, closed ones included, so a story
-    blocked by a done story still roots on that story's tip. A story's
-    `subtasks` lists only what would be dispatched, but each `base` comes
-    from `stack_bases` over the full ordered list, so a done first subtask
-    still anchors the second. `max_concurrent` is echoed at the top, and each
-    level row says how many of its stories would run together:
-    `min(len(level), max_concurrent)`. The caller refuses a bound below 1.
-
-    A story's `root` is `dag.story_root(...).branch`. A story with two or more
-    in-milestone blockers is not refused here: its `root` is its own merged
-    base branch and its row gains `merged_from`, the blockers in `blocked_by`
-    order. The key is absent for every other row. The real run still refuses
-    such a story (`orchestrate.plan_levels`).
-
-    `integrate` is the terminal phase's plan (Integrate addendum I6): the
-    branch every tip is merged into, its worktree under `repo_dir`, and the
-    merge order `integration.merge_order` gives -- every story with subtasks,
-    done or not. `repo_dir` is only joined onto, never read.
+    The levels, bases, roots, `merged_from` rows, per-level `concurrent` and
+    the Integrate plan are all computed by `compute_dry_run_plan` (which also
+    refuses a blocker cycle first). This only reads `stories` once, echoes
+    `max_concurrent` (defaulting to `DEFAULT_MAX_CONCURRENT`), adds
+    `already_done_entries`, and returns the envelope with its keys in the
+    order `--dry-run` prints them: `max_concurrent`, `levels`, `already_done`,
+    `integrate`.
     """
-    # `integration` imports this module at load time, so importing it at the
-    # top of this module would be circular. By call time both are loaded.
-    from agent_manager import integration
-
     stories = list(stories)
-    dag.assert_no_blocker_cycles(stories)
-    levels = dag.compute_levels(stories)
-    stories_by_id = {story.id: story for story in stories}
-    level_rows: list[dict[str, Any]] = []
-    for index, level in enumerate(levels):
-        story_rows: list[dict[str, Any]] = []
-        for story in level:
-            bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
-            root = dag.story_root(story, stories_by_id, branch_prefix, base_branch)
-            row: dict[str, Any] = {
-                "story": story.id,
-                "title": story.title,
-                "root": root.branch,
-                "subtasks": [
-                    {
-                        "id": subtask.id,
-                        "title": subtask.title,
-                        "status": subtask.status,
-                        "branch": dag.subtask_branch(branch_prefix, subtask),
-                        "base": bases[subtask.id],
-                    }
-                    for subtask in dag.remaining_subtasks(story)
-                ],
-            }
-            if root.kind == "merged":
-                row["merged_from"] = list(root.blockers)
-            story_rows.append(row)
-        level_rows.append(
-            {
-                "level": index,
-                "concurrent": min(len(level), max_concurrent),
-                "stories": story_rows,
-            }
-        )
-    integrate_branch = integration.integration_branch(branch_prefix)
+    plan = compute_dry_run_plan(
+        stories,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        max_concurrent=max_concurrent,
+    )
     return {
         "max_concurrent": max_concurrent,
-        "levels": level_rows,
+        "levels": plan.levels,
         "already_done": already_done_entries(stories),
-        "integrate": {
-            "branch": integrate_branch,
-            "worktree": str(worktree_for(repo_dir, integrate_branch)),
-            "order": [
-                {"story": story.id, "tip": tip}
-                for story, tip in integration.merge_order(
-                    stories, branch_prefix, base_branch
-                )
-            ],
-        },
+        "integrate": plan.integrate,
     }
 
 

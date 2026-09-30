@@ -134,6 +134,8 @@ MOVED_NAMES = (
     "select_resumable",
     "orphan_attempts",
     "continuable_checkpoint",
+    "DryRunPlan",
+    "compute_dry_run_plan",
 )
 
 
@@ -361,6 +363,54 @@ def test_compute_dry_run_plan_runs_in_a_fresh_interpreter_that_imported_runs_fir
         "assert plan.integrate['branch'] == 'm3-integrate', plan"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_cli_dry_run_payload_delegates_the_plan_to_runs():
+    """`cli.dry_run_payload` only assembles the envelope: it calls
+    `compute_dry_run_plan`, makes no `dag` call and imports no `integration`.
+    Checked on the function's code, not its docstring."""
+    import textwrap
+
+    from agent_manager import cli
+
+    function = ast.parse(textwrap.dedent(inspect.getsource(cli.dry_run_payload))).body[0]
+    body = function.body[1:] if ast.get_docstring(function) else function.body
+    names = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    imports = [
+        node
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert "compute_dry_run_plan" in names
+    assert "already_done_entries" in names
+    assert "dag" not in names
+    assert "integration" not in names
+    assert imports == []
+
+
+def test_cli_dry_run_payload_is_the_plan_wrapped_in_the_envelope():
+    from agent_manager import cli
+
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    plan = _plan([a, b], max_concurrent=3)
+
+    payload = cli.dry_run_payload(
+        [a, b], repo_dir=PLAN_REPO, branch_prefix="m3", base_branch="main", max_concurrent=3
+    )
+
+    assert payload == {
+        "max_concurrent": 3,
+        "levels": plan.levels,
+        "already_done": cli.already_done_entries([a, b]),
+        "integrate": plan.integrate,
+    }
 
 
 def test_checkpoint_resume_phase_stays_in_cli():
