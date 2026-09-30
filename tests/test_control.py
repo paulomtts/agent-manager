@@ -230,6 +230,17 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
 
 
+# -- claim keys (multi-process X5) ---------------------------------------------
+
+
+def test_card_claim_and_branch_claim_name_their_keys():
+    card = "ec7ae954-0000-4000-8000-000000000000"
+    assert control.card_claim(card) == f"card:{card}"
+    assert control.branch_claim("m10/task-lease-with-claims-for-ec7ae954") == (
+        "branch:m10/task-lease-with-claims-for-ec7ae954"
+    )
+
+
 # -- Lease ----------------------------------------------------------------------
 
 

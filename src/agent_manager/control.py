@@ -76,6 +76,16 @@ def lease_is_live(
     return lease.host != host or alive(lease.pid)
 
 
+def card_claim(card_id: str) -> str:
+    """The `run_claims` key that says a run is driving card `card_id` (X5)."""
+    return f"card:{card_id}"
+
+
+def branch_claim(branch: str) -> str:
+    """The `run_claims` key that says a run owns git branch `branch` (X5)."""
+    return f"branch:{branch}"
+
+
 class Lease:
     """This process's claim on a run, held for the length of a `with` block (C2).
 
