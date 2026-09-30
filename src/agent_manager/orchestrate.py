@@ -70,22 +70,6 @@ GRAFO_LOGGER = "grafo"
 handler; `supervise` silences it so stdout stays one JSON line (T6)."""
 
 
-STOPPED_PREFIX = "stopped before "
-"""How `walk._stop` opens a stopped subtask's `detail` (addendum P4)."""
-
-
-def stopped_before_phase(detail: str | None) -> str | None:
-    """The phase a stopped subtask would have run next, read out of its detail.
-
-    `walk._stop` writes `"stopped before <phase>"` and the summary has no
-    field of its own for the phase, so this strips the prefix. A detail without
-    the prefix, or no detail at all, gives None.
-    """
-    if detail is None or not detail.startswith(STOPPED_PREFIX):
-        return None
-    return detail[len(STOPPED_PREFIX):]
-
-
 LaneKind = Literal["done", "escalated", "stopped", "pending"]
 """How one story's lane ended (supervisor-tree T6): finished, escalated, stopped
 (parked by the stop, or saw it before a subtask), or never started by the tree."""
@@ -1227,7 +1211,7 @@ async def lane(
                     raise LaneStopped(
                         recorder.stopped(
                             subtask.id,
-                            stopped_before_phase(summary.detail),
+                            summary.before_phase,
                             subtask_row="started",
                         )
                     )

@@ -169,14 +169,6 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
     ]
 
 
-def test_the_before_phase_is_read_out_of_a_stopped_detail():
-    """`walk._stop` writes "stopped before <phase>"; the summary has no field
-    of its own for that phase, so the helper reads it out of `detail`."""
-    assert orchestrate.stopped_before_phase("stopped before implement") == "implement"
-    assert orchestrate.stopped_before_phase("reviewer found a blocker") is None
-    assert orchestrate.stopped_before_phase(None) is None
-
-
 def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
     also = orchestrate.LaneOutcome(
         kind="escalated",
@@ -1102,7 +1094,9 @@ class GatedDriver:
                 )
             elif outcome != "done" and stop is not None and stop.triggered:
                 summary = SubtaskSummary(
-                    status="stopped", detail="stopped before implement"
+                    status="stopped",
+                    detail="stopped before implement",
+                    before_phase="implement",
                 )
             else:
                 summary = SubtaskSummary(status="done")
