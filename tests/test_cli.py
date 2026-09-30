@@ -6539,3 +6539,98 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "thief"
     assert _loaded(project, run_id).status == "started"
+
+
+@requires_git
+@requires_brd
+def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
+    run_id = _crash_pygents(project, cards, "plan")
+    dead = _reaped_pid()
+    beat = datetime.now(timezone.utc)
+    _plant_lease(
+        project,
+        run_id=run_id,
+        token="crashed-life",
+        pid=dead,
+        heartbeat_at=beat,
+        claims=(control.card_claim(cards["subtask"]),),
+    )
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done", payload
+    assert payload["took_over"] == {
+        "pid": dead,
+        "host": HERE,
+        "heartbeat_at": beat.isoformat(),
+    }
+    assert set(payload) == RESUME_KEYS | {"took_over"}
+    assert _card_lease(project, run_id) is None
+    assert _claim_rows(project) == []
+
+
+@requires_git
+@requires_brd
+def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
+    project, cards, monkeypatch
+):
+    run_id = _crash_pygents(project, cards, "plan")
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=now - timedelta(seconds=7),
+        claims=(key,),
+    )
+    # `resume` passes no runner factory, so without this a missing refusal
+    # would reach the real `dispatch.AgentRunner`.
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+    before = (_attempt_rows(project), _checkpoint_rows(project), _runs_snapshot())
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "ClaimedError",
+        "message": (
+            f"card {cards['subtask']} is being driven by run {OTHER_RUN_ID}"
+            f" (pid {os.getpid()} on {HERE}, heartbeat 7s ago);"
+            f" wait for it, or `am pause {OTHER_RUN_ID}`"
+        ),
+    }
+    assert (_attempt_rows(project), _checkpoint_rows(project), _runs_snapshot()) == before
+    assert _card_lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
+    project, cards, monkeypatch
+):
+    """Review Focus 2: C10 in `resume_run` passed, then another `am resume`
+    took the lease; `_resume_from_checkpoint` must refuse before the orphan
+    writes."""
+    run_id = _crash_pygents(project, cards, "plan")
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_lease(project, run_id=run_id, token="racer", heartbeat_at=now - timedelta(seconds=5))
+    before = (_attempt_rows(project), _checkpoint_rows(project), store_module.Journal(run_id).read())
+
+    with pytest.raises(cli.RunIsLiveError) as caught:
+        _resume_card_run(project, run_id, _Forbidden("runner_factory"))
+
+    assert str(caught.value) == (
+        f"run {run_id} is still running in pid {os.getpid()} on {HERE}"
+        " (heartbeat 5s ago); wait for it to exit,"
+        f" or `am status {run_id}`"
+    )
+    assert (
+        _attempt_rows(project),
+        _checkpoint_rows(project),
+        store_module.Journal(run_id).read(),
+    ) == before
+    lease = _card_lease(project, run_id)
+    assert lease is not None and lease.token == "racer"

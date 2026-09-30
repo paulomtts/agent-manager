@@ -1547,31 +1547,42 @@ def _resume_from_checkpoint(
     where the walk goes on. A `milestone` run never comes here: `resume_run`
     hands it to `orchestrate.run_milestone` (card 54e4ec29).
 
-    Live control (C11), as in `run_card`: from the `started` rows through the
-    final ones this life of the run holds a fresh `control.Lease`, and the walk
-    runs under `control.controlled`. A pause parks it `stopped`; a cancel
-    parks it and records the run `cancelled` (`card_run_status`).
+    Live control (C11) and claims (X5), as in `run_card`: the card is refused
+    before `Store.open` if another live run claims it, and from right after
+    `Store.open` through the final rows this life of the run holds a fresh
+    `control.Lease` with the `card:<id>` claim (`run_lease`); a dead holder it
+    took over is reported under `took_over`. The walk runs under
+    `control.controlled`. A pause parks it `stopped`; a cancel parks it and
+    records the run `cancelled` (`card_run_status`).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
     orphans = orphan_attempts(subtask)
     resumed = subtask.model_copy(update={"status": "started"})
+    claims = [control.card_claim(subtask.card_id)]
+    # Read-only and before `Store.open` (X5); the run's own claims are not a
+    # conflict, and `take_lease` below re-checks atomically.
+    refuse_claimed(root, claims, run_id=run.id)
 
     store = Store.open(root, run.id)
     try:
-        checkpoint = store.latest_checkpoint(subtask.card_id)
-        phase = checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
-        for orphan, attempt in orphans:
-            store.record_attempt(
-                story.card_id,
-                subtask.card_id,
-                orphan.name,
-                attempt.model_copy(update={"status": "harness_error"}),
+        # Right after `Store.open` and inside the `try` that closes the store:
+        # a lost race refuses before the orphan writes, every write below is
+        # fenced, and the claims and lease are released before `store.close()`
+        # on every exit, a checkpoint refusal included (C2, X5).
+        with run_lease(store, claims=claims) as lease:
+            checkpoint = store.latest_checkpoint(subtask.card_id)
+            phase = checkpoint_resume_phase(
+                checkpoint, card_id=subtask.card_id, run_id=run.id
             )
-        # After every refusal, and inside the `try` that closes the store, so
-        # the lease is released before `store.close()` on every exit (C2).
-        with control.Lease(store) as lease:
+            for orphan, attempt in orphans:
+                store.record_attempt(
+                    story.card_id,
+                    subtask.card_id,
+                    orphan.name,
+                    attempt.model_copy(update={"status": "harness_error"}),
+                )
             store.record_run(run.model_copy(update={"status": "started"}))
             store.record_story(story.model_copy(update={"status": "started"}))
             store.record_subtask(story.card_id, resumed)
@@ -1607,7 +1618,7 @@ def _resume_from_checkpoint(
                 story.card_id, resumed.model_copy(update={"status": summary.status})
             )
 
-        return {
+        payload: dict[str, Any] = {
             "run_id": run.id,
             "card_id": subtask.card_id,
             "story_id": story.card_id,
@@ -1626,6 +1637,14 @@ def _resume_from_checkpoint(
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
             ],
         }
+        if lease.displaced is not None:
+            # A dead holder's lease was taken over (X5): say whose.
+            payload["took_over"] = {
+                "pid": lease.displaced.pid,
+                "host": lease.displaced.host,
+                "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+            }
+        return payload
     finally:
         store.close()
 
