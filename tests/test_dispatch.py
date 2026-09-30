@@ -877,6 +877,208 @@ def test_a_gate_that_raises_stops_after_one_dispatch(store, tmp_path, worktree):
     assert len(launcher.calls) == 1
 
 
+# ── the gate seam: what AgentRunner does with a gate's answer ────────────────
+# Engine tier (design §14): driven through `_runner` and `FakeLauncher` with
+# canned result files, never a process. The evaluator's own behaviour is tested
+# once, beside it, in tests/runtime/test_walk.py; these pin what an agent phase
+# makes of each outcome, byte for byte, across the S3 rewire.
+
+_BROKEN_RAISED = (
+    "; a gate returns None to pass or a mapping verdict to fail, so this is a "
+    "broken gate rather than a failed attempt"
+)
+_BROKEN_NOT_A_MAPPING = (
+    "; a gate returns None to pass or a mapping verdict to fail, and anything "
+    "else would be read as a pass by accident"
+)
+
+
+def raising_gate(result):
+    raise RuntimeError("the gate itself is broken")
+
+
+def chatty_gate(result):
+    return "looks fine to me"
+
+
+def empty_list_gate(result):
+    return []
+
+
+class _ControlSignal(BaseException):
+    """Stands in for a pygents control-flow signal: a `BaseException`, not an `Exception`."""
+
+
+def _last_phase_detail(opened) -> str | None:
+    return [
+        line.payload["detail"]
+        for line in opened.journal.read()
+        if line.event == "phase_upsert"
+    ][-1]
+
+
+@pytest.mark.parametrize(
+    ("gate", "expected"),
+    [
+        (
+            raising_gate,
+            "phase 'explore' gate 'raising_gate' raised RuntimeError: "
+            "the gate itself is broken" + _BROKEN_RAISED,
+        ),
+        (
+            chatty_gate,
+            "phase 'explore' gate 'chatty_gate' returned str" + _BROKEN_NOT_A_MAPPING,
+        ),
+        (
+            empty_list_gate,
+            "phase 'explore' gate 'empty_list_gate' returned list" + _BROKEN_NOT_A_MAPPING,
+        ),
+    ],
+    ids=["raises", "returns-str", "returns-empty-list"],
+)
+def test_agent_runner_maps_a_broken_gate_to_a_fatal_gate_failed(
+    store, tmp_path, worktree, gate, expected
+):
+    # S3 §6's thin test for the agent phase kind: retry.on lists gate_failed
+    # and the budget is three, yet a broken gate is dispatched exactly once.
+    workflow = _agentic(gate, retry=phases.Retry(3, ("schema_invalid", "gate_failed")))
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert caught.value.detail == expected
+    assert len(launcher.calls) == 1
+    assert _attempt_statuses(store) == [(1, "started"), (1, "gate_failed")]
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+    assert _last_phase_detail(store) == expected
+
+
+def test_a_warning_gate_passes_and_warns_exactly_once(store, tmp_path, worktree):
+    def output_gate(result):
+        return {"warn": "counts unusable"}
+
+    workflow = _agentic(output_gate)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert runner.warnings == [
+        "phase 'explore' gate 'output_gate' warned: counts unusable"
+    ]
+    assert len(launcher.calls) == 1
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+
+
+def test_a_failing_gate_records_the_rendered_message_as_the_detail(
+    store, tmp_path, worktree
+):
+    expected = "phase 'explore' gate '<lambda>' failed: blocked=x, detail=d"
+    workflow = _agentic(lambda result: {"blocked": "x", "detail": "d"})
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert caught.value.detail == expected
+    # Not fatal: retry.on lists gate_failed, so the whole budget of two is spent
+    # and the second prompt carries the rendered message as feedback.
+    assert len(launcher.calls) == 2
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "gate_failed"), (2, "started"), (2, "gate_failed")
+    ]
+    assert _last_phase_detail(store) == expected
+    second = (paths.attempt_dir(RUN_ID, CARD, "explore", 2) / "prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    assert expected in second.split(dispatch.FEEDBACK_HEADING, 1)[1]
+
+
+def test_an_unbindable_gate_parameter_propagates_as_engine_error(
+    store, tmp_path, worktree
+):
+    def output_gate(result, provided_verification):
+        return None
+
+    workflow = _agentic(output_gate)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(EngineError) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.parameter == "provided_verification"
+    assert caught.value.function == "output_gate"
+    assert caught.value.phase == "explore"
+    assert len(launcher.calls) == 1
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+    assert _last_phase_detail(store).startswith(
+        "EngineError: phase 'explore', function 'output_gate', "
+        "parameter 'provided_verification': no value for a required parameter"
+    )
+
+
+def test_a_warning_before_a_failing_gate_is_kept_once(store, tmp_path, worktree):
+    def cautious(result):
+        return {"warn": "coverage dipped"}
+
+    def blocking(result):
+        return {"blocked": "x"}
+
+    workflow = _agentic(cautious, blocking, retry=None)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.detail == "phase 'explore' gate 'blocking' failed: blocked=x"
+    assert runner.warnings == ["phase 'explore' gate 'cautious' warned: coverage dipped"]
+
+
+def test_a_result_less_phase_still_runs_its_gates_against_none(store, tmp_path, worktree):
+    seen: list[object] = []
+
+    def output_gate(result):
+        seen.append(result)
+
+    workflow = _agentic(
+        output_gate,
+        name="spec",
+        result=None,
+        retry=None,
+        writes="docs/superpowers/specs/{stem}.md",
+    )
+    launcher = FakeLauncher(results=[None])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    assert result is None
+    assert seen == [None]
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+
+
+def test_a_control_flow_signal_from_a_gate_is_not_caught(store, tmp_path, worktree):
+    def output_gate(result):
+        raise _ControlSignal()
+
+    workflow = _agentic(output_gate)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(_ControlSignal):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert len(launcher.calls) == 1
+
+
 def test_a_phase_with_no_retry_block_dispatches_exactly_once(store, tmp_path, worktree):
     # Review Focus: TASK's spec, plan, implement and review phases
     # carry no retry at all.
