@@ -16,6 +16,7 @@ the base branch, the story branches, the main checkout and `origin` are
 unchanged: Integrate never writes them and never pushes.
 """
 
+import ast
 import json
 import os
 import shlex
@@ -770,3 +771,38 @@ def test_a_relaunch_after_a_human_finished_the_merge_succeeds_without_dispatch(
     assert _sha(repo.worktree, "HEAD") == head
     assert _git(repo.worktree, "show", "HEAD:shared.txt") == "human fix\n"
     _assert_protected(repo, before, tips)
+
+
+# ── S1: integration reads the run helpers from `runs`, never from `cli` (card 61a0d9be) ──
+
+
+def _cli_imports(source: str) -> list[str]:
+    """Every import in `source`, at any depth, that binds `agent_manager.cli`.
+
+    Same helper as `tests/test_bases.py::_cli_imports`, whose parametrized
+    self-tests pin every spelling it catches.
+    """
+    offending: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            offending += [
+                alias.name
+                for alias in node.names
+                if alias.name == "agent_manager.cli" or alias.name.startswith("agent_manager.cli.")
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                module = "agent_manager" + (f".{module}" if module else "")
+            if module == "agent_manager":
+                offending += [f"agent_manager.{alias.name}" for alias in node.names if alias.name == "cli"]
+            elif module == "agent_manager.cli" or module.startswith("agent_manager.cli."):
+                offending.append(module)
+    return offending
+
+
+def test_integration_source_never_imports_cli():
+    """S1 (card 61a0d9be): `integration` reads `RunnerFactory`, `gate_context`
+    and `worktree_for` from `runs`. A static check, not a behavioural one."""
+    source = Path(integration.__file__).read_text(encoding="utf-8")
+    assert _cli_imports(source) == []

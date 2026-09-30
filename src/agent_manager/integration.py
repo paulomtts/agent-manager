@@ -5,7 +5,7 @@ decisions I1, I3, I4 and I5, narrowed by card 6fea51ad. The order is
 `dag.compute_integrate_levels` over every story, done or not, in census order
 within a level. A story with no subtasks has no tip of its own and is skipped.
 Each tip is merged by `steps.integrate.merge_tip` into `<prefix>-integrate`, in
-the worktree `cli.worktree_for` names. After the last tip the suite runs once in
+the worktree `runs.worktree_for` names. After the last tip the suite runs once in
 that worktree, and `verification_passed_gate` judges what it measured.
 
 A conflicting tip is handed to `workflow.integrate.INTEGRATE` (resolve, then
@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_manager import cli, dag, models
+from agent_manager import dag, models, runs
 from agent_manager.census import StoryPlan
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import SubtaskSummary
@@ -104,7 +104,7 @@ def _final_verification(
 
     An empty suite is judged by `verification_gate` first, because running zero
     commands reports `passed: True` and `verification_passed_gate` would wave it
-    through. `bool()` matches `cli.gate_context`: the reducer tests `is True`.
+    through. `bool()` matches `runs.gate_context`: the reducer tests `is True`.
     """
     missing = reducers.verification_gate(commands, bool(allow_no_verification), True)
     if missing is not None:
@@ -133,7 +133,7 @@ def _resolve_conflict(
     allow_no_verification: bool,
     store: Store,
     run_id: str,
-    runner_factory: cli.RunnerFactory,
+    runner_factory: runs.RunnerFactory,
 ) -> SubtaskSummary:
     """Drive the `integrate` workflow once for one conflicting tip.
 
@@ -163,7 +163,7 @@ def _resolve_conflict(
         "extra_context": {
             "merge_tip": tip,
             "conflict_files": list(files),
-            **cli.gate_context(commands, allow_no_verification),
+            **runs.gate_context(commands, allow_no_verification),
         },
         "agent_runner": runner,
     }
@@ -190,7 +190,7 @@ def integrate_milestone(
     allow_no_verification: bool,
     store: Store,
     run_id: str,
-    runner_factory: cli.RunnerFactory,
+    runner_factory: runs.RunnerFactory,
 ) -> IntegrateOutcome:
     """Merge every story tip into `<branch_prefix>-integrate`, then verify it once.
 
@@ -201,7 +201,7 @@ def integrate_milestone(
     """
     root = Path(repo_dir).resolve()
     branch = integration_branch(branch_prefix)
-    worktree = cli.worktree_for(root, branch)
+    worktree = runs.worktree_for(root, branch)
     suite = list(commands)
     story_row = models.StoryRun(
         card_id=INTEGRATE_STORY_ID,
