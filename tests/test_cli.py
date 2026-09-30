@@ -6490,3 +6490,52 @@ def test_a_card_run_releases_its_claims_on_every_exit(project, cards, monkeypatc
     assert row[:2] == (key, run_id)
     assert _claim_rows(project) == []
     assert _card_lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypatch):
+    """The first phase lets a second process take the run's lease over; the
+    next fenced write raises `LeaseLostError`, which the command renders."""
+    taken: list[str] = []
+
+    def thief_factory(*, store, run_id, story_id, card_id):
+        inner = fake_runner()
+
+        def runner(phase, context, rendered):
+            if phase.name == "explore" and not taken:
+                thief = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+                try:
+                    thief.take_lease(
+                        token="thief",
+                        pid=1,
+                        host="elsewhere",
+                        now=datetime.now(timezone.utc),
+                        is_live=lambda row: False,
+                    )
+                finally:
+                    thief.close()
+                taken.append(run_id)
+            return inner(phase, context, rendered)
+
+        return runner
+
+    monkeypatch.setattr(cli, "default_runner_factory", thief_factory)
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    (run_id,) = taken
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {
+            "type": "LeaseLostError",
+            "message": (
+                f"this process lost the lease of run {run_id!r}:"
+                " pid 1 on elsewhere holds it now"
+            ),
+        },
+    }
+    lease = _card_lease(project, run_id)
+    assert lease is not None and lease.token == "thief"
+    assert _loaded(project, run_id).status == "started"

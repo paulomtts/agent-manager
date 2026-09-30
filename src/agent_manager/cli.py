@@ -1173,6 +1173,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     EngineError,
     ValueError,
     locks.LockTimeoutError,
+    store_module.LeaseLostError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1180,8 +1181,11 @@ HANDLED: tuple[type[BaseException], ...] = (
 bare one for a card id that is not a UUID, and a typed `--card` must not come
 back as a traceback. `locks.LockTimeoutError` is in it because a start refused
 while another `am` process held a project lock past its timeout (spec X7) is a
-refusal, not a bug; nothing below the CLI catches it. Anything outside this
-tuple is a bug in this program and should crash loudly with its stack intact.
+refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostError`
+is in it because another process took this run's lease over mid-walk (spec X4):
+the fence stopped every write, and the operator gets the envelope naming the new
+holder. It is a `BaseException`, so it has to be listed by name. Anything outside
+this tuple is a bug in this program and should crash loudly with its stack intact.
 """
 
 
