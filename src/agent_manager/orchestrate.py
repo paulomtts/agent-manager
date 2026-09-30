@@ -1357,8 +1357,11 @@ def run_milestone(
 
     `resume_run_id` continues that milestone run instead (card 54e4ec29).
     `milestone`, `base_branch`, `branch_prefix`, `max_concurrent` and
-    `clock` are then not read: the milestone is the one the run id names
-    (`find_run_milestone`) and the rest is what the run recorded. The plan is
+    `clock` are then not read: the milestone is the one the run recorded
+    (`find_run_milestone`), and the rest is what the run recorded too. Both a
+    fresh and a resumed run are recorded with `milestone_id` set to the
+    milestone card's full id, which stamps a run recorded before that field
+    existed. The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
     unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
@@ -1414,10 +1417,15 @@ def run_milestone(
             status="started",
             started_at=started_at,
             config=models.RunConfig(max_concurrent_stories=max_concurrent),
+            milestone_id=milestone_card.id,
         )
     else:
         run_id = resumed.id
-        run_record = resumed.model_copy(update={"status": "started"})
+        # Stamps a run recorded before `milestone_id` existed, so the next
+        # resume no longer needs the short-id fallback.
+        run_record = resumed.model_copy(
+            update={"status": "started", "milestone_id": milestone_card.id}
+        )
     store = Store.open(root, run_id)
     try:
         checkpoints: dict[str, Checkpoint] | None = None

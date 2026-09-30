@@ -1952,6 +1952,17 @@ def test_the_bound_is_recorded_in_the_run_config(project):
 
 @requires_git
 @requires_brd
+def test_a_fresh_run_records_its_milestones_full_id(project):
+    shape = _milestone(project, {"A": 1})
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert _load(project, result["run_id"]).milestone_id == shape["milestone"]
+
+
+@requires_git
+@requires_brd
 def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(project):
     shape = _milestone(project, {"A": 2, "B": 1, "C": 1})
     story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
@@ -4333,6 +4344,30 @@ def test_a_refused_resume_never_takes_a_lease(project, monkeypatch):
         _resume(project, run_id, CheckpointDriver(), control_interval=0)
 
     assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_resuming_a_run_recorded_before_milestone_id_stamps_it(project):
+    """A pre-migration run resolves through the short-id fallback once, and
+    its record carries the resolved milestone's full id from then on."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.record_run(_load(project, run_id).model_copy(update={"milestone_id": None}))
+    finally:
+        opened.close()
+    assert _load(project, run_id).milestone_id is None
+
+    result = _resume(project, run_id, FakeDriver())
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert _load(project, run_id).milestone_id == shape["milestone"]
 
 
 @requires_git
