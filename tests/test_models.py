@@ -303,6 +303,32 @@ def test_minimal_run_needs_only_its_identity_fields():
     assert run.config.harness_map == {}
 
 
+MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
+
+
+def test_a_run_without_a_milestone_id_defaults_to_none_and_a_given_one_round_trips():
+    # S2: the milestone a run drives is recorded by full card id. It is
+    # optional because task runs have none and journal lines from before the
+    # field carry no such key, which `extra="forbid"` would otherwise reject.
+    identity = dict(
+        id="20260924T120000Z-9c44c2fb",
+        workflow="milestone",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    )
+    assert models.Run(**identity).milestone_id is None
+
+    stamped = models.Run(**identity, milestone_id=MILESTONE_ID)
+    restored = models.Run.model_validate(stamped.model_dump(mode="json"))
+    assert restored.milestone_id == MILESTONE_ID
+    assert restored == stamped
+
+    old_line = stamped.model_dump(mode="json", exclude={"stories", "milestone_id"})
+    assert "milestone_id" not in old_line
+    assert models.Run.model_validate(old_line).milestone_id is None
+
+
 def test_run_requires_an_id():
     with pytest.raises(ValidationError) as excinfo:
         models.Run(
