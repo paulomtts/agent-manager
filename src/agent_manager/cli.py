@@ -278,19 +278,57 @@ def status_rows(run: models.Run) -> list[dict[str, Any]]:
     return rows
 
 
-def status_payload(run: models.Run) -> dict[str, Any]:
-    """The run's identity, the §9 tree, and the flat table over it.
+def control_view(
+    lease: store_module.LeaseRow | None,
+    requests: Sequence[store_module.ControlRow],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """C12's `control` key: the lease or `None`, and every life's requests in seq order.
+
+    `live` is worked out here, at read time, by `control.lease_is_live`; it
+    is never stored. Timestamps are ISO strings.
+    """
+    return {
+        "lease": None
+        if lease is None
+        else {
+            "pid": lease.pid,
+            "host": lease.host,
+            "acquired_at": lease.acquired_at.isoformat(),
+            "heartbeat_at": lease.heartbeat_at.isoformat(),
+            "accepting": lease.accepting,
+            "live": control.lease_is_live(lease, now=now),
+        },
+        "requests": [
+            {
+                "command": row.command,
+                "requested_at": row.requested_at.isoformat(),
+                "handled_at": None if row.handled_at is None else row.handled_at.isoformat(),
+            }
+            for row in requests
+        ],
+    }
+
+
+def status_payload(
+    run: models.Run, control: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The run's identity, the §9 tree, the flat table over it, and live control.
 
     `model_dump()` rather than `model_dump(mode="json")`: the payload keeps its
     `Path` and `datetime` objects and `render`'s `default=str` stringifies them
     once, at the edge, the same way `run_card`'s `worktree` is handled. Field
-    names are `models.py`'s and are not renamed for display.
+    names are `models.py`'s and are not renamed for display. `control` is
+    `control_view`'s result; `None` renders as no lease and no requests, so
+    the key is always present (C12).
     """
     tree = run.model_dump()
     return {
         "run": {field: tree[field] for field in RUN_IDENTITY},
         "stories": tree["stories"],
         "rows": status_rows(run),
+        "control": {"lease": None, "requests": []} if control is None else control,
     }
 
 
@@ -1204,7 +1242,8 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     path including the refusals, the way `run_card` closes its store. The default
     run id comes from `store_module.latest_run_id`, which is the head of the very
     listing `runs` prints, so the two commands cannot disagree about which run is
-    the most recent one.
+    the most recent one. The lease and every control request are read on the
+    same connection and rendered by `control_view`, still without a write.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1223,7 +1262,12 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
                 f"run {wanted!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
-        return status_payload(run)
+        state = control_view(
+            store_module.read_lease(conn, wanted),
+            store_module.control_requests(conn, wanted),
+            now=_utcnow(),
+        )
+        return status_payload(run, state)
     finally:
         conn.close()
 

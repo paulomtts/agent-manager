@@ -5474,3 +5474,83 @@ def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
         ("life-1", "cancel"),
         ("life-2", "pause"),
     ]
+
+
+def test_the_status_payload_defaults_to_an_empty_control():
+    assert cli.status_payload(_pure_run([]))["control"] == {"lease": None, "requests": []}
+
+
+def test_status_of_a_run_with_no_lease_shows_an_empty_control(projection, monkeypatch):
+    """Spec test 10, first half; Review Focus: the no-RUN_ID default too."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+
+    for args in (["status", CONTROL_RUN_ID], ["status"]):
+        result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["control"] == {
+            "lease": None,
+            "requests": [],
+        }
+
+
+@pytest.mark.parametrize(
+    "heartbeat_at, live",
+    [
+        (CONTROL_NOW - timedelta(seconds=5), True),
+        (CONTROL_NOW - timedelta(seconds=31), False),
+    ],
+    ids=["live", "stale"],
+)
+def test_status_shows_the_lease_and_every_lifes_requests_in_seq_order(
+    projection, monkeypatch, heartbeat_at, live
+):
+    """Spec test 10, second half: C12's exact shape, `live` worked out at read
+    time, and `status` stays read-only."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_control(
+        projection,
+        lease="life-1",
+        command="pause",
+        requested_at=_at(-300),
+        handled_at=_at(-299),
+    )
+    _plant_control(projection, lease="life-1", command="cancel", requested_at=_at(-200))
+    _plant_control(projection, lease="life-2", command="pause", requested_at=_at(-10))
+    _plant_lease(projection, heartbeat_at=heartbeat_at)
+    before = (_controls(projection), _lease(projection))
+
+    for args in (["status", CONTROL_RUN_ID], ["status"]):
+        result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["control"] == {
+            "lease": {
+                "pid": os.getpid(),
+                "host": HERE,
+                "acquired_at": _at(-60).isoformat(),
+                "heartbeat_at": heartbeat_at.isoformat(),
+                "accepting": True,
+                "live": live,
+            },
+            "requests": [
+                {
+                    "command": "pause",
+                    "requested_at": _at(-300).isoformat(),
+                    "handled_at": _at(-299).isoformat(),
+                },
+                {
+                    "command": "cancel",
+                    "requested_at": _at(-200).isoformat(),
+                    "handled_at": None,
+                },
+                {
+                    "command": "pause",
+                    "requested_at": _at(-10).isoformat(),
+                    "handled_at": None,
+                },
+            ],
+        }
+    assert (_controls(projection), _lease(projection)) == before
