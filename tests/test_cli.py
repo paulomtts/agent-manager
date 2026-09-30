@@ -2588,8 +2588,16 @@ def _forbid_writes(monkeypatch) -> None:
 
 
 def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
-    """No run dir or projection, no worktree, no branch, no repo change."""
-    assert list(paths.data_dir().iterdir()) == []
+    """No run dir or projection, no worktree, no branch, no repo change.
+
+    Not a check that `paths.data_dir()` is empty: a board write in the test's
+    own setup (`board.set_status`) takes the process-wide board lock (spec
+    X7) and so leaves its lock file under `data_dir()/projects`, which is not
+    a run left behind.
+    """
+    assert not paths.project_db_path(project).exists()
+    runs_dir = paths.data_dir() / "runs"
+    assert not runs_dir.exists() or list(runs_dir.iterdir()) == []
     worktrees = [
         line
         for line in _git(project, "worktree", "list", "--porcelain").splitlines()
