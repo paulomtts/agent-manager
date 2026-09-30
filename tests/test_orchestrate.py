@@ -171,6 +171,42 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
     ]
 
 
+def test_milestone_claims_lists_milestone_remaining_subtasks_then_integration_branch():
+    """X6: `card:M`, every remaining subtask in census order, then
+    `branch:<prefix>-integrate`. A done subtask, a closed story and a
+    subtask-less story add no key."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    closed = _plan_story(2, [_plan_subtask(21)], status="done")
+    c = _plan_story(3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[a.id])
+    empty = _plan_story(4, [])
+
+    keys = orchestrate.milestone_claims(_plan_id(99), [a, closed, c, empty], "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(12)}",
+        f"card:{_plan_id(31)}",
+        f"card:{_plan_id(32)}",
+        "branch:m3-integrate",
+    ]
+
+
+def test_milestone_claims_has_no_duplicates():
+    """A card listed under two stories is claimed once, at its first place."""
+    shared = _plan_subtask(11)
+    a = _plan_story(1, [shared, _plan_subtask(12)])
+    b = _plan_story(2, [shared])
+
+    keys = orchestrate.milestone_claims(_plan_id(99), [a, b], "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(11)}",
+        f"card:{_plan_id(12)}",
+        "branch:m3-integrate",
+    ]
+
+
 def test_the_before_phase_is_read_out_of_a_stopped_detail():
     """`walk._stop` writes "stopped before <phase>"; the summary has no field
     of its own for that phase, so the helper reads it out of `detail`."""

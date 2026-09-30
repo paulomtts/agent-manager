@@ -1296,6 +1296,26 @@ async def supervise(
         grafo_logger.setLevel(level_before)
 
 
+def milestone_claims(
+    milestone_id: str, stories: Sequence[census.StoryPlan], branch_prefix: str
+) -> list[str]:
+    """The `run_claims` keys a milestone run holds under its lease (X5, X6).
+
+    `card:<milestone_id>`, then `card:<id>` for every remaining subtask
+    (`dag.remaining_subtasks`: a done subtask or a closed story adds none) in
+    census order, then `branch:<branch_prefix>-integrate`. Pure; a key
+    already listed is not repeated, so the first occurrence keeps its place.
+    """
+    keys = [control.card_claim(milestone_id)]
+    keys.extend(
+        control.card_claim(subtask.id)
+        for story in stories
+        for subtask in dag.remaining_subtasks(story)
+    )
+    keys.append(control.branch_claim(integration.integration_branch(branch_prefix)))
+    return list(dict.fromkeys(keys))
+
+
 def run_milestone(
     milestone: str | None,
     *,
