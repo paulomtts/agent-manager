@@ -37,7 +37,9 @@ from typing import Any
 import grafo
 import pytest
 
-from agent_manager import bases, board, census, cli, control, dag, integration, models, orchestrate, paths
+from lockhelpers import _holder, _probe, _reap, _release
+
+from agent_manager import bases, board, census, cli, control, dag, integration, locks, models, orchestrate, paths
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -1812,7 +1814,52 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
         _run(project, shape["milestone"], driver)
 
     assert driver.calls == []
-    assert list(paths.data_dir().iterdir()) == []
+    # No run was left behind: no project db, no run directory. The `git`
+    # ProcessLock's own lock file is the one thing spec X7 does put under the
+    # data directory even on this early a failure (paths.project_lock_path
+    # creates its `projects` directory as soon as the lock object exists).
+    assert not paths.project_db_path(project).exists()
+    runs_dir = paths.data_dir() / "runs"
+    assert not runs_dir.exists() or list(runs_dir.iterdir()) == []
+
+
+def test_refresh_git_prunes_under_the_git_lock(tmp_path, monkeypatch):
+    # Spec X7: `remote`, `fetch origin` and `worktree prune` all run while this
+    # process holds the repository's git flock, so another process's probe
+    # finds it busy at each call.
+    seen: list[tuple[list[str], str]] = []
+
+    def probing_run_git(argv: list[str]) -> str:
+        seen.append((argv[2:], _probe(tmp_path, "git")))
+        return "origin\n" if argv[2:] == ["remote"] else ""
+
+    monkeypatch.setattr(worktree, "run_git", probing_run_git)
+
+    orchestrate.refresh_git(tmp_path)
+
+    assert seen == [
+        (["remote"], "busy"),
+        (["fetch", "origin"], "busy"),
+        (["worktree", "prune"], "busy"),
+    ]
+    assert _probe(tmp_path, "git") == "free"
+
+
+def test_a_git_lock_timeout_in_refresh_git_propagates_before_any_git_call(
+    tmp_path, monkeypatch
+):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(worktree, "run_git", lambda argv: calls.append(argv) or "")
+    lock = worktree.git_lock(tmp_path)
+    monkeypatch.setattr(lock, "_timeout", 0)
+    child = _holder(tmp_path, "git")
+    try:
+        with pytest.raises(locks.LockTimeoutError):
+            orchestrate.refresh_git(tmp_path)
+    finally:
+        _reap(child)
+
+    assert calls == []
 
 
 def test_only_a_stale_story_is_anchored_and_on_its_last_done_subtask():
