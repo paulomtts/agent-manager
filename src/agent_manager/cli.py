@@ -47,8 +47,10 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.store import Store
 from agent_manager.workflow import task as task_workflow
 
-# Re-exported so every `cli.X` caller keeps working while S1 moves the plain
-# run helpers out of the Typer module; `cli.X is runs.X` for each name.
+# The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
+# integration and orchestrate read them off `runs`). This module uses some by
+# their bare names; the rest stay importable as `cli.X` for the tests and e2e
+# drivers that still read them here. `cli.X is runs.X` for every name.
 from agent_manager.runs import (
     RUN_ID_TIME_FORMAT,
     WORKTREE_PARTS,
