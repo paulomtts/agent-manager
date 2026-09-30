@@ -5288,6 +5288,24 @@ def test_a_request_to_a_run_whose_window_has_closed_is_refused(
     assert _controls(projection) == []
 
 
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_dead_lease_is_refused_as_dead_even_when_its_window_has_closed(
+    projection, monkeypatch, command
+):
+    """C8 order: liveness is judged before the window, so a crashed run that
+    had begun finishing points at `am resume`, not at `am status`."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(-31), accepting=False)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    assert _controls(projection) == []
+
+
 @pytest.mark.parametrize(
     "command, lease",
     [
