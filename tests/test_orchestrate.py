@@ -37,7 +37,7 @@ from typing import Any
 import grafo
 import pytest
 
-from lockhelpers import _holder, _probe, _reap, _release
+from lockhelpers import _holder, _probe, _reap
 
 from agent_manager import bases, board, census, cli, control, dag, integration, locks, models, orchestrate, paths
 from agent_manager.runtime import engine as runtime_engine
@@ -1814,13 +1814,19 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
         _run(project, shape["milestone"], driver)
 
     assert driver.calls == []
-    # No run was left behind: no project db, no run directory. The `git`
-    # ProcessLock's own lock file is the one thing spec X7 does put under the
-    # data directory even on this early a failure (paths.project_lock_path
-    # creates its `projects` directory as soon as the lock object exists).
-    assert not paths.project_db_path(project).exists()
-    runs_dir = paths.data_dir() / "runs"
-    assert not runs_dir.exists() or list(runs_dir.iterdir()) == []
+    # No run was left behind: the data directory holds nothing but the `git`
+    # ProcessLock's own lock file, the one thing spec X7 does put there even on
+    # this early a failure (paths.project_lock_path creates its `projects`
+    # directory as soon as the lock object exists).
+    data = paths.data_dir()
+    projects = data / "projects"
+    written = sorted(
+        str(entry.relative_to(data))
+        for entry in data.rglob("*")
+        if entry != projects
+        and not (entry.parent == projects and entry.suffix == ".lock")
+    )
+    assert written == []
 
 
 def test_refresh_git_prunes_under_the_git_lock(tmp_path, monkeypatch):
