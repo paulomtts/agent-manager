@@ -1408,6 +1408,13 @@ def run_milestone(
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     drive = cli.drive_subtask_async if driver is None else driver
+    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
+    # The last refusal (X5, X6): read-only, before `refresh_git` and before
+    # `Store.open`, so a milestone, remaining subtask or integration branch
+    # another live run claims leaves no fetch, prune, run row or run
+    # directory. A resume's own rows are not a conflict; `take_lease` below
+    # re-checks atomically.
+    cli.refuse_claimed(root, keys, run_id=None if resumed is None else resumed.id)
 
     if resumed is None:
         # The first side effect. It runs after every refusal and before the store
@@ -1439,8 +1446,11 @@ def run_milestone(
             checkpoints = resume_checkpoints(store, cards)
             refresh_git(root)
         # After every refusal, and inside the `try` that closes the store, so
-        # the lease is released before `store.close()` (live control C2).
-        with control.Lease(store) as lease:
+        # the claims and the lease are released before `store.close()` on
+        # every exit (live control C2, X5). Taken before `record_run`, so
+        # every run write is fenced by this token; a lost race is
+        # `ClaimedError` or `RunIsLiveError` with nothing recorded.
+        with cli.run_lease(store, claims=keys) as lease:
             store.record_run(run_record)
             rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
             if resumed is not None:
