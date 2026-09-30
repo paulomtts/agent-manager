@@ -116,3 +116,39 @@ def test_importing_runs_loads_neither_typer_nor_cli():
         "assert 'agent_manager.cli' not in sys.modules, 'cli'"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+MOVED_NAMES = (
+    "RUN_ID_TIME_FORMAT",
+    "WORKTREE_PARTS",
+    "CliError",
+    "RepoDirError",
+    "resolve_repo_dir",
+    "mint_run_id",
+    "worktree_for",
+    "RunnerFactory",
+    "gate_context",
+)
+
+
+@pytest.mark.parametrize("name", MOVED_NAMES)
+def test_cli_re_exports_the_moved_name_as_the_same_object(name):
+    from agent_manager import cli
+
+    assert getattr(cli, name) is getattr(runs, name)
+
+
+def test_cli_error_subclasses_share_the_moved_base():
+    from agent_manager import cli
+
+    assert issubclass(cli.UnknownRunError, runs.CliError)
+    assert issubclass(cli.CheckpointMismatchError, runs.CliError)
+    assert runs.CliError in cli.HANDLED
+
+
+def test_default_runner_factory_stays_in_cli():
+    from agent_manager import cli
+
+    assert cli.default_runner_factory.__module__ == "agent_manager.cli"
+    assert not hasattr(runs, "default_runner_factory")
+    assert not hasattr(runs, "run_direct")
