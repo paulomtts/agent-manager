@@ -4,7 +4,7 @@
 models, paths and datetimes -- so a checkpoint's `json.dumps` never meets
 them; `decode` turns the tags back into the typed values. Models are dumped
 by field name, not alias: gates that need aliases get them from
-`dispatch.gate_values`. Tuples come back as lists.
+`walk.gate_values`. Tuples come back as lists.
 """
 
 from __future__ import annotations

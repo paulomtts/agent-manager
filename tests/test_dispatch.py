@@ -9,7 +9,6 @@ test asserts `subprocess.Popen` is never reached.
 """
 
 import dataclasses
-import functools
 import hashlib
 import json
 import subprocess
@@ -32,7 +31,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.harness.base import Outcome, Usage
 from agent_manager.roles.loader import load_role
-from agent_manager.runtime import bridge
+from agent_manager.runtime import bridge, walk
 from agent_manager.workflow import phases
 
 RUN_ID = "run-2026-09-23-01"
@@ -490,114 +489,6 @@ def _model_phase(*gates, **overrides) -> phases.AgentPhase:
     }
     fields.update(overrides)
     return phases.AgentPhase(**fields)
-
-
-def test_callable_gate_is_called_directly():
-    verdict = dispatch.evaluate_gates(
-        _model_phase(lambda result: {"blocked": "x", "detail": "d"}),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is False
-    assert verdict.detail == "phase 'explore' gate '<lambda>' failed: blocked=x, detail=d"
-
-
-def test_a_passing_callable_gate_sees_the_result():
-    seen: list[object] = []
-
-    def output_gate(result):
-        seen.append(result)
-        return None
-
-    verdict = dispatch.evaluate_gates(
-        _model_phase(output_gate),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict is None
-    assert seen == [{"summary": "ok"}]
-
-
-def test_a_callable_gate_that_raises_is_fatal_and_named_by_its_function_name():
-    def output_gate(result):
-        raise RuntimeError("the gate itself is broken")
-
-    verdict = dispatch.evaluate_gates(
-        _model_phase(output_gate),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is True
-    assert "gate 'output_gate' raised RuntimeError: the gate itself is broken" in verdict.detail
-
-
-def test_a_callable_gate_returning_a_non_mapping_is_fatal_and_named_lambda():
-    verdict = dispatch.evaluate_gates(
-        _model_phase(lambda result: "looks fine to me"),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is True
-    assert "gate '<lambda>' returned str" in verdict.detail
-
-
-def test_a_callable_gate_with_an_unsupplied_parameter_is_a_named_engine_error():
-    def output_gate(result, provided_verification):
-        return None
-
-    with pytest.raises(EngineError) as caught:
-        dispatch.evaluate_gates(
-            _model_phase(output_gate),
-            dispatch.gate_values({}, "explore", {"summary": "ok"}),
-            [],
-        )
-
-    assert caught.value.parameter == "provided_verification"
-    assert caught.value.function == "output_gate"
-    assert caught.value.phase == "explore"
-
-
-def test_a_callable_gate_warning_names_the_gate_by_its_function_name():
-    def output_gate(result):
-        return {"warn": "counts unusable"}
-
-    warnings: list[str] = []
-
-    verdict = dispatch.evaluate_gates(
-        _model_phase(output_gate),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        warnings,
-    )
-
-    assert verdict is None
-    assert warnings == ["phase 'explore' gate 'output_gate' warned: counts unusable"]
-
-
-def _blocking_gate(result, blocked):
-    return {"blocked": blocked}
-
-
-def test_a_callable_gate_without_a_name_is_named_by_its_repr():
-    # A functools.partial has no __name__; the display name falls back to repr.
-    gate = functools.partial(_blocking_gate, blocked="x")
-    name = repr(gate)
-
-    verdict = dispatch.evaluate_gates(
-        _model_phase(gate),
-        dispatch.gate_values({}, "explore", {"summary": "ok"}),
-        [],
-    )
-
-    assert verdict.status == "gate_failed"
-    assert verdict.fatal is False
-    assert verdict.detail == f"phase 'explore' gate {name!r} failed: blocked=x"
 
 
 STORY_ID = "2143808b"
@@ -1059,6 +950,60 @@ def test_a_control_flow_signal_from_a_gate_is_not_caught(store, tmp_path, worktr
     with pytest.raises(_ControlSignal):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
 
+    assert len(launcher.calls) == 1
+
+
+def test_agent_runner_takes_a_failing_verdict_from_the_shared_evaluator(
+    store, tmp_path, worktree, monkeypatch
+):
+    # The seam itself (S3): the gate below would pass, so only a runner that
+    # asks `walk.evaluate_gates` can see this `fail`.
+    calls: list[tuple[str, object, object]] = []
+
+    def shared(phase, values, warnings):
+        calls.append((phase.name, values["result"], values["explore"]))
+        return walk.GateVerdict(
+            "fail",
+            {"gate": "g", "verdict": {"k": "v"}, "message": "from the shared evaluator"},
+        )
+
+    monkeypatch.setattr(walk, "evaluate_gates", shared)
+    workflow = _agentic(lambda result: None, retry=None)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    produced = {"summary": "explored the tree", "ok": True}
+    assert caught.value.outcome == "gate_failed"
+    assert caught.value.detail == "from the shared evaluator"
+    assert calls == [("explore", produced, produced)]
+    assert _last_phase_detail(store) == "from the shared evaluator"
+
+
+def test_agent_runner_maps_a_broken_verdict_from_the_shared_evaluator_to_fatal(
+    store, tmp_path, worktree, monkeypatch
+):
+    monkeypatch.setattr(
+        walk,
+        "evaluate_gates",
+        lambda phase, values, warnings: walk.GateVerdict(
+            "broken", {"gate": "g", "reason": "raised", "error": KeyError("gone")}
+        ),
+    )
+    # retry.on lists gate_failed with a budget of two: only `fatal` stops it.
+    workflow = _agentic(lambda result: None)
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert caught.value.detail == (
+        "phase 'explore' gate 'g' raised KeyError: 'gone'" + _BROKEN_RAISED
+    )
     assert len(launcher.calls) == 1
 
 

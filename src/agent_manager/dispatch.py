@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from agent_manager import models, paths, prompt, results
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
-from agent_manager.runtime.walk import RESERVED_CONTEXT_KEYS, bind_arguments
+from agent_manager.runtime import walk
 from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
@@ -259,96 +259,30 @@ def classify(
     return Verdict("ok", result=validated.model_dump(mode="json"))
 
 
-def gate_values(
-    context: Mapping[str, Any], phase_name: str, result: Any
-) -> dict[str, Any]:
-    """The binding table this phase's gates see.
+def _broken_gate_message(phase_name: str, detail: Mapping[str, Any]) -> str:
+    """The detail a broken gate on an agent phase records (architecture-cleanup S3).
 
-    The same table `walk._gate_values` builds for a deterministic phase, and
-    for the same two reasons: the result appears under `result` (the parameter
-    name the ported gates in `steps/reducers.py` declare) and under the phase's
-    own name (how §6 says later phases read it), except where that name is one
-    of the keys the engine owns.
+    `walk.evaluate_gates` reports a gate that raised, or returned something
+    other than `None` or a mapping, as `broken` and leaves the wording to each
+    caller. This is the text dispatch has always journalled for one, rebuilt
+    from the verdict's `gate`, `reason`, `error` and `returned_type`, so the
+    attempt and phase rows an operator reads do not change with the evaluator.
     """
-    values = {**context, "result": result}
-    if phase_name not in RESERVED_CONTEXT_KEYS:
-        values[phase_name] = result
-    return values
-
-
-def _render_verdict(verdict: Mapping[str, Any]) -> str:
-    return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
-
-
-def evaluate_gates(
-    phase: phase_model.AgentPhase,
-    values: Mapping[str, Any],
-    warnings: list[str],
-) -> Verdict | None:
-    """`None` when every gate passes, else the `gate_failed` verdict (§6 step 6).
-
-    A gate returns `None` to pass, a mapping with `warn` to warn, or any other
-    mapping to fail -- the contract `_evaluate_gates` already applies to
-    deterministic phases. No per-gate retryable flag exists and this subtask
-    does not add one: whether a `gate_failed` is retried is `retry.on`'s answer
-    alone.
-
-    The two ways a gate can be *wrong* rather than unhappy -- raising, or
-    returning something that is not a mapping -- come back `fatal`, so no
-    `retry.on` list can re-dispatch into a situation the harness cannot change.
-    A binding failure is different again and propagates as `EngineError`: it
-    means the workflow names a gate whose parameters nothing supplies, which is
-    a bug in the workflow, not in the attempt.
-
-    Every gate is the callable itself, used as-is and named by its `__name__`
-    (its `repr` when it has none) in every message.
-    """
-    for entry in phase.gates:
-        name, gate = getattr(entry, "__name__", repr(entry)), entry
-        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
-        try:
-            verdict = gate(**kwargs)
-        except Exception as error:
-            return Verdict(
-                "gate_failed",
-                detail=(
-                    f"phase {phase.name!r} gate {name!r} raised "
-                    f"{type(error).__name__}: {error}; a gate returns None to pass or "
-                    "a mapping verdict to fail, so this is a broken gate rather than a "
-                    "failed attempt"
-                ),
-                fatal=True,
-            )
-        if verdict is None:
-            continue
-        if not isinstance(verdict, Mapping):
-            return Verdict(
-                "gate_failed",
-                detail=(
-                    f"phase {phase.name!r} gate {name!r} returned "
-                    f"{type(verdict).__name__}; a gate returns None to pass or a "
-                    "mapping verdict to fail, and anything else would be read as a "
-                    "pass by accident"
-                ),
-                fatal=True,
-            )
-        if "warn" in verdict:
-            warnings.append(
-                f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
-            )
-            continue
-        return Verdict(
-            "gate_failed",
-            detail=(
-                f"phase {phase.name!r} gate {name!r} failed: {_render_verdict(verdict)}"
-            ),
+    gate = detail["gate"]
+    if detail["reason"] == "raised":
+        error = detail["error"]
+        return (
+            f"phase {phase_name!r} gate {gate!r} raised "
+            f"{type(error).__name__}: {error}; a gate returns None to pass or "
+            "a mapping verdict to fail, so this is a broken gate rather than a "
+            "failed attempt"
         )
-    return None
-
-
-def _render_error(error: BaseException) -> str:
-    """`walk._render_error`'s format, so both phase kinds fail the same way."""
-    return f"{type(error).__name__}: {error}"
+    return (
+        f"phase {phase_name!r} gate {gate!r} returned "
+        f"{detail['returned_type']}; a gate returns None to pass or a "
+        "mapping verdict to fail, and anything else would be read as a "
+        "pass by accident"
+    )
 
 
 def _utcnow() -> datetime:
@@ -463,7 +397,7 @@ class AgentRunner:
             # resume reads as work still in flight. The exception itself still
             # propagates -- `run_subtask` is the one that decides to escalate.
             self._record_phase(
-                phase, "failed", started_at, self.clock(), _render_error(error)
+                phase, "failed", started_at, self.clock(), walk._render_error(error)
             )
             raise
 
@@ -540,13 +474,23 @@ class AgentRunner:
             outcome, None if model is None else dispatch_record.result_path, model
         )
         if verdict.status == "ok":
-            failure = evaluate_gates(
+            # The one evaluator both phase kinds share (S3). `pass` and `warn`
+            # keep the `ok` verdict -- `evaluate_gates` has already appended any
+            # warning to `self.warnings`, so nothing is appended here. `fail` is
+            # retryable if `retry.on` says so; `broken` never is.
+            gates = walk.evaluate_gates(
                 phase,
-                gate_values(context, phase.name, verdict.result),
+                walk.gate_values(context, phase.name, verdict.result),
                 self.warnings,
             )
-            if failure is not None:
-                verdict = failure
+            if gates.kind == "fail":
+                verdict = Verdict("gate_failed", detail=gates.detail["message"])
+            elif gates.kind == "broken":
+                verdict = Verdict(
+                    "gate_failed",
+                    detail=_broken_gate_message(phase.name, gates.detail),
+                    fatal=True,
+                )
         usage = _usage(target.adapter, outcome)
         self._record_attempt(
             phase,

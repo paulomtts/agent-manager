@@ -380,9 +380,9 @@ def implement_blocked_gate(result: object) -> dict[str, str] | None:
 def critic_blockers_gate(result: object) -> dict[str, str] | None:
     """``None`` when the critic found no blockers, else a blocked verdict.
 
-    ``result`` is the critic phase's own result: both ``walk._gate_values``
-    and ``dispatch.gate_values`` place it under exactly that key, which is why
-    the parameter is not named after either phase.
+    ``result`` is the critic phase's own result: ``walk.gate_values``, which
+    builds the gate table for both phase kinds, places it under exactly that
+    key, which is why the parameter is not named after either phase.
 
     A dead validator -- ``None``, or anything that is not a ``Mapping`` -- is
     itself a block, checked before ``blockers`` rather than falling out of its

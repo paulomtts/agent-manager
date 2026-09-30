@@ -115,9 +115,9 @@ def _context() -> dict[str, Any]:
 
 def _values_for(phase_name: str) -> dict[str, Any]:
     """The binding table this phase's gates really see: the context, every
-    earlier phase's result under its own name, then `dispatch.gate_values`'
-    `result` / `<phase name>` overlay (`walk._gate_values` builds the same
-    table for the `verify` step)."""
+    earlier phase's result under its own name, then `walk.gate_values`'
+    `result` / `<phase name>` overlay (the one table both the `resolve` agent
+    phase and the `verify` step bind gates against)."""
     results = _phase_results()
     context = _context()
     for name in INTEGRATE.phase_names:
@@ -125,7 +125,7 @@ def _values_for(phase_name: str) -> dict[str, Any]:
             break
         if name not in walk.RESERVED_CONTEXT_KEYS:
             context[name] = results[name]
-    return dispatch.gate_values(context, phase_name, results[phase_name])
+    return walk.gate_values(context, phase_name, results[phase_name])
 
 
 GATED_PHASES = [
