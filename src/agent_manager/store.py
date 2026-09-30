@@ -137,12 +137,43 @@ database briefly. It is not a licence for two `am` processes to write one run:
 that is still unsupported (P2)."""
 
 
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("phases", "detail", "TEXT"),
+)
+"""Columns added to a table after it first shipped, as (table, column, type).
+
+`CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a database
+created before one of these columns existed would never get it. Each column
+must also appear, last, in that table's `CREATE` in `_SCHEMA`, so a fresh and a
+migrated database end up with the same column order."""
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Add each `_ADDED_COLUMNS` entry its table lacks, and touch nothing else.
+
+    SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is read first
+    and `ALTER TABLE ... ADD COLUMN` runs only for a missing column. Nothing is
+    caught: any SQLite error propagates unchanged.
+    """
+    for table, column, sql_type in _ADDED_COLUMNS:
+        present = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the per-project projection, applying the schema idempotently.
 
     WAL mode is set before the schema so a reader never blocks the writer. Every
-    `CREATE` is `IF NOT EXISTS`, so reopening an existing database neither
-    destroys nor migrates what is already there.
+    `CREATE` is `IF NOT EXISTS`, so reopening an existing database never
+    destroys what is already there. The only migration is additive:
+    `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
+    table lacks, as a nullable column. Existing rows keep their data and read
+    the new column as NULL. It is a no-op on a database that already has the
+    column, so opening the same database any number of times is safe.
 
     The connection may be used from any thread of the one process that writes a
     run (P2), so `check_same_thread` is off; `Store` serialises that use behind
@@ -158,6 +189,7 @@ def open_db(root: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
     return conn
 

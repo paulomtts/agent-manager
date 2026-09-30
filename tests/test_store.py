@@ -1886,6 +1886,79 @@ def test_re_recording_a_phase_overwrites_its_detail(repo):
     assert rows == 2
 
 
+_LEGACY_PHASES = """
+DROP TABLE phases;
+CREATE TABLE phases (
+    run_id     TEXT NOT NULL,
+    story_id   TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    started_at TEXT,
+    ended_at   TEXT,
+    position   INTEGER NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id, name)
+);
+INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
+                    started_at, ended_at, position)
+VALUES ('run-2026-09-23-01', '8831189b', 'ef248597', 'verify', 'deterministic',
+        'failed', NULL, NULL, 0);
+"""
+"""The `phases` table exactly as it shipped before `detail`, with one row."""
+
+
+def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it(repo):
+    # The journal already carries the reason; only the projection lost it.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_failed_phase(st, repo)
+    finally:
+        st.close()
+
+    legacy = store.open_db(repo)
+    legacy.executescript(_LEGACY_PHASES)
+    legacy.commit()
+    legacy.close()
+
+    migrated = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(phases)").fetchall()
+        ]
+        kept = [
+            (row["name"], row["status"], row["detail"])
+            for row in migrated.execute("SELECT name, status, detail FROM phases")
+        ]
+        stale = store.load_run(migrated, RUN_ID)
+    finally:
+        migrated.close()
+
+    assert columns == PHASE_COLUMNS
+    assert kept == [("verify", "failed", None)]
+    assert _phase_details(stale) == [("verify", "failed", None)]
+
+    # Opening an already-migrated database again adds nothing and raises nothing.
+    again = store.open_db(repo)
+    try:
+        reopened_columns = [
+            row["name"] for row in again.execute("PRAGMA table_info(phases)").fetchall()
+        ]
+    finally:
+        again.close()
+    assert reopened_columns == PHASE_COLUMNS
+
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert _phase_details(after) == _EXPECTED_DETAILS
+
+
 # -- checkpoints ---------------------------------------------------------------
 #
 # A row-only table outside the journal (pygents-engine spec §6). Steps tier:
