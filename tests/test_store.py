@@ -1959,6 +1959,168 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
     assert _phase_details(after) == _EXPECTED_DETAILS
 
 
+# -- run milestone id ----------------------------------------------------------
+#
+# `Run.milestone_id` is the full id of the milestone card a run drives
+# (architecture cleanup S2). The journal carries it through `record_run`'s
+# model dump; these pin that the projection does too. Steps tier: real temp DB
+# and journal, no harness.
+
+MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
+
+RUN_COLUMNS = [
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "config",
+    "milestone_id",
+]
+"""`milestone_id` is last: `ALTER TABLE ... ADD COLUMN` appends, so a fresh and
+a migrated database only agree if the schema puts it there too."""
+
+
+def _run_columns(conn: sqlite3.Connection) -> list[str]:
+    return [row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()]
+
+
+def test_a_fresh_runs_table_carries_milestone_id_as_its_last_column(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = _run_columns(conn)
+    finally:
+        conn.close()
+
+    assert columns == RUN_COLUMNS
+
+
+def test_a_runs_milestone_id_round_trips_through_load_run_and_is_overwritten(repo):
+    # A resume re-records an existing run row to stamp it, so the upsert's
+    # conflict clause must assign the new value, not keep the old NULL.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        unstamped = st.load_run(RUN_ID)
+        st.record_run(_run(repo).model_copy(update={"milestone_id": MILESTONE_ID}))
+        via_store = st.load_run(RUN_ID)
+        via_connection = store.load_run(st.connection, RUN_ID)
+        rows = st.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    finally:
+        st.close()
+
+    assert unstamped is not None and unstamped.milestone_id is None
+    assert via_store is not None and via_store.milestone_id == MILESTONE_ID
+    assert via_connection is not None and via_connection.milestone_id == MILESTONE_ID
+    assert rows == 1
+
+
+_LEGACY_RUNS = """
+DROP TABLE runs;
+CREATE TABLE runs (
+    id            TEXT PRIMARY KEY,
+    workflow      TEXT NOT NULL,
+    repo_dir      TEXT NOT NULL,
+    base_branch   TEXT NOT NULL,
+    branch_prefix TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    started_at    TEXT,
+    config        TEXT NOT NULL
+);
+INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix, status,
+                  started_at, config)
+VALUES ('run-2026-09-23-01', 'milestone', '/repo', 'main', 'm1/', 'escalated',
+        NULL, '{}');
+"""
+"""The `runs` table exactly as it shipped before `milestone_id`, with one row."""
+
+
+def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_row(repo):
+    fresh = store.open_db(repo)
+    try:
+        fresh_columns = _run_columns(fresh)
+        fresh.executescript(_LEGACY_RUNS)
+        fresh.commit()
+    finally:
+        fresh.close()
+
+    migrated = store.open_db(repo)
+    try:
+        migrated_columns = _run_columns(migrated)
+        kept = [
+            (row["id"], row["status"], row["milestone_id"])
+            for row in migrated.execute("SELECT id, status, milestone_id FROM runs")
+        ]
+        old = store.load_run(migrated, RUN_ID)
+    finally:
+        migrated.close()
+
+    assert migrated_columns == fresh_columns == RUN_COLUMNS
+    assert kept == [(RUN_ID, "escalated", None)]
+    assert old is not None
+    assert (old.id, old.status, old.milestone_id) == (RUN_ID, "escalated", None)
+
+    # Opening an already-migrated database again adds nothing and raises nothing.
+    again = store.open_db(repo)
+    try:
+        reopened_columns = _run_columns(again)
+    finally:
+        again.close()
+    assert reopened_columns == RUN_COLUMNS
+
+
+def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo).model_copy(update={"milestone_id": MILESTONE_ID}))
+    finally:
+        st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.milestone_id == MILESTONE_ID
+    assert after is not None and after.milestone_id == MILESTONE_ID
+    assert after == returned
+
+
+def test_a_run_upsert_line_from_before_milestone_id_rebuilds_to_none(repo):
+    # A journal written before the field existed has no `milestone_id` key at
+    # all (not `null`): it must still validate, and project a NULL column.
+    payload = _run(repo).model_dump(mode="json", exclude={"stories", "milestone_id"})
+    assert "milestone_id" not in payload
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _append_raw(
+            st.journal,
+            {
+                "seq": 1,
+                "ts": "2026-09-23T10:00:00+00:00",
+                "run_id": RUN_ID,
+                "event": "run_upsert",
+                "payload": payload,
+            },
+        )
+        returned = st.rebuild_from_journal(RUN_ID)
+        after = st.load_run(RUN_ID)
+        row = st.connection.execute(
+            "SELECT milestone_id FROM runs WHERE id = ?", (RUN_ID,)
+        ).fetchone()
+    finally:
+        st.close()
+
+    assert returned.milestone_id is None
+    assert after is not None and after.milestone_id is None
+    assert row["milestone_id"] is None
+
+
 # -- checkpoints ---------------------------------------------------------------
 #
 # A row-only table outside the journal (pygents-engine spec §6). Steps tier:

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS runs (
     branch_prefix TEXT NOT NULL,
     status        TEXT NOT NULL,
     started_at    TEXT,
-    config        TEXT NOT NULL
+    config        TEXT NOT NULL,
+    milestone_id  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -139,6 +140,7 @@ that is still unsupported (P2)."""
 
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("phases", "detail", "TEXT"),
+    ("runs", "milestone_id", "TEXT"),
 )
 """Columns added to a table after it first shipped, as (table, column, type).
 
@@ -492,6 +494,7 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
         status=row["status"],
         started_at=row["started_at"],
         config=json.loads(row["config"]),
+        milestone_id=row["milestone_id"],
     )
 
     for story_row in conn.execute(
@@ -873,9 +876,9 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,
-                              status, started_at, config)
+                              status, started_at, config, milestone_id)
             VALUES (:id, :workflow, :repo_dir, :base_branch, :branch_prefix,
-                    :status, :started_at, :config)
+                    :status, :started_at, :config, :milestone_id)
             ON CONFLICT(id) DO UPDATE SET
                 workflow=excluded.workflow,
                 repo_dir=excluded.repo_dir,
@@ -883,7 +886,8 @@ class Store:
                 branch_prefix=excluded.branch_prefix,
                 status=excluded.status,
                 started_at=excluded.started_at,
-                config=excluded.config
+                config=excluded.config,
+                milestone_id=excluded.milestone_id
             """,
             {
                 "id": run_id,
@@ -894,6 +898,7 @@ class Store:
                 "status": run.status,
                 "started_at": _iso(run.started_at),
                 "config": json.dumps(run.config.model_dump(mode="json"), sort_keys=True),
+                "milestone_id": run.milestone_id,
             },
         )
         self._conn.commit()
