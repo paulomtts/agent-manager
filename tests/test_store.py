@@ -2423,3 +2423,169 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
 
     assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "cancelled")]
     assert status == "cancelled"
+
+
+# -- run claims, lease takeover and fencing ----------------------------------------
+#
+# Multi-process design X4/X5/X9. Steps tier: real temp DB and journal, no
+# harness. A "second process" is a second `Store`/connection, except in the
+# two-process race test, which uses real child processes ordered by pipes.
+
+
+def _alive(row: store.LeaseRow) -> bool:
+    return True
+
+
+def _dead(row: store.LeaseRow) -> bool:
+    return False
+
+
+def _plant_lease(repo: Path, run_id: str, *, token: str) -> store.LeaseRow:
+    """A `run_claims` row, as another process's `take_lease` would have left it."""
+    conn = store.open_db(repo)
+    try:
+        with store.immediate(conn):
+            conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, 1, 'h', ?, ?, 1)"
+                " ON CONFLICT(run_id) DO UPDATE SET token = excluded.token",
+                (run_id, token, _at(0).isoformat(), _at(0).isoformat()),
+            )
+        row = store.read_lease(conn, run_id)
+    finally:
+        conn.close()
+    assert row is not None
+    return row
+
+
+def _plant_claim(repo: Path, key: str, *, run_id: str, token: str) -> None:
+    """A `run_claims` row, as another process's `take_lease` would have left it."""
+    conn = store.open_db(repo)
+    try:
+        with store.immediate(conn):
+            conn.execute(
+                "INSERT INTO run_claims (key, run_id, token, claimed_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                " run_id = excluded.run_id, token = excluded.token",
+                (key, run_id, token, _at(0).isoformat()),
+            )
+    finally:
+        conn.close()
+
+
+def test_the_claims_table_appears_on_an_existing_database(repo):
+    # A pre-M10 database: everything but `run_claims`.
+    first = store.open_db(repo)
+    first.execute("DROP TABLE IF EXISTS run_claims")
+    first.commit()
+    first.close()
+
+    conn = store.open_db(repo)
+    try:
+        claims = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_claims)").fetchall()
+        ]
+        leases = [
+            row["name"] for row in conn.execute("PRAGMA table_info(run_leases)").fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert claims == ["key", "run_id", "token", "claimed_at"]
+    # No existing table gains a column.
+    assert leases == [
+        "run_id",
+        "token",
+        "pid",
+        "host",
+        "acquired_at",
+        "heartbeat_at",
+        "accepting",
+    ]
+
+
+def test_lease_errors_name_their_holder_and_a_lost_lease_is_not_an_exception():
+    holder = store.LeaseRow(
+        run_id=RUN_ID,
+        token="t1",
+        pid=42,
+        host="h",
+        acquired_at=_at(0),
+        heartbeat_at=_at(0),
+        accepting=True,
+    )
+    held = store.LeaseHeldError(holder)
+    assert isinstance(held, RuntimeError) and held.holder == holder
+
+    claimed = store.ClaimHeldError("card:x", holder)
+    assert isinstance(claimed, RuntimeError)
+    assert (claimed.key, claimed.holder) == ("card:x", holder)
+
+    lost = store.LeaseLostError(RUN_ID, None)
+    assert (lost.run_id, lost.holder) == (RUN_ID, None)
+    assert isinstance(lost, BaseException) and not isinstance(lost, Exception)
+    with pytest.raises(store.LeaseLostError):
+        try:
+            raise store.LeaseLostError(RUN_ID, holder)
+        except Exception:  # must not catch it
+            pytest.fail("`except Exception` swallowed LeaseLostError")
+
+    take = store.LeaseTake(lease=holder, displaced=None)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        take.displaced = holder  # type: ignore[misc]
+
+
+def test_claim_conflicts_is_read_only_and_ignores_the_runs_own(repo):
+    holder = _plant_lease(repo, "run-a", token="ta")
+    _plant_claim(repo, "card:x", run_id="run-a", token="ta")
+    # run-c's lease has moved on to a new token: its old claim is dead.
+    _plant_lease(repo, "run-c", token="tc-new")
+    _plant_claim(repo, "card:z", run_id="run-c", token="tc-old")
+    # run-d has no lease row at all.
+    _plant_claim(repo, "card:w", run_id="run-d", token="td")
+    keys = ["card:x", "card:z", "card:w", "card:never"]
+
+    seen: list[store.LeaseRow] = []
+
+    def live(row: store.LeaseRow) -> bool:
+        seen.append(row)
+        return True
+
+    conn = store.open_db(repo)
+    try:
+        changes = conn.total_changes
+        assert store.claim_conflicts(conn, keys, is_live=live, run_id="run-b") == [
+            ("card:x", holder)
+        ]
+        # Liveness is asked only of a claim whose run's lease still carries its token.
+        assert seen == [holder]
+        assert store.claim_conflicts(conn, keys, is_live=_alive) == [("card:x", holder)]
+        assert store.claim_conflicts(conn, keys, is_live=_alive, run_id="run-a") == []
+        assert store.claim_conflicts(conn, keys, is_live=_dead, run_id="run-b") == []
+        assert store.claim_conflicts(conn, [], is_live=_alive) == []
+        assert conn.total_changes == changes
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+
+def test_held_claims_lists_one_tokens_keys_in_key_order(repo):
+    _plant_claim(repo, "card:b", run_id="run-a", token="ta")
+    _plant_claim(repo, "branch:m10/x", run_id="run-a", token="ta")
+    _plant_claim(repo, "card:c", run_id="run-a", token="old")
+    _plant_claim(repo, "card:d", run_id="run-b", token="ta")
+
+    conn = store.open_db(repo)
+    try:
+        rows = store.held_claims(conn, "run-a", "ta")
+        nobody = store.held_claims(conn, "run-a", "nobody")
+    finally:
+        conn.close()
+
+    assert rows == [
+        store.ClaimRow(key="branch:m10/x", run_id="run-a", token="ta", claimed_at=_at(0)),
+        store.ClaimRow(key="card:b", run_id="run-a", token="ta", claimed_at=_at(0)),
+    ]
+    assert nobody == []
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rows[0].token = "other"  # type: ignore[misc]

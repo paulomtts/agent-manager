@@ -15,7 +15,7 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -123,6 +123,13 @@ CREATE TABLE IF NOT EXISTS run_leases (
     acquired_at  TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL,
     accepting    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_claims (
+    key        TEXT PRIMARY KEY,
+    run_id     TEXT NOT NULL,
+    token      TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
 );
 """
 
@@ -607,6 +614,118 @@ def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
         "SELECT * FROM run_leases WHERE run_id = ?", (run_id,)
     ).fetchone()
     return None if row is None else _lease_from_row(row)
+
+
+@dataclass(frozen=True)
+class ClaimRow:
+    """One key a run's lease owns: a row of `run_claims` (multi-process X5).
+
+    Row-only and outside the journal, like `LeaseRow`. A claim counts only
+    while the `run_leases` row of `run_id` still carries `token` and is live;
+    otherwise the next `Store.take_lease` naming the key overwrites it.
+    """
+
+    key: str
+    run_id: str
+    token: str
+    claimed_at: datetime
+
+
+def _claim_from_row(row: sqlite3.Row) -> ClaimRow:
+    return ClaimRow(
+        key=row["key"],
+        run_id=row["run_id"],
+        token=row["token"],
+        claimed_at=datetime.fromisoformat(row["claimed_at"]),
+    )
+
+
+@dataclass(frozen=True)
+class LeaseTake:
+    """What `Store.take_lease` took, and the earlier lease row it replaced, if any."""
+
+    lease: LeaseRow
+    displaced: LeaseRow | None
+
+
+class LeaseHeldError(RuntimeError):
+    """Another process holds this run's lease and it is live (multi-process X5)."""
+
+    def __init__(self, holder: LeaseRow) -> None:
+        super().__init__(
+            f"run {holder.run_id!r} is held by a live lease"
+            f" (pid {holder.pid} on {holder.host})"
+        )
+        self.holder = holder
+
+
+class ClaimHeldError(RuntimeError):
+    """A claim key belongs to another run whose lease is live (multi-process X5)."""
+
+    def __init__(self, key: str, holder: LeaseRow) -> None:
+        super().__init__(
+            f"{key!r} is claimed by run {holder.run_id!r}, whose lease is live"
+            f" (pid {holder.pid} on {holder.host})"
+        )
+        self.key = key
+        self.holder = holder
+
+
+class LeaseLostError(BaseException):
+    """A bound store's lease was taken over or deleted: it must write nothing (X4).
+
+    A `BaseException`, not an `Exception`, so no `except Exception` in the
+    engine can swallow it and carry on writing a run this process no longer
+    owns. `holder` is the lease row now in place, or `None` if there is none.
+    """
+
+    def __init__(self, run_id: str, holder: LeaseRow | None) -> None:
+        who = (
+            "no process holds it now"
+            if holder is None
+            else f"pid {holder.pid} on {holder.host} holds it now"
+        )
+        super().__init__(f"this process lost the lease of run {run_id!r}: {who}")
+        self.run_id = run_id
+        self.holder = holder
+
+
+def claim_conflicts(
+    conn: sqlite3.Connection,
+    keys: Iterable[str],
+    *,
+    is_live: Callable[[LeaseRow], bool],
+    run_id: str | None = None,
+) -> list[tuple[str, LeaseRow]]:
+    """The keys of `keys`, in order, that another run's live lease holds.
+
+    Read-only. A key conflicts when its `run_claims` row names a run other
+    than `run_id`, that run's `run_leases` row still carries the claim's
+    token, and `is_live` says that lease row is live. `is_live` is injected so
+    this module never imports `control`; it is asked only about a claim whose
+    token still matches its run's lease.
+    """
+    conflicts: list[tuple[str, LeaseRow]] = []
+    for key in keys:
+        claim = conn.execute(
+            "SELECT run_id, token FROM run_claims WHERE key = ?", (key,)
+        ).fetchone()
+        if claim is None or claim["run_id"] == run_id:
+            continue
+        lease = read_lease(conn, claim["run_id"])
+        if lease is None or lease.token != claim["token"] or not is_live(lease):
+            continue
+        conflicts.append((key, lease))
+    return conflicts
+
+
+def held_claims(conn: sqlite3.Connection, run_id: str, token: str) -> list[ClaimRow]:
+    """Every claim `run_id` holds under `token`, in key order."""
+    rows = conn.execute(
+        "SELECT * FROM run_claims WHERE run_id = ? AND token = ? ORDER BY key",
+        (run_id, token),
+    ).fetchall()
+    return [_claim_from_row(row) for row in rows]
 
 
 @dataclass(frozen=True)
