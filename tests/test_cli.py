@@ -5544,7 +5544,11 @@ def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
 
 
 def test_the_status_payload_defaults_to_an_empty_control():
-    assert cli.status_payload(_pure_run([]))["control"] == {"lease": None, "requests": []}
+    assert cli.status_payload(_pure_run([]))["control"] == {
+        "lease": None,
+        "requests": [],
+        "claims": [],
+    }
 
 
 def test_status_of_a_run_with_no_lease_shows_an_empty_control(projection, monkeypatch):
@@ -5559,6 +5563,7 @@ def test_status_of_a_run_with_no_lease_shows_an_empty_control(projection, monkey
         assert json.loads(result.stdout)["data"]["control"] == {
             "lease": None,
             "requests": [],
+            "claims": [],
         }
 
 
@@ -5619,6 +5624,7 @@ def test_status_shows_the_lease_and_every_lifes_requests_in_seq_order(
                     "handled_at": None,
                 },
             ],
+            "claims": [],
         }
     assert (_controls(projection), _lease(projection)) == before
 
@@ -6634,3 +6640,71 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     ) == before
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "racer"
+
+
+@pytest.mark.parametrize(
+    "heartbeat_at, shown",
+    [
+        (CONTROL_NOW - timedelta(seconds=5), ["branch:m10/task-x", "card:card-1"]),
+        (CONTROL_NOW - timedelta(seconds=31), []),
+    ],
+    ids=["live", "stale"],
+)
+def test_status_lists_the_claims_of_the_live_lease(projection, monkeypatch, heartbeat_at, shown):
+    """A live lease's claims in key order; a stale lease's leftover claims are
+    not shown (Review Focus 5). `status` stays read-only."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(
+        projection,
+        heartbeat_at=heartbeat_at,
+        claims=("card:card-1", "branch:m10/task-x"),
+    )
+    before = (_lease(projection), _claim_rows(projection))
+
+    result = runner.invoke(cli.app, ["status", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["control"]["claims"] == shown
+    assert (_lease(projection), _claim_rows(projection)) == before
+
+
+@requires_git
+@requires_brd
+def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypatch):
+    _record_for_logs(project, LOGS_RUN_ID)
+    _plant_lease(
+        project,
+        run_id=LOGS_RUN_ID,
+        token="reader-test",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=("card:card-1",),
+    )
+    before = (_card_lease(project, LOGS_RUN_ID), _claim_rows(project))
+
+    def forbidden(name: str):
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError(f"a reader reached {name}")
+
+        return refuse
+
+    monkeypatch.setattr(store_module.Store, "take_lease", forbidden("Store.take_lease"))
+    monkeypatch.setattr(locks.ProcessLock, "acquire", forbidden("ProcessLock.acquire"))
+    monkeypatch.setattr(cli, "run_lease", forbidden("cli.run_lease"))
+
+    status = runner.invoke(cli.app, ["status", LOGS_RUN_ID, "--repo-dir", str(project)])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.stdout)["data"]["control"]["claims"] == ["card:card-1"]
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(project)])
+    assert listed.exit_code == 0, listed.output
+
+    logged = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(project)]
+    )
+    assert logged.exit_code == 0, logged.output
+
+    previewed = _dry_run(project, "make the skeleton real")
+    assert previewed.exit_code == 0, previewed.output
+
+    assert (_card_lease(project, LOGS_RUN_ID), _claim_rows(project)) == before

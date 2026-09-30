@@ -299,8 +299,10 @@ def control_view(
     requests: Sequence[store_module.ControlRow],
     *,
     now: datetime,
+    claims: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """C12's `control` key: the lease or `None`, and every life's requests in seq order.
+    """C12's `control` key: the lease or `None`, every life's requests in seq
+    order, and `claims`, the keys the live lease holds (X5; empty otherwise).
 
     `live` is worked out here, at read time, by `control.lease_is_live`; it
     is never stored. Timestamps are ISO strings.
@@ -324,6 +326,7 @@ def control_view(
             }
             for row in requests
         ],
+        "claims": list(claims),
     }
 
 
@@ -344,7 +347,9 @@ def status_payload(
         "run": {field: tree[field] for field in RUN_IDENTITY},
         "stories": tree["stories"],
         "rows": status_rows(run),
-        "control": {"lease": None, "requests": []} if control is None else control,
+        "control": {"lease": None, "requests": [], "claims": []}
+        if control is None
+        else control,
     }
 
 
@@ -1398,10 +1403,20 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
                 f"run {wanted!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
+        lease = store_module.read_lease(conn, wanted)
+        now = _utcnow()
+        # Only a live lease's claims count (X5): a dead one's leftover rows
+        # are anyone's to take, so they are not shown as held.
+        claims = (
+            [claim.key for claim in store_module.held_claims(conn, wanted, lease.token)]
+            if lease is not None and control.lease_is_live(lease, now=now)
+            else []
+        )
         state = control_view(
-            store_module.read_lease(conn, wanted),
+            lease,
             store_module.control_requests(conn, wanted),
-            now=_utcnow(),
+            now=now,
+            claims=claims,
         )
         return status_payload(run, state)
     finally:
