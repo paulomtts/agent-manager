@@ -17,11 +17,12 @@ import inspect
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -5078,3 +5079,301 @@ def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
 
     assert result.exit_code == code, result.output
     assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+# -- live control: am pause / am cancel / status control / resume guard -------
+#
+# Live control spec section 7 puts CLI refusals, idempotence, status and the
+# resume guard here. Runs, leases and requests are planted straight into the
+# projection through `store_module.open_db`, which is exactly how a second
+# `am` process reaches them. No sleeps: `cli._utcnow` is frozen and every
+# heartbeat is planted relative to it.
+
+CONTROL_RUN_ID = "20260929T090000Z-cbe34d00"
+CONTROL_NOW = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+HERE = socket.gethostname()
+CONTROL_KEYS = {
+    "run_id",
+    "command",
+    "effective",
+    "requested_at",
+    "already_requested",
+    "message",
+}
+
+
+def _at(seconds: float) -> datetime:
+    return CONTROL_NOW + timedelta(seconds=seconds)
+
+
+def _freeze_clock(monkeypatch, at: datetime = CONTROL_NOW) -> None:
+    """Every `cli._utcnow()` call site reads the module global at call time."""
+    monkeypatch.setattr(cli, "_utcnow", lambda: at)
+
+
+def _plant_run(root: Path, *, status: str = "started", workflow: str = "task") -> None:
+    if workflow == "task":
+        _record(root, CONTROL_RUN_ID, started_at=RECORDED_AT, status=status, with_phases=False)
+    else:
+        _record_milestone(root, CONTROL_RUN_ID, status=status, workflow=workflow)
+
+
+def _plant_lease(
+    root: Path,
+    *,
+    token: str = "life-2",
+    pid: int | None = None,
+    host: str | None = None,
+    heartbeat_at: datetime = CONTROL_NOW,
+    accepting: bool = True,
+) -> None:
+    """A `run_leases` row, as another process's `Lease` would have left it.
+
+    Defaults to this process on this host with a heartbeat at the frozen
+    clock: live by C2.
+    """
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        conn.execute(
+            "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+            " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
+            " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
+            " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
+            (
+                CONTROL_RUN_ID,
+                token,
+                os.getpid() if pid is None else pid,
+                HERE if host is None else host,
+                _at(-60).isoformat(),
+                heartbeat_at.isoformat(),
+                int(accepting),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _plant_control(
+    root: Path,
+    *,
+    lease: str,
+    command: str,
+    requested_at: datetime,
+    handled_at: datetime | None = None,
+) -> None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        with store_module.immediate(conn):
+            row = store_module.add_control(
+                conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
+            )
+            if handled_at is not None:
+                conn.execute(
+                    "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
+                    (handled_at.isoformat(), CONTROL_RUN_ID, row.seq),
+                )
+    finally:
+        conn.close()
+
+
+def _controls(root: Path) -> list[tuple[str, str]]:
+    """Every `run_controls` row of the run as `(lease, command)`, in seq order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            (row.lease, row.command)
+            for row in store_module.control_requests(conn, CONTROL_RUN_ID)
+        ]
+    finally:
+        conn.close()
+
+
+def _lease(root: Path) -> store_module.LeaseRow | None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return store_module.read_lease(conn, CONTROL_RUN_ID)
+    finally:
+        conn.close()
+
+
+def _invoke_control(root: Path, command: str, run_id: str = CONTROL_RUN_ID, *extra: str):
+    return runner.invoke(cli.app, [command, run_id, "--repo-dir", str(root), *extra])
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_an_unknown_run_is_refused(projection, monkeypatch, command):
+    """Spec test 1."""
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, command, "no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+@pytest.mark.parametrize("status", ["stopped", "escalated", "done", "cancelled"])
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_a_run_that_is_not_started_is_refused_and_names_its_status(
+    projection, monkeypatch, command, status
+):
+    """Spec test 2. C8 order: the status is judged before the lease, so a live
+    lease left on the row does not turn this into a different refusal."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status=status)
+    _plant_lease(projection)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotRunningError"
+    assert status in error["message"]
+    assert "am status" in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize(
+    "lease, expected",
+    [
+        (None, ["no process holds its lease"]),
+        (
+            {"heartbeat_at": CONTROL_NOW - timedelta(seconds=31)},
+            [f"pid {os.getpid()}", HERE, "31s ago"],
+        ),
+        ({"pid": 0}, ["pid 0", HERE, "0s ago"]),
+    ],
+    ids=["no-lease", "stale-heartbeat", "dead-pid-on-this-host"],
+)
+def test_a_request_to_a_started_run_with_no_live_lease_is_refused(
+    projection, monkeypatch, lease, expected
+):
+    """Spec test 3: nobody is left to honour the request, so none is recorded."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    if lease is not None:
+        _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    for piece in expected:
+        assert piece in error["message"]
+    assert CONTROL_RUN_ID in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_a_request_to_a_run_whose_window_has_closed_is_refused(
+    projection, monkeypatch, command
+):
+    """Spec test 4 (C3): a live lease with `accepting=0` is finishing."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, accepting=False)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotAcceptingError"
+    assert CONTROL_RUN_ID in error["message"]
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize(
+    "command, lease",
+    [
+        ("pause", {}),
+        ("cancel", {}),
+        ("pause", {"heartbeat_at": CONTROL_NOW - timedelta(seconds=30)}),
+        ("pause", {"pid": 0, "host": "am-test-other-host.invalid"}),
+    ],
+    ids=["pause", "cancel", "heartbeat-on-the-boundary", "fresh-lease-on-another-host"],
+)
+def test_a_request_to_a_live_accepting_run_is_recorded_under_its_lease(
+    projection, monkeypatch, command, lease
+):
+    """Spec test 5, plus Review Focus: C2's 30s boundary is inclusive, and a
+    fresh heartbeat from another host is live whatever its pid."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, command)
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == CONTROL_KEYS
+    assert {key: data[key] for key in CONTROL_KEYS - {"message"}} == {
+        "run_id": CONTROL_RUN_ID,
+        "command": command,
+        "effective": command,
+        "requested_at": CONTROL_NOW.isoformat(),
+        "already_requested": False,
+    }
+    assert CONTROL_RUN_ID in data["message"]
+    assert _controls(projection) == [("life-2", command)]
+
+
+def test_request_control_stamps_the_row_with_the_injected_clock(projection):
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(100))
+
+    data = cli.request_control(
+        CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(110)
+    )
+
+    assert data["requested_at"] == _at(110).isoformat()
+    assert _controls(projection) == [("life-2", "pause")]
+
+
+def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
+    projection,
+):
+    """Review Focus: a `ValueError` (in `HANDLED`), never the table CHECK's
+    `sqlite3.IntegrityError`."""
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    with pytest.raises(ValueError, match="'resume'"):
+        cli.request_control(
+            CONTROL_RUN_ID, "resume", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _controls(projection) == []
+
+
+@pytest.mark.parametrize("command", ["pause", "cancel"])
+def test_pause_and_cancel_pretty_indent_the_same_envelope(projection, monkeypatch, command):
+    """Spec test 9."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    result = _invoke_control(projection, command, CONTROL_RUN_ID, "--pretty")
+
+    assert result.exit_code == 0, result.output
+    assert "\n  " in result.stdout
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == CONTROL_KEYS
+    assert envelope["data"]["command"] == command
+
+    refusal = _invoke_control(projection, command, "no-such-run", "--pretty")
+
+    assert refusal.exit_code == cli.EXIT_ERROR, refusal.output
+    assert "\n  " in refusal.stdout
+    refused = json.loads(refusal.stdout)
+    assert refused["ok"] is False
+    assert refused["error"]["type"] == "UnknownRunError"

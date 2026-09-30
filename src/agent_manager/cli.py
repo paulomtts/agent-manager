@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ import typer
 from agent_manager import (
     board,
     census,
+    control,
     dag,
     dispatch,
     models,
@@ -135,6 +137,30 @@ class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
     write, rather than letting `run_subtask` raise it after the orphan
     attempts and the `started` rows were already recorded.
     """
+
+
+class NotRunningError(CliError):
+    """`am pause`/`am cancel` was asked to steer a run that is not `started` (C8).
+
+    The message names the recorded status and what to run instead, because
+    a stopped run wants `am resume` and a finished one wants nothing.
+    """
+
+
+class DeadRunError(CliError):
+    """The run is recorded `started`, but no live process holds its lease (C2, C8).
+
+    Nobody is left to honour a request, so none is recorded. The message
+    names the lease's pid, host and heartbeat age, or says there is no lease.
+    """
+
+
+class NotAcceptingError(CliError):
+    """The run's control window has closed: it is finishing (C3, C8)."""
+
+
+class RunIsLiveError(CliError):
+    """`am resume` was asked for a run another live process still holds (C10)."""
 
 
 def resolve_repo_dir(repo_dir: Path) -> Path:
@@ -1523,3 +1549,171 @@ def resume(
     # escalation, so it exits 0 with an ok envelope.
     if payload.get("status") == "escalated" or payload.get("escalated") is True:
         raise typer.Exit(EXIT_ESCALATED)
+
+
+CONTROL_COMMANDS: tuple[str, ...] = ("pause", "cancel")
+"""What `am pause` and `am cancel` record, weakest first (live control C6)."""
+
+
+def _heartbeat_age(lease: store_module.LeaseRow, now: datetime) -> int:
+    """Whole seconds since `lease` last beat, for a refusal message."""
+    return int((now - lease.heartbeat_at).total_seconds())
+
+
+def _controllable_lease(
+    conn: sqlite3.Connection, run_id: str, *, command: str, now: datetime
+) -> store_module.LeaseRow:
+    """The lease a request to `run_id` is addressed to, or C8's refusal.
+
+    The order is C8's: unknown run, not `started`, no live lease, window
+    closed. Runs inside `request_control`'s transaction, so a refusal rolls
+    back and leaves no row.
+    """
+    status = store_module.run_status(conn, run_id)
+    if status is None:
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    if status != "started":
+        raise NotRunningError(
+            f"run {run_id} is {status}, not started, so there is nothing to {command};"
+            f" `am status {run_id}` shows it, and `am resume {run_id}` continues a"
+            " stopped or escalated run"
+        )
+    lease = store_module.read_lease(conn, run_id)
+    if lease is None:
+        raise DeadRunError(
+            f"run {run_id} is recorded started but no process holds its lease;"
+            f" it is not running, so `am resume {run_id}` picks it up"
+        )
+    if not control.lease_is_live(lease, now=now):
+        raise DeadRunError(
+            f"run {run_id} is not running: its lease is held by pid {lease.pid}"
+            f" on {lease.host}, last heartbeat {_heartbeat_age(lease, now)}s ago;"
+            f" `am resume {run_id}` picks it up"
+        )
+    if not lease.accepting:
+        raise NotAcceptingError(
+            f"run {run_id} is finishing and no longer accepts pause or cancel;"
+            f" `am status {run_id}` shows how it ends"
+        )
+    return lease
+
+
+def _record_control(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease: store_module.LeaseRow,
+    command: str,
+    now: datetime,
+) -> tuple[store_module.ControlRow, bool]:
+    """Record `command` for this life of the run; the flag says it was already there."""
+    row = store_module.add_control(
+        conn, run_id, lease=lease.token, command=command, requested_at=now
+    )
+    return row, False
+
+
+def _effective_command(rows: Sequence[store_module.ControlRow]) -> str:
+    """The strongest command recorded for one life: `cancel` beats `pause` (C6)."""
+    return "cancel" if any(row.command == "cancel" for row in rows) else "pause"
+
+
+def _control_message(run_id: str, command: str, *, effective: str, already: bool) -> str:
+    if already:
+        return (
+            f"{command} was already requested for run {run_id};"
+            f" the effective request is {effective}"
+        )
+    if command == "pause":
+        return (
+            f"pause requested for run {run_id}; it parks at its next phase"
+            f" boundary, and `am resume {run_id}` continues it"
+        )
+    return (
+        f"cancel requested for run {run_id}; it stops at its next phase"
+        " boundary and cannot be resumed"
+    )
+
+
+def request_control(
+    run_id: str,
+    command: str,
+    *,
+    repo_dir: Path,
+    clock: Callable[[], datetime] = _utcnow,
+) -> dict[str, Any]:
+    """Record `am pause` or `am cancel` for the process holding `run_id` (C8).
+
+    One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
+    check and the insert, so two requesters cannot both insert and a refusal
+    leaves no row. The process holding the lease applies the request at its
+    next poll; this function only records it. SQLite is the only channel (C1).
+    """
+    if command not in CONTROL_COMMANDS:
+        raise ValueError(
+            f"unknown control command {command!r};"
+            f" expected one of {', '.join(CONTROL_COMMANDS)}"
+        )
+    root = resolve_repo_dir(repo_dir)
+    now = clock()
+    conn = store_module.open_db(root)
+    try:
+        with store_module.immediate(conn):
+            lease = _controllable_lease(conn, run_id, command=command, now=now)
+            row, already = _record_control(
+                conn, run_id, lease=lease, command=command, now=now
+            )
+            effective = _effective_command(
+                store_module.control_requests(conn, run_id, lease=lease.token)
+            )
+    finally:
+        conn.close()
+    return {
+        "run_id": run_id,
+        "command": command,
+        "effective": effective,
+        "requested_at": row.requested_at.isoformat(),
+        "already_requested": already,
+        "message": _control_message(run_id, command, effective=effective, already=already),
+    }
+
+
+def _control(command: str, run_id: str, *, repo_dir: Path, pretty: bool) -> None:
+    """`resume`'s envelope pattern for `pause` and `cancel`.
+
+    `clock=_utcnow` reads the module global at call time, so a test that
+    freezes `cli._utcnow` freezes this command too.
+    """
+    try:
+        payload = request_control(run_id, command, repo_dir=repo_dir, clock=_utcnow)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+@app.command("pause")
+def pause(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The running run to park."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Ask a running run to park at its next phase boundary; `am resume` continues it."""
+    _control("pause", run_id, repo_dir=repo_dir, pretty=pretty)
+
+
+@app.command("cancel")
+def cancel(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The running run to stop."),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Ask a running run to stop at its next phase boundary and close it for good."""
+    _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
