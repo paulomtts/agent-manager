@@ -360,7 +360,7 @@ def plan_levels(
 ) -> list[list[PlannedStory]]:
     """Dispatch levels with each pending story's bases and tip, derived before any write.
 
-    The same composition as `cli.dry_run_payload`: the cycle check runs first,
+    The same composition as `runs.compute_dry_run_plan`: the cycle check runs first,
     because a cycle is what breaks the geometry, and `stories_by_id` covers
     every story, done ones included, so a story blocked by a done story still
     roots on that story's tip. A story rooted on a merged base -- its own, for
