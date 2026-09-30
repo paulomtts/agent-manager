@@ -14,12 +14,14 @@ injected launcher double, `FakeResolver`, ported from
 only from its brief.
 """
 
+import ast
 import asyncio
 import dataclasses
 import inspect
 import json
 import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -1111,3 +1113,89 @@ async def test_git_and_verify_around_a_resolved_conflict_run_off_the_loop_thread
         thread != loop_thread for threads in calls.values() for thread in threads
     ), calls
     assert rev(repo, "master") == MASTER_BEFORE
+
+
+# ── S1: bases reads the run helpers from `runs`, never from `cli` (card 61a0d9be) ──
+
+
+def _cli_imports(source: str) -> list[str]:
+    """Every import in `source`, at any depth, that binds `agent_manager.cli`.
+
+    Covers `import agent_manager.cli`, `from agent_manager import cli`,
+    `from agent_manager.cli import X` and their relative spellings, resolved
+    against the `agent_manager` package the module lives in.
+    """
+    offending: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            offending += [
+                alias.name
+                for alias in node.names
+                if alias.name == "agent_manager.cli" or alias.name.startswith("agent_manager.cli.")
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                module = "agent_manager" + (f".{module}" if module else "")
+            if module == "agent_manager":
+                offending += [f"agent_manager.{alias.name}" for alias in node.names if alias.name == "cli"]
+            elif module == "agent_manager.cli" or module.startswith("agent_manager.cli."):
+                offending.append(module)
+    return offending
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from agent_manager import cli",
+        "from agent_manager import models, cli",
+        "import agent_manager.cli",
+        "import agent_manager.cli as c",
+        "from agent_manager.cli import worktree_for",
+        "from . import cli",
+        "from .cli import worktree_for",
+        "def f():\n    from agent_manager import cli\n",
+    ],
+)
+def test_cli_imports_catches_every_spelling_of_importing_cli(source):
+    assert _cli_imports(source) != []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from agent_manager import runs, models",
+        "from agent_manager.runs import worktree_for",
+        "import agent_manager.runs",
+        "from agent_manager import client",
+        "from agent_manager.clique import x",
+    ],
+)
+def test_cli_imports_ignores_imports_that_are_not_cli(source):
+    assert _cli_imports(source) == []
+
+
+def test_bases_source_never_imports_cli():
+    """S1 (card 61a0d9be): `bases` reads `RunnerFactory`, `gate_context` and
+    `worktree_for` from `runs`. A static check, not a behavioural one."""
+    source = Path(bases.__file__).read_text(encoding="utf-8")
+    assert _cli_imports(source) == []
+
+
+def test_importing_bases_first_loads_no_cli_and_leaves_cli_and_orchestrate_importable():
+    """Review Focus 1: a fresh interpreter, so earlier tests' imports do not
+    hide a cycle. `bases` alone must not pull in `cli`; after it, `cli` and
+    `orchestrate` still load and see the same module objects."""
+    code = (
+        "import sys\n"
+        "import agent_manager.bases\n"
+        "assert 'agent_manager.cli' not in sys.modules, sorted(sys.modules)\n"
+        "from agent_manager import bases, cli, orchestrate, runs\n"
+        "assert orchestrate.cli is cli\n"
+        "assert orchestrate.bases is bases\n"
+        "assert bases.runs is runs\n"
+    )
+
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
