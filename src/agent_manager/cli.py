@@ -1434,6 +1434,7 @@ def _resume_from_checkpoint(
     allow_no_verification: bool,
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
@@ -1442,9 +1443,14 @@ def _resume_from_checkpoint(
     the store, so its refusals (`checkpoint_resume_phase`) come right after it
     is opened and before the first write. Then the orphan attempts are marked
     `harness_error`, the run, story and subtask are recorded `started`, and
-    `drive_subtask` walks `TASK` from the checkpoint, whose queue says where the
-    walk goes on. A `milestone` run never comes here: `resume_run` hands it to
-    `orchestrate.run_milestone` (card 54e4ec29).
+    `drive_subtask_async` walks `TASK` from the checkpoint, whose queue says
+    where the walk goes on. A `milestone` run never comes here: `resume_run`
+    hands it to `orchestrate.run_milestone` (card 54e4ec29).
+
+    Live control (C11), as in `run_card`: from the `started` rows through the
+    final ones this life of the run holds a fresh `control.Lease`, and the walk
+    runs under `control.controlled`. A pause parks it `stopped`; a cancel
+    parks it and records the run `cancelled` (`card_run_status`).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1463,29 +1469,43 @@ def _resume_from_checkpoint(
                 orphan.name,
                 attempt.model_copy(update={"status": "harness_error"}),
             )
-        store.record_run(run.model_copy(update={"status": "started"}))
-        store.record_story(story.model_copy(update={"status": "started"}))
-        store.record_subtask(story.card_id, resumed)
+        # After every refusal, and inside the `try` that closes the store, so
+        # the lease is released before `store.close()` on every exit (C2).
+        with control.Lease(store) as lease:
+            store.record_run(run.model_copy(update={"status": "started"}))
+            store.record_story(story.model_copy(update={"status": "started"}))
+            store.record_subtask(story.card_id, resumed)
 
-        drive = drive_subtask(
-            store=store,
-            run_id=run.id,
-            card=card,
-            parent=parent,
-            subtask=resumed,
-            repo_dir=root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-            resume_from=checkpoint,
-        )
-        summary = drive.summary
+            stop = StopSignal()
+            drive = asyncio.run(
+                control.controlled(
+                    drive_subtask_async(
+                        store=store,
+                        run_id=run.id,
+                        card=card,
+                        parent=parent,
+                        subtask=resumed,
+                        repo_dir=root,
+                        commands=commands,
+                        allow_no_verification=allow_no_verification,
+                        runner_factory=runner_factory,
+                        stop=stop,
+                        resume_from=checkpoint,
+                    ),
+                    store=store,
+                    stop=stop,
+                    lease=lease,
+                    interval=control_interval,
+                )
+            )
+            summary = drive.summary
+            run_status = card_run_status(summary, stop)
 
-        store.record_run(run.model_copy(update={"status": summary.status}))
-        store.record_story(story.model_copy(update={"status": summary.status}))
-        store.record_subtask(
-            story.card_id, resumed.model_copy(update={"status": summary.status})
-        )
+            store.record_run(run.model_copy(update={"status": run_status}))
+            store.record_story(story.model_copy(update={"status": summary.status}))
+            store.record_subtask(
+                story.card_id, resumed.model_copy(update={"status": summary.status})
+            )
 
         return {
             "run_id": run.id,
@@ -1496,7 +1516,7 @@ def _resume_from_checkpoint(
             "worktree": None
             if subtask.worktree_path is None
             else str(subtask.worktree_path),
-            "status": summary.status,
+            "status": run_status,
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),

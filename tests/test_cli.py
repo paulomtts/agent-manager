@@ -6030,3 +6030,102 @@ def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch)
     assert during is not None, "no lease was held while the walk ran"
     assert _card_lease(project, run_id) is None
     assert _loaded(project, run_id).status == "started"
+
+
+
+def _resume_card_run(project: Path, run_id: str, factory) -> dict[str, Any]:
+    """`_resume_from_checkpoint` called as `resume_run` calls it, plus a short
+    interval. `resume_run` passes none and is not this card's to change."""
+    return cli._resume_from_checkpoint(
+        _loaded(project, run_id),
+        root=cli.resolve_repo_dir(project),
+        allow_no_verification=False,
+        commands=(),
+        runner_factory=factory,
+        control_interval=CONTROL_TICK,
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
+    project, cards, control_applied
+):
+    """Spec test 5: the resumed walk starts at `plan`, is paused there, finishes
+    `plan`, parks before the next phase, and gives its lease back."""
+    run_id = _crash_pygents(project, cards, "plan")
+    seen: list[str] = []
+    leases: list[store_module.LeaseRow | None] = []
+    factory = _controlling_factory(
+        project, control_applied, command="pause", at="plan", seen=seen, leases=leases
+    )
+
+    payload = _resume_card_run(project, run_id, factory)
+
+    assert payload["status"] == "stopped", payload
+    assert payload["failed_phase"] is None
+    assert payload["resumed_from"] == "plan"
+    assert payload["discarded_attempts"] == [{"phase": "plan", "n": 1}]
+    assert set(payload) == RESUME_KEYS
+    assert seen == ["plan"]
+    assert payload["detail"] == "stopped before validate_plan"
+    (during,) = leases
+    assert during is not None and during.run_id == run_id and during.accepting is True
+    assert _card_lease(project, run_id) is None
+    assert _card_statuses(project, run_id) == {
+        "run": "stopped",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _newest_checkpoint_reason(project, run_id) == "parked"
+    assert all(row.handled_at is not None for row in _card_controls(project, run_id))
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
+    project, cards, control_applied
+):
+    """Review Focus 5: a cancel reaches a resumed `task` run too, and a second
+    `am resume` refuses it."""
+    run_id = _crash_pygents(project, cards, "plan")
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="plan", seen=[]
+    )
+
+    payload = _resume_card_run(project, run_id, factory)
+
+    assert payload["status"] == "cancelled", payload
+    assert _card_statuses(project, run_id) == {
+        "run": "cancelled",
+        "story": "stopped",
+        "subtask": "stopped",
+    }
+    assert _card_lease(project, run_id) is None
+
+    again = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(project)])
+    assert again.exit_code == cli.EXIT_ERROR, again.output
+    assert json.loads(again.stdout)["error"]["type"] == "NotResumableError"
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
+    """Error path on resume: the lease was held when the walk blew up and is
+    released on the way out; the run stays `started` as it does today."""
+    run_id = _crash_pygents(project, cards, "plan")
+    held: list[store_module.LeaseRow | None] = []
+
+    async def exploding(*args, **kwargs):
+        held.append(_card_lease(project, run_id))
+        raise EngineError("no value for a required parameter", phase="plan")
+
+    monkeypatch.setattr(cli.runtime_engine, "run_subtask_async", exploding)
+
+    with pytest.raises(EngineError, match="plan"):
+        _resume_card_run(project, run_id, _resume_factory())
+
+    (during,) = held
+    assert during is not None, "no lease was held while the resumed walk ran"
+    assert _card_lease(project, run_id) is None
+    assert _loaded(project, run_id).status == "started"
