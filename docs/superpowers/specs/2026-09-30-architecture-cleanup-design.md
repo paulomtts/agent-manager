@@ -118,9 +118,10 @@ implementing (per this project's standing rule — line numbers drift).
 ## 3. Decisions
 
 **S1 — `cli.py` sheds its collaborator role.** New module `runs.py` (no Typer import) takes
-`worktree_for`, `gate_context`, `RunnerFactory`/`default_runner_factory`, `mint_run_id`,
-`resolve_repo_dir`, `orphan_attempts`, `continuable_checkpoint`, `select_resumable`, and the
-`UnknownRunError`/`NotResumableError`/`CheckpointMismatchError` types. `bases.py`, `integration.py`,
+`worktree_for`, `gate_context`, `RunnerFactory`, `mint_run_id`, `resolve_repo_dir`,
+`orphan_attempts`, `continuable_checkpoint`, `select_resumable`, and the
+`UnknownRunError`/`NotResumableError`/`CheckpointMismatchError` types. `default_runner_factory`
+**stays in `cli.py`** — see the exemption below. `bases.py`, `integration.py`,
 and `orchestrate.py` import `runs`, never `cli`. `cli.py` imports `runs` like everyone else and
 keeps only Typer command bodies plus the CLI-specific envelope/exit-code glue (§4 there). The three
 deferred imports at `cli.py:895,1137,1460` are deleted — nothing downstream of `runs` imports `cli`,
@@ -128,6 +129,17 @@ so the cycle they existed to break no longer exists. Business logic that survive
 today (`dry_run_payload`'s level/base/root computation) moves to `runs.py` too, since it is a pure
 function of the census and belongs next to `dag`'s other pure derivations, not the Typer app.
 
+**`default_runner_factory` exemption (found during implementation, not in the original audit).**
+`default_runner_factory`'s body calls the bare name `run_direct`, resolved against whatever module
+defines the function at call time. Three unmarked, default-suite e2e tests
+(`tests/e2e/test_live_control.py:179`, `tests/e2e/test_milestone_run.py:294,421`,
+`tests/e2e/test_milestone_resume.py:241`) do `monkeypatch.setattr(cli, "run_direct", ...)`
+specifically to intercept it. Moving the function into `runs.py` would silently read
+`runs.run_direct` instead and break that interception with no test file changing — violating this
+story's own "no test changes" constraint via the very move it asks for. `default_runner_factory`
+therefore stays in `cli.py`, `import`ing nothing new; every other name in this decision moves as
+written. `RunnerFactory` (the `Protocol` it satisfies) still moves to `runs.py` — only the
+production factory function is exempt.
 **S2 — Two schema additions.** `phases` gains a `detail TEXT` column; `_write_phase_row` writes
 `phase.detail`, `load_run` reads it back into `PhaseRun.detail`. `runs` gains a `milestone_id TEXT`
 column (nullable, for `task`-workflow runs); `run_milestone` stamps it from the census's card id at
