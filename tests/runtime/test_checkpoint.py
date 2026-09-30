@@ -221,6 +221,7 @@ def test_an_error_outside_a_phase_writes_an_escalated_row(store):
     assert ran == ["a"]
     assert summary.status == "escalated"
     assert "checkpoint write broke" in summary.detail
+    assert summary.before_phase is None
     assert [(seq, reason) for seq, reason, _ in _rows(store)] == [
         (0, "turn"), (1, "escalated"),
     ]
@@ -267,6 +268,7 @@ async def test_before_turn_saves_every_turn_and_only_on_pause_parks(store):
     assert ran == ["a", "b"]
     assert summary.status == "stopped"
     assert summary.detail == "stopped before c"
+    assert summary.before_phase == "c"
     rows = _rows(store)
     assert [(seq, reason) for seq, reason, _ in rows] == [
         (0, "turn"), (1, "turn"), (2, "parked"),
