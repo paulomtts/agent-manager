@@ -863,30 +863,37 @@ def builds_a_base_alone(story: census.StoryPlan, root_plan: dag.RootPlan) -> boo
 
 
 class StoryRecorder:
-    """Every row one story's `lane` writes, and every `LaneOutcome` it builds (cleanup §S5).
+    """Every row one story's lane writes, and every `LaneOutcome` it builds (cleanup §S5).
 
-    One per `lane` invocation, built once the story's planned rows are known.
+    One per lane invocation, and it serves both lanes. `lane` builds it once
+    the story's planned rows are known. `base_only_lane` builds it with
+    `without_rows`: a subtask-less story has no rows, since `record_plan`
+    records only stories with work, so that recorder writes nothing and only
+    builds outcomes, all with `level=None`.
+
     It owns the outcome's state: the subtasks `completed` so far, the lane's
     `warnings`, and the merged `base` once it is built. Every outcome
     snapshots them at the moment it is built. The methods that end a lane
-    write their rows and return the outcome for `lane` to raise. The recorder
-    never signals the stop: `stop.trigger` stays with the caller, right
-    before an escalation's writes.
+    write their rows and return the outcome for the lane to raise. The
+    recorder never signals the stop: `stop.trigger` stays with the caller,
+    right before an escalation's writes.
 
     Some transitions write only the story row: a stop seen before a subtask
     or before the base, and a base failure. So `stopped` and `escalated` take
     a keyword-only `subtask_row` that says which subtask row to write first,
     if any. `"started"` is the row `started` returned and the driver was
     handed. `"planned"` is `record_plan`'s row, which the catch-all writes for
-    a subtask it may never have started.
+    a subtask it may never have started. A row-less recorder has no subtask
+    rows, so `started`, `subtask_done` and any `subtask_row` raise `KeyError`
+    on it rather than write one.
     """
 
     def __init__(
         self,
         store: Store,
         story_id: str,
-        level: int,
-        story_row: models.StoryRun,
+        level: int | None,
+        story_row: models.StoryRun | None,
         subtask_rows: Mapping[str, models.SubtaskRun],
     ) -> None:
         self._store = store
@@ -898,6 +905,15 @@ class StoryRecorder:
         self._completed: list[str] = []
         self._warnings: list[str] = []
         self._base: dag.RootPlan | None = None
+
+    @classmethod
+    def without_rows(cls, store: Store, story_id: str) -> StoryRecorder:
+        """A recorder for a story with no store rows: it writes nothing.
+
+        Its outcomes have `level=None`, so `collect_outcomes` reports them
+        after the waves.
+        """
+        return cls(store, story_id, None, None, {})
 
     def started(self, *, subtask_id: str, first: bool) -> models.SubtaskRun:
         """Record the subtask `started`, and the story too on its first subtask.
@@ -970,6 +986,8 @@ class StoryRecorder:
         return self._outcome("done", None)
 
     def _record_story(self, status: str) -> None:
+        if self._story_row is None:
+            return
         self._store.record_story(self._story_row.model_copy(update={"status": status}))
 
     def _record_subtask(self, row: models.SubtaskRun, status: str) -> None:
@@ -1009,16 +1027,14 @@ async def base_only_lane(
     It takes a slot, since a base can dispatch a resolver, and checks the stop
     first. The failure paths are `lane`'s for a merged base, but with no
     subtask to name and no store row to write -- `record_plan` records only
-    stories with work -- so every outcome has `level=None` and
-    `collect_outcomes` reports it after the waves.
+    stories with work -- so it runs on a row-less `StoryRecorder`
+    (`StoryRecorder.without_rows`), which writes nothing. Every outcome has
+    `level=None` and `collect_outcomes` reports it after the waves.
     """
-
-    def outcome(kind: LaneKind, **fields: Any) -> LaneOutcome:
-        return LaneOutcome(kind=kind, story=story.id, level=None, **fields)
-
+    recorder = StoryRecorder.without_rows(store, story.id)
     async with slots:
         if stop.triggered:
-            raise LaneStopped(outcome("stopped"))
+            raise LaneStopped(recorder.stopped(None, None))
         try:
             await build_merged_base(
                 story,
@@ -1035,17 +1051,16 @@ async def base_only_lane(
             )
         except bases.BaseFailed as error:
             if error.stopped:
-                raise LaneStopped(outcome("stopped")) from error
+                raise LaneStopped(recorder.stopped(None, None)) from error
             stop.trigger(story.id)
-            raise LaneEscalated(
-                outcome("escalated", failed_phase="base", detail=error.detail)
-            ) from error
+            raise LaneEscalated(recorder.escalated(None, "base", error.detail)) from error
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             stop.trigger(story.id)
             raise LaneEscalated(
-                outcome("escalated", detail=f"{type(error).__name__}: {error}")
+                recorder.escalated(None, None, f"{type(error).__name__}: {error}")
             ) from error
-    finished[story.id] = outcome("done", base=root_plan)
+    recorder.base_built(root_plan)
+    finished[story.id] = recorder.done()
     return plan.tips[story.id]
 
 
