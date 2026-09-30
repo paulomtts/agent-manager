@@ -51,9 +51,12 @@ from agent_manager.workflow import task as task_workflow
 from agent_manager.runs import (
     RUN_ID_TIME_FORMAT,
     WORKTREE_PARTS,
+    CheckpointMismatchError,
     CliError,
+    NotResumableError,
     RepoDirError,
     RunnerFactory,
+    UnknownRunError,
     gate_context,
     mint_run_id,
     resolve_repo_dir,
@@ -65,17 +68,6 @@ EXIT_ESCALATED = 1
 
 EXIT_ERROR = 3
 """The tool could not run the subtask at all. `2` belongs to Typer's usage errors."""
-
-
-class UnknownRunError(CliError):
-    """`status` was asked for a run this project's projection does not hold.
-
-    A `CliError` so it rides the existing `HANDLED` tuple into an `ok: false`
-    envelope at exit 3 rather than reaching the renderer as a `None` tree. The
-    same class covers "no most-recent run to default to": both are the same
-    refusal -- the command was asked for a run and there is none -- and the
-    message is what tells the two apart.
-    """
 
 
 class ParentlessCardError(CliError):
@@ -114,27 +106,6 @@ class UnknownAttemptError(CliError):
     attempt and there is none to report. The message is what tells apart "you
     asked for attempt 7 of three" from "nothing has run for this card yet", the
     same way `UnknownRunError` carries two readings of one refusal.
-    """
-
-
-class NotResumableError(CliError):
-    """The run was found, and it holds nothing `resume` can pick up.
-
-    Its own type rather than `UnknownRunError`'s: the run and its tree read
-    fine, so what an operator does next -- start a fresh `run --card`, wait for
-    `retry`, or drive the subtasks one at a time -- depends entirely on the
-    status this message names, and a script can branch on the `type` field.
-    """
-
-
-class CheckpointMismatchError(CliError, runtime_engine.CheckpointMismatch):
-    """`resume` found a checkpoint saved under another `TASK`.
-
-    A `CliError`, so it rides `HANDLED` to an `ok: false` envelope at exit 3,
-    and a `runtime_engine.CheckpointMismatch`, so it is the engine's own
-    refusal by type (card 02890d5d). The CLI raises it itself, before any
-    write, rather than letting `run_subtask` raise it after the orphan
-    attempts and the `started` rows were already recorded.
     """
 
 

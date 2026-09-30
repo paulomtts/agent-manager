@@ -128,6 +128,9 @@ MOVED_NAMES = (
     "worktree_for",
     "RunnerFactory",
     "gate_context",
+    "UnknownRunError",
+    "NotResumableError",
+    "CheckpointMismatchError",
 )
 
 
@@ -152,3 +155,16 @@ def test_default_runner_factory_stays_in_cli():
     assert cli.default_runner_factory.__module__ == "agent_manager.cli"
     assert not hasattr(runs, "default_runner_factory")
     assert not hasattr(runs, "run_direct")
+
+
+def test_resume_error_types_are_defined_in_runs():
+    from agent_manager.runtime import engine as runtime_engine
+
+    for error_type in (
+        runs.UnknownRunError,
+        runs.NotResumableError,
+        runs.CheckpointMismatchError,
+    ):
+        assert error_type.__module__ == "agent_manager.runs"
+        assert issubclass(error_type, runs.CliError)
+    assert issubclass(runs.CheckpointMismatchError, runtime_engine.CheckpointMismatch)
