@@ -5140,36 +5140,65 @@ def _plant_run(root: Path, *, status: str = "started", workflow: str = "task") -
 def _plant_lease(
     root: Path,
     *,
+    run_id: str = CONTROL_RUN_ID,
     token: str = "life-2",
     pid: int | None = None,
     host: str | None = None,
     heartbeat_at: datetime = CONTROL_NOW,
     accepting: bool = True,
+    claims: tuple[str, ...] = (),
 ) -> None:
-    """A `run_leases` row, as another process's `Lease` would have left it.
+    """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
 
+    Written over a second `open_db` connection inside `store.immediate`.
     Defaults to this process on this host with a heartbeat at the frozen
     clock: live by C2.
     """
     conn = store_module.open_db(cli.resolve_repo_dir(root))
     try:
-        conn.execute(
-            "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-            " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
-            " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
-            " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
-            (
-                CONTROL_RUN_ID,
-                token,
-                os.getpid() if pid is None else pid,
-                HERE if host is None else host,
-                _at(-60).isoformat(),
-                heartbeat_at.isoformat(),
-                int(accepting),
-            ),
-        )
-        conn.commit()
+        with store_module.immediate(conn):
+            conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
+                " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
+                " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
+                (
+                    run_id,
+                    token,
+                    os.getpid() if pid is None else pid,
+                    HERE if host is None else host,
+                    _at(-60).isoformat(),
+                    heartbeat_at.isoformat(),
+                    int(accepting),
+                ),
+            )
+            for key in claims:
+                conn.execute(
+                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    " run_id=excluded.run_id, token=excluded.token,"
+                    " claimed_at=excluded.claimed_at",
+                    (key, run_id, token, heartbeat_at.isoformat()),
+                )
+    finally:
+        conn.close()
+
+
+OTHER_RUN_ID = "20260930T080000Z-a1b2c3d4"
+"""Another run, driven by another `am` process, that holds a claim."""
+
+
+def _claim_rows(root: Path) -> list[tuple[str, str, str]]:
+    """Every `run_claims` row as `(key, run_id, token)`, in key order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            (row["key"], row["run_id"], row["token"])
+            for row in conn.execute(
+                "SELECT key, run_id, token FROM run_claims ORDER BY key"
+            ).fetchall()
+        ]
     finally:
         conn.close()
 
@@ -6147,3 +6176,113 @@ def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monk
     assert during is not None, "no lease was held while the resumed walk ran"
     assert _card_lease(project, run_id) is None
     assert _loaded(project, run_id).status == "started"
+
+
+# ── leases with claims (card ec7ae954) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "key, named",
+    [
+        ("card:card-1", "card card-1"),
+        ("branch:m10/task-x-ec7ae954", "branch m10/task-x-ec7ae954"),
+    ],
+    ids=["card", "branch"],
+)
+def test_refuse_claimed_names_the_kind_and_the_live_holder(projection, monkeypatch, key, named):
+    """X11's wording, built from the key so a branch claim reads as a branch
+    (Review Focus 3). Read-only: no row changes, no run directory."""
+    _freeze_clock(monkeypatch)
+    _plant_lease(projection, heartbeat_at=_at(-7), claims=(key,))
+    before = (_lease(projection), _claim_rows(projection))
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        cli.refuse_claimed(cli.resolve_repo_dir(projection), [key])
+
+    assert str(caught.value) == (
+        f"{named} is being driven by run {CONTROL_RUN_ID}"
+        f" (pid {os.getpid()} on {HERE}, heartbeat 7s ago);"
+        f" wait for it, or `am pause {CONTROL_RUN_ID}`"
+    )
+    assert (caught.value.key, caught.value.run_id) == (key, CONTROL_RUN_ID)
+    assert isinstance(caught.value, cli.CliError)
+    assert (_lease(projection), _claim_rows(projection)) == before
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def test_refuse_claimed_passes_the_runs_own_claims_unclaimed_keys_and_dead_ones(
+    projection, monkeypatch
+):
+    _freeze_clock(monkeypatch)
+    root = cli.resolve_repo_dir(projection)
+    _plant_lease(projection, heartbeat_at=_at(-5), claims=("card:card-1",))
+
+    cli.refuse_claimed(root, ["card:card-1"], run_id=CONTROL_RUN_ID)
+    cli.refuse_claimed(root, ["card:someone-else"])
+
+    _plant_lease(projection, heartbeat_at=_at(-31), claims=("card:card-1",))
+    cli.refuse_claimed(root, ["card:card-1"])
+
+
+def test_run_lease_turns_a_held_claim_into_claimed_error_and_takes_nothing(
+    projection, monkeypatch
+):
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_lease(
+        projection,
+        run_id=OTHER_RUN_ID,
+        heartbeat_at=now - timedelta(seconds=7),
+        claims=("card:card-1",),
+    )
+    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        with pytest.raises(cli.ClaimedError) as caught:
+            with cli.run_lease(opened, claims=["card:card-1"]):
+                pytest.fail("entered a lease whose claim another live run holds")
+    finally:
+        opened.close()
+
+    assert (caught.value.key, caught.value.run_id) == ("card:card-1", OTHER_RUN_ID)
+    assert str(caught.value) == (
+        f"card card-1 is being driven by run {OTHER_RUN_ID}"
+        f" (pid {os.getpid()} on {HERE}, heartbeat 7s ago);"
+        f" wait for it, or `am pause {OTHER_RUN_ID}`"
+    )
+    assert _lease(projection) is None
+    assert _claim_rows(projection) == [("card:card-1", OTHER_RUN_ID, "life-2")]
+
+
+def test_run_lease_turns_a_held_lease_into_c10s_run_is_live_error(projection, monkeypatch):
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_lease(projection, heartbeat_at=now - timedelta(seconds=5))
+    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        with pytest.raises(cli.RunIsLiveError) as caught:
+            with cli.run_lease(opened, claims=["card:card-1"]):
+                pytest.fail("entered a lease another live process holds")
+    finally:
+        opened.close()
+
+    assert str(caught.value) == (
+        f"run {CONTROL_RUN_ID} is still running in pid {os.getpid()} on {HERE}"
+        " (heartbeat 5s ago); wait for it to exit,"
+        f" or `am status {CONTROL_RUN_ID}`"
+    )
+    assert _claim_rows(projection) == []
+
+
+def test_run_lease_releases_its_claims_and_lease_when_the_body_raises(projection):
+    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        with pytest.raises(ValueError, match="the walk raised"):
+            with cli.run_lease(opened, claims=["card:card-1"]) as lease:
+                assert _claim_rows(projection) == [("card:card-1", CONTROL_RUN_ID, lease.token)]
+                assert _lease(projection) is not None
+                raise ValueError("the walk raised")
+    finally:
+        opened.close()
+
+    assert _lease(projection) is None
+    assert _claim_rows(projection) == []

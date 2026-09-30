@@ -20,7 +20,8 @@ Typer's own usage errors.
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,6 +163,20 @@ class NotAcceptingError(CliError):
 
 class RunIsLiveError(CliError):
     """`am resume` was asked for a run another live process still holds (C10)."""
+
+
+class ClaimedError(CliError):
+    """A card or branch this run needs is claimed by another run's live lease (X5, X11).
+
+    `key` is the claim key (`card:<id>` or `branch:<name>`) and `run_id` the
+    run that holds it, so a script can act on the refusal without parsing
+    the message.
+    """
+
+    def __init__(self, message: str, *, key: str, run_id: str) -> None:
+        super().__init__(message)
+        self.key = key
+        self.run_id = run_id
 
 
 def resolve_repo_dir(repo_dir: Path) -> Path:
@@ -802,6 +817,74 @@ def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
     if stop.requested == "cancel":
         return "cancelled"
     return summary.status
+
+
+def _run_is_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+    """C10's refusal of a run another live process holds, worded once for every caller."""
+    return RunIsLiveError(
+        f"run {lease.run_id} is still running in pid {lease.pid} on {lease.host}"
+        f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
+        f" or `am status {lease.run_id}`"
+    )
+
+
+def _claimed_error(key: str, holder: store_module.LeaseRow, now: datetime) -> ClaimedError:
+    """X11's refusal of a claimed key. The kind and name come from the key itself,
+    split on its first `:`, so a `branch:` claim reads as a branch."""
+    kind, _, name = key.partition(":")
+    return ClaimedError(
+        f"{kind} {name} is being driven by run {holder.run_id}"
+        f" (pid {holder.pid} on {holder.host},"
+        f" heartbeat {_heartbeat_age(holder, now)}s ago);"
+        f" wait for it, or `am pause {holder.run_id}`",
+        key=key,
+        run_id=holder.run_id,
+    )
+
+
+def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None) -> None:
+    """Refuse, before any write, a run whose keys another live run already claims.
+
+    Read-only preflight (X5): one `open_db` connection, `claim_conflicts`
+    judged by `control.lease_is_live` at `_utcnow()`, closed on every path.
+    It takes no lease, claim or lock, so a refusal here leaves no run
+    directory. `run_id` excludes that run's own rows (a resume). The first
+    live conflict raises `ClaimedError`; `take_lease` re-checks atomically.
+    """
+    now = _utcnow()
+    conn = store_module.open_db(root)
+    try:
+        conflicts = store_module.claim_conflicts(
+            conn,
+            keys,
+            is_live=lambda row: control.lease_is_live(row, now=now),
+            run_id=run_id,
+        )
+    finally:
+        conn.close()
+    if conflicts:
+        key, holder = conflicts[0]
+        raise _claimed_error(key, holder, now)
+
+
+@contextmanager
+def run_lease(store: Store, *, claims: Sequence[str] = ()) -> Iterator[control.Lease]:
+    """Hold `control.Lease(store, claims=claims)` for the block, with CLI refusals.
+
+    A thin wrapper: only entering is translated -- `store.LeaseHeldError`
+    becomes C10's `RunIsLiveError`, `store.ClaimHeldError` becomes
+    `ClaimedError` -- and the block's exit, an exception included, is
+    `Lease.__exit__`'s, which releases the claims then the lease.
+    """
+    stack = ExitStack()
+    try:
+        lease = stack.enter_context(control.Lease(store, claims=claims))
+    except store_module.LeaseHeldError as error:
+        raise _run_is_live_error(error.holder, _utcnow()) from error
+    except store_module.ClaimHeldError as error:
+        raise _claimed_error(error.key, error.holder, _utcnow()) from error
+    with stack:
+        yield lease
 
 
 def run_card(
@@ -1587,11 +1670,7 @@ def resume_run(
         lease = store_module.read_lease(conn, run.id)
         now = _utcnow()
         if lease is not None and control.lease_is_live(lease, now=now):
-            raise RunIsLiveError(
-                f"run {run.id} is still running in pid {lease.pid} on {lease.host}"
-                f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
-                f" or `am status {run.id}`"
-            )
+            raise _run_is_live_error(lease, now)
     finally:
         conn.close()
     if run.workflow == WORKFLOW_NAME:
