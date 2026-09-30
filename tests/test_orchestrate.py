@@ -37,7 +37,7 @@ from typing import Any
 import grafo
 import pytest
 
-from agent_manager import bases, board, census, cli, control, dag, integration, models, orchestrate, paths
+from agent_manager import bases, board, census, cli, control, dag, integration, models, orchestrate, paths, runs
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -2945,7 +2945,7 @@ def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypa
     def broken(store, card_id):
         raise RuntimeError("checkpoints table unreadable")
 
-    monkeypatch.setattr(cli, "continuable_checkpoint", broken)
+    monkeypatch.setattr(runs, "continuable_checkpoint", broken)
     driver = CheckpointDriver()
 
     result = _run(project, shape["milestone"], driver)
@@ -3901,7 +3901,7 @@ def _runs_tree() -> dict[str, bytes]:
 
 
 def _never_consulted(store, card_id):
-    pytest.fail("a resume consulted the lenient relaunch lookup cli.continuable_checkpoint")
+    pytest.fail("a resume consulted the lenient relaunch lookup runs.continuable_checkpoint")
 
 
 @requires_git
@@ -3924,7 +3924,7 @@ def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on
     turn = _plant(project, run_id, a1, "turn", queue=("review",))
     resolver = _plant_integrate(project, run_id, story_c, "parked")
     bounds = _record_bounds(monkeypatch)
-    monkeypatch.setattr(cli, "continuable_checkpoint", _never_consulted)
+    monkeypatch.setattr(runs, "continuable_checkpoint", _never_consulted)
     driver = CheckpointDriver()
 
     result = _resume(project, run_id, driver)
