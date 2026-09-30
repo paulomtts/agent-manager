@@ -30,7 +30,7 @@ from typing import Any, Iterator, TypeVar
 
 import pytest
 
-from agent_manager import control, store
+from agent_manager import control, models, store
 from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
@@ -313,6 +313,34 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
     assert _heartbeat_threads() == []
+
+
+def test_a_lease_fences_its_store_only_while_it_is_held(root, opened_store):
+    # Review Focus 5 of the a7ed6c11 plan.
+    run = models.Run(
+        id=RUN_ID,
+        workflow="task",
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix="m10/",
+        status="started",
+        config=models.RunConfig(),
+    )
+    with control.Lease(opened_store):
+        opened_store.record_run(run)
+        thief = store.Store.open(root, RUN_ID)
+        try:
+            thief.take_lease(
+                token="thief", pid=1, host="elsewhere", now=_at(0), is_live=lambda row: False
+            )
+        finally:
+            thief.close()
+        with pytest.raises(store.LeaseLostError) as caught:
+            opened_store.record_run(run.model_copy(update={"status": "done"}))
+        assert caught.value.holder is not None and caught.value.holder.token == "thief"
+
+    # Out of the block the store is unbound and writes as M9 did.
+    assert opened_store.record_run(run.model_copy(update={"status": "done"})).event == "run_upsert"
 
 
 # -- apply_pending (C4) --------------------------------------------------------

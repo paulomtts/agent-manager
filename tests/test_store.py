@@ -2452,7 +2452,7 @@ def _dead(row: store.LeaseRow) -> bool:
 
 
 def _plant_lease(repo: Path, run_id: str, *, token: str) -> store.LeaseRow:
-    """A `run_claims` row, as another process's `take_lease` would have left it."""
+    """A `run_leases` row, as another process's `take_lease` would have left it."""
     conn = store.open_db(repo)
     try:
         with store.immediate(conn):
@@ -2829,3 +2829,117 @@ def test_two_processes_taking_one_dead_lease_leave_exactly_one_owner(repo, attem
     finally:
         conn.close()
     assert lease is not None and lease.token == winner
+
+
+def test_a_taken_over_store_writes_nothing(repo, stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    a.record_run(_run(repo))
+    a.record_story(_story())
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+    before = a.journal.path.read_bytes()
+
+    writes = [
+        lambda: a.record_run(_run_with_status(repo, RUN_ID, "done")),
+        lambda: a.record_story(_story().model_copy(update={"status": "done"})),
+        lambda: a.record_subtask("8831189b", _subtask()),
+        lambda: a.record_phase(
+            "8831189b",
+            "ef248597",
+            models.PhaseRun(name="explore", kind="agent", status="started"),
+        ),
+        lambda: a.record_attempt(
+            "8831189b",
+            "ef248597",
+            "explore",
+            models.Attempt(n=1, dispatch=_dispatch(phase="explore")),
+        ),
+        lambda: _save_checkpoint(a, "ef248597", saved_at=_at(2)),
+        lambda: a.rebuild_from_journal(RUN_ID),
+    ]
+    for write in writes:
+        with pytest.raises(store.LeaseLostError) as caught:
+            write()
+        assert caught.value.run_id == RUN_ID
+        assert caught.value.holder is not None and caught.value.holder.token == "t2"
+        assert a.connection.in_transaction is False
+
+    assert a.journal.path.read_bytes() == before
+    # The new owner's projection is exactly what a wrote while it was the owner.
+    assert store.run_status(b.connection, RUN_ID) == "started"
+    projected = b.load_run(RUN_ID)
+    assert projected is not None
+    assert [(story.status, story.subtasks) for story in projected.stories] == [("started", [])]
+    assert b.latest_checkpoint("ef248597") is None
+
+    # A deleted (not replaced) lease is lost too, and names no holder.
+    b.release_lease("t2")
+    with pytest.raises(store.LeaseLostError) as caught:
+        a.record_run(_run(repo))
+    assert caught.value.holder is None
+    assert a.journal.path.read_bytes() == before
+
+
+def test_an_unbound_store_writes_as_before(repo, stores):
+    holder = stores()
+    holder.take_lease(token="t9", pid=9, host="h", now=_at(0), is_live=_alive)
+    st = stores()
+    with pytest.raises(store.LeaseHeldError):
+        st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    # Neither the refused take nor the foreign live lease binds or fences `st`.
+    _record_full_run(st, repo)
+    _save_checkpoint(st, "ef248597", saved_at=_at(1))
+    st.rebuild_from_journal(RUN_ID)
+    assert st.connection.in_transaction is False
+
+    reader = store.open_db(repo)
+    try:
+        assert store.run_status(reader, RUN_ID) == "started"
+        projected = store.load_run(reader, RUN_ID)
+    finally:
+        reader.close()
+    assert projected is not None
+    assert [subtask.card_id for subtask in projected.stories[0].subtasks] == [
+        "fdebc746",
+        "ef248597",
+    ]
+    kept = store.read_lease(st.connection, RUN_ID)
+    assert kept is not None and kept.token == "t9"
+
+
+def test_a_bound_store_commits_each_write_inside_its_fence(repo, stores):
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    _record_full_run(st, repo)
+    first = _save_checkpoint(st, "ef248597", saved_at=_at(1))
+    # A refused write inside the fence rolls back, spends no seq, leaves nothing open.
+    with pytest.raises(sqlite3.IntegrityError):
+        _save_checkpoint(st, "ef248597", reason="bogus", saved_at=_at(2))
+    assert st.connection.in_transaction is False
+    second = _save_checkpoint(st, "ef248597", saved_at=_at(3))
+    st.rebuild_from_journal(RUN_ID)
+    assert st.connection.in_transaction is False
+
+    # Another connection sees every write: each fence committed its own work.
+    reader = store.open_db(repo)
+    try:
+        assert store.run_status(reader, RUN_ID) == "started"
+        projected = store.load_run(reader, RUN_ID)
+        seqs = [
+            row["seq"]
+            for row in reader.execute(
+                "SELECT seq FROM checkpoints WHERE run_id = ? ORDER BY seq", (RUN_ID,)
+            ).fetchall()
+        ]
+    finally:
+        reader.close()
+    assert projected is not None
+    assert [subtask.card_id for subtask in projected.stories[0].subtasks] == [
+        "fdebc746",
+        "ef248597",
+    ]
+    assert (first.seq, second.seq) == (0, 1)
+    assert seqs == [0, 1]

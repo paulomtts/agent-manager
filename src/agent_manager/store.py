@@ -138,9 +138,10 @@ BUSY_TIMEOUT_SECONDS = 30.0
 """How long a statement on the projection waits for a lock held by another
 connection before raising `sqlite3.OperationalError: database is locked`.
 
-It exists for a reader in another process, such as `am status`, holding the
-database briefly. It is not a licence for two `am` processes to write one run:
-that is still unsupported (P2)."""
+It covers a reader in another process, such as `am status`, holding the
+database briefly, and a second `am` process's short `BEGIN IMMEDIATE` write
+transactions: a lease take-over, or one fenced journal line and row
+(multi-process X4, X9)."""
 
 
 def open_db(root: Path) -> sqlite3.Connection:
@@ -150,11 +151,11 @@ def open_db(root: Path) -> sqlite3.Connection:
     `CREATE` is `IF NOT EXISTS`, so reopening an existing database neither
     destroys nor migrates what is already there.
 
-    The connection may be used from any thread of the one process that writes a
-    run (P2), so `check_same_thread` is off; `Store` serialises that use behind
-    its own lock. `BUSY_TIMEOUT_SECONDS` covers a reader in another process,
-    such as `am status`, holding the database briefly. Two `am` processes
-    writing one run remain unsupported.
+    The connection may be used from any thread of the process that holds the
+    run's lease, so `check_same_thread` is off; `Store` serialises that use
+    behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
+    the database briefly; two processes never write one run, because every
+    run write is fenced by the lease token (multi-process X4).
     """
     conn = sqlite3.connect(
         paths.project_db_path(root),
@@ -853,12 +854,15 @@ class Store:
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
-    One process writes a given run (P2), and its threads share one `Store`. A
+    The threads of the process holding a run's lease share one `Store`. A
     single re-entrant lock serialises every use of the shared connection. Each
     `record_*` holds it across the journal append and the row write, so the two
     are one critical section and journal order equals row order; `close`,
-    `load_run` and `rebuild_from_journal` hold it too. The lock never covers the
-    caller's own work, only the append and the row write.
+    `load_run` and `rebuild_from_journal` hold it too. Once `take_lease` has
+    bound a token, every run write also runs inside `_fenced()`, one
+    `BEGIN IMMEDIATE` transaction that first checks the token still holds the
+    lease (multi-process X4). The lock never covers the caller's own work,
+    only the append and the row write.
     """
 
     def __init__(self, conn: sqlite3.Connection, journal: Journal) -> None:
@@ -888,15 +892,52 @@ class Store:
         with self._lock:
             self._conn.close()
 
+    @contextmanager
+    def _fenced(self) -> Iterator[None]:
+        """Run one write as a single transaction fenced by the bound token (X4, X9).
+
+        With no token bound this is a no-op and the write commits as it always
+        has. Otherwise it opens `immediate`, and if this run's lease row is gone
+        or carries another token it raises `LeaseLostError` before the body
+        runs, so nothing is appended or written. While the body runs,
+        `_in_fence` makes `_commit` a no-op: the journal append and the row
+        write commit together when `immediate` exits, or roll back on a raise.
+        Callers already hold `self._lock`.
+        """
+        if self._token is None:
+            yield
+            return
+        with immediate(self._conn):
+            row = self._conn.execute(
+                "SELECT * FROM run_leases WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+            if row is None or row["token"] != self._token:
+                raise LeaseLostError(
+                    self.run_id, None if row is None else _lease_from_row(row)
+                )
+            self._in_fence = True
+            try:
+                yield
+            finally:
+                self._in_fence = False
+
+    def _commit(self) -> None:
+        """Commit a row write, unless a fence will commit it with its journal line."""
+        if not self._in_fence:
+            self._conn.commit()
+
     # -- recording ---------------------------------------------------------
     #
-    # Each method holds the store lock across its whole body: the journal line
-    # is appended first and the row written second (§9), with no other record
-    # able to land in between. If the row write raises, the line stays on disk,
+    # Each method holds the store lock, and the fence of the bound lease token,
+    # across its whole body: the journal line is appended first and the row
+    # written second (§9), with no other record able to land in between. A
+    # store whose lease was lost raises `LeaseLostError` before appending. If
+    # the row write raises, the line stays on disk and the exception
+    # propagates unchanged.
     # the exception propagates unchanged and the `with` block releases the lock.
 
     def record_run(self, run: models.Run) -> JournalLine:
-        with self._lock:
+        with self._lock, self._fenced():
             if run.id != self.run_id:
                 raise ValueError(
                     f"store is bound to run {self.run_id!r} but was handed run"
@@ -911,7 +952,7 @@ class Store:
             return line
 
     def record_story(self, story: models.StoryRun) -> JournalLine:
-        with self._lock:
+        with self._lock, self._fenced():
             line = self._journal.append(
                 "story_upsert",
                 story.model_dump(mode="json", exclude={"subtasks"}),
@@ -921,7 +962,7 @@ class Store:
             return line
 
     def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> JournalLine:
-        with self._lock:
+        with self._lock, self._fenced():
             line = self._journal.append(
                 "subtask_upsert",
                 subtask.model_dump(mode="json", exclude={"phases"}),
@@ -934,7 +975,7 @@ class Store:
     def record_phase(
         self, story_id: str, card_id: str, phase: models.PhaseRun
     ) -> JournalLine:
-        with self._lock:
+        with self._lock, self._fenced():
             line = self._journal.append(
                 "phase_upsert",
                 phase.model_dump(mode="json", exclude={"attempts"}),
@@ -948,7 +989,7 @@ class Store:
     def record_attempt(
         self, story_id: str, card_id: str, phase_name: str, attempt: models.Attempt
     ) -> JournalLine:
-        with self._lock:
+        with self._lock, self._fenced():
             line = self._journal.append(
                 "attempt_upsert",
                 attempt.model_dump(mode="json"),
@@ -995,7 +1036,7 @@ class Store:
                 "config": json.dumps(run.config.model_dump(mode="json"), sort_keys=True),
             },
         )
-        self._conn.commit()
+        self._commit()
 
     def _write_story_row(self, run_id: str, story: models.StoryRun) -> None:
         self._conn.execute(
@@ -1018,7 +1059,7 @@ class Store:
                 "tip_branch": story.tip_branch,
             },
         )
-        self._conn.commit()
+        self._commit()
 
     def _write_subtask_row(
         self, run_id: str, story_id: str, subtask: models.SubtaskRun
@@ -1047,7 +1088,7 @@ class Store:
                 "worktree_path": _text(subtask.worktree_path),
             },
         )
-        self._conn.commit()
+        self._commit()
 
     def _write_phase_row(
         self, run_id: str, story_id: str, card_id: str, phase: models.PhaseRun
@@ -1078,7 +1119,7 @@ class Store:
                 "ended_at": _iso(phase.ended_at),
             },
         )
-        self._conn.commit()
+        self._commit()
 
     def _write_attempt_row(
         self,
@@ -1128,7 +1169,7 @@ class Store:
                 ),
             },
         )
-        self._conn.commit()
+        self._commit()
 
     # -- reading -------------------------------------------------------------
 
@@ -1166,7 +1207,7 @@ class Store:
         `CHECK` as `sqlite3.IntegrityError`; the statement is rolled back, the
         error propagates unchanged and no `seq` is spent.
         """
-        with self._lock:
+        with self._lock, self._fenced():
             text = json.dumps(agent, sort_keys=True)
             highest = self._conn.execute(
                 "SELECT MAX(seq) FROM checkpoints WHERE run_id = ? AND card_id = ?",
@@ -1188,7 +1229,7 @@ class Store:
                         _iso(saved_at),
                     ),
                 )
-                self._conn.commit()
+                self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
                 raise
@@ -1407,9 +1448,10 @@ class Store:
         The store lock is held from reading the journal through the delete and
         every rewrite, so no `record_*` lands between the delete and the
         rewrite. `_delete_run` is only called from here and takes no lock of
-        its own.
+        its own. With a lease token bound, the delete and every rewrite are
+        one fenced transaction: a store that lost its lease touches no row.
         """
-        with self._lock:
+        with self._lock, self._fenced():
             journal = (
                 self._journal if self._journal.run_id == run_id else Journal(run_id)
             )
@@ -1445,4 +1487,4 @@ class Store:
         self._conn.execute("DELETE FROM subtasks WHERE run_id = ?", (run_id,))
         self._conn.execute("DELETE FROM stories WHERE run_id = ?", (run_id,))
         self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
-        self._conn.commit()
+        self._commit()

@@ -130,7 +130,12 @@ class Lease:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
-        self._store.release_lease(self.token)
+        try:
+            self._store.release_lease(self.token)
+        finally:
+            # This process no longer holds the run: stop fencing its writes to
+            # a token that is gone, as M9's store never fenced them.
+            self._store.bind_lease(None)
 
     def beat(self) -> None:
         """Move this lease's heartbeat to `clock()`."""
