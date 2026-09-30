@@ -425,6 +425,8 @@ single-card run. With `--milestone`, a level's stories run on up to
 `--workflow`, `--harness`, and a milestone-aware `resume`. See section 4 of the orchestration addendum,
 `2026-09-24-orchestration-design.md`.
 
+**Status (milestone 9):** `pause` and `cancel` exist, as the live-control addendum, `2026-09-27-live-control-design.md`, specifies: `am pause <run-id>` parks a running run at its next phase boundary for `am resume`, and `am cancel <run-id>` stops it there and closes it for good. The synopsis above lists `cancel` but not `pause`; both exist. `watch` and `retry` remain deferred.
+
 ## 11. Concurrency
 
 **Status:** as of milestone 4, stories in a dependency level run in parallel,

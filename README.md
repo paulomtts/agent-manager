@@ -122,7 +122,7 @@ The tips are merged into `<prefix>-integrate` and nowhere else. The story branch
 
 #### Integrate
 
-After every story has finished, the run merges every story's tip into one local branch, `<prefix>-integrate`, and checks the result once. This step is Integrate. It runs only when every story finished clean: an escalation or a stop ends the run before it. It also runs when there was nothing left to drive, so every relaunch of the milestone runs it again.
+After every story has finished, the run merges every story's tip into one local branch, `<prefix>-integrate`, and checks the result once. This step is Integrate. It runs only when every story finished clean: an escalation or a stop ends the run before it. An `am pause` or `am cancel` also keeps Integrate from running in that invocation, and Integrate itself cannot be paused or cancelled: once the lanes have ended, the run no longer accepts either (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run)). It also runs when there was nothing left to drive, so every relaunch of the milestone runs it again.
 
 Where, and in what order:
 
@@ -171,7 +171,7 @@ What runs together:
 - Never two subtasks of one story. A story's subtasks run in order, each stacked on the branch before it.
 - A story with two or more blockers first builds a merged base from their tips, after they have all finished clean. See [Multiple blockers](#multiple-blockers).
 
-How a run stops. The first escalation in any lane, an exception raised inside a lane, or a merged base that fails, sets the run's stop. Every other lane checks the stop before each subtask and before it starts its next phase. A phase already running is never interrupted, so a stop waits for the running phase to finish: a lane in the middle of a long `implement` finishes it and then parks. The subtask that lane was on is recorded `stopped`, and so is its story. A lane that is between two subtasks, or that only gets its slot after the stop, ends `stopped` too, without driving anything more. A story whose blocker escalated or stopped never starts, and stays `pending`. Integrate does not run.
+How a run stops. The first escalation in any lane, an exception raised inside a lane, or a merged base that fails, sets the run's stop. Every other lane checks the stop before each subtask and before it starts its next phase. A phase already running is never interrupted, so a stop waits for the running phase to finish: a lane in the middle of a long `implement` finishes it and then parks. The subtask that lane was on is recorded `stopped`, and so is its story. A lane that is between two subtasks, or that only gets its slot after the stop, ends `stopped` too, without driving anything more. A story whose blocker escalated or stopped never starts, and stays `pending`. Integrate does not run. `am pause` and `am cancel`, run from another terminal, set the same stop without anything failing; see [Pausing and cancelling a run](#pausing-and-cancelling-a-run).
 
 `stopped` is not `escalated`:
 
@@ -180,7 +180,7 @@ How a run stops. The first escalation in any lane, an exception raised inside a 
 - `stopped` is a clean park between two phases. Nothing failed, and the work
   done so far is kept.
 
-To continue, fix the escalation, then either relaunch the same `am run --milestone` command, which starts a new run, or run `am resume <run-id>`, which continues this run under the same run id (see [Relaunching resumes](#relaunching-resumes)). Either way the stopped subtask picks up where it parked, and every card already `done` on the board is skipped.
+To continue, fix the escalation, then either relaunch the same `am run --milestone` command, which starts a new run, or run `am resume <run-id>`, which continues this run under the same run id (see [Relaunching resumes](#relaunching-resumes)). Either way the stopped subtask picks up where it parked, and every card already `done` on the board is skipped. After an `am pause` there is nothing to fix: run `am resume <run-id>`. A cancelled run cannot be resumed, only relaunched (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run)).
 
 Run one `am` process per repository. Two `am` processes on the same repository
 or on the same run are not supported.
@@ -242,6 +242,8 @@ Three more keys appear only when they are not empty:
   stopped subtask and its story are recorded `stopped`, not `escalated`.
 - `bases`: the merged bases built before the run stopped, as on a clean run.
 
+When an `am pause` was requested and a lane then escalated, the escalation wins and this report gains `control` (`"pause"`); it still exits 1. A cancel wins over an escalation instead, and gives the cancelled report (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run)).
+
 An escalation at [Integrate](#integrate) has its own shape. The run exits 1, and `data` holds `escalated` (`true`), `phase` (`"integrate"`), `story`, `files`, `detail`, `run_id` and `warnings`. There is no `integrated` key.
 
 - `story` is the story whose tip was being merged, or `null` when the final check of the integrated branch failed. When a merge was already in progress, it is the first story in the merge order, not necessarily the one whose merge is stuck.
@@ -255,31 +257,105 @@ cycle, a board error), it prints `{"ok": false, "error": {...}}` and exits 3.
 
 #### Relaunching resumes
 
-To go on after an escalation, a stopped lane or a killed run, fix the cause
+To go on after an escalation, a stopped lane, a paused or cancelled run, or a killed run, fix the cause
 and run the same `am run --milestone` command again. It starts a new run that
 skips every card already `done` on the board. A subtask that was stopped or
 killed part way picks up in its existing worktree and does not redo a plan
-that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first.
+that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first. A relaunch after an `am cancel` ignores the cancelled run's checkpoints, so a subtask the cancel parked starts again from its first phase.
 
-`am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. Pass your `--verify` commands again: the suite is not recorded, and it is what every subtask with no checkpoint, every merged base and Integrate run. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished and 1 when it escalated again.
+`am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. Pass your `--verify` commands again: the suite is not recorded, and it is what every subtask with no checkpoint, every merged base and Integrate run. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished, was paused or was cancelled, and 1 when it escalated again.
 
 A milestone resume refuses before anything is written and before git is fetched, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
 - the run is `done`. Start new work with `am run --milestone`.
+- the run was cancelled (`NotResumableError`). Start new work with `am run --milestone`.
+- the run is still live: another process holds its lease and its heartbeat is fresh (`RunIsLiveError`). Wait for that process to exit, or check `am status <run-id>`.
 - any open subtask, or any open `base-<story id>` resolver, has a checkpoint saved under a workflow that has changed since (its digest no longer matches). One stale checkpoint refuses the whole resume, and nothing is written. Relaunch with `am run --milestone` instead: a relaunch starts such a card again from its first phase rather than refusing.
 - the run id's milestone is not on the board, or more than one root card has its short id, or the stories now have a blocker cycle.
 
-On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done` or `stopped` exits 0, and one that escalates exits 1.
+On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `cancelled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
 
 A `task` run's resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
 - the workflow changed since the checkpoint was saved (its digest no longer matches). Start a fresh `am run --card`.
 - the subtask has no checkpoint (the run died before its first turn, or it predates checkpoints), its newest checkpoint is `done`, or its newest checkpoint was left by a phase escalation. An escalated subtask of a `task` run is never resumed.
 - the run has no subtask recorded `started` or `stopped`, or more than one of them.
+- the run was cancelled (`NotResumableError`). Start a fresh `am run --card`.
+- the run is still live: another process holds its lease and its heartbeat is fresh (`RunIsLiveError`). Wait for that process to exit, or check `am status <run-id>`.
+
+#### Pausing and cancelling a run
+
+From another terminal, while a run is going, ask it to park (`pause`) or to stop for good (`cancel`):
+
+```bash
+am pause 20260930T101500Z-bdc5838b
+am cancel 20260930T101500Z-bdc5838b
+```
+
+Both take `--repo-dir` (default `.`, the repository the run belongs to) and `--pretty`, and both work on a `--milestone` run and on a `--card` run. There is no `--wait`: the command records the request and returns at once. The run's own report, or `am status <run-id>`, shows when it has landed.
+
+How the request reaches the run: it is a row in the repository's SQLite projection, the same database `am status` reads. There is no signal, socket or fifo. While a run is going, its process holds a lease on it, a row whose heartbeat it moves every 5 seconds, and it looks for new requests about once a second. A lease whose heartbeat is older than 30 seconds, or whose pid no longer exists on the same host, is dead, and a run with a dead lease cannot be asked anything.
+
+A recorded request exits 0 and prints:
+
+```json
+{"ok": true, "data": {"run_id": "20260930T101500Z-bdc5838b", "command": "pause", "effective": "pause", "requested_at": "2026-09-30T10:20:03.412000+00:00", "already_requested": false, "message": "pause requested for run 20260930T101500Z-bdc5838b; it parks at its next phase boundary, and `am resume 20260930T101500Z-bdc5838b` continues it"}}
+```
+
+- `command` is what you asked for. `effective` is what the run will do: `cancel` once any cancel is recorded for this life of the run, otherwise `pause`.
+- Asking again is a no-op that still exits 0, with `already_requested: true` and the `requested_at` of the earlier request that covers it. A pause is covered by any earlier pause or cancel. A cancel is covered only by an earlier cancel, so a cancel after a pause is recorded and upgrades the pause to a cancel.
+- Requests count per life of the run. A request made before an `am resume` does not count for the resumed process, so pausing a resumed run records a new request.
+
+What the run does with it:
+
+- A phase already running is never interrupted. Every lane finishes its in-flight phase and parks before its next one, the same park an escalation's stop uses (see [Parallel runs](#parallel-runs)).
+- No new story starts.
+- Integrate does not run in this invocation.
+
+A paused milestone run exits 0 (from `am run` and from `am resume` alike), and `data` holds:
+
+- `paused`: `true`.
+- `run_id`: the run.
+- `stopped`: one `{"story", "subtask", "before_phase"}` per parked lane, the same rows as in an [escalation report](#what-an-escalation-report-contains).
+- `completed`: the subtask ids finished in this invocation.
+- `pending`: the ids of stories that never started.
+- `warnings`: board writes that failed but did not stop the run, as text.
+- `resume`: `"am resume <run-id>"`, with the run id filled in.
+- `bases` and `resumed`, under the same rules as on every other report shape.
+
+The run is recorded `stopped`. `am resume <run-id>` continues it: each parked subtask goes on from its checkpoint, and no finished phase runs again.
+
+A cancelled milestone run exits 0, and `data` holds `cancelled` (`true`) and the same keys as a paused one except `resume`. When a lane also escalated, it adds `escalations`, a list of `{"level", "story", "subtask", "failed_phase", "detail"}` with the primary escalation first. The run is recorded `cancelled`. Neither shape has an `escalated` key or a top-level `failed_phase`: a pause or a cancel is not a failure.
+
+Which report you get when more than one thing happened:
+
+1. A cancel always wins, even over an escalation: the cancelled report, exit 0.
+2. Otherwise an escalation wins: the ordinary [escalation report](#what-an-escalation-report-contains), exit 1, with `control: "pause"` added when a pause had also been requested.
+3. Otherwise a pause gives the paused report, exit 0.
+
+`am status <run-id>` always has a `control` key: `{"lease": {"pid", "host", "acquired_at", "heartbeat_at", "accepting", "live"} or null, "requests": [{"command", "requested_at", "handled_at"}]}`. `requests` lists the requests from every life of the run, in the order they were made, and `handled_at` is `null` until the run has acted on one. `live` is worked out when `am status` reads the lease; it is not stored. `accepting` turns `false` when the run is finishing.
+
+A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
+
+- `UnknownRunError`: the run id is not in the repository's projection. `am runs` lists the ones that are.
+- `NotRunningError`: the run is not `started`. The message names its status. A stopped or escalated run wants `am resume`, and a finished one wants nothing.
+- `DeadRunError`: the run is recorded `started`, but no process holds its lease, or the lease is dead. Nobody is left to act on a request. `am resume <run-id>` picks the run up.
+- `NotAcceptingError`: the run is finishing. A milestone run stops accepting requests once its lanes have ended, and a `--card` run once its walk has ended, so a milestone run in [Integrate](#integrate) cannot be paused or cancelled.
+
+Ctrl-C, pause and cancel are not the same:
+
+- **Ctrl-C** kills the running harness processes. `am resume` then runs again every phase that was in flight.
+- **Pause** kills nothing. Finished phases stand, and `am resume` continues each parked subtask from its checkpoint.
+- **Cancel** parks the same way, but closes the run for good. `am resume` refuses it. A relaunch with `am run --milestone` ignores the cancelled run's checkpoints, so a subtask the cancel parked starts again from its first phase. A cancel does not reset board cards: they keep whatever status the run left them in.
+
+`am resume` refuses, with exit code 3 and before anything is written, a run that was cancelled (`NotResumableError`) and a run whose lease is still live in another process (`RunIsLiveError`: wait for that process to exit, or check `am status <run-id>`).
+
+On a `--card` run, a pause parks the walk before its next phase. The report's `status` is `stopped`, it exits 0, and `am resume <run-id>` continues it. A cancel parks it the same way, and the report's `status` is `cancelled`, exit 0, even when the walk escalated. In both cases the story and subtask rows keep the walk's own status.
 
 #### Not there yet
 
-- `watch`, `retry` and `cancel` do not exist.
+- `watch` and `retry` do not exist.
+- `am pause --wait` does not exist, Integrate cannot be paused or cancelled, and there is no way to pause a single story: a pause or cancel always applies to the whole run.
 - There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate.
 
 See section 4 of the
