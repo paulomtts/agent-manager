@@ -10,6 +10,7 @@ the test's `XDG_DATA_HOME` (tests/conftest.py), so they flock the same files.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import subprocess
 import sys
@@ -253,6 +254,44 @@ def test_a_positive_timeout_polls_until_it_runs_out(tmp_path):
         _reap(child)
 
 
+def test_a_positive_timeout_retries_and_gets_the_lock_once_it_is_freed(
+    tmp_path, monkeypatch
+):
+    # The first failed flock attempt asks `_backoff` for a delay; only then is
+    # the holder told to release, so the lock can only be obtained by a retry.
+    first_miss = threading.Event()
+    real_backoff = locks._backoff
+
+    def signalling_backoff(attempt: int) -> float:
+        first_miss.set()
+        return real_backoff(attempt)
+
+    monkeypatch.setattr(locks, "_backoff", signalling_backoff)
+    child = _holder(tmp_path, "git")
+    outcome: list[BaseException | None] = []
+    lock = locks.project_lock(tmp_path, "git")
+
+    def take() -> None:
+        try:
+            lock.acquire(timeout=30)
+        except BaseException as error:  # surfaced to the main thread below
+            outcome.append(error)
+        else:
+            outcome.append(None)
+            lock.release()
+
+    try:
+        worker = threading.Thread(target=take)
+        worker.start()
+        assert first_miss.wait(timeout=30)
+        _release(child)
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+        assert outcome == [None]
+    finally:
+        _reap(child)
+
+
 def test_the_instance_timeout_applies_when_acquire_gets_none(tmp_path):
     child = _holder(tmp_path, "git")
     try:
@@ -265,6 +304,8 @@ def test_the_instance_timeout_applies_when_acquire_gets_none(tmp_path):
 
 def test_timeout_default_is_ten_minutes():
     assert locks.LOCK_TIMEOUT_SECONDS == 600.0
+    signature = inspect.signature(locks.ProcessLock)
+    assert signature.parameters["timeout"].default == locks.LOCK_TIMEOUT_SECONDS
     lock = locks.ProcessLock(Path("/nonexistent/x.lock"))
     assert lock.path == Path("/nonexistent/x.lock")
 
