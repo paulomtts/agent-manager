@@ -2,20 +2,23 @@
 
 `cli.py` composes and renders; the plain pieces a run needs -- where its repo
 is, what it is called, where its worktree goes, how a runner is made, which
-gate parameters it binds, and how an interrupted run is picked back up (which
+gate parameters it binds, how an interrupted run is picked back up (which
 subtask is resumable, which attempts were orphaned, which checkpoint a relaunch
-continues from, and the refusals those raise) -- live here so the modules
-downstream of `cli` can reach them without importing the Typer app. `cli.py`
-re-exports every name defined here, so `cli.X is runs.X`. This module never
-imports `cli`.
+continues from, and the refusals those raise), and the `--dry-run` preview's
+levels and Integrate plan -- live here so the modules downstream of `cli` can
+reach them without importing the Typer app. `cli.py` re-exports every name
+defined here, so `cli.X is runs.X`. This module never imports `cli` at load
+time; `compute_dry_run_plan` imports `integration` (which still imports `cli`)
+only when called.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent_manager import dag, models, store as store_module
+from agent_manager import census, dag, models, store as store_module
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import AgentPhaseRunner
 from agent_manager.store import Store
@@ -226,3 +229,104 @@ def continuable_checkpoint(
     if runtime_engine.pending_phase(found) is None:
         return None
     return found
+
+
+@dataclass(frozen=True)
+class DryRunPlan:
+    """What `compute_dry_run_plan` works out; `cli.dry_run_payload` wraps it.
+
+    `levels` is one row per dispatch level and `integrate` is the terminal
+    phase's plan, both already in the exact shape and key order `--dry-run`
+    prints. Plain data, not Pydantic: it never crosses a process boundary.
+    """
+
+    levels: list[dict[str, Any]]
+    integrate: dict[str, Any]
+
+
+def compute_dry_run_plan(
+    stories: Iterable[census.StoryPlan],
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str,
+    max_concurrent: int,
+) -> DryRunPlan:
+    """O3's preview: dispatch levels with each subtask's branch and base, then Integrate.
+
+    Pure over the census, and every derivation belongs to `dag`. The cycle
+    check runs first because a cycle is what breaks the geometry, and
+    `story_root`'s own guard misses a cycle between two populated stories.
+    `stories_by_id` covers every story, closed ones included, so a story
+    blocked by a done story still roots on that story's tip. A story's
+    `subtasks` lists only what would be dispatched, but each `base` comes
+    from `stack_bases` over the full ordered list, so a done first subtask
+    still anchors the second. Each level row says how many of its stories
+    would run together: `min(len(level), max_concurrent)`. The caller refuses
+    a bound below 1 and supplies the default.
+
+    A story's `root` is `dag.story_root(...).branch`. A story with two or more
+    in-milestone blockers is not refused here: its `root` is its own merged
+    base branch and its row gains `merged_from`, the blockers in `blocked_by`
+    order. The key is absent for every other row. The real run still refuses
+    such a story (`orchestrate.plan_levels`).
+
+    `integrate` is the terminal phase's plan (Integrate addendum I6): the
+    branch every tip is merged into, its worktree under `repo_dir`, and the
+    merge order `integration.merge_order` gives -- every story with subtasks,
+    done or not. `repo_dir` is only joined onto, never read.
+    """
+    # `integration` imports `cli` at load time, and `cli` imports this module
+    # at load time, so importing it at the top of this module would be
+    # circular. By call time all three are loaded.
+    from agent_manager import integration
+
+    stories = list(stories)
+    dag.assert_no_blocker_cycles(stories)
+    levels = dag.compute_levels(stories)
+    stories_by_id = {story.id: story for story in stories}
+    level_rows: list[dict[str, Any]] = []
+    for index, level in enumerate(levels):
+        story_rows: list[dict[str, Any]] = []
+        for story in level:
+            bases = dag.stack_bases(story, stories_by_id, branch_prefix, base_branch)
+            root = dag.story_root(story, stories_by_id, branch_prefix, base_branch)
+            row: dict[str, Any] = {
+                "story": story.id,
+                "title": story.title,
+                "root": root.branch,
+                "subtasks": [
+                    {
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "status": subtask.status,
+                        "branch": dag.subtask_branch(branch_prefix, subtask),
+                        "base": bases[subtask.id],
+                    }
+                    for subtask in dag.remaining_subtasks(story)
+                ],
+            }
+            if root.kind == "merged":
+                row["merged_from"] = list(root.blockers)
+            story_rows.append(row)
+        level_rows.append(
+            {
+                "level": index,
+                "concurrent": min(len(level), max_concurrent),
+                "stories": story_rows,
+            }
+        )
+    integrate_branch = integration.integration_branch(branch_prefix)
+    return DryRunPlan(
+        levels=level_rows,
+        integrate={
+            "branch": integrate_branch,
+            "worktree": str(worktree_for(repo_dir, integrate_branch)),
+            "order": [
+                {"story": story.id, "tip": tip}
+                for story, tip in integration.merge_order(
+                    stories, branch_prefix, base_branch
+                )
+            ],
+        },
+    )

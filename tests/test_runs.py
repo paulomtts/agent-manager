@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import runs
+from agent_manager import census, dag, runs
 
 CARD_ID = "46244d0e-1111-2222-3333-444455556666"
 
@@ -171,6 +171,196 @@ def test_resume_error_types_are_defined_in_runs():
         assert error_type.__module__ == "agent_manager.runs"
         assert issubclass(error_type, runs.CliError)
     assert issubclass(runs.CheckpointMismatchError, runtime_engine.CheckpointMismatch)
+
+
+def _plan_id(n: int) -> str:
+    """A UUID-shaped card id whose short id is `n` in eight hex digits
+    (`dag.short_id` refuses anything that is not 32 hex characters)."""
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def _plan_subtask(n: int, status: str = "todo") -> census.SubtaskPlan:
+    return census.SubtaskPlan(id=_plan_id(n), title=f"subtask {n}", status=status)
+
+
+def _plan_story(
+    n: int,
+    subtasks: list[census.SubtaskPlan],
+    *,
+    status: str = "todo",
+    blocked_by: tuple[str, ...] | list[str] = (),
+) -> census.StoryPlan:
+    return census.StoryPlan(
+        id=_plan_id(n),
+        title=f"story {n}",
+        status=status,
+        blocked_by=list(blocked_by),
+        subtasks=list(subtasks),
+    )
+
+
+PLAN_REPO = Path("/repo")
+"""`worktree_for` only joins onto the repo dir, so it need not exist."""
+
+
+def _plan(stories, max_concurrent: int = 4) -> "runs.DryRunPlan":
+    return runs.compute_dry_run_plan(
+        stories,
+        repo_dir=PLAN_REPO,
+        branch_prefix="m3",
+        base_branch="main",
+        max_concurrent=max_concurrent,
+    )
+
+
+def test_dry_run_plan_is_a_plain_dataclass_of_levels_then_integrate():
+    import dataclasses
+
+    assert dataclasses.is_dataclass(runs.DryRunPlan)
+    assert [field.name for field in dataclasses.fields(runs.DryRunPlan)] == [
+        "levels",
+        "integrate",
+    ]
+    assert runs.compute_dry_run_plan.__module__ == "agent_manager.runs"
+
+
+def test_compute_dry_run_plan_computes_levels_bases_roots_and_the_integrate_plan():
+    """Remaining subtasks only, bases from the full ordered list, a dependent
+    rooted on its blocker's tip, and Integrate over every story with a tip."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+
+    def branch(subtask: census.SubtaskPlan) -> str:
+        return dag.subtask_branch("m3", subtask)
+
+    assert _plan([a, b]) == runs.DryRunPlan(
+        levels=[
+            {
+                "level": 0,
+                "concurrent": 1,
+                "stories": [
+                    {
+                        "story": a.id,
+                        "title": "story 1",
+                        "root": "main",
+                        "subtasks": [
+                            {
+                                "id": _plan_id(12),
+                                "title": "subtask 12",
+                                "status": "todo",
+                                "branch": branch(a.subtasks[1]),
+                                "base": branch(a.subtasks[0]),
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "level": 1,
+                "concurrent": 1,
+                "stories": [
+                    {
+                        "story": b.id,
+                        "title": "story 2",
+                        "root": branch(a.subtasks[-1]),
+                        "subtasks": [
+                            {
+                                "id": _plan_id(21),
+                                "title": "subtask 21",
+                                "status": "todo",
+                                "branch": branch(b.subtasks[0]),
+                                "base": branch(a.subtasks[-1]),
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+        integrate={
+            "branch": "m3-integrate",
+            "worktree": "/repo/.claude/worktrees/m3-integrate",
+            "order": [
+                {"story": a.id, "tip": branch(a.subtasks[-1])},
+                {"story": b.id, "tip": branch(b.subtasks[-1])},
+            ],
+        },
+    )
+
+
+@pytest.mark.parametrize("bound, concurrent", [(1, [1, 1]), (2, [2, 1]), (10, [3, 1])])
+def test_compute_dry_run_plan_bounds_each_level_by_the_passed_max_concurrent(
+    bound, concurrent
+):
+    stories = [
+        _plan_story(1, [_plan_subtask(11)]),
+        _plan_story(2, [_plan_subtask(21)]),
+        _plan_story(3, [_plan_subtask(31)]),
+        _plan_story(4, [_plan_subtask(41)], blocked_by=[_plan_id(1)]),
+    ]
+
+    plan = _plan(stories, max_concurrent=bound)
+
+    assert [level["concurrent"] for level in plan.levels] == concurrent
+
+
+def test_compute_dry_run_plan_checks_for_blocker_cycles_first():
+    """Review focus: the arrow trail is `assert_no_blocker_cycles`'s own
+    message, which proves it ran before any geometry."""
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+
+    with pytest.raises(dag.DependencyCycleError) as caught:
+        _plan([a, b])
+
+    assert f"#{a.id} -> #{b.id} -> #{a.id}" in str(caught.value)
+
+
+def test_compute_dry_run_plan_marks_only_merged_roots_with_merged_from():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[b.id, "outside", a.id])
+
+    plan = _plan([a, b, c])
+
+    rows = {row["story"]: row for level in plan.levels for row in level["stories"]}
+    assert rows[c.id]["root"] == "m3/base-00000003"
+    assert rows[c.id]["merged_from"] == [b.id, a.id]
+    assert list(rows[c.id]) == ["story", "title", "root", "subtasks", "merged_from"]
+    assert "merged_from" not in rows[a.id]
+    assert "merged_from" not in rows[b.id]
+
+
+def test_compute_dry_run_plan_accepts_a_one_shot_iterator():
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+
+    assert _plan(iter([a, b])) == _plan([a, b])
+
+
+def test_compute_dry_run_plan_over_an_empty_census():
+    assert _plan([]) == runs.DryRunPlan(
+        levels=[],
+        integrate={
+            "branch": "m3-integrate",
+            "worktree": "/repo/.claude/worktrees/m3-integrate",
+            "order": [],
+        },
+    )
+
+
+def test_compute_dry_run_plan_runs_in_a_fresh_interpreter_that_imported_runs_first():
+    """Review focus: `integration` imports `cli`, which imports from `runs`, so
+    `runs` may only import `integration` at call time. Importing `runs` alone
+    and then calling the function must not hit a circular import."""
+    code = (
+        "import sys; from pathlib import Path; import agent_manager.runs as runs; "
+        "assert 'agent_manager.cli' not in sys.modules; "
+        "plan = runs.compute_dry_run_plan([], repo_dir=Path('/repo'), "
+        "branch_prefix='m3', base_branch='main', max_concurrent=4); "
+        "assert plan.levels == [], plan; "
+        "assert plan.integrate['branch'] == 'm3-integrate', plan"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_checkpoint_resume_phase_stays_in_cli():
