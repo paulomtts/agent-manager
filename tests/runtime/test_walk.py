@@ -157,3 +157,176 @@ def test_run_one_step_keeps_earlier_warnings_when_a_later_gate_breaks(store):
         "phase 'a' gate 'first' warned: one",
         "phase 'a' gate 'second' warned: two",
     ]
+
+
+def _step(*gates) -> Step:
+    return Step("verify", lambda: {}, gates=tuple(gates))
+
+
+def test_gate_values_is_public_and_the_private_name_still_resolves():
+    context = {"card": "c1", "worktree": "/w"}
+
+    values = walk.gate_values(context, "build", {"x": 1})
+
+    assert values == {"card": "c1", "worktree": "/w", "result": {"x": 1}, "build": {"x": 1}}
+    assert walk._gate_values is walk.gate_values
+
+
+def test_evaluate_gates_passes_when_every_gate_returns_none():
+    """Spec test 1."""
+    calls: list[str] = []
+
+    def first(result):
+        calls.append("first")
+
+    def second(card):
+        calls.append("second")
+
+    warnings: list[str] = []
+
+    verdict = walk.evaluate_gates(_step(first, second), {"result": {}, "card": "c1"}, warnings)
+
+    assert verdict == walk.GateVerdict("pass", None)
+    assert verdict.detail is None
+    assert calls == ["first", "second"]
+    assert warnings == []
+
+
+def test_evaluate_gates_warns_and_keeps_going_after_a_warning_gate():
+    """Spec test 2."""
+    calls: list[str] = []
+
+    def cautious(result):
+        return {"warn": "coverage dipped"}
+
+    def fine(result):
+        calls.append("fine")
+
+    warnings = ["earlier"]
+
+    verdict = walk.evaluate_gates(_step(cautious, fine), {"result": {}}, warnings)
+
+    message = "phase 'verify' gate 'cautious' warned: coverage dipped"
+    assert verdict.kind == "warn"
+    assert verdict.detail == {"warnings": [message]}
+    assert warnings == ["earlier", message]
+    assert calls == ["fine"]
+
+
+def test_evaluate_gates_fails_at_the_first_failing_mapping_and_stops():
+    """Spec test 3, driven through an AgentPhase to show both phase kinds work."""
+    later_calls: list[str] = []
+
+    def blocking(result):
+        return {"reason": "red", "count": 2}
+
+    def later(result):
+        later_calls.append("later")
+
+    phase = AgentPhase("review", "critic", (), None, gates=(blocking, later))
+
+    verdict = walk.evaluate_gates(phase, {"result": {}}, [])
+
+    assert verdict.kind == "fail"
+    assert verdict.detail == {
+        "gate": "blocking",
+        "verdict": {"reason": "red", "count": 2},
+        "message": "phase 'review' gate 'blocking' failed: count=2, reason=red",
+    }
+    assert later_calls == []
+
+
+def test_evaluate_gates_reports_a_raising_gate_as_broken():
+    """Spec test 4: the one "raises" test against the shared evaluator (S3 §6)."""
+    boom = ValueError("gate blew up")
+    later_calls: list[str] = []
+
+    def exploding(result):
+        raise boom
+
+    def later(result):
+        later_calls.append("later")
+
+    verdict = walk.evaluate_gates(_step(exploding, later), {"result": {}}, [])
+
+    assert verdict.kind == "broken"
+    assert verdict.detail == {"gate": "exploding", "reason": "raised", "error": boom}
+    assert verdict.detail["error"] is boom
+    assert later_calls == []
+
+
+def test_evaluate_gates_reports_a_non_mapping_gate_as_broken():
+    """Spec test 5."""
+
+    def chatty(result):
+        return 3
+
+    verdict = walk.evaluate_gates(_step(chatty), {"result": {}}, [])
+
+    assert verdict.kind == "broken"
+    assert set(verdict.detail) == {"gate", "reason", "error", "returned_type"}
+    assert verdict.detail["gate"] == "chatty"
+    assert verdict.detail["reason"] == "not_a_mapping"
+    assert verdict.detail["returned_type"] == "int"
+    error = verdict.detail["error"]
+    assert isinstance(error, EngineError)
+    assert error.phase == "verify"
+    assert error.function == "chatty"
+    assert str(error) == (
+        "phase 'verify', function 'chatty': gate returned int; a gate returns "
+        "None to pass or a mapping verdict to fail, and anything else would be "
+        "read as a pass by accident"
+    )
+
+
+def test_evaluate_gates_lets_a_binding_failure_propagate():
+    """Spec test 6: a binding failure is not a verdict."""
+
+    def needs(missing):
+        return None
+
+    with pytest.raises(EngineError) as info:
+        walk.evaluate_gates(_step(needs), {"result": {}}, [])
+
+    assert info.value.phase == "verify"
+    assert info.value.function == "needs"
+    assert info.value.parameter == "missing"
+
+
+def test_evaluate_gates_fails_an_empty_mapping():
+    """Review Focus 3: `{}` is a failing verdict today, not a pass."""
+
+    def empty(result):
+        return {}
+
+    verdict = walk.evaluate_gates(_step(empty), {"result": {}}, [])
+
+    assert verdict.kind == "fail"
+    assert verdict.detail["message"] == "phase 'verify' gate 'empty' failed: "
+
+
+def test_evaluate_gates_lets_warn_win_over_other_keys():
+    """Review Focus 4: a mapping holding `warn` warns, whatever else it holds."""
+
+    def mixed(result):
+        return {"warn": "soft", "blocked": "x"}
+
+    warnings: list[str] = []
+
+    verdict = walk.evaluate_gates(_step(mixed), {"result": {}}, warnings)
+
+    assert verdict.kind == "warn"
+    assert warnings == ["phase 'verify' gate 'mixed' warned: soft"]
+
+
+def test_evaluate_gates_does_not_swallow_a_base_exception():
+    """Review Focus 5: control-flow signals are not `broken`."""
+
+    class _Signal(BaseException):
+        pass
+
+    def signalling(result):
+        raise _Signal()
+
+    with pytest.raises(_Signal):
+        walk.evaluate_gates(_step(signalling), {"result": {}}, [])

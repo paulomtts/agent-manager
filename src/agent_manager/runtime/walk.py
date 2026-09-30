@@ -274,7 +274,28 @@ class _GateFailed(Exception):
         super().__init__(detail)
 
 
-def _gate_values(
+@dataclass(frozen=True)
+class GateVerdict:
+    """What one pass over a phase's gates concluded (architecture-cleanup S3).
+
+    A plain dataclass rather than a Pydantic model: it never crosses a process
+    boundary. `detail` is `None` for `pass`; otherwise it carries enough for
+    either caller -- `run_one_step` here, `dispatch.AgentRunner` -- to render
+    its own message without re-running a gate:
+
+    - `fail`: `gate`, `verdict` (the raw mapping), `message` (the rendered
+      `phase ... gate ... failed: k=v` line).
+    - `broken`: `gate`, `reason` (`"raised"` or `"not_a_mapping"`), `error`
+      (the gate's exception, or the `EngineError` built for a non-mapping),
+      plus `returned_type` for `not_a_mapping`.
+    - `warn`: `warnings`, the messages this evaluation appended.
+    """
+
+    kind: Literal["pass", "warn", "fail", "broken"]
+    detail: dict[str, Any] | None
+
+
+def gate_values(
     context: Mapping[str, Any], phase_name: str, result: Mapping[str, Any]
 ) -> dict[str, Any]:
     """The binding table a gate or a `when` predicate sees.
@@ -294,9 +315,78 @@ def _gate_values(
     return values
 
 
+_gate_values = gate_values
+"""The pre-S3 private name, kept because `tests/test_engine.py` binds through it."""
+
+
 def _label(fn: Callable[..., Any]) -> str:
     """How messages name a callable: its `__name__`, or its `repr` when it has none."""
     return getattr(fn, "__name__", repr(fn))
+
+
+def evaluate_gates(
+    phase: phase_model.Step | phase_model.AgentPhase,
+    values: Mapping[str, Any],
+    warnings: list[str],
+) -> GateVerdict:
+    """Run `phase`'s gates in order and say what they concluded.
+
+    The one gate contract both phase kinds share: `None` passes, a mapping
+    holding `warn` appends a warning and continues, any other mapping fails.
+    A gate that raises an `Exception`, or returns anything that is not a
+    mapping, is `broken` -- never read as a pass. Evaluation stops at the first
+    `fail` or `broken`.
+
+    A gate whose parameters cannot be bound is a workflow wiring bug, not a
+    verdict: the `EngineError` from `bind_arguments` propagates unchanged.
+    """
+    warned: list[str] = []
+    for gate in phase.gates:
+        name = _label(gate)
+        kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
+        try:
+            verdict = gate(**kwargs)
+        except Exception as error:
+            return GateVerdict(
+                "broken", {"gate": name, "reason": "raised", "error": error}
+            )
+        if verdict is None:
+            continue
+        if not isinstance(verdict, Mapping):
+            returned_type = type(verdict).__name__
+            error = EngineError(
+                f"gate returned {returned_type}; a gate returns None to pass "
+                "or a mapping verdict to fail, and anything else would be read as a "
+                "pass by accident",
+                phase=phase.name,
+                function=name,
+            )
+            return GateVerdict(
+                "broken",
+                {
+                    "gate": name,
+                    "reason": "not_a_mapping",
+                    "error": error,
+                    "returned_type": returned_type,
+                },
+            )
+        if "warn" in verdict:
+            message = f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
+            warnings.append(message)
+            warned.append(message)
+            continue
+        rendered = ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
+        return GateVerdict(
+            "fail",
+            {
+                "gate": name,
+                "verdict": verdict,
+                "message": f"phase {phase.name!r} gate {name!r} failed: {rendered}",
+            },
+        )
+    if warned:
+        return GateVerdict("warn", {"warnings": warned})
+    return GateVerdict("pass", None)
 
 
 def _evaluate_gates(
