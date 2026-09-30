@@ -37,7 +37,7 @@ from typing import Any
 import grafo
 import pytest
 
-from agent_manager import bases, board, census, cli, dag, integration, models, orchestrate, paths
+from agent_manager import bases, board, census, cli, control, dag, integration, models, orchestrate, paths
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -262,6 +262,98 @@ def test_an_unnamed_primary_falls_back_to_the_first_escalation_in_census_order()
     assert payload["also_escalated"] == [
         {"level": 1, "story": "B", "subtask": "b1", "failed_phase": "verify", "detail": "y"}
     ]
+
+
+def test_controlled_payload_on_pause_lists_stopped_completed_pending_and_the_resume_hint():
+    """C12: every stopped lane in census order, every lane's completed work in
+    wave order (not only a stopped lane's), the pending stories, and the hint."""
+    parked = orchestrate.LaneOutcome(
+        kind="stopped",
+        story="A",
+        level=0,
+        subtask="a2",
+        before_phase="implement",
+        completed=("a1",),
+    )
+    finished = orchestrate.LaneOutcome(kind="done", story="B", level=0, completed=("b1", "b2"))
+    between = orchestrate.LaneOutcome(kind="stopped", story="C", level=1, subtask="c1")
+    queued = orchestrate.LaneOutcome(kind="pending", story="D", level=1)
+
+    payload = orchestrate.controlled_payload(
+        "run-1", "pause", [parked, finished, between, queued], ["gate warned"]
+    )
+
+    assert payload == {
+        "paused": True,
+        "run_id": "run-1",
+        "stopped": [
+            {"story": "A", "subtask": "a2", "before_phase": "implement"},
+            {"story": "C", "subtask": "c1", "before_phase": None},
+        ],
+        "completed": ["a1", "b1", "b2"],
+        "pending": ["D"],
+        "warnings": ["gate warned"],
+        "resume": "am resume run-1",
+    }
+    assert list(payload) == [
+        "paused", "run_id", "stopped", "completed", "pending", "warnings", "resume"
+    ]
+
+
+def test_controlled_payload_on_cancel_has_no_resume_and_lists_escalations_primary_first():
+    first = orchestrate.LaneOutcome(
+        kind="escalated", story="A", level=0, subtask="a1", failed_phase="review", detail="x"
+    )
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="B", level=0, subtask="b1", before_phase="implement"
+    )
+    primary = orchestrate.LaneOutcome(
+        kind="escalated",
+        story="C",
+        level=0,
+        subtask="c1",
+        failed_phase="verify",
+        detail="y",
+        primary=True,
+    )
+
+    payload = orchestrate.controlled_payload("run-1", "cancel", [first, parked, primary], [])
+
+    assert payload == {
+        "cancelled": True,
+        "run_id": "run-1",
+        "stopped": [{"story": "B", "subtask": "b1", "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "escalations": [
+            {"level": 0, "story": "C", "subtask": "c1", "failed_phase": "verify", "detail": "y"},
+            {"level": 0, "story": "A", "subtask": "a1", "failed_phase": "review", "detail": "x"},
+        ],
+    }
+    assert list(payload) == [
+        "cancelled", "run_id", "stopped", "completed", "pending", "warnings", "escalations"
+    ]
+    # No outcome marked primary: the first in census order leads, as in `escalated_payload`.
+    unmarked = orchestrate.controlled_payload(
+        "run-1", "cancel", [first, replace(primary, primary=False)], []
+    )
+    assert [row["story"] for row in unmarked["escalations"]] == ["A", "C"]
+
+
+def test_controlled_payload_on_cancel_without_escalations_omits_escalations_and_never_has_escalated():
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="A", level=0, subtask="a1", before_phase="plan"
+    )
+
+    for command in ("pause", "cancel"):
+        payload = orchestrate.controlled_payload("run-1", command, [parked], [])
+        assert "escalated" not in payload
+        assert "failed_phase" not in payload
+    cancelled = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
+    assert "escalations" not in cancelled
+    assert "resume" not in cancelled
+    assert "paused" not in cancelled
 
 
 def test_the_integrated_payload_is_plain_json_with_the_worktree_as_a_string():
@@ -3546,6 +3638,26 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
+def test_a_cancelled_milestone_run_is_refused_for_resume(tmp_path, monkeypatch):
+    """C9: unknown run, then wrong workflow, then cancelled -- the earlier
+    refusals still win for a run that is also cancelled."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(root, status="cancelled")
+
+    with pytest.raises(cli.NotResumableError) as caught:
+        orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+
+    assert str(caught.value) == (
+        f"run {RESUME_RUN_ID} was cancelled; start new work with am run --milestone"
+    )
+    task_run = "20260924T120000Z-00000008"
+    _record_resume_run(root, task_run, workflow="task", status="cancelled")
+    with pytest.raises(cli.NotResumableError, match="'task'"):
+        orchestrate.resumable_milestone_run(root, task_run)
+    with pytest.raises(cli.UnknownRunError, match="no-such-run"):
+        orchestrate.resumable_milestone_run(root, "no-such-run")
+
+
 def test_a_resumed_run_names_its_milestone_by_the_short_id_in_its_run_id():
     wanted = models.CardNode(id=_plan_id(9), title="Milestone 9", status="todo")
     other = models.CardNode(id=_plan_id(8), title="Milestone 8", status="todo")
@@ -4014,3 +4126,541 @@ def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monke
 
     with pytest.raises(ValueError, match="branch prefix"):
         orchestrate.run_milestone("Milestone 3", repo_dir=tmp_path, base_branch="main")
+
+
+# ── live control: pause and cancel (card 0e1edf31) ──────────────────────────
+
+
+def _lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+    """The run's lease row, read over a second connection as `am status` would."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.read_lease(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _send(project: Path, run_id: str, command: str, *, token: str | None = None) -> None:
+    """Insert one request over a second connection, as `am pause`/`am cancel` would.
+
+    Addressed to the live lease's token unless `token` names another one.
+    """
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        if token is None:
+            lease = store_module.read_lease(conn, run_id)
+            assert lease is not None and lease.accepting, "no open lease to address the request to"
+            token = lease.token
+        with store_module.immediate(conn):
+            store_module.add_control(
+                conn, run_id, lease=token, command=command, requested_at=STARTED_AT
+            )
+    finally:
+        conn.close()
+
+
+def _controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return store_module.control_requests(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _send_then_await_stop(project: Path, run_id: str, command: str) -> Gate:
+    """A gate that sends `command` mid-subtask, then holds the call until the
+    run's watcher has applied it and the stop fired (no sleeps)."""
+
+    async def gate(stop: StopSignal | None) -> None:
+        _send(project, run_id, command)
+        await _await_stop(stop)
+
+    return gate
+
+
+@requires_git
+@requires_brd
+def test_a_run_with_no_control_integrates_as_before(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+
+    result = _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert result["done"] is True, result
+    assert not {"paused", "cancelled", "control", "escalated"} & set(result)
+    assert len(integrate_recorder.calls) == 1
+    assert _statuses(_load(project, run_id)) == {"run": "done", story_a: "done", a1: "done"}
+    assert _controls(project, run_id) == []
+
+
+@requires_git
+@requires_brd
+def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
+    project, integrate_recorder, monkeypatch
+):
+    """C2/C4: the lease is held through Integrate with its window already
+    closed (`controlled` closed it when the tree returned), and gone once
+    `run_milestone` returns."""
+    shape = _milestone(project, {"A": 1})
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    seen: list[store_module.LeaseRow | None] = []
+
+    def integrate_reading_the_lease(**kwargs: Any) -> Any:
+        seen.append(_lease(project, run_id))
+        return integrate_recorder(**kwargs)
+
+    monkeypatch.setattr(integration, "integrate_milestone", integrate_reading_the_lease)
+
+    result = _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    assert result["done"] is True, result
+    (during,) = seen
+    assert during is not None, "no lease was held while Integrate ran"
+    assert during.run_id == run_id
+    assert during.accepting is False
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_crash_after_a_pause_propagates_releases_the_lease_and_records_neither(
+    project, integrate_recorder
+):
+    """Error paths: a lane's BaseException leaves the run as §7 says; the
+    pause already applied does not turn it into `stopped`, and the lease is
+    released on the way out."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(
+        outcomes={a1: _LaneKilled("the manager died after the pause")},
+        gates={a1: _send_then_await_stop(project, run_id, "pause")},
+    )
+
+    with pytest.raises(_LaneKilled):
+        _run_or_fail_if_it_hangs(
+            lambda: _run(project, shape["milestone"], driver, control_interval=0)
+        )
+
+    assert _load(project, run_id).status == "started"
+    assert _lease(project, run_id) is None
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_refused_resume_never_takes_a_lease(project, monkeypatch):
+    """Error paths: `resume_checkpoints`' refusal comes before `record_run`,
+    so before the lease."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",), digest="saved-under-another-task")
+
+    def never(self: control.Lease) -> control.Lease:
+        pytest.fail("a lease was taken before the resume was refused")
+
+    monkeypatch.setattr(control.Lease, "__enter__", never)
+
+    with pytest.raises(cli.CheckpointMismatchError):
+        _resume(project, run_id, CheckpointDriver(), control_interval=0)
+
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_request_left_under_an_earlier_lease_never_reaches_the_resumed_run(project):
+    """C4: a pause addressed to the interrupted process's token stays unhandled
+    and the resumed run, under its own fresh lease, finishes clean."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _send(project, run_id, "pause", token="the-interrupted-processes-lease")
+
+    result = _resume(project, run_id, FakeDriver(), control_interval=0)
+
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert [row.handled_at for row in _controls(project, run_id)] == [None]
+    assert _load(project, run_id).status == "done"
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_that_raises_still_releases_the_lease(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    integrate_recorder.outcome = RuntimeError("integrate blew up")
+
+    with pytest.raises(RuntimeError, match="integrate blew up"):
+        _run(project, shape["milestone"], FakeDriver(), control_interval=0)
+
+    assert _lease(project, run_id) is None
+    assert _load(project, run_id).status == "started"
+
+
+@requires_git
+@requires_brd
+def test_a_paused_milestone_parks_records_stopped_and_skips_integrate(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [story_b],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+        story_b: "pending",
+        b1: "pending",
+    }
+    assert integrate_recorder.calls == []
+    assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
+        ("pause", True)
+    ]
+
+
+@requires_git
+@requires_brd
+def test_a_pause_applied_after_the_last_lane_already_finished_still_skips_integrate(
+    project, integrate_recorder, monkeypatch
+):
+    """C6 case 3 applies even when every lane had already finished: the
+    request lands after the watcher stopped and before the window closed, so
+    only `controlled`'s final sweep applies it."""
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    real_close_window = control.Lease.close_window
+
+    def the_request_lands_then_the_window_closes(self: control.Lease) -> None:
+        _send(project, run_id, "pause")
+        real_close_window(self)
+
+    monkeypatch.setattr(control.Lease, "close_window", the_request_lands_then_the_window_closes)
+    driver = GatedDriver()
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [],
+        "completed": [a1],
+        "pending": [],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _statuses(_load(project, run_id)) == {"run": "stopped", story_a: "done", a1: "done"}
+    assert integrate_recorder.calls == []
+    assert [row.handled_at is not None for row in _controls(project, run_id)] == [True]
+
+
+@requires_git
+@requires_brd
+def test_a_lane_waiting_for_a_slot_ends_stopped_on_a_pause(project, integrate_recorder):
+    """Three ready stories, two slots: `queued` waits for a slot when the
+    pause lands, takes it, sees the stop and never reaches the driver."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    (first, second, queued) = _census_levels(project, shape["milestone"])[0]
+    subtasks = _subtasks_by_story(shape)
+    (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_then_pause(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "both slotted lanes in flight")
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+
+    driver = GatedDriver(gates={f1: meet_then_pause, s1: _meet_then_await_stop(pair)})
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert q1 not in [call["card"] for call in driver.calls]
+    assert result["paused"] is True, result
+    assert result["stopped"] == [
+        {"story": first, "subtask": f1, "before_phase": "implement"},
+        {"story": second, "subtask": s1, "before_phase": "implement"},
+        {"story": queued, "subtask": q1, "before_phase": None},
+    ]
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        first: "stopped",
+        f1: "stopped",
+        second: "stopped",
+        s1: "stopped",
+        queued: "stopped",
+        q1: "pending",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_recorder):
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+
+    async def pause_then_cancel(stop: StopSignal | None) -> None:
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+        _send(project, run_id, "cancel")
+
+    driver = GatedDriver(gates={a1: pause_then_cancel})
+
+    result = _run(project, shape["milestone"], driver, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert "paused" not in result and "resume" not in result
+    assert _load(project, run_id).status == "cancelled"
+    assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
+        ("pause", True),
+        ("cancel", True),
+    ]
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_under_pause_stays_escalated_and_carries_control_pause(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_pause_then_escalate(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a1 and b1 in flight together")
+        _send(project, run_id, "pause")
+        await _await_stop(stop)
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: meet_pause_then_escalate, b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert result == {
+        "escalated": True,
+        "run_id": run_id,
+        "level": 0,
+        "story": story_a,
+        "subtask": a1,
+        "failed_phase": "review",
+        "detail": "reviewer found a blocker",
+        "warnings": [],
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+        "control": "pause",
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "escalated",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_cancel_then_escalate(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a1 and b1 in flight together")
+        _send(project, run_id, "cancel")
+        await _await_stop(stop)
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: meet_cancel_then_escalate, b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
+
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "escalations": [
+            {
+                "level": 0,
+                "story": story_a,
+                "subtask": a1,
+                "failed_phase": "review",
+                "detail": "reviewer found a blocker",
+            }
+        ],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "escalated",
+        a1: "escalated",
+        story_b: "stopped",
+        b1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+
+
+@requires_git
+@requires_brd
+def test_a_resumed_paused_run_reports_resumed_and_bases_through_report(project, fake_bases):
+    """Every branch goes through `report`: a pause on a resume carries
+    `resumed` and the merged base C built in this invocation."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    driver = GatedDriver(gates={c1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _resume(project, run_id, driver, control_interval=0)
+
+    assert result["paused"] is True, result
+    assert result["resumed"] is True
+    assert result["resume"] == f"am resume {run_id}"
+    assert result["bases"] == [_bases_entry(story_c, root_plan)]
+    assert result["stopped"] == [{"story": story_c, "subtask": c1, "before_phase": "implement"}]
+    assert sorted(result["completed"]) == sorted([a1, b1])
+    assert _load(project, run_id).status == "stopped"
+
+
+@requires_git
+@requires_brd
+def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
+    project, fresh_pygents, integrate_recorder
+):
+    """Success Criterion 1, on a real M6 pygents subtask agent over a
+    step-only workflow: the pause lands while `first` runs; `first` finishes;
+    the agent parks through ON_PAUSE with `second` at the queue head; `second`
+    never runs; the run records `stopped`."""
+    shape = _milestone(project, {"A": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    watch = _ThreadWatch()
+    ran: list[str] = []
+
+    def first(card: str) -> dict[str, Any]:
+        ran.append("first")
+        _send(project, run_id, "pause")
+        if not watch.paused.wait(WAIT):
+            raise RuntimeError("the pause never reached the run")
+        return {"first": 1}
+
+    def second(card: str) -> dict[str, Any]:
+        ran.append("second")
+        return {"second": 2}
+
+    workflow = Workflow("m9_pause_parks", (Step("first", first), Step("second", second)))
+
+    async def drive(*, store, run_id, card, parent, subtask, repo_dir, stop=None, **_: Any):
+        stop.register(watch)
+        try:
+            summary = await runtime_engine.run_subtask_async(
+                workflow,
+                store,
+                story_id=parent.id,
+                subtask=subtask,
+                repo_dir=repo_dir,
+                stop=stop,
+            )
+        finally:
+            stop.unregister(watch)
+        return cli.SubtaskDrive(summary=summary, warnings=list(summary.warnings))
+
+    result = _run(project, shape["milestone"], drive, control_interval=0)
+
+    assert ran == ["first"]
+    assert result["paused"] is True, result
+    assert result["stopped"] == [{"story": story_a, "subtask": a1, "before_phase": "second"}]
+    assert result["resume"] == f"am resume {run_id}"
+    assert _statuses(_load(project, run_id)) == {
+        "run": "stopped",
+        story_a: "stopped",
+        a1: "stopped",
+    }
+    assert integrate_recorder.calls == []
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        newest = opened.latest_checkpoint(a1)
+    finally:
+        opened.close()
+    assert newest.reason == "parked"
+    assert newest.agent["queue"][0]["kwargs"]["phase"] == "second"
