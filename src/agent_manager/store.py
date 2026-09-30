@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS phases (
     started_at TEXT,
     ended_at   TEXT,
     position   INTEGER NOT NULL,
+    detail     TEXT,
     PRIMARY KEY (run_id, story_id, card_id, name)
 );
 
@@ -497,6 +498,7 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
                     status=phase_row["status"],
                     started_at=phase_row["started_at"],
                     ended_at=phase_row["ended_at"],
+                    detail=phase_row["detail"],
                 )
                 subtask.phases.append(phase)
 
@@ -922,9 +924,9 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
-                                started_at, ended_at, position)
+                                started_at, ended_at, detail, position)
             VALUES (:run_id, :story_id, :card_id, :name, :kind, :status,
-                    :started_at, :ended_at,
+                    :started_at, :ended_at, :detail,
                     (SELECT COUNT(*) FROM phases
                       WHERE run_id = :run_id AND story_id = :story_id
                         AND card_id = :card_id))
@@ -932,7 +934,8 @@ class Store:
                 kind=excluded.kind,
                 status=excluded.status,
                 started_at=excluded.started_at,
-                ended_at=excluded.ended_at
+                ended_at=excluded.ended_at,
+                detail=excluded.detail
             """,
             {
                 "run_id": run_id,
@@ -943,6 +946,7 @@ class Store:
                 "status": phase.status,
                 "started_at": _iso(phase.started_at),
                 "ended_at": _iso(phase.ended_at),
+                "detail": phase.detail,
             },
         )
         self._conn.commit()

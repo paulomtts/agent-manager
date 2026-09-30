@@ -1730,6 +1730,162 @@ def test_a_stopped_run_survives_a_rebuild_from_the_journal(repo):
     assert row["status"] == "stopped"
 
 
+# -- phase detail --------------------------------------------------------------
+#
+# `PhaseRun.detail` is why a phase failed (architecture cleanup S2). The journal
+# always carried it; these pin that the projection does too. Steps tier: real
+# temp DB and journal, no harness.
+
+FAILURE_DETAIL = (
+    "verify failed: `uv run pytest` exited 1\n"
+    "  FAILED tests/test_store.py::test_naïve_path — assert 'ü' == 'u'\n"
+    "  3 failed, 212 passed"
+)
+"""Multi-line and non-ASCII, the way a real failure reason arrives."""
+
+PHASE_COLUMNS = [
+    "run_id",
+    "story_id",
+    "card_id",
+    "name",
+    "kind",
+    "status",
+    "started_at",
+    "ended_at",
+    "position",
+    "detail",
+]
+"""`detail` is last: `ALTER TABLE ... ADD COLUMN` appends, so a fresh and a
+migrated database only agree if the schema puts it there too."""
+
+
+def _record_failed_phase(
+    st: store.Store, repo: Path, detail: str | None = FAILURE_DETAIL
+) -> None:
+    """One subtask with a finished `implement` (no detail) and a failed `verify`."""
+    st.record_run(_run(repo))
+    st.record_story(_story())
+    st.record_subtask("8831189b", _subtask())
+    st.record_phase(
+        "8831189b",
+        "ef248597",
+        models.PhaseRun(
+            name="implement",
+            kind="agent",
+            status="done",
+            started_at=datetime(2026, 9, 23, 10, 13, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 9, 23, 10, 20, tzinfo=timezone.utc),
+        ),
+    )
+    st.record_phase(
+        "8831189b",
+        "ef248597",
+        models.PhaseRun(
+            name="verify",
+            kind="deterministic",
+            status="failed",
+            started_at=datetime(2026, 9, 23, 10, 21, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 9, 23, 10, 22, tzinfo=timezone.utc),
+            detail=detail,
+        ),
+    )
+
+
+def _phase_details(run: models.Run | None) -> list[tuple[str, str, str | None]]:
+    assert run is not None
+    return [
+        (phase.name, phase.status, phase.detail)
+        for phase in run.stories[0].subtasks[0].phases
+    ]
+
+
+_EXPECTED_DETAILS = [
+    ("implement", "done", None),
+    ("verify", "failed", FAILURE_DETAIL),
+]
+
+
+def test_a_fresh_phases_table_carries_detail_as_its_last_column(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"] for row in conn.execute("PRAGMA table_info(phases)").fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert columns == PHASE_COLUMNS
+
+
+def test_a_failed_phase_detail_round_trips_through_load_run(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_failed_phase(st, repo)
+        via_store = st.load_run(RUN_ID)
+        via_connection = store.load_run(st.connection, RUN_ID)
+    finally:
+        st.close()
+
+    assert _phase_details(via_store) == _EXPECTED_DETAILS
+    assert _phase_details(via_connection) == _EXPECTED_DETAILS
+
+
+def test_a_failed_phase_detail_survives_a_rebuild_from_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_failed_phase(st, repo)
+    finally:
+        st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert _phase_details(after) == _EXPECTED_DETAILS
+    assert after == returned
+
+
+def test_re_recording_a_phase_overwrites_its_detail(repo):
+    # The upsert must assign the new value, including NULL: a retry that
+    # passes must not keep the old failure reason.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_failed_phase(st, repo, detail="first reason")
+        verify = models.PhaseRun(
+            name="verify",
+            kind="deterministic",
+            status="failed",
+            detail="second reason",
+        )
+        st.record_phase("8831189b", "ef248597", verify)
+        changed = st.load_run(RUN_ID)
+        st.record_phase(
+            "8831189b",
+            "ef248597",
+            verify.model_copy(update={"status": "done", "detail": None}),
+        )
+        cleared = st.load_run(RUN_ID)
+        rows = st.connection.execute(
+            "SELECT COUNT(*) FROM phases WHERE run_id = ?", (RUN_ID,)
+        ).fetchone()[0]
+    finally:
+        st.close()
+
+    assert _phase_details(changed) == [
+        ("implement", "done", None),
+        ("verify", "failed", "second reason"),
+    ]
+    assert _phase_details(cleared) == [
+        ("implement", "done", None),
+        ("verify", "done", None),
+    ]
+    assert rows == 2
+
+
 # -- checkpoints ---------------------------------------------------------------
 #
 # A row-only table outside the journal (pygents-engine spec §6). Steps tier:
