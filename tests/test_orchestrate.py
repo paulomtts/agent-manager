@@ -5077,3 +5077,120 @@ def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_c
     assert driver.calls == []
     assert _load(project, run_id).status == "escalated"
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
+def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, monkeypatch):
+    """X5: on a resume the fetch/prune and the first journal line both happen
+    under this life's lease, which already holds every claim."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    seen_by_git: list[store_module.LeaseRow | None] = []
+    real_refresh = orchestrate.refresh_git
+
+    def refresh_spy(root: Path) -> None:
+        seen_by_git.append(_lease(project, run_id))
+        real_refresh(root)
+
+    first_write: list[tuple[str | None, list[str]]] = []
+    real_record_run = store_module.Store.record_run
+
+    def record_spy(self, run):
+        if not first_write:
+            token = self._token
+            held = (
+                []
+                if token is None
+                else [
+                    claim.key
+                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                ]
+            )
+            first_write.append((token, held))
+        return real_record_run(self, run)
+
+    monkeypatch.setattr(orchestrate, "refresh_git", refresh_spy)
+    monkeypatch.setattr(store_module.Store, "record_run", record_spy)
+
+    result = _resume(project, run_id, FakeDriver())
+
+    assert result["done"] is True, result
+    ((token, held),) = first_write
+    assert token is not None
+    assert held == _expected_claims(shape["milestone"], [a1, b1])
+    (git_saw,) = seen_by_git
+    assert git_saw is not None, "git was refreshed before the resume took its lease"
+    assert (git_saw.token, git_saw.pid) == (token, os.getpid())
+
+
+@pytest.mark.parametrize("outcome", ["done", "escalated"])
+@requires_git
+@requires_brd
+def test_a_milestone_resume_excludes_its_own_claims_and_reports_took_over(project, outcome):
+    """The interrupted life's lease is dead and its own claims are still
+    planted: neither refuses, the resume takes them over, and every payload
+    shape names the dead holder under `took_over`."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    dead = _reaped_pid()
+    beat = datetime.now(timezone.utc)
+    _plant_lease(
+        project,
+        run_id=run_id,
+        token="crashed-life",
+        pid=dead,
+        heartbeat_at=beat,
+        claims=tuple(_expected_claims(shape["milestone"], [a1])),
+    )
+    driver = FakeDriver(outcomes={} if outcome == "done" else {a1: ("review", "still")})
+
+    result = _resume(project, run_id, driver)
+
+    assert result.get(outcome) is True, result
+    assert result["resumed"] is True
+    assert result["took_over"] == {
+        "pid": dead,
+        "host": HERE,
+        "heartbeat_at": beat.isoformat(),
+    }
+    assert _claim_rows(project) == []
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(project, monkeypatch):
+    """Review Focus 2 (C10): the run's own lease is live and holds its own
+    claims. The preflight skips the run's own rows (so no `ClaimedError`
+    about them), `run_lease` refuses with `RunIsLiveError`, and git, the
+    journal and the rows are untouched."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    own = _expected_claims(shape["milestone"], [a1])
+    _plant_lease(
+        project,
+        run_id=run_id,
+        token="still-running",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=tuple(own),
+    )
+    git_calls = _record_git(monkeypatch)
+    before = (_runs_tree(), _statuses(_load(project, run_id)))
+    driver = FakeDriver()
+
+    with pytest.raises(cli.RunIsLiveError):
+        _resume(project, run_id, driver)
+
+    assert driver.calls == []
+    assert git_calls == []
+    assert (_runs_tree(), _statuses(_load(project, run_id))) == before
+    assert _claim_rows(project) == [(key, run_id, "still-running") for key in own]

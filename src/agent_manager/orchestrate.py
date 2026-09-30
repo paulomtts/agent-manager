@@ -1334,8 +1334,9 @@ def run_milestone(
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
     `milestone` is a card id or a title needle (O1). Everything that can refuse,
-    `max_concurrent < 1` included, runs before the store is opened. Then the
-    run takes a `control.Lease`, one `milestone` run is recorded with its
+    `max_concurrent < 1` and another live run's claim included, runs before
+    the store is opened. Then the run takes a `control.Lease` with its
+    `milestone_claims` (`cli.run_lease`), one `milestone` run is recorded with its
     whole plan `pending`, and `asyncio.run(control.controlled(supervise(...)))`
     runs every story the moment its blockers succeeded, at most
     `max_concurrent` at once. A subtask already `done` on
@@ -1379,12 +1380,23 @@ def run_milestone(
     run id with each open checkpoint handed on as `resume_from`. Every
     payload gains `resumed: true`; `completed` is this invocation's work.
 
-    The lease (live control C2) is held from `record_run` to the run's final
-    record, and released before the store closes; every refusal comes before
-    it. `controlled` polls this lease's `am pause`/`am cancel` requests every
-    `control_interval` seconds and applies them to the run's one
-    `StopSignal`; it closes the window and sweeps once more when the tree
-    returns, before Integrate. A crash propagates and releases the lease.
+    Claims (multi-process X5, X6): the run's keys are `milestone_claims` --
+    `card:<milestone>`, `card:<id>` of every remaining subtask, and
+    `branch:<branch_prefix>-integrate`. `cli.refuse_claimed` checks them
+    read-only as the last refusal, before `refresh_git` and `Store.open`, so
+    a key another live run holds is `ClaimedError` with no fetch, prune, run
+    row or run directory; a resume's own rows are no conflict. On a resume,
+    `refresh_git` runs inside the lease, after `resume_checkpoints`, and a
+    dead holder the lease took over is reported under `took_over` in every
+    payload.
+
+    The lease (live control C2) and its claims are held from `record_run` to
+    the run's final record, and released before the store closes; every
+    refusal comes before it. `controlled` polls this lease's `am pause`/`am
+    cancel` requests every `control_interval` seconds and applies them to the
+    run's one `StopSignal`; it closes the window and sweeps once more when the
+    tree returns, before Integrate. A crash propagates and releases the lease
+    and its claims.
     """
     if resume_run_id is None:
         if max_concurrent < 1:
@@ -1443,14 +1455,18 @@ def run_milestone(
             cards = open_cards(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
             # The store's own refusal, a checkpoint saved under another
             # workflow, comes before the first write and before git is touched.
+            # Read-only, so it runs before the lease is taken.
             checkpoints = resume_checkpoints(store, cards)
-            refresh_git(root)
         # After every refusal, and inside the `try` that closes the store, so
         # the claims and the lease are released before `store.close()` on
         # every exit (live control C2, X5). Taken before `record_run`, so
         # every run write is fenced by this token; a lost race is
         # `ClaimedError` or `RunIsLiveError` with nothing recorded.
         with cli.run_lease(store, claims=keys) as lease:
+            if resumed is not None:
+                # A resume's first side effect, under this life's lease (X5):
+                # a run still live elsewhere was refused on entry, before git.
+                refresh_git(root)
             store.record_run(run_record)
             rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
             if resumed is not None:
@@ -1496,9 +1512,17 @@ def run_milestone(
             built_bases = bases_payload(outcomes)
 
             def report(payload: dict[str, Any]) -> dict[str, Any]:
-                """Every payload shape on the same terms: `bases` when built, `resumed` on a resume."""
+                """Every payload shape on the same terms: `bases` when built, and on
+                a resume `resumed` plus `took_over` when a dead holder's lease
+                was taken over (X5), as `cli._resume_from_checkpoint` reports it."""
                 if resumed is not None:
                     payload["resumed"] = True
+                    if lease.displaced is not None:
+                        payload["took_over"] = {
+                            "pid": lease.displaced.pid,
+                            "host": lease.displaced.host,
+                            "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+                        }
                 return with_bases(payload, built_bases)
 
             # Outcome precedence (live control C6): the first match wins. A
