@@ -1601,6 +1601,15 @@ def _controllable_lease(
     return lease
 
 
+CONTROL_SUBSUMES: dict[str, tuple[str, ...]] = {
+    "pause": ("pause", "cancel"),
+    "cancel": ("cancel",),
+}
+"""Requests already recorded that make a new one a no-op (C8). A pause is
+covered by any pause or cancel, a cancel only by a cancel, so a cancel after a
+pause is recorded and upgrades it."""
+
+
 def _record_control(
     conn: sqlite3.Connection,
     run_id: str,
@@ -1609,7 +1618,15 @@ def _record_control(
     command: str,
     now: datetime,
 ) -> tuple[store_module.ControlRow, bool]:
-    """Record `command` for this life of the run; the flag says it was already there."""
+    """Record `command` for this life of the run; the flag says it was already there.
+
+    Only rows addressed to `lease.token` count, so a request sent to an
+    earlier life never makes one to a resumed run a no-op. A no-op returns
+    the first row that covers it, whose time is reported as `requested_at`.
+    """
+    for row in store_module.control_requests(conn, run_id, lease=lease.token):
+        if row.command in CONTROL_SUBSUMES[command]:
+            return row, True
     row = store_module.add_control(
         conn, run_id, lease=lease.token, command=command, requested_at=now
     )

@@ -5377,3 +5377,100 @@ def test_pause_and_cancel_pretty_indent_the_same_envelope(projection, monkeypatc
     refused = json.loads(refusal.stdout)
     assert refused["ok"] is False
     assert refused["error"]["type"] == "UnknownRunError"
+
+
+def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
+    """Spec test 6, first half."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _freeze_clock(monkeypatch)
+    assert _invoke_control(projection, "pause").exit_code == 0
+
+    _freeze_clock(monkeypatch, _at(5))
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "pause"
+    assert data["requested_at"] == CONTROL_NOW.isoformat()
+    assert _controls(projection) == [("life-2", "pause")]
+
+
+def test_a_pause_after_a_cancel_is_a_no_op_and_the_cancel_stays_effective(
+    projection, monkeypatch
+):
+    """Spec test 6, second half: a pause never weakens a cancel."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _plant_control(projection, lease="life-2", command="cancel", requested_at=_at(-3))
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(-3).isoformat()
+    assert _controls(projection) == [("life-2", "cancel")]
+
+
+def test_a_cancel_after_a_pause_upgrades_it_and_a_repeated_cancel_is_a_no_op(
+    projection, monkeypatch
+):
+    """Spec test 7."""
+    _plant_run(projection)
+    _plant_lease(projection)
+    _freeze_clock(monkeypatch)
+    assert _invoke_control(projection, "pause").exit_code == 0
+
+    _freeze_clock(monkeypatch, _at(1))
+    upgrade = _invoke_control(projection, "cancel")
+
+    assert upgrade.exit_code == 0, upgrade.output
+    data = json.loads(upgrade.stdout)["data"]
+    assert data["already_requested"] is False
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(1).isoformat()
+    assert _controls(projection) == [("life-2", "pause"), ("life-2", "cancel")]
+
+    _freeze_clock(monkeypatch, _at(2))
+    repeat = _invoke_control(projection, "cancel")
+
+    assert repeat.exit_code == 0, repeat.output
+    data = json.loads(repeat.stdout)["data"]
+    assert data["already_requested"] is True
+    assert data["effective"] == "cancel"
+    assert data["requested_at"] == _at(1).isoformat()
+    assert _controls(projection) == [("life-2", "pause"), ("life-2", "cancel")]
+
+
+def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
+    projection, monkeypatch
+):
+    """Spec test 8: a resumed run starts clean (C4)."""
+    _plant_run(projection)
+    _plant_control(
+        projection,
+        lease="life-1",
+        command="pause",
+        requested_at=_at(-300),
+        handled_at=_at(-299),
+    )
+    _plant_control(projection, lease="life-1", command="cancel", requested_at=_at(-200))
+    _plant_lease(projection, token="life-2")
+    _freeze_clock(monkeypatch)
+
+    result = _invoke_control(projection, "pause")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["already_requested"] is False
+    assert data["effective"] == "pause"
+    assert data["requested_at"] == CONTROL_NOW.isoformat()
+    assert _controls(projection) == [
+        ("life-1", "pause"),
+        ("life-1", "cancel"),
+        ("life-2", "pause"),
+    ]
