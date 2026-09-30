@@ -906,8 +906,10 @@ def run_card(
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
 
-    Live control (C11): from the `started` rows through the final ones the run
-    holds a `control.Lease`, and the walk runs under `control.controlled`,
+    Live control (C11) and claims (X5): the card is refused before
+    `Store.open` if another live run claims it, and from before the
+    `started` rows through the final ones the run holds a `control.Lease`
+    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
     which polls for `am pause`/`am cancel` every `control_interval` seconds
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
@@ -924,6 +926,10 @@ def run_card(
 
     branch = dag.task_branch(branch_prefix, card)
     worktree = worktree_for(root, branch)
+    claims = [control.card_claim(card.id)]
+    # Read-only and before `Store.open`, so a refused card leaves no run
+    # directory (X5); `take_lease` below re-checks atomically.
+    refuse_claimed(root, claims)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
 
@@ -953,9 +959,12 @@ def run_card(
             status="started",
             worktree_path=worktree,
         )
-        # Inside the `try` that closes the store, so the lease is released
-        # before `store.close()` on every exit, a raising walk included (C2).
-        with control.Lease(store) as lease:
+        # Inside the `try` that closes the store, so the claims and the lease
+        # are released before `store.close()` on every exit, a raising walk
+        # included (C2, X5). Taken before `record_run`, so every run write is
+        # fenced by this token; a lost race is `ClaimedError` with nothing
+        # written but the empty run directory.
+        with run_lease(store, claims=claims) as lease:
             store.record_run(run_record)
             store.record_story(story)
             store.record_subtask(story.card_id, subtask)

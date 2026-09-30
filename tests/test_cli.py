@@ -34,6 +34,7 @@ from agent_manager import (
     board,
     census,
     cli,
+    control,
     dag,
     dispatch,
     integration,
@@ -6286,3 +6287,206 @@ def test_run_lease_releases_its_claims_and_lease_when_the_body_raises(projection
 
     assert _lease(projection) is None
     assert _claim_rows(projection) == []
+
+
+def _reaped_pid() -> int:
+    """The pid of a child that has exited and been waited for: dead by `pid_alive`."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
+def _run_dirs() -> list[Path]:
+    runs_root = paths.data_dir() / "runs"
+    return sorted(runs_root.iterdir()) if runs_root.exists() else []
+
+
+def _recorded_run_ids(project: Path) -> list[str]:
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [summary.id for summary in store_module.list_runs(conn)]
+    finally:
+        conn.close()
+
+
+@requires_git
+@requires_brd
+def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
+    project, cards, monkeypatch
+):
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=now - timedelta(seconds=7),
+        claims=(key,),
+    )
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {
+            "type": "ClaimedError",
+            "message": (
+                f"card {cards['subtask']} is being driven by run {OTHER_RUN_ID}"
+                f" (pid {os.getpid()} on {HERE}, heartbeat 7s ago);"
+                f" wait for it, or `am pause {OTHER_RUN_ID}`"
+            ),
+        },
+    }
+    assert _run_dirs() == []
+    assert _recorded_run_ids(project) == []
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+    worktrees = [
+        line
+        for line in _git(project, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    ]
+    assert len(worktrees) == 1, worktrees
+    assert _git(project, "branch", "--format=%(refname:short)").split() == ["main"]
+
+
+@requires_git
+@requires_brd
+def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir(
+    project, cards, monkeypatch
+):
+    """Review Focus 1: the preflight passed, then another run claimed the card
+    before `take_lease`; the only leftover is the empty run directory."""
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=now - timedelta(seconds=7),
+        claims=(key,),
+    )
+    monkeypatch.setattr(cli, "refuse_claimed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "ClaimedError"
+    assert error["message"].startswith(f"card {cards['subtask']} is being driven by run {OTHER_RUN_ID}")
+    (run_dir,) = _run_dirs()
+    assert list(run_dir.iterdir()) == []
+    assert _recorded_run_ids(project) == []
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
+def test_a_dead_claim_does_not_refuse(project, cards):
+    dead = _reaped_pid()
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="dead-life",
+        pid=dead,
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    payload = cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    assert payload["status"] == "done"
+    # The dead claim was taken over by this run, then released with its lease.
+    assert _claim_rows(project) == []
+
+
+@requires_git
+@requires_brd
+def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkeypatch):
+    real_record_run = store_module.Store.record_run
+    first: list[tuple[str | None, list[str]]] = []
+
+    def spy(self, run):
+        if not first:
+            token = self._token
+            held = (
+                []
+                if token is None
+                else [
+                    claim.key
+                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                ]
+            )
+            first.append((token, held))
+        return real_record_run(self, run)
+
+    monkeypatch.setattr(store_module.Store, "record_run", spy)
+
+    cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=lambda **kwargs: fake_runner(),
+    )
+
+    ((token, held),) = first
+    assert token is not None
+    assert held == [control.card_claim(cards["subtask"])]
+
+
+@pytest.mark.parametrize("outcome", ["done", "escalated", "raises"])
+@requires_git
+@requires_brd
+def test_a_card_run_releases_its_claims_on_every_exit(project, cards, monkeypatch, outcome):
+    run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
+    key = control.card_claim(cards["subtask"])
+    during: list[list[tuple[str, str, str]]] = []
+
+    if outcome == "raises":
+
+        async def exploding(*args, **kwargs):
+            during.append(_claim_rows(project))
+            raise EngineError("no value for a required parameter", phase="explore")
+
+        monkeypatch.setattr(cli.runtime_engine, "run_subtask_async", exploding)
+
+    inner = fake_runner(fail="review" if outcome == "escalated" else None)
+
+    def watching(phase, context, rendered):
+        if phase.name == "explore":
+            during.append(_claim_rows(project))
+        return inner(phase, context, rendered)
+
+    def drive() -> dict[str, Any]:
+        return cli.run_card(
+            cards["subtask"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix="m1",
+            clock=lambda: CRASHED_AT,
+            runner_factory=lambda **kwargs: watching,
+            control_interval=CONTROL_TICK,
+        )
+
+    if outcome == "raises":
+        with pytest.raises(EngineError, match="explore"):
+            drive()
+    else:
+        assert drive()["status"] == outcome
+
+    ((row,),) = during
+    assert row[:2] == (key, run_id)
+    assert _claim_rows(project) == []
+    assert _card_lease(project, run_id) is None
