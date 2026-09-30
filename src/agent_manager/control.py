@@ -19,7 +19,7 @@ import os
 import socket
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from types import TracebackType
 from typing import NoReturn, TypeVar, cast
@@ -87,24 +87,31 @@ def branch_claim(branch: str) -> str:
 
 
 class Lease:
-    """This process's claim on a run, held for the length of a `with` block (C2).
+    """This process's claim on a run and its keys, held for a `with` block (C2, X5).
 
-    `__enter__` takes a fresh token and starts a daemon heartbeat thread. That
-    thread waits on a `threading.Event`, never `time.sleep`, so `__exit__`
-    wakes it at once. `__exit__` stops and joins it and releases the lease on
-    any exit, and never swallows the exception.
+    `__enter__` takes a fresh token and calls `Store.take_lease` with `claims`,
+    `now = clock()` and `is_live` built on `lease_is_live` at that `now`, so a
+    live holder of the run or of any key refuses the lease
+    (`store.LeaseHeldError`, `store.ClaimHeldError`) and a dead one is taken
+    over and kept in `displaced`. Only then does it start a daemon heartbeat
+    thread. That thread waits on a `threading.Event`, never `time.sleep`, so
+    `__exit__` wakes it at once. `__exit__` stops and joins it, then releases
+    this token's claims, then this token's lease, on any exit, and never
+    swallows the exception. A process that took the lease over keeps its rows.
     """
 
     def __init__(
         self,
         store: Store,
         *,
+        claims: Sequence[str] = (),
         heartbeat: float = HEARTBEAT_SECONDS,
         clock: Callable[[], datetime] = _utcnow,
         pid: int | None = None,
         host: str | None = None,
     ) -> None:
         self._store = store
+        self._claims = tuple(claims)
         self._heartbeat = heartbeat
         self._clock = clock
         self._pid = pid
@@ -112,17 +119,20 @@ class Lease:
         self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
         self.token = ""
+        self.displaced: LeaseRow | None = None
 
     def __enter__(self) -> Lease:
         self.token = uuid4().hex
-        self._store.take_lease(
+        now = self._clock()
+        taken = self._store.take_lease(
             token=self.token,
             pid=os.getpid() if self._pid is None else self._pid,
             host=socket.gethostname() if self._host is None else self._host,
-            now=self._clock(),
-            # M9's unconditional replace; ec7ae954 injects `lease_is_live` and claims.
-            is_live=lambda row: False,
+            now=now,
+            is_live=lambda row: lease_is_live(row, now=now),
+            claims=self._claims,
         )
+        self.displaced = taken.displaced
         self._stopped.clear()
         self._thread = threading.Thread(
             target=self._keep_beating, name="am-lease-heartbeat", daemon=True
@@ -141,7 +151,10 @@ class Lease:
             self._thread.join()
             self._thread = None
         try:
-            self._store.release_lease(self.token)
+            try:
+                self._store.release_claims(self.token)
+            finally:
+                self._store.release_lease(self.token)
         finally:
             # This process no longer holds the run: stop fencing its writes to
             # a token that is gone, as M9's store never fenced them.
