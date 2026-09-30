@@ -1504,6 +1504,10 @@ def resume_run(
     reads them: its binding comes from the checkpoint's pool. On a milestone
     they also reach what starts afresh -- subtasks with no checkpoint, merged
     bases and Integrate.
+
+    A cancelled run is refused for both workflows (live control C9), and so
+    is a run whose lease is still live (C10): both refusals read only the
+    connection that loaded the run.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1513,6 +1517,20 @@ def resume_run(
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
+            )
+        # C9, then C10: both read-only and before anything is written, so a
+        # refusal leaves no run directory, row or journal line behind.
+        if run.status == "cancelled":
+            raise NotResumableError(
+                f"run {run.id} was cancelled; start new work with `am run --milestone`"
+            )
+        lease = store_module.read_lease(conn, run.id)
+        now = _utcnow()
+        if lease is not None and control.lease_is_live(lease, now=now):
+            raise RunIsLiveError(
+                f"run {run.id} is still running in pid {lease.pid} on {lease.host}"
+                f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
+                f" or `am status {run.id}`"
             )
     finally:
         conn.close()

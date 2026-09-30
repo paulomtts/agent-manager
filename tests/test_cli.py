@@ -5554,3 +5554,91 @@ def test_status_shows_the_lease_and_every_lifes_requests_in_seq_order(
             ],
         }
     assert (_controls(projection), _lease(projection)) == before
+
+
+def _forbid_resume(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+
+def _resume_guard_state(root: Path) -> tuple:
+    return (_runs_snapshot(), _attempt_rows(root), _controls(root), _lease(root))
+
+
+@pytest.mark.parametrize("leased", [False, True], ids=["no-lease", "live-lease"])
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_cancelled_run_and_writes_nothing(
+    projection, monkeypatch, workflow, leased
+):
+    """Spec test 11 (C9), both workflows. Review Focus: a cancelled run that
+    still holds a live lease is refused as cancelled."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="cancelled", workflow=workflow)
+    if leased:
+        _plant_lease(projection)
+    before = _resume_guard_state(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResumableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} was cancelled;"
+            " start new work with `am run --milestone`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_run_whose_lease_is_live_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """Spec test 12 (C10), both workflows."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started", workflow=workflow)
+    _plant_lease(projection, heartbeat_at=_at(-5))
+    before = _resume_guard_state(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "RunIsLiveError",
+        "message": (
+            f"run {CONTROL_RUN_ID} is still running in pid {os.getpid()} on {HERE}"
+            " (heartbeat 5s ago); wait for it to exit,"
+            f" or `am status {CONTROL_RUN_ID}`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+
+
+def test_resume_is_not_blocked_by_a_dead_lease(projection, monkeypatch):
+    """Spec test 12, last clause: a stale lease is a crashed run, which is
+    exactly what `resume` is for."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started")
+    _plant_lease(projection, heartbeat_at=_at(-31))
+    seen: list[str] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append(run.id)
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope({"status": "done"})
+    assert seen == [CONTROL_RUN_ID]
