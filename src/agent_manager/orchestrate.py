@@ -1703,7 +1703,11 @@ def run_milestone(
                 return comment_run_end(report(payload))
             if stop.requested == "pause":
                 store.record_run(run_record.model_copy(update={"status": "stopped"}))
-                return report(controlled_payload(run_id, "pause", outcomes, warnings))
+                # Board-comments B2 (card 5d9a875f): only the milestone's run-end;
+                # a parked subtask is resumed, not closed, so it gets no comment.
+                return comment_run_end(
+                    report(controlled_payload(run_id, "pause", outcomes, warnings))
+                )
 
             # Integrate (addendum I6) runs only once every lane finished clean,
             # and also when there was nothing left to drive: that is how a relaunch

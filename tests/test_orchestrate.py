@@ -5885,3 +5885,60 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
     )
     assert f"board comment {run_id}/{milestone}/run-end:" in result["warnings"][1]
     assert [state for _key, state in _comment_states(project)] == ["pending", "pending"]
+
+
+@requires_git
+@requires_brd
+def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
+    """Spec test 2: one comment in total, on the milestone, telling a human
+    to resume; parked a1, pending a2 and b1, and every story get nothing."""
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    milestone = shape["milestone"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _run(project, milestone, driver, control_interval=0)
+
+    assert result["paused"] is True, result
+    assert len(_comment_states(project)) == 1
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · paused · run {run_id}\n")
+    assert "done: 0 of 3" in body
+    assert f"parked: [[{a1}]]" in body
+    assert f"next: `am resume {run_id}`" in body
+    for quiet in (a1, a2, b1, *shape["stories"].values()):
+        assert _comments(project, quiet) == [], quiet
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_paused_then_resumed_run_leaves_a_paused_then_a_done_run_end(project):
+    """Review Focus 4: the resumed life has its own lease token, so its done
+    run-end is a second comment with its own key, after the paused one."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+    first = _run(project, milestone, driver, control_interval=0)
+    assert first["paused"] is True, first
+
+    again = _resume(project, run_id, FakeDriver(), control_interval=0)
+
+    assert again["done"] is True, again
+    on_milestone = _comments(project, milestone)
+    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
+        f"am · paused · run {run_id}",
+        f"am · done · run {run_id}",
+    ]
+    keys = _keys(on_milestone)
+    assert len(set(keys)) == 2, keys
+    assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in keys)
