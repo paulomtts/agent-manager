@@ -5449,3 +5449,83 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
         f"am · done · run {run_id}",
     ]
     assert len(set(_keys(on_milestone))) == 2
+
+
+@requires_git
+@requires_brd
+def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
+    """Spec test 5, `lane` case: one `base-failed` comment on C, none on c1."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_c, "base"), result
+    run_id = result["run_id"]
+    found = _comments(project, story_c)
+    assert _keys(found) == [f"{run_id}/{story_c}/base-failed"]
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · base failed · run {run_id}\n")
+    assert f"base branch: {root_plan.branch}" in body
+    assert "detail: conflict nobody could resolve" in body
+    assert _comments(project, c1) == []
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_bases):
+    """Spec test 5, `base_only_lane` case: J has no store row, yet its story
+    card gets the comment."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    root_plan = _root_plan(project, shape["milestone"], story_j)
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_j, "base"), result
+    run_id = result["run_id"]
+    found = _comments(project, story_j)
+    assert _keys(found) == [f"{run_id}/{story_j}/base-failed"]
+    assert f"base branch: {root_plan.branch}" in found[0].body
+    assert "detail: J's base broke" in found[0].body
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_base_whose_resolver_was_stopped_gets_no_base_failed_comment(project, fake_bases):
+    """Spec test 5, stopped case: `BaseFailed(stopped=True)` is a park, not a failure."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A", "B"]}
+    )
+    story_c = shape["stories"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    c_building = asyncio.Event()
+
+    async def park_with_the_stop(stop: StopSignal | None) -> None:
+        c_building.set()
+        await _await_stop(stop)
+
+    async def escalate_once_c_builds(stop: StopSignal | None) -> None:
+        await _within(c_building.wait(), "C's base to start building")
+
+    fake_bases.gates[story_c] = park_with_the_stop
+    fake_bases.outcomes[story_c] = bases.BaseFailed("the resolver was stopped", stopped=True)
+    driver = GatedDriver(
+        outcomes={d1: ("review", "d broke")}, gates={d1: escalate_once_c_builds}
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    assert result["stopped"] == [{"story": story_c, "subtask": None, "before_phase": None}]
+    assert _comments(project, story_c) == []

@@ -939,8 +939,25 @@ async def base_only_lane(
             if error.stopped:
                 raise LaneStopped(outcome("stopped")) from error
             stop.trigger(story.id)
+            # Board-comments B2: on the story card; there is no store row here.
+            flushed = await post_comment_async(
+                store,
+                root,
+                comments.compose_base_failed(
+                    run_id=run_id,
+                    story_id=story.id,
+                    base_branch=root_plan.branch,
+                    detail=error.detail,
+                ),
+                run_id=run_id,
+            )
             raise LaneEscalated(
-                outcome("escalated", failed_phase="base", detail=error.detail)
+                outcome(
+                    "escalated",
+                    failed_phase="base",
+                    detail=error.detail,
+                    warnings=tuple(flushed),
+                )
             ) from error
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             stop.trigger(story.id)
@@ -1086,6 +1103,20 @@ async def lane(
                         raise LaneStopped(outcome("stopped", None)) from error
                     stop.trigger(story.id)
                     store.record_story(story_row.model_copy(update={"status": "escalated"}))
+                    # Board-comments B2: the failed base is the story's, so is the comment.
+                    warnings.extend(
+                        await post_comment_async(
+                            store,
+                            root,
+                            comments.compose_base_failed(
+                                run_id=run_id,
+                                story_id=story.id,
+                                base_branch=root_plan.branch,
+                                detail=error.detail,
+                            ),
+                            run_id=run_id,
+                        )
+                    )
                     raise LaneEscalated(
                         outcome("escalated", None, failed_phase="base", detail=error.detail)
                     ) from error
