@@ -1099,6 +1099,76 @@ def test_the_dry_run_payload_defaults_to_four_lanes():
     assert [level["concurrent"] for level in payload["levels"]] == [3, 1]
 
 
+def test_the_dry_run_payload_keeps_every_key_order():
+    """Review focus: `--dry-run` output must stay byte-for-byte identical, and
+    dict equality ignores key order, so each row type's key order is pinned
+    here -- a merged-root row included, since it alone carries `merged_from`."""
+    a = _plan_story(1, [_plan_subtask(11)])
+    b = _plan_story(2, [_plan_subtask(21)])
+    c = _plan_story(3, [_plan_subtask(31)], blocked_by=[a.id, b.id])
+    done = _plan_story(4, [_plan_subtask(41, "done")], status="done")
+    partial = _plan_story(5, [_plan_subtask(51, "done"), _plan_subtask(52)])
+
+    payload = cli.dry_run_payload(
+        [a, b, c, done, partial], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
+
+    assert list(payload) == ["max_concurrent", "levels", "already_done", "integrate"]
+    for level in payload["levels"]:
+        assert list(level) == ["level", "concurrent", "stories"]
+        for row in level["stories"]:
+            expected = ["story", "title", "root", "subtasks"]
+            if row["story"] == c.id:
+                expected.append("merged_from")
+            assert list(row) == expected
+            for subtask in row["subtasks"]:
+                assert list(subtask) == ["id", "title", "status", "branch", "base"]
+    assert [list(entry) for entry in payload["already_done"]] == [
+        ["kind", "id", "title"],
+        ["kind", "id", "title", "story"],
+    ]
+    assert list(payload["integrate"]) == ["branch", "worktree", "order"]
+    assert payload["integrate"]["order"]
+    for entry in payload["integrate"]["order"]:
+        assert list(entry) == ["story", "tip"]
+
+
+def test_the_dry_run_payload_accepts_a_one_shot_iterator():
+    """Review focus: the stories feed both the levels and `already_done`, so a
+    generator must be read once and seen by both."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    done = _plan_story(3, [_plan_subtask(31, "done")], status="done")
+    stories = [a, b, done]
+
+    from_list = cli.dry_run_payload(
+        stories, repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
+    from_iterator = cli.dry_run_payload(
+        iter(stories), repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
+
+    assert from_iterator == from_list
+    assert from_iterator["already_done"] != []
+    assert [len(level["stories"]) for level in from_iterator["levels"]] == [1, 1]
+
+
+def test_an_empty_census_gives_an_empty_dry_run_payload():
+    """Review focus: a milestone with no stories at all is not an error."""
+    payload = cli.dry_run_payload([], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main")
+
+    assert payload == {
+        "max_concurrent": 4,
+        "levels": [],
+        "already_done": [],
+        "integrate": {
+            "branch": "m3-integrate",
+            "worktree": "/repo/.claude/worktrees/m3-integrate",
+            "order": [],
+        },
+    }
+
+
 def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
     """Review focus: one foreign blocker plus one in-milestone blocker is ONE
     in-milestone blocker, not a two-blocker refusal."""

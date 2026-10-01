@@ -22,7 +22,7 @@ in the worktree for a human or a later resume.
 
 Nothing is pushed, and the milestone's base branch is never checked out,
 merged into or moved: every git write is `ensure`'s or `merge_tip`'s, in the
-base worktree `cli.worktree_for` names. The outcome is internal state, so it
+base worktree `runs.worktree_for` names. The outcome is internal state, so it
 is a plain dataclass (CLAUDE.md).
 """
 
@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_manager import cli, models
+from agent_manager import models, runs
 from agent_manager.dag import RootPlan
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
@@ -136,7 +136,7 @@ def _verify(
     Mirrors `integration._final_verification`: an empty suite is judged by
     `verification_gate` first, because running zero commands reports
     `passed: True` and `verification_passed_gate` would wave it through.
-    `bool()` matches `cli.gate_context`: the reducer tests `is True`.
+    `bool()` matches `runs.gate_context`: the reducer tests `is True`.
     """
     missing = reducers.verification_gate(commands, bool(allow_no_verification), True)
     if missing is not None:
@@ -165,7 +165,7 @@ async def _resolve_conflict(
     allow_no_verification: bool,
     store: Store,
     run_id: str,
-    runner_factory: cli.RunnerFactory,
+    runner_factory: runs.RunnerFactory,
     stop: StopSignal | None,
     resume_from: Checkpoint | None = None,
 ) -> SubtaskSummary:
@@ -201,7 +201,7 @@ async def _resolve_conflict(
         extra_context={
             "merge_tip": tip,
             "conflict_files": list(files),
-            **cli.gate_context(commands, allow_no_verification),
+            **runs.gate_context(commands, allow_no_verification),
         },
         agent_runner=runner,
         stop=stop,
@@ -253,7 +253,7 @@ async def build(
     store: Store | None,
     run_id: str | None,
     story_id: str | None,
-    runner_factory: cli.RunnerFactory | None,
+    runner_factory: runs.RunnerFactory | None,
     stop: StopSignal | None,
     resume_from: Checkpoint | None = None,
 ) -> BaseResult:
@@ -280,7 +280,7 @@ async def build(
             f"bases.build needs at least one blocker tip to build {root.branch}, got none"
         )
     repo = Path(repo_dir).resolve()
-    worktree = cli.worktree_for(repo, root.branch)
+    worktree = runs.worktree_for(repo, root.branch)
     suite = list(commands)
 
     missing = await asyncio.to_thread(_missing_tips, repo, tips)

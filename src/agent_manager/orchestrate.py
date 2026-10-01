@@ -30,10 +30,14 @@ The order is load-bearing. Everything that can refuse -- an unknown milestone,
 a blocker cycle -- runs before the first write, so a refusal leaves no run
 directory, no store, no fetch and no prune behind.
 
-`cli` is imported as a module and every name on it is read at call time: the
-CLI wiring card makes `cli` import this module, and binding a `cli` name at
-import or definition time would break under that circular import. The clock
-default is this module's own `_utcnow` for the same reason.
+The run helpers S1 moved out of the Typer module (`RunnerFactory`, the resume
+error types, `mint_run_id`, `resolve_repo_dir`, `worktree_for`,
+`orphan_attempts`, `continuable_checkpoint`) are read off `runs`. `cli` is
+still imported, as a module, for what it alone defines -- the production
+`default_runner_factory` and the `drive_subtask_async` driver -- and every
+name on it is read at call time: `cli` imports this module, and binding a
+`cli` name at import or definition time would break under that circular
+import. The clock default is this module's own `_utcnow` for the same reason.
 
 The module holds no mutable state of its own (O4). A run's `StopSignal` is
 created by `run_milestone` for that run. This is the only module that imports
@@ -52,7 +56,7 @@ from typing import Any, Literal, Protocol
 
 import grafo
 
-from agent_manager import bases, board, census, cli, control, dag, integration, models
+from agent_manager import bases, board, census, cli, control, dag, integration, models, runs
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
@@ -329,7 +333,7 @@ class Driver(Protocol):
         repo_dir: Path,
         commands: Sequence[str] = (),
         allow_no_verification: bool = False,
-        runner_factory: cli.RunnerFactory | None = None,
+        runner_factory: runs.RunnerFactory | None = None,
         stop: StopSignal | None = None,
         resume_from: Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
@@ -360,7 +364,7 @@ def plan_levels(
 ) -> list[list[PlannedStory]]:
     """Dispatch levels with each pending story's bases and tip, derived before any write.
 
-    The same composition as `cli.dry_run_payload`: the cycle check runs first,
+    The same composition as `runs.compute_dry_run_plan`: the cycle check runs first,
     because a cycle is what breaks the geometry, and `stories_by_id` covers
     every story, done ones included, so a story blocked by a done story still
     roots on that story's tip. A story rooted on a merged base -- its own, for
@@ -565,20 +569,20 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     finally:
         conn.close()
     if run is None:
-        raise cli.UnknownRunError(
+        raise runs.UnknownRunError(
             f"run {run_id!r} is not in the projection for {root}"
             " (`agent-manager runs` lists the ones that are)"
         )
     if run.workflow != MILESTONE_WORKFLOW:
-        raise cli.NotResumableError(
+        raise runs.NotResumableError(
             f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
         )
     if run.status == "cancelled":
-        raise cli.NotResumableError(
+        raise runs.NotResumableError(
             f"run {run_id} was cancelled; start new work with am run --milestone"
         )
     if run.status == "done":
-        raise cli.NotResumableError(
+        raise runs.NotResumableError(
             f"run {run.id} finished; start new work with am run --milestone"
         )
     return run
@@ -589,14 +593,14 @@ def find_run_milestone(
 ) -> models.CardNode:
     """The one root card whose short id ends `run_id`.
 
-    `cli.mint_run_id` builds a milestone run's id as `<timestamp>-<short
+    `runs.mint_run_id` builds a milestone run's id as `<timestamp>-<short
     milestone id>`, and `models.Run` records no milestone id of its own, so
     the id is how a resume finds its milestone. A title edit cannot break it.
     """
     short = run_id.rsplit("-", 1)[-1]
     matches = [node for node in roots or [] if dag.short_id(node.id) == short]
     if len(matches) != 1:
-        raise cli.NotResumableError(
+        raise runs.NotResumableError(
             f"run {run_id!r} belongs to milestone {short}, and {len(matches)} root"
             " cards on the board have that short id"
         )
@@ -625,14 +629,14 @@ def open_cards(
 
 
 def _refuse_changed_workflow(checkpoint: Checkpoint, workflow: Workflow, run_id: str) -> None:
-    """`cli.CheckpointMismatchError` when `checkpoint` was saved under another digest.
+    """`runs.CheckpointMismatchError` when `checkpoint` was saved under another digest.
 
     Worded like `cli.checkpoint_resume_phase`'s refusal, with the milestone
     remedy.
     """
     digest = workflow.digest()
     if checkpoint.digest != digest:
-        raise cli.CheckpointMismatchError(
+        raise runs.CheckpointMismatchError(
             f"workflow changed since checkpoint: checkpoint #{checkpoint.seq} of card"
             f" {checkpoint.card_id} in run {run_id!r} was saved under digest"
             f" {checkpoint.digest}, but workflow {workflow.name!r} now has digest"
@@ -683,13 +687,13 @@ def reopen_rows(store: Store, run: models.Run, open_card_ids: set[str]) -> None:
     """Mark every orphan attempt `harness_error`, then reopen the open rows.
 
     `run` is the tree as the interrupted run left it. An orphan is
-    `cli.orphan_attempts`' in-flight attempt, marked as `cli`'s
+    `runs.orphan_attempts`' in-flight attempt, marked as `cli`'s
     `_resume_from_checkpoint` marks it. A subtask or resolver row of an open
     card that is stopped, escalated or started is recorded `started`.
     """
     for story in run.stories:
         for subtask in story.subtasks:
-            for phase, attempt in cli.orphan_attempts(subtask):
+            for phase, attempt in runs.orphan_attempts(subtask):
                 store.record_attempt(
                     story.card_id,
                     subtask.card_id,
@@ -776,7 +780,7 @@ def record_plan(
                     branch=branch,
                     base_branch=planned.bases[subtask.id],
                     status="pending",
-                    worktree_path=cli.worktree_for(root, branch),
+                    worktree_path=runs.worktree_for(root, branch),
                 )
                 store.record_subtask(planned.story.id, subtask_row)
                 subtask_rows[subtask.id] = subtask_row
@@ -794,7 +798,7 @@ async def build_merged_base(
     root: Path,
     commands: Sequence[str],
     allow_no_verification: bool,
-    runner_factory: cli.RunnerFactory | None,
+    runner_factory: runs.RunnerFactory | None,
     stop: StopSignal,
     resume_from: Checkpoint | None = None,
 ) -> None:
@@ -879,7 +883,7 @@ async def base_only_lane(
     root: Path,
     commands: Sequence[str],
     allow_no_verification: bool,
-    runner_factory: cli.RunnerFactory | None,
+    runner_factory: runs.RunnerFactory | None,
     slots: asyncio.Semaphore,
     stop: StopSignal,
     finished: dict[str, LaneOutcome],
@@ -939,7 +943,7 @@ async def lane(
     drive: Driver,
     commands: Sequence[str],
     allow_no_verification: bool,
-    runner_factory: cli.RunnerFactory | None,
+    runner_factory: runs.RunnerFactory | None,
     slots: asyncio.Semaphore,
     stop: StopSignal,
     finished: dict[str, LaneOutcome],
@@ -978,7 +982,7 @@ async def lane(
     carries the story's `RootPlan` as `base`, whatever happens after.
 
     Each subtask's open checkpoint is looked up first
-    (`cli.continuable_checkpoint`), inside the same `try`, and handed to the
+    (`runs.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
 
     On a resume (`plan.resuming`, card 54e4ec29) the subtask's checkpoint is
@@ -1085,7 +1089,7 @@ async def lane(
                 if plan.resuming:
                     checkpoint = plan.checkpoints.get(subtask.id)
                 else:
-                    checkpoint = cli.continuable_checkpoint(store, subtask.id)
+                    checkpoint = runs.continuable_checkpoint(store, subtask.id)
                 if checkpoint is not None:
                     extra["resume_from"] = checkpoint
                 result = await drive(
@@ -1194,7 +1198,7 @@ async def supervise(
     drive: Driver,
     commands: Sequence[str],
     allow_no_verification: bool,
-    runner_factory: cli.RunnerFactory | None,
+    runner_factory: runs.RunnerFactory | None,
     max_concurrent: int,
     stop: StopSignal,
 ) -> list[LaneOutcome]:
@@ -1324,7 +1328,7 @@ def run_milestone(
     branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
-    runner_factory: cli.RunnerFactory | None = None,
+    runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
@@ -1405,7 +1409,7 @@ def run_milestone(
             raise ValueError(
                 "a fresh milestone run needs a milestone, a base branch and a branch prefix"
             )
-    root = cli.resolve_repo_dir(repo_dir)
+    root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
     if resumed is not None:
         base_branch = resumed.base_branch
@@ -1433,7 +1437,7 @@ def run_milestone(
         # is opened, so a failed fetch leaves no run directory behind.
         refresh_git(root)
         started_at = clock()
-        run_id = cli.mint_run_id(milestone_card.id, started_at)
+        run_id = runs.mint_run_id(milestone_card.id, started_at)
         run_record = models.Run(
             id=run_id,
             workflow=MILESTONE_WORKFLOW,
