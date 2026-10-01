@@ -5277,7 +5277,6 @@ def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story
     assert result["warnings"] == []
 
 
-
 @requires_git
 @requires_brd
 def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
@@ -5607,3 +5606,94 @@ def test_a_board_that_is_down_changes_only_warnings_and_a_relaunch_posts_the_row
     assert milestone_keys[0].startswith(f"{run_id}/{milestone}/run-end:")
     assert milestone_keys[1].startswith(f"{second['run_id']}/{milestone}/run-end:")
     assert all(row_state == "posted" for _key, row_state in _comment_states(project))
+
+
+@requires_git
+@requires_brd
+def test_a_start_flush_that_fails_reports_its_warnings_and_the_run_goes_on(
+    project, monkeypatch
+):
+    """Board-comments B7/B8: a relaunch whose start flush meets a board that
+    is still down reports the earlier run's unposted rows as warnings and
+    still ends done. a1 is not driven again, so only the start flush can
+    report a warning on its row."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    _board_down(monkeypatch)
+    first = _run(project, milestone, BranchingDriver())
+    run_id = first["run_id"]
+
+    second = _run(project, milestone, BranchingDriver(), clock=lambda: LATER)
+
+    assert second["done"] is True, second
+    assert second["completed"] == []
+    on_a1 = [w for w in second["warnings"] if f"board comment {run_id}/{a1}/done " in w]
+    assert len(on_a1) == 1, second["warnings"]
+    assert "not posted" in on_a1[0] and "brd is down" in on_a1[0]
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_comment_the_board_refuses_is_a_warning_on_the_run(
+    project, monkeypatch
+):
+    """Board-comments B8: the escalated subtask's unposted comment surfaces
+    in the escalated report's `warnings`, and the run still escalates."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{a1}/escalated:" in w]
+    ) == 1, result["warnings"]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_base_comment_the_board_refuses_is_a_warning_on_the_run(
+    project, fake_bases, monkeypatch
+):
+    """Board-comments B8, `lane` case: the story's unposted base-failed
+    comment surfaces in the escalated report's `warnings`."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_c, "base"), result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{story_c}/base-failed " in w]
+    ) == 1, result["warnings"]
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_refused_base_comment_is_a_warning_on_the_run(
+    project, fake_bases, monkeypatch
+):
+    """Board-comments B8, `base_only_lane` case: J's unposted base-failed
+    comment surfaces in the escalated report's `warnings`."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_j, "base"), result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{story_j}/base-failed " in w]
+    ) == 1, result["warnings"]
