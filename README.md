@@ -312,7 +312,7 @@ A milestone resume refuses before anything is written and before git is fetched,
 - any open subtask, or any open `base-<story id>` resolver, has a checkpoint saved under a workflow that has changed since (its digest no longer matches). One stale checkpoint refuses the whole resume, and nothing is written. Relaunch with `am run --milestone` instead: a relaunch starts such a card again from its first phase rather than refusing.
 - the run id's milestone is not on the board, or more than one root card has its short id, or the stories now have a blocker cycle.
 
-On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. One exception: a phase that finished just before the process was killed, before the next checkpoint was saved, runs again too, because phases are at-least-once. Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `cancelled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
+On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. A phase that finished just before the process was killed, before the next checkpoint was saved, depends on its kind: an agent phase is adopted and not dispatched again, and a step runs again (see [Resuming: what runs again](#resuming-what-runs-again)). Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `cancelled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
 
 A `task` run's resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
@@ -406,6 +406,26 @@ section 6 of the
 and section 10 of the
 [supervisor-tree addendum](docs/superpowers/specs/2026-09-25-supervisor-tree-design.md#10-deferred)
 for everything deferred.
+
+## Resuming: what runs again
+
+`am resume <run-id>`, and a relaunch that continues an open checkpoint from an earlier run, go on at the turn the newest checkpoint saved, which is before the interrupted phase ran. Whether that phase runs again depends on its kind and on what was recorded before the process stopped:
+
+| Phase kind, and what was recorded before the stop | On resume |
+|---|---|
+| Agent phase with an `ok` attempt recorded for this turn (it finished, but the next checkpoint was not saved) | Adopted, not dispatched again. Its result file is read and validated again, and the phase's gates run again against the resumed context. If either fails, the result is not reused and the phase is dispatched again. |
+| Agent phase with no `ok` attempt, or only an attempt left `started` (marked `harness_error` on resume) | Dispatched again. An attempt that never finished is never adopted, even when its result file looks valid. |
+| Step (`worktree`, `docs_commit`, `verify`, ...) | May run again. Steps are at-least-once, and every step must be idempotent. |
+
+An adoption shows only as one line in the report's `warnings`:
+
+```
+phase 'implement' was not dispatched again: attempt 1 of run <run-id> had already succeeded (result reused)
+```
+
+A recorded result that no longer holds up is dispatched again, with one warning line `phase '<name>': attempt <n> of run <run-id> was not reused (<why>); dispatching again`. The envelope shape and the exit codes are the same as for any other resume.
+
+Exactly-once covers am's dispatch of an agent phase, not what the harness did. The harness's own effects are never transactional: commits, files written in the worktree, or anything else an agent did before the kill stay as they are, whether the phase is then adopted or dispatched again. A phase that is dispatched again finds that work already in its worktree; `implement`, for example, resumes from git and the `Plan-Hash` trailers.
 
 ## Develop
 
