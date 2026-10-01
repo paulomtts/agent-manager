@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import board, comments, store
+from agent_manager import board, comments, locks, store
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -711,8 +711,6 @@ class FakeBoard:
     @contextlib.contextmanager
     def write_lock(self, repo_dir):
         if self.lock_timeout:
-            from agent_manager import locks
-
             raise locks.LockTimeoutError(Path(repo_dir) / "board.lock", 0.0)
         self.locks_taken += 1
         self.held += 1
@@ -898,3 +896,99 @@ def test_flush_ignores_comments_whose_last_line_is_another_key(stores, root):
 
     assert fake.added == [("card-a", comment.body, "am")]
     assert _row(st, comment.key)["comment_id"] == "c1"
+
+
+def test_board_down_leaves_rows_pending_with_warnings_then_posts_them_later(stores, root):
+    st = stores()
+    first = _queue(st, "card-a", "done", minute=0)
+    second = _queue(st, "card-b", "done", minute=1)
+    fake = FakeBoard()
+    fake.down = True
+
+    warnings = comments.flush(st, root, board_api=fake)
+
+    assert len(warnings) == 2
+    assert first.key in warnings[0] and "card-a" in warnings[0] and "will retry" in warnings[0]
+    assert second.key in warnings[1] and "card-b" in warnings[1] and "will retry" in warnings[1]
+    assert [r.key for r in st.pending_comments()] == [first.key, second.key]
+    assert [r.failed_attempts for r in st.pending_comments()] == [1, 1]
+    assert fake.added == []
+    assert fake.held == 0
+
+    fake.down = False
+    assert comments.flush(st, root, board_api=fake) == []
+
+    assert st.pending_comments() == []
+    assert [added[0] for added in fake.added] == ["card-a", "card-b"]
+
+
+def test_a_board_lock_timeout_is_a_counted_board_failure(stores, root):
+    st = stores()
+    comment = _queue(st, "card-a", "done")
+    fake = FakeBoard()
+    fake.lock_timeout = True
+
+    warnings = comments.flush(st, root, board_api=fake)
+
+    assert len(warnings) == 1
+    assert comment.key in warnings[0] and "card-a" in warnings[0]
+    assert fake.calls == []
+    row = _row(st, comment.key)
+    assert (row["state"], row["failed_attempts"]) == ("pending", 1)
+
+
+def test_three_failures_abandon_a_row_with_one_warning(stores, root):
+    st = stores()
+    comment = _queue(st, "card-a", "done")
+    fake = FakeBoard()
+    fake.down = True
+
+    first = comments.flush(st, root, board_api=fake)
+    second = comments.flush(st, root, board_api=fake)
+    third = comments.flush(st, root, board_api=fake)
+
+    assert len(first) == 1 and "will retry" in first[0] and "abandoned" not in first[0]
+    assert len(second) == 1 and "will retry" in second[0] and "abandoned" not in second[0]
+    assert len(third) == 1
+    assert comment.key in third[0] and "card-a" in third[0] and "abandoned" in third[0]
+    assert "will retry" not in third[0]
+    row = _row(st, comment.key)
+    assert (row["state"], row["failed_attempts"]) == ("abandoned", store.COMMENT_ATTEMPTS)
+    assert st.pending_comments() == []
+
+    fake.down = False
+    calls_before = list(fake.calls)
+    assert comments.flush(st, root, board_api=fake) == []
+    assert fake.calls == calls_before
+    assert fake.added == []
+
+
+def test_one_failing_card_does_not_block_the_others(stores, root):
+    st = stores()
+    failing = _queue(st, "card-a", "done", minute=0)
+    fine = _queue(st, "card-b", "done", minute=1)
+    fake = FakeBoard()
+    fake.fail_cards = {"card-a"}
+
+    warnings = comments.flush(st, root, board_api=fake)
+
+    assert len(warnings) == 1
+    assert failing.key in warnings[0] and "card-a" in warnings[0]
+    assert fake.added == [("card-b", fine.body, "am")]
+    assert [r.key for r in st.pending_comments()] == [failing.key]
+    assert _row(st, fine.key)["state"] == "posted"
+
+
+def test_a_lost_lease_while_marking_propagates_and_counts_no_failure(stores, root):
+    # Guard for Step 4's except clause: passes before it and must keep passing.
+    st = stores()
+    comment = _queue(st, "card-a", "done")
+    fake = FakeBoard()
+    losing = CrashOnFirstMark(st, store.LeaseLostError(RUN, None))
+
+    with pytest.raises(store.LeaseLostError):
+        comments.flush(losing, root, board_api=fake)
+
+    row = _row(st, comment.key)
+    assert (row["state"], row["failed_attempts"]) == ("pending", 0)
+    assert fake.held == 0

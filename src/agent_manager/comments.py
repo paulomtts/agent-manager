@@ -22,7 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent_manager import board
+from agent_manager import board, locks
+from agent_manager.store import COMMENT_ATTEMPTS
 
 if TYPE_CHECKING:
     from agent_manager.runtime.walk import SubtaskSummary
@@ -390,6 +391,18 @@ def _post_one(store: Store, row: CommentRow, root: Path, board_api: Any) -> None
     store.mark_comment_posted(row.key, comment_id, datetime.now(timezone.utc))
 
 
+def _warning(row: CommentRow, attempts: int, error: Exception) -> str:
+    """The one report warning for a row whose post failed (B7, B8).
+
+    `attempts` is `Store.record_comment_failure`'s new count; at
+    `COMMENT_ATTEMPTS` the store has already marked the row `abandoned`.
+    """
+    where = f"board comment {row.key} on card {row.card_id}"
+    if attempts >= COMMENT_ATTEMPTS:
+        return f"{where} abandoned after {attempts} failed attempts: {error}"
+    return f"{where} not posted (attempt {attempts} of {COMMENT_ATTEMPTS}), will retry: {error}"
+
+
 def flush(
     store: Store,
     root: Path,
@@ -404,9 +417,20 @@ def flush(
     does. Each row takes `board_api.write_lock(root)` on its own -- never
     while a store transaction is open (X8) -- and all board access goes
     through `board_api`, so tests inject a fake.
+
+    A `board.BoardError` or a `locks.LockTimeoutError` on a row is counted
+    with `Store.record_comment_failure`, reported as exactly one warning,
+    and the next row is tried: a board failure never escalates, parks or
+    changes a run (B8). Every other exception propagates.
     """
     warnings: list[str] = []
     for row in store.pending_comments(run_id, card_ids):
-        with board_api.write_lock(root):
-            _post_one(store, row, root, board_api)
+        try:
+            with board_api.write_lock(root):
+                _post_one(store, row, root, board_api)
+        except (board.BoardError, locks.LockTimeoutError) as error:
+            # Counted outside the board lock; the store's own 3-strike rule
+            # abandons the row. Anything else (a lost lease, a crash) propagates.
+            attempts = store.record_comment_failure(row.key)
+            warnings.append(_warning(row, attempts, error))
     return warnings
