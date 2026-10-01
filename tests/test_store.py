@@ -3648,3 +3648,57 @@ def test_an_enqueue_with_no_body_is_refused_not_ignored(repo):
         assert _enqueue(st, "k1") is True
     finally:
         st.close()
+
+
+def test_pending_comments_filters_by_run_and_cards_oldest_first(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k1", card_id="card-a", run_id=RUN_ID, body="one", now=_at(2))
+        _enqueue(st, "k2", card_id="card-b", run_id=RUN_ID, body="two", now=_at(1))
+        _enqueue(st, "k3", card_id="card-a", run_id=OTHER_RUN_ID, body="three", now=_at(0))
+
+        def keys(**filters) -> list[str]:
+            return [row.key for row in st.pending_comments(**filters)]
+
+        every = st.pending_comments()
+        by_run = keys(run_id=RUN_ID)
+        by_cards = keys(card_ids=["card-a"])
+        both = keys(run_id=RUN_ID, card_ids=["card-a"])
+        empty = keys(card_ids=[])
+        one_shot = keys(card_ids=iter(["card-b"]))
+        unknown = keys(card_ids=("card-never",), run_id=OTHER_RUN_ID)
+    finally:
+        st.close()
+
+    assert [row.key for row in every] == ["k3", "k2", "k1"]
+    assert every[0] == store.CommentRow(
+        run_id=OTHER_RUN_ID,
+        card_id="card-a",
+        key="k3",
+        body="three",
+        state="pending",
+        comment_id=None,
+        failed_attempts=0,
+    )
+    assert by_run == ["k2", "k1"]
+    # card_ids reaches across runs: relaunch finds an older run's rows.
+    assert by_cards == ["k3", "k1"]
+    assert both == ["k1"]
+    assert empty == []
+    assert one_shot == ["k2"]
+    assert unknown == []
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        every[0].state = "posted"  # type: ignore[misc]
+
+
+def test_pending_comments_breaks_a_created_at_tie_by_insertion_order(repo):
+    # Review Focus 3: one tick composes several bodies with the same `now`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k-b", now=_at(5))
+        _enqueue(st, "k-a", now=_at(5))
+        _enqueue(st, "k-c", now=_at(5))
+        found = [row.key for row in st.pending_comments(run_id=RUN_ID)]
+    finally:
+        st.close()
+    assert found == ["k-b", "k-a", "k-c"]

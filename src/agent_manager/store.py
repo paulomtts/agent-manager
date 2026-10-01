@@ -883,6 +883,41 @@ def control_requests(
     return [_control_from_row(row) for row in rows]
 
 
+COMMENT_ATTEMPTS = 3
+"""Failed posts after which a `board_comments` row is `abandoned` (board-comments
+B7). The warning that names an abandoned row belongs to `comments.py`."""
+
+
+@dataclass(frozen=True)
+class CommentRow:
+    """One queued outcome comment: a row of `board_comments` (board-comments B6).
+
+    Row-only and outside the journal, like `Checkpoint`. `key` is the
+    idempotency key a replay or resume enqueues again (B9); `comment_id` is
+    the board's id once posted, else `None`.
+    """
+
+    run_id: str
+    card_id: str
+    key: str
+    body: str
+    state: str
+    comment_id: str | None
+    failed_attempts: int
+
+
+def _comment_from_row(row: sqlite3.Row) -> CommentRow:
+    return CommentRow(
+        run_id=row["run_id"],
+        card_id=row["card_id"],
+        key=row["key"],
+        body=row["body"],
+        state=row["state"],
+        comment_id=row["comment_id"],
+        failed_attempts=row["failed_attempts"],
+    )
+
+
 @contextmanager
 def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """One write transaction that holds the database write lock from `BEGIN`.
@@ -1459,6 +1494,38 @@ class Store:
                 self._conn.rollback()
                 raise
             return cursor.rowcount == 1
+
+    def pending_comments(
+        self,
+        run_id: str | None = None,
+        card_ids: Iterable[str] | None = None,
+    ) -> list[CommentRow]:
+        """Every `pending` row, oldest `created_at` first, then insertion order.
+
+        Each given filter narrows the result and they are ANDed; with neither,
+        every pending row of every run is returned. `card_ids` matches across
+        runs, which is what a relaunch needs; an empty `card_ids` matches
+        nothing.
+        """
+        clauses = ["state = 'pending'"]
+        params: list[str] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if card_ids is not None:
+            cards = list(card_ids)
+            if not cards:
+                return []
+            clauses.append(f"card_id IN ({', '.join('?' for _ in cards)})")
+            params.extend(cards)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM board_comments WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, rowid",
+                params,
+            ).fetchall()
+            return [_comment_from_row(row) for row in rows]
 
     # -- leases, claims and control requests -----------------------------------
     #
