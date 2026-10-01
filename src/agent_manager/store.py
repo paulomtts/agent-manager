@@ -1228,13 +1228,17 @@ class Store:
         reason: str,
         agent: dict,
         saved_at: datetime,
+        floor: TurnFloor | None = None,
     ) -> Checkpoint:
         """Write the next checkpoint of `card_id` under this store's run.
 
         `seq` is 0 for the card's first row in this run and one past the
-        highest after that. An unknown `reason` is refused by the table's
-        `CHECK` as `sqlite3.IntegrityError`; the statement is rolled back, the
-        error propagates unchanged and no `seq` is spent.
+        highest after that. With `floor`, a `checkpoint_floors` row keyed by
+        the same `(run_id, card_id, seq)` is written in the same transaction,
+        under the same fence, with one commit. Any `sqlite3.Error` from either
+        insert -- an unknown `reason` refused by the `checkpoints` CHECK, a
+        negative floor refused by the `checkpoint_floors` CHECK -- rolls back
+        both rows and propagates unchanged, and no `seq` is spent.
         """
         with self._lock, self._fenced():
             text = json.dumps(agent, sort_keys=True)
@@ -1258,6 +1262,20 @@ class Store:
                         _iso(saved_at),
                     ),
                 )
+                if floor is not None:
+                    self._conn.execute(
+                        "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase,"
+                        " loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            self.run_id,
+                            card_id,
+                            seq,
+                            floor.phase,
+                            floor.loop,
+                            floor.source_run,
+                            floor.floor,
+                        ),
+                    )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
@@ -1271,6 +1289,7 @@ class Store:
                 reason=reason,
                 agent=json.loads(text),
                 saved_at=saved_at,
+                floor=floor,
             )
 
     def latest_checkpoint(self, card_id: str) -> Checkpoint | None:

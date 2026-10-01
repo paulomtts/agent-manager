@@ -3065,3 +3065,125 @@ def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
         saved_at=_at(0),
     )
     assert plain.floor is None
+
+
+def _save_floored(
+    st: store.Store,
+    card_id: str = "card-a",
+    *,
+    floor: store.TurnFloor | None = FLOOR,
+    reason: str = "turn",
+    saved_at: datetime | None = None,
+) -> store.Checkpoint:
+    return st.save_checkpoint(
+        card_id,
+        workflow="task",
+        digest="sha256:aaa",
+        reason=reason,
+        agent={"turn": 0},
+        saved_at=_at(0) if saved_at is None else saved_at,
+        floor=floor,
+    )
+
+
+def test_save_checkpoint_writes_the_floor_row_with_the_checkpoint(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        saved = _save_floored(st)
+        plain = _save_floored(st, floor=None, saved_at=_at(1))
+        rows = st.connection.execute(
+            "SELECT run_id, card_id, seq, phase, loop, source_run, floor"
+            " FROM checkpoint_floors ORDER BY seq"
+        ).fetchall()
+        journaled = st.journal.path.exists()
+    finally:
+        st.close()
+
+    assert saved.floor == FLOOR
+    assert saved.seq == 0
+    assert plain.floor is None
+    assert plain.seq == 1
+    # Only the floored save wrote a floor row, keyed like its checkpoint row.
+    assert [tuple(row) for row in rows] == [
+        (RUN_ID, "card-a", 0, "implement", 2, OTHER_RUN_ID, 3)
+    ]
+    # Row-only: nothing was journaled (no journal file was ever created).
+    assert journaled is False
+
+
+def test_a_zero_floor_is_accepted(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        zero = dataclasses.replace(FLOOR, floor=0)
+        saved = _save_floored(st, floor=zero)
+        assert _count(st, "checkpoint_floors") == 1
+    finally:
+        st.close()
+
+    assert saved.floor == zero
+
+
+def test_a_negative_floor_is_refused_and_writes_nothing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        kept = _save_floored(st, floor=None)
+        with pytest.raises(sqlite3.IntegrityError):
+            _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1), saved_at=_at(1))
+
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.in_transaction is False
+        assert _count(st, "checkpoints") == 1
+        assert _count(st, "checkpoint_floors") == 0
+        assert st.latest_checkpoint("card-a") == kept
+        # The refused save spent no seq: the next one takes seq 1.
+        assert _save_floored(st, saved_at=_at(2)).seq == 1
+    finally:
+        st.close()
+
+
+def test_an_unknown_reason_with_a_floor_writes_no_floor_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _save_floored(st, reason="bogus")
+
+        assert st.connection.in_transaction is False
+        assert _count(st, "checkpoints") == 0
+        assert _count(st, "checkpoint_floors") == 0
+        assert _save_floored(st).seq == 0
+    finally:
+        st.close()
+
+
+def test_a_refused_floor_under_a_held_lease_writes_nothing_and_keeps_the_lease(stores):
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1))
+
+    assert _held_elsewhere(st._lock) is False
+    assert st.connection.in_transaction is False
+    assert _count(st, "checkpoints") == 0
+    assert _count(st, "checkpoint_floors") == 0
+    lease = store.read_lease(st.connection, RUN_ID)
+    assert lease is not None and lease.token == "t1"
+    saved = _save_floored(st)
+    assert saved.seq == 0
+    assert saved.floor == FLOOR
+    assert _count(st, "checkpoint_floors") == 1
+
+
+def test_a_taken_over_store_saves_neither_row_with_a_floor(stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        _save_floored(a)
+
+    assert caught.value.holder is not None and caught.value.holder.token == "t2"
+    assert a.connection.in_transaction is False
+    assert _count(b, "checkpoints") == 0
+    assert _count(b, "checkpoint_floors") == 0
