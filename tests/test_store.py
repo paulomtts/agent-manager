@@ -3461,3 +3461,76 @@ def test_replay_journal_writes_nothing(repo):
 
     assert after == before
     assert attempts == 0
+
+
+# -- board comment outbox ----------------------------------------------------------
+#
+# Board-comments spec B6/B7/B9: a row-only `board_comments` table outside the
+# journal, like `checkpoints` and `run_leases`. Steps tier: real temp DB, no
+# harness, no brd. The fake-board flush tests belong to `comments.py`.
+
+_COMMENT_COLUMNS = [
+    "run_id",
+    "card_id",
+    "key",
+    "body",
+    "state",
+    "comment_id",
+    "failed_attempts",
+    "created_at",
+    "posted_at",
+]
+
+
+def test_open_db_creates_the_board_comments_table(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_comments)").fetchall()
+        ]
+    finally:
+        conn.close()
+    assert columns == _COMMENT_COLUMNS
+
+
+def test_the_board_comments_table_appears_on_an_existing_database(repo):
+    # A pre-M12 database: every table but the new one, with a row in it.
+    first = store.open_db(repo)
+    first.execute("DROP TABLE IF EXISTS board_comments")
+    first.execute(
+        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+    )
+    first.commit()
+    first.close()
+
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_comments)").fetchall()
+        ]
+        kept = [row["id"] for row in conn.execute("SELECT id FROM runs").fetchall()]
+    finally:
+        conn.close()
+
+    assert columns == _COMMENT_COLUMNS
+    assert kept == [RUN_ID]
+
+
+def test_a_board_comment_with_an_unknown_state_is_refused(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO board_comments (run_id, card_id, key, body, state,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (RUN_ID, "card-a", "k-bogus", "body", "bogus", _at(0).isoformat()),
+            )
+        conn.rollback()
+        count = conn.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0

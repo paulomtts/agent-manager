@@ -142,6 +142,18 @@ CREATE TABLE IF NOT EXISTS run_claims (
     token      TEXT NOT NULL,
     claimed_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS board_comments (
+    run_id          TEXT NOT NULL,
+    card_id         TEXT NOT NULL,
+    key             TEXT PRIMARY KEY,
+    body            TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'posted', 'abandoned')),
+    comment_id      TEXT,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    posted_at       TEXT
+);
 """
 
 
@@ -932,7 +944,8 @@ class Store:
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
     The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
-    `run_leases` (live control C1/C2): row-only tables outside the journal.
+    `run_leases` (live control C1/C2) and `board_comments` (board-comments
+    B6): row-only tables outside the journal.
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
