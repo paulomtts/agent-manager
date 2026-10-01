@@ -74,22 +74,6 @@ GRAFO_LOGGER = "grafo"
 handler; `supervise` silences it so stdout stays one JSON line (T6)."""
 
 
-STOPPED_PREFIX = "stopped before "
-"""How `walk._stop` opens a stopped subtask's `detail` (addendum P4)."""
-
-
-def stopped_before_phase(detail: str | None) -> str | None:
-    """The phase a stopped subtask would have run next, read out of its detail.
-
-    `walk._stop` writes `"stopped before <phase>"` and the summary has no
-    field of its own for the phase, so this strips the prefix. A detail without
-    the prefix, or no detail at all, gives None.
-    """
-    if detail is None or not detail.startswith(STOPPED_PREFIX):
-        return None
-    return detail[len(STOPPED_PREFIX):]
-
-
 LaneKind = Literal["done", "escalated", "stopped", "pending"]
 """How one story's lane ended (supervisor-tree T6): finished, escalated, stopped
 (parked by the stop, or saw it before a subtask), or never started by the tree."""
@@ -888,6 +872,150 @@ def builds_a_base_alone(story: census.StoryPlan, root_plan: dag.RootPlan) -> boo
     )
 
 
+class StoryRecorder:
+    """Every row one story's lane writes, and every `LaneOutcome` it builds (cleanup §S5).
+
+    One per lane invocation, and it serves both lanes. `lane` builds it once
+    the story's planned rows are known. `base_only_lane` builds it with
+    `without_rows`: a subtask-less story has no rows, since `record_plan`
+    records only stories with work, so that recorder writes nothing and only
+    builds outcomes, all with `level=None`.
+
+    It owns the outcome's state: the subtasks `completed` so far, the lane's
+    `warnings`, and the merged `base` once it is built. Every outcome
+    snapshots them at the moment it is built. The methods that end a lane
+    write their rows and return the outcome for the lane to raise. The
+    recorder never signals the stop: `stop.trigger` stays with the caller,
+    right before an escalation's writes.
+
+    Some transitions write only the story row: a stop seen before a subtask
+    or before the base, and a base failure. So `stopped` and `escalated` take
+    a keyword-only `subtask_row` that says which subtask row to write first,
+    if any. `"started"` is the row `started` returned and the driver was
+    handed. `"planned"` is `record_plan`'s row, which the catch-all writes for
+    a subtask it may never have started. A row-less recorder has no subtask
+    rows, so `started`, `subtask_done` and any `subtask_row` raise `KeyError`
+    on it rather than write one.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        story_id: str,
+        level: int | None,
+        story_row: models.StoryRun | None,
+        subtask_rows: Mapping[str, models.SubtaskRun],
+    ) -> None:
+        self._store = store
+        self._story_id = story_id
+        self._level = level
+        self._story_row = story_row
+        self._subtask_rows = subtask_rows
+        self._started: dict[str, models.SubtaskRun] = {}
+        self._completed: list[str] = []
+        self._warnings: list[str] = []
+        self._base: dag.RootPlan | None = None
+
+    @classmethod
+    def without_rows(cls, store: Store, story_id: str) -> StoryRecorder:
+        """A recorder for a story with no store rows: it writes nothing.
+
+        Its outcomes have `level=None`, so `collect_outcomes` reports them
+        after the waves.
+        """
+        return cls(store, story_id, None, None, {})
+
+    def started(self, *, subtask_id: str, first: bool) -> models.SubtaskRun:
+        """Record the subtask `started`, and the story too on its first subtask.
+
+        Returns the started row, which is the one the driver is handed and
+        the one every later write for this subtask copies.
+        """
+        row = self._subtask_rows[subtask_id].model_copy(update={"status": "started"})
+        self._started[subtask_id] = row
+        self._store.record_subtask(self._story_id, row)
+        if first:
+            self._record_story("started")
+        return row
+
+    def subtask_done(self, subtask_id: str, tip: str) -> None:
+        """Record the subtask `done` and count it as completed.
+
+        `tip` is the subtask's branch. No row field holds a tip, so it is not
+        written.
+        """
+        row = self._started[subtask_id]
+        self._store.record_subtask(self._story_id, row.model_copy(update={"status": "done"}))
+        self._completed.append(subtask_id)
+
+    def stopped(
+        self,
+        subtask_id: str | None,
+        before_phase: str | None,
+        *,
+        subtask_row: Literal["started"] | None = None,
+    ) -> LaneOutcome:
+        """Record the story `stopped`, after the started subtask when there is one."""
+        if subtask_row == "started":
+            assert subtask_id is not None
+            self._record_subtask(self._started[subtask_id], "stopped")
+        self._record_story("stopped")
+        return self._outcome("stopped", subtask_id, before_phase=before_phase)
+
+    def escalated(
+        self,
+        subtask_id: str | None,
+        phase: str | None,
+        detail: str | None,
+        *,
+        subtask_row: Literal["started", "planned"] | None = None,
+    ) -> LaneOutcome:
+        """Record the story `escalated`, after the named subtask row when there is one."""
+        if subtask_row is not None:
+            assert subtask_id is not None
+            source = (
+                self._started[subtask_id]
+                if subtask_row == "started"
+                else self._subtask_rows[subtask_id]
+            )
+            self._record_subtask(source, "escalated")
+        self._record_story("escalated")
+        return self._outcome("escalated", subtask_id, failed_phase=phase, detail=detail)
+
+    def base_built(self, base: dag.RootPlan) -> None:
+        """The merged base is built: every later outcome carries it."""
+        self._base = base
+
+    def add_warnings(self, warnings: Sequence[str]) -> None:
+        """Keep a driven subtask's warnings, in the order they arrived."""
+        self._warnings.extend(warnings)
+
+    def done(self) -> LaneOutcome:
+        """Record the story `done` and return its outcome."""
+        self._record_story("done")
+        return self._outcome("done", None)
+
+    def _record_story(self, status: str) -> None:
+        if self._story_row is None:
+            return
+        self._store.record_story(self._story_row.model_copy(update={"status": status}))
+
+    def _record_subtask(self, row: models.SubtaskRun, status: str) -> None:
+        self._store.record_subtask(self._story_id, row.model_copy(update={"status": status}))
+
+    def _outcome(self, kind: LaneKind, subtask: str | None, **fields: Any) -> LaneOutcome:
+        return LaneOutcome(
+            kind=kind,
+            story=self._story_id,
+            level=self._level,
+            subtask=subtask,
+            completed=tuple(self._completed),
+            warnings=tuple(self._warnings),
+            base=self._base,
+            **fields,
+        )
+
+
 async def base_only_lane(
     story: census.StoryPlan,
     root_plan: dag.RootPlan,
@@ -909,16 +1037,14 @@ async def base_only_lane(
     It takes a slot, since a base can dispatch a resolver, and checks the stop
     first. The failure paths are `lane`'s for a merged base, but with no
     subtask to name and no store row to write -- `record_plan` records only
-    stories with work -- so every outcome has `level=None` and
-    `collect_outcomes` reports it after the waves.
+    stories with work -- so it runs on a row-less `StoryRecorder`
+    (`StoryRecorder.without_rows`), which writes nothing. Every outcome has
+    `level=None` and `collect_outcomes` reports it after the waves.
     """
-
-    def outcome(kind: LaneKind, **fields: Any) -> LaneOutcome:
-        return LaneOutcome(kind=kind, story=story.id, level=None, **fields)
-
+    recorder = StoryRecorder.without_rows(store, story.id)
     async with slots:
         if stop.triggered:
-            raise LaneStopped(outcome("stopped"))
+            raise LaneStopped(recorder.stopped(None, None))
         try:
             await build_merged_base(
                 story,
@@ -935,17 +1061,16 @@ async def base_only_lane(
             )
         except bases.BaseFailed as error:
             if error.stopped:
-                raise LaneStopped(outcome("stopped")) from error
+                raise LaneStopped(recorder.stopped(None, None)) from error
             stop.trigger(story.id)
-            raise LaneEscalated(
-                outcome("escalated", failed_phase="base", detail=error.detail)
-            ) from error
+            raise LaneEscalated(recorder.escalated(None, "base", error.detail)) from error
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             stop.trigger(story.id)
             raise LaneEscalated(
-                outcome("escalated", detail=f"{type(error).__name__}: {error}")
+                recorder.escalated(None, None, f"{type(error).__name__}: {error}")
             ) from error
-    finished[story.id] = outcome("done", base=root_plan)
+    recorder.base_built(root_plan)
+    finished[story.id] = recorder.done()
     return plan.tips[story.id]
 
 
@@ -997,6 +1122,11 @@ async def lane(
     the base reaches the catch-all with no subtask. Once built, the outcome
     carries the story's `RootPlan` as `base`, whatever happens after.
 
+    Every row the lane writes and every outcome it builds go through one
+    `StoryRecorder`, built once the story's planned rows are read. The lane
+    keeps the control flow and every `stop.trigger`; the recorder keeps
+    `completed`, `warnings` and the built base.
+
     Each subtask's open checkpoint is looked up first
     (`runs.continuable_checkpoint`), inside the same `try`, and handed to the
     driver as `resume_from` when it can be continued.
@@ -1033,21 +1163,7 @@ async def lane(
             finished=finished,
         )
     story_row, subtask_rows = plan.rows[story.id]
-    completed: list[str] = []
-    warnings: list[str] = []
-    built: dag.RootPlan | None = None
-
-    def outcome(kind: LaneKind, subtask: str | None, **fields: Any) -> LaneOutcome:
-        return LaneOutcome(
-            kind=kind,
-            story=story.id,
-            level=planned.level,
-            subtask=subtask,
-            completed=tuple(completed),
-            warnings=tuple(warnings),
-            base=built,
-            **fields,
-        )
+    recorder = StoryRecorder(store, story.id, planned.level, story_row, subtask_rows)
 
     async with slots:
         current: census.SubtaskPlan | None = None
@@ -1056,8 +1172,7 @@ async def lane(
                 # Checked before the base as before every subtask: a lane that
                 # finds the stop fired builds nothing (spec, first error path).
                 if stop.triggered:
-                    store.record_story(story_row.model_copy(update={"status": "stopped"}))
-                    raise LaneStopped(outcome("stopped", planned.remaining[0].id))
+                    raise LaneStopped(recorder.stopped(planned.remaining[0].id, None))
                 assert tips is not None
                 try:
                     await build_merged_base(
@@ -1076,26 +1191,19 @@ async def lane(
                 except bases.BaseFailed as error:
                     # A parked resolver is a stop, not an escalation (P4).
                     if error.stopped:
-                        store.record_story(story_row.model_copy(update={"status": "stopped"}))
-                        raise LaneStopped(outcome("stopped", None)) from error
+                        raise LaneStopped(recorder.stopped(None, None)) from error
                     stop.trigger(story.id)
-                    store.record_story(story_row.model_copy(update={"status": "escalated"}))
                     raise LaneEscalated(
-                        outcome("escalated", None, failed_phase="base", detail=error.detail)
+                        recorder.escalated(None, "base", error.detail)
                     ) from error
-                built = root_plan
+                recorder.base_built(root_plan)
             for position, subtask in enumerate(planned.remaining):
                 current = subtask
                 if stop.triggered:
-                    store.record_story(story_row.model_copy(update={"status": "stopped"}))
-                    raise LaneStopped(outcome("stopped", subtask.id))
-                row = subtask_rows[subtask.id]
+                    raise LaneStopped(recorder.stopped(subtask.id, None))
                 card = await asyncio.to_thread(board.show, subtask.id, repo_dir=root)
                 parent = await asyncio.to_thread(board.show, story.id, repo_dir=root)
-                row = row.model_copy(update={"status": "started"})
-                store.record_subtask(story.id, row)
-                if position == 0:
-                    store.record_story(story_row.model_copy(update={"status": "started"}))
+                row = recorder.started(subtask_id=subtask.id, first=position == 0)
                 # Relaunch continuation (card 02890d5d) is lenient and reads
                 # across runs; a resume (card 54e4ec29) hands on exactly the
                 # checkpoints `resume_checkpoints` already validated. Either
@@ -1121,53 +1229,43 @@ async def lane(
                     stop=stop,
                     **extra,
                 )
-                warnings.extend(result.warnings)
+                recorder.add_warnings(result.warnings)
                 summary = result.summary
                 # A `stopped` summary is handled before the non-`done` branch:
                 # a stop is not an escalation (P4).
                 if summary.status == "stopped":
-                    store.record_subtask(story.id, row.model_copy(update={"status": "stopped"}))
-                    store.record_story(story_row.model_copy(update={"status": "stopped"}))
                     raise LaneStopped(
-                        outcome(
-                            "stopped",
+                        recorder.stopped(
                             subtask.id,
-                            before_phase=stopped_before_phase(summary.detail),
+                            summary.before_phase,
+                            subtask_row="started",
                         )
                     )
                 if summary.status != "done":
                     stop.trigger(story.id)
-                    store.record_subtask(story.id, row.model_copy(update={"status": "escalated"}))
-                    store.record_story(story_row.model_copy(update={"status": "escalated"}))
                     raise LaneEscalated(
-                        outcome(
-                            "escalated",
+                        recorder.escalated(
                             subtask.id,
-                            failed_phase=summary.failed_phase,
-                            detail=summary.detail,
+                            summary.failed_phase,
+                            summary.detail,
+                            subtask_row="started",
                         )
                     )
-                store.record_subtask(story.id, row.model_copy(update={"status": "done"}))
-                completed.append(subtask.id)
-            store.record_story(story_row.model_copy(update={"status": "done"}))
+                recorder.subtask_done(subtask.id, row.branch)
+            done = recorder.done()
         except (LaneEscalated, LaneStopped):
             raise
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             stop.trigger(story.id)
-            if current is not None:
-                store.record_subtask(
-                    story.id,
-                    subtask_rows[current.id].model_copy(update={"status": "escalated"}),
-                )
-            store.record_story(story_row.model_copy(update={"status": "escalated"}))
             raise LaneEscalated(
-                outcome(
-                    "escalated",
+                recorder.escalated(
                     None if current is None else current.id,
-                    detail=f"{type(error).__name__}: {error}",
+                    None,
+                    f"{type(error).__name__}: {error}",
+                    subtask_row=None if current is None else "planned",
                 )
             ) from error
-    finished[story.id] = outcome("done", None)
+    finished[story.id] = done
     return planned.tip
 
 

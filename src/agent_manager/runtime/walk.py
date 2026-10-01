@@ -253,6 +253,8 @@ class SubtaskSummary:
     warnings: list[str] = field(default_factory=list)
     failed_phase: str | None = None
     detail: str | None = None
+    before_phase: str | None = None
+    """The phase a `stopped` subtask would have run next; None unless `_stop` ran."""
 
 
 @dataclass
@@ -550,6 +552,7 @@ def _stop(
     stay on the summary.
     """
     summary.status = "stopped"
+    summary.before_phase = phase_name
     summary.detail = f"stopped before {phase_name}"
     _record_subtask_status(store, story_id, subtask, "stopped")
     return summary
