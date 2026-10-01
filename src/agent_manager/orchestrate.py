@@ -1413,6 +1413,22 @@ def milestone_claims(
     return list(dict.fromkeys(keys))
 
 
+def milestone_card_ids(
+    milestone_id: str, stories: Sequence[census.StoryPlan]
+) -> list[str]:
+    """The milestone card, then each story followed by its subtasks, census order.
+
+    The cards a run's start flush covers (board-comments B7): done subtasks
+    and closed stories included, since an earlier run may have left a pending
+    comment on any of them. Pure; a card already listed is not repeated.
+    """
+    ids = [milestone_id]
+    for story in stories:
+        ids.append(story.id)
+        ids.extend(subtask.id for subtask in story.subtasks)
+    return list(dict.fromkeys(ids))
+
+
 def run_milestone(
     milestone: str | None,
     *,
@@ -1486,6 +1502,13 @@ def run_milestone(
     `refresh_git` runs inside the lease, after `resume_checkpoints`, and a
     dead holder the lease took over is reported under `took_over` in every
     payload.
+
+    Board comments (board-comments B2, B7): once the lease is held, before
+    anything is driven, every pending outbox row on the milestone's cards is
+    flushed. Each done or escalated subtask and each failed merged base is
+    commented by its lane; a lane-escalated, Integrate-escalated or done run
+    comments its end on the milestone card. A flush's warnings join the
+    report's `warnings`; nothing else about the run changes.
 
     The lease (live control C2) and its claims are held from `record_run` to
     the run's final record, and released before the store closes; every
@@ -1569,7 +1592,13 @@ def run_milestone(
             if resumed is not None:
                 # After `record_plan`, which records every planned row `pending`.
                 reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
-            warnings = reroll_stale_stories(plan.stories, root)
+            # Board-comments B7: any run's leftover comments on this milestone's
+            # cards go out under this lease, before anything is driven; a board
+            # failure is a warning and the run goes on (B8).
+            warnings = comments.flush(
+                store, root, card_ids=milestone_card_ids(milestone_card.id, plan.stories)
+            )
+            warnings.extend(reroll_stale_stories(plan.stories, root))
             completed: list[str] = []
             stop = StopSignal()
 

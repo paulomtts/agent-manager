@@ -209,6 +209,28 @@ def test_milestone_claims_has_no_duplicates():
     ]
 
 
+def test_milestone_card_ids_cover_the_milestone_every_story_and_every_subtask():
+    """Board-comments B7: the start flush covers done and closed cards too,
+    since an earlier run may have left a pending comment on any of them."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    closed = _plan_story(2, [_plan_subtask(21)], status="done")
+    empty = _plan_story(3, [])
+    shared = _plan_story(4, [_plan_subtask(12)])
+
+    ids = orchestrate.milestone_card_ids(_plan_id(99), [a, closed, empty, shared])
+
+    assert ids == [
+        _plan_id(99),
+        _plan_id(1),
+        _plan_id(11),
+        _plan_id(12),
+        _plan_id(2),
+        _plan_id(21),
+        _plan_id(3),
+        _plan_id(4),
+    ]
+
+
 def test_the_before_phase_is_read_out_of_a_stopped_detail():
     """`walk._stop` writes "stopped before <phase>"; the summary has no field
     of its own for that phase, so the helper reads it out of `detail`."""
@@ -5529,3 +5551,59 @@ def test_a_base_whose_resolver_was_stopped_gets_no_base_failed_comment(project, 
 
     assert result["stopped"] == [{"story": story_c, "subtask": None, "before_phase": None}]
     assert _comments(project, story_c) == []
+
+
+def _board_down(monkeypatch) -> dict[str, bool]:
+    """Fail `board.comment_list` -- the first `brd` call a flush makes per
+    row -- while `state["down"]`; every other board call stays real."""
+    state = {"down": True}
+    real = board.comment_list
+
+    def flaky(card_id: str, *, repo_dir: Path | None = None) -> list[board.BoardComment]:
+        if state["down"]:
+            raise board.BoardError(
+                "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+            )
+        return real(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(board, "comment_list", flaky)
+    return state
+
+
+@requires_git
+@requires_brd
+def test_a_board_that_is_down_changes_only_warnings_and_a_relaunch_posts_the_rows(
+    project, monkeypatch
+):
+    """Spec test 7; Review Focus 1 and 3: the run still ends done with its usual
+    keys, each failed row is one warning and stays pending, and a relaunch
+    under a new run id posts both before anything else, exactly once."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    state = _board_down(monkeypatch)
+
+    first = _run(project, milestone, BranchingDriver())
+
+    run_id = first["run_id"]
+    assert first["done"] is True, first
+    assert first["completed"] == [a1]
+    assert set(first) == {"done", "run_id", "levels", "completed", "tips", "warnings", "integrated"}
+    assert _load(project, run_id).status == "done"
+    assert len(first["warnings"]) == 2, first["warnings"]
+    assert f"board comment {run_id}/{a1}/done on card {a1} not posted" in first["warnings"][0]
+    assert f"board comment {run_id}/{milestone}/run-end:" in first["warnings"][1]
+    assert all("will retry" in warning for warning in first["warnings"])
+    assert [row_state for _key, row_state in _comment_states(project)] == ["pending", "pending"]
+
+    state["down"] = False
+    second = _run(project, milestone, BranchingDriver(), clock=lambda: LATER)
+
+    assert second["done"] is True, second
+    assert second["warnings"] == []
+    assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2, milestone_keys
+    assert milestone_keys[0].startswith(f"{run_id}/{milestone}/run-end:")
+    assert milestone_keys[1].startswith(f"{second['run_id']}/{milestone}/run-end:")
+    assert all(row_state == "posted" for _key, row_state in _comment_states(project))
