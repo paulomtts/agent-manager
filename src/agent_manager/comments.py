@@ -242,3 +242,99 @@ def compose_base_failed(
         f"am · base failed · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
     )
     return Comment(card_id=story_id, key=comment_key, body=body)
+
+
+_RUN_OUTCOMES = ("cancelled", "escalated", "paused", "done")
+"""Run outcomes in live-control C6 precedence: the first payload flag set wins."""
+
+
+def _ref(card_id: str) -> str:
+    """A real card id as a brd backlink (B4)."""
+    return f"[[{card_id}]]"
+
+
+def _escalation(payload: Mapping[str, Any]) -> tuple[str, Any] | None:
+    """The escalated subtask and its phase: top level, else the first `escalations` row."""
+    subtask = payload.get("subtask")
+    if subtask and payload.get("failed_phase"):
+        return subtask, payload["failed_phase"]
+    for row in payload.get("escalations") or []:
+        if _field(row, "subtask"):
+            return _field(row, "subtask"), _field(row, "failed_phase")
+    return None
+
+
+def _next_command(
+    outcome: str,
+    *,
+    integrate_failed: bool,
+    run_id: str,
+    milestone_id: str,
+    integrated: str | None,
+) -> str | None:
+    """What a human runs next: relaunch, resume, or merge the integrated branch."""
+    if outcome == "cancelled" or integrate_failed:
+        return f"am run --milestone {milestone_id}"
+    if outcome in ("escalated", "paused"):
+        return f"am resume {run_id}"
+    if outcome == "done" and integrated:
+        return f"git merge {integrated}"
+    return None
+
+
+def compose_run_end(
+    *,
+    run_id: str,
+    milestone_id: str,
+    token: str,
+    payload: Mapping[str, Any],
+) -> Comment:
+    """The milestone card's run-end comment, read from `run_milestone`'s payload (B2).
+
+    An Integrate escalation is told apart from a lane one by its `phase` key
+    with no `failed_phase`. `total` (the milestone's subtask count) is the
+    caller's addition; without it the count stands alone. An unknown payload
+    reads as outcome `ended` rather than raising: a comment never fails a run (B8).
+    """
+    outcome = next((name for name in _RUN_OUTCOMES if payload.get(name)), "ended")
+    integrate_failed = (
+        outcome == "escalated" and "phase" in payload and "failed_phase" not in payload
+    )
+    completed = payload.get("completed") or []
+    total = payload.get("total")
+    lines = [
+        f"done: {len(completed)} of {total}" if isinstance(total, int) else f"done: {len(completed)}"
+    ]
+    escalation = _escalation(payload)
+    if escalation is not None:
+        card, phase = escalation
+        lines.append(f"escalated: {_ref(card)} at {phase}")
+    parked = [
+        _field(row, "subtask") or _field(row, "story") for row in payload.get("stopped") or []
+    ]
+    parked = [card for card in parked if card]
+    if parked:
+        lines.append("parked: " + ", ".join(_ref(card) for card in parked))
+    integrated = _field(payload.get("integrated"), "branch")
+    if integrated:
+        lines.append(f"integrated: {integrated}")
+    if integrate_failed:
+        story = payload.get("story")
+        where = f"{payload['phase']} on {_ref(story)}" if story else str(payload["phase"])
+        detail = payload.get("detail")
+        line = f"integrate failed at {where}"
+        lines.append(f"{line}: {_unlink(str(detail))}" if detail else line)
+    following = _next_command(
+        outcome,
+        integrate_failed=integrate_failed,
+        run_id=run_id,
+        milestone_id=milestone_id,
+        integrated=integrated,
+    )
+    if following:
+        lines.append(f"next: {_cmd(following)}")
+    comment_key = key(run_id, milestone_id, f"run-end:{token}")
+    body = _render(
+        f"am · {outcome} · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
+    )
+    return Comment(card_id=milestone_id, key=comment_key, body=body)

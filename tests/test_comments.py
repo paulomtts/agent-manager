@@ -335,3 +335,187 @@ def test_base_failed_golden_body_goes_on_the_story():
             "am-key: r1/story-60189137/base-failed",
         ]
     )
+
+
+def _run_end(payload):
+    return comments.compose_run_end(
+        run_id=RUN, milestone_id=MILESTONE, token=TOKEN, payload=payload
+    )
+
+
+_RUN_END_KEY = "am-key: r1/ms-21f4cf06/run-end:tok-1"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "done": True,
+                "run_id": RUN,
+                "completed": ["sub-1", "sub-2", "sub-3"],
+                "total": 3,
+                "integrated": {"branch": "m12-integrate", "worktree": "/w", "merged": [], "resolved": []},
+                "warnings": [],
+            },
+            [
+                "am · done · run r1",
+                "done: 3 of 3",
+                "integrated: m12-integrate",
+                "next: `git merge m12-integrate`",
+            ],
+        ),
+        (
+            {
+                "escalated": True,
+                "run_id": RUN,
+                "level": 0,
+                "story": "st-1",
+                "subtask": "sub-1",
+                "failed_phase": "review",
+                "detail": "review blockers: 1 unresolved",
+                "stopped": [{"story": "st-2", "subtask": "sub-2", "before_phase": "implement"}],
+                "completed": ["sub-0"],
+                "total": 4,
+                "warnings": [],
+            },
+            [
+                "am · escalated · run r1",
+                "done: 1 of 4",
+                "escalated: [[sub-1]] at review",
+                "parked: [[sub-2]]",
+                "next: `am resume r1`",
+            ],
+        ),
+        (
+            {
+                "paused": True,
+                "run_id": RUN,
+                "stopped": [{"story": "st-2", "subtask": "sub-2", "before_phase": "implement"}],
+                "completed": ["sub-0", "sub-1"],
+                "pending": ["st-3"],
+                "resume": "am resume r1",
+                "total": 5,
+                "warnings": [],
+            },
+            [
+                "am · paused · run r1",
+                "done: 2 of 5",
+                "parked: [[sub-2]]",
+                "next: `am resume r1`",
+            ],
+        ),
+        (
+            {
+                "cancelled": True,
+                "run_id": RUN,
+                "stopped": [
+                    {"story": "st-2", "subtask": "sub-2", "before_phase": "verify"},
+                    {"story": "st-3", "subtask": None, "before_phase": None},
+                ],
+                "completed": [],
+                "pending": [],
+                "total": 2,
+                "warnings": [],
+            },
+            [
+                "am · cancelled · run r1",
+                "done: 0 of 2",
+                "parked: [[sub-2]], [[st-3]]",
+                "next: `am run --milestone ms-21f4cf06`",
+            ],
+        ),
+    ],
+    ids=["done", "escalated", "paused", "cancelled"],
+)
+def test_run_end_golden_bodies(payload, expected):
+    comment = _run_end(payload)
+    assert comment.card_id == MILESTONE
+    assert comment.key == "r1/ms-21f4cf06/run-end:tok-1"
+    assert comment.body == "\n".join([*expected, _RUN_END_KEY])
+
+
+def test_run_end_reports_an_integrate_failure():
+    payload = {
+        "escalated": True,
+        "phase": "verify",
+        "story": None,
+        "files": [],
+        "detail": "verification failed: uv run pytest",
+        "run_id": RUN,
+        "completed": ["sub-1", "sub-2", "sub-3"],
+        "total": 3,
+        "warnings": [],
+    }
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · escalated · run r1",
+            "done: 3 of 3",
+            "integrate failed at verify: verification failed: uv run pytest",
+            "next: `am run --milestone ms-21f4cf06`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
+def test_run_end_names_the_story_an_integrate_conflict_stopped_at():
+    payload = {
+        "escalated": True,
+        "phase": "resolve",
+        "story": "st-2",
+        "files": ["src/x.py"],
+        "detail": "conflict in src/x.py",
+        "run_id": RUN,
+        "completed": [],
+        "total": 2,
+        "warnings": [],
+    }
+    assert "integrate failed at resolve on [[st-2]]: conflict in src/x.py" in _run_end(payload).body.split("\n")
+
+
+def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
+    payload = {
+        "cancelled": True,
+        "run_id": RUN,
+        "stopped": [],
+        "completed": ["sub-0"],
+        "pending": [],
+        "escalations": [
+            {"level": 0, "story": "st-1", "subtask": "sub-1", "failed_phase": "implement", "detail": "blocked"}
+        ],
+        "total": 3,
+        "warnings": [],
+    }
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · cancelled · run r1",
+            "done: 1 of 3",
+            "escalated: [[sub-1]] at implement",
+            "next: `am run --milestone ms-21f4cf06`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
+def test_run_end_without_a_total_reports_the_count_alone():
+    body = _run_end({"paused": True, "run_id": RUN, "completed": ["sub-0"]}).body
+    assert body.split("\n")[1] == "done: 1"
+
+
+def test_run_end_keys_are_lease_token_scoped():
+    first = comments.compose_run_end(run_id=RUN, milestone_id=MILESTONE, token="tok-1", payload={"done": True})
+    second = comments.compose_run_end(run_id=RUN, milestone_id=MILESTONE, token="tok-2", payload={"done": True})
+    assert first.key == "r1/ms-21f4cf06/run-end:tok-1"
+    assert second.key == "r1/ms-21f4cf06/run-end:tok-2"
+
+
+def test_run_end_escapes_brackets_in_an_integrate_detail():
+    payload = {"escalated": True, "phase": "verify", "story": None, "detail": "see [[x]]", "completed": []}
+    body = _run_end(payload).body
+    assert "integrate failed at verify: see [ [x]]" in body
+    assert "[[" not in body
+
+
+def test_run_end_of_an_unknown_payload_does_not_raise():
+    comment = _run_end({})
+    assert comment.body == "\n".join(["am · ended · run r1", "done: 0", _RUN_END_KEY])
