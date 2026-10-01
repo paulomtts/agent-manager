@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     PRIMARY KEY (run_id, card_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS checkpoint_floors (
+    run_id     TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    phase      TEXT NOT NULL,
+    loop       INTEGER NOT NULL,
+    source_run TEXT NOT NULL,
+    floor      INTEGER NOT NULL CHECK (floor >= 0),
+    PRIMARY KEY (run_id, card_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS run_controls (
     run_id       TEXT NOT NULL,
     seq          INTEGER NOT NULL,
@@ -558,6 +569,21 @@ def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
 
 
 @dataclass(frozen=True)
+class TurnFloor:
+    """The turn identity saved beside an agent-phase checkpoint (exactly-once 1.1).
+
+    One row of `checkpoint_floors`, keyed like its `checkpoints` row. Row-only
+    and outside the journal: nothing journals it and `rebuild_from_journal`
+    leaves it alone. Computing it is the runtime's job, not the store's.
+    """
+
+    phase: str
+    loop: int
+    source_run: str
+    floor: int
+
+
+@dataclass(frozen=True)
 class Checkpoint:
     """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
 
@@ -575,6 +601,7 @@ class Checkpoint:
     reason: str
     agent: dict
     saved_at: datetime
+    floor: TurnFloor | None = None
 
 
 def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:

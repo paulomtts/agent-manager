@@ -2977,3 +2977,91 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
         "fdebc746",
         "ef248597",
     ]
+
+
+# -- checkpoint floors -----------------------------------------------------------
+#
+# Exactly-once Task 1.1: a row-only `checkpoint_floors` table written in the
+# same fenced transaction as its `checkpoints` row. Steps tier: real temp DB and
+# journal, no harness.
+
+FLOOR = store.TurnFloor(phase="implement", loop=2, source_run=OTHER_RUN_ID, floor=3)
+
+
+def _count(st: store.Store, table: str) -> int:
+    return st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_open_db_creates_the_checkpoint_floors_table(repo):
+    conn = store.open_db(repo)
+    try:
+        info = conn.execute("PRAGMA table_info(checkpoint_floors)").fetchall()
+        checkpoint_columns = [
+            row["name"] for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert [row["name"] for row in info] == [
+        "run_id",
+        "card_id",
+        "seq",
+        "phase",
+        "loop",
+        "source_run",
+        "floor",
+    ]
+    assert [row["name"] for row in sorted(info, key=lambda r: r["pk"]) if row["pk"]] == [
+        "run_id",
+        "card_id",
+        "seq",
+    ]
+    # M9 C1: the existing table is untouched.
+    assert checkpoint_columns == [
+        "run_id",
+        "card_id",
+        "seq",
+        "workflow",
+        "digest",
+        "reason",
+        "agent",
+        "saved_at",
+    ]
+
+
+def test_checkpoint_floors_refuses_a_negative_floor(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase, loop,"
+                " source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (RUN_ID, "card-a", 0, "implement", 0, RUN_ID, -1),
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
+    assert [f.name for f in dataclasses.fields(store.TurnFloor)] == [
+        "phase",
+        "loop",
+        "source_run",
+        "floor",
+    ]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        FLOOR.floor = 4  # type: ignore[misc]
+
+    assert dataclasses.fields(store.Checkpoint)[-1].name == "floor"
+    plain = store.Checkpoint(
+        run_id=RUN_ID,
+        card_id="card-a",
+        seq=0,
+        workflow="task",
+        digest="sha256:aaa",
+        reason="turn",
+        agent={},
+        saved_at=_at(0),
+    )
+    assert plain.floor is None
