@@ -2,6 +2,7 @@
 then the outbox (`enqueue`/`flush`) against a real temporary store and a fake
 `board_api` -- no `brd` process, no network."""
 
+import contextlib
 import dataclasses
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import comments, store
+from agent_manager import board, comments, store
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -685,3 +686,215 @@ def test_enqueue_on_a_taken_over_store_raises_and_writes_no_row(stores):
     assert caught.value.holder is not None and caught.value.holder.token == "t2"
     assert a.connection.in_transaction is False
     assert _row(b, comment.key) is None
+
+
+class FakeBoard:
+    """A stand-in for the `board` module: per-card comments, a call log, a tracked lock.
+
+    `down` makes every board call raise; `fail_cards` makes calls for those
+    cards raise; `lock_timeout` makes `write_lock` raise on entry, as a real
+    `ProcessLock` does. Every failure is the real `board.BoardError` /
+    `locks.LockTimeoutError`.
+    """
+
+    def __init__(self) -> None:
+        self.cards: dict[str, list[board.BoardComment]] = {}
+        self.calls: list[tuple[str, str, int, Path | None]] = []
+        self.added: list[tuple[str, str, str]] = []
+        self.held = 0
+        self.locks_taken = 0
+        self.down = False
+        self.fail_cards: set[str] = set()
+        self.lock_timeout = False
+        self._next_id = 0
+
+    @contextlib.contextmanager
+    def write_lock(self, repo_dir):
+        if self.lock_timeout:
+            from agent_manager import locks
+
+            raise locks.LockTimeoutError(Path(repo_dir) / "board.lock", 0.0)
+        self.locks_taken += 1
+        self.held += 1
+        try:
+            yield
+        finally:
+            self.held -= 1
+
+    def _call(self, op: str, card_id: str, repo_dir) -> None:
+        self.calls.append((op, card_id, self.held, repo_dir))
+        if self.down or card_id in self.fail_cards:
+            raise board.BoardError(
+                f"brd comment {op} failed", argv=["brd", "comment", op, card_id], exit_code=1
+            )
+
+    def comment_list(self, card_id, *, repo_dir=None):
+        self._call("list", card_id, repo_dir)
+        return list(self.cards.get(card_id, []))
+
+    def comment_add(self, card_id, body, *, author="am", repo_dir=None):
+        self._call("add", card_id, repo_dir)
+        self._next_id += 1
+        comment = board.BoardComment(id=f"c{self._next_id}", body=body, author=author)
+        self.cards.setdefault(card_id, []).append(comment)
+        self.added.append((card_id, body, author))
+        return comment.id
+
+
+class _Crash(Exception):
+    """The process dying between `comment_add` and marking the row posted."""
+
+
+class CrashOnFirstMark:
+    """A `Store` whose first `mark_comment_posted` raises `error`; everything else delegates."""
+
+    def __init__(self, inner: store.Store, error: BaseException) -> None:
+        self._inner = inner
+        self._error = error
+        self.marks = 0
+
+    def mark_comment_posted(self, key, comment_id, now):
+        self.marks += 1
+        if self.marks == 1:
+            raise self._error
+        self._inner.mark_comment_posted(key, comment_id, now)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _queue(st, card_id: str, event: str, *, minute: int = 0, run_id: str = RUN):
+    comment = _comment(card_id, event, run_id=run_id)
+    comments.enqueue(st, comment, run_id=run_id, now=_at(minute))
+    return comment
+
+
+def test_flush_posts_pending_rows_oldest_first_as_am(stores, root):
+    st = stores()
+    newest = _queue(st, "card-a", "done", minute=2)
+    oldest = _queue(st, "card-b", "done", minute=0)
+    middle = _queue(st, "card-c", "done", minute=1)
+    fake = FakeBoard()
+
+    warnings = comments.flush(st, root, board_api=fake)
+
+    assert warnings == []
+    assert fake.added == [
+        ("card-b", oldest.body, "am"),
+        ("card-c", middle.body, "am"),
+        ("card-a", newest.body, "am"),
+    ]
+    assert st.pending_comments() == []
+    posted = {c.key: _row(st, c.key) for c in (oldest, middle, newest)}
+    assert [(posted[c.key]["state"], posted[c.key]["comment_id"]) for c in (oldest, middle, newest)] == [
+        ("posted", "c1"),
+        ("posted", "c2"),
+        ("posted", "c3"),
+    ]
+    assert all(posted[c.key]["posted_at"] is not None for c in (oldest, middle, newest))
+
+
+def test_flush_calls_the_board_only_under_its_write_lock_once_per_row(stores, root):
+    st = stores()
+    _queue(st, "card-a", "done", minute=0)
+    _queue(st, "card-b", "done", minute=1)
+    fake = FakeBoard()
+
+    comments.flush(st, root, board_api=fake)
+
+    assert fake.calls == [
+        ("list", "card-a", 1, root),
+        ("add", "card-a", 1, root),
+        ("list", "card-b", 1, root),
+        ("add", "card-b", 1, root),
+    ]
+    assert fake.locks_taken == 2
+    assert fake.held == 0
+
+
+def test_flush_filters_by_run_and_cards(stores, root):
+    st = stores()
+    a = _queue(st, "card-a", "done", minute=0, run_id="r1")
+    b = _queue(st, "card-b", "done", minute=1, run_id="r2")
+    c = _queue(st, "card-c", "done", minute=2, run_id="r1")
+    fake = FakeBoard()
+
+    assert comments.flush(st, root, run_id="r2", board_api=fake) == []
+    assert [added[0] for added in fake.added] == ["card-b"]
+
+    assert comments.flush(st, root, card_ids=["card-c"], board_api=fake) == []
+    assert [added[0] for added in fake.added] == ["card-b", "card-c"]
+
+    assert comments.flush(st, root, card_ids=[], board_api=fake) == []
+    assert [added[0] for added in fake.added] == ["card-b", "card-c"]
+
+    assert [r.key for r in st.pending_comments()] == [a.key]
+    assert _row(st, b.key)["state"] == "posted"
+    assert _row(st, c.key)["state"] == "posted"
+
+
+def test_flush_with_nothing_pending_never_touches_the_board(stores, root):
+    st = stores()
+    fake = FakeBoard()
+
+    assert comments.flush(st, root, board_api=fake) == []
+    assert fake.calls == []
+    assert fake.locks_taken == 0
+
+
+def test_a_crash_between_post_and_mark_never_double_posts(stores, root):
+    st = stores()
+    comment = _queue(st, "card-a", "done")
+    fake = FakeBoard()
+    crashing = CrashOnFirstMark(st, _Crash("killed before marking"))
+
+    with pytest.raises(_Crash):
+        comments.flush(crashing, root, board_api=fake)
+
+    # The comment reached the board, the row did not move, and the lock is free.
+    assert [c.body for c in fake.cards["card-a"]] == [comment.body]
+    assert [r.key for r in st.pending_comments()] == [comment.key]
+    assert _row(st, comment.key)["failed_attempts"] == 0
+    assert fake.held == 0
+
+    assert comments.flush(crashing, root, board_api=fake) == []
+
+    assert fake.added == [("card-a", comment.body, "am")]
+    assert len(fake.cards["card-a"]) == 1
+    row = _row(st, comment.key)
+    assert (row["state"], row["comment_id"]) == ("posted", "c1")
+
+
+def test_flush_recognises_a_posted_body_with_trailing_whitespace(stores, root):
+    st = stores()
+    comment = _queue(st, "card-a", "done")
+    fake = FakeBoard()
+    fake.cards["card-a"] = [
+        board.BoardComment(id="c-prior", body=comment.body + "\n\n  ", author="am")
+    ]
+
+    assert comments.flush(st, root, board_api=fake) == []
+
+    assert fake.added == []
+    row = _row(st, comment.key)
+    assert (row["state"], row["comment_id"]) == ("posted", "c-prior")
+
+
+def test_flush_ignores_comments_whose_last_line_is_another_key(stores, root):
+    st = stores()
+    earlier = comments.key(RUN, "card-a", "escalated:tok-1")
+    comment = _queue(st, "card-a", "escalated:tok-2")
+    fake = FakeBoard()
+    fake.cards["card-a"] = [
+        board.BoardComment(
+            id="c-old", body=f"am · escalated · run {RUN}\nam-key: {earlier}", author="am"
+        ),
+        board.BoardComment(
+            id="c-human", body=f"see am-key: {comment.key}\nthanks", author="paulo"
+        ),
+    ]
+
+    assert comments.flush(st, root, board_api=fake) == []
+
+    assert fake.added == [("card-a", comment.body, "am")]
+    assert _row(st, comment.key)["comment_id"] == "c1"
