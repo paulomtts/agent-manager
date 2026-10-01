@@ -499,6 +499,38 @@ def two_story_board(fresh_project) -> dict[str, Any]:
 
 
 @pytest.fixture
+def two_milestone_board(fresh_project) -> dict[str, Any]:
+    """Two milestones on one board, each with two independent one-subtask stories.
+
+    First: A (a1) and B (b1). Second: C (c1) and D (d1). Nothing is shared, so
+    two `am` processes can drive them at once; which prefix each uses is the
+    test's choice, so branch names are derived in the test, never here.
+    `UNION_ATTRIBUTE` lets each Integrate fold its two stories'
+    `IMPLEMENTATION.md` without a resolver.
+    """
+    root = fresh_project
+    attributes = root / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text(UNION_ATTRIBUTE, encoding="utf-8")
+    first = _add_card(root, "Milestone 10a: the first of two concurrent milestones")
+    a = _add_card(root, "Story A: one side of the first milestone", first)
+    b = _add_card(root, "Story B: other side of the first milestone", first)
+    second = _add_card(root, "Milestone 10b: the second of two concurrent milestones")
+    c = _add_card(root, "Story C: one side of the second milestone", second)
+    d = _add_card(root, "Story D: other side of the second milestone", second)
+    a1 = _add_card(root, "a1: only subtask of story A", a)
+    b1 = _add_card(root, "b1: only subtask of story B", b)
+    c1 = _add_card(root, "c1: only subtask of story C", c)
+    d1 = _add_card(root, "d1: only subtask of story D", d)
+    return {
+        "root": root,
+        "milestones": {"first": first, "second": second},
+        "stories": {"first": [a, b], "second": [c, d]},
+        "subtasks": {"first": [a1, b1], "second": [c1, d1]},
+    }
+
+
+@pytest.fixture
 def run_milestone_cli(fake_claude_bin) -> Callable[..., Any]:
     """`am run --milestone` through `CliRunner`, with no runner_factory anywhere.
 

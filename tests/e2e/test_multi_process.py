@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, cli, dag
+from agent_manager.steps import rollup
 
 PREFIX = "m10"
 """The `--branch-prefix` of every single-prefix scenario."""
@@ -244,3 +245,87 @@ def test_a_card_a_live_milestone_claims_is_refused_to_every_other_process(
     after = _data(*am("status", run_id, "--repo-dir", str(root)))
     assert after["run"]["status"] == "done"
     assert after["control"]["claims"] == []
+
+
+def _is_ancestor(root: Path, earlier: str, later: str) -> bool:
+    """`git merge-base --is-ancestor`: exit 0 yes, exit 1 no, anything else fails."""
+    completed = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", earlier, later],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode in (0, 1), completed.stderr
+    return completed.returncode == 0
+
+
+def _local_branches(root: Path) -> list[str]:
+    completed = subprocess.run(
+        ["git", "-C", str(root), "branch", "--format=%(refname:short)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.split()
+
+
+def _assert_rolled_up(root: Path, parents) -> None:
+    """Every parent's board status is `rollup_status` of its direct children."""
+    for card_id in parents:
+        node = board.tree(card_id, repo_dir=root)
+        children = [child.status for child in node.children]
+        assert children, card_id
+        assert node.status == rollup.rollup_status(children), (card_id, node.status, children)
+
+
+def test_two_milestones_with_different_prefixes_run_at_once_and_stay_apart(
+    two_milestone_board, fake_claude_bin, rendezvous, spawn_am, finish_am
+):
+    """Spec scenario 2. Each milestone drives one story at a time, so the
+    count-2 rendezvous can only be met by the two processes' implements
+    overlapping."""
+    root = two_milestone_board["root"]
+    prefixes = {"first": "m10a", "second": "m10b"}
+    branches = {
+        side: [
+            dag.task_branch(prefixes[side], board.show(card_id, repo_dir=root))
+            for card_id in two_milestone_board["subtasks"][side]
+        ]
+        for side in prefixes
+    }
+    rendezvous.arm(2)
+
+    children = {
+        side: spawn_am(
+            *_milestone_argv(root, two_milestone_board["milestones"][side], prefix)
+        )
+        for side, prefix in prefixes.items()
+    }
+    results = {side: _data(*finish_am(child)) for side, child in children.items()}
+
+    assert results["first"]["run_id"] != results["second"]["run_id"]
+    for side, prefix in prefixes.items():
+        data = results[side]
+        other = "second" if side == "first" else "first"
+        integrate = f"{prefix}-integrate"
+        assert data["done"] is True, data
+        assert data["completed"] == two_milestone_board["subtasks"][side]
+        assert data["integrated"]["branch"] == integrate
+        assert data["integrated"]["merged"] == two_milestone_board["stories"][side]
+        for tip in branches[side]:
+            assert _is_ancestor(root, tip, integrate), (tip, integrate)
+        for tip in branches[other]:
+            assert not _is_ancestor(root, tip, integrate), (tip, integrate)
+    assert {"m10a-integrate", "m10b-integrate"} <= set(_local_branches(root))
+    # One marker per implement cwd: all four subtasks reached the rendezvous.
+    assert len(rendezvous.markers()) == 4
+
+    for side in prefixes:
+        for card_id in two_milestone_board["subtasks"][side]:
+            assert board.show(card_id, repo_dir=root).status == "done", card_id
+    parents = [
+        *(story for side in prefixes for story in two_milestone_board["stories"][side]),
+        *two_milestone_board["milestones"].values(),
+    ]
+    _assert_rolled_up(root, parents)
+    for card_id in parents:
+        assert board.show(card_id, repo_dir=root).status == "done", card_id
