@@ -7,6 +7,7 @@ checkpoint rows are read straight from the store's `checkpoints` table.
 """
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import threading
@@ -21,6 +22,7 @@ from agent_manager import models, store as store_module
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Step, Workflow
 
@@ -316,3 +318,59 @@ def test_an_engine_error_writes_no_after_run_row(store):
 
     assert caught.value.phase == "explore"
     assert [(seq, reason) for seq, reason, _ in _rows(store)] == [(0, "turn")]
+
+
+# ── the floor (exactly-once 1.2, card 94088f7e) ──────────────────────────────
+
+
+def _commit(card: str) -> dict[str, Any]:
+    return {}
+
+
+def _floor_workflow() -> Workflow:
+    """One agent phase, `explore`, and one step, `commit`."""
+    return Workflow(
+        "floors", (AgentPhase("explore", "explorer", (), None), Step("commit", _commit))
+    )
+
+
+def _deps(opened: Any, adopt: Adoption | None = None) -> RunDeps:
+    return RunDeps(
+        _floor_workflow(), opened, STORY_ID, _subtask(), None, lambda: FIXED, adopt=adopt
+    )
+
+
+def test_an_adoption_is_built_from_a_turn_floor_and_is_frozen():
+    adoption = Adoption(**vars(store_module.TurnFloor("explore", 1, "run-earlier", 2)))
+
+    assert adoption == Adoption("explore", 1, "run-earlier", 2)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        adoption.floor = 3
+
+
+def test_run_deps_start_with_no_adoption():
+    assert _deps(None).adopt is None
+
+
+def test_take_adoption_returns_a_match_once():
+    adoption = Adoption("explore", 0, "run-earlier", 3)
+    deps = _deps(None, adopt=adoption)
+
+    assert deps.take_adoption("explore", 0) == adoption
+    assert deps.adopt is None
+    assert deps.take_adoption("explore", 0) is None
+
+
+@pytest.mark.parametrize("phase, loop", [("explore", 1), ("commit", 0)])
+def test_take_adoption_clears_on_a_mismatch(phase, loop):
+    deps = _deps(None, adopt=Adoption("explore", 0, "run-earlier", 3))
+
+    assert deps.take_adoption(phase, loop) is None
+    assert deps.adopt is None
+
+
+def test_take_adoption_with_nothing_carried_returns_none():
+    deps = _deps(None)
+
+    assert deps.take_adoption("explore", 0) is None
+    assert deps.adopt is None
