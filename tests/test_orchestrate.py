@@ -5418,3 +5418,34 @@ def test_a_second_life_escalating_at_the_same_phase_adds_a_second_escalation_com
     assert all("reason:" not in comment.body for comment in found)
     milestone_keys = _keys(_comments(project, milestone))
     assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys
+
+
+@requires_git
+@requires_brd
+def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_review(project):
+    """Spec test 3: the first life's escalation stays; the second life adds
+    `done` with `(resumed at review)` and its own, distinct run-end."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, milestone, FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",))
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert driver.resumed[a1] is not _ABSENT
+    found = _comments(project, a1)
+    keys = _keys(found)
+    assert len(keys) == 2, keys
+    assert keys[0].startswith(f"{run_id}/{a1}/escalated:")
+    assert keys[1] == f"{run_id}/{a1}/done"
+    assert found[1].body.startswith(f"am · done · run {run_id}\n(resumed at review)\n")
+    on_milestone = _comments(project, milestone)
+    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
+        f"am · escalated · run {run_id}",
+        f"am · done · run {run_id}",
+    ]
+    assert len(set(_keys(on_milestone))) == 2
