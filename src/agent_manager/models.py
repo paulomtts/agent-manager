@@ -160,6 +160,15 @@ class Run(_Model):
     status: Status = "pending"
     started_at: datetime | None = None
     config: RunConfig = Field(default_factory=RunConfig)
+    milestone_id: str | None = None
+    """The full id of the milestone card a `milestone` run drives.
+
+    Resume finds its milestone by this id. It is None for a task run, and for
+    a milestone run recorded before the field existed: those fall back to the
+    short id at the end of the run id (`orchestrate.find_run_milestone`).
+    Defaulted because journal lines written before it carry no such key.
+    """
+
     stories: list[StoryRun] = Field(default_factory=list)
 
 

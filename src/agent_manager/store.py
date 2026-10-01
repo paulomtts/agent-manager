@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS runs (
     branch_prefix TEXT NOT NULL,
     status        TEXT NOT NULL,
     started_at    TEXT,
-    config        TEXT NOT NULL
+    config        TEXT NOT NULL,
+    milestone_id  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS phases (
     started_at TEXT,
     ended_at   TEXT,
     position   INTEGER NOT NULL,
+    detail     TEXT,
     PRIMARY KEY (run_id, story_id, card_id, name)
 );
 
@@ -155,12 +157,44 @@ transactions: a lease take-over, or one fenced journal line and row
 (multi-process X4, X9)."""
 
 
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("phases", "detail", "TEXT"),
+    ("runs", "milestone_id", "TEXT"),
+)
+"""Columns added to a table after it first shipped, as (table, column, type).
+
+`CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a database
+created before one of these columns existed would never get it. Each column
+must also appear, last, in that table's `CREATE` in `_SCHEMA`, so a fresh and a
+migrated database end up with the same column order."""
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Add each `_ADDED_COLUMNS` entry its table lacks, and touch nothing else.
+
+    SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is read first
+    and `ALTER TABLE ... ADD COLUMN` runs only for a missing column. Nothing is
+    caught: any SQLite error propagates unchanged.
+    """
+    for table, column, sql_type in _ADDED_COLUMNS:
+        present = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the per-project projection, applying the schema idempotently.
 
     WAL mode is set before the schema so a reader never blocks the writer. Every
-    `CREATE` is `IF NOT EXISTS`, so reopening an existing database neither
-    destroys nor migrates what is already there.
+    `CREATE` is `IF NOT EXISTS`, so reopening an existing database never
+    destroys what is already there. The only migration is additive:
+    `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
+    table lacks, as a nullable column. Existing rows keep their data and read
+    the new column as NULL. It is a no-op on a database that already has the
+    column, so opening the same database any number of times is safe.
 
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
@@ -176,6 +210,7 @@ def open_db(root: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
     return conn
 
@@ -521,6 +556,7 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
         status=row["status"],
         started_at=row["started_at"],
         config=json.loads(row["config"]),
+        milestone_id=row["milestone_id"],
     )
 
     for story_row in conn.execute(
@@ -559,6 +595,7 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
                     status=phase_row["status"],
                     started_at=phase_row["started_at"],
                     ended_at=phase_row["ended_at"],
+                    detail=phase_row["detail"],
                 )
                 subtask.phases.append(phase)
 
@@ -1094,9 +1131,9 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,
-                              status, started_at, config)
+                              status, started_at, config, milestone_id)
             VALUES (:id, :workflow, :repo_dir, :base_branch, :branch_prefix,
-                    :status, :started_at, :config)
+                    :status, :started_at, :config, :milestone_id)
             ON CONFLICT(id) DO UPDATE SET
                 workflow=excluded.workflow,
                 repo_dir=excluded.repo_dir,
@@ -1104,7 +1141,8 @@ class Store:
                 branch_prefix=excluded.branch_prefix,
                 status=excluded.status,
                 started_at=excluded.started_at,
-                config=excluded.config
+                config=excluded.config,
+                milestone_id=excluded.milestone_id
             """,
             {
                 "id": run_id,
@@ -1115,6 +1153,7 @@ class Store:
                 "status": run.status,
                 "started_at": _iso(run.started_at),
                 "config": json.dumps(run.config.model_dump(mode="json"), sort_keys=True),
+                "milestone_id": run.milestone_id,
             },
         )
         self._commit()
@@ -1177,9 +1216,9 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
-                                started_at, ended_at, position)
+                                started_at, ended_at, detail, position)
             VALUES (:run_id, :story_id, :card_id, :name, :kind, :status,
-                    :started_at, :ended_at,
+                    :started_at, :ended_at, :detail,
                     (SELECT COUNT(*) FROM phases
                       WHERE run_id = :run_id AND story_id = :story_id
                         AND card_id = :card_id))
@@ -1187,7 +1226,8 @@ class Store:
                 kind=excluded.kind,
                 status=excluded.status,
                 started_at=excluded.started_at,
-                ended_at=excluded.ended_at
+                ended_at=excluded.ended_at,
+                detail=excluded.detail
             """,
             {
                 "run_id": run_id,
@@ -1198,6 +1238,7 @@ class Store:
                 "status": phase.status,
                 "started_at": _iso(phase.started_at),
                 "ended_at": _iso(phase.ended_at),
+                "detail": phase.detail,
             },
         )
         self._commit()

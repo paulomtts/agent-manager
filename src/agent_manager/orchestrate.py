@@ -589,19 +589,35 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
 
 def find_run_milestone(
-    roots: Sequence[models.CardNode] | None, run_id: str
+    roots: Sequence[models.CardNode] | None, run: models.Run
 ) -> models.CardNode:
-    """The one root card whose short id ends `run_id`.
+    """The root card a resumed milestone `run` drives.
 
-    `runs.mint_run_id` builds a milestone run's id as `<timestamp>-<short
-    milestone id>`, and `models.Run` records no milestone id of its own, so
-    the id is how a resume finds its milestone. A title edit cannot break it.
+    `run.milestone_id` is the milestone's full card id, recorded when the run
+    started, and is authoritative: the root with exactly that id, or
+    `runs.NotResumableError` if the board has none (the card was deleted or
+    reparented). It never falls back to the short id, which could name a
+    different milestone.
+
+    A run recorded before `milestone_id` existed has None there. For those,
+    `runs.mint_run_id` built the run id as `<timestamp>-<short milestone id>`,
+    so the one root whose short id ends the run id is the milestone. Zero or
+    several such roots is `runs.NotResumableError`. A title edit breaks
+    neither lookup.
     """
-    short = run_id.rsplit("-", 1)[-1]
+    if run.milestone_id is not None:
+        for node in roots or []:
+            if node.id == run.milestone_id:
+                return node
+        raise runs.NotResumableError(
+            f"run {run.id!r} belongs to milestone {run.milestone_id}, and no root"
+            " card on the board has that id"
+        )
+    short = run.id.rsplit("-", 1)[-1]
     matches = [node for node in roots or [] if dag.short_id(node.id) == short]
     if len(matches) != 1:
         raise runs.NotResumableError(
-            f"run {run_id!r} belongs to milestone {short}, and {len(matches)} root"
+            f"run {run.id!r} belongs to milestone {short}, and {len(matches)} root"
             " cards on the board have that short id"
         )
     return matches[0]
@@ -1372,8 +1388,11 @@ def run_milestone(
 
     `resume_run_id` continues that milestone run instead (card 54e4ec29).
     `milestone`, `base_branch`, `branch_prefix`, `max_concurrent` and
-    `clock` are then not read: the milestone is the one the run id names
-    (`find_run_milestone`) and the rest is what the run recorded. The plan is
+    `clock` are then not read: the milestone is the one the run recorded
+    (`find_run_milestone`), and the rest is what the run recorded too. Both a
+    fresh and a resumed run are recorded with `milestone_id` set to the
+    milestone card's full id, which stamps a run recorded before that field
+    existed. The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
     unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
@@ -1419,7 +1438,7 @@ def run_milestone(
     if resumed is None:
         milestone_card = census.find_milestone(roots, milestone)
     else:
-        milestone_card = find_run_milestone(roots, resumed.id)
+        milestone_card = find_run_milestone(roots, resumed)
     plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
@@ -1447,10 +1466,15 @@ def run_milestone(
             status="started",
             started_at=started_at,
             config=models.RunConfig(max_concurrent_stories=max_concurrent),
+            milestone_id=milestone_card.id,
         )
     else:
         run_id = resumed.id
-        run_record = resumed.model_copy(update={"status": "started"})
+        # Stamps a run recorded before `milestone_id` existed, so the next
+        # resume no longer needs the short-id fallback.
+        run_record = resumed.model_copy(
+            update={"status": "started", "milestone_id": milestone_card.id}
+        )
     store = Store.open(root, run_id)
     try:
         checkpoints: dict[str, Checkpoint] | None = None
