@@ -5254,3 +5254,83 @@ def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story
     ]
     assert result["warnings"] == []
 
+
+
+@requires_git
+@requires_brd
+def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
+    """Spec test 1, milestone half; Review Focus 5: `total` reaches the comment only."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    milestone = shape["milestone"]
+
+    result = _run(project, milestone, FakeDriver())
+
+    assert result["done"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    (comment,) = found
+    assert comment.author == "am"
+    assert comment.body.startswith(f"am · done · run {run_id}\n")
+    assert "done: 3 of 3" in comment.body
+    assert f"integrated: {INTEGRATION_BRANCH}" in comment.body
+    assert f"next: `git merge {INTEGRATION_BRANCH}`" in comment.body
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
+    project, integrate_recorder
+):
+    """Spec test 6."""
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    milestone, story_b = shape["milestone"], shape["stories"]["B"]
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=story_b, files=["shared.txt"], detail="the resolver did not finish"
+    )
+
+    result = _run(project, milestone, FakeDriver())
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    (comment,) = _comments(project, milestone)
+    assert comment.body.startswith(f"am · escalated · run {run_id}\n")
+    assert (
+        f"integrate failed at integrate on [[{story_b}]]: the resolver did not finish"
+        in comment.body
+    )
+    assert f"next: `am run --milestone {milestone}`" in comment.body
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked(project):
+    """Spec test 2, milestone half: the run-end names the escalated subtask and
+    the parked one, and tells a human to resume."""
+    shape = _milestone(project, {"A": 1, "B": 2})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    b1, _b2 = shape["subtasks"]["B"]
+    pair = asyncio.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, milestone, driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    body = found[0].body
+    assert body.startswith(f"am · escalated · run {run_id}\n")
+    assert f"escalated: [[{a1}]] at review" in body
+    assert f"parked: [[{b1}]]" in body
+    assert f"next: `am resume {run_id}`" in body

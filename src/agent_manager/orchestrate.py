@@ -1547,6 +1547,7 @@ def run_milestone(
                 completed.extend(outcome.completed)
                 warnings.extend(outcome.warnings)
             built_bases = bases_payload(outcomes)
+            total = sum(len(story.subtasks) for story in plan.stories)
 
             def report(payload: dict[str, Any]) -> dict[str, Any]:
                 """Every payload shape on the same terms: `bases` when built, and on
@@ -1562,6 +1563,23 @@ def run_milestone(
                         }
                 return with_bases(payload, built_bases)
 
+            def comment_run_end(payload: dict[str, Any]) -> dict[str, Any]:
+                """Comment `payload`'s outcome on the milestone card (board-comments B2).
+
+                Called after the run's final record. `total` goes only into the
+                dict `compose_run_end` reads, so the report keeps its shape; the
+                flush's warnings join the report's own `warnings`. Cancel and
+                pause-only exits are not commented here (card 5d9a875f).
+                """
+                comment = comments.compose_run_end(
+                    run_id=run_id,
+                    milestone_id=milestone_card.id,
+                    token=lease.token,
+                    payload={**payload, "total": total},
+                )
+                payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+                return payload
+
             # Outcome precedence (live control C6): the first match wins. A
             # control is never an escalation, and a paused or cancelled run
             # never reaches Integrate in this invocation.
@@ -1574,7 +1592,7 @@ def run_milestone(
                 payload = escalated_payload(run_id, primary, outcomes, warnings)
                 if stop.requested == "pause":
                     payload["control"] = "pause"
-                return report(payload)
+                return comment_run_end(report(payload))
             if stop.requested == "pause":
                 store.record_run(run_record.model_copy(update={"status": "stopped"}))
                 return report(controlled_payload(run_id, "pause", outcomes, warnings))
@@ -1600,22 +1618,26 @@ def run_milestone(
             if isinstance(outcome, integration.IntegrateEscalation):
                 # The branch and worktree stay exactly as Integrate left them (I5).
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                return report(integrate_escalated_payload(run_id, outcome, warnings))
+                return comment_run_end(
+                    report(integrate_escalated_payload(run_id, outcome, warnings))
+                )
 
             store.record_run(run_record.model_copy(update={"status": "done"}))
-            return report(
-                {
-                    "done": True,
-                    "run_id": run_id,
-                    "levels": [
-                        {"level": index, "stories": [planned.story.id for planned in level]}
-                        for index, level in enumerate(levels)
-                    ],
-                    "completed": completed,
-                    "tips": tips,
-                    "warnings": warnings,
-                    "integrated": integrated_payload(outcome),
-                }
+            return comment_run_end(
+                report(
+                    {
+                        "done": True,
+                        "run_id": run_id,
+                        "levels": [
+                            {"level": index, "stories": [planned.story.id for planned in level]}
+                            for index, level in enumerate(levels)
+                        ],
+                        "completed": completed,
+                        "tips": tips,
+                        "warnings": warnings,
+                        "integrated": integrated_payload(outcome),
+                    }
+                )
             )
     finally:
         store.close()
