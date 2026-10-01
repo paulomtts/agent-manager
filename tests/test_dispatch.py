@@ -14,6 +14,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -514,9 +515,9 @@ def test_classify_after_a_clean_exit_is_read_result(tmp_path):
     path = tmp_path / "result.json"
     path.write_text(VALID_RESULT, encoding="utf-8")
 
-    assert dispatch.classify(_outcome(tmp_path), path, FakeResult) == dispatch.read_result(
-        path, FakeResult
-    )
+    expected = dispatch.Verdict("ok", result={"summary": "explored the tree", "ok": True})
+    assert dispatch.classify(_outcome(tmp_path), path, FakeResult) == expected
+    assert dispatch.read_result(path, FakeResult) == expected
 
 
 def AGENT_DOCUMENT(functions: dict[str, object]) -> phases.Workflow:
@@ -1922,3 +1923,48 @@ def test_a_phase_without_a_result_model_adopts_none(store, tmp_path, worktree):
     assert adopted.result is None
     assert runner.warnings == [_reused(1, name="spec")]
     assert len(launcher.calls) == 1
+
+
+def test_a_source_journal_that_fails_validation_declines(store, tmp_path, worktree):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+    broken = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        # Valid JSON, but no `models.Run`: replay raises pydantic's
+        # ValidationError, which is a decline, never an exception out of resume.
+        broken.journal.append("run_upsert", {"not": "a run"})
+    finally:
+        broken.close()
+
+    assert runner.adopt(phase, _context(worktree), source_run=OTHER_RUN_ID, floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(
+        f"phase 'explore': attempt ? of run {OTHER_RUN_ID} was not reused ("
+        "its journal cannot be read: ValidationError"
+    )
+    assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+
+
+def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
+    _succeed_once(store, tmp_path, worktree)
+    recorded = store.replay_journal(RUN_ID).stories[0].subtasks[0].phases[0]
+    later = recorded.started_at + timedelta(days=1)
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        runner, _ = _runner(
+            other, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree,
+            run_id=OTHER_RUN_ID, clock=lambda: later,
+        )
+        runner.adopt(_passing_phase(), _context(worktree), source_run=RUN_ID, floor=0)
+        [payload] = [
+            line.payload for line in other.journal.read() if line.event == "phase_upsert"
+        ]
+    finally:
+        other.close()
+
+    done = models.PhaseRun.model_validate(payload)
+    assert done.status == "done"
+    assert done.started_at == recorded.started_at
+    assert done.ended_at == later
