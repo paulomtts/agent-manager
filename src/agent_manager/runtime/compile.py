@@ -185,6 +185,10 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
     async def step_phase(phase: str, loop: int, pool: ContextPool):
         deps = current_run.get()
         deps.running = phase
+        # A step is never adopted and stays at-least-once (exactly-once E9);
+        # taking the carried adoption here ends it at the first turn after
+        # a resume, so no later agent phase can inherit it.
+        deps.take_adoption(phase, loop)
         p = deps.workflow.phase(phase)
         # A step never reads feedback, so it gets an empty memory window.
         table = context.binding_table(pool, ContextQueue(limit=1), phase)

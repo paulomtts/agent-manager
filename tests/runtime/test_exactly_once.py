@@ -623,3 +623,57 @@ def test_a_damaged_result_is_declined_and_dispatched_again(store, roles, monkeyp
     assert "is not valid JSON" in warning
     assert warning.endswith("); dispatching again")
     assert _attempt_statuses(store, "a") == [(1, "ok"), (2, "ok")]
+
+
+# ── steps are never adopted (E9) ────────────────────────────────────────────
+
+
+def test_a_step_caught_in_the_window_runs_again(store, roles, monkeypatch):
+    launcher = FakeLauncher()
+    ran: list[str] = []
+    wf = _workflow(ran)
+    _crash_after_step(monkeypatch, "w")
+
+    with pytest.raises(_Crash):
+        _go(wf, store, _runner(store, launcher, roles))
+
+    assert ran == ["w"]
+    assert _phase_rows(store, "w") == ["started", "done"]
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert _head(crashed.agent) == "w"
+    assert crashed.floor is None  # a step head carries no floor
+
+    summary = _go(wf, store, _runner(store, launcher, roles), resume_from=crashed)
+
+    assert summary.status == "done"
+    assert ran == ["w", "w", "z"]  # at-least-once: the step ran again
+    assert _dispatches(launcher) == {"a": 1, "b": 1}
+
+
+def test_a_carried_adoption_does_not_outlive_a_step_head(store, roles, monkeypatch, tmp_path):
+    launcher = FakeLauncher()
+    ran: list[str] = []
+    # Run 1 completes: `a` attempt 1 is `ok` in RUN_ID's journal.
+    assert _go(_workflow(ran), store, _runner(store, launcher, roles)).status == "done"
+    assert _dispatches(launcher) == {"a": 1, "b": 1}
+
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        _seed(other, OTHER_RUN_ID)
+        _crash_after_step(monkeypatch, "w")
+        with pytest.raises(_Crash):
+            _go(_workflow(ran), other, _runner(other, launcher, roles))
+        crashed = other.latest_checkpoint(CARD_ID)
+        assert _head(crashed.agent) == "w"
+        # A floor naming `a`, carried into a resume whose head is the step
+        # `w`: the step's turn is the first after resume, so it must end the
+        # adoption, and `a` must dispatch rather than reuse run 1's result.
+        forged = dataclasses.replace(crashed, floor=TurnFloor("a", 0, RUN_ID, 0))
+        runner = _runner(other, launcher, roles)
+        summary = _go(_workflow(ran), other, runner, resume_from=forged)
+    finally:
+        other.close()
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 2, "b": 2}
+    assert runner.warnings == []
