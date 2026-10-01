@@ -4571,6 +4571,44 @@ def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
 
 @requires_git
 @requires_brd
+def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
+    project, cards, monkeypatch
+):
+    """Board-comments B7/B8 (card 65ed3c70): a board that refuses the resumed
+    run's leftover row is a warning leading the payload's, never a refusal."""
+    run_id = _crash_pygents(project, cards, "plan")
+    key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.enqueue_comment(
+            run_id=run_id,
+            card_id=cards["subtask"],
+            key=key,
+            body=f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}",
+            now=datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        opened.close()
+
+    def down(card_id, *, repo_dir=None):
+        raise board.BoardError(
+            "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+        )
+
+    monkeypatch.setattr(board, "comment_list", down)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["status"] == "done"
+    assert set(payload) == RESUME_KEYS
+    ours = [w for w in payload["warnings"] if f"board comment {key} " in w]
+    assert len(ours) == 1, payload["warnings"]
+    assert "not posted" in ours[0] and "brd is down" in ours[0]
+    assert payload["warnings"][0] == ours[0]
+
+
+@requires_git
+@requires_brd
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     project, cards, monkeypatch
 ):
