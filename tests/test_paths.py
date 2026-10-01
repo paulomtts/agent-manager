@@ -273,3 +273,48 @@ def test_attempt_dir_renders_attempt_as_plain_decimal(monkeypatch, tmp_path):
     assert paths.attempt_dir("run-abc", "abc123", "implement", 1) != paths.attempt_dir(
         "run-abc", "abc123", "implement", 10
     )
+
+
+def test_highest_attempt_is_zero_and_creates_nothing_for_a_missing_card(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.highest_attempt("run-abc", "abc123", "implement") == 0
+    # The run root may exist (run_dir's own side effect); the card dir must not.
+    assert not (tmp_path / "agent-manager" / "runs" / "run-abc" / "abc123").exists()
+
+
+def test_highest_attempt_is_zero_when_no_directory_matches_the_phase(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    paths.attempt_dir("run-abc", "abc123", "review", 1)
+    card_dir = paths.run_dir("run-abc") / "abc123"
+    before = sorted(p.name for p in card_dir.iterdir())
+
+    assert paths.highest_attempt("run-abc", "abc123", "implement") == 0
+    assert sorted(p.name for p in card_dir.iterdir()) == before == ["review.1"]
+
+
+def test_highest_attempt_is_the_highest_consecutive_attempt_of_its_phase(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    for n in (1, 2, 3):
+        paths.attempt_dir("run-abc", "abc123", "implement", n)
+    for n in (1, 2, 3, 4, 5):
+        paths.attempt_dir("run-abc", "abc123", "review", n)
+
+    assert paths.highest_attempt("run-abc", "abc123", "implement") == 3
+    assert paths.highest_attempt("run-abc", "abc123", "review") == 5
+    assert not (paths.run_dir("run-abc") / "abc123" / "implement.4").exists()
+
+
+def test_highest_attempt_stops_at_the_first_gap(monkeypatch, tmp_path):
+    # Same consecutive scan as dispatch.next_attempt has always done.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    paths.attempt_dir("run-abc", "abc123", "implement", 1)
+    paths.attempt_dir("run-abc", "abc123", "implement", 3)
+
+    assert paths.highest_attempt("run-abc", "abc123", "implement") == 1

@@ -29,8 +29,14 @@ from typing import Any
 
 from pygents import AgentHook, hook
 
+from agent_manager import paths
 from agent_manager.runtime import walk
-from agent_manager.runtime.state import current_run
+from agent_manager.runtime.state import RunDeps, current_run
+from agent_manager.store import TurnFloor
+from agent_manager.workflow.phases import AgentPhase
+
+_FLOORED = ("turn", "parked")
+"""The reasons whose row names a turn still to run, so it carries that turn's floor."""
 
 
 class Parked(Exception):
@@ -53,6 +59,39 @@ def save(agent: Any, reason: str) -> None:
         reason=reason,
         agent=agent.to_dict(),
         saved_at=walk._utcnow(),
+        floor=_floor(deps, agent, reason),
+    )
+
+
+def _floor(deps: RunDeps, agent: Any, reason: str) -> TurnFloor | None:
+    """The floor of the agent-phase turn `agent` would run next, or `None` (exactly-once 1.2).
+
+    Only `turn` and `parked` rows name a turn still to run. The next turn is
+    the one in flight, else the queue head; a step (E9), a phase the workflow
+    does not have, or no turn at all gets no floor, and neither does a store
+    with no run. A carried adoption for the same `(phase, loop)` is written
+    unchanged, so the floor survives a chain of resumes; otherwise the floor
+    is the highest attempt this run's directory holds for the phase.
+    """
+    if reason not in _FLOORED:
+        return None
+    state = agent.to_dict()
+    turn = state.get("current_turn") or next(iter(state.get("queue") or ()), None)
+    if turn is None:
+        return None
+    phase, loop = turn["kwargs"]["phase"], turn["kwargs"]["loop"]
+    if not any(
+        isinstance(p, AgentPhase) and p.name == phase for p in deps.workflow.phases
+    ):
+        return None
+    run_id = getattr(deps.store, "run_id", None)
+    if not run_id:
+        return None
+    carried = deps.adopt
+    if carried is not None and (carried.phase, carried.loop) == (phase, loop):
+        return TurnFloor(**vars(carried))
+    return TurnFloor(
+        phase, loop, run_id, paths.highest_attempt(run_id, deps.subtask.card_id, phase)
     )
 
 

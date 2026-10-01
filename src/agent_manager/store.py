@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     PRIMARY KEY (run_id, card_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS checkpoint_floors (
+    run_id     TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    phase      TEXT NOT NULL,
+    loop       INTEGER NOT NULL,
+    source_run TEXT NOT NULL,
+    floor      INTEGER NOT NULL CHECK (floor >= 0),
+    PRIMARY KEY (run_id, card_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS run_controls (
     run_id       TEXT NOT NULL,
     seq          INTEGER NOT NULL,
@@ -558,6 +569,21 @@ def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
 
 
 @dataclass(frozen=True)
+class TurnFloor:
+    """The turn identity saved beside an agent-phase checkpoint (exactly-once 1.1).
+
+    One row of `checkpoint_floors`, keyed like its `checkpoints` row. Row-only
+    and outside the journal: nothing journals it and `rebuild_from_journal`
+    leaves it alone. Computing it is the runtime's job, not the store's.
+    """
+
+    phase: str
+    loop: int
+    source_run: str
+    floor: int
+
+
+@dataclass(frozen=True)
 class Checkpoint:
     """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
 
@@ -575,9 +601,24 @@ class Checkpoint:
     reason: str
     agent: dict
     saved_at: datetime
+    floor: TurnFloor | None = None
 
 
 def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
+    """A `Checkpoint` from a `checkpoints` row, joined with its floor if selected.
+
+    A `sqlite3.Row` raises `IndexError` for a key it lacks, so a row selected
+    without the `floor_*` columns is checked for the key first and gives
+    `floor=None`, as does a joined row with no `checkpoint_floors` match.
+    """
+    floor = None
+    if "floor_phase" in row.keys() and row["floor_phase"] is not None:
+        floor = TurnFloor(
+            phase=row["floor_phase"],
+            loop=row["floor_loop"],
+            source_run=row["floor_source_run"],
+            floor=row["floor_floor"],
+        )
     return Checkpoint(
         run_id=row["run_id"],
         card_id=row["card_id"],
@@ -587,7 +628,17 @@ def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
         reason=row["reason"],
         agent=json.loads(row["agent"]),
         saved_at=datetime.fromisoformat(row["saved_at"]),
+        floor=floor,
     )
+
+
+_CHECKPOINT_SELECT = (
+    "SELECT c.*, f.phase AS floor_phase, f.loop AS floor_loop,"
+    " f.source_run AS floor_source_run, f.floor AS floor_floor"
+    " FROM checkpoints c LEFT JOIN checkpoint_floors f"
+    " ON f.run_id = c.run_id AND f.card_id = c.card_id AND f.seq = c.seq"
+)
+"""Every checkpoint reader's select: the row plus its floor, if it has one."""
 
 
 @dataclass(frozen=True)
@@ -1201,13 +1252,17 @@ class Store:
         reason: str,
         agent: dict,
         saved_at: datetime,
+        floor: TurnFloor | None = None,
     ) -> Checkpoint:
         """Write the next checkpoint of `card_id` under this store's run.
 
         `seq` is 0 for the card's first row in this run and one past the
-        highest after that. An unknown `reason` is refused by the table's
-        `CHECK` as `sqlite3.IntegrityError`; the statement is rolled back, the
-        error propagates unchanged and no `seq` is spent.
+        highest after that. With `floor`, a `checkpoint_floors` row keyed by
+        the same `(run_id, card_id, seq)` is written in the same transaction,
+        under the same fence, with one commit. Any `sqlite3.Error` from either
+        insert -- an unknown `reason` refused by the `checkpoints` CHECK, a
+        negative floor refused by the `checkpoint_floors` CHECK -- rolls back
+        both rows and propagates unchanged, and no `seq` is spent.
         """
         with self._lock, self._fenced():
             text = json.dumps(agent, sort_keys=True)
@@ -1231,6 +1286,20 @@ class Store:
                         _iso(saved_at),
                     ),
                 )
+                if floor is not None:
+                    self._conn.execute(
+                        "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase,"
+                        " loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            self.run_id,
+                            card_id,
+                            seq,
+                            floor.phase,
+                            floor.loop,
+                            floor.source_run,
+                            floor.floor,
+                        ),
+                    )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
@@ -1244,14 +1313,16 @@ class Store:
                 reason=reason,
                 agent=json.loads(text),
                 saved_at=saved_at,
+                floor=floor,
             )
 
     def latest_checkpoint(self, card_id: str) -> Checkpoint | None:
         """The highest-`seq` checkpoint of `card_id` in this store's run, any reason."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
-                " ORDER BY seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.run_id = ? AND c.card_id = ?"
+                " ORDER BY c.seq DESC LIMIT 1",
                 (self.run_id, card_id),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
@@ -1266,8 +1337,9 @@ class Store:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
-                " AND reason = 'turn' ORDER BY seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.run_id = ? AND c.card_id = ?"
+                " AND c.reason = 'turn' ORDER BY c.seq DESC LIMIT 1",
                 (self.run_id, card_id),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
@@ -1298,10 +1370,11 @@ class Store:
             ):
                 return None
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
-                " AND reason IN ('turn', 'parked', 'escalated')"
-                " AND run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
-                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.card_id = ? AND c.workflow = ?"
+                " AND c.reason IN ('turn', 'parked', 'escalated')"
+                " AND c.run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
+                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)

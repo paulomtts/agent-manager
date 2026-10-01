@@ -2977,3 +2977,347 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
         "fdebc746",
         "ef248597",
     ]
+
+
+# -- checkpoint floors -----------------------------------------------------------
+#
+# Exactly-once Task 1.1: a row-only `checkpoint_floors` table written in the
+# same fenced transaction as its `checkpoints` row. Steps tier: real temp DB and
+# journal, no harness.
+
+FLOOR = store.TurnFloor(phase="implement", loop=2, source_run=OTHER_RUN_ID, floor=3)
+
+
+def _count(st: store.Store, table: str) -> int:
+    return st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_open_db_creates_the_checkpoint_floors_table(repo):
+    conn = store.open_db(repo)
+    try:
+        info = conn.execute("PRAGMA table_info(checkpoint_floors)").fetchall()
+        checkpoint_columns = [
+            row["name"] for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert [row["name"] for row in info] == [
+        "run_id",
+        "card_id",
+        "seq",
+        "phase",
+        "loop",
+        "source_run",
+        "floor",
+    ]
+    assert [row["name"] for row in sorted(info, key=lambda r: r["pk"]) if row["pk"]] == [
+        "run_id",
+        "card_id",
+        "seq",
+    ]
+    # M9 C1: the existing table is untouched.
+    assert checkpoint_columns == [
+        "run_id",
+        "card_id",
+        "seq",
+        "workflow",
+        "digest",
+        "reason",
+        "agent",
+        "saved_at",
+    ]
+
+
+def test_checkpoint_floors_refuses_a_negative_floor(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase, loop,"
+                " source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (RUN_ID, "card-a", 0, "implement", 0, RUN_ID, -1),
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
+    assert [f.name for f in dataclasses.fields(store.TurnFloor)] == [
+        "phase",
+        "loop",
+        "source_run",
+        "floor",
+    ]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        FLOOR.floor = 4  # type: ignore[misc]
+
+    assert dataclasses.fields(store.Checkpoint)[-1].name == "floor"
+    plain = store.Checkpoint(
+        run_id=RUN_ID,
+        card_id="card-a",
+        seq=0,
+        workflow="task",
+        digest="sha256:aaa",
+        reason="turn",
+        agent={},
+        saved_at=_at(0),
+    )
+    assert plain.floor is None
+
+
+def _save_floored(
+    st: store.Store,
+    card_id: str = "card-a",
+    *,
+    floor: store.TurnFloor | None = FLOOR,
+    reason: str = "turn",
+    saved_at: datetime | None = None,
+) -> store.Checkpoint:
+    return st.save_checkpoint(
+        card_id,
+        workflow="task",
+        digest="sha256:aaa",
+        reason=reason,
+        agent={"turn": 0},
+        saved_at=_at(0) if saved_at is None else saved_at,
+        floor=floor,
+    )
+
+
+def test_save_checkpoint_writes_the_floor_row_with_the_checkpoint(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        saved = _save_floored(st)
+        plain = _save_floored(st, floor=None, saved_at=_at(1))
+        rows = st.connection.execute(
+            "SELECT run_id, card_id, seq, phase, loop, source_run, floor"
+            " FROM checkpoint_floors ORDER BY seq"
+        ).fetchall()
+        journaled = st.journal.path.exists()
+    finally:
+        st.close()
+
+    assert saved.floor == FLOOR
+    assert saved.seq == 0
+    assert plain.floor is None
+    assert plain.seq == 1
+    # Only the floored save wrote a floor row, keyed like its checkpoint row.
+    assert [tuple(row) for row in rows] == [
+        (RUN_ID, "card-a", 0, "implement", 2, OTHER_RUN_ID, 3)
+    ]
+    # Row-only: nothing was journaled (no journal file was ever created).
+    assert journaled is False
+
+
+def test_a_zero_floor_is_accepted(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        zero = dataclasses.replace(FLOOR, floor=0)
+        saved = _save_floored(st, floor=zero)
+        assert _count(st, "checkpoint_floors") == 1
+    finally:
+        st.close()
+
+    assert saved.floor == zero
+
+
+def test_a_negative_floor_is_refused_and_writes_nothing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        kept = _save_floored(st, floor=None)
+        with pytest.raises(sqlite3.IntegrityError):
+            _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1), saved_at=_at(1))
+
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.in_transaction is False
+        assert _count(st, "checkpoints") == 1
+        assert _count(st, "checkpoint_floors") == 0
+        assert st.latest_checkpoint("card-a") == kept
+        # The refused save spent no seq: the next one takes seq 1.
+        assert _save_floored(st, saved_at=_at(2)).seq == 1
+    finally:
+        st.close()
+
+
+def test_an_unknown_reason_with_a_floor_writes_no_floor_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _save_floored(st, reason="bogus")
+
+        assert st.connection.in_transaction is False
+        assert _count(st, "checkpoints") == 0
+        assert _count(st, "checkpoint_floors") == 0
+        assert _save_floored(st).seq == 0
+    finally:
+        st.close()
+
+
+def test_a_refused_floor_under_a_held_lease_writes_nothing_and_keeps_the_lease(stores):
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1))
+
+    assert _held_elsewhere(st._lock) is False
+    assert st.connection.in_transaction is False
+    assert _count(st, "checkpoints") == 0
+    assert _count(st, "checkpoint_floors") == 0
+    lease = store.read_lease(st.connection, RUN_ID)
+    assert lease is not None and lease.token == "t1"
+    saved = _save_floored(st)
+    assert saved.seq == 0
+    assert saved.floor == FLOOR
+    assert _count(st, "checkpoint_floors") == 1
+
+
+def test_a_taken_over_store_saves_neither_row_with_a_floor(stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        _save_floored(a)
+
+    assert caught.value.holder is not None and caught.value.holder.token == "t2"
+    assert a.connection.in_transaction is False
+    assert _count(b, "checkpoints") == 0
+    assert _count(b, "checkpoint_floors") == 0
+
+
+def test_every_reader_returns_the_saved_floor(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        saved = _save_floored(st)
+        latest = st.latest_checkpoint("card-a")
+        turn = st.latest_turn_checkpoint("card-a")
+        open_ = st.latest_open_checkpoint("card-a", "task")
+    finally:
+        st.close()
+
+    for read in (latest, turn, open_):
+        assert read is not None
+        assert read.floor == FLOOR
+        assert read == saved
+
+
+def test_every_reader_returns_no_floor_for_a_floorless_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-a", reason="turn")
+        reads = [
+            st.latest_checkpoint("card-a"),
+            st.latest_turn_checkpoint("card-a"),
+            st.latest_open_checkpoint("card-a", "task"),
+        ]
+    finally:
+        st.close()
+
+    for read in reads:
+        assert read is not None
+        assert read.floor is None
+
+
+def test_floored_and_floorless_rows_of_one_card_read_back_per_seq(repo):
+    other_floor = store.TurnFloor(phase="review", loop=0, source_run=RUN_ID, floor=0)
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_floored(st, saved_at=_at(0))
+        assert st.latest_checkpoint("card-a").floor == FLOOR
+
+        plain = _save_floored(st, floor=None, saved_at=_at(1))
+        assert st.latest_checkpoint("card-a").floor is None
+
+        parked = _save_floored(st, floor=other_floor, reason="parked", saved_at=_at(2))
+        latest = st.latest_checkpoint("card-a")
+        turn = st.latest_turn_checkpoint("card-a")
+        open_ = st.latest_open_checkpoint("card-a", "task")
+    finally:
+        st.close()
+
+    assert latest == parked and latest.floor == other_floor
+    assert turn == plain and turn.floor is None
+    assert open_ == parked and open_.floor == other_floor
+
+
+def test_a_floor_never_attaches_to_another_runs_or_cards_row(repo):
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        old_saved = _save_floored(old, "card-a", saved_at=_at(0))
+    finally:
+        old.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        floored_b = _save_floored(st, "card-b", saved_at=_at(0))
+        own = _save_floored(st, "card-a", floor=None, saved_at=_at(1))
+        latest = st.latest_checkpoint("card-a")
+        turn = st.latest_turn_checkpoint("card-a")
+        open_ = st.latest_open_checkpoint("card-a", "task")
+        b = st.latest_checkpoint("card-b")
+    finally:
+        st.close()
+
+    # All three rows have seq 0; only the matching (run_id, card_id, seq) joins.
+    assert own.seq == old_saved.seq == floored_b.seq == 0
+    for read in (latest, turn, open_):
+        assert read is not None
+        assert read.run_id == RUN_ID and read.card_id == "card-a"
+        assert read.floor is None
+    assert b is not None and b.floor == FLOOR
+
+
+def test_latest_open_checkpoint_returns_an_older_runs_floor(repo):
+    old = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        parked = _save_floored(old, "card-a", reason="parked", saved_at=_at(0))
+    finally:
+        old.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        found = st.latest_open_checkpoint("card-a", "task")
+    finally:
+        st.close()
+
+    assert found == parked
+    assert found is not None and found.floor == FLOOR
+
+
+def test_a_rebuild_keeps_checkpoint_floors(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        before = [line.seq for line in st.journal.read()]
+        saved = _save_floored(st, "ef248597")
+        after = [line.seq for line in st.journal.read()]
+        st.rebuild_from_journal(RUN_ID)
+        kept = st.latest_checkpoint("ef248597")
+        floors = _count(st, "checkpoint_floors")
+    finally:
+        st.close()
+
+    assert after == before
+    assert floors == 1
+    assert kept == saved
+    assert kept is not None and kept.floor == FLOOR
+
+
+def test_checkpoint_from_row_without_floor_columns_has_no_floor(repo):
+    # Regression guard: passes before this task's change and must keep passing
+    # once _checkpoint_from_row reads the joined floor_* keys.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_floored(st)
+        row = st.connection.execute(
+            "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?",
+            (RUN_ID, "card-a"),
+        ).fetchone()
+    finally:
+        st.close()
+
+    assert store._checkpoint_from_row(row).floor is None

@@ -56,3 +56,17 @@ def attempt_dir(run_id: str, card: str, phase: str, attempt: int) -> Path:
     result = run_dir(run_id) / card / f"{phase}.{attempt}"
     result.mkdir(parents=True, exist_ok=True)
     return result
+
+
+def highest_attempt(run_id: str, card: str, phase: str) -> int:
+    """The highest attempt number `phase` of `card` has a directory for, or 0.
+
+    Scans `{phase}.1`, `{phase}.2`, ... on disk and stops at the first absent
+    one, so a resumed run sees the attempts a previous process made. Creates
+    no card or attempt directory; `run_dir` still creates the run's own root.
+    """
+    card_dir = run_dir(run_id) / card
+    attempt = 0
+    while (card_dir / f"{phase}.{attempt + 1}").exists():
+        attempt += 1
+    return attempt

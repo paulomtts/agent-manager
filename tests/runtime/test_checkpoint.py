@@ -17,10 +17,11 @@ from typing import Any
 import pytest
 from pygents import Agent, Turn, tool
 
-from agent_manager import models, store as store_module
+from agent_manager import models, paths, store as store_module
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import AgentPhase, Step, Workflow
 
@@ -316,3 +317,156 @@ def test_an_engine_error_writes_no_after_run_row(store):
 
     assert caught.value.phase == "explore"
     assert [(seq, reason) for seq, reason, _ in _rows(store)] == [(0, "turn")]
+
+
+# ── the floor (exactly-once 1.2, card 94088f7e) ──────────────────────────────
+
+
+def _commit(card: str) -> dict[str, Any]:
+    return {}
+
+
+def _floor_workflow() -> Workflow:
+    """One agent phase, `explore`, and one step, `commit`."""
+    return Workflow(
+        "floors", (AgentPhase("explore", "explorer", (), None), Step("commit", _commit))
+    )
+
+
+def _deps(opened: Any, adopt: Adoption | None = None) -> RunDeps:
+    return RunDeps(
+        _floor_workflow(), opened, STORY_ID, _subtask(), None, lambda: FIXED, adopt=adopt
+    )
+
+
+class _Stored:
+    """A stand-in agent: `save` reads it only through `to_dict()`."""
+
+    def __init__(self, current: dict | None = None, queue: tuple[dict, ...] = ()) -> None:
+        self._state = {"current_turn": current, "queue": list(queue)}
+
+    def to_dict(self) -> dict:
+        return self._state
+
+
+def _turn(phase: str, loop: int = 0) -> dict:
+    return {"kwargs": {"phase": phase, "loop": loop}}
+
+
+def _save(deps: RunDeps, agent: Any, reason: str) -> None:
+    token = current_run.set(deps)
+    try:
+        checkpoint.save(agent, reason)
+    finally:
+        current_run.reset(token)
+
+
+def _seed_attempts(phase: str, count: int) -> None:
+    for attempt in range(1, count + 1):
+        paths.attempt_dir(RUN_ID, CARD_ID, phase, attempt)
+
+
+def _saved_floor(opened) -> store_module.TurnFloor | None:
+    return opened.latest_checkpoint(CARD_ID).floor
+
+
+def test_an_agent_turn_records_the_highest_attempt_on_disk(store):
+    _seed_attempts("explore", 2)
+
+    _save(_deps(store), _Stored(current=_turn("explore", 0)), "turn")
+
+    assert _saved_floor(store) == store_module.TurnFloor("explore", 0, RUN_ID, 2)
+
+
+def test_an_agent_turn_with_no_attempts_records_floor_zero(store):
+    _save(_deps(store), _Stored(current=_turn("explore", 0)), "turn")
+
+    assert _saved_floor(store) == store_module.TurnFloor("explore", 0, RUN_ID, 0)
+
+
+def test_a_parked_row_records_the_floor_of_its_queue_head(store):
+    _seed_attempts("explore", 1)
+
+    _save(_deps(store), _Stored(queue=(_turn("explore", 1), _turn("commit", 1))), "parked")
+
+    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, RUN_ID, 1)
+
+
+def test_the_turn_in_flight_wins_over_the_queue_head(store):
+    _save(_deps(store), _Stored(current=_turn("commit"), queue=(_turn("explore"),)), "turn")
+
+    assert _saved_floor(store) is None
+
+
+def test_a_step_head_records_no_floor(store):
+    _save(_deps(store), _Stored(queue=(_turn("commit"),)), "parked")
+
+    assert _saved_floor(store) is None
+
+
+def test_an_unknown_phase_records_no_floor(store):
+    _save(_deps(store), _Stored(current=_turn("gone")), "turn")
+
+    assert _saved_floor(store) is None
+
+
+@pytest.mark.parametrize("reason", ["turn", "parked"])
+def test_an_agent_with_no_next_turn_records_no_floor(store, reason):
+    _save(_deps(store), _Stored(), reason)
+
+    assert _saved_floor(store) is None
+
+
+@pytest.mark.parametrize("reason", ["done", "escalated"])
+def test_after_run_rows_record_no_floor(store, reason):
+    _seed_attempts("explore", 2)
+
+    _save(_deps(store), _Stored(current=_turn("explore", 0)), reason)
+
+    assert store.latest_checkpoint(CARD_ID).reason == reason
+    assert _saved_floor(store) is None
+
+
+class _RunlessStore:
+    """A store with no `run_id`, recording every `save_checkpoint` call."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def save_checkpoint(self, card_id: str, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+def test_a_store_without_a_run_records_no_floor():
+    runless = _RunlessStore()
+
+    _save(_deps(runless), _Stored(current=_turn("explore", 0)), "turn")
+
+    assert len(runless.calls) == 1
+    assert runless.calls[0]["floor"] is None
+
+
+def test_a_matching_adoption_is_carried_unchanged(store):
+    _seed_attempts("explore", 2)
+    adoption = Adoption("explore", 1, "run-earlier", 7)
+    deps = _deps(store, adopt=adoption)
+
+    _save(deps, _Stored(current=_turn("explore", 1)), "turn")
+
+    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, "run-earlier", 7)
+    assert deps.adopt == adoption  # save reads the adoption, never consumes it
+
+
+@pytest.mark.parametrize(
+    "adoption",
+    [
+        Adoption("explore", 0, "run-earlier", 7),  # same phase, another loop
+        Adoption("commit", 1, "run-earlier", 7),  # another phase, same loop
+    ],
+)
+def test_a_non_matching_adoption_is_recomputed(store, adoption):
+    _seed_attempts("explore", 2)
+
+    _save(_deps(store, adopt=adoption), _Stored(current=_turn("explore", 1)), "turn")
+
+    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, RUN_ID, 2)

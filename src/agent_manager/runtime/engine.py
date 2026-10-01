@@ -22,7 +22,7 @@ from agent_manager.runtime import walk
 from agent_manager.runtime import checkpoint  # registers the BEFORE_TURN and ON_PAUSE hooks
 from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
-from agent_manager.runtime.state import RunDeps, current_run
+from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow.phases import Workflow
 
@@ -178,7 +178,17 @@ async def run_subtask_async(
         if resume_from is None:
             await agent.context_pool.add(context.seed_item(binding))
             await agent.put(compiled.first_turn())
-        deps = RunDeps(workflow, store, story_id, subtask, agent_runner, clock, stop=stop)
+        # The resume checkpoint's floor is carried as the run's adoption, so a
+        # re-save of that turn writes it unchanged (exactly-once E4/E5). A fresh
+        # run, or a row saved with no floor, starts with none.
+        adopt = (
+            None
+            if resume_from is None or resume_from.floor is None
+            else Adoption(**vars(resume_from.floor))
+        )
+        deps = RunDeps(
+            workflow, store, story_id, subtask, agent_runner, clock, stop=stop, adopt=adopt
+        )
         return await _run(agent, deps)
     finally:
         _forget(agent.name)

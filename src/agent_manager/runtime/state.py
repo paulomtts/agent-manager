@@ -17,6 +17,20 @@ from typing import Any, Callable
 from agent_manager.runtime.stop import StopSignal
 
 
+@dataclass(frozen=True)
+class Adoption:
+    """A turn a resumed run carries from its checkpoint's floor (exactly-once E4/E5).
+
+    Same fields as `store.TurnFloor`, so `Adoption(**vars(floor))` builds one.
+    Plain values only: nothing here imports the store or pygents.
+    """
+
+    phase: str
+    loop: int
+    source_run: str
+    floor: int
+
+
 @dataclass
 class RunDeps:
     workflow: Any
@@ -34,6 +48,19 @@ class RunDeps:
     """The phase whose tool was entered last. pygents clears the agent's
     `current_turn` before an error leaves `run()`, so the engine reads the
     phase an unexpected error escaped from here instead."""
+    adopt: Adoption | None = None
+    """The floor carried from the resume checkpoint, until `take_adoption`
+    consumes it. `checkpoint.save` reads it but never clears it."""
+
+    def take_adoption(self, phase: str, loop: int) -> Adoption | None:
+        """The carried adoption if it is for `(phase, loop)`, else `None`.
+
+        Always clears `adopt`, on a mismatch too, so a second call returns `None`.
+        """
+        carried, self.adopt = self.adopt, None
+        if carried is not None and (carried.phase, carried.loop) == (phase, loop):
+            return carried
+        return None
 
 
 current_run: ContextVar[RunDeps] = ContextVar("current_run")
