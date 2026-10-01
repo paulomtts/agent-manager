@@ -14,12 +14,16 @@ loaded here by path rather than imported by name, because `tests/e2e` is not on
 import ast
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from agent_manager import dag
 from agent_manager.steps.reducers import critic_blockers_gate, review_gate
 from agent_manager.steps.integrate import merge_completed_gate
 
@@ -781,6 +785,189 @@ def test_a_rendezvous_failure_makes_the_fake_process_exit_1(tmp_path, monkeypatc
     assert completed.returncode == 1
     assert "FAKE_CLAUDE_RENDEZVOUS_COUNT" in completed.stderr
     assert not result_path.exists()
+
+
+HOLD_CARD = "0123abcd-4567-89ef-0123-456789abcdef"
+"""A card id shaped like brd's, so the fake's `short_id` accepts it."""
+
+HOLD_SHORT = "0123abcd"
+"""`dag.short_id(HOLD_CARD)`, written out so a drift in either shows."""
+
+
+def _hold_result_path(tmp_path, phase="implement"):
+    """`<run dir>/<card id>/<phase>.<n>/result.json`, the shape `paths.attempt_dir` gives."""
+    return tmp_path / "runs" / "r1" / HOLD_CARD / f"{phase}.1" / "result.json"
+
+
+def _arm_hold(monkeypatch, tmp_path, phase=None):
+    """Point the hold at `<tmp>/hold`; `phase=None` leaves the default phase."""
+    folder = tmp_path / "hold"
+    monkeypatch.setenv(fake_claude.HOLD_DIR_ENV, str(folder))
+    if phase is None:
+        monkeypatch.delenv(fake_claude.HOLD_PHASE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(fake_claude.HOLD_PHASE_ENV, phase)
+    return folder
+
+
+def test_the_hold_names_are_pinned_and_are_the_conftest_twins():
+    """The fixture and the script meet across a process boundary, like the
+    rendezvous names above."""
+    assert fake_claude.HOLD_DIR_ENV == "FAKE_CLAUDE_HOLD_DIR"
+    assert fake_claude.HOLD_PHASE_ENV == "FAKE_CLAUDE_HOLD_PHASE"
+    assert fake_claude.HOLD_DEFAULT_PHASE == "implement"
+    assert fake_claude.HOLD_SUFFIX == ".held"
+    assert fake_claude.RELEASE_SUFFIX == ".release"
+    assert fake_claude.HOLD_DIR_ENV == _conftest_constant("FAKE_HOLD_DIR_ENV")
+    assert fake_claude.HOLD_PHASE_ENV == _conftest_constant("FAKE_HOLD_PHASE_ENV")
+    assert fake_claude.HOLD_SUFFIX == _conftest_constant("FAKE_HOLD_SUFFIX")
+    assert fake_claude.RELEASE_SUFFIX == _conftest_constant("FAKE_RELEASE_SUFFIX")
+
+
+def test_the_fakes_short_id_is_dags():
+    """The test names a marker with `dag.short_id`, the fake with its own copy."""
+    for card in (HOLD_CARD, HOLD_CARD.upper(), HOLD_CARD.replace("-", "")):
+        assert fake_claude.short_id(card) == dag.short_id(card) == HOLD_SHORT
+
+
+def test_a_result_path_that_names_no_card_is_refused_by_the_hold(tmp_path, monkeypatch):
+    _arm_hold(monkeypatch, tmp_path)
+    result_path = tmp_path / "runs" / "r1" / "not-a-card" / "implement.1" / "result.json"
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.hold("implement", result_path)
+
+    assert "not-a-card" in str(caught.value)
+
+
+def test_without_a_hold_dir_nothing_is_held(tmp_path, monkeypatch):
+    """Unset means today's behaviour exactly; a wait would raise at 0.2s."""
+    monkeypatch.delenv(fake_claude.HOLD_DIR_ENV, raising=False)
+    monkeypatch.setenv(fake_claude.HOLD_PHASE_ENV, "implement")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+
+    fake_claude.hold("implement", _hold_result_path(tmp_path))
+
+    assert not (tmp_path / "hold").exists()
+
+
+def test_a_hold_for_another_phase_passes_straight_through(tmp_path, monkeypatch):
+    folder = _arm_hold(monkeypatch, tmp_path, phase="plan")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+
+    fake_claude.hold("implement", _hold_result_path(tmp_path))
+
+    assert not folder.exists()
+
+
+def test_an_unknown_hold_phase_is_refused_on_any_phase(tmp_path, monkeypatch):
+    """Review focus: a typo must stop the fake, not read as "never hold"."""
+    _arm_hold(monkeypatch, tmp_path, phase="implemnt")
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.hold("explore", _hold_result_path(tmp_path, "explore"))
+
+    assert fake_claude.HOLD_PHASE_ENV in str(caught.value)
+    assert "implemnt" in str(caught.value)
+
+
+def test_a_released_hold_writes_its_pid_marker_and_returns(tmp_path, monkeypatch):
+    """Review focus: the marker holds this process's whole pid, and the
+    atomic write leaves no temp file behind."""
+    folder = _arm_hold(monkeypatch, tmp_path)
+    folder.mkdir()
+    (folder / f"{HOLD_SHORT}.release").write_text("", encoding="utf-8")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+
+    fake_claude.hold("implement", _hold_result_path(tmp_path))
+
+    marker = folder / f"{HOLD_SHORT}.held"
+    assert marker.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert sorted(path.name for path in folder.iterdir()) == [
+        f"{HOLD_SHORT}.held",
+        f"{HOLD_SHORT}.release",
+    ]
+
+
+def test_a_hold_waits_until_its_release_appears(tmp_path, monkeypatch):
+    """The `.held` marker is written before the wait, and the wait ends only
+    when the release is written by someone else."""
+    folder = _arm_hold(monkeypatch, tmp_path)
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 30.0)
+    marker = folder / f"{HOLD_SHORT}.held"
+    saw_marker = threading.Event()
+
+    def release_once_held():
+        deadline = time.monotonic() + 30.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if marker.exists():
+            saw_marker.set()
+        (folder / f"{HOLD_SHORT}.release").write_text("", encoding="utf-8")
+
+    releaser = threading.Thread(target=release_once_held)
+    releaser.start()
+    try:
+        fake_claude.hold("implement", _hold_result_path(tmp_path))
+        # Read before joining: a hold that returned without waiting would
+        # come back before the releaser had written anything.
+        released_on_return = (folder / f"{HOLD_SHORT}.release").exists()
+    finally:
+        releaser.join(timeout=30.0)
+
+    assert saw_marker.is_set()
+    assert released_on_return
+
+
+def test_a_named_hold_phase_holds_that_phase(tmp_path, monkeypatch):
+    folder = _arm_hold(monkeypatch, tmp_path, phase="plan")
+    folder.mkdir()
+    (folder / f"{HOLD_SHORT}.release").write_text("", encoding="utf-8")
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+
+    fake_claude.hold("plan", _hold_result_path(tmp_path, "plan"))
+
+    assert (folder / f"{HOLD_SHORT}.held").is_file()
+
+
+def test_an_unreleased_hold_times_out_naming_the_release_file(tmp_path, monkeypatch):
+    folder = _arm_hold(monkeypatch, tmp_path)
+    monkeypatch.setattr(fake_claude, "RENDEZVOUS_TIMEOUT", 0.2)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.hold("implement", _hold_result_path(tmp_path))
+
+    message = str(caught.value)
+    assert "timed out" in message
+    assert str(folder / f"{HOLD_SHORT}.release") in message
+    assert (folder / f"{HOLD_SHORT}.held").is_file()
+
+
+def test_the_fake_process_holds_before_it_implements(tmp_path, monkeypatch):
+    """`main` wires the hold in: the child writes its marker, finds the
+    release, then implements and writes its result."""
+    folder = _arm_hold(monkeypatch, tmp_path)
+    folder.mkdir()
+    (folder / f"{HOLD_SHORT}.release").write_text("", encoding="utf-8")
+    repo = _implement_repo(tmp_path)
+    before = _head(repo)
+    result_path = _hold_result_path(tmp_path)
+    result_path.parent.mkdir(parents=True)
+    prompt_path = _brief(
+        tmp_path,
+        "implement",
+        "coder",
+        f"\n## plan_path\n{PLAN_RELATIVE}\n\n## plan_hash\n{BRIEF_HASH}\n",
+        IMPLEMENT_SCHEMA,
+        result_path,
+    )
+
+    completed = _run_fake(prompt_path, repo)
+
+    assert completed.returncode == 0, completed.stderr
+    assert int((folder / f"{HOLD_SHORT}.held").read_text(encoding="utf-8")) > 0
+    assert json.loads(result_path.read_text(encoding="utf-8"))["plan_hash"] == BRIEF_HASH
+    assert _head(repo) != before
 
 
 IMPLEMENT_BRANCH = "m3/task-a1-00000001"

@@ -10,7 +10,7 @@ adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no extra argv flag and no import
 of `agent_manager` -- a brief that omits the contract must make this script
-fail, because that failure is the test's whole point. There are exactly five
+fail, because that failure is the test's whole point. There are exactly six
 test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
 from its own cwd and compares with the brief's `## branch`;
@@ -19,9 +19,11 @@ writes for the brief's `## branch`; the implement-only rendezvous
 (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
 wait for other lanes and changes nothing it writes; `RESOLVER_ENV`, which
 only makes the resolve phase leave the merge it was given unfinished while
-still claiming `resolved`, so git has to catch the lie; and
+still claiming `resolved`, so git has to catch the lie;
 `CRITIC_BLOCKS_ENV`, a budget file that makes a critic block a set number of
-times with a fixed reason. The resolve phase learns the tip and the
+times with a fixed reason; and the hold (`HOLD_DIR_ENV` / `HOLD_PHASE_ENV`),
+which only parks one phase of the card the brief's result path names until a
+release file appears. The resolve phase learns the tip and the
 conflicting files from the brief's `## merge_tip` and `## conflict_files` and
 nowhere else.
 
@@ -319,6 +321,83 @@ def rendezvous(cwd):
             raise FakeClaudeError(
                 f"rendezvous in {folder} timed out after {RENDEZVOUS_TIMEOUT}s: "
                 f"saw {seen} of {needed} marker(s)"
+            )
+        time.sleep(RENDEZVOUS_POLL)
+
+
+HOLD_DIR_ENV = "FAKE_CLAUDE_HOLD_DIR"
+"""Test scaffolding, never in a brief: where a held phase announces itself and waits.
+
+Unset or empty means no hold at all. Set, the hold phase writes
+`<dir>/<short id><HOLD_SUFFIX>` holding this process's pid, then waits for
+`<dir>/<short id><RELEASE_SUFFIX>`, polling every `RENDEZVOUS_POLL` and giving
+up after `RENDEZVOUS_TIMEOUT`. Whether and where to hold comes from the
+environment alone; which card is held is the card the brief's own result path
+names (`<run dir>/<card id>/<phase>.<n>/result.json`). The multi-process tests
+use it to keep a milestone run live for exactly as long as they need."""
+
+HOLD_PHASE_ENV = "FAKE_CLAUDE_HOLD_PHASE"
+"""Which phase holds. Unset or empty means `HOLD_DEFAULT_PHASE`."""
+
+HOLD_DEFAULT_PHASE = "implement"
+
+HOLD_PHASES = (
+    "explore",
+    "spec",
+    "validate_spec",
+    "plan",
+    "validate_plan",
+    "implement",
+    "review",
+    "resolve",
+)
+"""Every phase `build_result` knows. A hold phase outside it is a typo and stops
+the fake, instead of silently never holding."""
+
+HOLD_SUFFIX = ".held"
+RELEASE_SUFFIX = ".release"
+
+_HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def short_id(card_id):
+    """`agent_manager.dag.short_id`, copied: this script imports nothing from the package."""
+    hex_only = str(card_id).replace("-", "")
+    if not _HEX32.match(hex_only):
+        raise FakeClaudeError(f"not a card id: {card_id!r}")
+    return hex_only[:8].lower()
+
+
+def hold(phase, result_path):
+    """Announce this card's `phase` and wait for its release. A no-op unless armed.
+
+    The marker is written to a temp name and renamed into place, so a test
+    that sees `.held` always reads a whole pid.
+    """
+    directory = os.environ.get(HOLD_DIR_ENV)
+    if not directory:
+        return
+    wanted = os.environ.get(HOLD_PHASE_ENV) or HOLD_DEFAULT_PHASE
+    if wanted not in HOLD_PHASES:
+        raise FakeClaudeError(
+            f"{HOLD_PHASE_ENV} is {wanted!r}, not a phase this fake runs "
+            f"(one of {list(HOLD_PHASES)})"
+        )
+    if phase != wanted:
+        return
+    card = short_id(Path(result_path).parents[1].name)
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    staging = folder / f".{card}{HOLD_SUFFIX}.tmp"
+    staging.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    os.replace(staging, folder / f"{card}{HOLD_SUFFIX}")
+    release = folder / f"{card}{RELEASE_SUFFIX}"
+    deadline = time.monotonic() + RENDEZVOUS_TIMEOUT
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise FakeClaudeError(
+                f"hold in {folder} timed out after {RENDEZVOUS_TIMEOUT}s: "
+                f"{release} was never written"
             )
         time.sleep(RENDEZVOUS_POLL)
 
@@ -729,6 +808,8 @@ def main(argv):
     text = prompt_path_from_argv(argv).read_text(encoding="utf-8")
     phase = phase_of(text)
     result_path = result_path_of(text)
+    # Test scaffolding: park here, before any work, when the hold is armed.
+    hold(phase, result_path)
     cwd = Path(os.getcwd())
     payload = build_result(phase, payload_from_schema(schema_of(text)), text, cwd)
     result_path.parent.mkdir(parents=True, exist_ok=True)

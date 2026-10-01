@@ -279,10 +279,13 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        One process writes a given run (P2). The sequence number is cached when
-        the journal is opened, not re-read from disk, and the lock is held from
-        numbering the line until it is fsynced, so the threads of that process
-        never share a number or interleave their bytes. The cached number
+        Only the process holding the run's lease writes it: after a take-over
+        the new owner writes, and the old owner's writes are fenced out by the
+        lease token (multi-process X4). The sequence number is cached when the
+        journal is opened (and re-read by `reseek` on a take-over), not re-read
+        from disk on each append, and the lock is held from numbering the line
+        until it is fsynced, so the threads of that process never share a
+        number or interleave their bytes. The cached number
         advances once the line has been written and flushed to the file; if
         validation, the open or the write raises, the next append retries the
         same number, and if only the fsync raises the number stays spent, so

@@ -437,6 +437,8 @@ parallel-stories addendum, `2026-09-24-parallel-stories-design.md`.
 
 **Status (milestone 7):** superseded by the supervisor-tree addendum, `2026-09-25-supervisor-tree-design.md`: levels are no longer barriers (a story starts once its own blockers finish), a story with two or more blockers roots on a merged base, and `am resume` continues a milestone run.
 
+**Status (milestone 10):** superseded by the multi-process addendum, `2026-09-27-multi-process-design.md`: several `am` processes may now run on one repository at once, on disjoint cards and branches, each run holding a lease and claims that fence its writes, with board and git operations serialised by process-wide locks.
+
 Stories within a dependency level run in parallel, bounded by
 `max_concurrent_stories` (default 4). Subtasks within a story run
 **sequentially**, each branch stacked on the previous subtask's branch. This is

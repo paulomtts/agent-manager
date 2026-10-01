@@ -42,7 +42,7 @@ am run --milestone "document milestone runs" \
   [--max-concurrent N]
 ```
 
-`--max-concurrent N` is how many stories run at once, across the whole milestone. It defaults to 4, and `--max-concurrent 1` runs one story at a time. See [Parallel runs](#parallel-runs) for what runs together, how a run stops, and the limits, and [Multiple blockers](#multiple-blockers) for a story with two or more blockers.
+`--max-concurrent N` is how many stories run at once, across the whole milestone. It defaults to 4, and `--max-concurrent 1` runs one story at a time. See [Parallel runs](#parallel-runs) for what runs together and how a run stops, [Several am processes](#several-am-processes) for running more than one `am` at once and for the limits, and [Multiple blockers](#multiple-blockers) for a story with two or more blockers.
 
 `--milestone` takes the milestone card's id, its exact title (case does not
 matter), or a piece of its title that matches exactly one root card. A piece
@@ -182,8 +182,42 @@ How a run stops. The first escalation in any lane, an exception raised inside a 
 
 To continue, fix the escalation, then either relaunch the same `am run --milestone` command, which starts a new run, or run `am resume <run-id>`, which continues this run under the same run id (see [Relaunching resumes](#relaunching-resumes)). Either way the stopped subtask picks up where it parked, and every card already `done` on the board is skipped. After an `am pause` there is nothing to fix: run `am resume <run-id>`. A cancelled run cannot be resumed, only relaunched (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run)).
 
-Run one `am` process per repository. Two `am` processes on the same repository
-or on the same run are not supported.
+#### Several am processes
+
+Several `am` processes may run on one repository at once, from different terminals, as long as their runs drive different cards and different branches. Each run claims, at its start, every card and branch it may drive, and holds those claims for as long as it holds its lease. A second process that needs any of them is refused before it writes anything. Nothing is queued: a refused command does not wait, so run it again once the other run has finished, or pause that run first.
+
+What may run beside a live run:
+
+| Beside a live … | `am run --milestone M2` | `am run --card X` | `am resume R` | `am status` / `am runs` / `am logs` / `am run --dry-run` |
+|---|---|---|---|---|
+| milestone run of `M1` | allowed when `M2` is not `M1` and the two `--branch-prefix` values differ | allowed unless `X` is a remaining subtask of `M1` | allowed unless `R` is that run or claims a key it holds | always |
+| `--card` run of `Y` | allowed unless `Y` is a remaining subtask of `M2` | allowed when `X` is not `Y` | allowed unless `R` is that run or claims `Y` | always |
+
+A claim is a key, `card:<card id>` or `branch:<branch name>`:
+
+| Command | Claims |
+|---|---|
+| `am run --card X` | `card:X` |
+| `am resume R` of a `--card` run | `card:<its one resumable subtask>` |
+| `am run --milestone M` | `card:M`, `card:<id>` of every remaining subtask, and `branch:<prefix>-integrate` |
+| `am resume R` of a milestone run | the same set, worked out again from the board with the run's recorded `--branch-prefix` |
+
+A subtask already `done` on the board, and every subtask of a closed story, adds no key. `card:M` keeps two runs of one milestone apart whatever their prefixes, the subtask keys keep a `--card` run and a milestone run apart on a shared card in either order, and `branch:<prefix>-integrate` keeps two milestones with one `--branch-prefix` apart. A claim lives only as long as its run's lease: when the process dies, its claims die with it, and a later run takes them over.
+
+Refusals. Each one prints `{"ok": false, "error": {"type", "message"}}`, exits 3, and comes before any write. A refused `am run --card` or `am run --milestone` leaves no run directory and does no `git fetch` and no `git worktree prune`.
+
+- `RunIsLiveError`: `am resume` of a run whose lease another process holds and is live, and the loser when two `am resume` race to take over the same dead run (exactly one wins). The message reads ``run <run-id> is still running in pid <pid> on <host> (heartbeat <n>s ago); wait for it to exit, or `am status <run-id>` ``.
+- `ClaimedError`: a card or a branch this run needs is claimed by another run whose lease is live. Both kinds read the same way, with the key's kind and name: ``card <card id> is being driven by run <run-id> (pid <pid> on <host>, heartbeat <n>s ago); wait for it, or `am pause <run-id>` ``, or ``branch <prefix>-integrate is being driven by run <run-id> (…); wait for it, or `am pause <run-id>` ``. The JSON envelope has only `type` and `message`, and the message names both the key and the holding run; the `ClaimedError` exception itself also carries them as its `key` and `run_id` attributes.
+
+A branch refusal means another milestone run uses the same `--branch-prefix`; picking another prefix avoids it.
+
+Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am run --dry-run` take no lease, no claim and no lock, and never write, so they work while any number of runs are going. `am status <run-id>` shows the keys the run's live lease holds in `control.claims`.
+
+`took_over`. `am resume` of a run whose process is dead takes its lease over. A lease is dead when its pid no longer exists on the same host, or when its heartbeat is more than 30 seconds old; from another host, the heartbeat is the only test. The resumed report then has `"took_over": {"pid", "host", "heartbeat_at"}`, naming the dead holder. On a milestone run it is on every report shape.
+
+`LeaseLostError`. A process that was stuck rather than dead (stopped with SIGSTOP, or on a laptop that was suspended) may wake after another process has taken its run over. Every write of a run checks that this process still holds the lease, so the stuck process stops at its next store write: it writes nothing, not even the journal line, its lanes are cancelled as on a kill, and it exits 3 with `type: "LeaseLostError"` and the message `this process lost the lease of run '<run-id>': pid <pid> on <host> holds it now`. The new owner's rows are untouched. What this does not cover: a `git` or `brd` call the stuck process had already started finishes on its own. Such a call is bounded by one phase.
+
+Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is the same per-repository digest as the project database `<digest>.db` beside them, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
 
 Limits, stated plainly:
 
@@ -195,6 +229,11 @@ Limits, stated plainly:
   a `.venv` in each worktree, which takes time and disk once per lane.
 - **Machine load.** N lanes means up to N `claude -p` processes at once, and
   nothing rate-limits them.
+- **`--max-concurrent` is per process.** Two `am` processes with `--max-concurrent 4` each can run 8 lanes, and 8 `claude -p` processes, at once. Nothing caps lanes across processes.
+- **One data directory per machine.** Leases, claims and lock files live under the data directory. Two processes that see different data directories, for example through a different `XDG_DATA_HOME`, do not see each other's runs and are not kept apart.
+- **Not over NFS.** The locks are `flock`s, which are not reliable on a network filesystem. Keep the data directory on a local disk.
+- **POSIX only.** The locks use `fcntl`, so `am` does not run on Windows.
+- **A repository is known by its resolved path.** A linked worktree of the repository given as `--repo-dir` is a different project, with its own database, leases and locks, so a run there is not kept apart from a run on the main checkout.
 
 #### Multiple blockers
 
@@ -333,7 +372,7 @@ Which report you get when more than one thing happened:
 2. Otherwise an escalation wins: the ordinary [escalation report](#what-an-escalation-report-contains), exit 1, with `control: "pause"` added when a pause had also been requested.
 3. Otherwise a pause gives the paused report, exit 0.
 
-`am status <run-id>` always has a `control` key: `{"lease": {"pid", "host", "acquired_at", "heartbeat_at", "accepting", "live"} or null, "requests": [{"command", "requested_at", "handled_at"}]}`. `requests` lists the requests from every life of the run, in the order they were made, and `handled_at` is `null` until the run has acted on one. `live` is worked out when `am status` reads the lease; it is not stored. `accepting` turns `false` when the run is finishing.
+`am status <run-id>` always has a `control` key: `{"lease": {"pid", "host", "acquired_at", "heartbeat_at", "accepting", "live"} or null, "requests": [{"command", "requested_at", "handled_at"}], "claims": ["card:<id>", "branch:<name>", ...]}`. `claims` lists the keys the run's lease holds while it is live, and is empty otherwise (see [Several am processes](#several-am-processes)). `requests` lists the requests from every life of the run, in the order they were made, and `handled_at` is `null` until the run has acted on one. `live` is worked out when `am status` reads the lease; it is not stored. `accepting` turns `false` when the run is finishing.
 
 A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
 

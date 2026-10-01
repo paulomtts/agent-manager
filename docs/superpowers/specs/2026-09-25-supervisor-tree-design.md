@@ -248,6 +248,6 @@ No test sleeps to prove ordering; fake drivers block on `asyncio.Event`s.
 ## 10. Deferred
 
 - Verification discovery (orchestrator.js's Detect); live `am pause`/`am cancel` (superseded by `2026-09-27-live-control-design.md`); `watch`/`retry`.
-- More than one `am` process per repository.
+- More than one `am` process per repository. Superseded by `2026-09-27-multi-process-design.md`.
 - A grafo `max_workers` option (would replace T4's semaphore).
 - leave-me-alone's multi-blocker support (issue `a676f178` in that project's board).
