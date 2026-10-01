@@ -227,6 +227,20 @@ def classify(
         )
     if outcome.exit_code != 0:
         return Verdict("harness_error", detail=f"the harness exited {outcome.exit_code}")
+    return read_result(result_path, model)
+
+
+def read_result(result_path: Path | None, model: type[BaseModel] | None) -> Verdict:
+    """The file half of `classify`: judge a result file with no launcher report.
+
+    Split out so `AgentRunner.adopt` can re-judge an attempt recorded by an
+    earlier process, which left a file on disk but no `Outcome` in memory. The
+    order and every message are `classify`'s, unchanged: no model is `ok` with
+    no result and the path is never touched, a missing file is a
+    `harness_error`, and every way an existing file fails to validate is
+    `schema_invalid`. An `ok` result is the JSON-mode dump, for the reason
+    `classify`'s docstring gives.
+    """
     if model is None:
         return Verdict("ok", result=None)
     if result_path is None or not result_path.is_file():

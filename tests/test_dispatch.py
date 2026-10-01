@@ -484,6 +484,41 @@ def test_stdout_is_never_the_channel(tmp_path):
     assert verdict.status == "schema_invalid"
 
 
+def test_read_result_with_no_model_is_ok_without_touching_the_path():
+    assert dispatch.read_result(None, None) == dispatch.Verdict("ok", result=None)
+
+
+def test_read_result_judges_the_file_alone(tmp_path):
+    path = tmp_path / "result.json"
+
+    missing = dispatch.read_result(path, FakeResult)
+    assert missing.status == "harness_error"
+    assert "wrote no result file" in missing.detail
+
+    path.write_text(NOT_JSON, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_text(INVALID_RESULT, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_bytes(b"\xff\xfe not utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_text(VALID_RESULT, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult) == dispatch.Verdict(
+        "ok", result={"summary": "explored the tree", "ok": True}
+    )
+
+
+def test_classify_after_a_clean_exit_is_read_result(tmp_path):
+    path = tmp_path / "result.json"
+    path.write_text(VALID_RESULT, encoding="utf-8")
+
+    assert dispatch.classify(_outcome(tmp_path), path, FakeResult) == dispatch.read_result(
+        path, FakeResult
+    )
+
+
 def AGENT_DOCUMENT(functions: dict[str, object]) -> phases.Workflow:
     """One `explore` phase: role `explorer`, result `FakeResult`, gated by
     `functions["output_gate"]`, retried twice on `schema_invalid` and
