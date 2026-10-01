@@ -242,6 +242,7 @@ def test_a_card_a_live_milestone_claims_is_refused_to_every_other_process(
     finished = _data(*finish_am(milestone))
     assert finished["done"] is True, finished
     assert finished["run_id"] == run_id
+    assert finished["integrated"]["branch"] == f"{PREFIX}-integrate"
     after = _data(*am("status", run_id, "--repo-dir", str(root)))
     assert after["run"]["status"] == "done"
     assert after["control"]["claims"] == []
