@@ -909,10 +909,14 @@ def test_a_hold_waits_until_its_release_appears(tmp_path, monkeypatch):
     releaser.start()
     try:
         fake_claude.hold("implement", _hold_result_path(tmp_path))
+        # Read before joining: a hold that returned without waiting would
+        # come back before the releaser had written anything.
+        released_on_return = (folder / f"{HOLD_SHORT}.release").exists()
     finally:
         releaser.join(timeout=30.0)
 
     assert saw_marker.is_set()
+    assert released_on_return
 
 
 def test_a_named_hold_phase_holds_that_phase(tmp_path, monkeypatch):
