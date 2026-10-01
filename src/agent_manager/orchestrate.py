@@ -1506,9 +1506,10 @@ def run_milestone(
     Board comments (board-comments B2, B7): once the lease is held, before
     anything is driven, every pending outbox row on the milestone's cards is
     flushed. Each done or escalated subtask and each failed merged base is
-    commented by its lane; a lane-escalated, Integrate-escalated or done run
-    comments its end on the milestone card. A flush's warnings join the
-    report's `warnings`; nothing else about the run changes.
+    commented by its lane. A cancel comments each subtask it parked, in wave
+    order (card 5d9a875f). Every recorded end -- cancelled, escalated, paused
+    or done -- is commented on the milestone card. A flush's warnings join
+    the report's `warnings`; nothing else about the run changes.
 
     The lease (live control C2) and its claims are held from `record_run` to
     the run's final record, and released before the store closes; every
@@ -1656,10 +1657,10 @@ def run_milestone(
             def comment_run_end(payload: dict[str, Any]) -> dict[str, Any]:
                 """Comment `payload`'s outcome on the milestone card (board-comments B2).
 
-                Called after the run's final record. `total` goes only into the
-                dict `compose_run_end` reads, so the report keeps its shape; the
-                flush's warnings join the report's own `warnings`. Cancel and
-                pause-only exits are not commented here (card 5d9a875f).
+                Called after the run's final record, on every exit that records
+                one. `total` goes only into the dict `compose_run_end` reads, so
+                the report keeps its shape; the flush's warnings join the
+                report's own `warnings`.
                 """
                 comment = comments.compose_run_end(
                     run_id=run_id,
@@ -1675,7 +1676,24 @@ def run_milestone(
             # never reaches Integrate in this invocation.
             if stop.requested == "cancel":
                 store.record_run(run_record.model_copy(update={"status": "cancelled"}))
-                return report(controlled_payload(run_id, "cancel", outcomes, warnings))
+                payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
+                # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
+                # each subtask it parked, in wave order, then the milestone. A lane
+                # stopped while its base built names no subtask and gets nothing;
+                # an escalated lane already commented its own escalation.
+                for outcome in outcomes:
+                    if outcome.kind != "stopped" or outcome.subtask is None:
+                        continue
+                    assert outcome.story is not None
+                    comment = comments.compose_cancelled(
+                        run_id=run_id,
+                        card_id=outcome.subtask,
+                        before_phase=outcome.before_phase,
+                        branch=rows[outcome.story][1][outcome.subtask].branch,
+                        relaunch=f"am run --milestone {milestone_card.id}",
+                    )
+                    payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+                return comment_run_end(payload)
             if any(outcome.kind == "escalated" for outcome in outcomes):
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
                 primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
