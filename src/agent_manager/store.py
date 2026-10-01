@@ -1420,6 +1420,46 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
+    # -- board comment outbox ------------------------------------------------
+    #
+    # A row-only table outside the journal (board-comments B6, B9): nothing
+    # here calls `self._journal`, and `rebuild_from_journal` leaves the rows
+    # alone. Every writer holds the store lock and the fence of the bound
+    # lease token, like `save_checkpoint`. Posting to the board is not this
+    # module's job: `comments.py` drains the outbox through `board.py`.
+
+    def enqueue_comment(
+        self,
+        *,
+        run_id: str,
+        card_id: str,
+        key: str,
+        body: str,
+        now: datetime,
+    ) -> bool:
+        """Queue `body` for `card_id` under `key`, once (B9).
+
+        True when a `pending` row was inserted; False when `key` already had a
+        row, which is left exactly as it was, whatever its state. Only the key
+        collision is ignored (`ON CONFLICT(key) DO NOTHING`, not `OR IGNORE`):
+        a NULL body or any other refused value raises `sqlite3.IntegrityError`
+        and rolls back.
+        """
+        with self._lock, self._fenced():
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO board_comments (run_id, card_id, key, body, state,"
+                    " comment_id, failed_attempts, created_at, posted_at)"
+                    " VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
+                    " ON CONFLICT(key) DO NOTHING",
+                    (run_id, card_id, key, body, _iso(now)),
+                )
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+            return cursor.rowcount == 1
+
     # -- leases, claims and control requests -----------------------------------
     #
     # Row-only tables outside the journal (live control C2, multi-process X5):

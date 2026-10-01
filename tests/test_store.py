@@ -3534,3 +3534,117 @@ def test_a_board_comment_with_an_unknown_state_is_refused(repo):
     finally:
         conn.close()
     assert count == 0
+
+
+def _enqueue(
+    st: store.Store,
+    key: str,
+    *,
+    card_id: str = "card-a",
+    run_id: str = RUN_ID,
+    body: str = "body",
+    now: datetime | None = None,
+) -> bool:
+    return st.enqueue_comment(
+        run_id=run_id,
+        card_id=card_id,
+        key=key,
+        body=body,
+        now=_at(0) if now is None else now,
+    )
+
+
+def _comment_row(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM board_comments WHERE key = ?", (key,)).fetchone()
+
+
+def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
+    body = "## Done\n\nmerged `m12/x` — é\n"
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        first = _enqueue(st, "k1", body=body, now=_at(1))
+        again = _enqueue(
+            st, "k1", run_id=OTHER_RUN_ID, card_id="card-b", body="other", now=_at(2)
+        )
+        row = _comment_row(st.connection, "k1")
+        count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+        journal_exists = st.journal.path.exists()
+    finally:
+        st.close()
+
+    assert first is True
+    assert again is False
+    assert count == 1
+    assert row is not None
+    assert dict(row) == {
+        "run_id": RUN_ID,
+        "card_id": "card-a",
+        "key": "k1",
+        "body": body,
+        "state": "pending",
+        "comment_id": None,
+        "failed_attempts": 0,
+        "created_at": _at(1).isoformat(),
+        "posted_at": None,
+    }
+    # Row-only: the outbox never appends a journal line (the journal file is
+    # only created by its first append).
+    assert journal_exists is False
+
+
+def test_an_enqueue_under_a_lost_lease_raises_and_writes_nothing(stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        _enqueue(a, "k1")
+    assert caught.value.holder is not None and caught.value.holder.token == "t2"
+    assert a.connection.in_transaction is False
+    assert _comment_row(b.connection, "k1") is None
+
+    # The store holding the lease writes under its own fence and commits it:
+    # `a`, a separate connection, sees the committed row.
+    assert _enqueue(b, "k1") is True
+    assert b.connection.in_transaction is False
+    assert _comment_row(a.connection, "k1") is not None
+
+
+def test_a_refused_enqueue_rolls_back_and_writes_nothing(repo, stores):
+    # Review Focus 4: a database error inside the fence rolls back cleanly.
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    saboteur = store.open_db(repo)
+    try:
+        saboteur.execute(
+            "CREATE TRIGGER refuse_comments BEFORE INSERT ON board_comments"
+            " BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        )
+        saboteur.commit()
+    finally:
+        saboteur.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _enqueue(st, "k1")
+    assert st.connection.in_transaction is False
+    assert _held_elsewhere(st._lock) is False
+    assert _comment_row(st.connection, "k1") is None
+
+    st.connection.execute("DROP TRIGGER refuse_comments")
+    st.connection.commit()
+    assert _enqueue(st, "k1") is True
+
+
+def test_an_enqueue_with_no_body_is_refused_not_ignored(repo):
+    # Review Focus 5: only a key collision is ignored; NOT NULL still raises.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _enqueue(st, "k1", body=None)  # type: ignore[arg-type]
+        assert st.connection.in_transaction is False
+        assert _comment_row(st.connection, "k1") is None
+        assert _enqueue(st, "k1") is True
+    finally:
+        st.close()
