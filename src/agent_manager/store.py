@@ -1527,6 +1527,47 @@ class Store:
             ).fetchall()
             return [_comment_from_row(row) for row in rows]
 
+    def mark_comment_posted(self, key: str, comment_id: str, now: datetime) -> None:
+        """Record that `key`'s body is on the board as `comment_id`.
+
+        The row leaves `pending_comments`. An unknown `key` changes nothing.
+        """
+        with self._lock, self._fenced():
+            try:
+                self._conn.execute(
+                    "UPDATE board_comments SET state = 'posted', comment_id = ?,"
+                    " posted_at = ? WHERE key = ?",
+                    (comment_id, _iso(now), key),
+                )
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+
+    def record_comment_failure(self, key: str) -> int:
+        """Count one failed post of `key` and return the new `failed_attempts`.
+
+        A `pending` row reaching `COMMENT_ATTEMPTS` becomes `abandoned` and
+        leaves `pending_comments`; a row already `posted` keeps its state. No
+        warning is emitted here. An unknown `key` changes nothing and gives 0.
+        """
+        with self._lock, self._fenced():
+            try:
+                self._conn.execute(
+                    "UPDATE board_comments SET failed_attempts = failed_attempts + 1,"
+                    " state = CASE WHEN state = 'pending' AND failed_attempts + 1 >= ?"
+                    " THEN 'abandoned' ELSE state END WHERE key = ?",
+                    (COMMENT_ATTEMPTS, key),
+                )
+                row = self._conn.execute(
+                    "SELECT failed_attempts FROM board_comments WHERE key = ?", (key,)
+                ).fetchone()
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+            return 0 if row is None else row["failed_attempts"]
+
     # -- leases, claims and control requests -----------------------------------
     #
     # Row-only tables outside the journal (live control C2, multi-process X5):
