@@ -28,7 +28,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
-from agent_manager.runtime.state import Adoption, current_run
+from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.store import TurnFloor
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
@@ -623,7 +623,7 @@ def _crash_in_the_loop(opened):
     return wf, opened.latest_checkpoint(CARD_ID)
 
 
-def test_a_carried_floor_survives_a_resume(store):
+def test_a_carried_floor_survives_a_resume(store, monkeypatch):
     wf, crashed = _crash_in_the_loop(store)
     # The first run floored the turn it died in under its own id.
     assert crashed.reason == "turn"
@@ -632,6 +632,14 @@ def test_a_carried_floor_survives_a_resume(store):
     # must keep the earlier run's id and number, not recompute its own.
     carried = TurnFloor("spec", 1, "run-earlier", 7)
     seen: list[tuple[str, Adoption | None]] = []
+    taken: list[Adoption | None] = []
+    take = RunDeps.take_adoption
+
+    def recording_take(self, phase, loop):
+        taken.append(take(self, phase, loop))
+        return taken[-1]
+
+    monkeypatch.setattr(RunDeps, "take_adoption", recording_take)
 
     summary = _go(
         wf,
@@ -640,7 +648,11 @@ def test_a_carried_floor_survives_a_resume(store):
         resume_from=dataclasses.replace(crashed, floor=carried),
     )
 
-    assert seen[0] == ("spec", Adoption("spec", 1, "run-earlier", 7))
+    # The resumed head's tool takes the carried floor before it dispatches
+    # (compile.agent_phase, exactly-once E8). This runner has no `adopt`, so
+    # it dispatches as before -- and sees the adoption already consumed.
+    assert taken[0] == Adoption("spec", 1, "run-earlier", 7)
+    assert seen[0] == ("spec", None)
     assert summary.status == "escalated"
     assert _floors(store)[crashed.seq + 1:] == [
         ("turn", carried),

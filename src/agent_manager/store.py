@@ -237,6 +237,23 @@ class Journal:
         self._lock = threading.Lock()
         self._seq = self.last_seq()
 
+    @classmethod
+    def _for_reading(cls, run_id: str) -> "Journal":
+        """Another run's journal, opened only to be read.
+
+        `__init__` scans the file for its highest `seq` with the default
+        `read()`, which would raise on the very torn tail
+        `read(ignore_torn_tail=True)` exists to tolerate, and `paths.run_dir`
+        would create a directory for a run that never existed. This instance
+        is never appended to, so it needs neither: `_seq` stays 0.
+        """
+        journal = cls.__new__(cls)
+        journal.run_id = run_id
+        journal.path = paths.data_dir() / "runs" / run_id / JOURNAL_NAME
+        journal._lock = threading.Lock()
+        journal._seq = 0
+        return journal
+
     def last_seq(self) -> int:
         """Highest sequence number already on disk, or 0 for a fresh journal."""
         if not self.path.exists():
@@ -253,28 +270,39 @@ class Journal:
         with self._lock:
             self._seq = self.last_seq()
 
-    def read(self) -> list[JournalLine]:
+    def read(self, *, ignore_torn_tail: bool = False) -> list[JournalLine]:
         """Every line, validated, in sequence order.
 
         Blank lines are skipped: a crash between the write and the flush can
         leave one. Anything else that is not JSON is an error naming the line.
+
+        `ignore_torn_tail` is for reading *another* run's journal, which a
+        process elsewhere may be appending to right now: a final line that is
+        not JSON and has no trailing newline is that append in flight, and is
+        skipped. A non-JSON line that is newline-terminated, or that is not the
+        last, is still `CorruptJournalError`. Lines are ASCII (`json.dumps`
+        escapes), so a cut can never split a character.
         """
         if not self.path.exists():
             raise MissingJournalError(
                 f"no journal for run {self.run_id!r} at {self.path}"
             )
-        lines: list[JournalLine] = []
         with self.path.open(encoding="utf-8") as handle:
-            for number, text in enumerate(handle, start=1):
-                if not text.strip():
+            texts = handle.readlines()
+        lines: list[JournalLine] = []
+        for number, text in enumerate(texts, start=1):
+            if not text.strip():
+                continue
+            try:
+                record = json.loads(text)
+            except json.JSONDecodeError as error:
+                torn = number == len(texts) and not text.endswith("\n")
+                if ignore_torn_tail and torn:
                     continue
-                try:
-                    record = json.loads(text)
-                except json.JSONDecodeError as error:
-                    raise CorruptJournalError(
-                        f"{self.path}:{number}: line is not JSON: {error}"
-                    ) from error
-                lines.append(JournalLine.model_validate(record))
+                raise CorruptJournalError(
+                    f"{self.path}:{number}: line is not JSON: {error}"
+                ) from error
+            lines.append(JournalLine.model_validate(record))
         lines.sort(key=lambda line: line.seq)
         return lines
 
@@ -1555,6 +1583,23 @@ class Store:
                                 attempt,
                             )
             return run
+
+    def replay_journal(self, run_id: str) -> models.Run:
+        """The §9 tree `run_id`'s journal records, without touching any row.
+
+        Adoption reads attempts here and never from the `attempts` projection.
+        The store lock is held across the read: `Journal.read` takes no lock,
+        and other lanes of a milestone resume append to this run's journal
+        through this store, so an unlocked read could meet half a line. Nothing
+        is written, so there is no `_fenced()`. Another run's journal may be
+        live in another process, so only there is a torn final line ignored.
+        """
+        with self._lock:
+            if run_id == self.run_id:
+                lines = self._journal.read()
+            else:
+                lines = Journal._for_reading(run_id).read(ignore_torn_tail=True)
+            return replay(lines)
 
     def _delete_run(self, run_id: str) -> None:
         self._conn.execute("DELETE FROM attempts WHERE run_id = ?", (run_id,))

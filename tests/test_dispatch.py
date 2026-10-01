@@ -14,6 +14,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -482,6 +483,41 @@ def test_stdout_is_never_the_channel(tmp_path):
     verdict = dispatch.classify(outcome, result, FakeResult)
 
     assert verdict.status == "schema_invalid"
+
+
+def test_read_result_with_no_model_is_ok_without_touching_the_path():
+    assert dispatch.read_result(None, None) == dispatch.Verdict("ok", result=None)
+
+
+def test_read_result_judges_the_file_alone(tmp_path):
+    path = tmp_path / "result.json"
+
+    missing = dispatch.read_result(path, FakeResult)
+    assert missing.status == "harness_error"
+    assert "wrote no result file" in missing.detail
+
+    path.write_text(NOT_JSON, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_text(INVALID_RESULT, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_bytes(b"\xff\xfe not utf-8")
+    assert dispatch.read_result(path, FakeResult).status == "schema_invalid"
+
+    path.write_text(VALID_RESULT, encoding="utf-8")
+    assert dispatch.read_result(path, FakeResult) == dispatch.Verdict(
+        "ok", result={"summary": "explored the tree", "ok": True}
+    )
+
+
+def test_classify_after_a_clean_exit_is_read_result(tmp_path):
+    path = tmp_path / "result.json"
+    path.write_text(VALID_RESULT, encoding="utf-8")
+
+    expected = dispatch.Verdict("ok", result={"summary": "explored the tree", "ok": True})
+    assert dispatch.classify(_outcome(tmp_path), path, FakeResult) == expected
+    assert dispatch.read_result(path, FakeResult) == expected
 
 
 def AGENT_DOCUMENT(functions: dict[str, object]) -> phases.Workflow:
@@ -1578,3 +1614,357 @@ async def test_a_launcher_without_on_spawn_still_works_inside_a_bridge_call(
 
     assert result == {"summary": "explored the tree", "ok": True}
     assert len(launcher.calls) == 1
+
+
+# ── adoption (exactly-once Task 2.1) ─────────────────────────────────────────
+# Engine tier: `adopt` is called directly on a runner that already ran the
+# phase once through the counting FakeLauncher, so `launcher.calls` proves
+# nothing was dispatched again. The pygents wiring is sibling 6ecbe6e2's.
+
+OTHER_RUN_ID = "run-2"
+OTHER_VALID_RESULT = json.dumps({"summary": "explored it again", "ok": True})
+EXPLORED = {"summary": "explored the tree", "ok": True}
+
+
+def _reused(n: int, source_run: str = RUN_ID, name: str = "explore") -> str:
+    return (
+        f"phase {name!r} was not dispatched again: attempt {n} of run {source_run} "
+        "had already succeeded (result reused)"
+    )
+
+
+def _declines(runner) -> list[str]:
+    return [warning for warning in runner.warnings if "was not reused" in warning]
+
+
+def _seed(opened, run_id: str = RUN_ID, story_id: str = STORY_ID) -> None:
+    """The run, story and subtask lines `replay` needs above any phase line."""
+    opened.record_run(
+        models.Run(
+            id=run_id,
+            workflow="agentic",
+            repo_dir=Path("/repo"),
+            base_branch="master",
+            branch_prefix="m11/",
+        )
+    )
+    opened.record_story(models.StoryRun(card_id=story_id, title="Adoption", level=0))
+    opened.record_subtask(
+        story_id,
+        models.SubtaskRun(card_id=CARD, branch=f"m11/task-{CARD}", base_branch="master"),
+    )
+
+
+def _passing_phase() -> phases.AgentPhase:
+    return _model_phase(lambda result: None)
+
+
+def _succeed_once(
+    store, tmp_path, worktree, phase=None, results=(VALID_RESULT,), story_id=STORY_ID
+):
+    """Seed the run tree, then run `phase` once: attempt 1 `ok`, phase `done`."""
+    _seed(store, story_id=story_id)
+    phase = _passing_phase() if phase is None else phase
+    launcher = FakeLauncher(results=list(results))
+    runner, _ = _runner(store, launcher, tmp_path, worktree, story_id=story_id)
+    runner(phase, _context(worktree), _rendered())
+    return runner, launcher, phase
+
+
+@dataclass
+class CrashingLauncher(FakeLauncher):
+    """Writes its canned result, then dies before the attempt is judged."""
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        super().__call__(argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path)
+        raise RuntimeError("the manager died after the harness wrote its result")
+
+
+def test_adopt_returns_the_recorded_result_without_dispatching(store, tmp_path, worktree):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+
+    adopted = runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0)
+
+    assert adopted == dispatch.Adopted(EXPLORED, 1, RUN_ID)
+    assert len(launcher.calls) == 1
+    assert runner.warnings == [_reused(1)]
+    assert _phase_statuses(store) == [
+        ("explore", "started"), ("explore", "done"), ("explore", "done")
+    ]
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+
+
+def test_adopted_is_a_frozen_plain_value():
+    adopted = dispatch.Adopted({"a": 1}, 2, RUN_ID)
+
+    assert (adopted.result, adopted.attempt, adopted.source_run) == ({"a": 1}, 2, RUN_ID)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        adopted.attempt = 3
+
+
+def test_an_attempt_at_or_below_the_floor_is_not_adopted(store, tmp_path, worktree):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+
+    assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=1) is None
+    assert runner.warnings == []
+    assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+
+
+def test_an_orphaned_attempt_is_never_adopted(store, tmp_path, worktree):
+    _seed(store)
+    phase = _passing_phase()
+    runner, _ = _runner(store, CrashingLauncher(results=[VALID_RESULT]), tmp_path, worktree)
+    with pytest.raises(RuntimeError, match="the manager died"):
+        runner(phase, _context(worktree), _rendered())
+    assert (paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "result.json").is_file()
+    assert _attempt_statuses(store) == [(1, "started")]
+
+    assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0) is None
+    assert runner.warnings == []
+
+    # Resume later marks the orphan `harness_error`; it is still never adopted.
+    started = next(
+        line.payload for line in store.journal.read() if line.event == "attempt_upsert"
+    )
+    store.record_attempt(
+        STORY_ID,
+        CARD,
+        "explore",
+        models.Attempt.model_validate(started).model_copy(update={"status": "harness_error"}),
+    )
+    assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0) is None
+    assert runner.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("damage", "why"),
+    [
+        ("delete", "the harness wrote no result file at"),
+        ("not_json", "is not valid JSON"),
+        ("schema", "summary"),
+    ],
+)
+def test_a_result_that_no_longer_validates_is_declined(
+    damage, why, store, tmp_path, worktree
+):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    result_file = paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "result.json"
+    if damage == "delete":
+        result_file.unlink()
+    elif damage == "not_json":
+        result_file.write_text(NOT_JSON, encoding="utf-8")
+    else:
+        result_file.write_text(INVALID_RESULT, encoding="utf-8")
+    lines = len(store.journal.read())
+
+    assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(f"phase 'explore': attempt 1 of run {RUN_ID} was not reused (")
+    assert warning.endswith("); dispatching again")
+    assert why in warning
+    assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+
+
+def test_a_gate_that_fails_now_declines(store, tmp_path, worktree):
+    runner, _, _ = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+
+    failing = _model_phase(lambda result: {"blocked": True})
+    assert runner.adopt(failing, _context(worktree), source_run=RUN_ID, floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(f"phase 'explore': attempt 1 of run {RUN_ID} was not reused (")
+    assert "gate '<lambda>' failed: blocked=True" in warning
+    assert len(store.journal.read()) == lines
+
+
+def test_a_gate_that_raises_now_declines_rather_than_raising(store, tmp_path, worktree):
+    # Review Focus 3: a fatal gate verdict is a decline, never an exception
+    # out of the resume.
+    runner, _, _ = _succeed_once(store, tmp_path, worktree)
+
+    def output_gate(result):
+        raise RuntimeError("broken now")
+
+    adopted = runner.adopt(
+        _model_phase(output_gate), _context(worktree), source_run=RUN_ID, floor=0
+    )
+
+    assert adopted is None
+    [warning] = _declines(runner)
+    assert "gate 'output_gate' raised RuntimeError: broken now" in warning
+
+
+def test_adopt_reads_the_journal_not_the_projection(store, tmp_path, worktree):
+    runner, _, phase = _succeed_once(store, tmp_path, worktree)
+    store.connection.execute("DELETE FROM attempts")
+    store.connection.commit()
+    assert store.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+    adopted = runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0)
+
+    assert adopted == dispatch.Adopted(EXPLORED, 1, RUN_ID)
+
+
+def test_adopt_reads_another_runs_journal(store, tmp_path, worktree):
+    _succeed_once(store, tmp_path, worktree)
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        launcher = FakeLauncher(results=[VALID_RESULT])
+        runner, _ = _runner(other, launcher, tmp_path, worktree, run_id=OTHER_RUN_ID)
+        adopted = runner.adopt(
+            _passing_phase(), _context(worktree), source_run=RUN_ID, floor=0
+        )
+        phase_lines = _phase_statuses(other)
+        attempt_lines = _attempt_statuses(other)
+        copied = other.connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE run_id = ?", (OTHER_RUN_ID,)
+        ).fetchone()[0]
+    finally:
+        other.close()
+
+    assert adopted == dispatch.Adopted(EXPLORED, 1, RUN_ID)
+    assert adopted.source_run == RUN_ID
+    assert launcher.calls == []
+    assert phase_lines == [("explore", "done")]
+    assert attempt_lines == []
+    assert copied == 0
+    assert runner.warnings == [_reused(1)]
+
+
+def test_adopt_finds_the_card_under_any_story_of_the_source_run(store, tmp_path, worktree):
+    # Review Focus 2: the source run's story structure is not assumed to match.
+    _succeed_once(store, tmp_path, worktree, story_id="5f0c1a2e")
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        runner, _ = _runner(
+            other, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree,
+            run_id=OTHER_RUN_ID,
+        )
+        adopted = runner.adopt(
+            _passing_phase(), _context(worktree), source_run=RUN_ID, floor=0
+        )
+    finally:
+        other.close()
+
+    assert adopted == dispatch.Adopted(EXPLORED, 1, RUN_ID)
+
+
+def test_a_phase_or_card_the_source_run_never_recorded_adopts_nothing_silently(
+    store, tmp_path, worktree
+):
+    # Review Focus 2, the other half: nothing to adopt is not a decline.
+    runner, _, phase = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+
+    never_ran = _model_phase(lambda result: None, name="review")
+    assert runner.adopt(never_ran, _context(worktree), source_run=RUN_ID, floor=0) is None
+
+    stranger, _ = _runner(
+        store, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree, card_id="0000aaaa"
+    )
+    assert stranger.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0) is None
+
+    assert runner.warnings == []
+    assert stranger.warnings == []
+    assert len(store.journal.read()) == lines
+
+
+def test_the_highest_ok_attempt_above_the_floor_is_adopted(store, tmp_path, worktree):
+    # Review Focus 1.
+    runner, launcher, phase = _succeed_once(
+        store, tmp_path, worktree, results=(VALID_RESULT, OTHER_VALID_RESULT)
+    )
+    runner(phase, _context(worktree), _rendered())
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok"), (2, "started"), (2, "ok")]
+    again = {"summary": "explored it again", "ok": True}
+
+    assert runner.adopt(
+        phase, _context(worktree), source_run=RUN_ID, floor=0
+    ) == dispatch.Adopted(again, 2, RUN_ID)
+    assert runner.adopt(
+        phase, _context(worktree), source_run=RUN_ID, floor=1
+    ) == dispatch.Adopted(again, 2, RUN_ID)
+    assert runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=2) is None
+    assert len(launcher.calls) == 2
+
+
+def test_a_missing_source_journal_declines(store, tmp_path, worktree):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+
+    assert runner.adopt(phase, _context(worktree), source_run="never-ran", floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(
+        "phase 'explore': attempt ? of run never-ran was not reused ("
+        "its journal cannot be read: MissingJournalError: "
+    )
+    assert warning.endswith("); dispatching again")
+    assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+    # Review Focus 5: declining leaves no run directory for a run that never was.
+    assert not (paths.data_dir() / "runs" / "never-ran").exists()
+
+
+def test_a_phase_without_a_result_model_adopts_none(store, tmp_path, worktree):
+    phase = _model_phase(
+        name="spec", result=None, retry=None, writes="docs/superpowers/specs/{stem}.md"
+    )
+    runner, launcher, _ = _succeed_once(store, tmp_path, worktree, phase=phase, results=(None,))
+
+    adopted = runner.adopt(phase, _context(worktree), source_run=RUN_ID, floor=0)
+
+    assert adopted == dispatch.Adopted(None, 1, RUN_ID)
+    assert adopted.result is None
+    assert runner.warnings == [_reused(1, name="spec")]
+    assert len(launcher.calls) == 1
+
+
+def test_a_source_journal_that_fails_validation_declines(store, tmp_path, worktree):
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    lines = len(store.journal.read())
+    broken = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        # Valid JSON, but no `models.Run`: replay raises pydantic's
+        # ValidationError, which is a decline, never an exception out of resume.
+        broken.journal.append("run_upsert", {"not": "a run"})
+    finally:
+        broken.close()
+
+    assert runner.adopt(phase, _context(worktree), source_run=OTHER_RUN_ID, floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(
+        f"phase 'explore': attempt ? of run {OTHER_RUN_ID} was not reused ("
+        "its journal cannot be read: ValidationError"
+    )
+    assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+
+
+def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
+    _succeed_once(store, tmp_path, worktree)
+    recorded = store.replay_journal(RUN_ID).stories[0].subtasks[0].phases[0]
+    later = recorded.started_at + timedelta(days=1)
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        runner, _ = _runner(
+            other, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree,
+            run_id=OTHER_RUN_ID, clock=lambda: later,
+        )
+        runner.adopt(_passing_phase(), _context(worktree), source_run=RUN_ID, floor=0)
+        [payload] = [
+            line.payload for line in other.journal.read() if line.event == "phase_upsert"
+        ]
+    finally:
+        other.close()
+
+    done = models.PhaseRun.model_validate(payload)
+    assert done.status == "done"
+    assert done.started_at == recorded.started_at
+    assert done.ended_at == later

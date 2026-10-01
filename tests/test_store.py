@@ -3321,3 +3321,143 @@ def test_checkpoint_from_row_without_floor_columns_has_no_floor(repo):
         st.close()
 
     assert store._checkpoint_from_row(row).floor is None
+
+
+# -- replaying a journal for adoption (exactly-once Task 2.1) ----------------
+
+ADOPTING_RUN_ID = "run-2"
+
+
+def test_ignore_torn_tail_skips_only_an_unterminated_last_line(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write('{"seq": 2, "run_id"')
+
+    with pytest.raises(store.CorruptJournalError):
+        journal.read()
+    assert [line.payload["i"] for line in journal.read(ignore_torn_tail=True)] == [0]
+
+
+def test_ignore_torn_tail_still_rejects_a_bad_line_before_the_last(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write("this is not json\n")
+        handle.write('{"seq": 3')
+
+    with pytest.raises(store.CorruptJournalError) as excinfo:
+        journal.read(ignore_torn_tail=True)
+    assert ":2:" in str(excinfo.value)
+
+
+def test_ignore_torn_tail_still_raises_for_a_missing_journal(repo):
+    journal = store.Journal("run-never-started")
+    with pytest.raises(store.MissingJournalError):
+        journal.read(ignore_torn_tail=True)
+
+
+def test_replay_journal_of_another_run_ignores_a_torn_tail(repo):
+    other = store.Store.open(repo, ADOPTING_RUN_ID)
+    try:
+        other.record_run(_run(repo, ADOPTING_RUN_ID))
+        other.record_story(_story())
+    finally:
+        other.close()
+    torn = paths.run_dir(ADOPTING_RUN_ID) / store.JOURNAL_NAME
+    with torn.open("a", encoding="utf-8") as handle:
+        handle.write('{"seq": 9')
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        replayed = st.replay_journal(ADOPTING_RUN_ID)
+
+        # The same bytes, now newline-terminated, are a finished line that is
+        # not JSON: that is corruption, not an append in flight.
+        with torn.open("a", encoding="utf-8") as handle:
+            handle.write("\n")
+        with pytest.raises(store.CorruptJournalError) as excinfo:
+            st.replay_journal(ADOPTING_RUN_ID)
+    finally:
+        st.close()
+
+    assert replayed.id == ADOPTING_RUN_ID
+    assert [story.card_id for story in replayed.stories] == ["8831189b"]
+    assert ":3:" in str(excinfo.value)
+
+
+def test_replay_journal_of_its_own_run_never_ignores_a_torn_tail(repo):
+    # Review Focus 4: only another run, which may be live elsewhere, gets the
+    # benefit of the doubt. The own journal is this process's to write.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        with st.journal.path.open("a", encoding="utf-8") as handle:
+            handle.write('{"seq": 9')
+        with pytest.raises(store.CorruptJournalError):
+            st.replay_journal(RUN_ID)
+    finally:
+        st.close()
+
+
+def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        replayed = st.replay_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert replayed == loaded
+
+
+def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        real_read = st.journal.read
+        seen: list[bool] = []
+        writers: list[threading.Thread] = []
+
+        def interleaving_read(**kwargs):
+            # A record_* started from another thread mid-replay must wait for
+            # the replay: if it could land now, this read would include it.
+            seen.append(_held_elsewhere(st._lock))
+            writer = threading.Thread(
+                target=st.record_subtask, args=("8831189b", _subtask())
+            )
+            writers.append(writer)
+            writer.start()
+            writer.join(timeout=0.2)
+            seen.append(writer.is_alive())
+            return real_read(**kwargs)
+
+        monkeypatch.setattr(st.journal, "read", interleaving_read)
+        replayed = st.replay_journal(RUN_ID)
+        writers[0].join()
+        after = store.replay(real_read())
+    finally:
+        st.close()
+
+    assert seen == [True, True]
+    assert replayed.stories[0].subtasks == []
+    assert [subtask.card_id for subtask in after.stories[0].subtasks] == ["ef248597"]
+
+
+def test_replay_journal_writes_nothing(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        before = st.journal.path.read_bytes()
+        st.connection.execute("DELETE FROM attempts")
+        st.connection.commit()
+        st.replay_journal(RUN_ID)
+        attempts = st.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+        after = st.journal.path.read_bytes()
+    finally:
+        st.close()
+
+    assert after == before
+    assert attempts == 0
