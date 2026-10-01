@@ -5194,3 +5194,63 @@ def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(proje
     assert git_calls == []
     assert (_runs_tree(), _statuses(_load(project, run_id))) == before
     assert _claim_rows(project) == [(key, run_id, "still-running") for key in own]
+
+
+# ── board comments (card 65ed3c70) ──────────────────────────────────────────
+
+
+def _comments(project: Path, card_id: str) -> list[board.BoardComment]:
+    """`card_id`'s comments on the temporary board, oldest first."""
+    return board.comment_list(card_id, repo_dir=project)
+
+
+def _keys(found: list[board.BoardComment]) -> list[str]:
+    """Each comment's `am-key:` value, read off its last line, in board order."""
+    return [
+        comment.body.rstrip().rsplit("\n", 1)[-1].removeprefix("am-key: ")
+        for comment in found
+    ]
+
+
+def _comment_states(project: Path) -> list[tuple[str, str]]:
+    """Every outbox row as `(key, state)`, in insertion order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            (row["key"], row["state"])
+            for row in conn.execute("SELECT key, state FROM board_comments ORDER BY rowid")
+        ]
+    finally:
+        conn.close()
+
+
+@requires_git
+@requires_brd
+def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story(project):
+    """Spec test 1, subtask half; Review Focus 2: two lanes finish at once,
+    yet each subtask gets exactly one done comment and nothing stays pending."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+
+    result = _run(project, shape["milestone"], FakeDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    run_id = result["run_id"]
+    for subtask in (a1, a2, b1):
+        found = _comments(project, subtask)
+        assert _keys(found) == [f"{run_id}/{subtask}/done"], subtask
+        (comment,) = found
+        assert comment.author == "am"
+        assert comment.body.startswith(f"am · done · run {run_id}\n")
+        assert f"branch: {_branch(project, subtask)}" in comment.body
+        assert "(resumed at" not in comment.body
+    for story in shape["stories"].values():
+        assert _comments(project, story) == [], story
+    assert [state for _key, state in _comment_states(project) if "/done" in _key] == [
+        "posted",
+        "posted",
+        "posted",
+    ]
+    assert result["warnings"] == []
+

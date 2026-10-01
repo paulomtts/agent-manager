@@ -52,7 +52,7 @@ from typing import Any, Literal, Protocol
 
 import grafo
 
-from agent_manager import bases, board, census, cli, control, dag, integration, models
+from agent_manager import bases, board, census, cli, comments, control, dag, integration, models
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
@@ -304,6 +304,28 @@ def _utcnow() -> datetime:
     """This module's own clock default. `cli._utcnow` is private, and binding a
     `cli` name at definition time would break under the circular import."""
     return datetime.now(timezone.utc)
+
+
+def post_comment(
+    store: Store, root: Path, comment: comments.Comment, *, run_id: str
+) -> list[str]:
+    """Queue `comment`, then flush its card's pending rows; the flush's warnings.
+
+    Called only after the outcome it describes is recorded (board-comments B2).
+    A board failure comes back as a warning, never an exception (B8); a lost
+    lease propagates like any fenced write. Flushing by card also posts any
+    earlier run's leftover row for that card.
+    """
+    comments.enqueue(store, comment, run_id=run_id, now=_utcnow())
+    return comments.flush(store, root, card_ids=[comment.card_id])
+
+
+async def post_comment_async(
+    store: Store, root: Path, comment: comments.Comment, *, run_id: str
+) -> list[str]:
+    """`post_comment` off the run's event loop: a flush runs `brd`, a blocking
+    subprocess, so a lane awaits it in a worker thread as it awaits `board.show`."""
+    return await asyncio.to_thread(post_comment, store, root, comment, run_id=run_id)
 
 
 class Driver(Protocol):
@@ -1129,6 +1151,21 @@ async def lane(
                     )
                 store.record_subtask(story.id, row.model_copy(update={"status": "done"}))
                 completed.append(subtask.id)
+                # Board-comments B2: after the outcome is recorded, never instead of it.
+                warnings.extend(
+                    await post_comment_async(
+                        store,
+                        root,
+                        comments.compose_done(
+                            run_id=run_id,
+                            card_id=subtask.id,
+                            summary=summary,
+                            branch=row.branch,
+                            resumed_at=None,
+                        ),
+                        run_id=run_id,
+                    )
+                )
             store.record_story(story_row.model_copy(update={"status": "done"}))
         except (LaneEscalated, LaneStopped):
             raise
