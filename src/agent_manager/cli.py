@@ -20,7 +20,8 @@ Typer's own usage errors.
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +165,20 @@ class RunIsLiveError(CliError):
     """`am resume` was asked for a run another live process still holds (C10)."""
 
 
+class ClaimedError(CliError):
+    """A card or branch this run needs is claimed by another run's live lease (X5, X11).
+
+    `key` is the claim key (`card:<id>` or `branch:<name>`) and `run_id` the
+    run that holds it, so a script can act on the refusal without parsing
+    the message.
+    """
+
+    def __init__(self, message: str, *, key: str, run_id: str) -> None:
+        super().__init__(message)
+        self.key = key
+        self.run_id = run_id
+
+
 def resolve_repo_dir(repo_dir: Path) -> Path:
     """`--repo-dir` as an existing absolute directory, or `RepoDirError`.
 
@@ -284,8 +299,10 @@ def control_view(
     requests: Sequence[store_module.ControlRow],
     *,
     now: datetime,
+    claims: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """C12's `control` key: the lease or `None`, and every life's requests in seq order.
+    """C12's `control` key: the lease or `None`, every life's requests in seq
+    order, and `claims`, the keys the live lease holds (X5; empty otherwise).
 
     `live` is worked out here, at read time, by `control.lease_is_live`; it
     is never stored. Timestamps are ISO strings.
@@ -309,6 +326,7 @@ def control_view(
             }
             for row in requests
         ],
+        "claims": list(claims),
     }
 
 
@@ -329,7 +347,9 @@ def status_payload(
         "run": {field: tree[field] for field in RUN_IDENTITY},
         "stories": tree["stories"],
         "rows": status_rows(run),
-        "control": {"lease": None, "requests": []} if control is None else control,
+        "control": {"lease": None, "requests": [], "claims": []}
+        if control is None
+        else control,
     }
 
 
@@ -804,6 +824,74 @@ def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
     return summary.status
 
 
+def _run_is_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+    """C10's refusal of a run another live process holds, worded once for every caller."""
+    return RunIsLiveError(
+        f"run {lease.run_id} is still running in pid {lease.pid} on {lease.host}"
+        f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
+        f" or `am status {lease.run_id}`"
+    )
+
+
+def _claimed_error(key: str, holder: store_module.LeaseRow, now: datetime) -> ClaimedError:
+    """X11's refusal of a claimed key. The kind and name come from the key itself,
+    split on its first `:`, so a `branch:` claim reads as a branch."""
+    kind, _, name = key.partition(":")
+    return ClaimedError(
+        f"{kind} {name} is being driven by run {holder.run_id}"
+        f" (pid {holder.pid} on {holder.host},"
+        f" heartbeat {_heartbeat_age(holder, now)}s ago);"
+        f" wait for it, or `am pause {holder.run_id}`",
+        key=key,
+        run_id=holder.run_id,
+    )
+
+
+def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None) -> None:
+    """Refuse, before any write, a run whose keys another live run already claims.
+
+    Read-only preflight (X5): one `open_db` connection, `claim_conflicts`
+    judged by `control.lease_is_live` at `_utcnow()`, closed on every path.
+    It takes no lease, claim or lock, so a refusal here leaves no run
+    directory. `run_id` excludes that run's own rows (a resume). The first
+    live conflict raises `ClaimedError`; `take_lease` re-checks atomically.
+    """
+    now = _utcnow()
+    conn = store_module.open_db(root)
+    try:
+        conflicts = store_module.claim_conflicts(
+            conn,
+            keys,
+            is_live=lambda row: control.lease_is_live(row, now=now),
+            run_id=run_id,
+        )
+    finally:
+        conn.close()
+    if conflicts:
+        key, holder = conflicts[0]
+        raise _claimed_error(key, holder, now)
+
+
+@contextmanager
+def run_lease(store: Store, *, claims: Sequence[str] = ()) -> Iterator[control.Lease]:
+    """Hold `control.Lease(store, claims=claims)` for the block, with CLI refusals.
+
+    A thin wrapper: only entering is translated -- `store.LeaseHeldError`
+    becomes C10's `RunIsLiveError`, `store.ClaimHeldError` becomes
+    `ClaimedError` -- and the block's exit, an exception included, is
+    `Lease.__exit__`'s, which releases the claims then the lease.
+    """
+    stack = ExitStack()
+    try:
+        lease = stack.enter_context(control.Lease(store, claims=claims))
+    except store_module.LeaseHeldError as error:
+        raise _run_is_live_error(error.holder, _utcnow()) from error
+    except store_module.ClaimHeldError as error:
+        raise _claimed_error(error.key, error.holder, _utcnow()) from error
+    with stack:
+        yield lease
+
+
 def run_card(
     card_id: str,
     *,
@@ -823,8 +911,10 @@ def run_card(
     and subtask rows are written before the walk starts (so `status` and `resume`
     can see a run that died on its first phase).
 
-    Live control (C11): from the `started` rows through the final ones the run
-    holds a `control.Lease`, and the walk runs under `control.controlled`,
+    Live control (C11) and claims (X5): the card is refused before
+    `Store.open` if another live run claims it, and from before the
+    `started` rows through the final ones the run holds a `control.Lease`
+    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
     which polls for `am pause`/`am cancel` every `control_interval` seconds
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
@@ -841,6 +931,10 @@ def run_card(
 
     branch = dag.task_branch(branch_prefix, card)
     worktree = worktree_for(root, branch)
+    claims = [control.card_claim(card.id)]
+    # Read-only and before `Store.open`, so a refused card leaves no run
+    # directory (X5); `take_lease` below re-checks atomically.
+    refuse_claimed(root, claims)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
 
@@ -870,9 +964,12 @@ def run_card(
             status="started",
             worktree_path=worktree,
         )
-        # Inside the `try` that closes the store, so the lease is released
-        # before `store.close()` on every exit, a raising walk included (C2).
-        with control.Lease(store) as lease:
+        # Inside the `try` that closes the store, so the claims and the lease
+        # are released before `store.close()` on every exit, a raising walk
+        # included (C2, X5). Taken before `record_run`, so every run write is
+        # fenced by this token; a lost race is `ClaimedError` with nothing
+        # written but the empty run directory.
+        with run_lease(store, claims=claims) as lease:
             store.record_run(run_record)
             store.record_story(story)
             store.record_subtask(story.card_id, subtask)
@@ -1081,6 +1178,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     EngineError,
     ValueError,
     locks.LockTimeoutError,
+    store_module.LeaseLostError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1088,8 +1186,11 @@ HANDLED: tuple[type[BaseException], ...] = (
 bare one for a card id that is not a UUID, and a typed `--card` must not come
 back as a traceback. `locks.LockTimeoutError` is in it because a start refused
 while another `am` process held a project lock past its timeout (spec X7) is a
-refusal, not a bug; nothing below the CLI catches it. Anything outside this
-tuple is a bug in this program and should crash loudly with its stack intact.
+refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostError`
+is in it because another process took this run's lease over mid-walk (spec X4):
+the fence stopped every write, and the operator gets the envelope naming the new
+holder. It is a `BaseException`, so it has to be listed by name. Anything outside
+this tuple is a bug in this program and should crash loudly with its stack intact.
 """
 
 
@@ -1302,10 +1403,20 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
                 f"run {wanted!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
+        lease = store_module.read_lease(conn, wanted)
+        now = _utcnow()
+        # Only a live lease's claims count (X5): a dead one's leftover rows
+        # are anyone's to take, so they are not shown as held.
+        claims = (
+            [claim.key for claim in store_module.held_claims(conn, wanted, lease.token)]
+            if lease is not None and control.lease_is_live(lease, now=now)
+            else []
+        )
         state = control_view(
-            store_module.read_lease(conn, wanted),
+            lease,
             store_module.control_requests(conn, wanted),
-            now=_utcnow(),
+            now=now,
+            claims=claims,
         )
         return status_payload(run, state)
     finally:
@@ -1451,31 +1562,42 @@ def _resume_from_checkpoint(
     where the walk goes on. A `milestone` run never comes here: `resume_run`
     hands it to `orchestrate.run_milestone` (card 54e4ec29).
 
-    Live control (C11), as in `run_card`: from the `started` rows through the
-    final ones this life of the run holds a fresh `control.Lease`, and the walk
-    runs under `control.controlled`. A pause parks it `stopped`; a cancel
-    parks it and records the run `cancelled` (`card_run_status`).
+    Live control (C11) and claims (X5), as in `run_card`: the card is refused
+    before `Store.open` if another live run claims it, and from right after
+    `Store.open` through the final rows this life of the run holds a fresh
+    `control.Lease` with the `card:<id>` claim (`run_lease`); a dead holder it
+    took over is reported under `took_over`. The walk runs under
+    `control.controlled`. A pause parks it `stopped`; a cancel parks it and
+    records the run `cancelled` (`card_run_status`).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
     orphans = orphan_attempts(subtask)
     resumed = subtask.model_copy(update={"status": "started"})
+    claims = [control.card_claim(subtask.card_id)]
+    # Read-only and before `Store.open` (X5); the run's own claims are not a
+    # conflict, and `take_lease` below re-checks atomically.
+    refuse_claimed(root, claims, run_id=run.id)
 
     store = Store.open(root, run.id)
     try:
-        checkpoint = store.latest_checkpoint(subtask.card_id)
-        phase = checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
-        for orphan, attempt in orphans:
-            store.record_attempt(
-                story.card_id,
-                subtask.card_id,
-                orphan.name,
-                attempt.model_copy(update={"status": "harness_error"}),
+        # Right after `Store.open` and inside the `try` that closes the store:
+        # a lost race refuses before the orphan writes, every write below is
+        # fenced, and the claims and lease are released before `store.close()`
+        # on every exit, a checkpoint refusal included (C2, X5).
+        with run_lease(store, claims=claims) as lease:
+            checkpoint = store.latest_checkpoint(subtask.card_id)
+            phase = checkpoint_resume_phase(
+                checkpoint, card_id=subtask.card_id, run_id=run.id
             )
-        # After every refusal, and inside the `try` that closes the store, so
-        # the lease is released before `store.close()` on every exit (C2).
-        with control.Lease(store) as lease:
+            for orphan, attempt in orphans:
+                store.record_attempt(
+                    story.card_id,
+                    subtask.card_id,
+                    orphan.name,
+                    attempt.model_copy(update={"status": "harness_error"}),
+                )
             store.record_run(run.model_copy(update={"status": "started"}))
             store.record_story(story.model_copy(update={"status": "started"}))
             store.record_subtask(story.card_id, resumed)
@@ -1511,7 +1633,7 @@ def _resume_from_checkpoint(
                 story.card_id, resumed.model_copy(update={"status": summary.status})
             )
 
-        return {
+        payload: dict[str, Any] = {
             "run_id": run.id,
             "card_id": subtask.card_id,
             "story_id": story.card_id,
@@ -1530,6 +1652,14 @@ def _resume_from_checkpoint(
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
             ],
         }
+        if lease.displaced is not None:
+            # A dead holder's lease was taken over (X5): say whose.
+            payload["took_over"] = {
+                "pid": lease.displaced.pid,
+                "host": lease.displaced.host,
+                "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+            }
+        return payload
     finally:
         store.close()
 
@@ -1587,11 +1717,7 @@ def resume_run(
         lease = store_module.read_lease(conn, run.id)
         now = _utcnow()
         if lease is not None and control.lease_is_live(lease, now=now):
-            raise RunIsLiveError(
-                f"run {run.id} is still running in pid {lease.pid} on {lease.host}"
-                f" (heartbeat {_heartbeat_age(lease, now)}s ago); wait for it to exit,"
-                f" or `am status {run.id}`"
-            )
+            raise _run_is_live_error(lease, now)
     finally:
         conn.close()
     if run.workflow == WORKFLOW_NAME:

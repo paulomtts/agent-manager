@@ -30,7 +30,7 @@ from typing import Any, Iterator, TypeVar
 
 import pytest
 
-from agent_manager import control, store
+from agent_manager import control, models, store
 from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
@@ -98,6 +98,63 @@ def _requests(root: Path) -> list[store.ControlRow]:
     conn = store.open_db(root)
     try:
         return store.control_requests(conn, RUN_ID)
+    finally:
+        conn.close()
+
+
+def _plant(
+    root: Path,
+    *,
+    run_id: str = RUN_ID,
+    token: str = "t0",
+    pid: int = 4242,
+    host: str = "build-box",
+    heartbeat_at: datetime,
+    claims: tuple[str, ...] = (),
+) -> None:
+    """A lease row and its claims, written by a second connection as another `am` would."""
+    conn = store.open_db(root)
+    try:
+        with store.immediate(conn):
+            conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
+                " pid=excluded.pid, host=excluded.host,"
+                " acquired_at=excluded.acquired_at,"
+                " heartbeat_at=excluded.heartbeat_at, accepting=1",
+                (run_id, token, pid, host, _at(0).isoformat(), heartbeat_at.isoformat()),
+            )
+            for key in claims:
+                conn.execute(
+                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    " run_id=excluded.run_id, token=excluded.token,"
+                    " claimed_at=excluded.claimed_at",
+                    (key, run_id, token, _at(0).isoformat()),
+                )
+    finally:
+        conn.close()
+
+
+def _held(root: Path, token: str) -> list[str]:
+    conn = store.open_db(root)
+    try:
+        return [claim.key for claim in store.held_claims(conn, RUN_ID, token)]
+    finally:
+        conn.close()
+
+
+def _all_claims(root: Path) -> list[tuple[str, str, str]]:
+    """Every `run_claims` row as `(key, run_id, token)`, in key order."""
+    conn = store.open_db(root)
+    try:
+        return [
+            (row["key"], row["run_id"], row["token"])
+            for row in conn.execute(
+                "SELECT key, run_id, token FROM run_claims ORDER BY key"
+            ).fetchall()
+        ]
     finally:
         conn.close()
 
@@ -230,6 +287,17 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
 
 
+# -- claim keys (multi-process X5) ---------------------------------------------
+
+
+def test_card_claim_and_branch_claim_name_their_keys():
+    card = "ec7ae954-0000-4000-8000-000000000000"
+    assert control.card_claim(card) == f"card:{card}"
+    assert control.branch_claim("m10/task-lease-with-claims-for-ec7ae954") == (
+        "branch:m10/task-lease-with-claims-for-ec7ae954"
+    )
+
+
 # -- Lease ----------------------------------------------------------------------
 
 
@@ -313,6 +381,156 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
     assert _heartbeat_threads() == []
+
+
+def test_a_lease_fences_its_store_only_while_it_is_held(root, opened_store):
+    # Review Focus 5 of the a7ed6c11 plan.
+    run = models.Run(
+        id=RUN_ID,
+        workflow="task",
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix="m10/",
+        status="started",
+        config=models.RunConfig(),
+    )
+    with control.Lease(opened_store):
+        opened_store.record_run(run)
+        thief = store.Store.open(root, RUN_ID)
+        try:
+            thief.take_lease(
+                token="thief", pid=1, host="elsewhere", now=_at(0), is_live=lambda row: False
+            )
+        finally:
+            thief.close()
+        with pytest.raises(store.LeaseLostError) as caught:
+            opened_store.record_run(run.model_copy(update={"status": "done"}))
+        assert caught.value.holder is not None and caught.value.holder.token == "thief"
+
+    # Out of the block the store is unbound and writes as M9 did.
+    assert opened_store.record_run(run.model_copy(update={"status": "done"})).event == "run_upsert"
+
+
+def test_a_lease_takes_its_claims_and_displaces_nothing_on_a_fresh_run(root, opened_store):
+    with control.Lease(
+        opened_store,
+        claims=["card:a", "branch:m10/b"],
+        pid=4242,
+        host="build-box",
+        clock=lambda: _at(0),
+    ) as lease:
+        assert lease.displaced is None
+        assert _held(root, lease.token) == ["branch:m10/b", "card:a"]
+    assert _all_claims(root) == []
+
+
+def test_a_lease_takes_over_a_holder_that_is_stale_at_its_own_clock(root, opened_store):
+    _plant(root, token="dead", host="other-box", heartbeat_at=_at(0))
+
+    with control.Lease(
+        opened_store, clock=lambda: _at(control.LEASE_STALE_SECONDS + 1)
+    ) as lease:
+        assert lease.displaced is not None
+        assert (lease.displaced.token, lease.displaced.host) == ("dead", "other-box")
+        row = _read_lease(root)
+        assert row is not None and row.token == lease.token
+    assert _read_lease(root) is None
+
+
+def test_a_lease_refuses_a_live_holder_and_leaves_no_trace(root, opened_store):
+    # Live on another host, and exactly at the (inclusive) stale boundary of
+    # the lease's own clock: proves `is_live` is `lease_is_live(now=clock())`.
+    _plant(root, token="alive", host="other-box", heartbeat_at=_at(0))
+
+    with pytest.raises(store.LeaseHeldError) as caught:
+        with control.Lease(
+            opened_store,
+            claims=["card:a"],
+            clock=lambda: _at(control.LEASE_STALE_SECONDS),
+        ):
+            pytest.fail("entered a lease another live process holds")
+
+    assert caught.value.holder.token == "alive"
+    row = _read_lease(root)
+    assert row is not None and row.token == "alive"
+    assert _all_claims(root) == []
+    assert _heartbeat_threads() == []
+
+
+def test_a_lease_refuses_a_key_another_live_run_claims(root, opened_store):
+    _plant(
+        root,
+        run_id="run-other",
+        token="theirs",
+        host="other-box",
+        heartbeat_at=_at(0),
+        claims=("card:a",),
+    )
+
+    with pytest.raises(store.ClaimHeldError) as caught:
+        with control.Lease(opened_store, claims=["card:a"], clock=lambda: _at(1)):
+            pytest.fail("entered a lease whose claim another live run holds")
+
+    assert caught.value.key == "card:a"
+    assert caught.value.holder.run_id == "run-other"
+    assert _read_lease(root) is None
+    assert _all_claims(root) == [("card:a", "run-other", "theirs")]
+    assert _heartbeat_threads() == []
+
+
+def test_lease_exit_releases_claims_then_lease_even_on_exception(root, opened_store):
+    events: list[tuple[str, str]] = []
+
+    class Recording(Wrapped):
+        def release_claims(self, token: str) -> None:
+            events.append(("release_claims", token))
+            self._inner.release_claims(token)
+
+        def release_lease(self, token: str) -> None:
+            events.append(("release_lease", token))
+            self._inner.release_lease(token)
+
+    _plant(
+        root,
+        run_id="run-other",
+        token="theirs",
+        host="other-box",
+        heartbeat_at=_at(0),
+        claims=("card:z",),
+    )
+
+    with pytest.raises(RuntimeError, match="inside the run"):
+        with control.Lease(
+            Recording(opened_store), claims=["card:a"], clock=lambda: _at(1)
+        ) as lease:
+            assert _held(root, lease.token) == ["card:a"]
+            raise RuntimeError("inside the run")
+
+    assert events == [("release_claims", lease.token), ("release_lease", lease.token)]
+    assert _read_lease(root) is None
+    assert _all_claims(root) == [("card:z", "run-other", "theirs")]
+    assert _heartbeat_threads() == []
+
+
+def test_lease_exit_leaves_a_new_holders_lease_and_claims_alone(root, opened_store):
+    # Review Focus 4: taken over mid-block, this lease releases only its own token.
+    with control.Lease(opened_store, claims=["card:a"], clock=lambda: _at(0)):
+        thief = store.Store.open(root, RUN_ID)
+        try:
+            thief.take_lease(
+                token="thief",
+                pid=1,
+                host="elsewhere",
+                now=_at(1),
+                is_live=lambda row: False,
+                claims=["card:a"],
+            )
+        finally:
+            thief.close()
+
+    row = _read_lease(root)
+    assert row is not None and row.token == "thief"
+    assert _all_claims(root) == [("card:a", RUN_ID, "thief")]
 
 
 # -- apply_pending (C4) --------------------------------------------------------

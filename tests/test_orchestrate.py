@@ -22,8 +22,10 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -168,6 +170,42 @@ def test_story_tips_name_every_story_with_subtasks_in_census_order():
     assert tips == [
         {"story": a.id, "tip": _branch_of(a.subtasks[-1])},
         {"story": c.id, "tip": _branch_of(c.subtasks[-1])},
+    ]
+
+
+def test_milestone_claims_lists_milestone_remaining_subtasks_then_integration_branch():
+    """X6: `card:M`, every remaining subtask in census order, then
+    `branch:<prefix>-integrate`. A done subtask, a closed story and a
+    subtask-less story add no key."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    closed = _plan_story(2, [_plan_subtask(21)], status="done")
+    c = _plan_story(3, [_plan_subtask(31), _plan_subtask(32)], blocked_by=[a.id])
+    empty = _plan_story(4, [])
+
+    keys = orchestrate.milestone_claims(_plan_id(99), [a, closed, c, empty], "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(12)}",
+        f"card:{_plan_id(31)}",
+        f"card:{_plan_id(32)}",
+        "branch:m3-integrate",
+    ]
+
+
+def test_milestone_claims_has_no_duplicates():
+    """A card listed under two stories is claimed once, at its first place."""
+    shared = _plan_subtask(11)
+    a = _plan_story(1, [shared, _plan_subtask(12)])
+    b = _plan_story(2, [shared])
+
+    keys = orchestrate.milestone_claims(_plan_id(99), [a, b], "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(11)}",
+        f"card:{_plan_id(12)}",
+        "branch:m3-integrate",
     ]
 
 
@@ -1817,16 +1855,21 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
     # No run was left behind: the data directory holds nothing but the `git`
     # ProcessLock's own lock file, the one thing spec X7 does put there even on
     # this early a failure (paths.project_lock_path creates its `projects`
-    # directory as soon as the lock object exists).
+    # directory as soon as the lock object exists), and the project's
+    # projection, which the read-only claims preflight (`cli.refuse_claimed`,
+    # X5) opens before the fetch. That projection records no run.
     data = paths.data_dir()
     projects = data / "projects"
+    db_name = paths.project_db_path(cli.resolve_repo_dir(project)).name
     written = sorted(
         str(entry.relative_to(data))
         for entry in data.rglob("*")
         if entry != projects
         and not (entry.parent == projects and entry.suffix == ".lock")
+        and not (entry.parent == projects and entry.name.startswith(db_name))
     )
     assert written == []
+    assert _run_ids(project) == []
 
 
 def test_refresh_git_prunes_under_the_git_lock(tmp_path, monkeypatch):
@@ -4717,3 +4760,437 @@ def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
         opened.close()
     assert newest.reason == "parked"
     assert newest.agent["queue"][0]["kwargs"]["phase"] == "second"
+
+
+# ── claims: a milestone run's milestone, cards and integration branch (card 1a3fdd73) ──
+
+
+HERE = socket.gethostname()
+"""This host, as `control.Lease` records it."""
+
+OTHER_RUN_ID = "20260930T080000Z-a1b2c3d4"
+"""Another run, driven by another `am` process, that holds a claim."""
+
+
+def _plant_lease(
+    project: Path,
+    *,
+    run_id: str,
+    token: str,
+    pid: int,
+    heartbeat_at: datetime,
+    claims: tuple[str, ...] = (),
+) -> None:
+    """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
+
+    Written over a second `open_db` connection inside `store.immediate`, on
+    this host, window open. Live by C2 when `pid` is alive and `heartbeat_at`
+    is fresh; dead when `pid` is `_reaped_pid()`.
+    """
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        with store_module.immediate(conn):
+            conn.execute(
+                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
+                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
+                " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
+                " heartbeat_at=excluded.heartbeat_at, accepting=1",
+                (run_id, token, pid, HERE, heartbeat_at.isoformat(), heartbeat_at.isoformat()),
+            )
+            for key in claims:
+                conn.execute(
+                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    " run_id=excluded.run_id, token=excluded.token,"
+                    " claimed_at=excluded.claimed_at",
+                    (key, run_id, token, heartbeat_at.isoformat()),
+                )
+    finally:
+        conn.close()
+
+
+def _reaped_pid() -> int:
+    """The pid of a child that has exited and been waited for: dead by `pid_alive`."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
+def _claim_rows(project: Path) -> list[tuple[str, str, str]]:
+    """Every `run_claims` row as `(key, run_id, token)`, in key order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            (row["key"], row["run_id"], row["token"])
+            for row in conn.execute("SELECT key, run_id, token FROM run_claims ORDER BY key")
+        ]
+    finally:
+        conn.close()
+
+
+def _held_keys(project: Path, run_id: str) -> list[str]:
+    """The keys `run_id`'s current lease holds, in key order, read as `am status` would."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        lease = store_module.read_lease(conn, run_id)
+        if lease is None:
+            return []
+        return [claim.key for claim in store_module.held_claims(conn, run_id, lease.token)]
+    finally:
+        conn.close()
+
+
+def _run_dirs() -> list[Path]:
+    runs_root = paths.data_dir() / "runs"
+    return sorted(runs_root.iterdir()) if runs_root.exists() else []
+
+
+def _worktree_count(project: Path) -> int:
+    return sum(
+        1
+        for line in _git(project, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    )
+
+
+def _forbidden(name: str) -> Callable[..., Any]:
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail(f"{name} ran before the claim refusal")
+
+    return refuse
+
+
+def _expected_claims(milestone: str, cards: list[str]) -> list[str]:
+    """`milestone_claims`' keys spelled out, in `held_claims`' key order."""
+    return sorted(
+        [f"card:{milestone}", *(f"card:{card}" for card in cards), f"branch:{INTEGRATION_BRANCH}"]
+    )
+
+
+def _recording(
+    project: Path, run_id: str, during: list[list[str]], then: Gate | None = None
+) -> Gate:
+    """A gate that records the run's held keys mid-subtask, then runs `then`."""
+
+    async def gate(stop: StopSignal | None) -> None:
+        during.append(_held_keys(project, run_id))
+        if then is not None:
+            await then(stop)
+
+    return gate
+
+
+@pytest.mark.parametrize("claimed", ["milestone", "subtask"])
+@requires_git
+@requires_brd
+def test_a_milestone_run_is_refused_while_a_live_run_claims_one_of_its_cards(
+    project, monkeypatch, claimed
+):
+    """X5/X6: the preflight refuses before git is refreshed and before the
+    store opens, so nothing is fetched, pruned, recorded or made. `milestone`
+    is another milestone run of M under another prefix: only `card:M` is shared."""
+    shape = _milestone(project, {"A": 2})
+    _a1, a2 = shape["subtasks"]["A"]
+    card = shape["milestone"] if claimed == "milestone" else a2
+    key = f"card:{card}"
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _forbidden("refresh_git"))
+    driver = FakeDriver()
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _run(project, shape["milestone"], driver)
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert str(caught.value).startswith(f"card {card} is being driven by run {OTHER_RUN_ID}")
+    assert driver.calls == []
+    assert _run_ids(project) == []
+    assert _run_dirs() == []
+    assert _worktree_count(project) == 1
+    assert _local_branches(project) == ["main"]
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_run_is_refused_while_a_live_run_claims_its_integration_branch(
+    project, monkeypatch
+):
+    shape = _milestone(project, {"A": 1})
+    key = f"branch:{INTEGRATION_BRANCH}"
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _forbidden("refresh_git"))
+    driver = FakeDriver()
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _run(project, shape["milestone"], driver)
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert str(caught.value).startswith(
+        f"branch {INTEGRATION_BRANCH} is being driven by run {OTHER_RUN_ID}"
+    )
+    assert driver.calls == []
+    assert _run_ids(project) == []
+    assert _run_dirs() == []
+    assert _worktree_count(project) == 1
+    assert _local_branches(project) == ["main"]
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
+def test_a_dead_claim_does_not_refuse_a_milestone_run(project):
+    """A dead holder's claims are taken over by `take_lease`, then released
+    with this run's lease; the dead holder's own lease row is left alone."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="dead-life",
+        pid=_reaped_pid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(f"card:{a1}", f"branch:{INTEGRATION_BRANCH}"),
+    )
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert _claim_rows(project) == []
+    other = _lease(project, OTHER_RUN_ID)
+    assert other is not None and other.token == "dead-life"
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_run_holds_its_claims_while_driving(project):
+    """Mid-run the lease holds exactly `milestone_claims`: the milestone, the
+    remaining subtasks (a1 is done on the board, so it is not claimed) and
+    the integration branch. A fresh run never reports `took_over`."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    rollup.set_status(a1, "done", repo_dir=project)
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    during: list[list[str]] = []
+    driver = GatedDriver(
+        gates={
+            a2: _recording(project, run_id, during),
+            b1: _recording(project, run_id, during),
+        }
+    )
+
+    result = _run(project, shape["milestone"], driver)
+
+    assert result["done"] is True, result
+    assert "took_over" not in result
+    expected = _expected_claims(shape["milestone"], [a2, b1])
+    assert during == [expected, expected]
+    assert _claim_rows(project) == []
+
+
+@pytest.mark.parametrize(
+    "exit_by", ["done", "escalated", "paused", "cancelled", "killed", "integrate_raises"]
+)
+@requires_git
+@requires_brd
+def test_a_milestone_run_releases_its_claims_on_every_exit(project, integrate_recorder, exit_by):
+    """X5: the claims are held mid-run and gone, with the lease, however the
+    run ends -- a lane's `BaseException` and a raising Integrate included."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    during: list[list[str]] = []
+    outcomes: dict[str, Any] = {}
+    then: Gate | None = None
+    if exit_by == "escalated":
+        outcomes[a1] = ("review", "boom")
+    elif exit_by == "paused":
+        then = _send_then_await_stop(project, run_id, "pause")
+    elif exit_by == "cancelled":
+        then = _send_then_await_stop(project, run_id, "cancel")
+    elif exit_by == "killed":
+        outcomes[a1] = _LaneKilled("the manager died mid-lane")
+    elif exit_by == "integrate_raises":
+        integrate_recorder.outcome = RuntimeError("integrate blew up")
+    driver = GatedDriver(outcomes=outcomes, gates={a1: _recording(project, run_id, during, then)})
+
+    def go() -> dict[str, Any]:
+        return _run(project, shape["milestone"], driver, control_interval=0)
+
+    if exit_by == "killed":
+        with pytest.raises(_LaneKilled):
+            _run_or_fail_if_it_hangs(go)
+    elif exit_by == "integrate_raises":
+        with pytest.raises(RuntimeError, match="integrate blew up"):
+            go()
+    else:
+        go()
+
+    assert during == [_expected_claims(shape["milestone"], [a1])]
+    assert _claim_rows(project) == []
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_claims_its_card(
+    project, monkeypatch
+):
+    """Review Focus 1: another live run took a1 since the interrupt. The
+    resume refuses read-only, before `Store.open` and before git."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    key = f"card:{a1}"
+    _plant_lease(
+        project,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    monkeypatch.setattr(store_module.Store, "open", _forbidden("Store.open"))
+    monkeypatch.setattr(orchestrate, "refresh_git", _forbidden("refresh_git"))
+    driver = FakeDriver()
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _resume(project, run_id, driver)
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert driver.calls == []
+    assert _load(project, run_id).status == "escalated"
+    assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+@requires_git
+@requires_brd
+def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, monkeypatch):
+    """X5: on a resume the fetch/prune and the first journal line both happen
+    under this life's lease, which already holds every claim."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    seen_by_git: list[store_module.LeaseRow | None] = []
+    real_refresh = orchestrate.refresh_git
+
+    def refresh_spy(root: Path) -> None:
+        seen_by_git.append(_lease(project, run_id))
+        real_refresh(root)
+
+    first_write: list[tuple[str | None, list[str]]] = []
+    real_record_run = store_module.Store.record_run
+
+    def record_spy(self, run):
+        if not first_write:
+            token = self._token
+            held = (
+                []
+                if token is None
+                else [
+                    claim.key
+                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                ]
+            )
+            first_write.append((token, held))
+        return real_record_run(self, run)
+
+    monkeypatch.setattr(orchestrate, "refresh_git", refresh_spy)
+    monkeypatch.setattr(store_module.Store, "record_run", record_spy)
+
+    result = _resume(project, run_id, FakeDriver())
+
+    assert result["done"] is True, result
+    ((token, held),) = first_write
+    assert token is not None
+    assert held == _expected_claims(shape["milestone"], [a1, b1])
+    (git_saw,) = seen_by_git
+    assert git_saw is not None, "git was refreshed before the resume took its lease"
+    assert (git_saw.token, git_saw.pid) == (token, os.getpid())
+
+
+@pytest.mark.parametrize("outcome", ["done", "escalated"])
+@requires_git
+@requires_brd
+def test_a_milestone_resume_excludes_its_own_claims_and_reports_took_over(project, outcome):
+    """The interrupted life's lease is dead and its own claims are still
+    planted: neither refuses, the resume takes them over, and every payload
+    shape names the dead holder under `took_over`."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    dead = _reaped_pid()
+    beat = datetime.now(timezone.utc)
+    _plant_lease(
+        project,
+        run_id=run_id,
+        token="crashed-life",
+        pid=dead,
+        heartbeat_at=beat,
+        claims=tuple(_expected_claims(shape["milestone"], [a1])),
+    )
+    driver = FakeDriver(outcomes={} if outcome == "done" else {a1: ("review", "still")})
+
+    result = _resume(project, run_id, driver)
+
+    assert result.get(outcome) is True, result
+    assert result["resumed"] is True
+    assert result["took_over"] == {
+        "pid": dead,
+        "host": HERE,
+        "heartbeat_at": beat.isoformat(),
+    }
+    assert _claim_rows(project) == []
+    assert _lease(project, run_id) is None
+
+
+@requires_git
+@requires_brd
+def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(project, monkeypatch):
+    """Review Focus 2 (C10): the run's own lease is live and holds its own
+    claims. The preflight skips the run's own rows (so no `ClaimedError`
+    about them), `run_lease` refuses with `RunIsLiveError`, and git, the
+    journal and the rows are untouched."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    own = _expected_claims(shape["milestone"], [a1])
+    _plant_lease(
+        project,
+        run_id=run_id,
+        token="still-running",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=tuple(own),
+    )
+    git_calls = _record_git(monkeypatch)
+    before = (_runs_tree(), _statuses(_load(project, run_id)))
+    driver = FakeDriver()
+
+    with pytest.raises(cli.RunIsLiveError):
+        _resume(project, run_id, driver)
+
+    assert driver.calls == []
+    assert git_calls == []
+    assert (_runs_tree(), _statuses(_load(project, run_id))) == before
+    assert _claim_rows(project) == [(key, run_id, "still-running") for key in own]
