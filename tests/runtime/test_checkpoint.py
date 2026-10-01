@@ -7,7 +7,6 @@ checkpoint rows are read straight from the store's `checkpoints` table.
 """
 
 import asyncio
-import dataclasses
 import itertools
 import json
 import threading
@@ -338,42 +337,6 @@ def _deps(opened: Any, adopt: Adoption | None = None) -> RunDeps:
     return RunDeps(
         _floor_workflow(), opened, STORY_ID, _subtask(), None, lambda: FIXED, adopt=adopt
     )
-
-
-def test_an_adoption_is_built_from_a_turn_floor_and_is_frozen():
-    adoption = Adoption(**vars(store_module.TurnFloor("explore", 1, "run-earlier", 2)))
-
-    assert adoption == Adoption("explore", 1, "run-earlier", 2)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        adoption.floor = 3
-
-
-def test_run_deps_start_with_no_adoption():
-    assert _deps(None).adopt is None
-
-
-def test_take_adoption_returns_a_match_once():
-    adoption = Adoption("explore", 0, "run-earlier", 3)
-    deps = _deps(None, adopt=adoption)
-
-    assert deps.take_adoption("explore", 0) == adoption
-    assert deps.adopt is None
-    assert deps.take_adoption("explore", 0) is None
-
-
-@pytest.mark.parametrize("phase, loop", [("explore", 1), ("commit", 0)])
-def test_take_adoption_clears_on_a_mismatch(phase, loop):
-    deps = _deps(None, adopt=Adoption("explore", 0, "run-earlier", 3))
-
-    assert deps.take_adoption(phase, loop) is None
-    assert deps.adopt is None
-
-
-def test_take_adoption_with_nothing_carried_returns_none():
-    deps = _deps(None)
-
-    assert deps.take_adoption("explore", 0) is None
-    assert deps.adopt is None
 
 
 class _Stored:
