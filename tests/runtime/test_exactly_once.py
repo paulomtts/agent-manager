@@ -677,3 +677,164 @@ def test_a_carried_adoption_does_not_outlive_a_step_head(store, roles, monkeypat
     assert summary.status == "done"
     assert _dispatches(launcher) == {"a": 2, "b": 2}
     assert runner.warnings == []
+
+
+# ── the windows that must dispatch again ────────────────────────────────────
+
+
+def test_w0_a_crash_mid_dispatch_dispatches_again(store, roles):
+    # The harness wrote a valid result.json, but the attempt was never judged:
+    # it stays `started`, a resume marks it `harness_error`, and an attempt
+    # that is not `ok` is never adopted.
+    launcher = FakeLauncher(crash_on={("a", 1)})
+    wf = _workflow([])
+
+    with pytest.raises(_Crash):
+        _go(wf, store, _runner(store, launcher, roles))
+
+    assert (paths.attempt_dir(RUN_ID, CARD_ID, "a", 1) / dispatch.RESULT_NAME).is_file()
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert crashed.floor == TurnFloor("a", 0, RUN_ID, 0)
+    _mark_orphans(store)
+
+    runner = _runner(store, launcher, roles)
+    summary = _go(wf, store, runner, resume_from=crashed)
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 2, "b": 1}
+    assert _attempt_statuses(store, "a") == [(1, "harness_error"), (2, "ok")]
+    assert runner.warnings == []
+
+
+def test_a_goto_looped_phase_dispatches_every_iteration_and_is_never_adopted(store, roles):
+    # `b` rejects the first `a`, so `a` runs again at loop 1 and dies there
+    # mid-dispatch. Its loop-0 attempt 1 is `ok` but sits at the loop-1 floor,
+    # so the resume must dispatch `a` a third time rather than reuse it.
+    launcher = FakeLauncher(
+        results={"b": [REJECTED_JSON, FOUND_JSON]}, crash_on={("a", 2)}
+    )
+    wf = _workflow([], critic=True)
+
+    with pytest.raises(_Crash):
+        _go(wf, store, _runner(store, launcher, roles))
+
+    assert _dispatches(launcher) == {"a": 2, "b": 1}
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert _next_turn(crashed.agent)["kwargs"] == {"phase": "a", "loop": 1}
+    assert crashed.floor == TurnFloor("a", 1, RUN_ID, 1)
+    _mark_orphans(store)
+
+    runner = _runner(store, launcher, roles)
+    summary = _go(wf, store, runner, resume_from=crashed)
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 3, "b": 2}
+    assert runner.warnings == []
+    assert _attempt_statuses(store, "a") == [(1, "ok"), (2, "harness_error"), (3, "ok")]
+
+
+def test_a_checkpoint_with_no_floor_row_dispatches_again(store, roles, monkeypatch):
+    # E11: a row saved before checkpoint_floors existed has no floor; the
+    # resume degrades to at-least-once, with no error.
+    launcher = FakeLauncher()
+    wf = _workflow([])
+    _crash_after_call_agent(monkeypatch, "a")
+    with pytest.raises(_Crash):
+        _go(wf, store, _runner(store, launcher, roles))
+    store.connection.execute("DELETE FROM checkpoint_floors")
+    store.connection.commit()
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert crashed.floor is None
+
+    runner = _runner(store, launcher, roles)
+    summary = _go(wf, store, runner, resume_from=crashed)
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 2, "b": 1}
+    assert runner.warnings == []
+
+
+def test_a_parked_subtask_dispatches_the_next_phase_once(store, roles):
+    stop = _StopDuring("a")
+    launcher = FakeLauncher(on_call=stop)
+    ran: list[str] = []
+    wf = _workflow(ran)
+
+    async def go():
+        stop.loop = asyncio.get_running_loop()
+        return await runtime_engine.run_subtask_async(
+            wf,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            clock=lambda: FIXED,
+            agent_runner=_runner(store, launcher, roles),
+            stop=stop.signal,
+        )
+
+    parked_summary = asyncio.run(go())
+
+    assert parked_summary.status == "stopped"
+    assert parked_summary.detail == "stopped before b"
+    parked = store.latest_checkpoint(CARD_ID)
+    assert parked.reason == "parked"
+    assert parked.floor == TurnFloor("b", 0, RUN_ID, 0)
+    assert _dispatches(launcher) == {"a": 1}
+
+    runner = _runner(store, launcher, roles)
+    summary = _go(wf, store, runner, resume_from=parked)
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 1, "b": 1}
+    assert runner.warnings == []
+    assert ran == ["w", "z"]
+
+
+def test_a_mismatched_adoption_is_discarded(store, roles, monkeypatch):
+    # `b` succeeded and the process died; the row's floor is forged to name
+    # `a`. `take_adoption("b", 0)` discards it, so `b` dispatches again.
+    launcher = FakeLauncher()
+    wf = _workflow([])
+    _crash_after_call_agent(monkeypatch, "b")
+    with pytest.raises(_Crash):
+        _go(wf, store, _runner(store, launcher, roles))
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert _head(crashed.agent) == "b"
+    forged = dataclasses.replace(crashed, floor=TurnFloor("a", 0, RUN_ID, 0))
+
+    runner = _runner(store, launcher, roles)
+    summary = _go(wf, store, runner, resume_from=forged)
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 1, "b": 2}
+    assert runner.warnings == []
+
+
+def test_a_relaunch_whose_source_journal_is_gone_dispatches_again(
+    store, roles, monkeypatch, tmp_path
+):
+    launcher = FakeLauncher()
+    _crash_after_call_agent(monkeypatch, "a")
+    with pytest.raises(_Crash):
+        _go(_workflow([]), store, _runner(store, launcher, roles))
+    crashed = store.latest_checkpoint(CARD_ID)
+    store.journal.path.unlink()
+
+    _new_process()
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        _seed(other, OTHER_RUN_ID)
+        runner = _runner(other, launcher, roles)
+        summary = _go(_workflow([]), other, runner, resume_from=crashed)
+    finally:
+        other.close()
+
+    assert summary.status == "done"
+    assert _dispatches(launcher) == {"a": 2, "b": 1}
+    [warning] = runner.warnings
+    assert warning.startswith(
+        f"phase 'a': attempt ? of run {RUN_ID} was not reused (its journal cannot be read: "
+    )
+    assert "MissingJournalError" in warning
+    assert warning.endswith("); dispatching again")
