@@ -203,3 +203,44 @@ def test_release_all_releases_every_held_card(hold):
     assert os.environ["FAKE_CLAUDE_HOLD_PHASE"] == "plan"
     assert hold.holder_pid(SOME_CARD) == 4242
     assert (directory / f"{dag.short_id(SOME_CARD)}.release").is_file()
+
+
+def test_a_card_a_live_milestone_claims_is_refused_to_every_other_process(
+    milestone_board, fake_claude_bin, hold, spawn_am, am, finish_am, wait_for_file
+):
+    """Spec scenario 1: `run --card`, `resume` and `status` from other processes
+    while a real milestone process holds a1 in `implement`."""
+    root = milestone_board["root"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    (b1,) = milestone_board["subtasks"]["B"]
+    (c1,) = milestone_board["subtasks"]["C"]
+    hold.arm()
+    hold.release(a2, b1, c1)  # only a1 is held; the rest pass straight through
+    milestone = spawn_am(*_milestone_argv(root, milestone_board["milestone"], PREFIX))
+    wait_for_file(hold.held_marker(a1), milestone)
+    run_id = _only_run_id(am, root)
+
+    error = _error(*am("run", "--card", a2, *_common(root, PREFIX)))
+    assert error["type"] == "ClaimedError", error
+    assert f"card {a2} is" in error["message"]
+    assert run_id in error["message"]
+    assert _run_ids(am, root) == [run_id]
+    a2_branch = dag.task_branch(PREFIX, board.show(a2, repo_dir=root))
+    assert not cli.worktree_for(root, a2_branch).exists()
+
+    error = _error(*am("resume", run_id, "--repo-dir", str(root), "--verify", VERIFY))
+    assert error["type"] == "RunIsLiveError", error
+
+    live = _data(*am("status", run_id, "--repo-dir", str(root)))
+    assert live["run"]["status"] == "started"
+    assert live["control"]["lease"]["live"] is True
+    assert live["control"]["lease"]["pid"] == milestone.pid
+    assert f"card:{a2}" in live["control"]["claims"]
+
+    hold.release(a1)
+    finished = _data(*finish_am(milestone))
+    assert finished["done"] is True, finished
+    assert finished["run_id"] == run_id
+    after = _data(*am("status", run_id, "--repo-dir", str(root)))
+    assert after["run"]["status"] == "done"
+    assert after["control"]["claims"] == []
