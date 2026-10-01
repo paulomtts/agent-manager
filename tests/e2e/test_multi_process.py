@@ -363,3 +363,52 @@ def test_a_second_milestone_on_a_prefix_in_use_is_refused_by_its_integration_bra
     finished = _data(*finish_am(live))
     assert finished["done"] is True, finished
     assert finished["integrated"]["branch"] == f"{PREFIX}-integrate"
+
+
+def _kill_orphaned_fake(pid: int) -> None:
+    """SIGKILL the held fake `claude` a killed `am` left behind.
+
+    `run_direct` starts the fake in its own session, so killing `am` does not
+    reach it. Left alive it would wake on the release and commit in the same
+    worktree as the resumed run's implement. The pid is the one the fake wrote
+    into its `.held` marker, and it is still polling because no release
+    exists yet, so the pid is still that fake's.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_resume_takes_over_a_killed_milestone_and_finishes_it(
+    milestone_board, fake_claude_bin, hold, spawn_am, am, wait_for_file
+):
+    """Spec scenario 4: a dead holder's lease is taken over, not refused."""
+    root = milestone_board["root"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    (b1,) = milestone_board["subtasks"]["B"]
+    (c1,) = milestone_board["subtasks"]["C"]
+    hold.arm()
+    hold.release(a2, b1, c1)
+    milestone = spawn_am(*_milestone_argv(root, milestone_board["milestone"], PREFIX))
+    wait_for_file(hold.held_marker(a1), milestone)
+    run_id = _only_run_id(am, root)
+    fake_pid = hold.holder_pid(a1)
+    assert fake_pid != milestone.pid
+
+    dead_pid = milestone.pid
+    milestone.kill()
+    milestone.wait()
+    assert milestone.returncode == -signal.SIGKILL
+    _kill_orphaned_fake(fake_pid)
+    hold.release(a1)
+
+    resumed = _data(*am("resume", run_id, "--repo-dir", str(root), "--verify", VERIFY))
+
+    assert resumed["done"] is True, resumed
+    assert resumed["resumed"] is True
+    assert resumed["run_id"] == run_id
+    assert resumed["took_over"]["pid"] == dead_pid
+    status = _data(*am("status", run_id, "--repo-dir", str(root)))
+    assert status["run"]["status"] == "done"
+    assert status["control"]["claims"] == []
