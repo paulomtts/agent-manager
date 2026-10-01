@@ -3762,6 +3762,42 @@ def test_an_unknown_comment_key_is_left_alone(repo):
     assert in_transaction is False
 
 
+def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
+    # B9: a resumed phase enqueues the same key again after the first run's
+    # flush already settled it; the row must not go back to `pending`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k-posted", body="first")
+        st.mark_comment_posted("k-posted", "c-101", _at(1))
+        _enqueue(st, "k-gone", body="first")
+        for _ in range(store.COMMENT_ATTEMPTS):
+            st.record_comment_failure("k-gone")
+
+        replays = [
+            _enqueue(st, "k-posted", body="again", now=_at(5)),
+            _enqueue(st, "k-gone", body="again", now=_at(5)),
+        ]
+        posted = _comment_row(st.connection, "k-posted")
+        gone = _comment_row(st.connection, "k-gone")
+        pending = st.pending_comments()
+    finally:
+        st.close()
+
+    assert replays == [False, False]
+    assert posted is not None and gone is not None
+    assert (posted["state"], posted["body"], posted["comment_id"]) == (
+        "posted",
+        "first",
+        "c-101",
+    )
+    assert (gone["state"], gone["body"], gone["failed_attempts"]) == (
+        "abandoned",
+        "first",
+        store.COMMENT_ATTEMPTS,
+    )
+    assert pending == []
+
+
 def test_a_failure_on_a_posted_comment_never_abandons_it(repo):
     # Review Focus 1: a late failure must not undo a comment the board has.
     st = store.Store.open(repo, RUN_ID)
