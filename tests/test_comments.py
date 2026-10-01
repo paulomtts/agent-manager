@@ -519,3 +519,75 @@ def test_run_end_escapes_brackets_in_an_integrate_detail():
 def test_run_end_of_an_unknown_payload_does_not_raise():
     comment = _run_end({})
     assert comment.body == "\n".join(["am · ended · run r1", "done: 0", _RUN_END_KEY])
+
+
+def test_agent_reason_skips_empty_review_blockers():
+    results = {"review": {"unresolved_blockers": ["", "missing test", ""]}}
+    assert comments.agent_reason(results, "review") == "missing test"
+
+
+def test_escalated_detail_brackets_are_broken():
+    comment = _escalated(reason=None, detail="gate saw [[4f31e025-aaaa]]")
+    assert "detail: gate saw [ [4f31e025-aaaa]]" in comment.body.split("\n")
+    assert "[[" not in comment.body
+
+
+def test_an_over_cap_detail_drops_the_reason_and_still_fits():
+    comment = _escalated(reason="short reason", detail="d" * 5000, phase="implement")
+    lines = comment.body.split("\n")
+    assert len(comment.body) <= comments.CAP
+    assert "short reason" not in comment.body
+    assert lines[0] == "am · escalated · run r1"
+    assert lines[1].startswith("phase: implement")
+    assert lines[-4] == "… (truncated; see `am logs r1 card-476f1040 --phase implement`)"
+    assert lines[-3] == "next: `am resume r1`"
+    assert lines[-2] == "why: `am logs r1 card-476f1040 --phase implement`"
+    assert lines[-1] == "am-key: r1/card-476f1040/escalated:tok-1"
+
+
+def test_done_lists_only_the_verify_commands_that_passed():
+    summary = _done_summary()
+    summary.results["verify"] = {
+        "passed": False,
+        "verified": [
+            {"command": "uv run pytest", "ok": True, "tail": ""},
+            {"command": "uv run ruff check", "ok": False, "tail": ""},
+        ],
+        "detail": "",
+    }
+    lines = _done(summary=summary).body.split("\n")
+    assert "verified: `uv run pytest`" in lines
+    assert "ruff" not in "\n".join(lines)
+
+
+def test_cancelled_without_a_phase_omits_the_stopped_before_line():
+    comment = comments.compose_cancelled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase=None,
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+    assert comment.body == "\n".join(
+        [
+            "am · cancelled · run r1",
+            "branch: m12/task-x-476f1040",
+            "relaunch: `am run --milestone ms-21f4cf06`",
+            "am-key: r1/card-476f1040/cancelled",
+        ]
+    )
+
+
+def test_base_failed_detail_brackets_are_broken_and_an_over_cap_detail_is_cut():
+    comment = comments.compose_base_failed(
+        run_id=RUN,
+        story_id=STORY,
+        base_branch="m12/base-story-60189137",
+        detail="[[x]] " * 1000,
+    )
+    lines = comment.body.split("\n")
+    assert len(comment.body) <= comments.CAP
+    assert "[[" not in comment.body
+    assert lines[0] == "am · base failed · run r1"
+    assert lines[-2] == "… (truncated; see `am status r1`)"
+    assert lines[-1] == "am-key: r1/story-60189137/base-failed"
