@@ -39,6 +39,8 @@ class Retry:
 
 @dataclass(frozen=True)
 class Step:
+    """A step may run more than once for one walk (a resume re-runs a step whose completion was not checkpointed); it must be idempotent."""
+
     name: str
     run: Callable[..., Any]
     args: Mapping[str, Any] = field(default_factory=dict)
