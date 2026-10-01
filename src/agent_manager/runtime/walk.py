@@ -274,7 +274,28 @@ class _GateFailed(Exception):
         super().__init__(detail)
 
 
-def _gate_values(
+@dataclass(frozen=True)
+class GateVerdict:
+    """What one pass over a phase's gates concluded (architecture-cleanup S3).
+
+    A plain dataclass rather than a Pydantic model: it never crosses a process
+    boundary. `detail` is `None` for `pass`; otherwise it carries enough for
+    either caller -- `run_one_step` here, `dispatch.AgentRunner` -- to render
+    its own message without re-running a gate:
+
+    - `fail`: `gate`, `verdict` (the raw mapping), `message` (the rendered
+      `phase ... gate ... failed: k=v` line).
+    - `broken`: `gate`, `reason` (`"raised"` or `"not_a_mapping"`), `error`
+      (the gate's exception, or the `EngineError` built for a non-mapping),
+      plus `returned_type` for `not_a_mapping`.
+    - `warn`: `warnings`, the messages this evaluation appended.
+    """
+
+    kind: Literal["pass", "warn", "fail", "broken"]
+    detail: dict[str, Any] | None
+
+
+def gate_values(
     context: Mapping[str, Any], phase_name: str, result: Mapping[str, Any]
 ) -> dict[str, Any]:
     """The binding table a gate or a `when` predicate sees.
@@ -294,41 +315,78 @@ def _gate_values(
     return values
 
 
+_gate_values = gate_values
+"""The pre-S3 private name, kept because `tests/test_engine.py` binds through it."""
+
+
 def _label(fn: Callable[..., Any]) -> str:
     """How messages name a callable: its `__name__`, or its `repr` when it has none."""
     return getattr(fn, "__name__", repr(fn))
 
 
-def _evaluate_gates(
-    phase: phase_model.Step,
+def evaluate_gates(
+    phase: phase_model.Step | phase_model.AgentPhase,
     values: Mapping[str, Any],
     warnings: list[str],
-) -> None:
-    """Run every gate in order; append warnings, raise `_GateFailed` on a verdict."""
+) -> GateVerdict:
+    """Run `phase`'s gates in order and say what they concluded.
+
+    The one gate contract both phase kinds share: `None` passes, a mapping
+    holding `warn` appends a warning and continues, any other mapping fails.
+    A gate that raises an `Exception`, or returns anything that is not a
+    mapping, is `broken` -- never read as a pass. Evaluation stops at the first
+    `fail` or `broken`.
+
+    A gate whose parameters cannot be bound is a workflow wiring bug, not a
+    verdict: the `EngineError` from `bind_arguments` propagates unchanged.
+    """
+    warned: list[str] = []
     for gate in phase.gates:
         name = _label(gate)
         kwargs = bind_arguments(gate, values, phase=phase.name, function=name)
-        verdict = gate(**kwargs)
+        try:
+            verdict = gate(**kwargs)
+        except Exception as error:
+            return GateVerdict(
+                "broken", {"gate": name, "reason": "raised", "error": error}
+            )
         if verdict is None:
             continue
         if not isinstance(verdict, Mapping):
-            raise EngineError(
-                f"gate returned {type(verdict).__name__}; a gate returns None to pass "
+            returned_type = type(verdict).__name__
+            error = EngineError(
+                f"gate returned {returned_type}; a gate returns None to pass "
                 "or a mapping verdict to fail, and anything else would be read as a "
                 "pass by accident",
                 phase=phase.name,
                 function=name,
             )
-        if "warn" in verdict:
-            warnings.append(
-                f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
+            return GateVerdict(
+                "broken",
+                {
+                    "gate": name,
+                    "reason": "not_a_mapping",
+                    "error": error,
+                    "returned_type": returned_type,
+                },
             )
+        if "warn" in verdict:
+            message = f"phase {phase.name!r} gate {name!r} warned: {verdict['warn']}"
+            warnings.append(message)
+            warned.append(message)
             continue
-        raise _GateFailed(f"phase {phase.name!r} gate {name!r} failed: {_render_verdict(verdict)}")
-
-
-def _render_verdict(verdict: Mapping[str, Any]) -> str:
-    return ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
+        rendered = ", ".join(f"{key}={value}" for key, value in sorted(verdict.items()))
+        return GateVerdict(
+            "fail",
+            {
+                "gate": name,
+                "verdict": verdict,
+                "message": f"phase {phase.name!r} gate {name!r} failed: {rendered}",
+            },
+        )
+    if warned:
+        return GateVerdict("warn", {"warnings": warned})
+    return GateVerdict("pass", None)
 
 
 def _skip_target(phase: phase_model.Step, values: Mapping[str, Any]) -> str | None:
@@ -395,8 +453,15 @@ def run_one_step(
                 phase=phase.name,
                 function=label,
             )
-        _evaluate_gates(phase, _gate_values(table, phase.name, result), warnings)
-        skip_to = _skip_target(phase, _gate_values(table, phase.name, result))
+        verdict = evaluate_gates(phase, gate_values(table, phase.name, result), warnings)
+        if verdict.kind == "fail":
+            raise _GateFailed(verdict.detail["message"])
+        if verdict.kind == "broken":
+            # Re-raised into the catch-all below on purpose: it records
+            # `_render_error(error)`, the exact string a broken gate recorded
+            # before the evaluator was shared.
+            raise verdict.detail["error"]
+        skip_to = _skip_target(phase, gate_values(table, phase.name, result))
     except _GateFailed as failure:
         _record_phase(
             store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail

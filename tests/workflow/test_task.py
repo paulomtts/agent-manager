@@ -419,8 +419,8 @@ def _values_for(phase_name: str, result: Any = None) -> dict[str, Any]:
 
     `walk.subtask_context` plus the caller's own `cli.gate_context` plus the
     document paths, then every earlier phase's result under its own name, then
-    `dispatch.gate_values`' `result` / `<phase name>` overlay --
-    `walk._gate_values` builds the identical table for the `verify` step.
+    `walk.gate_values`' `result` / `<phase name>` overlay -- the one table both
+    agent phases and the `verify` step bind gates against.
     """
     results = _phase_results()
     context = walk.subtask_context(
@@ -433,7 +433,7 @@ def _values_for(phase_name: str, result: Any = None) -> dict[str, Any]:
             break
         if name in results and name not in walk.RESERVED_CONTEXT_KEYS:
             context[name] = results[name]
-    return dispatch.gate_values(
+    return walk.gate_values(
         context, phase_name, results[phase_name] if result is None else result
     )
 
