@@ -67,6 +67,18 @@ FAKE_RENDEZVOUS_DIR_ENV = "FAKE_CLAUDE_RENDEZVOUS_DIR"
 FAKE_RENDEZVOUS_COUNT_ENV = "FAKE_CLAUDE_RENDEZVOUS_COUNT"
 """Must equal `fake_claude.RENDEZVOUS_COUNT_ENV`, which `test_fake_claude.py` pins."""
 
+FAKE_HOLD_DIR_ENV = "FAKE_CLAUDE_HOLD_DIR"
+"""Must equal `fake_claude.HOLD_DIR_ENV`, which `test_fake_claude.py` pins."""
+
+FAKE_HOLD_PHASE_ENV = "FAKE_CLAUDE_HOLD_PHASE"
+"""Must equal `fake_claude.HOLD_PHASE_ENV`, which `test_fake_claude.py` pins."""
+
+FAKE_HOLD_SUFFIX = ".held"
+"""Must equal `fake_claude.HOLD_SUFFIX`: the marker a held phase writes."""
+
+FAKE_RELEASE_SUFFIX = ".release"
+"""Must equal `fake_claude.RELEASE_SUFFIX`: the file that lets a held phase go on."""
+
 FAKE_IMPLEMENTATION_NAME = "IMPLEMENTATION.md"
 """Must equal `fake_claude.IMPLEMENTATION_NAME`: the one file the fake coder writes."""
 
