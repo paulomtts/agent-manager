@@ -618,7 +618,7 @@ class AgentRunner:
         except (JournalError, ValidationError) as error:
             return self._decline(
                 phase, None, source_run,
-                f"its journal cannot be read: {_render_error(error)}",
+                f"its journal cannot be read: {walk._render_error(error)}",
             )
         found = _recorded_phase(run, self.card_id, phase.name)
         if found is None:
@@ -636,12 +636,14 @@ class AgentRunner:
             return self._decline(
                 phase, attempt.n, source_run, verdict.detail or verdict.status
             )
-        failure = evaluate_gates(
-            phase, gate_values(context, phase.name, verdict.result), self.warnings
+        gates = walk.evaluate_gates(
+            phase, walk.gate_values(context, phase.name, verdict.result), self.warnings
         )
-        if failure is not None:
+        if gates.kind == "fail":
+            return self._decline(phase, attempt.n, source_run, gates.detail["message"])
+        if gates.kind == "broken":
             return self._decline(
-                phase, attempt.n, source_run, failure.detail or failure.status
+                phase, attempt.n, source_run, _broken_gate_message(phase.name, gates.detail)
             )
         self._record_phase(
             phase, "done", found.started_at or self.clock(), self.clock(), None
