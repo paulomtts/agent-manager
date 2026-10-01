@@ -23,11 +23,13 @@ import pytest
 from pygents import Agent, AgentRegistry, ToolRegistry
 from pygents.errors import UnregisteredAgentError
 
-from agent_manager import models, store as store_module
+from agent_manager import models, paths, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
+from agent_manager.runtime.state import Adoption, current_run
+from agent_manager.store import TurnFloor
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
@@ -563,3 +565,102 @@ def test_a_row_parked_without_a_pause_still_resumes(store):
     assert ran == list(FIVE)
     assert summary.status == "done"
     assert summary.results == ALL_RESULTS
+
+
+# ── the floor across a resume (exactly-once 1.2, card 94088f7e) ──────────────
+
+
+def _crash_on_the_second_spec(names: list[str]):
+    """`_loop_workflow`'s runner: the critic fails once, and the second pass of
+    `spec` (loop 1) dies with `_Crash`."""
+
+    def runner(phase, table, rendered):
+        names.append(phase.name)
+        if phase.name == "validate_spec":
+            raise AgentPhaseFailed("validate_spec", outcome="gate_failed", detail="no error path")
+        if phase.name == "spec" and names.count("spec") == 2:
+            raise _Crash("killed on the second pass of spec")
+        return {"ok": True}
+
+    return runner
+
+
+def _critic_fails_recording(seen: list[tuple[str, Adoption | None]]):
+    """A resumed run's runner: records each phase with the run's `adopt`, and the
+    critic fails again, which escalates (loop 1 already spent the Goto)."""
+
+    def runner(phase, table, rendered):
+        seen.append((phase.name, current_run.get().adopt))
+        if phase.name == "validate_spec":
+            raise AgentPhaseFailed(
+                "validate_spec", outcome="gate_failed", detail="still no error path"
+            )
+        return {"ok": True}
+
+    return runner
+
+
+def _floors(opened) -> list[tuple[str, TurnFloor | None]]:
+    """Every checkpoint row's reason and floor, oldest first."""
+    rows = opened.connection.execute(
+        "SELECT c.reason, f.phase, f.loop, f.source_run, f.floor"
+        " FROM checkpoints c LEFT JOIN checkpoint_floors f"
+        " ON f.run_id = c.run_id AND f.card_id = c.card_id AND f.seq = c.seq"
+        " ORDER BY c.card_id, c.seq"
+    ).fetchall()
+    return [
+        (row[0], None if row[1] is None else TurnFloor(row[1], row[2], row[3], row[4]))
+        for row in rows
+    ]
+
+
+def _crash_in_the_loop(opened):
+    names: list[str] = []
+    wf = _loop_workflow()
+    with pytest.raises(_Crash):
+        _go(wf, opened, agent_runner=_crash_on_the_second_spec(names))
+    assert names == ["spec", "validate_spec", "spec"]
+    return wf, opened.latest_checkpoint(CARD_ID)
+
+
+def test_a_carried_floor_survives_a_resume(store):
+    wf, crashed = _crash_in_the_loop(store)
+    # The first run floored the turn it died in under its own id.
+    assert crashed.reason == "turn"
+    assert crashed.floor == TurnFloor("spec", 1, RUN_ID, 0)
+    # As if that row had itself been carried from an earlier run: the resume
+    # must keep the earlier run's id and number, not recompute its own.
+    carried = TurnFloor("spec", 1, "run-earlier", 7)
+    seen: list[tuple[str, Adoption | None]] = []
+
+    summary = _go(
+        wf,
+        store,
+        agent_runner=_critic_fails_recording(seen),
+        resume_from=dataclasses.replace(crashed, floor=carried),
+    )
+
+    assert seen[0] == ("spec", Adoption("spec", 1, "run-earlier", 7))
+    assert summary.status == "escalated"
+    assert _floors(store)[crashed.seq + 1:] == [
+        ("turn", carried),
+        ("turn", TurnFloor("validate_spec", 1, RUN_ID, 0)),
+        ("escalated", None),
+    ]
+
+
+def test_a_floorless_row_resumes_with_a_fresh_floor(store):
+    wf, crashed = _crash_in_the_loop(store)
+    for attempt in (1, 2):
+        paths.attempt_dir(RUN_ID, CARD_ID, "spec", attempt)
+    seen: list[tuple[str, Adoption | None]] = []
+
+    _go(
+        wf,
+        store,
+        agent_runner=_critic_fails_recording(seen),
+        resume_from=dataclasses.replace(crashed, floor=None),
+    )
+
+    assert seen[0] == ("spec", None)
+    assert _floors(store)[crashed.seq + 1] == ("turn", TurnFloor("spec", 1, RUN_ID, 2))
