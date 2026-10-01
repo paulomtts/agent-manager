@@ -329,3 +329,37 @@ def test_two_milestones_with_different_prefixes_run_at_once_and_stay_apart(
     _assert_rolled_up(root, parents)
     for card_id in parents:
         assert board.show(card_id, repo_dir=root).status == "done", card_id
+
+
+def test_a_second_milestone_on_a_prefix_in_use_is_refused_by_its_integration_branch(
+    two_milestone_board, fake_claude_bin, hold, spawn_am, am, finish_am, wait_for_file
+):
+    """Spec scenario 3. The two milestones share no card, so the only key they
+    both need is `branch:<prefix>-integrate`."""
+    root = two_milestone_board["root"]
+    a1, b1 = two_milestone_board["subtasks"]["first"]
+    c1, d1 = two_milestone_board["subtasks"]["second"]
+    hold.arm()
+    hold.release(b1)
+    live = spawn_am(
+        *_milestone_argv(root, two_milestone_board["milestones"]["first"], PREFIX)
+    )
+    wait_for_file(hold.held_marker(a1), live)
+    run_id = _only_run_id(am, root)
+
+    error = _error(
+        *am(*_milestone_argv(root, two_milestone_board["milestones"]["second"], PREFIX))
+    )
+
+    assert error["type"] == "ClaimedError", error
+    assert f"branch {PREFIX}-integrate is" in error["message"]
+    assert run_id in error["message"]
+    assert _run_ids(am, root) == [run_id]
+    for card_id in (c1, d1):
+        branch = dag.task_branch(PREFIX, board.show(card_id, repo_dir=root))
+        assert branch not in _local_branches(root), branch
+
+    hold.release(a1)
+    finished = _data(*finish_am(live))
+    assert finished["done"] is True, finished
+    assert finished["integrated"]["branch"] == f"{PREFIX}-integrate"
