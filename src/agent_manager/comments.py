@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agent_manager.runtime.walk import SubtaskSummary
+    from agent_manager.store import Store
 
 CAP = 1500
 """Hard cap on one comment body, in characters (B4)."""
@@ -338,3 +340,23 @@ def compose_run_end(
         f"am · {outcome} · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
     )
     return Comment(card_id=milestone_id, key=comment_key, body=body)
+
+
+# -- outbox (board-comments B6-B9) ---------------------------------------------
+
+
+def enqueue(store: Store, comment: Comment, *, run_id: str, now: datetime) -> None:
+    """Queue `comment` in the store's outbox under its key, once (B6, B9).
+
+    A pass-through to `Store.enqueue_comment`: a key already queued, in any
+    state, is left exactly as it was. Nothing is posted here; the caller
+    flushes. Nothing is caught: a lost lease raises `store.LeaseLostError`
+    and writes no row.
+    """
+    store.enqueue_comment(
+        run_id=run_id,
+        card_id=comment.card_id,
+        key=comment.key,
+        body=comment.body,
+        now=now,
+    )

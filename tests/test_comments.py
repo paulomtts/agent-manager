@@ -1,10 +1,15 @@
-"""Outcome comment bodies (board-comments design B2-B5): pure unit tests."""
+"""Outcome comments (board-comments design B2-B9): pure `compose_*` unit tests,
+then the outbox (`enqueue`/`flush`) against a real temporary store and a fake
+`board_api` -- no `brd` process, no network."""
 
 import dataclasses
+from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from agent_manager import comments
+from agent_manager import comments, store
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -591,3 +596,92 @@ def test_base_failed_detail_brackets_are_broken_and_an_over_cap_detail_is_cut():
     assert lines[0] == "am · base failed · run r1"
     assert lines[-2] == "… (truncated; see `am status r1`)"
     assert lines[-1] == "am-key: r1/story-60189137/base-failed"
+
+
+# -- outbox: enqueue and flush (board-comments B6-B9) ---------------------------
+#
+# Unit tier: a real temporary `Store` (XDG_DATA_HOME is redirected by
+# tests/conftest.py) and a fake `board_api`. The real-brd proof is the e2e
+# sibling's job.
+
+
+@pytest.fixture
+def root(tmp_path) -> Path:
+    """A stand-in for the project worktree the store and board are keyed by."""
+    project = tmp_path / "repo"
+    project.mkdir()
+    return project
+
+
+@pytest.fixture
+def stores(root) -> Iterator[Callable[..., store.Store]]:
+    """Open any number of `Store`s on `root`, each on its own connection; close them all.
+
+    A local copy of `tests/test_store.py`'s `stores` fixture (M10 takeover pattern).
+    """
+    opened: list[store.Store] = []
+
+    def open_store(run_id: str = RUN) -> store.Store:
+        st = store.Store.open(root, run_id)
+        opened.append(st)
+        return st
+
+    yield open_store
+    for st in opened:
+        st.close()
+
+
+def _at(minute: int) -> datetime:
+    return datetime(2026, 9, 30, 12, minute, tzinfo=timezone.utc)
+
+
+def _alive(row: store.LeaseRow) -> bool:
+    return True
+
+
+def _dead(row: store.LeaseRow) -> bool:
+    return False
+
+
+def _comment(card_id: str, event: str, *, run_id: str = RUN) -> comments.Comment:
+    comment_key = comments.key(run_id, card_id, event)
+    body = f"am · {event} · run {run_id}\nbranch: m12/x — é `cmd`\nam-key: {comment_key}"
+    return comments.Comment(card_id=card_id, key=comment_key, body=body)
+
+
+def _row(st: store.Store, key: str):
+    return st.connection.execute(
+        "SELECT * FROM board_comments WHERE key = ?", (key,)
+    ).fetchone()
+
+
+def test_enqueue_queues_one_pending_row_per_key(stores):
+    st = stores()
+    first = _comment("card-a", "done")
+
+    assert comments.enqueue(st, first, run_id=RUN, now=_at(0)) is None
+    comments.enqueue(
+        st, dataclasses.replace(first, body="a different body"), run_id=RUN, now=_at(1)
+    )
+
+    rows = st.pending_comments()
+    assert [(r.run_id, r.card_id, r.key, r.body, r.state) for r in rows] == [
+        (RUN, "card-a", first.key, first.body, "pending")
+    ]
+    count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+    assert count == 1
+
+
+def test_enqueue_on_a_taken_over_store_raises_and_writes_no_row(stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+    comment = _comment("card-a", "done")
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        comments.enqueue(a, comment, run_id=RUN, now=_at(2))
+
+    assert caught.value.holder is not None and caught.value.holder.token == "t2"
+    assert a.connection.in_transaction is False
+    assert _row(b, comment.key) is None
