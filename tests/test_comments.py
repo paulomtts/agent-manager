@@ -199,3 +199,139 @@ def test_an_over_cap_detail_with_no_reason_is_cut_and_keeps_the_commands():
     assert lines[-3] == "next: `am resume r1`"
     assert lines[-2] == "why: `am logs r1 card-476f1040 --phase implement`"
     assert lines[-1] == "am-key: r1/card-476f1040/escalated:tok-1"
+
+
+_VERIFY = {
+    "passed": True,
+    "verified": [{"command": "uv run pytest", "ok": True, "tail": "5 passed"}],
+    "detail": "",
+}
+
+
+def _done_summary():
+    return SubtaskSummary(
+        results={
+            "spec": SpecResult(path="docs/superpowers/specs/s.md", note=None),
+            "plan": PlanResult(path="docs/superpowers/plans/p.md", self_reviewed=True, note=None),
+            "implement": _implement(),
+            "review": _review(),
+            "verify": _VERIFY,
+        }
+    )
+
+
+def _done(*, summary=None, resumed_at=None):
+    return comments.compose_done(
+        run_id=RUN,
+        card_id=CARD,
+        summary=summary if summary is not None else _done_summary(),
+        branch="m12/task-x-476f1040",
+        resumed_at=resumed_at,
+    )
+
+
+def test_done_fresh_golden_body():
+    comment = _done()
+    assert comment.card_id == CARD
+    assert comment.key == "r1/card-476f1040/done"
+    assert comment.body == "\n".join(
+        [
+            "am · done · run r1",
+            "branch: m12/task-x-476f1040",
+            "commits: 3",
+            "Plan-Hash: abcd1234",
+            "spec: docs/superpowers/specs/s.md",
+            "plan: docs/superpowers/plans/p.md",
+            "verified: `uv run pytest`",
+            "review findings fixed: 2",
+            "am-key: r1/card-476f1040/done",
+        ]
+    )
+
+
+def test_done_resumed_golden_body():
+    comment = _done(resumed_at="review")
+    assert comment.key == "r1/card-476f1040/done"
+    assert comment.body == "\n".join(
+        [
+            "am · done · run r1",
+            "(resumed at review)",
+            "branch: m12/task-x-476f1040",
+            "commits: 3",
+            "Plan-Hash: abcd1234",
+            "spec: docs/superpowers/specs/s.md",
+            "plan: docs/superpowers/plans/p.md",
+            "verified: `uv run pytest`",
+            "review findings fixed: 2",
+            "am-key: r1/card-476f1040/done",
+        ]
+    )
+
+
+def test_done_carries_no_agent_text():
+    body = _done().body
+    for agent_text in ("did it", "fixed both", "5 passed", '"'):
+        assert agent_text not in body
+
+
+def test_done_after_a_skipped_planning_reads_the_found_plan_and_docs_commit_hash():
+    summary = SubtaskSummary(
+        results={
+            "plan_check": {"found": True, "path": ".claude/plans/p.md", "validated": True},
+            "docs_commit": {"plan_hash": "feedbeef"},
+            "review": _review(),
+            "verify": _VERIFY,
+        }
+    )
+    assert _done(summary=summary).body == "\n".join(
+        [
+            "am · done · run r1",
+            "branch: m12/task-x-476f1040",
+            "commits: 3",
+            "Plan-Hash: feedbeef",
+            "plan: .claude/plans/p.md",
+            "verified: `uv run pytest`",
+            "review findings fixed: 2",
+            "am-key: r1/card-476f1040/done",
+        ]
+    )
+
+
+def test_cancelled_golden_body():
+    comment = comments.compose_cancelled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase="implement",
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+    assert comment.card_id == CARD
+    assert comment.key == "r1/card-476f1040/cancelled"
+    assert comment.body == "\n".join(
+        [
+            "am · cancelled · run r1",
+            "stopped before: implement",
+            "branch: m12/task-x-476f1040",
+            "relaunch: `am run --milestone ms-21f4cf06`",
+            "am-key: r1/card-476f1040/cancelled",
+        ]
+    )
+
+
+def test_base_failed_golden_body_goes_on_the_story():
+    comment = comments.compose_base_failed(
+        run_id=RUN,
+        story_id=STORY,
+        base_branch="m12/base-story-60189137",
+        detail="merge conflict in src/x.py",
+    )
+    assert comment.card_id == STORY
+    assert comment.key == "r1/story-60189137/base-failed"
+    assert comment.body == "\n".join(
+        [
+            "am · base failed · run r1",
+            "base branch: m12/base-story-60189137",
+            "detail: merge conflict in src/x.py",
+            "am-key: r1/story-60189137/base-failed",
+        ]
+    )

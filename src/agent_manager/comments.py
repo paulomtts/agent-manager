@@ -155,3 +155,90 @@ def compose_escalated(
         after=[f"next: {_cmd(f'am resume {run_id}')}", f"why: {_cmd(logs)}"],
     )
     return Comment(card_id=card_id, key=comment_key, body=body)
+
+
+def compose_done(
+    *,
+    run_id: str,
+    card_id: str,
+    summary: SubtaskSummary,
+    branch: str,
+    resumed_at: str | None,
+) -> Comment:
+    """The subtask's done comment: facts only, no agent text (B2).
+
+    Each line is present only when its source result is: a resumed or
+    plan-skipping walk may lack `spec`/`plan`, so the plan path falls back to
+    `plan_check`'s found plan and the Plan-Hash to `docs_commit`'s.
+    """
+    results = summary.results
+    review = results.get("review")
+    lines: list[str] = []
+    if resumed_at is not None:
+        lines.append(f"(resumed at {resumed_at})")
+    lines.append(f"branch: {branch}")
+    commits = _field(review, "commit_count")
+    if commits is not None:
+        lines.append(f"commits: {commits}")
+    plan_hash = _field(results.get("implement"), "plan_hash") or _field(
+        results.get("docs_commit"), "plan_hash"
+    )
+    if plan_hash:
+        lines.append(f"Plan-Hash: {plan_hash}")
+    spec_path = _field(results.get("spec"), "path")
+    if spec_path:
+        lines.append(f"spec: {spec_path}")
+    plan_path = _field(results.get("plan"), "path") or _field(results.get("plan_check"), "path")
+    if plan_path:
+        lines.append(f"plan: {plan_path}")
+    rows = _field(results.get("verify"), "verified") or []
+    verified = [str(_field(row, "command")) for row in rows if _field(row, "ok")]
+    if verified:
+        lines.append("verified: " + ", ".join(_cmd(command) for command in verified))
+    findings = _field(review, "findings")
+    if findings is not None:
+        lines.append(f"review findings fixed: {len(findings)}")
+    comment_key = key(run_id, card_id, "done")
+    body = _render(
+        f"am · done · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
+    )
+    return Comment(card_id=card_id, key=comment_key, body=body)
+
+
+def compose_cancelled(
+    *,
+    run_id: str,
+    card_id: str,
+    before_phase: str | None,
+    branch: str,
+    relaunch: str,
+) -> Comment:
+    """A subtask a cancel left `in_progress`: where it stopped, its branch, how to relaunch (B2)."""
+    lines: list[str] = []
+    if before_phase is not None:
+        lines.append(f"stopped before: {before_phase}")
+    lines.append(f"branch: {branch}")
+    lines.append(f"relaunch: {_cmd(relaunch)}")
+    comment_key = key(run_id, card_id, "cancelled")
+    body = _render(
+        f"am · cancelled · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
+    )
+    return Comment(card_id=card_id, key=comment_key, body=body)
+
+
+def compose_base_failed(
+    *,
+    run_id: str,
+    story_id: str,
+    base_branch: str,
+    detail: str | None,
+) -> Comment:
+    """A merged base that failed to build, on the story it roots (B2)."""
+    lines = [f"base branch: {base_branch}"]
+    if detail:
+        lines.append(f"detail: {_unlink(detail)}")
+    comment_key = key(run_id, story_id, "base-failed")
+    body = _render(
+        f"am · base failed · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
+    )
+    return Comment(card_id=story_id, key=comment_key, body=body)
