@@ -6815,3 +6815,179 @@ def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypa
     assert previewed.exit_code == 0, previewed.output
 
     assert (_card_lease(project, LOGS_RUN_ID), _claim_rows(project)) == before
+
+
+# ── board comments on `run --card` (card 5d9a875f) ──────────────────────────
+
+
+def _card_comment_keys(project: Path, card_id: str) -> list[str]:
+    """`card_id`'s comments on the temporary board, as their `am-key:` values."""
+    return [
+        comment.body.rstrip().rsplit("\n", 1)[-1].removeprefix("am-key: ")
+        for comment in board.comment_list(card_id, repo_dir=project)
+    ]
+
+
+def _card_outbox(project: Path) -> list[tuple[str, str]]:
+    """Every outbox row as `(key, state)`, in insertion order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            (row["key"], row["state"])
+            for row in conn.execute("SELECT key, state FROM board_comments ORDER BY rowid")
+        ]
+    finally:
+        conn.close()
+
+
+def _run_card_with(project: Path, cards: dict[str, str], factory) -> dict[str, Any]:
+    return cli.run_card(
+        cards["subtask"],
+        repo_dir=project,
+        base_branch="main",
+        branch_prefix="m1",
+        runner_factory=factory,
+    )
+
+
+@requires_git
+@requires_brd
+def test_a_done_card_run_leaves_one_done_comment_on_the_card_only(project, cards):
+    """Spec cli test 1: one done comment naming the branch; nothing on the
+    story or the milestone."""
+    payload = _run_card_with(project, cards, lambda **kwargs: fake_runner())
+
+    assert payload["status"] == "done", payload
+    run_id, card = payload["run_id"], cards["subtask"]
+    assert _card_comment_keys(project, card) == [f"{run_id}/{card}/done"]
+    (comment,) = board.comment_list(card, repo_dir=project)
+    assert comment.author == "am"
+    assert comment.body.startswith(f"am · done · run {run_id}\n")
+    assert f"branch: {payload['branch']}" in comment.body
+    assert board.comment_list(cards["story"], repo_dir=project) == []
+    assert board.comment_list(cards["milestone"], repo_dir=project) == []
+    assert not [w for w in payload["warnings"] if "board comment" in w], payload["warnings"]
+    assert _card_outbox(project) == [(f"{run_id}/{card}/done", "posted")]
+
+
+@requires_git
+@requires_brd
+def test_an_escalated_card_run_leaves_one_escalation_comment_with_the_phase(project, cards):
+    """Spec cli test 2: keyed by this run's lease token; names the failed
+    phase and its detail, and tells a human to resume."""
+    payload = _run_card_with(project, cards, lambda **kwargs: fake_runner(fail="review"))
+
+    assert payload["status"] == "escalated", payload
+    run_id, card = payload["run_id"], cards["subtask"]
+    (key,) = _card_comment_keys(project, card)
+    assert key.startswith(f"{run_id}/{card}/escalated:")
+    (comment,) = board.comment_list(card, repo_dir=project)
+    assert comment.body.startswith(f"am · escalated · run {run_id}\n")
+    assert "phase: review" in comment.body
+    assert "canned gate failure" in comment.body
+    assert f"next: `am resume {run_id}`" in comment.body
+    assert board.comment_list(cards["story"], repo_dir=project) == []
+    assert board.comment_list(cards["milestone"], repo_dir=project) == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
+    project, cards, control_applied
+):
+    """Spec cli test 3, cancel half: where it stopped, its branch, and the
+    `am run --card` relaunch."""
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=[]
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    assert payload["status"] == "cancelled", payload
+    run_id, card = payload["run_id"], cards["subtask"]
+    assert _card_comment_keys(project, card) == [f"{run_id}/{card}/cancelled"]
+    (comment,) = board.comment_list(card, repo_dir=project)
+    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    assert "stopped before: validate_spec" in comment.body
+    assert f"branch: {payload['branch']}" in comment.body
+    assert f"relaunch: `am run --card {card}`" in comment.body
+    assert board.comment_list(cards["story"], repo_dir=project) == []
+    assert board.comment_list(cards["milestone"], repo_dir=project) == []
+
+
+@requires_git
+@requires_brd
+def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
+    """Spec cli test 3, pause half: a park is resumed, not closed."""
+    factory = _controlling_factory(
+        project, control_applied, command="pause", at="spec", seen=[]
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    assert payload["status"] == "stopped", payload
+    for card_id in cards.values():
+        assert board.comment_list(card_id, repo_dir=project) == [], card_id
+    assert _card_outbox(project) == []
+
+
+@requires_git
+@requires_brd
+def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
+    project, cards, control_applied
+):
+    """Review Focus 5: the run is `cancelled` (C6) but the walk escalated;
+    the comment follows `summary.status`, so it is the escalation."""
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=[], fail=True
+    )
+
+    payload = _controlled_card_run(project, cards, factory)
+
+    assert payload["status"] == "cancelled", payload
+    run_id, card = payload["run_id"], cards["subtask"]
+    (key,) = _card_comment_keys(project, card)
+    assert key.startswith(f"{run_id}/{card}/escalated:")
+    assert "phase: spec" in board.comment_list(card, repo_dir=project)[0].body
+
+
+@requires_git
+@requires_brd
+def test_a_card_comment_the_board_refuses_is_a_warning_and_changes_nothing_else(
+    project, cards, monkeypatch
+):
+    """Spec cli test 4 (B8): status, recorded rows and payload keys are
+    unchanged; the refusal is one warning and the row stays pending."""
+    real_list = board.comment_list
+
+    def refuse(card_id: str, *, repo_dir: Path | None = None):
+        if card_id == cards["subtask"]:
+            raise board.BoardError(
+                "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+            )
+        return real_list(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(board, "comment_list", refuse)
+
+    payload = _run_card_with(project, cards, lambda **kwargs: fake_runner())
+
+    run_id, card = payload["run_id"], cards["subtask"]
+    assert payload["status"] == "done", payload
+    assert set(payload) == {
+        "run_id",
+        "card_id",
+        "story_id",
+        "branch",
+        "base_branch",
+        "worktree",
+        "status",
+        "failed_phase",
+        "detail",
+        "skipped",
+        "warnings",
+    }
+    assert _card_statuses(project, run_id) == {"run": "done", "story": "done", "subtask": "done"}
+    refused = [w for w in payload["warnings"] if f"board comment {run_id}/{card}/done" in w]
+    assert len(refused) == 1, payload["warnings"]
+    assert "not posted" in refused[0] and "brd is down" in refused[0]
+    assert _card_outbox(project) == [(f"{run_id}/{card}/done", "pending")]
