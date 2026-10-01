@@ -605,6 +605,20 @@ class Checkpoint:
 
 
 def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
+    """A `Checkpoint` from a `checkpoints` row, joined with its floor if selected.
+
+    A `sqlite3.Row` raises `IndexError` for a key it lacks, so a row selected
+    without the `floor_*` columns is checked for the key first and gives
+    `floor=None`, as does a joined row with no `checkpoint_floors` match.
+    """
+    floor = None
+    if "floor_phase" in row.keys() and row["floor_phase"] is not None:
+        floor = TurnFloor(
+            phase=row["floor_phase"],
+            loop=row["floor_loop"],
+            source_run=row["floor_source_run"],
+            floor=row["floor_floor"],
+        )
     return Checkpoint(
         run_id=row["run_id"],
         card_id=row["card_id"],
@@ -614,7 +628,17 @@ def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
         reason=row["reason"],
         agent=json.loads(row["agent"]),
         saved_at=datetime.fromisoformat(row["saved_at"]),
+        floor=floor,
     )
+
+
+_CHECKPOINT_SELECT = (
+    "SELECT c.*, f.phase AS floor_phase, f.loop AS floor_loop,"
+    " f.source_run AS floor_source_run, f.floor AS floor_floor"
+    " FROM checkpoints c LEFT JOIN checkpoint_floors f"
+    " ON f.run_id = c.run_id AND f.card_id = c.card_id AND f.seq = c.seq"
+)
+"""Every checkpoint reader's select: the row plus its floor, if it has one."""
 
 
 @dataclass(frozen=True)
@@ -1296,8 +1320,9 @@ class Store:
         """The highest-`seq` checkpoint of `card_id` in this store's run, any reason."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
-                " ORDER BY seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.run_id = ? AND c.card_id = ?"
+                " ORDER BY c.seq DESC LIMIT 1",
                 (self.run_id, card_id),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
@@ -1312,8 +1337,9 @@ class Store:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE run_id = ? AND card_id = ?"
-                " AND reason = 'turn' ORDER BY seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.run_id = ? AND c.card_id = ?"
+                " AND c.reason = 'turn' ORDER BY c.seq DESC LIMIT 1",
                 (self.run_id, card_id),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
@@ -1344,10 +1370,11 @@ class Store:
             ):
                 return None
             row = self._conn.execute(
-                "SELECT * FROM checkpoints WHERE card_id = ? AND workflow = ?"
-                " AND reason IN ('turn', 'parked', 'escalated')"
-                " AND run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
-                " ORDER BY saved_at DESC, seq DESC LIMIT 1",
+                _CHECKPOINT_SELECT
+                + " WHERE c.card_id = ? AND c.workflow = ?"
+                " AND c.reason IN ('turn', 'parked', 'escalated')"
+                " AND c.run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
+                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
