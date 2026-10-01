@@ -6,11 +6,12 @@ written to the board (decision D5, design §9) -- run state lives in
 agent-manager's own SQLite projection and journal, so `set_status` is the
 module's entire write surface.
 
-Writes are serialized within one process: `set_status` runs under the
-module-level `WRITE_LOCK`, a reentrant lock that `steps/rollup.py` also holds
-around its whole read-modify-write walk up a card's ancestors. Reads take no
-lock. Nothing here coordinates two separate `am` processes on one repository;
-that is not supported.
+Writes are serialized across threads and across `am` processes on one project
+(spec X7 of the multi-process design): `set_status` runs under
+`write_lock(repo_dir)`, the project's process-wide `board` lock, whose
+in-process layer is the module-level `WRITE_LOCK`. `steps/rollup.py` holds the
+same lock around its whole read-modify-write walk up a card's ancestors. Reads
+take no lock. A `locks.LockTimeoutError` is never caught here.
 
 Every invocation is an argument list handed to `subprocess`. Design §5 line 252
 is explicit that the program runs commands itself with argument lists, so
@@ -29,7 +30,7 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from agent_manager import models
+from agent_manager import locks, models
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -37,13 +38,27 @@ BRD = "brd"
 """Executable name, resolved on PATH. Argv element zero of every call."""
 
 WRITE_LOCK = threading.RLock()
-"""Serializes board writes across threads of one process.
+"""The in-process layer of `write_lock`: serializes board writes across threads.
 
-Held for the whole of `set_status`, and by `steps/rollup.py` around its entire
-ancestor walk, so a rollup's read-modify-write is one critical section.
-Reentrant because the walk calls `set_status` again on the same thread. Reads
-(`show`, `tree`, `roots`) do not take it.
+Held (through `write_lock`) for the whole of `set_status`, and by
+`steps/rollup.py` around its entire ancestor walk, so a rollup's
+read-modify-write is one critical section. Reentrant because the walk calls
+`set_status` again on the same thread. Reads (`show`, `tree`, `roots`) do not
+take it.
 """
+
+
+def write_lock(repo_dir: Path | None) -> locks.ProcessLock:
+    """The project's process-wide board write lock (spec X7).
+
+    Keyed by the resolved `repo_dir`, or by the resolved working directory when
+    it is `None` -- the directory `brd` resolves its board from. `WRITE_LOCK` is
+    its in-process layer, read at call time, so threads of this process still
+    serialize on it. Reentrant: a rollup's nested `set_status` takes no second
+    flock.
+    """
+    root = Path(repo_dir).resolve() if repo_dir is not None else Path.cwd().resolve()
+    return locks.project_lock(root, "board", local=WRITE_LOCK)
 
 
 class BoardError(RuntimeError):
@@ -252,11 +267,12 @@ def set_status(
     call this are `best_effort`, so a spurious second-call failure would be
     journalled as a board-write failure for work that actually succeeded.
 
-    Runs entirely under `WRITE_LOCK`, so concurrent writers in one process
-    reach brd one at a time.
+    Runs entirely under `write_lock(repo_dir)`, so concurrent writers -- threads
+    of this process or other `am` processes on the project -- reach brd one at a
+    time. A `locks.LockTimeoutError` from the lock propagates uncaught.
     """
     argv = set_status_argv(card_id, status)
-    with WRITE_LOCK:
+    with write_lock(repo_dir):
         completed = _run(argv, repo_dir)
         data = _decode(
             completed.stdout, argv=argv, exit_code=completed.returncode

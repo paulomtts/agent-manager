@@ -39,3 +39,6 @@ markers = [
 # `-m "not e2e"` keeps the paid real-harness test out of the default suite; a `-m`
 # passed on the command line overrides this one, which is how `-m e2e` selects it.
 addopts = "--import-mode=importlib -m \"not e2e\""
+# importlib mode puts nothing on sys.path, so shared test helpers that are not
+# fixtures (tests/lockhelpers.py) are importable only through this entry.
+pythonpath = ["tests"]

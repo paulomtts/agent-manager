@@ -15,7 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from lockhelpers import _holder, _probe, _reap, _release
 
+from agent_manager import locks, paths
 from agent_manager.steps import worktree
 from agent_manager.steps.worktree import GitError
 
@@ -77,6 +79,29 @@ def _recorder(calls: list[list[str]], inner=None):
         return "" if inner is None else inner(argv)
 
     return runner
+
+
+def _repo_lock_is_free(repo: Path) -> bool:
+    """Whether another thread can take `repo`'s in-process git lock right now.
+
+    Probed with a non-blocking acquire from a fresh thread, so it never blocks
+    and works for a `Lock` or an `RLock` alike (`RLock.locked()` only exists
+    from Python 3.14; this project runs 3.12).
+    """
+    lock = worktree._repo_lock(str(repo))
+    outcome: list[bool] = []
+
+    def take() -> None:
+        got = lock.acquire(blocking=False)
+        if got:
+            lock.release()
+        outcome.append(got)
+
+    prober = threading.Thread(target=take)
+    prober.start()
+    prober.join(timeout=30)
+    assert not prober.is_alive()
+    return outcome == [True]
 
 
 def test_worktree_paths_takes_only_the_worktree_lines():
@@ -755,7 +780,8 @@ def test_a_failed_add_releases_the_repository_lock(repo: Path, tmp_path: Path):
             repo_dir=str(repo),
         )
 
-    assert worktree._repo_lock(str(repo)).locked() is False
+    assert _repo_lock_is_free(repo)
+    assert _probe(repo, "git") == "free"
     result = worktree.ensure(
         branch="m4/after",
         base="main",
@@ -785,7 +811,8 @@ def test_a_same_branch_at_a_different_path_surfaces_gits_error_and_frees_the_loc
         )
 
     assert "add" in excinfo.value.argv
-    assert worktree._repo_lock(str(repo)).locked() is False
+    assert _repo_lock_is_free(repo)
+    assert _probe(repo, "git") == "free"
 
 
 @requires_git
@@ -825,3 +852,114 @@ def test_an_existing_worktree_takes_no_lock(repo: Path, tmp_path: Path):
 
     assert finished is True
     assert isinstance(result, dict) and result["created"] is False
+
+
+# --- Process-wide git lock (spec X7, card 43043f10) -------------------------
+
+
+def test_the_repository_lock_is_reentrant(tmp_path: Path):
+    # It is the in-process layer of a ProcessLock, which re-acquires it on
+    # every nested acquire; a plain Lock would deadlock its own thread.
+    lock = worktree._repo_lock(str(tmp_path))
+    assert lock.acquire(blocking=False)
+    try:
+        assert lock.acquire(blocking=False)
+        lock.release()
+    finally:
+        lock.release()
+
+
+@requires_git
+def test_git_lock_is_keyed_by_the_resolved_repository(repo: Path):
+    lock = worktree.git_lock(repo)
+
+    assert worktree.git_lock(str(repo)) is lock
+    assert worktree.git_lock(f"{repo}{os.sep}") is lock
+    assert worktree.git_lock(repo / "x" / "..") is lock
+    assert lock is locks.project_lock(repo, "git")
+    assert lock.path == paths.project_lock_path(repo, "git")
+    assert lock._local is worktree._repo_lock(str(repo))
+
+
+@requires_git
+def test_worktree_add_waits_for_the_git_lock_of_another_process(
+    repo: Path, tmp_path: Path, monkeypatch
+):
+    # `progressed` fires on the lane's first failed flock attempt (it is now
+    # waiting on the child) or, if nothing locks, when the lane finishes. Only
+    # then is the marker written and the child released, so an `add` that saw
+    # no marker ran while the child held the git lock.
+    marker = tmp_path / "released"
+    progressed = threading.Event()
+    real_backoff = locks._backoff
+
+    def signalling_backoff(attempt: int) -> float:
+        progressed.set()
+        return real_backoff(attempt)
+
+    monkeypatch.setattr(locks, "_backoff", signalling_backoff)
+    adds: list[bool] = []
+
+    def runner(argv: list[str]) -> str:
+        if _is_add(argv):
+            adds.append(marker.exists())
+        return worktree.run_git(argv)
+
+    outcome: dict[str, object] = {}
+
+    def lane() -> None:
+        try:
+            outcome["result"] = worktree.ensure(
+                branch="m10/waits",
+                base="main",
+                worktree=str(tmp_path / "wt"),
+                repo_dir=str(repo),
+                git_runner=runner,
+            )
+        except BaseException as exc:  # surfaced by the assertions below
+            outcome["error"] = exc
+        finally:
+            progressed.set()
+
+    child = _holder(repo, "git")
+    try:
+        worker = threading.Thread(target=lane, daemon=True)
+        worker.start()
+        assert progressed.wait(timeout=30)
+        marker.touch()
+        _release(child)
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+    finally:
+        _reap(child)
+
+    assert "error" not in outcome, outcome
+    assert outcome["result"]["created"] is True
+    assert adds == [True]
+    assert _probe(repo, "git") == "free"
+    assert list(repo.rglob("*.lock")) == []  # no lock file in the repository
+
+
+@requires_git
+def test_a_git_lock_timeout_propagates_and_no_worktree_is_added(
+    repo: Path, tmp_path: Path, monkeypatch
+):
+    lock = worktree.git_lock(repo)
+    monkeypatch.setattr(lock, "_timeout", 0)
+    calls: list[list[str]] = []
+    child = _holder(repo, "git")
+    try:
+        with pytest.raises(locks.LockTimeoutError):
+            worktree.ensure(
+                branch="m10/timeout",
+                base="main",
+                worktree=str(tmp_path / "wt"),
+                repo_dir=str(repo),
+                git_runner=_recorder(calls, worktree.run_git),
+            )
+    finally:
+        _reap(child)
+
+    assert not any(_is_add(argv) for argv in calls)
+    assert not (tmp_path / "wt").exists()
+    assert _repo_lock_is_free(repo)

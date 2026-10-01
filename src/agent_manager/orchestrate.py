@@ -534,11 +534,17 @@ def refresh_git(root: Path) -> None:
     `origin` exactly: `upstream` or `origin-mirror` is not it. Both calls go
     through `worktree.run_git`, read at call time, and a `GitError` from any
     of them propagates.
+
+    All three git calls run under `worktree.git_lock(root)` (spec X7), so the
+    prune never sweeps while another `am` process is mid-`worktree add` on the
+    same repository. A `locks.LockTimeoutError` propagates uncaught, before any
+    git call, and reaches `cli.HANDLED` when the run has not started.
     """
-    remotes = worktree.run_git(["-C", str(root), "remote"]).split()
-    if "origin" in remotes:
-        worktree.run_git(["-C", str(root), "fetch", "origin"])
-    worktree.run_git(["-C", str(root), "worktree", "prune"])
+    with worktree.git_lock(root):
+        remotes = worktree.run_git(["-C", str(root), "remote"]).split()
+        if "origin" in remotes:
+            worktree.run_git(["-C", str(root), "fetch", "origin"])
+        worktree.run_git(["-C", str(root), "worktree", "prune"])
 
 
 REOPENED_STATUSES = ("stopped", "escalated", "started")

@@ -13,8 +13,9 @@ import threading
 from pathlib import Path
 
 import pytest
+from lockhelpers import _holder, _probe, _reap
 
-from agent_manager import board, census, models
+from agent_manager import board, census, locks, models
 
 requires_brd = pytest.mark.skipif(
     shutil.which("brd") is None,
@@ -536,6 +537,27 @@ def test_reads_do_not_wait_for_the_board_write_lock(temp_board):
     assert outcome["card"].id == subtask
     assert outcome["node"].id == subtask
     assert [node.id for node in outcome["roots"]] == [subtask]
+
+
+@requires_brd
+def test_a_lone_set_status_refuses_while_another_process_holds_the_board_lock(
+    temp_board, monkeypatch
+):
+    # Spec X7 (card 43043f10): a single `set_status`, not only a rollup walk,
+    # takes the project's process-wide board lock before calling brd. With a
+    # zero timeout and a child process holding the flock, it raises and brd is
+    # never asked to write.
+    subtask = _add_card(temp_board, "Serialize board writes across processes")
+    monkeypatch.setattr(board.write_lock(temp_board), "_timeout", 0)
+    child = _holder(temp_board, "board")
+    try:
+        with pytest.raises(locks.LockTimeoutError):
+            board.set_status(subtask, "in_progress", repo_dir=temp_board)
+    finally:
+        _reap(child)
+
+    assert _brd_json(temp_board, "show", subtask)["status"] == "todo"
+    assert _probe(temp_board, "board") == "free"
 
 
 _STRESS_STATUSES = ("todo", "in_progress", "done")

@@ -37,6 +37,7 @@ from agent_manager import (
     dag,
     dispatch,
     integration,
+    locks,
     models,
     orchestrate,
     paths,
@@ -2587,8 +2588,23 @@ def _forbid_writes(monkeypatch) -> None:
 
 
 def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
-    """No run dir or projection, no worktree, no branch, no repo change."""
-    assert list(paths.data_dir().iterdir()) == []
+    """No run dir or projection, no worktree, no branch, no repo change.
+
+    `paths.data_dir()` holds nothing but process-wide lock files: a board
+    write in the test's own setup (`board.set_status`) takes the project's
+    board lock (spec X7) and so leaves its lock file under
+    `data_dir()/projects`, which is not a run left behind. Anything else there
+    -- a projection, a run directory, any stray file -- is.
+    """
+    data = paths.data_dir()
+    projects = data / "projects"
+    written = sorted(
+        str(entry.relative_to(data))
+        for entry in data.rglob("*")
+        if entry != projects
+        and not (entry.parent == projects and entry.suffix == ".lock")
+    )
+    assert written == []
     worktrees = [
         line
         for line in _git(project, "worktree", "list", "--porcelain").splitlines()
@@ -3198,8 +3214,11 @@ def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeyp
         cli.CliError("no milestone matches 'Milestone 3'"),
         board.BoardError("brd refused", argv=["brd", "tree"]),
         ValueError("not a card id: 'x'"),
+        # Spec X7: another process held a project lock past its timeout before
+        # the run started (e.g. `refresh_git`'s git lock).
+        locks.LockTimeoutError(Path("/data/projects/abc.git.lock"), 600.0),
     ],
-    ids=["CliError", "BoardError", "ValueError"],
+    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError"],
 )
 def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""

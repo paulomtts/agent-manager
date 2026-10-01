@@ -34,6 +34,7 @@ from agent_manager import (
     control,
     dag,
     dispatch,
+    locks,
     models,
     prompt,
     store as store_module,
@@ -1079,13 +1080,16 @@ HANDLED: tuple[type[BaseException], ...] = (
     board.BoardError,
     EngineError,
     ValueError,
+    locks.LockTimeoutError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
 `ValueError` is in the list for one concrete reason: `dag.short_id` raises a
 bare one for a card id that is not a UUID, and a typed `--card` must not come
-back as a traceback. Anything outside this tuple is a bug in this program and
-should crash loudly with its stack intact.
+back as a traceback. `locks.LockTimeoutError` is in it because a start refused
+while another `am` process held a project lock past its timeout (spec X7) is a
+refusal, not a bug; nothing below the CLI catches it. Anything outside this
+tuple is a bug in this program and should crash loudly with its stack intact.
 """
 
 

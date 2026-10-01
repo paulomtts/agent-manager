@@ -18,11 +18,12 @@ Nothing is cached: every parent is read fresh, because sibling work can change
 a shared ancestor between one level and the next.
 
 The whole call -- the card's write and every level of the walk -- runs under
-`board.WRITE_LOCK`, one critical section, because a rollup reads, then
-modifies, then writes. Concurrent calls on sibling subtasks in one process
+`board.write_lock(path)`, the project's process-wide board lock (spec X7), one
+critical section, because a rollup reads, then modifies, then writes.
+Concurrent calls on sibling subtasks, in this process or another `am` process,
 therefore run one after another, and the last one sees every sibling's final
 status. The lock is reentrant, so the nested `board.set_status` calls re-take
-it on the same thread.
+it on the same thread without a second flock.
 
 The first parameter is named `card`, not `card_id`, because the engine binds
 arguments by parameter name out of the run context and the context key holding
@@ -87,10 +88,12 @@ def set_status(
     `MAX_ANCESTRY_DEPTH` ancestors raises `board.BoardError`.
 
     All of it -- the card's write and the whole walk -- holds
-    `board.WRITE_LOCK`, so a concurrent call on a sibling cannot interleave
-    its reads and writes with this one. The lock is released by a `with`
-    block, so a `board.BoardError` from anywhere inside, the depth guard
-    included, never leaves it held.
+    `board.write_lock(path)`, so a concurrent call on a sibling, from any
+    thread or process, cannot interleave its reads and writes with this one.
+    The lock is released by a `with` block, so a `board.BoardError` from
+    anywhere inside, the depth guard included, never leaves it held. A
+    `locks.LockTimeoutError` while waiting for it propagates uncaught, before
+    any `brd` call.
 
     Idempotency is inherited, not implemented: `brd update --status` stores the
     value it is given, so a repeated identical call is another successful write
@@ -112,7 +115,7 @@ def set_status(
     process boundary, so it needs no pydantic model (`CLAUDE.md`).
     """
     path = Path(repo_dir) if repo_dir is not None else None
-    with board.WRITE_LOCK:
+    with board.write_lock(path):
         written = board.set_status(card, status, repo_dir=path)
 
         rolled_up: list[dict[str, str]] = []
