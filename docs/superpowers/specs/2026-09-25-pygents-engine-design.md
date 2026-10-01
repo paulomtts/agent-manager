@@ -302,7 +302,7 @@ Resume:
 Known limit, accepted: a phase's journal row is written inside its turn and the next
 checkpoint at the next `BEFORE_TURN`. A crash between the two re-runs that phase:
 phases are at-least-once. Inside a phase, git and the Plan-Hash trailers remain what
-`implement` resumes from.
+`implement` resumes from. Closed for agent phases by milestone 11 (`2026-09-27-exactly-once-design.md`); steps stay at-least-once by contract.
 
 ## 7. `task.js` on `TASK`
 
@@ -419,7 +419,11 @@ completion, parks at a phase boundary with a checkpoint, and returns
 ## 11. Deferred
 
 - The supervisor tree and `pause()`-based stop (orchestrator milestone).
-- Exactly-once phases (checkpoint on the next turn's `put`).
+- ~~Exactly-once phases (checkpoint on the next turn's `put`).~~ Delivered for agent
+  phases by milestone 11 (`2026-09-27-exactly-once-design.md`), by a different
+  mechanism: a floor saved with each checkpoint, and adoption of the recorded `ok`
+  attempt on resume, not a checkpoint on the next turn's `put`. Steps stay
+  at-least-once by contract.
 - Benchmarking the rewritten reviewer and critic prompts.
 - Upstream pygents fixes: early exit from `run()` raising `SafeExecutionError`;
   closure hooks colliding in `HookRegistry`. Done (pygents 0.7.0).
