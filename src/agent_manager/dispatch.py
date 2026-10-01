@@ -502,7 +502,9 @@ class AgentRunner:
 
         detail = verdict.detail or verdict.status
         self._record_phase(phase, "failed", started_at, self.clock(), detail)
-        raise AgentPhaseFailed(phase.name, outcome=verdict.status, detail=detail)
+        raise AgentPhaseFailed(
+            phase.name, outcome=verdict.status, detail=detail, result=verdict.result
+        )
 
     def _attempt(
         self,
@@ -579,7 +581,11 @@ class AgentRunner:
                 self.warnings,
             )
             if failure is not None:
-                verdict = failure
+                # Keep the dispatch's own result: a gate failing does not mean
+                # nothing was produced, and the agent's own explanation (e.g.
+                # review's `unresolved_blockers`) is read off this result by
+                # `comments.agent_reason` once the phase escalates.
+                verdict = replace(failure, result=verdict.result)
         usage = _usage(target.adapter, outcome)
         self._record_attempt(
             phase,

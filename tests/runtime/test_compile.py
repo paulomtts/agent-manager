@@ -320,6 +320,28 @@ async def test_agent_phase_failure_escalates(store):
 
     assert info.value.phase == "review"
     assert info.value.detail == "blocked by critic"
+    assert info.value.result is None
+
+
+async def test_agent_phase_failure_s_result_reaches_escalated(store):
+    # `comments.agent_reason` reads `unresolved_blockers` off exactly this
+    # field, via `summary.results[failed_phase]` -- `_run` sets that from
+    # `Escalated.result`, since a failed phase's own `ContextItem` is never
+    # yielded.
+    def runner(phase, table, rendered):
+        raise AgentPhaseFailed(
+            "review",
+            outcome="gate_failed",
+            detail="blocked by critic",
+            result={"unresolved_blockers": ["the thing is broken"]},
+        )
+
+    wf = Workflow("t", (AgentPhase("review", "critic", (), None), Step("b", _noop)))
+
+    with pytest.raises(C.Escalated) as info:
+        await _drive(wf, _deps(wf, store, runner))
+
+    assert info.value.result == {"unresolved_blockers": ["the thing is broken"]}
 
 
 async def test_an_unexpected_runner_error_escalates_with_the_rendered_error(store):

@@ -40,11 +40,18 @@ bounds a hung git or test-suite call without cutting a slow suite short."""
 
 
 class Escalated(Exception):
-    """A phase ended the subtask: `.phase` names it, `.detail` says why."""
+    """A phase ended the subtask: `.phase` names it, `.detail` says why.
 
-    def __init__(self, phase: str, detail: str | None) -> None:
+    `.result` is the agent's own decoded payload when the phase produced one
+    before a gate failed it (`AgentPhaseFailed.result`); `None` for every other
+    escalation. `_run` injects it into `summary.results[phase]`, since a failed
+    phase's `ContextItem` is never yielded -- only a successful phase's is.
+    """
+
+    def __init__(self, phase: str, detail: str | None, result: Any = None) -> None:
         self.phase = phase
         self.detail = detail
+        self.result = result
         super().__init__(f"{phase}: {detail}")
 
 
@@ -172,7 +179,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 )
                 yield holder["compiled"].turn_for(p.on_fail.phase, loop + 1)
                 return
-            raise Escalated(phase, failure.detail) from failure
+            raise Escalated(phase, failure.detail, result=failure.result) from failure
         except Exception as error:
             # Total: an exception escaping the walk would leave the subtask
             # recorded `started` forever.

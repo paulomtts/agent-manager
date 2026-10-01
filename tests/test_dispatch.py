@@ -918,6 +918,24 @@ def test_a_gate_failure_outside_retry_on_is_not_retried(store, tmp_path, worktre
     assert len(launcher.calls) == 1
 
 
+def test_a_gate_failure_keeps_the_dispatch_s_own_result(store, tmp_path, worktree):
+    # The result a gate judges is still what the agent produced: losing it
+    # when the gate fails the phase (as the pre-fix code did, replacing the
+    # whole Verdict) left `comments.agent_reason` with nothing to read on a
+    # real escalation, since a failed phase's ContextItem is never yielded.
+    workflow = _workflow(
+        AGENT_DOCUMENT, {"output_gate": lambda result: {"blocked": "exploration"}}
+    )
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert caught.value.result == {"summary": "explored the tree", "ok": True}
+
+
 def test_a_gate_that_raises_stops_after_one_dispatch(store, tmp_path, worktree):
     # Review Focus: fatal beats retry.on, which lists gate_failed here.
     def output_gate(result):
