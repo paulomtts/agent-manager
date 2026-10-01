@@ -5334,3 +5334,87 @@ def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked
     assert f"escalated: [[{a1}]] at review" in body
     assert f"parked: [[{b1}]]" in body
     assert f"next: `am resume {run_id}`" in body
+
+
+@dataclass
+class WithResults:
+    """Wraps a fake driver and merges canned phase results into a card's
+    summary, as the real walk returns them, so `agent_reason` has its field."""
+
+    inner: Any
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    async def __call__(self, **kwargs: Any) -> cli.SubtaskDrive:
+        drive = await self.inner(**kwargs)
+        extra = self.results.get(kwargs["card"].id)
+        if extra is None:
+            return drive
+        summary = replace(drive.summary, results={**drive.summary.results, **extra})
+        return replace(drive, summary=summary)
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(project):
+    """Spec test 2: the escalated subtask gets phase, detail and the agent's
+    one reason field (quoted, `[[` broken); parked b1, pending c1 and every
+    story get nothing."""
+    shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    b1, b2 = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    pair = asyncio.Barrier(2)
+    driver = WithResults(
+        GatedDriver(
+            outcomes={a1: ("review", "reviewer found a blocker")},
+            gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+        ),
+        results={
+            a1: {"review": {"unresolved_blockers": ["the [[parser]] still drops input", "no test"]}}
+        },
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, a1)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{a1}/escalated:")
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · escalated · run {run_id}\n")
+    assert "phase: review" in body
+    assert "detail: reviewer found a blocker" in body
+    assert 'reason: "the [ [parser]] still drops input; no test"' in body
+    assert f"next: `am resume {run_id}`" in body
+    for quiet in (story_a, story_b, b1, b2, story_c, c1):
+        assert _comments(project, quiet) == [], quiet
+    assert len(_comments(project, shape["milestone"])) == 1
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_second_life_escalating_at_the_same_phase_adds_a_second_escalation_comment(project):
+    """Spec test 4 (Review Focus 3 of the card); Review Focus 4 here: no
+    review result at all gives no `reason:` line and no crash."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, milestone, FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+
+    again = _resume(project, run_id, FakeDriver(outcomes={a1: ("review", "still")}))
+
+    assert again["escalated"] is True, again
+    found = _comments(project, a1)
+    keys = _keys(found)
+    assert len(keys) == 2 and len(set(keys)) == 2, keys
+    assert all(key.startswith(f"{run_id}/{a1}/escalated:") for key in keys)
+    assert "detail: boom" in found[0].body
+    assert "detail: still" in found[1].body
+    assert all("reason:" not in comment.body for comment in found)
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys

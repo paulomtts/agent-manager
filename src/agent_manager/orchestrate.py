@@ -957,6 +957,7 @@ async def lane(
     plan: SupervisorPlan,
     store: Store,
     run_id: str,
+    lease_token: str,
     root: Path,
     drive: Driver,
     commands: Sequence[str],
@@ -1006,6 +1007,9 @@ async def lane(
     On a resume (`plan.resuming`, card 54e4ec29) the subtask's checkpoint is
     `plan.checkpoints`' and the lenient relaunch lookup is never read; a
     merged base gets its resolver's checkpoint the same way.
+
+    `lease_token` is this life's `control.Lease.token`; it keys the escalation
+    comment, so a later life escalating at the same phase comments again.
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
@@ -1141,6 +1145,25 @@ async def lane(
                     stop.trigger(story.id)
                     store.record_subtask(story.id, row.model_copy(update={"status": "escalated"}))
                     store.record_story(story_row.model_copy(update={"status": "escalated"}))
+                    # Board-comments B2: keyed by this life's lease token, so a
+                    # second life escalating at the same phase comments again.
+                    warnings.extend(
+                        await post_comment_async(
+                            store,
+                            root,
+                            comments.compose_escalated(
+                                run_id=run_id,
+                                card_id=subtask.id,
+                                token=lease_token,
+                                failed_phase=summary.failed_phase,
+                                detail=summary.detail,
+                                reason=comments.agent_reason(
+                                    summary.results, summary.failed_phase
+                                ),
+                            ),
+                            run_id=run_id,
+                        )
+                    )
                     raise LaneEscalated(
                         outcome(
                             "escalated",
@@ -1227,6 +1250,7 @@ async def supervise(
     *,
     store: Store,
     run_id: str,
+    lease_token: str,
     root: Path,
     drive: Driver,
     commands: Sequence[str],
@@ -1281,6 +1305,7 @@ async def supervise(
                         plan=plan,
                         store=store,
                         run_id=run_id,
+                        lease_token=lease_token,
                         root=root,
                         drive=drive,
                         commands=commands,
@@ -1528,6 +1553,7 @@ def run_milestone(
                         ),
                         store=store,
                         run_id=run_id,
+                        lease_token=lease.token,
                         root=root,
                         drive=drive,
                         commands=list(commands),
