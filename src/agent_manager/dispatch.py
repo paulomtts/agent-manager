@@ -63,11 +63,7 @@ def next_attempt(run_id: str, card: str, phase: str) -> int:
     attempts a previous process made, and overwriting one would destroy the
     prompt, result and log that are the only evidence of what happened.
     """
-    card_dir = paths.run_dir(run_id) / card
-    attempt = 1
-    while (card_dir / f"{phase}.{attempt}").exists():
-        attempt += 1
-    return attempt
+    return paths.highest_attempt(run_id, card, phase) + 1
 
 
 def with_feedback(

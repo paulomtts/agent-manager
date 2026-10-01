@@ -71,6 +71,28 @@ def test_attempt_numbers_are_per_phase(data_home):
     assert dispatch.next_attempt(RUN_ID, CARD, "implement") == 1
 
 
+def test_next_attempt_is_one_past_paths_highest_attempt(data_home, monkeypatch):
+    seen = []
+
+    def highest(run_id, card, phase):
+        seen.append((run_id, card, phase))
+        return 41
+
+    monkeypatch.setattr(paths, "highest_attempt", highest)
+
+    assert dispatch.next_attempt(RUN_ID, CARD, "explore") == 42
+    assert seen == [(RUN_ID, CARD, "explore")]
+
+
+@pytest.mark.parametrize("existing", [0, 1, 3])
+def test_next_attempt_equals_highest_attempt_plus_one_on_disk(data_home, existing):
+    for n in range(1, existing + 1):
+        paths.attempt_dir(RUN_ID, CARD, "explore", n)
+
+    assert paths.highest_attempt(RUN_ID, CARD, "explore") == existing
+    assert dispatch.next_attempt(RUN_ID, CARD, "explore") == existing + 1
+
+
 def test_the_attempt_directory_is_outside_the_worktree(data_home):
     worktree = data_home / "repo" / ".claude" / "worktrees" / "m1" / "task-bf8e415b"
     worktree.mkdir(parents=True)
