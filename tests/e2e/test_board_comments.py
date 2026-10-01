@@ -51,6 +51,129 @@ def _resume(root: Path, run_id: str):
     )
 
 
+HELD_PHASE = "plan"
+"""The phase whose launch is held while the cancel is sent."""
+
+WAIT = 120.0
+"""Seconds any bounded wait gives up after. It only bounds a broken run."""
+
+
+def _latest_run_id(root: Path) -> str:
+    """The run id, read on a second connection: the "other process" of live-control §7."""
+    conn = store.open_db(cli.resolve_repo_dir(root))
+    try:
+        run_id = store.latest_run_id(conn)
+    finally:
+        conn.close()
+    assert run_id is not None
+    return run_id
+
+
+def _run_status(root: Path, run_id: str) -> str:
+    conn = store.open_db(cli.resolve_repo_dir(root))
+    try:
+        run = store.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None, run_id
+    return run.status
+
+
+def _attempt_of(stdout_path: Path) -> tuple[str, str]:
+    """(card id, phase) of the attempt a launch belongs to, from
+    `<run dir>/<card>/<phase>.<n>/stdout.log`; the fake is never asked."""
+    attempt = Path(stdout_path).parent
+    return attempt.parent.name, attempt.name.rsplit(".", 1)[0]
+
+
+def _hold(
+    monkeypatch,
+    card: str,
+    phase: str,
+    entered: threading.Event,
+    release: threading.Event,
+) -> None:
+    """Hold `card`'s `phase` launch once: announce it, wait for `release`, then launch.
+
+    `cli.default_runner_factory` reads `cli.run_direct` at call time; the
+    launch runs in a `to_thread` worker, so the control watcher stays free.
+    One-shot, and undone with the test's function-scoped `monkeypatch`.
+    """
+    real = launcher.run_direct
+    armed = {"on": True}
+
+    def holding(argv, *, cwd, timeout, stdout_path, on_spawn=None):
+        if armed["on"] and _attempt_of(stdout_path) == (card, phase):
+            armed["on"] = False
+            entered.set()
+            if not release.wait(WAIT):
+                raise AssertionError(f"{card}'s {phase} launch was never released")
+        return real(
+            argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path, on_spawn=on_spawn
+        )
+
+    monkeypatch.setattr(cli, "run_direct", holding)
+
+
+def _signal_when_applied(monkeypatch, applied: threading.Event) -> None:
+    """Set `applied` once the running process has applied a control request
+    (a non-empty return from `control.apply_pending`)."""
+    real = control.apply_pending
+
+    def applying(*args: Any, **kwargs: Any):
+        rows = real(*args, **kwargs)
+        if rows:
+            applied.set()
+        return rows
+
+    monkeypatch.setattr(control, "apply_pending", applying)
+
+
+def _in_background(work: Callable[[], Any]) -> tuple[threading.Thread, dict[str, Any]]:
+    """Run `work` on a daemon thread; its result or error lands in the box."""
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = work()
+        except BaseException as error:  # surfaced by the caller, never swallowed
+            box["error"] = error
+
+    worker = threading.Thread(target=target, name="am-run-milestone", daemon=True)
+    worker.start()
+    return worker, box
+
+
+def _control_while_held(
+    root: Path,
+    milestone: str,
+    command: str,
+    *,
+    run_milestone_cli,
+    entered: threading.Event,
+    release: threading.Event,
+    applied: threading.Event,
+):
+    """Run the milestone in a worker, send `am <command>` while the hold is in,
+    and finish it. Returns (run id, the control command's `data`, the run's
+    `CliRunner` result). `release` is set in a `finally`, so a failed
+    assertion never leaves the worker hanging."""
+    worker, box = _in_background(lambda: run_milestone_cli(root, milestone))
+    try:
+        assert entered.wait(WAIT), "the held launch never arrived"
+        run_id = _latest_run_id(root)
+        requested = CliRunner().invoke(cli.app, [command, run_id, "--repo-dir", str(root)])
+        assert requested.exit_code == 0, (requested.output, requested.exception)
+        control_data = _envelope(requested)
+        assert applied.wait(WAIT), f"the running process never applied the {command}"
+    finally:
+        release.set()
+        worker.join(WAIT)
+    assert not worker.is_alive(), "the milestone run never finished after release"
+    assert "error" not in box, box.get("error")
+    return run_id, control_data, box["result"]
+
+
 def _envelope(result) -> dict[str, Any]:
     envelope = json.loads(result.stdout)
     assert set(envelope) == {"ok", "data"}, envelope
@@ -252,3 +375,67 @@ def test_escalation_then_resume_keeps_escalation_and_appends_resumed_done(
 
     every_key = [_key_of(comment) for card in _all_cards(milestone_board) for comment in _on(root, card)]
     assert len(every_key) == len(set(every_key)), every_key
+
+
+def test_cancel_comments_in_progress_subtasks_and_milestone(
+    milestone_board, run_milestone_cli, monkeypatch
+):
+    """Spec scenario 3: held in a2's plan and cancelled from another
+    connection. a1 (done) keeps only its done comment, a2 (in progress) gets
+    one cancelled comment, b1 and c1 (never started) get nothing, and the
+    milestone gets one cancelled run-end."""
+    root = milestone_board["root"]
+    milestone = milestone_board["milestone"]
+    branches = milestone_board["branches"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    (b1,) = milestone_board["subtasks"]["B"]
+    (c1,) = milestone_board["subtasks"]["C"]
+    entered, release, applied = threading.Event(), threading.Event(), threading.Event()
+    _hold(monkeypatch, a2, HELD_PHASE, entered, release)
+    _signal_when_applied(monkeypatch, applied)
+
+    run_id, requested, first = _control_while_held(
+        root,
+        milestone,
+        "cancel",
+        run_milestone_cli=run_milestone_cli,
+        entered=entered,
+        release=release,
+        applied=applied,
+    )
+
+    assert requested["effective"] == "cancel", requested
+    assert first.exit_code == 0, (first.output, first.exception)
+    cancelled = _envelope(first)
+    assert cancelled["cancelled"] is True, cancelled
+    assert cancelled["run_id"] == run_id
+    assert _run_status(root, run_id) == "cancelled"
+
+    (a1_done,) = _on(root, a1)
+    _assert_shape(a1_done, outcome="done", run_id=run_id, key=comments.key(run_id, a1, "done"))
+
+    (a2_cancelled,) = _on(root, a2)
+    lines = _assert_shape(
+        a2_cancelled,
+        outcome="cancelled",
+        run_id=run_id,
+        key=comments.key(run_id, a2, "cancelled"),
+    )
+    assert f"branch: {branches[a2]}" in lines, a2_cancelled.body
+    assert f"relaunch: `am run --milestone {milestone}`" in lines, a2_cancelled.body
+
+    for card in (b1, c1):
+        assert _on(root, card) == [], card
+    for story in milestone_board["stories"].values():
+        assert _on(root, story) == [], story
+
+    (end,) = _on(root, milestone)
+    end_lines, _key = _assert_scoped(
+        end,
+        outcome="cancelled",
+        run_id=run_id,
+        prefix=comments.key(run_id, milestone, "run-end:"),
+    )
+    assert "done: 1 of 4" in end_lines, end.body
+    assert f"parked: [[{a2}]]" in end_lines, end.body
+    assert f"next: `am run --milestone {milestone}`" in end_lines, end.body
