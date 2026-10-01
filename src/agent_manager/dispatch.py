@@ -38,7 +38,7 @@ from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.runtime import bridge
-from agent_manager.store import Store
+from agent_manager.store import JournalError, Store
 from agent_manager.workflow import phases as phase_model
 
 RESULT_NAME = "result.json"
@@ -167,6 +167,39 @@ class Verdict:
     result: Any = None
     detail: str | None = None
     fatal: bool = False
+
+
+@dataclass(frozen=True)
+class Adopted:
+    """An earlier attempt's result, reused instead of dispatching again.
+
+    Internal-only state, so a dataclass (CLAUDE.md). `result` is the
+    re-validated JSON-mode dump (or `None` for a result-less phase), `attempt`
+    the recorded attempt number it came from, `source_run` the run whose
+    journal recorded it.
+    """
+
+    result: Any
+    attempt: int
+    source_run: str
+
+
+def _recorded_phase(
+    run: models.Run, card_id: str, phase_name: str
+) -> models.PhaseRun | None:
+    """This card's phase `phase_name` in `run`, under whichever story holds it.
+
+    The source run's story structure is not assumed to match the current
+    run's, so every story is searched.
+    """
+    for story in run.stories:
+        for subtask in story.subtasks:
+            if subtask.card_id != card_id:
+                continue
+            for recorded in subtask.phases:
+                if recorded.name == phase_name:
+                    return recorded
+    return None
 
 
 def build_dispatch(
@@ -432,17 +465,7 @@ class AgentRunner:
         """
         role = load_role(phase.role, root=self.role_root)
         target = resolve_target(role, self.harness_map, self.adapters, phase=phase.name)
-        # A declared phase carries its result model as the class itself, which
-        # is used as-is; a result given by name is looked up in
-        # `result_models`, and a name the table lacks is refused here.
-        if phase.result is None:
-            model = None
-        elif isinstance(phase.result, type):
-            model = phase.result
-        else:
-            model = results.resolve_result_model(
-                phase.result, self.result_models, phase=phase.name
-            )
+        model = self._result_model(phase)
         cwd = self._worktree(context, phase.name)
 
         started_at = self.clock()
@@ -610,6 +633,99 @@ class AgentRunner:
 
     def _record_attempt(self, phase: phase_model.AgentPhase, attempt: models.Attempt) -> None:
         self.store.record_attempt(self.story_id, self.card_id, phase.name, attempt)
+
+    def _result_model(self, phase: phase_model.AgentPhase) -> type[BaseModel] | None:
+        """The model this phase's result is validated against, or `None`.
+
+        A declared phase carries its result model as the class itself, which
+        is used as-is; a result given by name is looked up in
+        `result_models`, and a name the table lacks is refused here.
+        """
+        if phase.result is None:
+            return None
+        if isinstance(phase.result, type):
+            return phase.result
+        return results.resolve_result_model(
+            phase.result, self.result_models, phase=phase.name
+        )
+
+    def adopt(
+        self,
+        phase: phase_model.AgentPhase,
+        context: Mapping[str, Any],
+        *,
+        source_run: str,
+        floor: int,
+    ) -> Adopted | None:
+        """Reuse `source_run`'s recorded `ok` attempt instead of dispatching.
+
+        Attempts are read from the source run's journal, never from the
+        `attempts` projection, and only attempts numbered above `floor` with
+        status `ok` qualify: an orphaned `started` one, even with a valid
+        file on disk, never does. The highest such attempt's result file is
+        re-read and its gates re-run against the resumed context. Nothing to
+        adopt returns `None` silently; a recorded result that no longer holds
+        up declines with a warning and writes no row. Only an adoption records
+        anything: this phase `done`, in the current run.
+        """
+        model = self._result_model(phase)
+        try:
+            run = self.store.replay_journal(source_run)
+        except (JournalError, ValidationError) as error:
+            return self._decline(
+                phase, None, source_run,
+                f"its journal cannot be read: {_render_error(error)}",
+            )
+        found = _recorded_phase(run, self.card_id, phase.name)
+        if found is None:
+            return None
+        candidates = [
+            attempt
+            for attempt in found.attempts
+            if attempt.n > floor and attempt.status == "ok"
+        ]
+        if not candidates:
+            return None
+        attempt = max(candidates, key=lambda candidate: candidate.n)
+        verdict = read_result(None if model is None else attempt.result_path, model)
+        if verdict.status != "ok":
+            return self._decline(
+                phase, attempt.n, source_run, verdict.detail or verdict.status
+            )
+        failure = evaluate_gates(
+            phase, gate_values(context, phase.name, verdict.result), self.warnings
+        )
+        if failure is not None:
+            return self._decline(
+                phase, attempt.n, source_run, failure.detail or failure.status
+            )
+        self._record_phase(
+            phase, "done", found.started_at or self.clock(), self.clock(), None
+        )
+        self.warnings.append(
+            f"phase {phase.name!r} was not dispatched again: attempt {attempt.n} of "
+            f"run {source_run} had already succeeded (result reused)"
+        )
+        return Adopted(verdict.result, attempt.n, source_run)
+
+    def _decline(
+        self,
+        phase: phase_model.AgentPhase,
+        n: int | None,
+        source_run: str,
+        why: str,
+    ) -> None:
+        """Warn that a recorded attempt is not reused; write nothing.
+
+        `n` is `None` when the journal could not be read, before any attempt
+        was found; the number is then shown as `?`.
+        """
+        shown = "?" if n is None else n
+        self.warnings.append(
+            f"phase {phase.name!r}: attempt {shown} of run {source_run} was not "
+            f"reused ({why}); dispatching again"
+        )
+        return None
 
 
 def _usage(adapter: HarnessAdapter, outcome: Outcome) -> Usage | None:
