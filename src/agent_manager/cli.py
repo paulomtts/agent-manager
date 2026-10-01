@@ -32,6 +32,7 @@ import typer
 from agent_manager import (
     board,
     census,
+    comments,
     control,
     dag,
     dispatch,
@@ -1569,6 +1570,9 @@ def _resume_from_checkpoint(
     took over is reported under `took_over`. The walk runs under
     `control.controlled`. A pause parks it `stopped`; a cancel parks it and
     records the run `cancelled` (`card_run_status`).
+
+    Once the checkpoint is accepted, the run's pending board comments are
+    flushed (board-comments B7) and their warnings lead the payload's.
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1591,6 +1595,10 @@ def _resume_from_checkpoint(
             phase = checkpoint_resume_phase(
                 checkpoint, card_id=subtask.card_id, run_id=run.id
             )
+            # Board-comments B7: this run's leftover comments go out under this
+            # life's lease, after every refusal and before the walk goes on; a
+            # board failure is a warning, never a refusal (B8).
+            flushed = comments.flush(store, root, run_id=run.id)
             for orphan, attempt in orphans:
                 store.record_attempt(
                     story.card_id,
@@ -1646,7 +1654,7 @@ def _resume_from_checkpoint(
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": drive.warnings,
+            "warnings": [*flushed, *drive.warnings],
             "resumed_from": phase,
             "discarded_attempts": [
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans

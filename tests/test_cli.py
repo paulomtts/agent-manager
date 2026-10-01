@@ -4529,6 +4529,48 @@ def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards)
 
 @requires_git
 @requires_brd
+def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
+    project, cards
+):
+    """Board-comments B7 (card 65ed3c70): a row the killed life queued but
+    never posted is on the card before the resumed walk's first phase."""
+    run_id = _crash_pygents(project, cards, "plan")
+    key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
+    body = f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}"
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.enqueue_comment(
+            run_id=run_id,
+            card_id=cards["subtask"],
+            key=key,
+            body=body,
+            now=datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        opened.close()
+    inner = _resume_factory()
+    on_the_card_at_walk_start: list[list[str]] = []
+
+    def factory(**kwargs):
+        if not on_the_card_at_walk_start:
+            on_the_card_at_walk_start.append(
+                [c.body for c in board.comment_list(cards["subtask"], repo_dir=project)]
+            )
+        return inner(**kwargs)
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=factory)
+
+    assert payload["status"] == "done"
+    assert set(payload) == RESUME_KEYS
+    (seen,) = on_the_card_at_walk_start
+    assert [b.rstrip().endswith(f"am-key: {key}") for b in seen] == [True]
+    found = board.comment_list(cards["subtask"], repo_dir=project)
+    assert [c.body.rstrip().endswith(f"am-key: {key}") for c in found] == [True]
+    assert found[0].author == "am"
+
+
+@requires_git
+@requires_brd
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     project, cards, monkeypatch
 ):
