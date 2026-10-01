@@ -19,7 +19,7 @@ writes for the brief's `## branch`; the implement-only rendezvous
 (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
 wait for other lanes and changes nothing it writes; `RESOLVER_ENV`, which
 only makes the resolve phase leave the merge it was given unfinished while
-still claiming `resolved`, so git has to catch the lie; and
+still claiming `resolved`, so git has to catch the lie;
 `CRITIC_BLOCKS_ENV`, a budget file that makes a critic block a set number of
 times with a fixed reason; and the hold (`HOLD_DIR_ENV` / `HOLD_PHASE_ENV`),
 which only parks one phase of the card the brief's result path names until a
