@@ -4,12 +4,18 @@
 A test that opens a store or a run directory without pointing `XDG_DATA_HOME`
 somewhere temporary writes into the real directory, and can read real run data.
 The guard below fails the session if the real directory changed during it.
+
+It also gives directory-conventional tests a default tier marker: items under
+`tests/e2e/` get `e2e_fake` and items under `tests/steps/` get `git`, unless the
+item already carries a tier marker anywhere on its marker chain. The hook only
+adds markers; the addopts `-m` expression in pyproject.toml does the deselecting.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from collections.abc import Iterable
+from pathlib import Path, PurePath
 
 import pytest
 
@@ -70,3 +76,37 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         if reporter is not None:
             reporter.write_line(f"DATA-DIR GUARD FAILED: {message}", red=True)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+TESTS_DIR = Path(__file__).resolve().parent
+
+TIER_MARKERS = frozenset({"git", "brd", "e2e_fake", "soak", "e2e"})
+
+_DIRECTORY_TIERS = {"e2e": "e2e_fake", "steps": "git"}
+
+
+def relative_to_tests(path: os.PathLike[str] | str, tests_dir: Path = TESTS_DIR) -> PurePath | None:
+    """`path` relative to `tests_dir`, or None when it lies outside it.
+
+    Resolved first, so neither the invocation cwd nor the rootdir matters.
+    """
+    try:
+        return Path(path).resolve().relative_to(tests_dir)
+    except ValueError:
+        return None
+
+
+def default_tier_marker(rel_path: PurePath, existing: Iterable[str]) -> str | None:
+    """The tier marker an item at `rel_path` (relative to tests/) should get.
+
+    None when its first directory is neither `e2e` nor `steps`, or when
+    `existing` (every marker name on the item's chain) already holds a tier.
+    """
+    if len(rel_path.parts) < 2:
+        return None
+    tier = _DIRECTORY_TIERS.get(rel_path.parts[0])
+    if tier is None:
+        return None
+    if TIER_MARKERS.intersection(existing):
+        return None
+    return tier
