@@ -427,6 +427,137 @@ A recorded result that no longer holds up is dispatched again, with one warning 
 
 Exactly-once covers am's dispatch of an agent phase, not what the harness did. The harness's own effects are never transactional: commits, files written in the worktree, or anything else an agent did before the kill stay as they are, whether the phase is then adopted or dispatched again. A phase that is dispatched again finds that work already in its worktree; `implement`, for example, resumes from git and the `Plan-Hash` trailers.
 
+## What the board records
+
+`am` leaves a short comment on a `brd` card when something final happens to it: a subtask finishes, escalates or is cancelled, a merged base fails, or a run ends. Code writes every comment, after the outcome is already recorded in the run's store. The board is a log for people to read; `am` never reads it back.
+
+| Event | Card that gets the comment |
+|---|---|
+| A subtask is done | the subtask |
+| A subtask escalates | the subtask |
+| A cancel parks a subtask partway through a milestone run | that subtask |
+| A merged base fails | the story the base roots |
+| A milestone run ends: done, escalated, paused or cancelled | the milestone card |
+| A `--card` run ends | the subtask only, with the done, escalated or cancelled comment above. There is no milestone card. |
+
+Nothing else is posted: no comment when a run or phase starts, none for retries, revision loops or gate warnings, none for a subtask parked because another card escalated (the run-end comment lists it), and none for a pause on a subtask card, because a paused subtask is resumed, not closed. A lane stopped while its merged base was still being built names no subtask and gets no cancel comment. `am resume` of a `--card` run composes no outcome comment of its own: it only sends comments an earlier life left unsent.
+
+### What each comment looks like
+
+Every comment is plain text. The first line is `am · <outcome> · run <run-id>`, commands are in backticks, real card ids are `[[id]]` backlinks, and the last line is `am-key: <key>`.
+
+A subtask that is done lists only facts. Each line is there only when the run recorded it:
+
+```
+am · done · run <run-id>
+branch: m12/task-<slug>-<short-id>
+commits: 3
+Plan-Hash: <plan-hash>
+spec: docs/superpowers/specs/<slug>-design.md
+plan: docs/superpowers/plans/<slug>.md
+verified: `uv run pytest`
+review findings fixed: 2
+am-key: <run-id>/<subtask-id>/done
+```
+
+When a milestone run picked the subtask up from a checkpoint, a second line `(resumed at <phase>)` follows the first. A `--card` run never adds it.
+
+A subtask that escalated:
+
+```
+am · escalated · run <run-id>
+phase: review
+detail: review blockers: 1 unresolved
+reason: "tests do not cover the empty list"
+next: `am resume <run-id>`
+why: `am logs <run-id> <subtask-id> --phase review`
+am-key: <run-id>/<subtask-id>/escalated:<lease-token>
+```
+
+A subtask a cancel parked. On a `--card` run the relaunch is `am run --card <subtask-id>`:
+
+```
+am · cancelled · run <run-id>
+stopped before: implement
+branch: m12/task-<slug>-<short-id>
+relaunch: `am run --milestone <milestone-id>`
+am-key: <run-id>/<subtask-id>/cancelled
+```
+
+A merged base that failed, on the story it roots:
+
+```
+am · base failed · run <run-id>
+base branch: m12/base-<story-short-id>
+detail: the merged base m12/base-<story-short-id> failed its verification in <worktree>: <what failed>
+am-key: <run-id>/<story-id>/base-failed
+```
+
+The end of a milestone run, on the milestone card. A clean run:
+
+```
+am · done · run <run-id>
+done: 5 of 5
+integrated: m12-integrate
+next: `git merge m12-integrate`
+am-key: <run-id>/<milestone-id>/run-end:<lease-token>
+```
+
+An escalated run names the escalated card and phase and the parked cards instead:
+
+```
+am · escalated · run <run-id>
+done: 2 of 5
+escalated: [[<subtask-id>]] at review
+parked: [[<other-subtask-id>]]
+next: `am resume <run-id>`
+am-key: <run-id>/<milestone-id>/run-end:<lease-token>
+```
+
+A paused run's `next:` line is `am resume <run-id>`. A cancelled run's is `am run --milestone <milestone-id>`, and so is an [Integrate](#integrate) escalation's, which also adds an `integrate failed at …` line.
+
+### Who writes them
+
+The author is always `am`. Code builds every body from what the run recorded; no agent writes to the board. Agent text gets in only through three failure fields, and only on an escalation, as the `reason:` line:
+
+- `validate_spec` and `validate_plan`: the critic's `reason`;
+- `implement`: `blocked_reason`;
+- `review`: `unresolved_blockers`, joined with `; `.
+
+That text is in double quotes, and every `[[` in it becomes `[ [`, so it cannot create a backlink. A comment is at most 1,500 characters. When a body would be longer, the agent text is cut first and ends with a marker that names where to read the rest:
+
+```
+reason: "xxxx…xxxx" … (truncated; see `am logs <run-id> <subtask-id> --phase implement`)
+```
+
+Every other comment's marker says `am status <run-id>`. If cutting the agent text is not enough, or there is none, the field lines are cut instead. The first line, an escalation's `next:` and `why:` lines and the `am-key:` line are never cut.
+
+### The `am-key` line
+
+Every comment's last line is `am-key: <run-id>/<card-id>/<event>`, where the event is `done`, `escalated:<lease-token>`, `cancelled`, `base-failed` or `run-end:<lease-token>`. Before posting, `am` lists the card's comments and skips the post when one already ends with that line. So a crash between posting and recording, a replayed phase, or a resume never posts the same comment twice. Escalations and run ends carry the lease token of the process that ran them, so each life of a resumed milestone run posts its own escalation and its own run end. A subtask's `done` and `cancelled` happen once per run.
+
+### When the board is down
+
+Comments are best-effort. Each one is queued in the run's store after the outcome is recorded, then posted with `brd comment add <card> - --author am`, the body on stdin. If `brd` fails or the board lock times out, nothing about the run changes: it does not escalate, park or change status. The run's report gets one warning and the comment stays queued:
+
+```
+board comment <key> on card <card-id> not posted (attempt 1 of 3), will retry: <error>
+```
+
+Queued comments are sent again right after the next comment on the same card is queued, at the start of every milestone run or `am resume` (every run's queued comments on the milestone's cards), and at the start of `am resume` of a `--card` run (that run's own). After 3 failed attempts a comment is given up, with one last warning:
+
+```
+board comment <key> on card <card-id> abandoned after 3 failed attempts: <error>
+```
+
+### Nothing is deleted
+
+A card's thread only grows. An escalation comment stays after a later resume finishes the subtask and appends its `done` comment with `(resumed at <phase>)`. `am` never edits, replaces or deletes a comment, and never reads one back to decide anything: the run's store, not the board, is the record.
+
+#### Not there yet
+
+Comments from runs of leave-me-alone's orchestrator, feeding earlier comments into a later run's prompts, deleting or superseding outdated comments, and issues opened on escalation do not exist. See section 7 of the [board-comments addendum](docs/superpowers/specs/2026-09-29-board-comments-design.md#7-deferred) for everything deferred.
+
 ## Develop
 
 ```bash
