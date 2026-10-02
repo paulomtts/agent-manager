@@ -8144,3 +8144,67 @@ def test_watch_follow_tolerates_a_journal_that_disappears(tmp_path, monkeypatch)
     assert lines[0] == _hello(tmp_path)
     # Seq 1 is not repeated: the run's cursor outlived the missing file.
     assert lines[1:] == backlog + recreated[1:]
+
+
+def test_watch_follow_mid_stream_corruption_ends_stream_with_stderr_message(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    backlog = _write_watch_journal(tmp_path, "run-a", [1])
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    appended: list[dict[str, Any]] = []
+
+    def append_second() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [2]))
+
+    def corrupt_third() -> None:
+        # Newline-terminated, so a corrupt line rather than a torn tail.
+        _append_watch_journal(tmp_path, "run-a", [], tail="not json\n")
+
+    result, sleeps = _watch_follow(
+        monkeypatch,
+        "run-a",
+        actions=[append_second, corrupt_third, lambda: None],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert len(sleeps) == 2  # the stream ended on the corrupt poll
+    assert _stream(result) == [_hello(tmp_path), *backlog, *appended]
+    message = result.stderr.strip()
+    assert "\n" not in message
+    assert f"{journal}:3:" in message
+
+
+def test_watch_follow_ctrl_c_exits_zero_quietly(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    backlog = _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    def press_ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    result, _ = _watch_follow(monkeypatch, "run-a", actions=[press_ctrl_c])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [_hello(tmp_path), *backlog]
+
+
+def test_watch_follow_closed_pipe_exits_zero_quietly(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+    real_emit = cli._emit_stream_line
+    emitted: list[Any] = []
+
+    def emit_into_a_closed_pipe(obj) -> None:
+        emitted.append(obj)
+        if len(emitted) == 2:  # the reader went away after the hello line
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_into_a_closed_pipe)
+
+    result, _ = _watch_follow(monkeypatch, "run-a", actions=[lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [_hello(tmp_path)]

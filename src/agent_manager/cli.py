@@ -1673,17 +1673,46 @@ def _follow_watch(
         yield from _poll_watch(run_id, since=since, cursors=cursors)
 
 
+def _silence_stdout() -> None:
+    """Point fd 1 at /dev/null once the reader has closed the pipe.
+
+    Without it, the interpreter's own flush of stdout at exit raises a second
+    `BrokenPipeError` and prints it (Python docs, "Note on SIGPIPE"). A
+    stdout with no file descriptor (a test runner's buffer) is left alone.
+    """
+    try:
+        descriptor = sys.stdout.fileno()
+    except (OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, descriptor)
+    os.close(devnull)
+
+
 def _stream_watch(run_id: str | None, *, since: int) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
-    test that replaces them controls every poll.
+    test that replaces them controls every poll. Ctrl-C and a closed pipe are
+    how a stream normally ends: exit 0, nothing on stderr. A journal that
+    turns corrupt after the hello line cannot get an envelope, because every
+    line after the first must be a JournalLine. So its message goes to stderr
+    and the exit is `EXIT_ERROR`.
     """
-    _emit_stream_line(_watch_hello())
-    for event in _follow_watch(
-        run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
-    ):
-        _emit_stream_line(event)
+    try:
+        _emit_stream_line(_watch_hello())
+        for event in _follow_watch(
+            run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+        ):
+            _emit_stream_line(event)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        _silence_stdout()
+        return
+    except WATCH_HANDLED as error:
+        typer.echo(f"am watch: {error}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("watch")
