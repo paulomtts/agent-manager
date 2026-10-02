@@ -12,10 +12,10 @@ the release marker file existed and whether the board lock's flock was held at
 that moment. The pure status computation (`stored_status`, `rollup_status`)
 gets plain unit tests at the end of the file.
 
-`tests/steps/` has no `conftest.py` (`test_verify.py` defines its own
-`requires_git` marker locally), so the brd helpers are lifted from
-`tests/test_board.py`: the `requires_brd` marker, the `temp_board` fixture,
-`_add_card` and `_brd_json`.
+`tests/steps/` has no `conftest.py`, so the brd helpers are lifted from
+`tests/test_board.py`: the `temp_board` fixture, `_add_card` and `_brd_json`.
+Every test that needs the real brd carries `@pytest.mark.brd`, and the root
+`tests/conftest.py` skips it when `brd` is not installed.
 
 Two lock-scope tests wrap `board.show` and `board.tree` in pass-through spies
 that only record whether `board.WRITE_LOCK` is held; the real functions still
@@ -24,7 +24,6 @@ run against the real board.
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -37,11 +36,6 @@ from lockhelpers import _holder, _probe, _reap, _release
 
 from agent_manager import board, locks, paths
 from agent_manager.steps import rollup
-
-requires_brd = pytest.mark.skipif(
-    shutil.which("brd") is None,
-    reason="the brd CLI must be installed for the roll-up step's steps-tier tests",
-)
 
 
 @pytest.fixture
@@ -84,7 +78,7 @@ def _brd_json(root: Path, *args: str) -> object:
     return json.loads(completed.stdout)["data"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_really_changes_the_card_on_the_board(temp_board):
     milestone = _add_card(temp_board, "Milestone 2")
     story = _add_card(temp_board, "Close the seams the wiring test found", milestone)
@@ -108,7 +102,7 @@ def test_set_status_really_changes_the_card_on_the_board(temp_board):
     assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_second_identical_call_is_a_harmless_no_op(temp_board):
     subtask = _add_card(temp_board, "Implement the rollup.set_status step")
 
@@ -119,7 +113,7 @@ def test_a_second_identical_call_is_a_harmless_no_op(temp_board):
     assert _brd_json(temp_board, "show", subtask)["status"] == "done"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_later_call_with_a_different_status_overwrites(temp_board):
     subtask = _add_card(temp_board, "Implement the rollup.set_status step")
 
@@ -130,20 +124,20 @@ def test_a_later_call_with_a_different_status_overwrites(temp_board):
     assert _brd_json(temp_board, "show", subtask)["status"] == "done"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_nonexistent_card_raises_board_error(temp_board):
     with pytest.raises(board.BoardError):
         rollup.set_status("deadbeef", "done", repo_dir=temp_board)
 
 
-@requires_brd
+@pytest.mark.brd
 def test_an_empty_card_id_raises_board_error(temp_board):
     # A context key that was never populated must fail loudly, not write nothing.
     with pytest.raises(board.BoardError):
         rollup.set_status("", "done", repo_dir=temp_board)
 
 
-@requires_brd
+@pytest.mark.brd
 def test_the_first_subtask_going_in_progress_starts_story_and_milestone(temp_board):
     milestone = _add_card(temp_board, "Milestone 3")
     story = _add_card(temp_board, "Run a milestone", milestone)
@@ -160,7 +154,7 @@ def test_the_first_subtask_going_in_progress_starts_story_and_milestone(temp_boa
     assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_the_last_subtask_going_done_marks_story_and_milestone_done(temp_board):
     milestone = _add_card(temp_board, "Milestone 3")
     story = _add_card(temp_board, "Run a milestone", milestone)
@@ -190,7 +184,7 @@ def test_the_last_subtask_going_done_marks_story_and_milestone_done(temp_board):
     assert again == {"card": last, "status": "done", "rolled_up": []}
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_stale_grandparent_is_repaired_past_a_correct_parent(temp_board):
     milestone = _add_card(temp_board, "Milestone 3")
     story = _add_card(temp_board, "Run a milestone", milestone)
@@ -208,7 +202,7 @@ def test_a_stale_grandparent_is_repaired_past_a_correct_parent(temp_board):
     assert _brd_json(temp_board, "show", milestone)["status"] == "in_progress"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_card_with_no_parent_rolls_nothing_up(temp_board):
     lone = _add_card(temp_board, "A card with no parent")
 
@@ -217,7 +211,7 @@ def test_a_card_with_no_parent_rolls_nothing_up(temp_board):
     assert result == {"card": lone, "status": "in_progress", "rolled_up": []}
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_blocked_sibling_counts_as_todo_when_rolling_up(temp_board):
     story = _add_card(temp_board, "Run a milestone")
     first = _add_card(temp_board, "Extract the shared driver", story)
@@ -242,7 +236,7 @@ def test_a_blocked_sibling_counts_as_todo_when_rolling_up(temp_board):
     assert _brd_json(temp_board, "show", story)["status"] == "todo"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_parent_reported_blocked_is_not_rewritten_to_todo(temp_board):
     milestone = _add_card(temp_board, "Milestone 3")
     before = _add_card(temp_board, "An earlier story", milestone)
@@ -266,7 +260,7 @@ def test_a_parent_reported_blocked_is_not_rewritten_to_todo(temp_board):
 
 
 @pytest.mark.soak
-@requires_brd
+@pytest.mark.brd
 def test_the_walk_is_capped_at_sixteen_ancestors(temp_board):
     # chain[0] is the root; chain[i] has exactly i ancestors.
     chain = [_add_card(temp_board, "Level 0")]
@@ -307,7 +301,7 @@ def _write_lock_held_by_another_thread() -> bool:
     return not acquired[0]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_the_whole_rollup_walk_runs_under_the_board_lock(temp_board, monkeypatch):
     # A rollup is read-modify-write: the ancestor reads must be inside the same
     # critical section as the writes, or two sibling walks can interleave.
@@ -369,7 +363,7 @@ class _CountingRLock:
         self.release()
 
 
-@requires_brd
+@pytest.mark.brd
 def test_the_card_write_and_whole_walk_are_one_critical_section(
     temp_board, monkeypatch
 ):
@@ -392,7 +386,7 @@ def test_the_card_write_and_whole_walk_are_one_critical_section(
 
 
 @pytest.mark.soak
-@requires_brd
+@pytest.mark.brd
 def test_a_failed_rollup_releases_the_board_lock(temp_board):
     with pytest.raises(board.BoardError):
         rollup.set_status("deadbeef", "done", repo_dir=temp_board)
@@ -407,7 +401,7 @@ def test_a_failed_rollup_releases_the_board_lock(temp_board):
     assert not _write_lock_held_by_another_thread()
 
 
-@requires_brd
+@pytest.mark.brd
 def test_rollup_reenters_a_board_lock_its_own_thread_already_holds(temp_board):
     story = _add_card(temp_board, "Serialize the shared resources")
     subtask = _add_card(temp_board, "Serialize board writes", story)
@@ -438,7 +432,7 @@ _RACE_SUBTASKS_PER_STORY = 4
 
 
 @pytest.mark.soak
-@requires_brd
+@pytest.mark.brd
 def test_concurrent_rollups_reach_done(temp_board):
     # Parallel-stories P3: 8 sibling-and-cousin subtasks finishing at once must
     # not lose a story or milestone update. Fresh cards every iteration.

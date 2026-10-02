@@ -16,7 +16,6 @@ import asyncio
 import inspect
 import json
 import os
-import shutil
 import socket
 import sqlite3
 import subprocess
@@ -1190,16 +1189,6 @@ def test_a_blocker_outside_the_milestone_roots_the_story_on_the_base_branch():
     }
 
 
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the CLI's steps-tier fixtures",
-)
-requires_brd = pytest.mark.skipif(
-    shutil.which("brd") is None,
-    reason="the brd CLI must be installed for the CLI's steps-tier fixtures",
-)
-
-
 def _git(cwd: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True
@@ -1307,8 +1296,7 @@ def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str 
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_run_card_drives_the_task_workflow_to_done(project, cards):
     payload = cli.run_card(
         cards["subtask"],
@@ -1326,8 +1314,7 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_run_card_really_moves_the_card_on_the_board(project, cards):
     """§12: a payload saying `done` while the card never moved is the failure
     this run is supposed to prevent. `mark_in_progress` and `mark_done` are
@@ -1348,8 +1335,7 @@ def test_run_card_really_moves_the_card_on_the_board(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
     card = board.show(cards["subtask"], repo_dir=project)
     payload = cli.run_card(
@@ -1370,8 +1356,7 @@ def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards, monkeypatch):
     """The option's default is `.`, and `worktree.ensure` refuses anything
     relative -- so the resolution has to happen in the CLI, not in the step."""
@@ -1388,8 +1373,7 @@ def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards,
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, cards):
     """§12's escape hatch is bound by name out of the engine's context, and
     `subtask_context` holds none of these four names."""
@@ -1410,8 +1394,7 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
     """Addendum O4: the driver runs against a store and run id its caller already
     holds, so a milestone runner can drive every subtask of a story under one
@@ -1492,8 +1475,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards):
     """Addendum P4, on the one stop: the driver passes the run's `StopSignal`
     straight through. With the signal already triggered, the first phase of
@@ -1923,8 +1905,7 @@ def _invoke(project: Path, card_id: str, *extra: str):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, cards["subtask"])
@@ -1937,8 +1918,7 @@ def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkey
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, cards["subtask"], "--pretty")
@@ -1949,8 +1929,7 @@ def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatch):
     monkeypatch.setattr(
         cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
@@ -1973,8 +1952,7 @@ def _fail_board_writes(monkeypatch) -> None:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
     project, cards, monkeypatch
 ):
@@ -1996,8 +1974,7 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
     project, cards, monkeypatch
 ):
@@ -2031,8 +2008,7 @@ def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards):
     """The run id is a directory name and a join key, so which clock produced it
     is behaviour, not decoration: `started_at` and the id must be the same
@@ -2056,8 +2032,7 @@ def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards)
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
     payload = cli.run_card(
         cards["subtask"],
@@ -2089,8 +2064,7 @@ def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_no_run_artifact_is_written_inside_the_repository(project, cards):
     """D4/§9: every artifact path comes from `paths.py`, which roots under
     `data_dir()`. The only thing this run may add to the repo is the worktree
@@ -2115,8 +2089,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
     payload = cli.run_card(
         cards["subtask"],
@@ -2135,8 +2108,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards):
     """The guarantee `status` and `resume` are built on: a process that dies on
     its first dispatch still left a run behind."""
@@ -2170,8 +2142,7 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_unknown_card_is_an_envelope_with_brds_own_message(project, cards, monkeypatch):
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, "no-such-card")
@@ -2185,8 +2156,7 @@ def test_an_unknown_card_is_an_envelope_with_brds_own_message(project, cards, mo
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_parentless_card_is_refused_before_a_run_exists(project, cards, monkeypatch):
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
     result = _invoke(project, cards["milestone"])
@@ -2199,8 +2169,7 @@ def test_a_parentless_card_is_refused_before_a_run_exists(project, cards, monkey
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_failing_parent_lookup_is_an_envelope_and_leaves_no_run_directory(
     project, cards, monkeypatch
 ):
@@ -2245,8 +2214,7 @@ def test_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
     project, cards, monkeypatch
 ):
@@ -2272,8 +2240,7 @@ def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, monkeypatch):
     """`run_subtask_async` deliberately lets `EngineError` out rather than
     journalling it as a phase failure: an unbindable gate is a document bug,
@@ -2293,8 +2260,7 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_no_harness_is_ever_launched(project, cards, monkeypatch):
     """§14's adapter rule at the CLI seam: the launcher is injected, so a test
     that gets as far as launching one has already failed. `run_direct` is the
@@ -2316,8 +2282,7 @@ def test_no_harness_is_ever_launched(project, cards, monkeypatch):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
     project, cards
 ):
@@ -2383,8 +2348,7 @@ def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_repeated_verify_options_reach_run_card_in_command_line_order(
     project, cards, monkeypatch
 ):
@@ -2412,8 +2376,7 @@ def test_repeated_verify_options_reach_run_card_in_command_line_order(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
     """`gate_context` calls `list(commands)` and `verification_gate` tells an
     empty suite apart from a missing one, so `None` here would be a crash or a
@@ -2432,8 +2395,7 @@ def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, m
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
     project, cards, monkeypatch
 ):
@@ -2461,8 +2423,7 @@ def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_verify_values_reach_the_gate_context_through_the_real_run_card(
     project, cards, monkeypatch
 ):
@@ -2492,8 +2453,7 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
     project, cards, monkeypatch
 ):
@@ -2523,8 +2483,7 @@ def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
     project, cards, monkeypatch
 ):
@@ -2555,8 +2514,7 @@ def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_run_success_envelope_keys_are_frozen(project, cards, monkeypatch):
     """A shape freeze: `status`, `logs` and every downstream consumer read these
     eleven names, so an added, dropped or renamed key is a contract break."""
@@ -2719,8 +2677,7 @@ def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
     project, milestone_board, monkeypatch
 ):
@@ -2769,8 +2726,7 @@ def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_done_work_is_already_done_and_still_anchors_the_stack(
     project, milestone_board, monkeypatch
 ):
@@ -2816,8 +2772,7 @@ def test_done_work_is_already_done_and_still_anchors_the_stack(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_milestone_dry_run_shows_the_integrate_plan_and_writes_nothing(
     project, milestone_board, monkeypatch
 ):
@@ -2852,8 +2807,7 @@ def test_the_milestone_dry_run_shows_the_integrate_plan_and_writes_nothing(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_title_substring_names_the_same_milestone_as_its_id(
     project, milestone_board, monkeypatch
 ):
@@ -2868,8 +2822,7 @@ def test_a_title_substring_names_the_same_milestone_as_its_id(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
     project, milestone_board, monkeypatch
 ):
@@ -2884,8 +2837,7 @@ def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 @pytest.mark.parametrize("extra, bound", [((), 4), (("--max-concurrent", "3"), 3)])
 def test_the_milestone_dry_run_echoes_the_lane_bound_and_writes_nothing(
     project, milestone_board, monkeypatch, extra, bound
@@ -2950,8 +2902,7 @@ def _refusal(result) -> dict[str, Any]:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_story_cycle_from_the_board_is_an_envelope_naming_both_stories(
     project, monkeypatch
 ):
@@ -2997,8 +2948,7 @@ def test_a_story_cycle_from_the_board_is_an_envelope_naming_both_stories(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
     project, monkeypatch
 ):
@@ -3023,8 +2973,7 @@ def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monkeypatch):
     milestone = _add_card(project, "Milestone 8: diamond")
     first = _add_card(project, "Story one", milestone)
@@ -3061,8 +3010,7 @@ def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monke
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_unknown_milestone_is_an_envelope(project, milestone_board, monkeypatch):
     _forbid_writes(monkeypatch)
 
@@ -3082,7 +3030,7 @@ def test_a_milestone_dry_run_with_a_missing_repo_dir_is_an_envelope(tmp_path, mo
     assert "missing" in error["message"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_milestone_dry_run_outside_a_brd_project_is_a_board_error(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     plain = tmp_path / "plain"
@@ -4603,8 +4551,7 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(project, cards):
     """Spec test 3: the runner sees `plan` next, never `explore` or `spec`."""
     run_id = _crash_pygents(project, cards, "plan")
@@ -4626,8 +4573,7 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):
     """Spec test 5: the orphan attempt is marked `harness_error`."""
     run_id = _crash_pygents(project, cards, "plan")
@@ -4641,8 +4587,7 @@ def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards)
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
     project, cards
 ):
@@ -4684,8 +4629,7 @@ def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     project, cards, monkeypatch
 ):
@@ -4723,8 +4667,7 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     project, cards, monkeypatch
 ):
@@ -4749,8 +4692,7 @@ def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
     """Spec test 7, second half: only the final status write was lost."""
     payload = cli.run_card(
@@ -4776,8 +4718,7 @@ def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project, cards):
     """Replaces spec test 8 (plan deviation 1): a phase escalation's row holds
     no turn, so continuing it would record `done` with review never passed."""
@@ -4806,8 +4747,7 @@ def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project,
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards):
     """Spec test 6 at the function, and Review Focus 3: the orphan attempt is
     still `started` afterwards, because nothing is re-marked before the
@@ -4830,8 +4770,7 @@ def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
     project, cards, monkeypatch
 ):
@@ -4854,8 +4793,7 @@ def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
     """The factory is patched on the module rather than passed as an option: the
     injection seam is `cli.default_runner_factory`, and patching it is what
@@ -4875,8 +4813,7 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
     run_id = _crash_pygents(project, cards, "plan")
     monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
@@ -4891,8 +4828,7 @@ def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
     """An escalation is a truthful result, so the envelope stays `ok: true` and
     the exit code carries the full stop -- exactly as `run` does."""
@@ -4912,8 +4848,7 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_resume_launches_no_harness(project, cards, monkeypatch):
     """§14's adapter rule at the resume seam: the launcher is injected, so a
     resume that got as far as launching one has already failed."""
@@ -5094,8 +5029,7 @@ def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
     project, resume_board, monkeypatch
 ):
@@ -5134,8 +5068,7 @@ def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
     project, resume_board, monkeypatch
 ):
@@ -5153,8 +5086,7 @@ def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_milestone_resume_across_a_workflow_change_is_exit_three_and_writes_nothing(
     project, resume_board, monkeypatch
 ):
@@ -6066,8 +5998,7 @@ def _controlled_card_run(project: Path, cards: dict[str, str], factory) -> dict[
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_paused_card_run_parks_after_the_running_phase(project, cards, control_applied):
     """Spec test 1: the running phase finishes, nothing after it is
     dispatched, the park is `parked`, every row is `stopped`, and the request
@@ -6098,8 +6029,7 @@ def test_a_paused_card_run_parks_after_the_running_phase(project, cards, control
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
     project, cards, control_applied
 ):
@@ -6126,8 +6056,7 @@ def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     project, cards, control_applied
 ):
@@ -6166,8 +6095,7 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
     project, cards, control_applied
 ):
@@ -6198,8 +6126,7 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
     ids=["pause", "cancel", "cancel-over-escalation", "pause-keeps-escalation"],
 )
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_control_and_an_escalation_follow_c6_at_the_command(
     project, cards, control_applied, monkeypatch, command, fail, exit_code, status
 ):
@@ -6228,8 +6155,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, cards):
     """Spec tests 4 and 6: the lease is held, window open, while a phase runs;
     it is gone afterwards; the payload is today's, key for key."""
@@ -6269,8 +6195,7 @@ def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, card
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
     """Spec test 4 and the error path: the lease was held when the walk blew
     up, it is released on the way out, the error surfaces as is, and no final
@@ -6315,8 +6240,7 @@ def _resume_card_run(project: Path, run_id: str, factory) -> dict[str, Any]:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
     project, cards, control_applied
 ):
@@ -6351,8 +6275,7 @@ def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
     project, cards, control_applied
 ):
@@ -6379,8 +6302,7 @@ def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
     """Error path on resume: the lease was held when the walk blew up and is
     released on the way out; the run stays `started` as it does today."""
@@ -6533,8 +6455,7 @@ def _recorded_run_ids(project: Path) -> list[str]:
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
     project, cards, monkeypatch
 ):
@@ -6577,8 +6498,7 @@ def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir(
     project, cards, monkeypatch
 ):
@@ -6610,8 +6530,7 @@ def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_dead_claim_does_not_refuse(project, cards):
     dead = _reaped_pid()
     key = control.card_claim(cards["subtask"])
@@ -6638,8 +6557,7 @@ def test_a_dead_claim_does_not_refuse(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkeypatch):
     real_record_run = store_module.Store.record_run
     first: list[tuple[str | None, list[str]]] = []
@@ -6675,8 +6593,7 @@ def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkey
 
 @pytest.mark.brd
 @pytest.mark.parametrize("outcome", ["done", "escalated", "raises"])
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_run_releases_its_claims_on_every_exit(project, cards, monkeypatch, outcome):
     run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
     key = control.card_claim(cards["subtask"])
@@ -6721,8 +6638,7 @@ def test_a_card_run_releases_its_claims_on_every_exit(project, cards, monkeypatc
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypatch):
     """The first phase lets a second process take the run's lease over; the
     next fenced write raises `LeaseLostError`, which the command renders."""
@@ -6771,8 +6687,7 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
     run_id = _crash_pygents(project, cards, "plan")
     dead = _reaped_pid()
@@ -6800,8 +6715,7 @@ def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
     project, cards, monkeypatch
 ):
@@ -6837,8 +6751,7 @@ def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
     project, cards, monkeypatch
 ):
@@ -6865,8 +6778,7 @@ def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     project, cards, monkeypatch
 ):
@@ -6924,8 +6836,7 @@ def test_status_lists_the_claims_of_the_live_lease(projection, monkeypatch, hear
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypatch):
     _record_for_logs(project, LOGS_RUN_ID)
     _plant_lease(
@@ -6999,8 +6910,7 @@ def _run_card_with(project: Path, cards: dict[str, str], factory) -> dict[str, A
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_done_card_run_leaves_one_done_comment_on_the_card_only(project, cards):
     """Spec cli test 1: one done comment naming the branch; nothing on the
     story or the milestone."""
@@ -7020,8 +6930,7 @@ def test_a_done_card_run_leaves_one_done_comment_on_the_card_only(project, cards
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_an_escalated_card_run_leaves_one_escalation_comment_with_the_phase(project, cards):
     """Spec cli test 2: keyed by this run's lease token; names the failed
     phase and its detail, and tells a human to resume."""
@@ -7041,8 +6950,7 @@ def test_an_escalated_card_run_leaves_one_escalation_comment_with_the_phase(proj
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
     project, cards, control_applied
 ):
@@ -7067,8 +6975,7 @@ def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
     """Spec cli test 3, pause half: a park is resumed, not closed."""
     factory = _controlling_factory(
@@ -7084,8 +6991,7 @@ def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
     project, cards, control_applied
 ):
@@ -7105,8 +7011,7 @@ def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
 
 
 @pytest.mark.brd
-@requires_git
-@requires_brd
+@pytest.mark.git
 def test_a_card_comment_the_board_refuses_is_a_warning_and_changes_nothing_else(
     project, cards, monkeypatch
 ):

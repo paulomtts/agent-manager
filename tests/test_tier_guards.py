@@ -599,3 +599,24 @@ def test_the_e2e_toolchain_gate_uses_the_shared_binary_check():
     assert "missing_binary(BINARY_TIERS)" in source
     assert 'pytest.skip(f"the {missing} CLI must be installed for the e2e tier")' in source
     assert "shutil.which" not in source
+
+
+TESTS_ROOT = Path(__file__).resolve().parent
+_LOCAL_SKIP_COPIES = (
+    re.compile(r"\brequires_(?:git|brd)\b"),
+    re.compile(r"skipif\(\s*shutil\.which\("),
+)
+
+
+def test_no_local_binary_skip_copies_remain_under_tests():
+    # This file is skipped: it holds the patterns themselves.
+    offenders = []
+    for path in sorted(TESTS_ROOT.rglob("*.py")):
+        if path == Path(__file__).resolve():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for pattern in _LOCAL_SKIP_COPIES:
+            for match in pattern.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                offenders.append(f"{path.relative_to(TESTS_ROOT)}:{line}: {match.group(0)!r}")
+    assert offenders == []

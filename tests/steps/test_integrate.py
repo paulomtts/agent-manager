@@ -10,7 +10,6 @@ pushes.
 """
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,11 +22,6 @@ from agent_manager.steps.integrate import (
     merge_tip,
 )
 from agent_manager.steps.worktree import GitError, run_git
-
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the integrate step's steps-tier tests",
-)
 
 BRANCH = "m5-integrate"
 
@@ -205,7 +199,6 @@ def test_bad_arguments_raise_before_any_git_invocation(kwargs, expected):
     assert calls == []
 
 
-@requires_git
 def test_a_fresh_branch_is_cut_from_the_local_base_when_there_is_no_origin(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -245,7 +238,6 @@ def repo_with_origin(repo: Path, tmp_path: Path) -> Path:
     return repo
 
 
-@requires_git
 def test_a_fresh_branch_is_cut_from_origin_base_when_origin_resolves(
     repo_with_origin: Path, wt: Path, tmp_path: Path
 ):
@@ -263,7 +255,6 @@ def test_a_fresh_branch_is_cut_from_origin_base_when_origin_resolves(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_clean_merge_reports_what_was_merged(repo: Path, wt: Path, tmp_path: Path):
     main_sha = _head(repo)
     tip = _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
@@ -286,7 +277,6 @@ def test_a_clean_merge_reports_what_was_merged(repo: Path, wt: Path, tmp_path: P
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_an_existing_branch_and_worktree_are_reused(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -306,7 +296,6 @@ def test_an_existing_branch_and_worktree_are_reused(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_removed_worktree_is_re_added_on_the_existing_branch_without_b(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -329,7 +318,6 @@ def test_a_removed_worktree_is_re_added_on_the_existing_branch_without_b(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_tip_given_as_a_commit_sha_is_merged_and_reported_as_given(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -345,7 +333,6 @@ def test_a_tip_given_as_a_commit_sha_is_merged_and_reported_as_given(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_an_already_merged_tip_is_a_stable_no_op(repo: Path, wt: Path, tmp_path: Path):
     _make_tip(repo, tmp_path, "m5/story-a", {"a.js": "from story a\n"})
     before = _base_state(repo)
@@ -370,7 +357,6 @@ def test_an_already_merged_tip_is_a_stable_no_op(repo: Path, wt: Path, tmp_path:
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_an_already_merged_tip_never_reaches_git_merge(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -387,7 +373,6 @@ def test_an_already_merged_tip_never_reaches_git_merge(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_git_saying_already_up_to_date_is_also_the_no_op(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -412,7 +397,6 @@ def test_git_saying_already_up_to_date_is_also_the_no_op(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_conflict_is_reported_and_left_in_progress(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -440,7 +424,6 @@ def test_a_conflict_is_reported_and_left_in_progress(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_conflict_across_several_files_lists_them_all(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -456,7 +439,6 @@ def test_a_conflict_across_several_files_lists_them_all(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_bad_tip_ref_raises_rather_than_reporting_a_conflict(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -470,7 +452,6 @@ def test_a_bad_tip_ref_raises_rather_than_reporting_a_conflict(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_local_edits_the_merge_would_overwrite_raise_and_survive(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -503,7 +484,6 @@ def _leave_a_conflict(repo: Path, wt: Path, tmp_path: Path) -> str:
     return tip_b
 
 
-@requires_git
 def test_a_merge_left_in_progress_refuses_the_next_call(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -529,7 +509,6 @@ def test_a_merge_left_in_progress_refuses_the_next_call(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_differently_spelled_worktree_path_is_still_refused_mid_merge(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -543,7 +522,6 @@ def test_a_differently_spelled_worktree_path_is_still_refused_mid_merge(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_merge_head_probe_that_fails_otherwise_is_re_raised(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -568,7 +546,6 @@ def test_a_merge_head_probe_that_fails_otherwise_is_re_raised(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_worktree_not_yet_registered_skips_the_probe(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -584,7 +561,6 @@ def test_a_worktree_not_yet_registered_skips_the_probe(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_conflict_a_human_resolved_and_committed_is_merged_on_relaunch(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -623,7 +599,6 @@ def _assert_no_forbidden_git(calls: list[list[str]]) -> None:
         assert "branch" not in argv, argv
 
 
-@requires_git
 def test_no_forbidden_git_operation_runs_on_any_path(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -680,7 +655,6 @@ def _merged_cleanly(repo: Path, wt: Path, tmp_path: Path, files: dict[str, str])
     assert result["already_merged"] is False
 
 
-@requires_git
 def test_measure_merge_reports_a_merge_left_in_progress(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -700,7 +674,6 @@ def test_measure_merge_reports_a_merge_left_in_progress(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_measure_merge_reports_a_finished_merge(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
@@ -735,7 +708,6 @@ def test_measure_merge_reports_a_finished_merge(repo: Path, wt: Path, tmp_path: 
         "markers-without-the-space",
     ],
 )
-@requires_git
 def test_a_touched_file_is_marked_only_with_both_marker_lines(
     repo: Path, wt: Path, tmp_path: Path, body: str, marked: bool
 ):
@@ -750,7 +722,6 @@ def test_a_touched_file_is_marked_only_with_both_marker_lines(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_markers_in_a_file_the_merge_did_not_touch_are_ignored(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -765,7 +736,6 @@ def test_markers_in_a_file_the_merge_did_not_touch_are_ignored(
 
 
 @pytest.mark.parametrize("name", ["my notes.md", "café.md", 'say "hi".md'])
-@requires_git
 def test_a_touched_file_with_an_unusual_name_is_read_by_its_real_name(
     repo: Path, wt: Path, tmp_path: Path, name: str
 ):
@@ -776,7 +746,6 @@ def test_a_touched_file_with_an_unusual_name_is_read_by_its_real_name(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_touched_binary_file_is_scanned_as_bytes(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
@@ -793,7 +762,6 @@ def test_a_touched_binary_file_is_scanned_as_bytes(repo: Path, wt: Path, tmp_pat
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_touched_file_that_was_deleted_is_skipped(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
@@ -808,7 +776,6 @@ def test_a_touched_file_that_was_deleted_is_skipped(repo: Path, wt: Path, tmp_pa
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_head_with_no_parent_has_nothing_touched(tmp_path: Path):
     solo = tmp_path / "solo"
     subprocess.run(
@@ -833,7 +800,6 @@ RESOLVED = {"resolved": True, "files": ["a.js"], "summary": "kept both sides"}
 """What a resolver that claims success returns. The gate must not believe it."""
 
 
-@requires_git
 def test_the_gate_passes_a_finished_merge(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     _merged_cleanly(repo, wt, tmp_path, {"a.js": "from story a\n"})
@@ -846,7 +812,6 @@ def test_the_gate_passes_a_finished_merge(repo: Path, wt: Path, tmp_path: Path):
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_fails_a_merge_still_in_progress(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     tip_b = _leave_a_conflict(repo, wt, tmp_path)
@@ -869,7 +834,6 @@ def test_the_gate_fails_a_merge_still_in_progress(repo: Path, wt: Path, tmp_path
 
 
 @pytest.mark.parametrize("path", ["scratch.txt", "b.js"], ids=["untracked", "modified"])
-@requires_git
 def test_the_gate_fails_a_finished_merge_with_a_dirty_tree(
     repo: Path, wt: Path, tmp_path: Path, path: str
 ):
@@ -889,7 +853,6 @@ def test_the_gate_fails_a_finished_merge_with_a_dirty_tree(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_fails_a_committed_resolution_that_kept_the_markers(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -912,7 +875,6 @@ def test_the_gate_fails_a_committed_resolution_that_kept_the_markers(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_passes_a_touched_file_with_only_an_underline(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -927,7 +889,6 @@ def test_the_gate_passes_a_touched_file_with_only_an_underline(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_resolver_claiming_resolved_does_not_pass_an_unfinished_merge(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -945,7 +906,6 @@ def test_a_resolver_claiming_resolved_does_not_pass_an_unfinished_merge(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_ignores_markers_in_a_file_the_merge_did_not_touch(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -961,7 +921,6 @@ def test_the_gate_ignores_markers_in_a_file_the_merge_did_not_touch(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_names_every_failure_in_order(repo: Path, wt: Path, tmp_path: Path):
     before = _base_state(repo)
     _leave_a_conflict(repo, wt, tmp_path)
@@ -980,7 +939,6 @@ def test_the_gate_names_every_failure_in_order(repo: Path, wt: Path, tmp_path: P
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_a_merge_head_probe_failing_otherwise_propagates_from_the_gate(
     repo: Path, wt: Path, tmp_path: Path
 ):
@@ -1005,7 +963,6 @@ def test_a_merge_head_probe_failing_otherwise_propagates_from_the_gate(
     [("status", 1), ("diff", 1), ("HEAD^1", 128)],
     ids=["status-exit-1", "diff-exit-1", "first-parent-probe-exit-128"],
 )
-@requires_git
 def test_any_other_git_failure_propagates_from_the_gate(
     repo: Path, wt: Path, tmp_path: Path, token: str, exit_code: int
 ):
@@ -1025,7 +982,6 @@ def test_any_other_git_failure_propagates_from_the_gate(
     assert _base_state(repo) == before
 
 
-@requires_git
 def test_the_gate_raises_for_a_worktree_that_is_not_a_repository(tmp_path: Path):
     with pytest.raises(GitError) as excinfo:
         merge_completed_gate(RESOLVED, str(tmp_path / "not-a-repo"))

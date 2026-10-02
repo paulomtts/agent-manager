@@ -20,7 +20,6 @@ import ast
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -44,11 +43,6 @@ from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
 from agent_manager.store import Store
 from agent_manager.workflow import integrate as integrate_workflow
-
-pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for integrate_milestone's tests",
-)
 
 BASE = "main"
 PREFIX = "m5"
