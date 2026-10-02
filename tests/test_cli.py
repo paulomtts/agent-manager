@@ -1251,11 +1251,15 @@ def project(tmp_path, monkeypatch) -> Path:
 
 
 @pytest.fixture
-def cards(project) -> dict[str, str]:
-    """A milestone -> story -> subtask chain, the shape `run --card` requires."""
-    milestone = _add_card(project, "Milestone 1: walking skeleton")
-    story = _add_card(project, "The CLI: run, status, logs, resume", milestone)
-    subtask = _add_card(project, "Add run --card end to end", story)
+def cards(project, fake_board) -> dict[str, str]:
+    """A milestone -> story -> subtask chain, the shape `run --card` requires.
+
+    The cards live in the in-memory `fake_board` (test-tier V5); `project` still
+    supplies the real git repo the CLI runs in.
+    """
+    milestone = fake_board.add_card("Milestone 1: walking skeleton")
+    story = fake_board.add_card("The CLI: run, status, logs, resume", parent_id=milestone)
+    subtask = fake_board.add_card("Add run --card end to end", parent_id=story)
     return {"milestone": milestone, "story": story, "subtask": subtask}
 
 
