@@ -172,3 +172,74 @@ def test_marked_test_gets_real_path(pytester, monkeypatch):
         """,
     )
     result.assert_outcomes(passed=3)
+
+
+@pytest.mark.git
+def test_slow_unmarked_test_fails_budget(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import time
+
+        def test_slow():
+            time.sleep(0.55)
+        """,
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*unit-tier budget exceeded: *s > 0.5s*"])
+
+
+@pytest.mark.git
+def test_failing_slow_test_keeps_original_failure(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import time
+
+        def test_slow_and_wrong():
+            time.sleep(0.55)
+            assert 1 == 2, "original failure"
+        """,
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*original failure*"])
+    result.stdout.no_fnmatch_line("*budget exceeded*")
+
+
+@pytest.mark.git
+def test_slow_fixture_setup_is_not_counted(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import time
+
+        import pytest
+
+        @pytest.fixture
+        def slow_setup():
+            time.sleep(0.55)
+
+        def test_fast_body(slow_setup):
+            pass
+        """,
+    )
+    result.assert_outcomes(passed=1)
+    result.stdout.no_fnmatch_line("*budget exceeded*")
+
+
+@pytest.mark.git
+def test_slow_test_that_skips_stays_skipped(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import time
+
+        import pytest
+
+        def test_slow_then_skip():
+            time.sleep(0.55)
+            pytest.skip("skipped after the budget")
+        """,
+    )
+    result.assert_outcomes(skipped=1)
+    result.stdout.no_fnmatch_line("*budget exceeded*")

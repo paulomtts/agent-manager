@@ -13,12 +13,15 @@ adds markers; the addopts `-m` expression in pyproject.toml does the deselecting
 Unit-tier items (no tier marker after collection) run with stub `brd`, `git` and
 `claude` scripts first on `PATH`; each stub prints `<name>: forbidden in the unit
 tier` to stderr and exits 99, so an accidental real spawn fails loudly.
+
+A passing call phase over its tier's budget (unit 0.5s, `git` 2s; the opt-in tiers
+have none) is turned into a failure naming the tier, budget and measured time.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
 from pathlib import Path, PurePath
 
 import pytest
@@ -196,3 +199,22 @@ def unit_tier_path_shim(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
         return
     bin_dir = request.getfixturevalue("unit_tier_stub_dir")
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}")
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Fail a passing call phase that ran over its tier's per-test budget.
+
+    `tryfirst` makes this the outermost wrapper, so it sees the report after the
+    other plugins (xfail handling) have settled it. Setup and teardown are not
+    counted, and a failed or skipped report keeps its own outcome and text.
+    """
+    report = yield
+    if report.when == "call" and report.passed:
+        violation = tier_budget_violation((mark.name for mark in item.iter_markers()), call.duration)
+        if violation is not None:
+            report.outcome = "failed"
+            report.longrepr = violation
+    return report
