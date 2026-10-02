@@ -593,12 +593,31 @@ def test_missing_binaries_skip_their_tier_and_leave_unmarked_tests_alone(pyteste
 E2E_CONFTEST = Path(__file__).resolve().parent / "e2e" / "conftest.py"
 
 
-def test_the_e2e_toolchain_gate_uses_the_shared_binary_check():
-    source = E2E_CONFTEST.read_text(encoding="utf-8")
-    assert "from conftest import BINARY_TIERS, missing_binary" in source
-    assert "missing_binary(BINARY_TIERS)" in source
-    assert 'pytest.skip(f"the {missing} CLI must be installed for the e2e tier")' in source
-    assert "shutil.which" not in source
+def test_the_e2e_conftest_has_no_binary_check_of_its_own():
+    assert "shutil.which" not in E2E_CONFTEST.read_text(encoding="utf-8")
+
+
+@pytest.mark.git
+def test_the_e2e_toolchain_gate_skips_naming_the_missing_binary(pytester, tmp_path, monkeypatch):
+    # The real root and e2e conftests, laid out as in tests/. PATH holds only a
+    # stand-in `git`, so the gate must look past git and name brd, with the
+    # e2e-tier message. The nested test is auto-marked `e2e_fake` (no PATH
+    # shim) and has no `git`/`brd` marker, so only `toolchain` can skip it.
+    bin_dir = tmp_path / "only-git-bin"
+    bin_dir.mkdir()
+    fake_git = bin_dir / "git"
+    fake_git.write_text("#!/bin/sh\nexit 0\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    pytester.makeconftest(REAL_CONFTEST.read_text())
+    pytester.makeini(NESTED_INI + "pythonpath = .\n")
+    e2e_dir = pytester.mkdir("e2e")
+    (e2e_dir / "conftest.py").write_text(E2E_CONFTEST.read_text(encoding="utf-8"))
+    (e2e_dir / "test_gated.py").write_text("def test_gated(toolchain):\n    pass\n")
+    result = pytester.runpytest_subprocess("--import-mode=importlib", "-rs")
+    result.assert_outcomes(skipped=1)
+    result.stdout.fnmatch_lines(["*the brd CLI must be installed for the e2e tier*"])
+    result.stdout.no_fnmatch_line("*the git CLI must be installed*")
 
 
 TESTS_ROOT = Path(__file__).resolve().parent
