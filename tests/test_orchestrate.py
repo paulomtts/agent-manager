@@ -5917,3 +5917,298 @@ def test_board_claims_takes_each_milestones_keys_from_milestone_claims():
 )
 def test_milestone_status_reads_a_run_milestone_payload(payload, status):
     assert orchestrate.milestone_status(payload) == status
+
+
+# ── run_board at its seams (card baef4f94) ──────────────────────────────────
+#
+# `board.roots`, `cli.refuse_claimed` and `orchestrate._run_milestone_async`
+# are replaced, so these exercise `run_board`'s own validation, leveling,
+# claim union, tree, isolation and payload with no git, brd or harness.
+# Production wiring is `tests/e2e/test_run_board.py`'s.
+
+
+@dataclass
+class FakeMilestoneRuns:
+    """`orchestrate._run_milestone_async` replaced: records each call and
+    answers from `outcomes` (a payload dict, or an exception to raise);
+    a milestone with no entry finishes `done`."""
+
+    outcomes: dict[str, Any] = field(default_factory=dict)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    async def __call__(self, milestone: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append((milestone, kwargs))
+        await asyncio.sleep(0)
+        outcome = self.outcomes.get(milestone, {"done": True, "run_id": f"run-{milestone[:8]}"})
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return dict(outcome)
+
+    def called(self) -> list[str]:
+        return [milestone for milestone, _kwargs in self.calls]
+
+
+@dataclass
+class BoardSeams:
+    root: Path
+    runs: FakeMilestoneRuns
+    cards: list[models.CardNode] = field(default_factory=list)
+    claims: list[list[str]] = field(default_factory=list)
+
+
+@pytest.fixture
+def board_seams(tmp_path, monkeypatch) -> BoardSeams:
+    seams = BoardSeams(root=tmp_path, runs=FakeMilestoneRuns())
+    monkeypatch.setattr(board, "roots", lambda *, repo_dir=None: list(seams.cards))
+    monkeypatch.setattr(orchestrate, "_run_milestone_async", seams.runs)
+
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        seams.claims.append(list(keys))
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+    return seams
+
+
+def _board(seams: BoardSeams, **overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "repo_dir": seams.root,
+        "base_branch": "main",
+        "branch_prefix_of": _prefix_of,
+        "max_concurrent": 2,
+    }
+    kwargs.update(overrides)
+    return orchestrate.run_board(**kwargs)
+
+
+def _by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {entry["milestone_id"]: entry for entry in result["milestones"]}
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"max_concurrent": 0}, {"base_branch": None}, {"base_branch": ""}]
+)
+def test_run_board_refuses_bad_arguments_before_it_reads_the_board(
+    board_seams, monkeypatch, overrides
+):
+    def no_read(*, repo_dir=None):
+        pytest.fail("run_board read the board before refusing its arguments")
+
+    monkeypatch.setattr(board, "roots", no_read)
+
+    with pytest.raises(ValueError):
+        _board(board_seams, **overrides)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize(
+    "prefix_of", [lambda card: "", lambda card: "   ", lambda card: None, lambda card: "same"]
+)
+def test_run_board_refuses_a_blank_or_shared_branch_prefix_before_any_claim_check(
+    board_seams, prefix_of
+):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2)]
+
+    with pytest.raises(ValueError, match="branch prefix"):
+        _board(board_seams, branch_prefix_of=prefix_of)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_lets_a_milestone_cycle_propagate_before_any_claim_check(board_seams):
+    board_seams.cards = [
+        _board_milestone(1, blocked_by=(2,)),
+        _board_milestone(2, blocked_by=(1,)),
+    ]
+
+    with pytest.raises(dag.DependencyCycleError):
+        _board(board_seams)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_on_a_board_with_nothing_open_is_ok_and_runs_nothing(board_seams):
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+
+    result = _board(board_seams)
+
+    assert result == {"ok": True, "board": True, "levels": [], "milestones": []}
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_checks_every_open_milestones_claims_once_in_level_order(board_seams):
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [second, first]  # board order is not level order
+
+    _board(board_seams)
+
+    expected = list(
+        dict.fromkeys(
+            [
+                *orchestrate.milestone_claims(
+                    first.id, census.flatten_milestone(first).stories, _prefix_of(first)
+                ),
+                *orchestrate.milestone_claims(
+                    second.id, census.flatten_milestone(second).stories, _prefix_of(second)
+                ),
+            ]
+        )
+    )
+    assert board_seams.claims == [expected]
+    assert expected[0] == f"card:{first.id}"
+
+
+def test_run_board_starts_no_milestone_when_the_upfront_claim_check_refuses(
+    board_seams, monkeypatch
+):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2, blocked_by=(1,))]
+
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        raise cli.ClaimedError("held elsewhere", key=keys[-1], run_id=OTHER_RUN_ID)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+    with pytest.raises(cli.ClaimedError):
+        _board(board_seams)
+
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_runs_every_milestone_on_one_shared_semaphore(board_seams):
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+
+    result = _board(board_seams, max_concurrent=3, commands=("git status",))
+
+    assert result["ok"] is True
+    assert result["board"] is True
+    assert result["levels"] == [{"level": 0, "milestones": [one.id, two.id]}]
+    assert result["milestones"] == [
+        {"milestone_id": one.id, "status": "done", "done": True, "run_id": f"run-{one.id[:8]}"},
+        {"milestone_id": two.id, "status": "done", "done": True, "run_id": f"run-{two.id[:8]}"},
+    ]
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    semaphores = [kwargs["slots"] for _milestone, kwargs in board_seams.runs.calls]
+    assert isinstance(semaphores[0], asyncio.Semaphore)
+    assert all(semaphore is semaphores[0] for semaphore in semaphores)
+    for milestone, kwargs in board_seams.runs.calls:
+        card = one if milestone == one.id else two
+        assert kwargs["branch_prefix"] == _prefix_of(card)
+        assert kwargs["base_branch"] == "main"
+        assert kwargs["repo_dir"] == runs.resolve_repo_dir(board_seams.root)
+        assert kwargs["max_concurrent"] == 3
+        assert list(kwargs["commands"]) == ["git status"]
+        assert "resume_run_id" not in kwargs
+
+
+def test_run_board_isolates_a_milestone_that_raises_and_blocks_only_its_dependents(
+    board_seams,
+):
+    """Spec steps 5-6 and Review Focus 4: D is blocked by a *blocked* B."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3)
+    d = _board_milestone(4, blocked_by=(2,))
+    board_seams.cards = [a, b, c, d]
+    board_seams.runs.outcomes[a.id] = RuntimeError("boom")
+    grafo_level = logging.getLogger(orchestrate.GRAFO_LOGGER).level
+
+    result = _board(board_seams)
+
+    assert result["ok"] is False
+    assert [entry["milestone_id"] for entry in result["milestones"]] == [a.id, c.id, b.id, d.id]
+    by_id = _by_id(result)
+    assert by_id[a.id] == {"milestone_id": a.id, "status": "escalated", "error": "RuntimeError: boom"}
+    assert by_id[c.id]["status"] == "done"
+    assert by_id[b.id] == {"milestone_id": b.id, "status": "blocked", "blocked_by": [a.id]}
+    assert by_id[d.id] == {"milestone_id": d.id, "status": "blocked", "blocked_by": [b.id]}
+    assert sorted(board_seams.runs.called()) == sorted([a.id, c.id])
+    assert logging.getLogger(orchestrate.GRAFO_LOGGER).level == grafo_level
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"escalated": True, "run_id": "r"}, "escalated"),
+        ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
+        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+    ],
+)
+def test_run_board_blocks_the_dependent_of_a_milestone_that_did_not_finish_done(
+    board_seams, payload, status
+):
+    """Review Focus 2: a paused or cancelled milestone blocks like an escalated one."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    board_seams.runs.outcomes[a.id] = payload
+
+    result = _board(board_seams)
+
+    assert result["ok"] is False
+    assert result["milestones"] == [
+        {"milestone_id": a.id, "status": status, **payload},
+        {"milestone_id": b.id, "status": "blocked", "blocked_by": [a.id]},
+    ]
+    assert board_seams.runs.called() == [a.id]
+
+
+def test_run_board_runs_a_two_blocker_milestone_only_after_both_finish_done(board_seams):
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    board_seams.cards = [a, b, c]
+
+    result = _board(board_seams)
+
+    assert result["ok"] is True
+    assert result["levels"] == [
+        {"level": 0, "milestones": [a.id, b.id]},
+        {"level": 1, "milestones": [c.id]},
+    ]
+    assert board_seams.runs.called()[-1] == c.id
+    assert _by_id(result)[c.id]["status"] == "done"
+
+
+def test_run_board_blocks_a_two_blocker_milestone_on_only_its_unclean_blocker(board_seams):
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    board_seams.cards = [a, b, c]
+    board_seams.runs.outcomes[b.id] = {"escalated": True, "run_id": "r"}
+
+    result = _board(board_seams)
+
+    assert _by_id(result)[c.id] == {"milestone_id": c.id, "status": "blocked", "blocked_by": [b.id]}
+    assert c.id not in board_seams.runs.called()
+
+
+def test_run_board_treats_an_already_done_blocker_as_satisfied(board_seams):
+    """Review Focus 3: `board_levels` drops the done milestone, so its dependent is level 0."""
+    finished = _board_milestone(1, status="done", done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [finished, later]
+
+    result = _board(board_seams)
+
+    assert result["ok"] is True
+    assert result["levels"] == [{"level": 0, "milestones": [later.id]}]
+    assert board_seams.runs.called() == [later.id]
+
+
+def test_run_board_ends_on_a_base_exception_instead_of_hanging(board_seams):
+    """Review Focus 5: grafo drops a non-`Exception` and would hang `gather()`;
+    the board run re-raises it through `run_until_killed`."""
+
+    class Fatal(BaseException):
+        pass
+
+    a, b = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [a, b]
+    board_seams.runs.outcomes[a.id] = Fatal("dead")
+
+    with pytest.raises(Fatal):
+        _board(board_seams)
