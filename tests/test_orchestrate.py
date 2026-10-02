@@ -2,8 +2,9 @@
 
 Two tiers, per design §14:
 
-- `plan_levels`, `story_tips`, `stale_story_anchors` and the payload helpers
-  are pure and get unit tests on hand-built plans or outcomes;
+- `plan_levels`, `story_tips`, `stale_story_anchors`, `build_dag_tree` and the
+  payload helpers are pure and get unit tests on hand-built plans, outcomes or
+  plain items;
 - `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
   real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
   `paths.data_dir()` never touches the developer's own -- with the harness

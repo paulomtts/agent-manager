@@ -1376,11 +1376,11 @@ async def supervise(
     `tip_<short id>`, and every story rooted on a `merged` base (two or more
     in-milestone blockers) as an extra executor root, for the grafo
     join-starvation reason `build_dag_tree` documents (a grafo limitation,
-    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's own completion,
-    signalled by `story_done`/`story_ok` below, and reads the blocker's tip
-    off `plan.tips` (`blocker_tips`); every lane sets its own signal on exit,
-    success or not, so this never hangs. A milestone with no story has no
-    tree to run.
+    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's
+    own completion, signalled by `story_done`/`story_ok` below, and reads the
+    blocker's tip off `plan.tips` (`blocker_tips`); every lane sets its own
+    signal on exit, success or not, so this never hangs. A milestone with no
+    story has no tree to run.
 
     A lane that dies of a `BaseException` other than a cancellation ends the
     whole call at once, re-raised by `run_until_killed`: grafo alone would
