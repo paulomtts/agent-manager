@@ -140,6 +140,40 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(marker)
 
 
+E2E_CAP = 5
+JUSTIFICATION_PREFIX = "justification:"
+
+
+def has_justification(docstring: str | None) -> bool:
+    """True when some line of `docstring`, leading whitespace stripped, starts `justification:`."""
+    if not docstring:
+        return False
+    return any(line.lstrip().startswith(JUSTIFICATION_PREFIX) for line in docstring.splitlines())
+
+
+def e2e_tier_violations(items: Iterable[tuple[str, Iterable[str], str | None]]) -> list[str]:
+    """Every e2e-tier rule `items` break, as messages; empty when none.
+
+    Each item is a (nodeid, marker names on its chain, docstring) triple. Only the
+    exact `e2e` marker counts (`e2e_fake` is another tier). Over the cap gives one
+    message naming the count, the cap and every e2e nodeid; each e2e item with no
+    `justification:` line gives one more, in input order.
+    """
+    e2e = [(nodeid, doc) for nodeid, markers, doc in items if "e2e" in set(markers)]
+    violations: list[str] = []
+    if len(e2e) > E2E_CAP:
+        nodeids = ", ".join(nodeid for nodeid, _ in e2e)
+        violations.append(
+            f"the e2e tier is capped at {E2E_CAP} tests, but {len(e2e)} carry the e2e marker: {nodeids}"
+        )
+    for nodeid, doc in e2e:
+        if not has_justification(doc):
+            violations.append(
+                f"{nodeid}: an e2e test's docstring needs a line starting `{JUSTIFICATION_PREFIX}`"
+            )
+    return violations
+
+
 UNIT_BUDGET_S = 0.5
 GIT_BUDGET_S = 2.0
 

@@ -1,11 +1,12 @@
-"""Tier guards in `tests/conftest.py`: the unit-tier PATH shim and the per-test budget.
+"""Tier guards in `tests/conftest.py`: the unit-tier PATH shim, the per-test budget,
+the e2e cap and justification check, and the git/brd binary skip.
 
-The budget helper and the stub text are pure, so their tests carry no tier
-marker and run in the unit tier. The hook-level tests start a nested pytest in
-a subprocess (pytester) that execs the stub scripts, so they are marked `git`:
-a subprocess cannot be unit tier, and the marker keeps them out of the very
-shim they police. They touch no real git, brd or claude. This file sits at the
-top of `tests/`, so the directory auto-mark leaves it alone.
+The helpers, the stub text and the source scans are pure, so their tests carry
+no tier marker and run in the unit tier. The hook-level tests start a nested
+pytest in a subprocess (pytester) that execs the stub scripts, so they are
+marked `git`: a subprocess cannot be unit tier, and the marker keeps them out of
+the very shim they police. They touch no real git, brd or claude. This file sits
+at the top of `tests/`, so the directory auto-mark leaves it alone.
 """
 
 from __future__ import annotations
@@ -16,10 +17,13 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    E2E_CAP,
     GIT_BUDGET_S,
     STUB_EXIT_CODE,
     STUB_NAMES,
     UNIT_BUDGET_S,
+    e2e_tier_violations,
+    has_justification,
     stub_script,
     tier_budget_violation,
 )
@@ -268,3 +272,74 @@ def test_hook_reads_the_items_own_tier_markers(pytester):
     )
     result.assert_outcomes(passed=2)
     result.stdout.no_fnmatch_line("*budget exceeded*")
+
+
+# ── the e2e cap and justification check ─────────────────────────────────────
+
+JUSTIFIED = "Drives the real claude.\n\njustification: only the real binary shows this.\n"
+UNJUSTIFIED_MESSAGE = "an e2e test's docstring needs a line starting `justification:`"
+
+
+def _e2e(nodeid: str, doc: str | None = JUSTIFIED) -> tuple[str, list[str], str | None]:
+    return (nodeid, ["e2e"], doc)
+
+
+def test_e2e_cap_matches_the_v2_table():
+    assert E2E_CAP == 5
+
+
+def test_five_justified_e2e_items_and_any_non_e2e_items_pass():
+    items = [_e2e(f"t.py::test_e2e_{i}") for i in range(5)]
+    items += [(f"t.py::test_plain_{i}", ["git", "parametrize"], None) for i in range(50)]
+    assert e2e_tier_violations(items) == []
+
+
+def test_e2e_fake_items_never_count_toward_the_cap():
+    items = [(f"t.py::test_fake_{i}", ["e2e_fake"], None) for i in range(9)]
+    assert e2e_tier_violations(items) == []
+
+
+def test_a_sixth_e2e_item_is_a_cap_violation_naming_every_nodeid():
+    items = [_e2e(f"t.py::test_e2e_{i}") for i in range(6)]
+    assert e2e_tier_violations(items) == [
+        "the e2e tier is capped at 5 tests, but 6 carry the e2e marker: "
+        + ", ".join(f"t.py::test_e2e_{i}" for i in range(6))
+    ]
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [None, "", "Drives the real claude.\nNo reason given.\n"],
+    ids=["no-docstring", "empty-docstring", "no-justification-line"],
+)
+def test_an_e2e_item_without_a_justification_line_is_a_violation(doc):
+    assert e2e_tier_violations([_e2e("t.py::test_paid", doc)]) == [
+        f"t.py::test_paid: {UNJUSTIFIED_MESSAGE}"
+    ]
+
+
+def test_an_indented_justification_line_passes():
+    doc = "Drives the real claude.\n\n    justification: only the real binary shows this.\n    "
+    assert has_justification(doc)
+    assert e2e_tier_violations([_e2e("t.py::test_paid", doc)]) == []
+
+
+def test_justification_mid_line_does_not_count():
+    doc = "Needs a justification: but not at the start of the line.\n"
+    assert not has_justification(doc)
+    assert e2e_tier_violations([_e2e("t.py::test_paid", doc)]) == [
+        f"t.py::test_paid: {UNJUSTIFIED_MESSAGE}"
+    ]
+
+
+def test_cap_and_justification_violations_are_reported_together():
+    items = [_e2e(f"t.py::test_e2e_{i}") for i in range(5)] + [_e2e("t.py::test_bare", None)]
+    violations = e2e_tier_violations(items)
+    assert len(violations) == 2
+    assert violations[0].startswith("the e2e tier is capped at 5 tests, but 6 carry the e2e marker: ")
+    assert violations[1] == f"t.py::test_bare: {UNJUSTIFIED_MESSAGE}"
+
+
+def test_marker_names_may_be_any_iterable():
+    assert e2e_tier_violations([("t.py::test_paid", iter(["e2e"]), JUSTIFIED)]) == []
+    assert e2e_tier_violations([("t.py::test_plain", iter(["skipif"]), None)]) == []
