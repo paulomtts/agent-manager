@@ -953,6 +953,56 @@ def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], st
     return prefix_of
 
 
+def dry_run_board(
+    *,
+    repo_dir: Path,
+    branch_prefix: str | None,
+    base_branch: str,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+) -> dict[str, Any]:
+    """`--dry-run --board`: every open milestone, by level, each with its own preview.
+
+    Read-only by construction, like `dry_run_milestone`. `board.roots()` is
+    read once (each root already nests its whole tree), leveled by
+    `dag.board_levels` (a done milestone drops out, a cycle is
+    `DependencyCycleError`), and each milestone's prefix comes from
+    `orchestrate.board_prefixes` over `board_prefix_of`, the very check
+    `run_board` makes. Each milestone's `plan` is its own `dry_run_payload`.
+    No `Store` is opened, no claim is checked, no runner is built, and
+    `orchestrate.run_board` is never called. Every refusal is a type already
+    in `HANDLED`.
+    """
+    root = resolve_repo_dir(repo_dir)
+    levels = dag.board_levels(board.roots(repo_dir=root))
+    milestones = [card for level in levels for card in level]
+    prefixes = orchestrate.board_prefixes(milestones, board_prefix_of(branch_prefix))
+    return {
+        "board": True,
+        "max_concurrent": max_concurrent,
+        "levels": [
+            {
+                "level": index,
+                "milestones": [
+                    {
+                        "milestone_id": card.id,
+                        "title": card.title,
+                        "branch_prefix": prefixes[card.id],
+                        "plan": dry_run_payload(
+                            census.flatten_milestone(card).stories,
+                            repo_dir=root,
+                            branch_prefix=prefixes[card.id],
+                            base_branch=base_branch,
+                            max_concurrent=max_concurrent,
+                        ),
+                    }
+                    for card in level
+                ],
+            }
+            for index, level in enumerate(levels)
+        ],
+    }
+
+
 HANDLED: tuple[type[BaseException], ...] = (
     CliError,
     board.BoardError,
@@ -1150,7 +1200,14 @@ def run(
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
-        if milestone is not None and dry_run:
+        if whole_board and dry_run:
+            payload = dry_run_board(
+                repo_dir=repo_dir,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+                max_concurrent=lanes,
+            )
+        elif milestone is not None and dry_run:
             payload = dry_run_milestone(
                 milestone,
                 repo_dir=repo_dir,
@@ -1184,12 +1241,20 @@ def run(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
-    # A card payload reports `status`. A milestone payload has no `status` key:
-    # it carries `escalated: true` only when it stopped, a clean one carries
-    # `done: true`, and a dry-run preview carries neither. So the flag is read
-    # with `.get`, never indexed. Both checks are strict equality on purpose: a
-    # `stopped` card (addendum P4) is not an escalation and exits 0.
-    if milestone is None:
+    # A board payload carries one entry per milestone under `milestones`, each
+    # with a `status`; a board dry-run carries no `milestones` key at all, so
+    # it is read with `.get` and an empty default. A card payload reports
+    # `status`. A milestone payload has no `status` key: it carries
+    # `escalated: true` only when it stopped, a clean one carries `done: true`,
+    # and a dry-run preview carries neither, so it is read with `.get`, never
+    # indexed. Every check is strict equality on purpose: a `stopped` card
+    # (addendum P4), or a stopped, cancelled or blocked milestone, is not an
+    # escalation and exits 0.
+    if whole_board:
+        escalated = any(
+            entry.get("status") == "escalated" for entry in payload.get("milestones", [])
+        )
+    elif milestone is None:
         escalated = payload["status"] == "escalated"
     else:
         escalated = payload.get("escalated") is True

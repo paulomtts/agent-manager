@@ -3432,6 +3432,7 @@ def _forbid_board_paths(monkeypatch) -> None:
     monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
     monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
     monkeypatch.setattr(orchestrate, "run_board", _Forbidden("run_board"))
+    monkeypatch.setattr(cli, "dry_run_board", _Forbidden("dry_run_board"))
 
 
 @pytest.mark.parametrize(
@@ -3464,6 +3465,237 @@ def test_bad_board_targets_are_usage_errors_that_start_nothing(
     assert result.exit_code == 2, result.output
     assert '"ok"' not in result.stdout
     assert word in result.output
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def _as_json(value: Any) -> Any:
+    """`value` as the CLI would print it: `render` stringifies any `Path`."""
+    return json.loads(cli.render({"value": value}))["value"]
+
+
+def _forbid_board_dry_run_writes(monkeypatch) -> None:
+    """The board preview must open no Store, check no claims and run nothing."""
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(store_module, "Store", _Forbidden("store.Store"))
+    monkeypatch.setattr(cli, "refuse_claimed", _Forbidden("refuse_claimed"))
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_board", _Forbidden("run_board"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+
+def _expected_board_milestone(
+    card: models.CardNode, prefix: str, *, root: Path, max_concurrent: int
+) -> dict[str, Any]:
+    return {
+        "milestone_id": card.id,
+        "title": card.title,
+        "branch_prefix": prefix,
+        "plan": cli.dry_run_payload(
+            census.flatten_milestone(card).stories,
+            repo_dir=root,
+            branch_prefix=prefix,
+            base_branch="main",
+            max_concurrent=max_concurrent,
+        ),
+    }
+
+
+def _board_dry_run(repo_dir: Path, *extra: str):
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--board",
+            "--dry-run",
+            "--repo-dir",
+            str(repo_dir),
+            "--base-branch",
+            "main",
+            *extra,
+        ],
+    )
+
+
+@requires_git
+@requires_brd
+def test_the_board_dry_run_previews_every_open_milestone_by_level_and_writes_nothing(
+    project, monkeypatch
+):
+    """Spec test 13: two milestones, the second blocked by the first, on a real
+    temporary brd board. Two levels, each milestone with its derived prefix and
+    its own `dry_run_payload` nested as `plan`; nothing run, nothing written."""
+    first = _add_card(project, "Milestone A: the adapter")
+    first_story = _add_card(project, "Story A1: read cards", first)
+    _add_card(project, "a1: read one card", first_story)
+    second = _add_card(project, "Milestone B: the store")
+    second_story = _add_card(project, "Story B1: the schema", second)
+    _add_card(project, "b1: write the schema", second_story)
+    _block(project, second, first)
+    board_before = board.roots(repo_dir=project)
+    roots = {card.id: card for card in board_before}
+    porcelain_before = _git(project, "status", "--porcelain")
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(project)
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    # `cli.render` always serializes with `sort_keys=True` (it documents this
+    # as making output diffable), so the rendered envelope's key order is
+    # always alphabetical regardless of the payload dict's construction
+    # order; membership, not order, is what this checks.
+    assert set(data) == {"board", "max_concurrent", "levels"}
+    assert data["board"] is True
+    assert data["max_concurrent"] == cli.DEFAULT_MAX_CONCURRENT
+    root = cli.resolve_repo_dir(project)
+    expected = [
+        {
+            "level": index,
+            "milestones": [
+                _expected_board_milestone(
+                    roots[card_id],
+                    dag.task_stem(roots[card_id]),
+                    root=root,
+                    max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                )
+            ],
+        }
+        for index, card_id in enumerate([first, second])
+    ]
+    assert data["levels"] == _as_json(expected)
+    for level in data["levels"]:
+        for entry in level["milestones"]:
+            assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+    _assert_nothing_written(project, porcelain_before)
+    assert board.roots(repo_dir=project) == board_before
+
+
+def _board_milestone(
+    n: int,
+    *,
+    status: str = "todo",
+    blocked_by: tuple[str, ...] = (),
+    card_id: str | None = None,
+    title: str | None = None,
+) -> models.CardNode:
+    """A milestone root with one open story holding one open subtask."""
+    return models.CardNode(
+        id=card_id or _plan_id(n),
+        title=title or f"Milestone {n}",
+        status=status,
+        blocked_by=list(blocked_by),
+        children=[
+            models.CardNode(
+                id=_plan_id(n * 100 + 1),
+                title=f"story {n}",
+                status="todo",
+                children=[
+                    models.CardNode(id=_plan_id(n * 100 + 2), title=f"subtask {n}", status="todo")
+                ],
+            )
+        ],
+    )
+
+
+def _serve_roots(monkeypatch, roots: list[models.CardNode]) -> None:
+    monkeypatch.setattr(cli.board, "roots", lambda *, repo_dir=None: list(roots))
+
+
+def test_the_board_dry_run_derives_prefixes_from_a_given_prefix_and_drops_done_milestones(
+    tmp_path, monkeypatch
+):
+    """A done milestone is not previewed and the one it blocked lands in level 0.
+    A given prefix becomes `<prefix>-<stem>` in each milestone's nested plan, and
+    --max-concurrent is echoed at both levels of the payload."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    third = _board_milestone(3, blocked_by=(second.id,))
+    _serve_roots(monkeypatch, [done, second, third])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(tmp_path, "--branch-prefix", "sprint9", "--max-concurrent", "2")
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    root = cli.resolve_repo_dir(tmp_path)
+    assert data == _as_json(
+        {
+            "board": True,
+            "max_concurrent": 2,
+            "levels": [
+                {
+                    "level": index,
+                    "milestones": [
+                        _expected_board_milestone(
+                            card,
+                            f"sprint9-{dag.task_stem(card)}",
+                            root=root,
+                            max_concurrent=2,
+                        )
+                    ],
+                }
+                for index, card in enumerate([second, third])
+            ],
+        }
+    )
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_an_empty_board_dry_runs_to_no_levels_and_exits_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _serve_roots(monkeypatch, [])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {
+        "board": True,
+        "max_concurrent": cli.DEFAULT_MAX_CONCURRENT,
+        "levels": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "roots, error_type",
+    [
+        (
+            [
+                _board_milestone(1, blocked_by=(_plan_id(2),)),
+                _board_milestone(2, blocked_by=(_plan_id(1),)),
+            ],
+            "DependencyCycleError",
+        ),
+        ([_board_milestone(1, card_id="not-a-uuid")], "ValueError"),
+        (
+            [
+                _board_milestone(1, title="Milestone twin"),
+                _board_milestone(
+                    2, card_id="00000001-0000-4000-8000-000000000001", title="Milestone twin"
+                ),
+            ],
+            "ValueError",
+        ),
+    ],
+    ids=["milestone-cycle", "non-uuid-milestone", "shared-derived-prefix"],
+)
+def test_a_board_dry_run_refusal_is_an_envelope_and_writes_nothing(
+    tmp_path, monkeypatch, roots, error_type
+):
+    """Review focus: a cycle among milestones, a milestone id `dag.task_stem`
+    cannot read, and two milestones deriving one prefix are each the same
+    `HANDLED` refusal the real run gives: `ok: false`, exit 3."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _serve_roots(monkeypatch, roots)
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    error = _refusal(_board_dry_run(tmp_path))
+
+    assert error["type"] == error_type
     assert list(paths.data_dir().iterdir()) == []
 
 
