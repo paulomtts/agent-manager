@@ -436,7 +436,9 @@ class AgentRunner:
 
         detail = verdict.detail or verdict.status
         self._record_phase(phase, "failed", started_at, self.clock(), detail)
-        raise AgentPhaseFailed(phase.name, outcome=verdict.status, detail=detail)
+        raise AgentPhaseFailed(
+            phase.name, outcome=verdict.status, detail=detail, result=verdict.result
+        )
 
     def _attempt(
         self,
@@ -516,13 +518,22 @@ class AgentRunner:
                 walk.gate_values(context, phase.name, verdict.result),
                 self.warnings,
             )
+            # Both gate-failure verdicts keep the dispatch's own result: a gate
+            # failing does not mean nothing was produced, and the agent's own
+            # explanation (e.g. review's `unresolved_blockers`) is read off this
+            # result by `comments.agent_reason` once the phase escalates.
             if gates.kind == "fail":
-                verdict = Verdict("gate_failed", detail=gates.detail["message"])
+                verdict = Verdict(
+                    "gate_failed",
+                    detail=gates.detail["message"],
+                    result=verdict.result,
+                )
             elif gates.kind == "broken":
                 verdict = Verdict(
                     "gate_failed",
                     detail=_broken_gate_message(phase.name, gates.detail),
                     fatal=True,
+                    result=verdict.result,
                 )
         usage = _usage(target.adapter, outcome)
         self._record_attempt(

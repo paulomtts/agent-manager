@@ -209,6 +209,28 @@ def test_milestone_claims_has_no_duplicates():
     ]
 
 
+def test_milestone_card_ids_cover_the_milestone_every_story_and_every_subtask():
+    """Board-comments B7: the start flush covers done and closed cards too,
+    since an earlier run may have left a pending comment on any of them."""
+    a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12)])
+    closed = _plan_story(2, [_plan_subtask(21)], status="done")
+    empty = _plan_story(3, [])
+    shared = _plan_story(4, [_plan_subtask(12)])
+
+    ids = orchestrate.milestone_card_ids(_plan_id(99), [a, closed, empty, shared])
+
+    assert ids == [
+        _plan_id(99),
+        _plan_id(1),
+        _plan_id(11),
+        _plan_id(12),
+        _plan_id(2),
+        _plan_id(21),
+        _plan_id(3),
+        _plan_id(4),
+    ]
+
+
 def test_the_escalated_payload_names_the_primary_and_lists_the_rest_in_census_order():
     also = orchestrate.LaneOutcome(
         kind="escalated",
@@ -5287,3 +5309,729 @@ def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(proje
     assert git_calls == []
     assert (_runs_tree(), _statuses(_load(project, run_id))) == before
     assert _claim_rows(project) == [(key, run_id, "still-running") for key in own]
+
+
+# ── board comments (card 65ed3c70) ──────────────────────────────────────────
+
+
+def _comments(project: Path, card_id: str) -> list[board.BoardComment]:
+    """`card_id`'s comments on the temporary board, oldest first."""
+    return board.comment_list(card_id, repo_dir=project)
+
+
+def _keys(found: list[board.BoardComment]) -> list[str]:
+    """Each comment's `am-key:` value, read off its last line, in board order."""
+    return [
+        comment.body.rstrip().rsplit("\n", 1)[-1].removeprefix("am-key: ")
+        for comment in found
+    ]
+
+
+def _comment_states(project: Path) -> list[tuple[str, str]]:
+    """Every outbox row as `(key, state)`, in insertion order."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        return [
+            (row["key"], row["state"])
+            for row in conn.execute("SELECT key, state FROM board_comments ORDER BY rowid")
+        ]
+    finally:
+        conn.close()
+
+
+@requires_git
+@requires_brd
+def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story(project):
+    """Spec test 1, subtask half; Review Focus 2: two lanes finish at once,
+    yet each subtask gets exactly one done comment and nothing stays pending."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+
+    result = _run(project, shape["milestone"], FakeDriver(), max_concurrent=2)
+
+    assert result["done"] is True, result
+    run_id = result["run_id"]
+    for subtask in (a1, a2, b1):
+        found = _comments(project, subtask)
+        assert _keys(found) == [f"{run_id}/{subtask}/done"], subtask
+        (comment,) = found
+        assert comment.author == "am"
+        assert comment.body.startswith(f"am · done · run {run_id}\n")
+        assert f"branch: {_branch(project, subtask)}" in comment.body
+        assert "(resumed at" not in comment.body
+    for story in shape["stories"].values():
+        assert _comments(project, story) == [], story
+    assert [state for _key, state in _comment_states(project) if "/done" in _key] == [
+        "posted",
+        "posted",
+        "posted",
+    ]
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
+    """Spec test 1, milestone half; Review Focus 5: `total` reaches the comment only."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    milestone = shape["milestone"]
+
+    result = _run(project, milestone, FakeDriver())
+
+    assert result["done"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    (comment,) = found
+    assert comment.author == "am"
+    assert comment.body.startswith(f"am · done · run {run_id}\n")
+    assert "done: 3 of 3" in comment.body
+    assert f"integrated: {INTEGRATION_BRANCH}" in comment.body
+    assert f"next: `git merge {INTEGRATION_BRANCH}`" in comment.body
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
+    project, integrate_recorder
+):
+    """Spec test 6."""
+    shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    milestone, story_b = shape["milestone"], shape["stories"]["B"]
+    integrate_recorder.outcome = integration.IntegrateEscalation(
+        story=story_b, files=["shared.txt"], detail="the resolver did not finish"
+    )
+
+    result = _run(project, milestone, FakeDriver())
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    (comment,) = _comments(project, milestone)
+    assert comment.body.startswith(f"am · escalated · run {run_id}\n")
+    assert (
+        f"integrate failed at integrate on [[{story_b}]]: the resolver did not finish"
+        in comment.body
+    )
+    assert f"next: `am run --milestone {milestone}`" in comment.body
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked(project):
+    """Spec test 2, milestone half: the run-end names the escalated subtask and
+    the parked one, and tells a human to resume."""
+    shape = _milestone(project, {"A": 1, "B": 2})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    b1, _b2 = shape["subtasks"]["B"]
+    pair = asyncio.Barrier(2)
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, milestone, driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    body = found[0].body
+    assert body.startswith(f"am · escalated · run {run_id}\n")
+    assert f"escalated: [[{a1}]] at review" in body
+    assert f"parked: [[{b1}]]" in body
+    assert f"next: `am resume {run_id}`" in body
+
+
+@dataclass
+class WithResults:
+    """Wraps a fake driver and merges canned phase results into a card's
+    summary, as the real walk returns them, so `agent_reason` has its field."""
+
+    inner: Any
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    async def __call__(self, **kwargs: Any) -> cli.SubtaskDrive:
+        drive = await self.inner(**kwargs)
+        extra = self.results.get(kwargs["card"].id)
+        if extra is None:
+            return drive
+        summary = replace(drive.summary, results={**drive.summary.results, **extra})
+        return replace(drive, summary=summary)
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(project):
+    """Spec test 2: the escalated subtask gets phase, detail and the agent's
+    one reason field (quoted, `[[` broken); parked b1, pending c1 and every
+    story get nothing."""
+    shape = _milestone(project, {"A": 1, "B": 2, "C": 1}, blocked_by={"C": ["A"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    b1, b2 = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    pair = asyncio.Barrier(2)
+    driver = WithResults(
+        GatedDriver(
+            outcomes={a1: ("review", "reviewer found a blocker")},
+            gates={a1: _meet(pair), b1: _meet_then_await_stop(pair)},
+        ),
+        results={
+            a1: {"review": {"unresolved_blockers": ["the [[parser]] still drops input", "no test"]}}
+        },
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    found = _comments(project, a1)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{a1}/escalated:")
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · escalated · run {run_id}\n")
+    assert "phase: review" in body
+    assert "detail: reviewer found a blocker" in body
+    assert 'reason: "the [ [parser]] still drops input; no test"' in body
+    assert f"next: `am resume {run_id}`" in body
+    for quiet in (story_a, story_b, b1, b2, story_c, c1):
+        assert _comments(project, quiet) == [], quiet
+    assert len(_comments(project, shape["milestone"])) == 1
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_second_life_escalating_at_the_same_phase_adds_a_second_escalation_comment(project):
+    """Spec test 4 (Review Focus 3 of the card); Review Focus 4 here: no
+    review result at all gives no `reason:` line and no crash."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, milestone, FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+
+    again = _resume(project, run_id, FakeDriver(outcomes={a1: ("review", "still")}))
+
+    assert again["escalated"] is True, again
+    found = _comments(project, a1)
+    keys = _keys(found)
+    assert len(keys) == 2 and len(set(keys)) == 2, keys
+    assert all(key.startswith(f"{run_id}/{a1}/escalated:") for key in keys)
+    assert "detail: boom" in found[0].body
+    assert "detail: still" in found[1].body
+    assert all("reason:" not in comment.body for comment in found)
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys
+
+
+@requires_git
+@requires_brd
+def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_review(project):
+    """Spec test 3: the first life's escalation stays; the second life adds
+    `done` with `(resumed at review)` and its own, distinct run-end."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, milestone, FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",))
+    driver = CheckpointDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert driver.resumed[a1] is not _ABSENT
+    found = _comments(project, a1)
+    keys = _keys(found)
+    assert len(keys) == 2, keys
+    assert keys[0].startswith(f"{run_id}/{a1}/escalated:")
+    assert keys[1] == f"{run_id}/{a1}/done"
+    assert found[1].body.startswith(f"am · done · run {run_id}\n(resumed at review)\n")
+    on_milestone = _comments(project, milestone)
+    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
+        f"am · escalated · run {run_id}",
+        f"am · done · run {run_id}",
+    ]
+    assert len(set(_keys(on_milestone))) == 2
+
+
+@requires_git
+@requires_brd
+def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
+    """Spec test 5, `lane` case: one `base-failed` comment on C, none on c1."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    (c1,) = shape["subtasks"]["C"]
+    root_plan = _root_plan(project, shape["milestone"], story_c)
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_c, "base"), result
+    run_id = result["run_id"]
+    found = _comments(project, story_c)
+    assert _keys(found) == [f"{run_id}/{story_c}/base-failed"]
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · base failed · run {run_id}\n")
+    assert f"base branch: {root_plan.branch}" in body
+    assert "detail: conflict nobody could resolve" in body
+    assert _comments(project, c1) == []
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_bases):
+    """Spec test 5, `base_only_lane` case: J has no store row, yet its story
+    card gets the comment."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    root_plan = _root_plan(project, shape["milestone"], story_j)
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_j, "base"), result
+    run_id = result["run_id"]
+    found = _comments(project, story_j)
+    assert _keys(found) == [f"{run_id}/{story_j}/base-failed"]
+    assert f"base branch: {root_plan.branch}" in found[0].body
+    assert "detail: J's base broke" in found[0].body
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_base_whose_resolver_was_stopped_gets_no_base_failed_comment(project, fake_bases):
+    """Spec test 5, stopped case: `BaseFailed(stopped=True)` is a park, not a failure."""
+    shape = _milestone(
+        project, {"A": 1, "B": 1, "C": 1, "D": 1}, blocked_by={"C": ["A", "B"]}
+    )
+    story_c = shape["stories"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    c_building = asyncio.Event()
+
+    async def park_with_the_stop(stop: StopSignal | None) -> None:
+        c_building.set()
+        await _await_stop(stop)
+
+    async def escalate_once_c_builds(stop: StopSignal | None) -> None:
+        await _within(c_building.wait(), "C's base to start building")
+
+    fake_bases.gates[story_c] = park_with_the_stop
+    fake_bases.outcomes[story_c] = bases.BaseFailed("the resolver was stopped", stopped=True)
+    driver = GatedDriver(
+        outcomes={d1: ("review", "d broke")}, gates={d1: escalate_once_c_builds}
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=3)
+
+    assert result["stopped"] == [{"story": story_c, "subtask": None, "before_phase": None}]
+    assert _comments(project, story_c) == []
+
+
+def _board_down(monkeypatch) -> dict[str, bool]:
+    """Fail `board.comment_list` -- the first `brd` call a flush makes per
+    row -- while `state["down"]`; every other board call stays real."""
+    state = {"down": True}
+    real = board.comment_list
+
+    def flaky(card_id: str, *, repo_dir: Path | None = None) -> list[board.BoardComment]:
+        if state["down"]:
+            raise board.BoardError(
+                "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+            )
+        return real(card_id, repo_dir=repo_dir)
+
+    monkeypatch.setattr(board, "comment_list", flaky)
+    return state
+
+
+@requires_git
+@requires_brd
+def test_a_board_that_is_down_changes_only_warnings_and_a_relaunch_posts_the_rows(
+    project, monkeypatch
+):
+    """Spec test 7; Review Focus 1 and 3: the run still ends done with its usual
+    keys, each failed row is one warning and stays pending, and a relaunch
+    under a new run id posts both before anything else, exactly once."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    state = _board_down(monkeypatch)
+
+    first = _run(project, milestone, BranchingDriver())
+
+    run_id = first["run_id"]
+    assert first["done"] is True, first
+    assert first["completed"] == [a1]
+    assert set(first) == {"done", "run_id", "levels", "completed", "tips", "warnings", "integrated"}
+    assert _load(project, run_id).status == "done"
+    assert len(first["warnings"]) == 2, first["warnings"]
+    assert f"board comment {run_id}/{a1}/done on card {a1} not posted" in first["warnings"][0]
+    assert f"board comment {run_id}/{milestone}/run-end:" in first["warnings"][1]
+    assert all("will retry" in warning for warning in first["warnings"])
+    assert [row_state for _key, row_state in _comment_states(project)] == ["pending", "pending"]
+
+    state["down"] = False
+    second = _run(project, milestone, BranchingDriver(), clock=lambda: LATER)
+
+    assert second["done"] is True, second
+    assert second["warnings"] == []
+    assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2, milestone_keys
+    assert milestone_keys[0].startswith(f"{run_id}/{milestone}/run-end:")
+    assert milestone_keys[1].startswith(f"{second['run_id']}/{milestone}/run-end:")
+    assert all(row_state == "posted" for _key, row_state in _comment_states(project))
+
+
+@requires_git
+@requires_brd
+def test_a_start_flush_that_fails_reports_its_warnings_and_the_run_goes_on(
+    project, monkeypatch
+):
+    """Board-comments B7/B8: a relaunch whose start flush meets a board that
+    is still down reports the earlier run's unposted rows as warnings and
+    still ends done. a1 is not driven again, so only the start flush can
+    report a warning on its row."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    _board_down(monkeypatch)
+    first = _run(project, milestone, BranchingDriver())
+    run_id = first["run_id"]
+
+    second = _run(project, milestone, BranchingDriver(), clock=lambda: LATER)
+
+    assert second["done"] is True, second
+    assert second["completed"] == []
+    on_a1 = [w for w in second["warnings"] if f"board comment {run_id}/{a1}/done " in w]
+    assert len(on_a1) == 1, second["warnings"]
+    assert "not posted" in on_a1[0] and "brd is down" in on_a1[0]
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_comment_the_board_refuses_is_a_warning_on_the_run(
+    project, monkeypatch
+):
+    """Board-comments B8: the escalated subtask's unposted comment surfaces
+    in the escalated report's `warnings`, and the run still escalates."""
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
+
+    assert result["escalated"] is True, result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{a1}/escalated:" in w]
+    ) == 1, result["warnings"]
+
+
+@requires_git
+@requires_brd
+def test_a_failed_base_comment_the_board_refuses_is_a_warning_on_the_run(
+    project, fake_bases, monkeypatch
+):
+    """Board-comments B8, `lane` case: the story's unposted base-failed
+    comment surfaces in the escalated report's `warnings`."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_c = shape["stories"]["C"]
+    fake_bases.outcomes[story_c] = bases.BaseFailed("conflict nobody could resolve")
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_c, "base"), result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{story_c}/base-failed " in w]
+    ) == 1, result["warnings"]
+
+
+@requires_git
+@requires_brd
+def test_a_subtask_less_storys_refused_base_comment_is_a_warning_on_the_run(
+    project, fake_bases, monkeypatch
+):
+    """Board-comments B8, `base_only_lane` case: J's unposted base-failed
+    comment surfaces in the escalated report's `warnings`."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "J": 0, "D": 1},
+        blocked_by={"J": ["A", "B"], "D": ["J"]},
+    )
+    story_j = shape["stories"]["J"]
+    fake_bases.outcomes[story_j] = bases.BaseFailed("J's base broke")
+    _board_down(monkeypatch)
+
+    result = _run(project, shape["milestone"], FakeDriver())
+
+    assert (result["story"], result["failed_phase"]) == (story_j, "base"), result
+    run_id = result["run_id"]
+    assert len(
+        [w for w in result["warnings"] if f"board comment {run_id}/{story_j}/base-failed " in w]
+    ) == 1, result["warnings"]
+
+
+# ── board comments on cancel and pause (card 5d9a875f) ─────────────────────
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
+    """Spec test 1: a2 and b1 park under the cancel and each get one
+    `cancelled` comment; a1 keeps only its done comment; stories get none;
+    the milestone gets one `cancelled` run-end. Comments go out in the
+    order `stopped` lists the parked lanes (wave order)."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    milestone = shape["milestone"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_then_cancel(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a2 and b1 in flight together")
+        _send(project, run_id, "cancel")
+        await _await_stop(stop)
+
+    driver = GatedDriver(gates={a2: meet_then_cancel, b1: _meet_then_await_stop(pair)})
+
+    result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert _load(project, run_id).status == "cancelled"
+    parked = [row["subtask"] for row in result["stopped"]]
+    assert sorted(parked) == sorted([a2, b1]), result
+    for subtask in (a2, b1):
+        found = _comments(project, subtask)
+        assert _keys(found) == [f"{run_id}/{subtask}/cancelled"], subtask
+        (comment,) = found
+        assert comment.author == "am"
+        assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+        assert "stopped before: implement" in comment.body
+        assert f"branch: {_branch(project, subtask)}" in comment.body
+        assert f"relaunch: `am run --milestone {milestone}`" in comment.body
+    assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
+    for story in shape["stories"].values():
+        assert _comments(project, story) == [], story
+    on_milestone = _comments(project, milestone)
+    (key,) = _keys(on_milestone)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    body = on_milestone[0].body
+    assert body.startswith(f"am · cancelled · run {run_id}\n")
+    assert "done: 1 of 3" in body
+    assert "parked: " + ", ".join(f"[[{card}]]" for card in parked) in body
+    assert f"next: `am run --milestone {milestone}`" in body
+    cancelled_keys = [key for key, _state in _comment_states(project) if key.endswith("/cancelled")]
+    assert cancelled_keys == [f"{run_id}/{card}/cancelled" for card in parked]
+    assert all(state == "posted" for _key, state in _comment_states(project))
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_cancelled(project):
+    """Review Focus 3: a1's lane already posted its escalation; the cancel
+    adds no `cancelled` comment for it, only for parked b1, and the run-end
+    names both."""
+    shape = _milestone(project, {"A": 1, "B": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_cancel_then_escalate(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "a1 and b1 in flight together")
+        _send(project, run_id, "cancel")
+        await _await_stop(stop)
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: meet_cancel_then_escalate, b1: _meet_then_await_stop(pair)},
+    )
+
+    result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    a1_keys = _keys(_comments(project, a1))
+    assert len(a1_keys) == 1 and a1_keys[0].startswith(f"{run_id}/{a1}/escalated:"), a1_keys
+    assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/cancelled"]
+    (comment,) = _comments(project, milestone)
+    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    assert f"escalated: [[{a1}]] at review" in comment.body
+    assert f"parked: [[{b1}]]" in comment.body
+    assert f"next: `am run --milestone {milestone}`" in comment.body
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_phase(project):
+    """Review Focus 1: `queued` never reached the driver, so its stopped
+    outcome has no `before_phase`; q1 still gets one `cancelled` comment,
+    with its branch and relaunch hint and no `stopped before:` line."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    milestone = shape["milestone"]
+    (first, second, queued) = _census_levels(project, milestone)[0]
+    subtasks = _subtasks_by_story(shape)
+    (f1,), (s1,), (q1,) = subtasks[first], subtasks[second], subtasks[queued]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    pair = asyncio.Barrier(2)
+
+    async def meet_then_cancel(stop: StopSignal | None) -> None:
+        await _within(pair.wait(), "both slotted lanes in flight")
+        _send(project, run_id, "cancel")
+        await _await_stop(stop)
+
+    driver = GatedDriver(gates={f1: meet_then_cancel, s1: _meet_then_await_stop(pair)})
+
+    result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert {"story": queued, "subtask": q1, "before_phase": None} in result["stopped"]
+    found = _comments(project, q1)
+    assert _keys(found) == [f"{run_id}/{q1}/cancelled"]
+    body = found[0].body
+    assert "stopped before:" not in body
+    assert f"branch: {_branch(project, q1)}" in body
+    assert f"relaunch: `am run --milestone {milestone}`" in body
+    for subtask in (f1, s1):
+        assert "stopped before: implement" in _comments(project, subtask)[0].body
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
+    project, fake_bases
+):
+    """Review Focus 2: C's lane parks while its merged base builds, so its
+    stopped outcome names no subtask. Neither C nor c1 gets a comment, and
+    the milestone still gets its `cancelled` run-end."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    milestone = shape["milestone"]
+    story_c = shape["stories"]["C"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    fake_bases.gates[story_c] = _send_then_await_stop(project, run_id, "cancel")
+    fake_bases.outcomes[story_c] = bases.BaseFailed("the resolver was stopped", stopped=True)
+
+    result = _run(project, milestone, FakeDriver(), control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert result["stopped"] == [{"story": story_c, "subtask": None, "before_phase": None}]
+    assert _comments(project, story_c) == []
+    assert _comments(project, c1) == []
+    assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
+    assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/done"]
+    (comment,) = _comments(project, milestone)
+    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warnings(
+    project, monkeypatch
+):
+    """Spec test 3 (error path B8): the board refuses both the parked
+    subtask's and the milestone's comments. The run is still recorded
+    `cancelled`, the payload keeps its shape, each refusal is one warning,
+    and both rows stay pending for a later flush."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    _board_down(monkeypatch)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    result = _run(project, milestone, driver, control_interval=0)
+
+    assert result["cancelled"] is True, result
+    assert set(result) == {"cancelled", "run_id", "stopped", "completed", "pending", "warnings"}
+    assert _load(project, run_id).status == "cancelled"
+    assert len(result["warnings"]) == 2, result["warnings"]
+    assert (
+        f"board comment {run_id}/{a1}/cancelled on card {a1} not posted" in result["warnings"][0]
+    )
+    assert f"board comment {run_id}/{milestone}/run-end:" in result["warnings"][1]
+    assert [state for _key, state in _comment_states(project)] == ["pending", "pending"]
+
+
+@requires_git
+@requires_brd
+def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
+    """Spec test 2: one comment in total, on the milestone, telling a human
+    to resume; parked a1, pending a2 and b1, and every story get nothing."""
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    milestone = shape["milestone"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    result = _run(project, milestone, driver, control_interval=0)
+
+    assert result["paused"] is True, result
+    assert len(_comment_states(project)) == 1
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    body = found[0].body
+    assert found[0].author == "am"
+    assert body.startswith(f"am · paused · run {run_id}\n")
+    assert "done: 0 of 3" in body
+    assert f"parked: [[{a1}]]" in body
+    assert f"next: `am resume {run_id}`" in body
+    for quiet in (a1, a2, b1, *shape["stories"].values()):
+        assert _comments(project, quiet) == [], quiet
+    assert "total" not in result
+    assert result["warnings"] == []
+
+
+@requires_git
+@requires_brd
+def test_a_paused_then_resumed_run_leaves_a_paused_then_a_done_run_end(project):
+    """Review Focus 4: the resumed life has its own lease token, so its done
+    run-end is a second comment with its own key, after the paused one."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+    first = _run(project, milestone, driver, control_interval=0)
+    assert first["paused"] is True, first
+
+    again = _resume(project, run_id, FakeDriver(), control_interval=0)
+
+    assert again["done"] is True, again
+    on_milestone = _comments(project, milestone)
+    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
+        f"am · paused · run {run_id}",
+        f"am · done · run {run_id}",
+    ]
+    keys = _keys(on_milestone)
+    assert len(set(keys)) == 2, keys
+    assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in keys)

@@ -3852,3 +3852,389 @@ def test_replay_journal_writes_nothing(repo):
 
     assert after == before
     assert attempts == 0
+
+
+# -- board comment outbox ----------------------------------------------------------
+#
+# Board-comments spec B6/B7/B9: a row-only `board_comments` table outside the
+# journal, like `checkpoints` and `run_leases`. Steps tier: real temp DB, no
+# harness, no brd. The fake-board flush tests belong to `comments.py`.
+
+_COMMENT_COLUMNS = [
+    "run_id",
+    "card_id",
+    "key",
+    "body",
+    "state",
+    "comment_id",
+    "failed_attempts",
+    "created_at",
+    "posted_at",
+]
+
+
+def test_open_db_creates_the_board_comments_table(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_comments)").fetchall()
+        ]
+    finally:
+        conn.close()
+    assert columns == _COMMENT_COLUMNS
+
+
+def test_the_board_comments_table_appears_on_an_existing_database(repo):
+    # A pre-M12 database: every table but the new one, with a row in it.
+    first = store.open_db(repo)
+    first.execute("DROP TABLE IF EXISTS board_comments")
+    first.execute(
+        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
+        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+    )
+    first.commit()
+    first.close()
+
+    conn = store.open_db(repo)
+    try:
+        columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_comments)").fetchall()
+        ]
+        kept = [row["id"] for row in conn.execute("SELECT id FROM runs").fetchall()]
+    finally:
+        conn.close()
+
+    assert columns == _COMMENT_COLUMNS
+    assert kept == [RUN_ID]
+
+
+def test_a_board_comment_with_an_unknown_state_is_refused(repo):
+    conn = store.open_db(repo)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO board_comments (run_id, card_id, key, body, state,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (RUN_ID, "card-a", "k-bogus", "body", "bogus", _at(0).isoformat()),
+            )
+        conn.rollback()
+        count = conn.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0
+
+
+def _enqueue(
+    st: store.Store,
+    key: str,
+    *,
+    card_id: str = "card-a",
+    run_id: str = RUN_ID,
+    body: str = "body",
+    now: datetime | None = None,
+) -> bool:
+    return st.enqueue_comment(
+        run_id=run_id,
+        card_id=card_id,
+        key=key,
+        body=body,
+        now=_at(0) if now is None else now,
+    )
+
+
+def _comment_row(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM board_comments WHERE key = ?", (key,)).fetchone()
+
+
+def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
+    body = "## Done\n\nmerged `m12/x` — é\n"
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        first = _enqueue(st, "k1", body=body, now=_at(1))
+        again = _enqueue(
+            st, "k1", run_id=OTHER_RUN_ID, card_id="card-b", body="other", now=_at(2)
+        )
+        row = _comment_row(st.connection, "k1")
+        count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+        journal_exists = st.journal.path.exists()
+    finally:
+        st.close()
+
+    assert first is True
+    assert again is False
+    assert count == 1
+    assert row is not None
+    assert dict(row) == {
+        "run_id": RUN_ID,
+        "card_id": "card-a",
+        "key": "k1",
+        "body": body,
+        "state": "pending",
+        "comment_id": None,
+        "failed_attempts": 0,
+        "created_at": _at(1).isoformat(),
+        "posted_at": None,
+    }
+    # Row-only: the outbox never appends a journal line (the journal file is
+    # only created by its first append).
+    assert journal_exists is False
+
+
+def test_an_enqueue_under_a_lost_lease_raises_and_writes_nothing(stores):
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        _enqueue(a, "k1")
+    assert caught.value.holder is not None and caught.value.holder.token == "t2"
+    assert a.connection.in_transaction is False
+    assert _comment_row(b.connection, "k1") is None
+
+    # The store holding the lease writes under its own fence and commits it:
+    # `a`, a separate connection, sees the committed row.
+    assert _enqueue(b, "k1") is True
+    assert b.connection.in_transaction is False
+    assert _comment_row(a.connection, "k1") is not None
+
+
+def test_a_refused_enqueue_rolls_back_and_writes_nothing(repo, stores):
+    # Review Focus 4: a database error inside the fence rolls back cleanly.
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+
+    saboteur = store.open_db(repo)
+    try:
+        saboteur.execute(
+            "CREATE TRIGGER refuse_comments BEFORE INSERT ON board_comments"
+            " BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        )
+        saboteur.commit()
+    finally:
+        saboteur.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _enqueue(st, "k1")
+    assert st.connection.in_transaction is False
+    assert _held_elsewhere(st._lock) is False
+    assert _comment_row(st.connection, "k1") is None
+
+    st.connection.execute("DROP TRIGGER refuse_comments")
+    st.connection.commit()
+    assert _enqueue(st, "k1") is True
+
+
+def test_an_enqueue_with_no_body_is_refused_not_ignored(repo):
+    # Review Focus 5: only a key collision is ignored; NOT NULL still raises.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _enqueue(st, "k1", body=None)  # type: ignore[arg-type]
+        assert st.connection.in_transaction is False
+        assert _comment_row(st.connection, "k1") is None
+        assert _enqueue(st, "k1") is True
+    finally:
+        st.close()
+
+
+def test_pending_comments_filters_by_run_and_cards_oldest_first(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k1", card_id="card-a", run_id=RUN_ID, body="one", now=_at(2))
+        _enqueue(st, "k2", card_id="card-b", run_id=RUN_ID, body="two", now=_at(1))
+        _enqueue(st, "k3", card_id="card-a", run_id=OTHER_RUN_ID, body="three", now=_at(0))
+
+        def keys(**filters) -> list[str]:
+            return [row.key for row in st.pending_comments(**filters)]
+
+        every = st.pending_comments()
+        by_run = keys(run_id=RUN_ID)
+        by_cards = keys(card_ids=["card-a"])
+        both = keys(run_id=RUN_ID, card_ids=["card-a"])
+        empty = keys(card_ids=[])
+        one_shot = keys(card_ids=iter(["card-b"]))
+        unknown = keys(card_ids=("card-never",), run_id=OTHER_RUN_ID)
+    finally:
+        st.close()
+
+    assert [row.key for row in every] == ["k3", "k2", "k1"]
+    assert every[0] == store.CommentRow(
+        run_id=OTHER_RUN_ID,
+        card_id="card-a",
+        key="k3",
+        body="three",
+        state="pending",
+        comment_id=None,
+        failed_attempts=0,
+    )
+    assert by_run == ["k2", "k1"]
+    # card_ids reaches across runs: relaunch finds an older run's rows.
+    assert by_cards == ["k3", "k1"]
+    assert both == ["k1"]
+    assert empty == []
+    assert one_shot == ["k2"]
+    assert unknown == []
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        every[0].state = "posted"  # type: ignore[misc]
+
+
+def test_pending_comments_breaks_a_created_at_tie_by_insertion_order(repo):
+    # Review Focus 3: one tick composes several bodies with the same `now`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k-b", now=_at(5))
+        _enqueue(st, "k-a", now=_at(5))
+        _enqueue(st, "k-c", now=_at(5))
+        found = [row.key for row in st.pending_comments(run_id=RUN_ID)]
+    finally:
+        st.close()
+    assert found == ["k-b", "k-a", "k-c"]
+
+
+def test_mark_comment_posted_moves_the_row_out_of_pending(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k1", now=_at(0))
+        _enqueue(st, "k2", now=_at(1))
+        st.mark_comment_posted("k1", "c-101", _at(3))
+        row = _comment_row(st.connection, "k1")
+        pending = [r.key for r in st.pending_comments()]
+        in_transaction = st.connection.in_transaction
+    finally:
+        st.close()
+
+    assert row is not None
+    assert (row["state"], row["comment_id"], row["posted_at"]) == (
+        "posted",
+        "c-101",
+        _at(3).isoformat(),
+    )
+    assert pending == ["k2"]
+    assert in_transaction is False
+
+
+def test_record_comment_failure_abandons_the_row_on_the_third_failure(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k1")
+        counts = []
+        states = []
+        for _ in range(store.COMMENT_ATTEMPTS):
+            counts.append(st.record_comment_failure("k1"))
+            row = _comment_row(st.connection, "k1")
+            assert row is not None
+            states.append(row["state"])
+        pending = st.pending_comments()
+    finally:
+        st.close()
+
+    assert store.COMMENT_ATTEMPTS == 3
+    assert counts == [1, 2, 3]
+    assert states == ["pending", "pending", "abandoned"]
+    assert pending == []
+
+
+def test_an_unknown_comment_key_is_left_alone(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.mark_comment_posted("k-never", "c-1", _at(0))
+        failures = st.record_comment_failure("k-never")
+        count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
+        in_transaction = st.connection.in_transaction
+    finally:
+        st.close()
+
+    assert failures == 0
+    assert count == 0
+    assert in_transaction is False
+
+
+def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
+    # B9: a resumed phase enqueues the same key again after the first run's
+    # flush already settled it; the row must not go back to `pending`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k-posted", body="first")
+        st.mark_comment_posted("k-posted", "c-101", _at(1))
+        _enqueue(st, "k-gone", body="first")
+        for _ in range(store.COMMENT_ATTEMPTS):
+            st.record_comment_failure("k-gone")
+
+        replays = [
+            _enqueue(st, "k-posted", body="again", now=_at(5)),
+            _enqueue(st, "k-gone", body="again", now=_at(5)),
+        ]
+        posted = _comment_row(st.connection, "k-posted")
+        gone = _comment_row(st.connection, "k-gone")
+        pending = st.pending_comments()
+    finally:
+        st.close()
+
+    assert replays == [False, False]
+    assert posted is not None and gone is not None
+    assert (posted["state"], posted["body"], posted["comment_id"]) == (
+        "posted",
+        "first",
+        "c-101",
+    )
+    assert (gone["state"], gone["body"], gone["failed_attempts"]) == (
+        "abandoned",
+        "first",
+        store.COMMENT_ATTEMPTS,
+    )
+    assert pending == []
+
+
+def test_a_failure_on_a_posted_comment_never_abandons_it(repo):
+    # Review Focus 1: a late failure must not undo a comment the board has.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _enqueue(st, "k1")
+        st.mark_comment_posted("k1", "c-101", _at(1))
+        for _ in range(store.COMMENT_ATTEMPTS):
+            st.record_comment_failure("k1")
+        row = _comment_row(st.connection, "k1")
+    finally:
+        st.close()
+
+    assert row is not None
+    assert (row["state"], row["comment_id"]) == ("posted", "c-101")
+
+
+def test_a_taken_over_store_neither_marks_nor_fails_a_comment(stores):
+    # Review Focus 2: every outbox writer is fenced, not only enqueue.
+    a = stores()
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    _enqueue(a, "k1")
+    b = stores()
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+
+    writes = [
+        lambda: a.mark_comment_posted("k1", "c-101", _at(2)),
+        lambda: a.record_comment_failure("k1"),
+    ]
+    for write in writes:
+        with pytest.raises(store.LeaseLostError) as caught:
+            write()
+        assert caught.value.holder is not None and caught.value.holder.token == "t2"
+        assert a.connection.in_transaction is False
+
+    row = _comment_row(b.connection, "k1")
+    assert row is not None
+    assert (row["state"], row["comment_id"], row["failed_attempts"], row["posted_at"]) == (
+        "pending",
+        None,
+        0,
+        None,
+    )
+
+    # The new holder's writes go through its own fence.
+    assert b.record_comment_failure("k1") == 1
+    b.mark_comment_posted("k1", "c-202", _at(3))
+    row = _comment_row(a.connection, "k1")
+    assert row is not None
+    assert (row["state"], row["comment_id"]) == ("posted", "c-202")
