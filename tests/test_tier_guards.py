@@ -573,8 +573,7 @@ def test_missing_binaries_skip_their_tier_and_leave_unmarked_tests_alone(pyteste
     # `pytest.skip` call is always the same conftest.py line, so every skip of a
     # given reason collapses together). Sum the bracketed counts rather than
     # counting matching lines, which would always read back as 1 for a reason
-    # that several items share. Deviation from the plan's literal line-count
-    # assertion, verified against this pytest version's actual grouping.
+    # that several items share.
     lines = result.stdout.lines
 
     def _skip_count(reason: str) -> int:
