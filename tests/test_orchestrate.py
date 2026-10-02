@@ -5816,3 +5816,104 @@ def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(proje
     assert git_calls == []
     assert (_runs_tree(), _statuses(_load(project, run_id))) == before
     assert _claim_rows(project) == [(key, run_id, "still-running") for key in own]
+
+
+# ── run_board helpers (card baef4f94) ───────────────────────────────────────
+
+
+def _board_milestone(
+    n: int,
+    *,
+    blocked_by: tuple[int, ...] = (),
+    status: str = "todo",
+    done_children: bool = False,
+) -> models.CardNode:
+    """A milestone root with one story holding one subtask, ids from `_plan_id`.
+
+    Milestone `n` is `_plan_id(n)`, its story `_plan_id(n * 100 + 1)`, its
+    subtask `_plan_id(n * 100 + 2)`. `blocked_by` names other milestones by `n`.
+    """
+    child_status = "done" if done_children else "todo"
+    subtask = models.CardNode(
+        id=_plan_id(n * 100 + 2), title=f"subtask of milestone {n}", status=child_status
+    )
+    story = models.CardNode(
+        id=_plan_id(n * 100 + 1),
+        title=f"story of milestone {n}",
+        status=child_status,
+        children=[subtask],
+    )
+    return models.CardNode(
+        id=_plan_id(n),
+        title=f"milestone {n}",
+        status=status,
+        blocked_by=[_plan_id(blocker) for blocker in blocked_by],
+        children=[story],
+    )
+
+
+def _prefix_of(card: models.CardNode) -> str:
+    """A distinct branch prefix per milestone, as d78b3118's caller would hand in."""
+    return f"p{dag.short_id(card.id)}"
+
+
+def test_board_prefixes_maps_each_milestone_to_its_callers_prefix_in_order():
+    one, two = _board_milestone(1), _board_milestone(2)
+
+    prefixes = orchestrate.board_prefixes([one, two], _prefix_of)
+
+    assert list(prefixes.items()) == [(one.id, "p00000001"), (two.id, "p00000002")]
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", None])
+def test_board_prefixes_refuses_a_blank_prefix(prefix):
+    with pytest.raises(ValueError, match="has no branch prefix"):
+        orchestrate.board_prefixes([_board_milestone(1)], lambda card: prefix)
+
+
+def test_board_prefixes_refuses_two_milestones_on_one_prefix():
+    """Review Focus 1: a shared prefix means one shared `<prefix>-integrate` claim."""
+    with pytest.raises(ValueError, match="share the branch prefix 'm14'"):
+        orchestrate.board_prefixes(
+            [_board_milestone(1), _board_milestone(2)], lambda card: "m14"
+        )
+
+
+def test_board_claims_unions_each_milestones_claims_first_occurrence_first():
+    one, two = _board_milestone(1), _board_milestone(2)
+    prefixes = {one.id: "pa", two.id: "pb"}
+
+    keys = orchestrate.board_claims([one, two, one], prefixes)
+
+    assert keys == [
+        f"card:{one.id}",
+        f"card:{_plan_id(102)}",
+        "branch:pa-integrate",
+        f"card:{two.id}",
+        f"card:{_plan_id(202)}",
+        "branch:pb-integrate",
+    ]
+
+
+def test_board_claims_takes_each_milestones_keys_from_milestone_claims():
+    one = _board_milestone(1)
+    expected = orchestrate.milestone_claims(
+        one.id, census.flatten_milestone(one).stories, "pa"
+    )
+
+    assert orchestrate.board_claims([one], {one.id: "pa"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"done": True, "run_id": "r"}, "done"),
+        ({"escalated": True, "run_id": "r"}, "escalated"),
+        ({"escalated": True, "control": "pause", "run_id": "r"}, "escalated"),
+        ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
+        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"run_id": "r"}, "escalated"),
+    ],
+)
+def test_milestone_status_reads_a_run_milestone_payload(payload, status):
+    assert orchestrate.milestone_status(payload) == status

@@ -1834,3 +1834,74 @@ async def _run_milestone_async(
             )
     finally:
         store.close()
+
+
+# ── the board run (card baef4f94) ───────────────────────────────────────────
+
+
+BoardStatus = Literal["done", "escalated", "stopped", "cancelled", "blocked"]
+"""How one milestone of a board run ended: its own run's outcome, or `blocked`
+when a blocker did not finish `done` and it was never dispatched."""
+
+
+def board_prefixes(
+    milestones: Sequence[models.CardNode],
+    branch_prefix_of: Callable[[models.CardNode], str],
+) -> dict[str, str]:
+    """Each open milestone's branch prefix, keyed by milestone id, in input order.
+
+    `branch_prefix_of` is the caller's: deriving a prefix is not this module's
+    job. This only checks it. A prefix that is not a non-blank string is
+    `ValueError`, as `run_milestone` refuses a missing one. So is a prefix two
+    milestones share: both would claim `branch:<prefix>-integrate`, and the
+    deduplicated board claim set would hide that until the second milestone's
+    own pre-flight refused it mid-run.
+    """
+    prefixes: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for card in milestones:
+        prefix = branch_prefix_of(card)
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(f"milestone {card.id} has no branch prefix (got {prefix!r})")
+        if prefix in owners:
+            raise ValueError(
+                f"milestones {owners[prefix]} and {card.id} share the branch prefix {prefix!r}"
+            )
+        owners[prefix] = card.id
+        prefixes[card.id] = prefix
+    return prefixes
+
+
+def board_claims(
+    milestones: Sequence[models.CardNode], prefixes: Mapping[str, str]
+) -> list[str]:
+    """Every open milestone's `milestone_claims`, in the order given, deduplicated.
+
+    The stories come from `census.flatten_milestone`, the census
+    `run_milestone` reads. The union keeps a key's first occurrence in its
+    place (`list(dict.fromkeys(...))`), the discipline `milestone_claims`
+    itself follows. Pure.
+    """
+    keys: list[str] = []
+    for card in milestones:
+        stories = census.flatten_milestone(card).stories
+        keys.extend(milestone_claims(card.id, stories, prefixes[card.id]))
+    return list(dict.fromkeys(keys))
+
+
+def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
+    """One `_run_milestone_async` payload read as a board status.
+
+    `done` is the only clean outcome. A cancel is `cancelled`, an escalation
+    (a paused one included) is `escalated`, a pause is `stopped`. Any other
+    shape is not clean, so it counts as `escalated`.
+    """
+    if payload.get("done") is True:
+        return "done"
+    if payload.get("cancelled") is True:
+        return "cancelled"
+    if payload.get("escalated") is True:
+        return "escalated"
+    if payload.get("paused") is True:
+        return "stopped"
+    return "escalated"
