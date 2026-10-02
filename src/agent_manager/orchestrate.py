@@ -1367,6 +1367,7 @@ async def supervise(
     runner_factory: runs.RunnerFactory | None,
     max_concurrent: int,
     stop: StopSignal,
+    slots: asyncio.Semaphore | None = None,
 ) -> list[LaneOutcome]:
     """Run every census story as a grafo node and collect the outcomes (T1, T6).
 
@@ -1382,6 +1383,11 @@ async def supervise(
     signal on exit, success or not, so this never hangs. A milestone with no
     story has no tree to run.
 
+    `slots` is the semaphore every lane takes its slot from: when given it is
+    used as is, so concurrent `supervise` calls handed the same one share one
+    budget and `max_concurrent` sizes nothing; when omitted this call makes its
+    own `asyncio.Semaphore(max_concurrent)`, as a solo run always has.
+
     A lane that dies of a `BaseException` other than a cancellation ends the
     whole call at once, re-raised by `run_until_killed`: grafo alone would
     drop it (§7).
@@ -1394,7 +1400,8 @@ async def supervise(
     level_before = grafo_logger.level
     grafo_logger.setLevel(logging.CRITICAL)
     try:
-        slots = asyncio.Semaphore(max_concurrent)
+        if slots is None:
+            slots = asyncio.Semaphore(max_concurrent)
         finished: dict[str, LaneOutcome] = {}
         story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
         story_ok: dict[str, bool] = {}
