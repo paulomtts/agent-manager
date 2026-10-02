@@ -9,6 +9,14 @@ a model; everything else is plain Python.
 
 See `docs/superpowers/specs/2026-09-23-agent-manager-design.md` for the design.
 
+## Install
+
+```bash
+uv tool install agent-manager     # or: pipx install agent-manager
+```
+
+To work on agent-manager itself, clone the repository and run `uv sync`.
+
 ## Usage
 
 Drive one subtask card end to end. `--branch-prefix` is required — it is the
