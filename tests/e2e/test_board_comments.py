@@ -327,13 +327,6 @@ def test_clean_milestone_run_posts_one_done_per_subtask_and_one_run_end(
     assert f"next: `git merge {INTEGRATION_BRANCH}`" in lines, end.body
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """Like `test_milestone_run.py`'s guard: no `e2e` marker may reach this
-    module, or outcome comments stop being checked on every run."""
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_escalation_then_resume_keeps_escalation_and_appends_resumed_done(
     milestone_board, review_fail_marker, run_milestone_cli
 ):

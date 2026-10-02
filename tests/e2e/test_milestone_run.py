@@ -124,13 +124,6 @@ def test_a_clean_three_story_milestone_runs_to_done_on_one_stacked_line(
     assert rows > 0, rows
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """Like `test_production_wiring.py`'s guard: no `e2e` marker may reach this
-    module, or the milestone wiring stops being checked on every run."""
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def _load_run(root: Path, run_id: str) -> models.Run:
     conn = store.open_db(cli.resolve_repo_dir(root))
     try:

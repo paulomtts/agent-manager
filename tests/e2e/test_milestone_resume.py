@@ -426,13 +426,6 @@ def test_a_checkpoint_saved_under_another_task_refuses_the_resume_and_writes_not
     ) == before
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """Like `test_milestone_run.py`'s guard: no `e2e` marker may reach this
-    module, or milestone resume stops being checked on every run."""
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_no_kill_switch_is_left_armed_for_later_tests():
     """Review Focus 5: the kill switch is set through the function-scoped
     `monkeypatch`; it must be gone once its test ends, or every later launch

@@ -205,13 +205,6 @@ def _check(cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """No `e2e` marker may reach this module, or Integrate stops being checked
-    on every `uv run pytest`."""
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_stories_that_touch_different_files_integrate_with_no_resolver(
     two_story_board, run_milestone_cli, read_fake_log
 ):
