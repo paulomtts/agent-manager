@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from agent_manager import (
@@ -3331,6 +3332,139 @@ def test_board_prefix_of_with_a_prefix_joins_it_to_the_stem_and_never_reuses_it_
 
     assert prefix_of(BOARD_CARD) == f"sprint9-{dag.task_stem(BOARD_CARD)}"
     assert prefix_of(BOARD_CARD) != "sprint9"
+
+
+BLANK_BOARD_PREFIX = "--branch-prefix with --board needs a non-blank prefix, not a blank string"
+PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
+
+
+@pytest.mark.parametrize(
+    "kwargs, message, hint",
+    [
+        (
+            {"card": SOME_CARD, "milestone": None, "board": True, "branch_prefix": "m2"},
+            "give --board or --card, not both",
+            "'--board' / '--card'",
+        ),
+        (
+            {"card": None, "milestone": "2", "board": True, "branch_prefix": "m2"},
+            "give --board or --milestone, not both",
+            "'--board' / '--milestone'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": False, "branch_prefix": "m2"},
+            "one of --card, --milestone or --board is required",
+            "'--card' / '--milestone' / '--board'",
+        ),
+        (
+            {"card": None, "milestone": "2", "board": False, "branch_prefix": None},
+            PREFIX_REQUIRED,
+            "'--branch-prefix'",
+        ),
+        (
+            {"card": SOME_CARD, "milestone": None, "board": False, "branch_prefix": None},
+            PREFIX_REQUIRED,
+            "'--branch-prefix'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": True, "branch_prefix": ""},
+            BLANK_BOARD_PREFIX,
+            "'--branch-prefix'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": True, "branch_prefix": "   "},
+            BLANK_BOARD_PREFIX,
+            "'--branch-prefix'",
+        ),
+        (
+            {
+                "card": SOME_CARD,
+                "milestone": None,
+                "board": False,
+                "branch_prefix": "m2",
+                "max_concurrent": 2,
+            },
+            "--max-concurrent applies only to --milestone or --board",
+            "'--max-concurrent'",
+        ),
+        (
+            {
+                "card": None,
+                "milestone": None,
+                "board": True,
+                "branch_prefix": None,
+                "max_concurrent": 0,
+            },
+            "--max-concurrent must be at least 1, got 0",
+            "'--max-concurrent'",
+        ),
+    ],
+)
+def test_check_run_targets_words_each_board_refusal_like_the_card_milestone_conflict(
+    kwargs, message, hint
+):
+    """Exact wording and hint, checked on the function itself so Typer's error
+    box cannot wrap the text out from under the assertion."""
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(dry_run=False, **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"board": True, "branch_prefix": None, "dry_run": False, "max_concurrent": None},
+        {"board": True, "branch_prefix": "sprint9", "dry_run": False, "max_concurrent": 2},
+        {"board": True, "branch_prefix": None, "dry_run": True, "max_concurrent": 1},
+    ],
+)
+def test_check_run_targets_accepts_board_with_or_without_a_prefix_and_with_dry_run(kwargs):
+    """--branch-prefix is optional only in board mode; --dry-run and
+    --max-concurrent both apply to --board."""
+    assert cli._check_run_targets(card=None, milestone=None, **kwargs) is None
+
+
+def _forbid_board_paths(monkeypatch) -> None:
+    """Every run path forbidden: a refusal must start nothing at all."""
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+    monkeypatch.setattr(orchestrate, "run_board", _Forbidden("run_board"))
+
+
+@pytest.mark.parametrize(
+    "targets, word",
+    [
+        (["--board", "--card", SOME_CARD, "--branch-prefix", "m2"], "both"),
+        (["--board", "--milestone", "2", "--branch-prefix", "m2"], "both"),
+        (["--board", "--milestone", "2", "--dry-run"], "both"),
+        (["--branch-prefix", "m2"], "required"),
+        (["--milestone", "2"], "required"),
+        (["--milestone", "2", "--dry-run"], "required"),
+        (["--card", SOME_CARD], "required"),
+        (["--board", "--branch-prefix", ""], "blank"),
+        (["--board", "--branch-prefix", "   "], "blank"),
+        (["--board", "--max-concurrent", "0"], "least"),
+        (["--board", "--dry-run", "--max-concurrent", "0"], "least"),
+        (["--card", SOME_CARD, "--branch-prefix", "m2", "--max-concurrent", "2"], "only"),
+    ],
+)
+def test_bad_board_targets_are_usage_errors_that_start_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    """Spec tests 1-4, 7, 9 at the command line: Typer's exit 2, never an
+    envelope, and `run_board`, `run_milestone`, `run_card` all unreached."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+
+    result = runner.invoke(cli.app, ["run", *targets, "--repo-dir", str(tmp_path)])
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert list(paths.data_dir().iterdir()) == []
 
 
 @pytest.mark.parametrize(
