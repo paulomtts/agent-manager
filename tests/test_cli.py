@@ -7653,3 +7653,160 @@ def test_a_card_comment_the_board_refuses_is_a_warning_and_changes_nothing_else(
     assert len(refused) == 1, payload["warnings"]
     assert "not posted" in refused[0] and "brd is down" in refused[0]
     assert _card_outbox(project) == [(f"{run_id}/{card}/done", "pending")]
+
+
+# ── am watch, one-shot (card 43f4f076) ─────────────────────────────────────
+#
+# Default (unit) tier per design §14: no git, no brd, no harness. Journals are
+# written straight to `XDG_DATA_HOME/agent-manager/runs/<id>/journal.jsonl`.
+
+WATCH_TS = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def _watch_runs_dir(tmp_path: Path) -> Path:
+    return tmp_path / "xdg" / "agent-manager" / "runs"
+
+
+def _write_watch_journal(
+    tmp_path: Path, run_id: str, seqs: list[int], *, tail: str = ""
+) -> list[dict[str, Any]]:
+    """Write `run_id`'s journal with one line per seq, then `tail` verbatim.
+
+    Returns the lines as `am watch` must report them: JSON-mode dumps.
+    """
+    run_dir = _watch_runs_dir(tmp_path) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dumped = [
+        store_module.JournalLine(
+            seq=seq,
+            ts=WATCH_TS,
+            run_id=run_id,
+            event="phase_upsert",
+            card="card-1",
+            phase="implement",
+            attempt=1,
+            payload={"status": "started", "n": seq},
+        ).model_dump(mode="json")
+        for seq in seqs
+    ]
+    text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
+    (run_dir / store_module.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
+    return dumped
+
+
+def _watch(*args: str):
+    return runner.invoke(cli.app, ["watch", *args])
+
+
+def test_watch_single_run_returns_events_envelope(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+
+    result = _watch("run-a")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"ok": True, "data": {"events": written}}
+    assert [event["seq"] for event in written] == [1, 2, 3]
+
+    pretty = _watch("run-a", "--pretty")
+    assert pretty.exit_code == 0, pretty.output
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(result.stdout)
+
+
+def test_watch_since_filters_to_later_seqs(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3, 4])
+
+    result = _watch("run-a", "--since", "2")
+
+    assert result.exit_code == 0, result.output
+    events = json.loads(result.stdout)["data"]["events"]
+    assert [event["seq"] for event in events] == [3, 4]
+    assert events == written[2:]
+
+
+def test_watch_since_past_the_last_seq_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    result = _watch("run-a", "--since", "99")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"ok": True, "data": {"events": []}}
+
+
+def test_watch_refuses_a_negative_since(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1])
+
+    result = _watch("run-a", "--since", "-1")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CliError"
+    assert "--since" in envelope["error"]["message"]
+
+
+def test_watch_unknown_run_refuses_and_creates_no_run_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _watch("no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
+    assert not _watch_runs_dir(tmp_path).exists()
+
+
+def test_watch_tolerates_a_torn_last_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(
+        tmp_path, "run-a", [1, 2], tail='{"seq": 3, "ts": "2026-10'
+    )
+
+    result = _watch("run-a")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["events"] == written
+
+
+def test_watch_corrupt_journal_is_an_envelope_not_a_traceback(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    # Newline-terminated, so it is not a torn tail: a corrupt line.
+    _write_watch_journal(tmp_path, "run-a", [1], tail="not json\n")
+
+    result = _watch("run-a")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CorruptJournalError"
+
+
+@pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", ".."])
+def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    # runs/ must exist for "runs/../escape" to resolve on disk, so that without
+    # the guard "../escape" really would read the journal one level above it.
+    _watch_runs_dir(tmp_path).mkdir(parents=True)
+    escape = tmp_path / "xdg" / "agent-manager" / "escape"
+    escape.mkdir(parents=True)
+    line = store_module.JournalLine(
+        seq=1, ts=WATCH_TS, run_id="escape", event="run_upsert"
+    ).model_dump(mode="json")
+    (escape / store_module.JOURNAL_NAME).write_text(
+        json.dumps(line) + "\n", encoding="utf-8"
+    )
+
+    result = _watch(run_id)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert list(_watch_runs_dir(tmp_path).iterdir()) == []

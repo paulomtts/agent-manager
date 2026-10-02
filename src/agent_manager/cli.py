@@ -39,6 +39,7 @@ from agent_manager import (
     locks,
     models,
     orchestrate,
+    paths,
     prompt,
     store as store_module,
 )
@@ -1504,6 +1505,73 @@ def logs(
             run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
         )
     except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_module.JournalError)
+"""`HANDLED` plus `JournalError`, for `watch` only.
+
+A corrupt journal is a refusal for a reader, so `watch` turns it into an
+`ok: false` envelope at exit 3. It is not added to `HANDLED` itself: for the
+commands that write a journal, a corrupt one is still a bug that should crash
+with its stack intact. `MissingJournalError` never reaches this tuple; `watch_for`
+turns it into `UnknownRunError` first.
+"""
+
+
+def _check_watch_run_id(run_id: str) -> None:
+    """Refuse a run id that is a path rather than one directory name.
+
+    `Journal._for_reading` joins the id onto `<data dir>/runs/`, so `..` or a
+    `/` would read a `journal.jsonl` outside the runs directory.
+    """
+    if run_id in ("", ".", "..") or Path(run_id).name != run_id:
+        raise UnknownRunError(
+            f"run id {run_id!r} is not a run directory name"
+            " (`agent-manager watch --all` reads every run there is)"
+        )
+
+
+def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
+    """`run_id`'s journal lines with `seq > since`, JSON-mode, in `seq` order.
+
+    Opened through `Journal._for_reading`, never `Journal(run_id)`: the normal
+    constructor calls `paths.run_dir`, which would create a directory for a run
+    that does not exist (am-watch design 3.7). A torn last line is an append in
+    flight and is skipped. Raises `MissingJournalError` when there is no journal.
+    """
+    lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+    return [line.model_dump(mode="json") for line in lines if line.seq > since]
+
+
+def watch_for(run_id: str, *, since: int = 0) -> dict[str, Any]:
+    """The payload of `am watch RUN_ID`: `{"events": [...]}`."""
+    if since < 0:
+        raise CliError(f"--since must be 0 or more, got {since}")
+    _check_watch_run_id(run_id)
+    try:
+        return {"events": _journal_events(run_id, since=since)}
+    except store_module.MissingJournalError as error:
+        raise UnknownRunError(
+            f"run {run_id!r} has no journal under the data directory"
+            " (`agent-manager watch --all` reads every run there is)"
+        ) from error
+
+
+@app.command("watch")
+def watch(
+    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run whose journal is read."),
+    since: int = typer.Option(
+        0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Print a run's journal events once, as one envelope."""
+    try:
+        payload = watch_for(run_id, since=since)
+    except WATCH_HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
