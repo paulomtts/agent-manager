@@ -229,7 +229,12 @@ def _launch_with_a1_review_failing(parallel_board, rendezvous, run_milestone_cli
 def test_a_relaunch_after_the_escalation_finishes_and_skips_done_subtasks(
     parallel_board, rendezvous, run_milestone_cli, read_fake_log
 ):
-    """Spec test 5: continues spec test 4's scenario on a board of its own."""
+    """Spec test 5: relaunches after spec test 4's escalation, on a board of its own.
+
+    Spec test 4 itself (the escalation parks the other lane and its dependent
+    never starts) is proven through `FakeDriver` in tests/test_orchestrate.py
+    (`test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending`).
+    """
     root = parallel_board["root"]
     milestone = parallel_board["milestone"]
     stories = parallel_board["stories"]
