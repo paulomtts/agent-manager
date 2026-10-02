@@ -160,6 +160,161 @@ def test_a_milestone_with_nothing_pending_plans_no_levels():
     assert orchestrate.plan_levels([a], branch_prefix="m3", base_branch="main") == []
 
 
+@dataclass(frozen=True)
+class _DagItem:
+    """A plain item for `build_dag_tree`: an id and the ids blocking it."""
+
+    id: str
+    blockers: tuple[str, ...] = ()
+
+
+def _dag_factory(
+    calls: dict[str, dict[str, Any]],
+) -> Callable[[_DagItem], Callable[..., Awaitable[str]]]:
+    """A `node_factory` whose coroutine records the kwargs it got and returns `out-<id>`."""
+
+    def factory(item: _DagItem) -> Callable[..., Awaitable[str]]:
+        async def run(**forwarded: Any) -> str:
+            calls[item.id] = forwarded
+            return f"out-{item.id}"
+
+        return run
+
+    return factory
+
+
+def _dag_forward(item: _DagItem) -> str:
+    """Reads `.id`, so it fails loudly if handed a blocker id instead of the item."""
+    return f"from_{item.id}"
+
+
+async def _build(
+    items: list[_DagItem],
+    calls: dict[str, dict[str, Any]],
+    forward: Callable[[_DagItem], str | None] | None = _dag_forward,
+) -> tuple[dict[str, grafo.Node], list[grafo.Node]]:
+    return await orchestrate.build_dag_tree(
+        items,
+        id_of=lambda item: item.id,
+        blockers_of=lambda item: item.blockers,
+        node_factory=_dag_factory(calls),
+        forward=forward,
+    )
+
+
+async def test_build_dag_tree_single_blocker_wires_edge():
+    """A <- B: one timeout-less node per item, keyed and ordered by item; B is
+    reached from A by an edge forwarding A's output as `forward(A)`; A alone
+    is a root."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b], calls)
+
+    assert list(nodes) == ["a", "b"]
+    assert [node.uuid for node in nodes.values()] == ["a", "b"]
+    assert [node._timeout for node in nodes.values()] == [None, None]
+    assert nodes["a"].children == [nodes["b"]]
+    assert nodes["b"].children == []
+    assert roots == [nodes["a"]]
+
+    await grafo.TreeExecutor(uuid="single", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {"from_a": "out-a"}}
+
+
+async def test_build_dag_tree_multi_blocker_is_root_not_edge():
+    """A and B both block C: C gets no incoming edge and is a root itself, so
+    `roots` is every item, in items order. The helper does no waiting: C runs
+    with no forwarded kwargs."""
+    a, b = _DagItem("a"), _DagItem("b")
+    c = _DagItem("c", ("a", "b"))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b, c], calls)
+
+    assert nodes["a"].children == []
+    assert nodes["b"].children == []
+    assert roots == [nodes["a"], nodes["b"], nodes["c"]]
+
+    await grafo.TreeExecutor(uuid="merged", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {}, "c": {}}
+
+
+async def test_build_dag_tree_no_forward_connects_without_kwarg():
+    """With `forward=None` the single-blocker edge still exists, but nothing is
+    forwarded along it."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b], calls, forward=None)
+
+    assert nodes["a"].children == [nodes["b"]]
+    assert nodes["a"]._forward_map == {}
+    assert roots == [nodes["a"]]
+
+    await grafo.TreeExecutor(uuid="unforwarded", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {}}
+
+
+async def test_build_dag_tree_forward_returning_none_connects_without_kwarg():
+    """A `forward` that returns `None` for a blocker behaves as no `forward` for
+    that edge only."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    c, d = _DagItem("c"), _DagItem("d", ("c",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    def only_a(item: _DagItem) -> str | None:
+        return "from_a" if item.id == "a" else None
+
+    nodes, roots = await _build([a, b, c, d], calls, forward=only_a)
+
+    assert nodes["c"].children == [nodes["d"]]
+    assert nodes["c"]._forward_map == {}
+    assert roots == [nodes["a"], nodes["c"]]
+
+    await grafo.TreeExecutor(uuid="partial", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {"from_a": "out-a"}, "c": {}, "d": {}}
+
+
+async def test_build_dag_tree_roots_follow_items_order():
+    """A merged item listed before a plain root keeps its place: roots are in
+    items order, not plain roots first."""
+    a, b = _DagItem("a"), _DagItem("b")
+    c = _DagItem("c", ("a", "b"))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, c, b], calls)
+
+    assert list(nodes) == ["a", "c", "b"]
+    assert roots == [nodes["a"], nodes["c"], nodes["b"]]
+
+
+async def test_build_dag_tree_merged_item_still_forwards_to_its_dependent():
+    """A merged item is a root, and a single-blocker item behind it is still
+    reached by an edge forwarding the merged item's output."""
+    a, b = _DagItem("a"), _DagItem("b")
+    joined = _DagItem("joined", ("a", "b"))
+    d = _DagItem("d", ("joined",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b, joined, d], calls)
+
+    assert nodes["joined"].children == [nodes["d"]]
+    assert roots == [nodes["a"], nodes["b"], nodes["joined"]]
+
+    await grafo.TreeExecutor(uuid="joined", roots=roots).run()
+
+    assert calls["d"] == {"from_joined": "out-joined"}
+
+
+async def test_build_dag_tree_empty_items():
+    assert await _build([], {}) == ({}, [])
+
+
 def test_story_tips_name_every_story_with_subtasks_in_census_order():
     a = _plan_story(1, [_plan_subtask(11, "done"), _plan_subtask(12, "done")], status="done")
     empty = _plan_story(2, [], blocked_by=[a.id])

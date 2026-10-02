@@ -52,7 +52,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 import grafo
 
@@ -77,6 +77,10 @@ handler; `supervise` silences it so stdout stays one JSON line (T6)."""
 LaneKind = Literal["done", "escalated", "stopped", "pending"]
 """How one story's lane ended (supervisor-tree T6): finished, escalated, stopped
 (parked by the stop, or saw it before a subtask), or never started by the tree."""
+
+
+T = TypeVar("T")
+"""An item `build_dag_tree` turns into one grafo node."""
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1305,54 @@ async def run_until_killed(
         running.cancel()
         raise fatal[0]
     await running
+
+
+async def build_dag_tree(
+    items: Sequence[T],
+    *,
+    id_of: Callable[[T], str],
+    blockers_of: Callable[[T], Sequence[str]],
+    node_factory: Callable[[T], Callable[..., Awaitable[Any]]],
+    forward: Callable[[T], str | None] | None = None,
+) -> tuple[dict[str, grafo.Node], list[grafo.Node]]:
+    """Build the grafo nodes and edges for `items`, and pick the executor's roots.
+
+    One `grafo.Node` per item, `uuid=id_of(item)`, `timeout=None` always
+    (grafo's 60 s default would cancel a long-running node). `nodes_by_id` is
+    keyed by `id_of(item)`, in `items` order.
+
+    An item with exactly one blocker gets one edge from that blocker. Its
+    output is forwarded as `forward(blocker_item)` -- `forward` is handed the
+    blocker item, not its id -- or not at all when `forward` is `None` or
+    returns `None`.
+
+    An item with two or more blockers gets no incoming edge and is one of the
+    executor's roots itself: grafo's dynamic worker pool can starve a
+    2+-parent join forever when an unrelated sibling node is still in flight
+    (confirmed in the pinned grafo release; not fixed here). This helper
+    creates no events and does no waiting: the coroutine `node_factory`
+    builds for such an item must wait on its blockers itself.
+
+    `roots` is, in `items` order, every item with no blocker plus every item
+    with two or more. A blocker id not among `items` is the caller's to
+    avoid; nothing is filtered or validated. Empty `items` gives `({}, [])`.
+    """
+    nodes = {
+        id_of(item): grafo.Node(coroutine=node_factory(item), uuid=id_of(item), timeout=None)
+        for item in items
+    }
+    items_by_id = {id_of(item): item for item in items}
+    roots: list[grafo.Node] = []
+    for item in items:
+        blockers = blockers_of(item)
+        if len(blockers) == 1:
+            (blocker,) = blockers
+            parent = nodes[blocker]
+            name = None if forward is None else forward(items_by_id[blocker])
+            await parent.connect(nodes[id_of(item)], forward=name)
+        else:
+            roots.append(nodes[id_of(item)])
+    return nodes, roots
 
 
 async def supervise(
