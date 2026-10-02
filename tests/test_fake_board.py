@@ -413,7 +413,6 @@ def test_seeding_an_invalid_comment_fails_loudly(fake_board, card_id, body, matc
     assert fake_board.comments == []
 
 
-
 def test_a_parent_blocked_by_its_own_child_resolves_like_brd(fake_board):
     # Real brd accepts `brd block <parent> --by <child>` and then reports both
     # cards blocked: resolving the child walks to the parent, whose blocker is
