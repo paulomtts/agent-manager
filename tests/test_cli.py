@@ -7705,8 +7705,9 @@ def test_watch_single_run_returns_events_envelope(tmp_path, monkeypatch):
     result = _watch("run-a")
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"ok": True, "data": {"events": written}}
-    assert [event["seq"] for event in written] == [1, 2, 3]
+    envelope = json.loads(result.stdout)
+    assert envelope == {"ok": True, "data": {"events": written}}
+    assert [event["seq"] for event in envelope["data"]["events"]] == [1, 2, 3]
 
     pretty = _watch("run-a", "--pretty")
     assert pretty.exit_code == 0, pretty.output
@@ -7788,7 +7789,7 @@ def test_watch_corrupt_journal_is_an_envelope_not_a_traceback(tmp_path, monkeypa
     assert envelope["error"]["type"] == "CorruptJournalError"
 
 
-@pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", ".."])
+@pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", "..", ""])
 def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     # runs/ must exist for "runs/../escape" to resolve on disk, so that without
@@ -7809,6 +7810,8 @@ def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
     envelope = json.loads(result.stdout)
     assert envelope["ok"] is False
     assert envelope["error"]["type"] == "UnknownRunError"
+    # The path guard refused it, not a journal lookup that happened to miss.
+    assert "not a run directory name" in envelope["error"]["message"]
     assert list(_watch_runs_dir(tmp_path).iterdir()) == []
 
 
