@@ -196,19 +196,35 @@ def compute_integrate_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
     return topological_levels(stories)
 
 
+def _has_open_descendant(node: CardNode) -> bool:
+    """True when any card nested under ``node``, at any depth, is not ``done``."""
+    return any(
+        (child.status or "").lower() != "done" or _has_open_descendant(child)
+        for child in node.children
+    )
+
+
 def board_levels(roots: list[CardNode]) -> list[list[CardNode]]:
     """Open milestone roots grouped into dependency levels, each in input order.
 
-    The board-wide twin of ``topological_levels``: a root is ready once every
-    blocker is either outside ``roots`` (ignored: it is not this board's to
-    order) or already placed. The same ``CardNode`` objects come back; the
-    input list is not touched. Used only for display and for computing the
-    claim set up front; it never drives execution order.
+    The board-wide twin of ``compute_levels``: a root still has work only if
+    it is not ``done`` and some card under it, at any depth, is not ``done``.
+    Any other root is dropped first, so its id sits outside the set and a
+    root it blocked lands in level 0. A kept root is ready once every blocker
+    is either outside the kept set (ignored: it is not this board's to order)
+    or already placed. The same ``CardNode`` objects come back; the input list
+    is not touched. Used only for display and for computing the claim set up
+    front; it never drives execution order.
     """
-    ids = {root.id for root in roots}
+    pending = [
+        root
+        for root in roots
+        if (root.status or "").lower() != "done" and _has_open_descendant(root)
+    ]
+    ids = {root.id for root in pending}
     placed: set[str] = set()
     levels: list[list[CardNode]] = []
-    rest = list(roots)
+    rest = list(pending)
     while rest:
         ready = [
             root

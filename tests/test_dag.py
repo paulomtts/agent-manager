@@ -712,3 +712,49 @@ def test_board_levels_names_only_the_unplaced_milestones_of_a_cycle():
 def test_a_self_blocking_milestone_stops_board_levels():
     with pytest.raises(DependencyCycleError, match="milestones #a"):
         board_levels([_root("a", ["a"])])
+
+
+def _card(id: str, status: str = "todo", children: list[CardNode] | None = None) -> CardNode:
+    return CardNode(id=id, title=f"card {id}", status=status, children=list(children or []))
+
+
+def test_a_done_milestone_is_dropped_and_what_it_blocked_moves_to_level_zero():
+    roots = [_root("a", status="done"), _root("b", ["a"])]
+    assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+def test_an_open_milestone_with_only_done_descendants_is_dropped():
+    roots = [
+        _root("a", children=[_card("a1", "done", [_card("a1x", "done")]), _card("a2", "done")]),
+        _root("b", ["a"]),
+    ]
+    assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+def test_an_open_milestone_with_no_children_is_dropped():
+    roots = [_root("a", children=[]), _root("b")]
+    assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+def test_board_levels_keeps_a_root_whose_only_open_work_is_a_grandchild():
+    roots = [_root("a", children=[_card("a1", "done", [_card("a1x", "todo")])])]
+    assert _node_ids(board_levels(roots)) == [["a"]]
+
+
+def test_board_levels_reads_done_case_insensitively():
+    roots = [
+        _root("a", status="DONE"),
+        _root("b", children=[_card("b1", "Done")]),
+        _root("c", ["a", "b"]),
+    ]
+    assert _node_ids(board_levels(roots)) == [["c"]]
+
+
+def test_board_levels_of_only_finished_milestones_is_empty():
+    roots = [_root("a", status="done"), _root("b", children=[])]
+    assert board_levels(roots) == []
+
+
+def test_a_cycle_through_a_done_milestone_does_not_stop_board_levels():
+    roots = [_root("a", ["b"], status="done"), _root("b", ["a"])]
+    assert _node_ids(board_levels(roots)) == [["b"]]
