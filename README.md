@@ -17,6 +17,12 @@ uv tool install agent-manager     # or: pipx install agent-manager
 
 To work on agent-manager itself, clone the repository and run `uv sync`.
 
+## Requires
+
+- `git`
+- [`brd`](https://github.com/paulomtts/brd) — the board `am` drives
+- `claude` (Claude Code) on `PATH` — the only harness wired up today; Codex and Pi are planned
+
 ## Usage
 
 Drive one subtask card end to end. `--branch-prefix` is required — it is the
