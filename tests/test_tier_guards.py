@@ -243,3 +243,28 @@ def test_slow_test_that_skips_stays_skipped(pytester):
     )
     result.assert_outcomes(skipped=1)
     result.stdout.no_fnmatch_line("*budget exceeded*")
+
+
+@pytest.mark.git
+def test_hook_reads_the_items_own_tier_markers(pytester):
+    # Over the unit budget but under git's, so only the item's markers decide:
+    # `git` (function, class, or module-inherited) and opt-in tiers pass.
+    result = run_nested(
+        pytester,
+        """
+        import time
+
+        import pytest
+
+        @pytest.mark.git
+        def test_git_function_over_unit_budget():
+            time.sleep(0.55)
+
+        @pytest.mark.soak
+        class TestSoakClass:
+            def test_inherits_no_budget(self):
+                time.sleep(0.55)
+        """,
+    )
+    result.assert_outcomes(passed=2)
+    result.stdout.no_fnmatch_line("*budget exceeded*")
