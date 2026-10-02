@@ -12,20 +12,26 @@ at the top of `tests/`, so the directory auto-mark leaves it alone.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 from pathlib import Path
 
 import pytest
 
 from conftest import (
+    BINARY_TIERS,
     E2E_CAP,
     GIT_BUDGET_S,
     STUB_EXIT_CODE,
     STUB_NAMES,
     UNIT_BUDGET_S,
     E2ETierCap,
+    binary_skip_reason,
     e2e_tier_violations,
     has_justification,
     item_docstring,
+    missing_binary,
+    pytest_runtest_setup,
     stub_script,
     tier_budget_violation,
 )
@@ -471,3 +477,114 @@ def test_five_justified_e2e_tests_collect_and_are_deselected_by_default(pytester
     result = run_nested(pytester, source, "-m", DEFAULT_SELECTION)
     assert result.ret == pytest.ExitCode.OK
     result.assert_outcomes(passed=1, deselected=5)
+
+
+# ── the git/brd binary skip ─────────────────────────────────────────────────
+
+
+def _nothing_installed(name: str) -> str | None:
+    return None
+
+
+def _everything_installed(name: str) -> str | None:
+    return f"/usr/bin/{name}"
+
+
+def test_binary_tiers_are_git_then_brd():
+    assert BINARY_TIERS == ("git", "brd")
+    assert binary_skip_reason("brd") == "the brd CLI must be installed for the brd tier"
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [set(), {"parametrize", "skipif"}, {"soak"}, {"e2e_fake"}, {"e2e"}],
+    ids=["none", "non-tier", "soak", "e2e_fake", "e2e"],
+)
+def test_items_without_git_or_brd_are_never_skipped(markers):
+    assert missing_binary(markers, which=_nothing_installed) is None
+
+
+@pytest.mark.parametrize("name", ["git", "brd"])
+def test_a_marked_item_names_its_missing_binary(name):
+    assert missing_binary({name, "parametrize"}, which=_nothing_installed) == name
+    assert missing_binary({name}, which=_everything_installed) is None
+
+
+def test_both_missing_names_git_first_and_only_the_missing_one_otherwise():
+    assert missing_binary(["brd", "git"], which=_nothing_installed) == "git"
+    only_brd_missing = lambda name: None if name == "brd" else f"/usr/bin/{name}"  # noqa: E731
+    assert missing_binary(iter(["git", "brd"]), which=only_brd_missing) == "brd"
+
+
+def test_missing_binary_defaults_to_shutil_which_at_call_time(monkeypatch):
+    monkeypatch.setattr(shutil, "which", _nothing_installed)
+    assert missing_binary({"git"}) == "git"
+    monkeypatch.setattr(shutil, "which", _everything_installed)
+    assert missing_binary({"git"}) is None
+
+
+def test_the_hook_skips_a_brd_item_when_brd_is_missing(monkeypatch):
+    monkeypatch.setattr(shutil, "which", _nothing_installed)
+    with pytest.raises(pytest.skip.Exception, match="the brd CLI must be installed for the brd tier"):
+        pytest_runtest_setup(_FakeItem("t.py::test_board", chain=["brd"]))
+
+
+def test_the_hook_leaves_unmarked_and_satisfied_items_alone(monkeypatch):
+    monkeypatch.setattr(shutil, "which", _nothing_installed)
+    pytest_runtest_setup(_FakeItem("t.py::test_pure"))
+    monkeypatch.setattr(shutil, "which", _everything_installed)
+    pytest_runtest_setup(_FakeItem("t.py::test_board", chain=["brd", "git"]))
+
+
+@pytest.mark.git
+def test_missing_binaries_skip_their_tier_and_leave_unmarked_tests_alone(pytester, tmp_path, monkeypatch):
+    # No `-m`: the nested session has no addopts, so every test is selected and
+    # the unmarked one can show it is not skipped. PATH holds an empty directory,
+    # so neither git nor brd is found; python is spawned by absolute path.
+    bare = tmp_path / "bare-bin"
+    bare.mkdir()
+    monkeypatch.setenv("PATH", str(bare))
+    result = run_nested(
+        pytester,
+        """
+        import pytest
+
+        @pytest.mark.brd
+        def test_needs_brd():
+            pass
+
+        @pytest.mark.git
+        def test_needs_git():
+            pass
+
+        @pytest.mark.brd
+        @pytest.mark.git
+        def test_needs_both():
+            pass
+
+        def test_unmarked():
+            pass
+        """,
+        "-rs",
+    )
+    result.assert_outcomes(passed=1, skipped=3)
+    # pytest's `-rs` summary groups skips that share a (location, reason) pair
+    # into one `SKIPPED [N] ...` line, rather than one line per skip (the hook's
+    # `pytest.skip` call is always the same conftest.py line, so every skip of a
+    # given reason collapses together). Sum the bracketed counts rather than
+    # counting matching lines, which would always read back as 1 for a reason
+    # that several items share. Deviation from the plan's literal line-count
+    # assertion, verified against this pytest version's actual grouping.
+    lines = result.stdout.lines
+
+    def _skip_count(reason: str) -> int:
+        total = 0
+        for line in lines:
+            if reason not in line:
+                continue
+            match = re.match(r"SKIPPED \[(\d+)\]", line)
+            total += int(match.group(1)) if match else 1
+        return total
+
+    assert _skip_count("the brd CLI must be installed for the brd tier") == 1
+    assert _skip_count("the git CLI must be installed for the git tier") == 2

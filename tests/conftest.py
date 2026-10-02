@@ -20,12 +20,17 @@ have none) is turned into a failure naming the tier, budget and measured time.
 At collection, before `-m` deselection, the run fails with a usage error when more
 than 5 items carry `e2e` or any `e2e` item's docstring has no line starting
 `justification:`, so the check also fires in the default run.
+
+An item marked `git` or `brd` is skipped at setup when that binary is not on
+`PATH`; this is the suite's only such check (tests/e2e/conftest.py's `toolchain`
+calls the same `missing_binary`).
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Generator, Iterable
+import shutil
+from collections.abc import Callable, Generator, Iterable
 from pathlib import Path, PurePath
 
 import pytest
@@ -295,3 +300,40 @@ def pytest_runtest_makereport(
             report.outcome = "failed"
             report.longrepr = violation
     return report
+
+
+BINARY_TIERS = ("git", "brd")
+"""The tiers whose marker means "needs this binary on PATH", in skip-reason order."""
+
+
+def missing_binary(
+    markers: Iterable[str], which: Callable[[str], str | None] | None = None
+) -> str | None:
+    """The first of `git`, `brd` that `markers` names and `which` cannot find, or None.
+
+    `markers` is every marker name on the item's chain. `which` defaults to
+    `shutil.which`, looked up at call time. Items with neither marker are never
+    reported, whatever `which` says.
+    """
+    names = set(markers)
+    lookup = shutil.which if which is None else which
+    for name in BINARY_TIERS:
+        if name in names and lookup(name) is None:
+            return name
+    return None
+
+
+def binary_skip_reason(name: str) -> str:
+    return f"the {name} CLI must be installed for the {name} tier"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip a `git`- or `brd`-marked item whose binary is not on PATH.
+
+    Runs after collection, so the auto-added `git` on tests/steps/ items counts,
+    and before fixture setup, so no fixture spawns a missing binary first.
+    """
+    missing = missing_binary(mark.name for mark in item.iter_markers())
+    if missing is not None:
+        pytest.skip(binary_skip_reason(missing))
