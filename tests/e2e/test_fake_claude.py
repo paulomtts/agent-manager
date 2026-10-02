@@ -75,6 +75,25 @@ _TIERS = frozenset({"git", "brd", "e2e_fake", "soak", "e2e"})
 imported here, for the same reason `_conftest_constant` parses its sibling."""
 
 
+def test_the_tier_set_here_is_the_root_conftests_tier_markers():
+    """`_TIERS` is a hand copy; a tier added to `tests/conftest.py` and not here
+    would be invisible to the marker guard below."""
+    tree = ast.parse(
+        (Path(__file__).parents[1] / "conftest.py").read_text(encoding="utf-8")
+    )
+    [value] = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "TIER_MARKERS"
+            for target in node.targets
+        )
+    ]
+    assert isinstance(value, ast.Call) and value.func.id == "frozenset"
+    assert _TIERS == ast.literal_eval(value.args[0])
+
+
 def _tier_marks(node):
     """The tier names among `node`'s `@pytest.mark.<name>` decorators, called or bare."""
     names = set()
