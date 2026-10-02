@@ -32,6 +32,7 @@ import typer
 from agent_manager import (
     board,
     census,
+    comments,
     control,
     dag,
     dispatch,
@@ -712,6 +713,48 @@ def run_lease(store: Store, *, claims: Sequence[str] = ()) -> Iterator[control.L
         yield lease
 
 
+def card_outcome_comment(
+    *,
+    run_id: str,
+    card: models.Card,
+    summary: SubtaskSummary,
+    stop: StopSignal,
+    branch: str,
+    token: str,
+) -> comments.Comment | None:
+    """The one board comment a `run --card` walk leaves on its card, or None (card 5d9a875f).
+
+    Chosen by `summary.status`, so a cancel that met an escalation comments
+    the escalation: `done` is the done comment, `escalated` the escalation
+    keyed by this life's lease `token`, and `stopped` under a cancel the
+    cancelled comment with the `am run --card` relaunch. A stop under a pause
+    is resumed, not closed, so it gets None. Never a story or milestone comment.
+    """
+    if summary.status == "done":
+        return comments.compose_done(
+            run_id=run_id, card_id=card.id, summary=summary, branch=branch, resumed_at=None
+        )
+    if summary.status == "escalated":
+        failed_phase = summary.failed_phase or ""
+        return comments.compose_escalated(
+            run_id=run_id,
+            card_id=card.id,
+            token=token,
+            failed_phase=failed_phase,
+            detail=summary.detail,
+            reason=comments.agent_reason(summary.results, failed_phase),
+        )
+    if stop.requested == "cancel":
+        return comments.compose_cancelled(
+            run_id=run_id,
+            card_id=card.id,
+            before_phase=summary.before_phase,
+            branch=branch,
+            relaunch=f"am run --card {card.id}",
+        )
+    return None
+
+
 def run_card(
     card_id: str,
     *,
@@ -739,6 +782,10 @@ def run_card(
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
     the run `cancelled` (`card_run_status`). No control cancels a running phase.
+
+    Board comments (card 5d9a875f): once the rows are recorded, still under
+    the lease, the card gets at most one comment (`card_outcome_comment`);
+    a flush's warnings join the payload's `warnings` and nothing else changes.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -825,6 +872,25 @@ def run_card(
             store.record_subtask(
                 story.card_id, subtask.model_copy(update={"status": summary.status})
             )
+
+            # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
+            # still under the lease, so the outbox write is fenced. A board
+            # failure is a warning (B8); a lost lease propagates.
+            comment = card_outcome_comment(
+                run_id=run_id,
+                card=card,
+                summary=summary,
+                stop=stop,
+                branch=branch,
+                token=lease.token,
+            )
+            if comment is not None:
+                # `orchestrate` imports `cli`, so it is read here, at call time.
+                from agent_manager import orchestrate
+
+                drive.warnings.extend(
+                    orchestrate.post_comment(store, root, comment, run_id=run_id)
+                )
 
         return {
             "run_id": run_id,
@@ -1329,6 +1395,9 @@ def _resume_from_checkpoint(
     took over is reported under `took_over`. The walk runs under
     `control.controlled`. A pause parks it `stopped`; a cancel parks it and
     records the run `cancelled` (`card_run_status`).
+
+    Once the checkpoint is accepted, the run's pending board comments are
+    flushed (board-comments B7) and their warnings lead the payload's.
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1351,6 +1420,10 @@ def _resume_from_checkpoint(
             phase = checkpoint_resume_phase(
                 checkpoint, card_id=subtask.card_id, run_id=run.id
             )
+            # Board-comments B7: this run's leftover comments go out under this
+            # life's lease, after every refusal and before the walk goes on; a
+            # board failure is a warning, never a refusal (B8).
+            flushed = comments.flush(store, root, run_id=run.id)
             for orphan, attempt in orphans:
                 store.record_attempt(
                     story.card_id,
@@ -1406,7 +1479,7 @@ def _resume_from_checkpoint(
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": drive.warnings,
+            "warnings": [*flushed, *drive.warnings],
             "resumed_from": phase,
             "discarded_attempts": [
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans

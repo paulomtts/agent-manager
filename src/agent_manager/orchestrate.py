@@ -56,7 +56,18 @@ from typing import Any, Literal, Protocol
 
 import grafo
 
-from agent_manager import bases, board, census, cli, control, dag, integration, models, runs
+from agent_manager import (
+    bases,
+    board,
+    census,
+    cli,
+    comments,
+    control,
+    dag,
+    integration,
+    models,
+    runs,
+)
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
@@ -292,6 +303,28 @@ def _utcnow() -> datetime:
     """This module's own clock default. `cli._utcnow` is private, and binding a
     `cli` name at definition time would break under the circular import."""
     return datetime.now(timezone.utc)
+
+
+def post_comment(
+    store: Store, root: Path, comment: comments.Comment, *, run_id: str
+) -> list[str]:
+    """Queue `comment`, then flush its card's pending rows; the flush's warnings.
+
+    Called only after the outcome it describes is recorded (board-comments B2).
+    A board failure comes back as a warning, never an exception (B8); a lost
+    lease propagates like any fenced write. Flushing by card also posts any
+    earlier run's leftover row for that card.
+    """
+    comments.enqueue(store, comment, run_id=run_id, now=_utcnow())
+    return comments.flush(store, root, card_ids=[comment.card_id])
+
+
+async def post_comment_async(
+    store: Store, root: Path, comment: comments.Comment, *, run_id: str
+) -> list[str]:
+    """`post_comment` off the run's event loop: a flush runs `brd`, a blocking
+    subprocess, so a lane awaits it in a worker thread as it awaits `board.show`."""
+    return await asyncio.to_thread(post_comment, store, root, comment, run_id=run_id)
 
 
 class Driver(Protocol):
@@ -1063,7 +1096,23 @@ async def base_only_lane(
             if error.stopped:
                 raise LaneStopped(recorder.stopped(None, None)) from error
             stop.trigger(story.id)
-            raise LaneEscalated(recorder.escalated(None, "base", error.detail)) from error
+            # Recorded first (a row-less recorder writes nothing), then
+            # board-comments B2: on the story card; there is no store row here.
+            escalated = recorder.escalated(None, "base", error.detail)
+            flushed = await post_comment_async(
+                store,
+                root,
+                comments.compose_base_failed(
+                    run_id=run_id,
+                    story_id=story.id,
+                    base_branch=root_plan.branch,
+                    detail=error.detail,
+                ),
+                run_id=run_id,
+            )
+            raise LaneEscalated(
+                replace(escalated, warnings=escalated.warnings + tuple(flushed))
+            ) from error
         except Exception as error:  # not BaseException: Ctrl-C must still stop
             stop.trigger(story.id)
             raise LaneEscalated(
@@ -1080,6 +1129,7 @@ async def lane(
     plan: SupervisorPlan,
     store: Store,
     run_id: str,
+    lease_token: str,
     root: Path,
     drive: Driver,
     commands: Sequence[str],
@@ -1134,6 +1184,9 @@ async def lane(
     On a resume (`plan.resuming`, card 54e4ec29) the subtask's checkpoint is
     `plan.checkpoints`' and the lenient relaunch lookup is never read; a
     merged base gets its resolver's checkpoint the same way.
+
+    `lease_token` is this life's `control.Lease.token`; it keys the escalation
+    comment, so a later life escalating at the same phase comments again.
     """
     root_plan = plan.roots[story.id]
     planned = plan.planned.get(story.id)
@@ -1193,8 +1246,22 @@ async def lane(
                     if error.stopped:
                         raise LaneStopped(recorder.stopped(None, None)) from error
                     stop.trigger(story.id)
+                    escalated = recorder.escalated(None, "base", error.detail)
+                    # Board-comments B2: after the escalation is recorded; the
+                    # failed base is the story's, so is the comment.
+                    flushed = await post_comment_async(
+                        store,
+                        root,
+                        comments.compose_base_failed(
+                            run_id=run_id,
+                            story_id=story.id,
+                            base_branch=root_plan.branch,
+                            detail=error.detail,
+                        ),
+                        run_id=run_id,
+                    )
                     raise LaneEscalated(
-                        recorder.escalated(None, "base", error.detail)
+                        replace(escalated, warnings=escalated.warnings + tuple(flushed))
                     ) from error
                 recorder.base_built(root_plan)
             for position, subtask in enumerate(planned.remaining):
@@ -1243,15 +1310,53 @@ async def lane(
                     )
                 if summary.status != "done":
                     stop.trigger(story.id)
+                    escalated = recorder.escalated(
+                        subtask.id,
+                        summary.failed_phase,
+                        summary.detail,
+                        subtask_row="started",
+                    )
+                    # Board-comments B2: after the escalation is recorded, keyed
+                    # by this life's lease token, so a second life escalating at
+                    # the same phase comments again.
+                    flushed = await post_comment_async(
+                        store,
+                        root,
+                        comments.compose_escalated(
+                            run_id=run_id,
+                            card_id=subtask.id,
+                            token=lease_token,
+                            failed_phase=summary.failed_phase,
+                            detail=summary.detail,
+                            reason=comments.agent_reason(
+                                summary.results, summary.failed_phase
+                            ),
+                        ),
+                        run_id=run_id,
+                    )
                     raise LaneEscalated(
-                        recorder.escalated(
-                            subtask.id,
-                            summary.failed_phase,
-                            summary.detail,
-                            subtask_row="started",
-                        )
+                        replace(escalated, warnings=escalated.warnings + tuple(flushed))
                     )
                 recorder.subtask_done(subtask.id, row.branch)
+                # Board-comments B2: after the outcome is recorded, never instead of it.
+                recorder.add_warnings(
+                    await post_comment_async(
+                        store,
+                        root,
+                        comments.compose_done(
+                            run_id=run_id,
+                            card_id=subtask.id,
+                            summary=summary,
+                            branch=row.branch,
+                            # Where the walk picked up, only when the lane
+                            # handed the driver a checkpoint as `resume_from`.
+                            resumed_at=None
+                            if checkpoint is None
+                            else runtime_engine.pending_phase(checkpoint),
+                        ),
+                        run_id=run_id,
+                    )
+                )
             done = recorder.done()
         except (LaneEscalated, LaneStopped):
             raise
@@ -1308,6 +1413,7 @@ async def supervise(
     *,
     store: Store,
     run_id: str,
+    lease_token: str,
     root: Path,
     drive: Driver,
     commands: Sequence[str],
@@ -1362,6 +1468,7 @@ async def supervise(
                         plan=plan,
                         store=store,
                         run_id=run_id,
+                        lease_token=lease_token,
                         root=root,
                         drive=drive,
                         commands=commands,
@@ -1432,6 +1539,22 @@ def milestone_claims(
     )
     keys.append(control.branch_claim(integration.integration_branch(branch_prefix)))
     return list(dict.fromkeys(keys))
+
+
+def milestone_card_ids(
+    milestone_id: str, stories: Sequence[census.StoryPlan]
+) -> list[str]:
+    """The milestone card, then each story followed by its subtasks, census order.
+
+    The cards a run's start flush covers (board-comments B7): done subtasks
+    and closed stories included, since an earlier run may have left a pending
+    comment on any of them. Pure; a card already listed is not repeated.
+    """
+    ids = [milestone_id]
+    for story in stories:
+        ids.append(story.id)
+        ids.extend(subtask.id for subtask in story.subtasks)
+    return list(dict.fromkeys(ids))
 
 
 def run_milestone(
@@ -1510,6 +1633,14 @@ def run_milestone(
     `refresh_git` runs inside the lease, after `resume_checkpoints`, and a
     dead holder the lease took over is reported under `took_over` in every
     payload.
+
+    Board comments (board-comments B2, B7): once the lease is held, before
+    anything is driven, every pending outbox row on the milestone's cards is
+    flushed. Each done or escalated subtask and each failed merged base is
+    commented by its lane. A cancel comments each subtask it parked, in wave
+    order (card 5d9a875f). Every recorded end -- cancelled, escalated, paused
+    or done -- is commented on the milestone card. A flush's warnings join
+    the report's `warnings`; nothing else about the run changes.
 
     The lease (live control C2) and its claims are held from `record_run` to
     the run's final record, and released before the store closes; every
@@ -1598,7 +1729,13 @@ def run_milestone(
             if resumed is not None:
                 # After `record_plan`, which records every planned row `pending`.
                 reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
-            warnings = reroll_stale_stories(plan.stories, root)
+            # Board-comments B7: any run's leftover comments on this milestone's
+            # cards go out under this lease, before anything is driven; a board
+            # failure is a warning and the run goes on (B8).
+            warnings = comments.flush(
+                store, root, card_ids=milestone_card_ids(milestone_card.id, plan.stories)
+            )
+            warnings.extend(reroll_stale_stories(plan.stories, root))
             completed: list[str] = []
             stop = StopSignal()
 
@@ -1617,6 +1754,7 @@ def run_milestone(
                         ),
                         store=store,
                         run_id=run_id,
+                        lease_token=lease.token,
                         root=root,
                         drive=drive,
                         commands=list(commands),
@@ -1636,6 +1774,7 @@ def run_milestone(
                 completed.extend(outcome.completed)
                 warnings.extend(outcome.warnings)
             built_bases = bases_payload(outcomes)
+            total = sum(len(story.subtasks) for story in plan.stories)
 
             def report(payload: dict[str, Any]) -> dict[str, Any]:
                 """Every payload shape on the same terms: `bases` when built, and on
@@ -1651,22 +1790,60 @@ def run_milestone(
                         }
                 return with_bases(payload, built_bases)
 
+            def comment_run_end(payload: dict[str, Any]) -> dict[str, Any]:
+                """Comment `payload`'s outcome on the milestone card (board-comments B2).
+
+                Called after the run's final record, on every exit that records
+                one. `total` goes only into the dict `compose_run_end` reads, so
+                the report keeps its shape; the flush's warnings join the
+                report's own `warnings`.
+                """
+                comment = comments.compose_run_end(
+                    run_id=run_id,
+                    milestone_id=milestone_card.id,
+                    token=lease.token,
+                    payload={**payload, "total": total},
+                )
+                payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+                return payload
+
             # Outcome precedence (live control C6): the first match wins. A
             # control is never an escalation, and a paused or cancelled run
             # never reaches Integrate in this invocation.
             if stop.requested == "cancel":
                 store.record_run(run_record.model_copy(update={"status": "cancelled"}))
-                return report(controlled_payload(run_id, "cancel", outcomes, warnings))
+                payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
+                # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
+                # each subtask it parked, in wave order, then the milestone. A lane
+                # stopped while its base built names no subtask and gets nothing;
+                # an escalated lane already commented its own escalation.
+                for outcome in outcomes:
+                    if outcome.kind != "stopped" or outcome.subtask is None:
+                        continue
+                    assert outcome.story is not None
+                    comment = comments.compose_cancelled(
+                        run_id=run_id,
+                        card_id=outcome.subtask,
+                        before_phase=outcome.before_phase,
+                        branch=rows[outcome.story][1][outcome.subtask].branch,
+                        relaunch=f"am run --milestone {milestone_card.id}",
+                    )
+                    payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+                return comment_run_end(payload)
             if any(outcome.kind == "escalated" for outcome in outcomes):
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
                 primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
                 payload = escalated_payload(run_id, primary, outcomes, warnings)
                 if stop.requested == "pause":
                     payload["control"] = "pause"
-                return report(payload)
+                return comment_run_end(report(payload))
             if stop.requested == "pause":
                 store.record_run(run_record.model_copy(update={"status": "stopped"}))
-                return report(controlled_payload(run_id, "pause", outcomes, warnings))
+                # Board-comments B2 (card 5d9a875f): only the milestone's run-end;
+                # a parked subtask is resumed, not closed, so it gets no comment.
+                return comment_run_end(
+                    report(controlled_payload(run_id, "pause", outcomes, warnings))
+                )
 
             # Integrate (addendum I6) runs only once every lane finished clean,
             # and also when there was nothing left to drive: that is how a relaunch
@@ -1689,22 +1866,26 @@ def run_milestone(
             if isinstance(outcome, integration.IntegrateEscalation):
                 # The branch and worktree stay exactly as Integrate left them (I5).
                 store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                return report(integrate_escalated_payload(run_id, outcome, warnings))
+                return comment_run_end(
+                    report(integrate_escalated_payload(run_id, outcome, warnings))
+                )
 
             store.record_run(run_record.model_copy(update={"status": "done"}))
-            return report(
-                {
-                    "done": True,
-                    "run_id": run_id,
-                    "levels": [
-                        {"level": index, "stories": [planned.story.id for planned in level]}
-                        for index, level in enumerate(levels)
-                    ],
-                    "completed": completed,
-                    "tips": tips,
-                    "warnings": warnings,
-                    "integrated": integrated_payload(outcome),
-                }
+            return comment_run_end(
+                report(
+                    {
+                        "done": True,
+                        "run_id": run_id,
+                        "levels": [
+                            {"level": index, "stories": [planned.story.id for planned in level]}
+                            for index, level in enumerate(levels)
+                        ],
+                        "completed": completed,
+                        "tips": tips,
+                        "warnings": warnings,
+                        "integrated": integrated_payload(outcome),
+                    }
+                )
             )
     finally:
         store.close()

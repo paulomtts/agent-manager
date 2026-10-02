@@ -1,20 +1,33 @@
-"""Outcome comment bodies for brd cards (board-comments design B2-B5).
+"""Outcome comments for brd cards (board-comments design B2-B9).
 
-Pure: no I/O, no `brd`, no store, no clock. Each `compose_*` turns one
-outcome's data into a `Comment` that a caller later enqueues and flushes
-(Task 2.1); this module never posts anything. Agent text enters only
-through `agent_reason`'s three failure fields, quoted, `[[`-escaped and
-cut first when a body would exceed `CAP`.
+`key`, `agent_reason` and every `compose_*` are pure: no I/O, no `brd`, no
+store, no clock. Each `compose_*` turns one outcome's data into a `Comment`.
+Agent text enters only through `agent_reason`'s three failure fields, quoted,
+`[[`-escaped and cut first when a body would exceed `CAP`.
+
+`enqueue` and `flush` are the outbox side (B6-B9). `enqueue` queues a
+`Comment` in the store's `board_comments` table. `flush` posts the pending
+rows through an injected `board_api` (the `board` module by default), one
+row at a time under the board write lock and never inside a store
+transaction, checking the card for the row's `am-key:` line first so a crash
+between posting and marking never double-posts. A board failure becomes a
+returned warning, never an exception.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from agent_manager import board, locks
+from agent_manager.store import COMMENT_ATTEMPTS
 
 if TYPE_CHECKING:
     from agent_manager.runtime.walk import SubtaskSummary
+    from agent_manager.store import CommentRow, Store
 
 CAP = 1500
 """Hard cap on one comment body, in characters (B4)."""
@@ -338,3 +351,86 @@ def compose_run_end(
         f"am · {outcome} · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
     )
     return Comment(card_id=milestone_id, key=comment_key, body=body)
+
+
+# -- outbox (board-comments B6-B9) ---------------------------------------------
+
+
+def enqueue(store: Store, comment: Comment, *, run_id: str, now: datetime) -> None:
+    """Queue `comment` in the store's outbox under its key, once (B6, B9).
+
+    A pass-through to `Store.enqueue_comment`: a key already queued, in any
+    state, is left exactly as it was. Nothing is posted here; the caller
+    flushes. Nothing is caught: a lost lease raises `store.LeaseLostError`
+    and writes no row.
+    """
+    store.enqueue_comment(
+        run_id=run_id,
+        card_id=comment.card_id,
+        key=comment.key,
+        body=comment.body,
+        now=now,
+    )
+
+
+def _post_one(store: Store, row: CommentRow, root: Path, board_api: Any) -> None:
+    """Put `row` on its card unless its `am-key:` line is already there, then mark it.
+
+    Called with the board write lock held. A comment whose body (trailing
+    whitespace ignored) ends with `am-key: <key>` is this row, posted by an
+    earlier flush that died before marking (B7); its id is recorded instead
+    of posting again.
+    """
+    marker = f"am-key: {row.key}"
+    existing = board_api.comment_list(row.card_id, repo_dir=root)
+    match = next((c for c in existing if c.body.rstrip().endswith(marker)), None)
+    if match is None:
+        comment_id = board_api.comment_add(row.card_id, row.body, author="am", repo_dir=root)
+    else:
+        comment_id = match.id
+    store.mark_comment_posted(row.key, comment_id, datetime.now(timezone.utc))
+
+
+def _warning(row: CommentRow, attempts: int, error: Exception) -> str:
+    """The one report warning for a row whose post failed (B7, B8).
+
+    `attempts` is `Store.record_comment_failure`'s new count; at
+    `COMMENT_ATTEMPTS` the store has already marked the row `abandoned`.
+    """
+    where = f"board comment {row.key} on card {row.card_id}"
+    if attempts >= COMMENT_ATTEMPTS:
+        return f"{where} abandoned after {attempts} failed attempts: {error}"
+    return f"{where} not posted (attempt {attempts} of {COMMENT_ATTEMPTS}), will retry: {error}"
+
+
+def flush(
+    store: Store,
+    root: Path,
+    *,
+    run_id: str | None = None,
+    card_ids: Iterable[str] | None = None,
+    board_api: Any = board,
+) -> list[str]:
+    """Post every pending outbox row, oldest first, and return the warnings (B7).
+
+    `run_id`/`card_ids` narrow the rows exactly as `Store.pending_comments`
+    does. Each row takes `board_api.write_lock(root)` on its own -- never
+    while a store transaction is open (X8) -- and all board access goes
+    through `board_api`, so tests inject a fake.
+
+    A `board.BoardError` or a `locks.LockTimeoutError` on a row is counted
+    with `Store.record_comment_failure`, reported as exactly one warning,
+    and the next row is tried: a board failure never escalates, parks or
+    changes a run (B8). Every other exception propagates.
+    """
+    warnings: list[str] = []
+    for row in store.pending_comments(run_id, card_ids):
+        try:
+            with board_api.write_lock(root):
+                _post_one(store, row, root, board_api)
+        except (board.BoardError, locks.LockTimeoutError) as error:
+            # Counted outside the board lock; the store's own 3-strike rule
+            # abandons the row. Anything else (a lost lease, a crash) propagates.
+            attempts = store.record_comment_failure(row.key)
+            warnings.append(_warning(row, attempts, error))
+    return warnings
