@@ -1572,6 +1572,77 @@ def run_milestone(
             raise ValueError(
                 "a fresh milestone run needs a milestone, a base branch and a branch prefix"
             )
+    return asyncio.run(
+        _run_milestone_async(
+            milestone,
+            repo_dir=repo_dir,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            max_concurrent=max_concurrent,
+            resume_run_id=resume_run_id,
+            control_interval=control_interval,
+        )
+    )
+
+
+async def _in_thread_to_completion(function: Callable[..., T], /, **kwargs: Any) -> T:
+    """Await `function(**kwargs)` on a worker thread, and never unwind before it returns.
+
+    A thread cannot be cancelled, so a cancel arriving while it runs is held
+    until the thread finishes and only then re-raised: the caller's `finally`
+    blocks (closing the store, releasing the lease) never run under a call
+    that is still using them. The thread's own result or exception is dropped
+    once the caller has been cancelled.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(function, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                continue
+        if not future.cancelled():
+            future.exception()  # retrieved, so it is not logged as never retrieved
+        raise
+
+
+async def _run_milestone_async(
+    milestone: str | None,
+    *,
+    repo_dir: Path,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    max_concurrent: int = 1,
+    resume_run_id: str | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+    slots: asyncio.Semaphore | None = None,
+) -> dict[str, Any]:
+    """`run_milestone`'s body without its argument validation, awaitable in a
+    caller's own event loop.
+
+    A caller that skips `run_milestone` must validate its own arguments first:
+    a fresh run needs `max_concurrent >= 1` and a `milestone`, `base_branch`
+    and `branch_prefix`. `slots`, when given, is forwarded to `supervise` and
+    bounds this run's lanes instead of `max_concurrent`, so several runs can
+    share one semaphore; `None` lets `supervise` make its own
+    `asyncio.Semaphore(max_concurrent)`, as `run_milestone` does. The run is
+    still recorded with `max_concurrent`. Board reads and `refresh_git` stay
+    synchronous on the loop thread; Integrate stays a synchronous call but runs
+    on a worker thread (see its call site), and a cancel arriving meanwhile
+    waits for it to return before this coroutine unwinds.
+    """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
     if resumed is not None:
@@ -1650,32 +1721,31 @@ def run_milestone(
 
             # `controlled` only ever parks the run through `stop` (C3); it
             # closes the window and runs a final sweep before returning.
-            outcomes = asyncio.run(
-                control.controlled(
-                    supervise(
-                        supervisor_plan(
-                            plan.stories,
-                            levels,
-                            rows,
-                            branch_prefix=branch_prefix,
-                            base_branch=base_branch,
-                            checkpoints=checkpoints,
-                        ),
-                        store=store,
-                        run_id=run_id,
-                        root=root,
-                        drive=drive,
-                        commands=list(commands),
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        max_concurrent=max_concurrent,
-                        stop=stop,
+            outcomes = await control.controlled(
+                supervise(
+                    supervisor_plan(
+                        plan.stories,
+                        levels,
+                        rows,
+                        branch_prefix=branch_prefix,
+                        base_branch=base_branch,
+                        checkpoints=checkpoints,
                     ),
                     store=store,
+                    run_id=run_id,
+                    root=root,
+                    drive=drive,
+                    commands=list(commands),
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    max_concurrent=max_concurrent,
                     stop=stop,
-                    lease=lease,
-                    interval=control_interval,
-                )
+                    slots=slots,
+                ),
+                store=store,
+                stop=stop,
+                lease=lease,
+                interval=control_interval,
             )
             # Wave order, census order within a wave, never finish order.
             for outcome in outcomes:
@@ -1721,7 +1791,17 @@ def run_milestone(
             # so a test can replace it, as `driver` is. It needs a factory for a
             # conflicting tip; `None` is production's, read off `cli` now.
             factory = cli.default_runner_factory if runner_factory is None else runner_factory
-            outcome = integration.integrate_milestone(
+            # `integrate_milestone` stays a synchronous call (I6); it is run on a
+            # worker thread, not the loop thread, only because its conflict
+            # resolver (`runtime_engine.run_subtask`) makes its own nested
+            # `asyncio.run(...)` call, which `asyncio.run` refuses once this
+            # coroutine is already running on the loop thread. `Store`'s
+            # connection is `check_same_thread=False` for exactly this kind of
+            # cross-thread, strictly sequential use (store.py).
+            # A cancel waits for that thread, so the store and lease below
+            # outlive it (`_in_thread_to_completion`).
+            outcome = await _in_thread_to_completion(
+                integration.integrate_milestone,
                 stories=plan.stories,
                 repo_dir=root,
                 base_branch=base_branch,
