@@ -4,9 +4,10 @@ Two tiers, per design §14:
 
 - `plan_levels`, `story_tips`, `stale_story_anchors` and the payload helpers
   are pure and get unit tests on hand-built plans or outcomes;
-- `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
-  real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
-  `paths.data_dir()` never touches the developer's own -- with the harness
+- `run_milestone` runs on git-tier fixtures -- a real temporary git repo and an
+  in-memory `FakeBoard` (tests/conftest.py) behind `board.run_brd`, with
+  `XDG_DATA_HOME` under `tmp_path` so `paths.data_dir()` never touches the
+  developer's own -- with the harness
   replaced at the injected `driver` seam by an awaitable fake that runs on the
   run's one event loop (supervisor-tree T3). No runner, adapter or `claude` is
   involved; production wiring under a fake `claude` belongs to tests/e2e.
@@ -644,7 +645,7 @@ def test_a_base_only_lanes_outcome_follows_the_waves_in_census_order():
     ]
 
 
-# ── the runner, on a real repo and a real board ─────────────────────────────
+# ── the runner, on a real repo and a FakeBoard ──────────────────────────────
 
 
 requires_git = pytest.mark.skipif(
@@ -697,31 +698,58 @@ def _local_branches(cwd: Path) -> list[str]:
     return _git(cwd, "branch", "--format=%(refname:short)").split()
 
 
+def _active_fake_board() -> Any:
+    """The FakeBoard the `project` fixture installed as `board.run_brd`.
+
+    Duck-typed: conftest classes are not importable from a test module under
+    `--import-mode=importlib`, so `isinstance(..., FakeBoard)` is unavailable.
+    """
+    fake = board.run_brd
+    if not (hasattr(fake, "add_card") and hasattr(fake, "cards")):
+        raise AssertionError(
+            "_add_card/_block seed the FakeBoard that the `project` fixture installs "
+            f"as board.run_brd; board.run_brd is {fake!r} -- request `project`"
+        )
+    return fake
+
+
 def _add_card(root: Path, title: str, parent: str | None = None) -> str:
-    argv = ["brd", "add", "--title", title]
-    if parent is not None:
-        argv += ["--parent", parent]
-    completed = subprocess.run(argv, cwd=root, check=True, capture_output=True, text=True)
-    return json.loads(completed.stdout)["data"]["id"]
+    """Seed one card on the project's FakeBoard and return its id.
+
+    `root` is kept so call sites read as before; one FakeBoard is one board.
+    """
+    return _active_fake_board().add_card(title, parent_id=parent)
 
 
 def _block(root: Path, card_id: str, blocker: str) -> None:
-    subprocess.run(
-        ["brd", "block", card_id, "--by", blocker],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    """Make `blocker` block `card_id`, as `brd block card_id --by blocker` would.
+
+    Appends to the seeded card's `blocked_by` after the fact, because story
+    blocks are added once both stories exist. Never stores `blocked` -- it is
+    derived -- and is seeding, so it is not a `FakeBoard.writes` entry.
+    """
+    fake = _active_fake_board()
+    for wanted in (card_id, blocker):
+        if wanted not in fake.cards:
+            raise AssertionError(f"_block: unknown card {wanted!r}")
+    blocked_by = fake.cards[card_id].blocked_by
+    if blocker not in blocked_by:
+        blocked_by.append(blocker)
 
 
 @pytest.fixture
-def project(tmp_path, monkeypatch) -> Path:
-    """One directory that is both a real git repo on `main` and a real brd board.
+def project(tmp_path, monkeypatch, fake_board) -> Path:
+    """A real git repo on `main`, with a fresh FakeBoard as its board.
 
-    XDG_DATA_HOME points into tmp_path, which isolates brd's own database and
-    `paths.data_dir()`, so no run artifact can land in the developer's home.
-    The repo has no remote.
+    `fake_board` (tests/conftest.py) installs an empty in-memory board as
+    `board.run_brd`; `_add_card`/`_block` seed it, and every `board.*` call --
+    from `run_milestone` or from a test body -- is answered by it. No `brd`
+    process starts. Git stays real: worktrees and branches are what these
+    tests are about.
+
+    XDG_DATA_HOME points into tmp_path, so `paths.data_dir()` never lands a
+    run artifact in the developer's home. The repo has no remote and one
+    commit, "base".
     """
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     root = tmp_path / "project"
@@ -735,15 +763,6 @@ def project(tmp_path, monkeypatch) -> Path:
     (root / "README.md").write_text("base\n", encoding="utf-8")
     _git(root, "add", "README.md")
     _git(root, "commit", "-m", "base")
-    subprocess.run(
-        ["brd", "init", "--name", "temp-board"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    _git(root, "add", "-A")
-    _git(root, "commit", "-m", "brd init")
     return root
 
 
