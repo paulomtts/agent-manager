@@ -1,17 +1,22 @@
 """The only caller of the `brd` CLI (design §4 line 119).
 
-Four operations cross this seam: read one card, read a card subtree, read
-every root of the board, write a card status. Nothing about a *run* is ever
-written to the board (decision D5, design §9) -- run state lives in
-agent-manager's own SQLite projection and journal, so `set_status` is the
-module's entire write surface.
+Six operations cross this seam: read one card, read a card subtree, read
+every root of the board, write a card status, add a comment to a card, and
+list a card's comments. Nothing about a *run* is ever written to the board
+(decision D5, design §9) -- run state lives in agent-manager's own SQLite
+projection and journal. Under decision B1 of the board-comments addendum the
+board may also receive code-authored, append-only outcome comments, so
+`set_status` and `comment_add` are the module's entire write surface. A
+comment body is piped to `brd comment add <id> -` on stdin, never put in argv.
 
-Writes are serialized across threads and across `am` processes on one project
-(spec X7 of the multi-process design): `set_status` runs under
+Status writes are serialized across threads and across `am` processes on one
+project (spec X7 of the multi-process design): `set_status` runs under
 `write_lock(repo_dir)`, the project's process-wide `board` lock, whose
 in-process layer is the module-level `WRITE_LOCK`. `steps/rollup.py` holds the
 same lock around its whole read-modify-write walk up a card's ancestors. Reads
-take no lock. A `locks.LockTimeoutError` is never caught here.
+and the comment calls take no lock here; the outbox flush that drives comments
+owns its own locking (board-comments B7). A `locks.LockTimeoutError` is never
+caught here.
 
 Every invocation is an argument list handed to `subprocess`. Design §5 line 252
 is explicit that the program runs commands itself with argument lists, so
@@ -25,6 +30,7 @@ Naming, slugs, branches and ref matching are `dag.py`'s job, not this module's.
 import json
 import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -86,6 +92,19 @@ class BoardError(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class BoardComment:
+    """One comment on a card, as `comment_list` reports it.
+
+    A plain dataclass, not a Pydantic model: `comment_list` checks the three
+    fields it keeps itself and drops brd's `entity_id` and `created_at`.
+    """
+
+    id: str
+    body: str
+    author: str
+
+
 def show_argv(card_id: str) -> list[str]:
     return [BRD, "show", card_id]
 
@@ -105,13 +124,25 @@ def set_status_argv(card_id: str, status: str) -> list[str]:
     return [BRD, "update", card_id, "--status", status]
 
 
+def comment_add_argv(card_id: str, author: str) -> list[str]:
+    # The body never rides in argv: `-` makes brd read it from stdin, so a body
+    # of any length or content is never a command-line argument.
+    return [BRD, "comment", "add", card_id, "-", "--author", author]
+
+
+def comment_list_argv(card_id: str) -> list[str]:
+    return [BRD, "comment", "list", card_id]
+
+
 def _run(
-    argv: list[str], repo_dir: Path | None
+    argv: list[str], repo_dir: Path | None, *, input: str | None = None
 ) -> "subprocess.CompletedProcess[str]":
     """Run one `brd` argv list, returning the completed process.
 
-    Raises `BoardError` when `brd` is missing, or when it failed without
-    printing an envelope -- a bare non-zero exit with stderr only.
+    `input`, when given, is written to the process's stdin -- the only way a
+    comment body reaches brd. Raises `BoardError` when `brd` is missing, or
+    when it failed without printing an envelope -- a bare non-zero exit with
+    stderr only.
     """
     try:
         completed = subprocess.run(
@@ -119,6 +150,7 @@ def _run(
             cwd=repo_dir,
             capture_output=True,
             text=True,
+            input=input,
         )
     except FileNotFoundError as exc:
         raise BoardError(
@@ -257,9 +289,10 @@ def set_status(
 ) -> models.Card:
     """Write a card's board status via `brd update --status`, and return it.
 
-    This is the module's entire write surface: under D5 the board receives
-    status transitions and nothing else, and run state lives in agent-manager's
-    own store.
+    This is the module's only status writer. Under D5, as amended by decision
+    B1 of the board-comments addendum, the board receives status transitions
+    and code-authored, append-only outcome comments (`comment_add`) -- never
+    run state, which lives in agent-manager's own store.
 
     Idempotent by construction (design §9 line 376): `brd update` stores the
     value it is given, so a repeat of the same transition is another successful
@@ -278,3 +311,69 @@ def set_status(
             completed.stdout, argv=argv, exit_code=completed.returncode
         )
         return _validated(models.Card, data, argv=argv)
+
+
+def comment_add(
+    card_id: str,
+    body: str,
+    *,
+    author: str = "am",
+    repo_dir: Path | None = None,
+) -> str:
+    """Append one comment to a card via `brd comment add`, returning its id.
+
+    The body is piped on stdin (`brd comment add <id> - --author <author>`),
+    never placed in argv, so newlines, long text and shell metacharacters
+    reach brd byte-for-byte and are never executed. No lock is taken and
+    nothing is deduplicated: idempotence and serialization belong to the
+    outbox flush that calls this (board-comments design B7). brd's own
+    failures -- an unknown card, an empty body -- surface as `BoardError`.
+    """
+    argv = comment_add_argv(card_id, author)
+    completed = _run(argv, repo_dir, input=body)
+    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
+    if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+        raise BoardError(
+            f"brd comment add {card_id} returned {type(data).__name__} where "
+            "a comment object with a string id was expected",
+            argv=argv,
+            exit_code=completed.returncode,
+        )
+    return data["id"]
+
+
+def comment_list(
+    card_id: str, *, repo_dir: Path | None = None
+) -> list[BoardComment]:
+    """A card's comments, oldest first, via `brd comment list`.
+
+    brd already lists oldest first (by creation time, then insertion), and that
+    order is returned untouched -- nothing is re-sorted. Every comment on the
+    card is included, whoever wrote it. A card with no comments is an empty
+    list; an unknown card surfaces brd's `EntityNotFoundError` as `BoardError`.
+    """
+    argv = comment_list_argv(card_id)
+    completed = _run(argv, repo_dir)
+    data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
+    if not isinstance(data, list):
+        raise BoardError(
+            f"brd comment list {card_id} returned {type(data).__name__} where "
+            "a list of comments was expected",
+            argv=argv,
+            exit_code=completed.returncode,
+        )
+    comments: list[BoardComment] = []
+    for item in data:
+        if not isinstance(item, dict) or not all(
+            isinstance(item.get(field), str) for field in ("id", "body", "author")
+        ):
+            raise BoardError(
+                f"brd comment list {card_id} returned an item that is not a "
+                f"comment with a string id, body and author: {item!r:.200}",
+                argv=argv,
+                exit_code=completed.returncode,
+            )
+        comments.append(
+            BoardComment(id=item["id"], body=item["body"], author=item["author"])
+        )
+    return comments

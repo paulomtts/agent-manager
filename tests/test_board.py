@@ -6,6 +6,8 @@ no mocking of brd, no network. The narrow checks at the bottom cover the pure
 parts (argv construction, envelope decoding) that need no board at all.
 """
 
+import dataclasses
+import inspect
 import json
 import shutil
 import subprocess
@@ -872,8 +874,306 @@ def test_roots_requires_a_list_of_roots(data, tmp_path, monkeypatch):
     assert excinfo.value.argv == [str(fake_brd), "tree"]
 
 
+def _fake_brd_answering(tmp_path: Path, data: object) -> Path:
+    """An executable `brd` stand-in that prints one ok envelope around `data`.
+
+    Same technique as the tree/roots shape guards above: it replaces the brd
+    executable, not `_run`, so the real subprocess path still runs.
+    """
+    fake_brd = tmp_path / "brd"
+    fake_brd.write_text(
+        "#!/bin/sh\ncat <<'EOF'\n"
+        + json.dumps({"ok": True, "data": data})
+        + "\nEOF\n"
+    )
+    fake_brd.chmod(0o755)
+    return fake_brd
+
+
+@requires_brd
+def test_comment_add_returns_the_new_comments_id(temp_board):
+    card = _add_card(temp_board, "Add board.comment_add")
+
+    comment_id = board.comment_add(card, "first outcome", repo_dir=temp_board)
+
+    assert isinstance(comment_id, str) and comment_id
+    raw = _brd_json(temp_board, "comment", "list", card)
+    assert [(c["id"], c["body"], c["author"]) for c in raw] == [
+        (comment_id, "first outcome", "am")
+    ]
+
+
+@requires_brd
+def test_comment_add_passes_an_explicit_author(temp_board):
+    card = _add_card(temp_board, "Add board.comment_add")
+
+    board.comment_add(card, "by hand", author="paulo", repo_dir=temp_board)
+
+    assert [c["author"] for c in _brd_json(temp_board, "comment", "list", card)] == [
+        "paulo"
+    ]
+
+
+@requires_brd
+def test_comment_add_on_an_unknown_card_raises_board_error(temp_board):
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_add("no-such-card", "orphan", repo_dir=temp_board)
+    assert excinfo.value.error_type == "EntityNotFoundError"
+    assert "no-such-card" in excinfo.value.message
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.argv == [
+        "brd",
+        "comment",
+        "add",
+        "no-such-card",
+        "-",
+        "--author",
+        "am",
+    ]
+
+
+@requires_brd
+def test_comment_add_of_a_blank_body_raises_brds_own_rejection(temp_board):
+    # brd refuses whitespace-only bodies; board.py special-cases nothing.
+    card = _add_card(temp_board, "Add board.comment_add")
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_add(card, "  \n\t", repo_dir=temp_board)
+    assert excinfo.value.error_type == "EmptyCommentError"
+    assert _brd_json(temp_board, "comment", "list", card) == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [[], "nope", None, {}, {"id": 7}],
+    ids=["list", "str", "null", "no-id", "int-id"],
+)
+def test_comment_add_requires_an_object_with_a_string_id(data, tmp_path, monkeypatch):
+    fake_brd = _fake_brd_answering(tmp_path, data)
+    monkeypatch.setattr(board, "BRD", str(fake_brd))
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_add("3fb36324", "body", repo_dir=tmp_path)
+    assert "a comment object with a string id" in str(excinfo.value)
+    assert excinfo.value.argv == [
+        str(fake_brd),
+        "comment",
+        "add",
+        "3fb36324",
+        "-",
+        "--author",
+        "am",
+    ]
+
+
+def _hostile_body(marker: Path) -> str:
+    """5,000 characters a shell would mangle or execute, ending in a newline.
+
+    brd reads stdin verbatim (it never strips), so leading/trailing whitespace,
+    tabs and non-ASCII must all survive exactly.
+    """
+    head = (
+        " leading space, then newlines\n"
+        f"$(touch {marker})\n"
+        f"`touch {marker}`\n"
+        "; echo pwned && rm -rf nothing | cat > /dev/null\n"
+        "'single' \"double\" \\backslash \t tab, accents é, check ✓\n"
+    )
+    filler = "0123456789" * 7 + "\n"
+    body = (head + filler * 100)[:4999] + "\n"
+    assert len(body) == 5000
+    return body
+
+
+@requires_brd
+def test_comment_list_of_a_card_with_no_comments_is_empty(temp_board):
+    card = _add_card(temp_board, "Add board.comment_list")
+    assert board.comment_list(card, repo_dir=temp_board) == []
+
+
+@requires_brd
+def test_comment_list_returns_comments_oldest_first_with_their_authors(temp_board):
+    card = _add_card(temp_board, "Add board.comment_list")
+    first = board.comment_add(card, "first", repo_dir=temp_board)
+    second = board.comment_add(card, "second", author="paulo", repo_dir=temp_board)
+    third = board.comment_add(card, "third", repo_dir=temp_board)
+
+    comments = board.comment_list(card, repo_dir=temp_board)
+
+    # The ids comment_add returned are the ids comment_list reports.
+    assert comments == [
+        board.BoardComment(id=first, body="first", author="am"),
+        board.BoardComment(id=second, body="second", author="paulo"),
+        board.BoardComment(id=third, body="third", author="am"),
+    ]
+    # brd's order, untouched.
+    raw = _brd_json(temp_board, "comment", "list", card)
+    assert [comment.id for comment in comments] == [c["id"] for c in raw]
+
+
+@requires_brd
+def test_a_long_hostile_body_round_trips_exactly_through_stdin(temp_board, tmp_path):
+    marker = tmp_path / "pwned"
+    body = _hostile_body(marker)
+    card = _add_card(temp_board, "Add board.comment_add")
+
+    comment_id = board.comment_add(card, body, repo_dir=temp_board)
+
+    assert board.comment_list(card, repo_dir=temp_board) == [
+        board.BoardComment(id=comment_id, body=body, author="am")
+    ]
+    # Nothing in the body was ever executed by a shell.
+    assert not marker.exists()
+
+
+@requires_brd
+def test_comment_list_on_an_unknown_card_raises_board_error(temp_board):
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_list("no-such-card", repo_dir=temp_board)
+    assert excinfo.value.error_type == "EntityNotFoundError"
+    assert "no-such-card" in excinfo.value.message
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.argv == ["brd", "comment", "list", "no-such-card"]
+
+
+@requires_brd
+def test_comment_list_includes_comments_am_did_not_write(temp_board):
+    # A human's comment, written with brd directly, is listed in brd's order
+    # with its real author -- the later outbox flush scans this list.
+    card = _add_card(temp_board, "Add board.comment_list")
+    mine = board.comment_add(card, "from am", repo_dir=temp_board)
+    _brd_json(temp_board, "comment", "add", card, "from a human", "--author", "paulo")
+
+    listed = board.comment_list(card, repo_dir=temp_board)
+
+    assert [(c.body, c.author) for c in listed] == [
+        ("from am", "am"),
+        ("from a human", "paulo"),
+    ]
+    assert listed[0].id == mine
+
+
+@requires_brd
+def test_comment_add_does_not_deduplicate(temp_board):
+    # Idempotence is the outbox's job, not this primitive's.
+    card = _add_card(temp_board, "Add board.comment_add")
+    first = board.comment_add(card, "same body", repo_dir=temp_board)
+    second = board.comment_add(card, "same body", repo_dir=temp_board)
+
+    assert first != second
+    assert [c.id for c in board.comment_list(card, repo_dir=temp_board)] == [
+        first,
+        second,
+    ]
+
+
+@requires_brd
+def test_comment_list_is_scoped_to_one_card(temp_board):
+    one = _add_card(temp_board, "card one")
+    two = _add_card(temp_board, "card two")
+    on_one = board.comment_add(one, "about one", repo_dir=temp_board)
+
+    assert board.comment_list(two, repo_dir=temp_board) == []
+    assert [c.id for c in board.comment_list(one, repo_dir=temp_board)] == [on_one]
+
+
+@pytest.mark.parametrize("data", [{}, "nope", None], ids=["dict", "str", "null"])
+def test_comment_list_requires_a_list_of_comments(data, tmp_path, monkeypatch):
+    fake_brd = _fake_brd_answering(tmp_path, data)
+    monkeypatch.setattr(board, "BRD", str(fake_brd))
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_list("3fb36324", repo_dir=tmp_path)
+    assert "a list of comments" in str(excinfo.value)
+    assert excinfo.value.argv == [str(fake_brd), "comment", "list", "3fb36324"]
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"id": "c1", "body": "b"},
+        {"id": "c1", "author": "am"},
+        {"body": "b", "author": "am"},
+        {"id": "c1", "body": None, "author": "am"},
+        "c1",
+    ],
+    ids=["no-author", "no-body", "no-id", "null-body", "bare-str"],
+)
+def test_comment_list_rejects_an_item_that_is_not_a_comment(item, tmp_path, monkeypatch):
+    good = {"id": "c0", "entity_id": "3fb36324", "author": "am", "body": "ok", "created_at": "t"}
+    fake_brd = _fake_brd_answering(tmp_path, [good, item])
+    monkeypatch.setattr(board, "BRD", str(fake_brd))
+    with pytest.raises(board.BoardError) as excinfo:
+        board.comment_list("3fb36324", repo_dir=tmp_path)
+    assert "not a comment" in str(excinfo.value)
+    assert excinfo.value.argv == [str(fake_brd), "comment", "list", "3fb36324"]
+
+
 # Pure checks: no board needed.
 
 
 def test_roots_argv_is_brd_tree_with_no_id():
     assert board.roots_argv() == ["brd", "tree"]
+
+
+def test_comment_add_argv_reads_the_body_from_stdin():
+    # `-` is brd's own "read the body from stdin" marker (brd comment add --help).
+    assert board.comment_add_argv("3fb36324", "am") == [
+        "brd",
+        "comment",
+        "add",
+        "3fb36324",
+        "-",
+        "--author",
+        "am",
+    ]
+
+
+def test_comment_add_argv_has_no_way_to_carry_a_body():
+    # Bodies go on stdin, never argv: the builder does not even accept one.
+    assert list(inspect.signature(board.comment_add_argv).parameters) == [
+        "card_id",
+        "author",
+    ]
+    assert board.comment_add_argv("3fb36324", "am").count("-") == 1
+
+
+def test_comment_list_argv_is_brd_comment_list_with_the_card_id():
+    assert board.comment_list_argv("3fb36324") == [
+        "brd",
+        "comment",
+        "list",
+        "3fb36324",
+    ]
+
+
+def test_comment_argv_keeps_shell_metacharacters_inside_one_element():
+    hostile = "3fb36324; rm -rf /"
+    assert board.comment_add_argv(hostile, "am $(whoami)") == [
+        "brd",
+        "comment",
+        "add",
+        hostile,
+        "-",
+        "--author",
+        "am $(whoami)",
+    ]
+    assert board.comment_list_argv(hostile) == ["brd", "comment", "list", hostile]
+
+
+def test_run_pipes_input_to_the_process_stdin():
+    # `cat` echoes stdin back, so stdout proves the bytes arrived untouched
+    # and unexecuted.
+    text = "line one\n$(echo pwned)\n`echo pwned`\n"
+    completed = board._run(["cat"], None, input=text)
+    assert completed.returncode == 0
+    assert completed.stdout == text
+
+
+def test_board_comment_is_a_frozen_plain_dataclass():
+    comment = board.BoardComment(id="c1", body="body", author="am")
+    assert dataclasses.is_dataclass(comment)
+    assert [field.name for field in dataclasses.fields(comment)] == [
+        "id",
+        "body",
+        "author",
+    ]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        comment.body = "changed"  # type: ignore[misc]

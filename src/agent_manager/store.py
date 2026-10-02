@@ -144,6 +144,18 @@ CREATE TABLE IF NOT EXISTS run_claims (
     token      TEXT NOT NULL,
     claimed_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS board_comments (
+    run_id          TEXT NOT NULL,
+    card_id         TEXT NOT NULL,
+    key             TEXT PRIMARY KEY,
+    body            TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'posted', 'abandoned')),
+    comment_id      TEXT,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    posted_at       TEXT
+);
 """
 
 
@@ -908,6 +920,41 @@ def control_requests(
     return [_control_from_row(row) for row in rows]
 
 
+COMMENT_ATTEMPTS = 3
+"""Failed posts after which a `board_comments` row is `abandoned` (board-comments
+B7). The warning that names an abandoned row belongs to `comments.py`."""
+
+
+@dataclass(frozen=True)
+class CommentRow:
+    """One queued outcome comment: a row of `board_comments` (board-comments B6).
+
+    Row-only and outside the journal, like `Checkpoint`. `key` is the
+    idempotency key a replay or resume enqueues again (B9); `comment_id` is
+    the board's id once posted, else `None`.
+    """
+
+    run_id: str
+    card_id: str
+    key: str
+    body: str
+    state: str
+    comment_id: str | None
+    failed_attempts: int
+
+
+def _comment_from_row(row: sqlite3.Row) -> CommentRow:
+    return CommentRow(
+        run_id=row["run_id"],
+        card_id=row["card_id"],
+        key=row["key"],
+        body=row["body"],
+        state=row["state"],
+        comment_id=row["comment_id"],
+        failed_attempts=row["failed_attempts"],
+    )
+
+
 @contextmanager
 def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """One write transaction that holds the database write lock from `BEGIN`.
@@ -969,7 +1016,8 @@ class Store:
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
     The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
-    `run_leases` (live control C1/C2): row-only tables outside the journal.
+    `run_leases` (live control C1/C2) and `board_comments` (board-comments
+    B6): row-only tables outside the journal.
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
@@ -1447,6 +1495,119 @@ class Store:
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
+
+    # -- board comment outbox ------------------------------------------------
+    #
+    # A row-only table outside the journal (board-comments B6, B9): nothing
+    # here calls `self._journal`, and `rebuild_from_journal` leaves the rows
+    # alone. Every writer holds the store lock and the fence of the bound
+    # lease token, like `save_checkpoint`. Posting to the board is not this
+    # module's job: `comments.py` drains the outbox through `board.py`.
+
+    def enqueue_comment(
+        self,
+        *,
+        run_id: str,
+        card_id: str,
+        key: str,
+        body: str,
+        now: datetime,
+    ) -> bool:
+        """Queue `body` for `card_id` under `key`, once (B9).
+
+        True when a `pending` row was inserted; False when `key` already had a
+        row, which is left exactly as it was, whatever its state. Only the key
+        collision is ignored (`ON CONFLICT(key) DO NOTHING`, not `OR IGNORE`):
+        a NULL body or any other refused value raises `sqlite3.IntegrityError`
+        and rolls back.
+        """
+        with self._lock, self._fenced():
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO board_comments (run_id, card_id, key, body, state,"
+                    " comment_id, failed_attempts, created_at, posted_at)"
+                    " VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
+                    " ON CONFLICT(key) DO NOTHING",
+                    (run_id, card_id, key, body, _iso(now)),
+                )
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+            return cursor.rowcount == 1
+
+    def pending_comments(
+        self,
+        run_id: str | None = None,
+        card_ids: Iterable[str] | None = None,
+    ) -> list[CommentRow]:
+        """Every `pending` row, oldest `created_at` first, then insertion order.
+
+        Each given filter narrows the result and they are ANDed; with neither,
+        every pending row of every run is returned. `card_ids` matches across
+        runs, which is what a relaunch needs; an empty `card_ids` matches
+        nothing.
+        """
+        clauses = ["state = 'pending'"]
+        params: list[str] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if card_ids is not None:
+            cards = list(card_ids)
+            if not cards:
+                return []
+            clauses.append(f"card_id IN ({', '.join('?' for _ in cards)})")
+            params.extend(cards)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM board_comments WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, rowid",
+                params,
+            ).fetchall()
+            return [_comment_from_row(row) for row in rows]
+
+    def mark_comment_posted(self, key: str, comment_id: str, now: datetime) -> None:
+        """Record that `key`'s body is on the board as `comment_id`.
+
+        The row leaves `pending_comments`. An unknown `key` changes nothing.
+        """
+        with self._lock, self._fenced():
+            try:
+                self._conn.execute(
+                    "UPDATE board_comments SET state = 'posted', comment_id = ?,"
+                    " posted_at = ? WHERE key = ?",
+                    (comment_id, _iso(now), key),
+                )
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+
+    def record_comment_failure(self, key: str) -> int:
+        """Count one failed post of `key` and return the new `failed_attempts`.
+
+        A `pending` row reaching `COMMENT_ATTEMPTS` becomes `abandoned` and
+        leaves `pending_comments`; a row already `posted` keeps its state. No
+        warning is emitted here. An unknown `key` changes nothing and gives 0.
+        """
+        with self._lock, self._fenced():
+            try:
+                self._conn.execute(
+                    "UPDATE board_comments SET failed_attempts = failed_attempts + 1,"
+                    " state = CASE WHEN state = 'pending' AND failed_attempts + 1 >= ?"
+                    " THEN 'abandoned' ELSE state END WHERE key = ?",
+                    (COMMENT_ATTEMPTS, key),
+                )
+                row = self._conn.execute(
+                    "SELECT failed_attempts FROM board_comments WHERE key = ?", (key,)
+                ).fetchone()
+                self._commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+            return 0 if row is None else row["failed_attempts"]
 
     # -- leases, claims and control requests -----------------------------------
     #
