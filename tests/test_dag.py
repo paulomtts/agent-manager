@@ -9,6 +9,7 @@ from agent_manager.dag import (
     StackRootError,
     assert_no_blocker_cycles,
     base_branch_name,
+    board_levels,
     compute_integrate_levels,
     compute_levels,
     is_story_closed,
@@ -25,6 +26,7 @@ from agent_manager.dag import (
     task_stem,
     topological_levels,
 )
+from agent_manager.models import CardNode
 
 CARD = {"id": "a32af745-15ef-45cd-b52c-64c19ae82c17", "title": "40.1 feat: write rows"}
 
@@ -629,3 +631,84 @@ def test_the_milestone_two_board_stacks_each_story_on_the_previous_ones_tip():
         s3a.id: "m3/task-s2c-22220003",
         s3b.id: "m3/task-s3a-33330001",
     }
+
+
+# ── board levels ────────────────────────────────────────────────────────────
+
+
+def _root(
+    id: str,
+    blocked_by: list[str] | None = None,
+    status: str = "todo",
+    children: list[CardNode] | None = None,
+) -> CardNode:
+    """A milestone root; by default open with one todo story, so it has work."""
+    return CardNode(
+        id=id,
+        title=f"milestone {id}",
+        status=status,
+        blocked_by=list(blocked_by or []),
+        children=[CardNode(id=f"{id}-story", title="story", status="todo")]
+        if children is None
+        else children,
+    )
+
+
+def _node_ids(levels: list[list[CardNode]]) -> list[list[str]]:
+    return [[node.id for node in level] for level in levels]
+
+
+def test_independent_milestones_share_level_zero_in_input_order():
+    assert _node_ids(board_levels([_root("y"), _root("x")])) == [["y", "x"]]
+
+
+def test_a_milestone_chain_is_one_milestone_per_level():
+    roots = [_root("a"), _root("b", ["a"]), _root("c", ["b"])]
+    assert _node_ids(board_levels(roots)) == [["a"], ["b"], ["c"]]
+
+
+def test_board_levels_keeps_input_order_not_id_order_in_a_shared_level():
+    roots = [_root("a"), _root("c", ["a"]), _root("b", ["a"]), _root("d", ["b", "c"])]
+    assert _node_ids(board_levels(roots)) == [["a"], ["c", "b"], ["d"]]
+
+
+def test_an_external_blocker_is_ignored_by_board_levels():
+    roots = [_root("a", ["not-on-this-board"]), _root("b", ["a"])]
+    assert _node_ids(board_levels(roots)) == [["a"], ["b"]]
+
+
+def test_a_duplicated_blocker_does_not_hold_a_milestone_back():
+    roots = [_root("a"), _root("b", ["a", "a"])]
+    assert _node_ids(board_levels(roots)) == [["a"], ["b"]]
+
+
+def test_board_levels_returns_the_same_objects_and_leaves_the_input_alone():
+    roots = [_root("a"), _root("b", ["a"]), _root("c", ["a"])]
+    before = list(roots)
+    levels = board_levels(roots)
+    assert roots == before
+    assert [id(node) for level in levels for node in level] == [id(r) for r in roots]
+
+
+def test_board_levels_of_no_roots_is_empty():
+    assert board_levels([]) == []
+
+
+def test_a_two_milestone_cycle_stops_board_levels_naming_both():
+    roots = [_root("a", ["b"]), _root("b", ["a"])]
+    with pytest.raises(DependencyCycleError, match="dependency cycle among milestones #a, #b"):
+        board_levels(roots)
+
+
+def test_board_levels_names_only_the_unplaced_milestones_of_a_cycle():
+    roots = [_root("root"), _root("a", ["root", "b"]), _root("b", ["a"])]
+    with pytest.raises(DependencyCycleError) as caught:
+        board_levels(roots)
+    message = str(caught.value)
+    assert "#a, #b" in message
+    assert "#root" not in message
+
+
+def test_a_self_blocking_milestone_stops_board_levels():
+    with pytest.raises(DependencyCycleError, match="milestones #a"):
+        board_levels([_root("a", ["a"])])
