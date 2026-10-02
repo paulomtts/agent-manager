@@ -1226,3 +1226,99 @@ def test_every_public_function_runs_brd_through_the_run_brd_seam(
     assert calls == [(argv, tmp_path, stdin)]
     assert excinfo.value.error_type == "FakeError"
     assert excinfo.value.message == "faked"
+
+
+_VOLATILE_KEYS = frozenset({"id", "created_at", "updated_at"})
+"""Keys whose string values brd generates (uuid4s, now() timestamps); checked by type only."""
+
+
+def _assert_same_shape(fake: object, real: object, where: str) -> None:
+    """FakeBoard's JSON matches real brd's: same key sets, value types, list
+    lengths and order at every level, and equal values everywhere except a
+    generated id or timestamp, which only has to be a non-empty string."""
+    assert type(fake) is type(real), (
+        f"{where}: fake {type(fake).__name__} != real {type(real).__name__}"
+    )
+    if isinstance(real, dict):
+        assert set(fake) == set(real), f"{where}: keys {sorted(fake)} != {sorted(real)}"
+        for key, real_value in real.items():
+            if key in _VOLATILE_KEYS and isinstance(real_value, str):
+                assert isinstance(fake[key], str) and fake[key], (
+                    f"{where}.{key}: {fake[key]!r} is not a non-empty string"
+                )
+            else:
+                _assert_same_shape(fake[key], real_value, f"{where}.{key}")
+    elif isinstance(real, list):
+        assert len(fake) == len(real), f"{where}: {len(fake)} items != {len(real)}"
+        for index, (fake_item, real_item) in enumerate(zip(fake, real)):
+            _assert_same_shape(fake_item, real_item, f"{where}[{index}]")
+    else:
+        assert fake == real, f"{where}: fake {fake!r} != real {real!r}"
+
+
+@pytest.mark.brd
+@requires_brd
+def test_fake_board_answers_every_argv_like_real_brd_for_the_same_card_tree(
+    temp_board, fake_board
+):
+    # Test-tier V3: the conftest FakeBoard is the unit tier's brd, so it is
+    # pinned against the real binary -- the same "conftest twin" idea as
+    # tests/e2e/test_fake_claude.py:39-50 -- and cannot drift silently.
+    parent = _add_card(temp_board, "Milestone 1")
+    child = _add_card(temp_board, "Add FakeBoard", parent)
+    sibling = _add_card(temp_board, "Pin it against real brd", parent)
+    _brd_json(temp_board, "block", sibling, "--by", child)
+
+    # Seed the fake from the real board's own ids and fields, oldest first.
+    for card_id in (parent, child, sibling):
+        raw = _brd_json(temp_board, "show", card_id)
+        fake_board.add_card(
+            raw["title"],
+            card_id=raw["id"],
+            parent_id=raw["parent_id"],
+            description=raw["description"],
+            blocked_by=raw["blocked_by"],
+            created_at=raw["created_at"],
+            updated_at=raw["updated_at"],
+        )
+
+    exchanges: list[tuple[list[str], str | None]] = [
+        # Writes first, on both boards, so the reads below see them.
+        (board.set_status_argv(child, "in_progress"), None),
+        (board.comment_add_argv(child, "am"), "first outcome\nwith a second line\n"),
+        # Reads: show (with the comment embedded), tree, roots, comment list.
+        (board.show_argv(parent), None),
+        (board.show_argv(child), None),
+        (board.show_argv(sibling), None),
+        (board.tree_argv(parent), None),
+        (board.tree_argv(sibling), None),
+        (board.roots_argv(), None),
+        (board.comment_list_argv(child), None),
+        (board.comment_list_argv(parent), None),
+        # Error paths: brd's error type and message, verbatim, with exit 1.
+        (board.show_argv("no-such-card"), None),
+        (board.tree_argv("no-such-card"), None),
+        (board.set_status_argv("no-such-card", "done"), None),
+        (board.set_status_argv(child, "blocked"), None),
+        (board.comment_add_argv("no-such-card", "am"), "orphan"),
+        (board.comment_add_argv(child, "am"), "  \n\t"),
+        (board.comment_list_argv("no-such-card"), None),
+    ]
+
+    for argv, stdin in exchanges:
+        where = " ".join(argv)
+        real = subprocess.run(
+            argv, cwd=temp_board, capture_output=True, text=True, input=stdin
+        )
+        fake = fake_board(argv, temp_board, stdin)
+        assert fake.returncode == real.returncode, (
+            f"{where}: fake exit {fake.returncode} != real {real.returncode} "
+            f"(real stdout {real.stdout!r}, stderr {real.stderr!r})"
+        )
+        _assert_same_shape(json.loads(fake.stdout), json.loads(real.stdout), where)
+
+    # The writes reached the fake as recorded entries, in order.
+    assert fake_board.writes == [
+        ("set_status", child, "in_progress"),
+        ("comment_add", child, "first outcome\nwith a second line\n", "am"),
+    ]
