@@ -344,7 +344,7 @@ def test_on_spawn_is_called_once_with_the_live_process(tmp_path):
         seen.append((process, process.poll()))
 
     outcome = launcher.run_direct(
-        [sys.executable, "-c", "import time; time.sleep(0.3); print('done')"],
+        [sys.executable, "-c", "import time; time.sleep(0.1); print('done')"],
         cwd=tmp_path,
         timeout=30.0,
         stdout_path=tmp_path / "stdout.log",
