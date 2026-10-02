@@ -288,11 +288,16 @@ def test_the_real_claude_drives_two_independent_stories_in_parallel(
     subtask's commits carrying one Plan-Hash, the toy suite green on both
     tips, `main` untouched, and the two implement phases overlapping.
 
-    justification: verifies real process-level concurrency between two
-    independently-spawned `claude -p` processes actually overlapping in wall
-    time -- a fake-claude stand-in's near-instant, deterministic replies
-    cannot exercise genuine scheduling/timing overlap between two real
-    external processes."""
+    justification: two real `claude -p` sessions, each with real tool
+    permissions, working sibling worktrees at the same time with nothing
+    forcing them to overlap. The `e2e_fake` twin
+    (`test_parallel_milestone.py::test_two_lanes_overlap_in_implement_and_the_milestone_finishes`)
+    already proves overlap, but only through a rendezvous that holds scripted
+    fake processes inside implement until both arrive; it cannot observe
+    whether real, variable-length model sessions still overlap unforced (the
+    implement-span assertion) and each still lands its own working change
+    (`add` in `calc.py`, `greet` in `hello.py`, a green suite on both tips)
+    on its own independent branch."""
     # `.get`, not `[...]`: an escalation payload has no `completed`.
     assert completed_run.get("done") is True, (
         completed_run.get("story"),
