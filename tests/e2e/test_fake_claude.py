@@ -1,9 +1,28 @@
 """Tests for the fake `claude` of the production-wiring tier.
 
-The parsing and payload-generation tests are pure-functions tier (design §14
-lines 477-492); the four `_run_fake` tests below drive the whole script as a
-child process and belong to the production-wiring tier, like the fixture they
-underwrite.
+Tier follows what a test touches, not the directory it sits in (V1 of
+`docs/superpowers/specs/2026-10-02-test-tier-design.md`, which supersedes the
+design doc's old testing section). Each test here is marked on its own:
+
+- `@pytest.mark.e2e_fake`: the tests that call `_run_fake`, which runs
+  `fake_claude.py` as a child process. A test that also builds a git repo is
+  still `e2e_fake` only: one test, one tier.
+- `@pytest.mark.git`: the tests that build a real git repo in `tmp_path`
+  through `_implement_repo`, directly or via `_review_worktree` or
+  `_conflicted_repo`, and call the script's functions in-process.
+- no marker: the pure parsing, schema and payload tests, in the default `unit`
+  tier with its PATH shim and 0.5s budget.
+
+This module is the one exception to the `tests/e2e/` directory auto-mark
+(`_AUTO_MARK_EXEMPT` in `tests/conftest.py`). Every other module under
+`tests/e2e/` drives production wiring, so `e2e_fake` is the right default
+there. Most tests here only exercise the fake's helpers as plain functions;
+auto-marking them would keep them out of the default run for no reason. They
+stay in this file, rather than moving to a separate parsing module, because
+they share its by-path load of the script and its brief and schema fixtures.
+There is no module-level `pytestmark`, which would mark the pure tests too.
+`test_each_test_here_carries_exactly_the_tier_its_helpers_touch` fails when a
+test's marker disagrees with the helpers it reaches.
 
 `tests/e2e/fake_claude.py` is a script, not a package module: it is copied to a
 tmp directory and executed as `claude` by the production-wiring tier. It is
