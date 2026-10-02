@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -268,6 +268,23 @@ class JournalLine(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+_EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
+
+
+class _UnknownEventLine(BaseModel):
+    """What a line with an unrecognised `event` must still carry: its `seq`.
+
+    A newer `am` may journal an event kind this version's `EventKind` does not
+    list. `Journal.read` skips such a line, but `last_seq` still counts it, so
+    a later `append` never reuses a number already on disk. Every other field
+    belongs to a schema this version does not know and is ignored.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    seq: int = Field(gt=0)
+
+
 class Journal:
     """Append-only JSONL log for one run: the truth the projection is built from.
 
@@ -317,8 +334,17 @@ class Journal:
         with self._lock:
             self._seq = self.last_seq()
 
-    def read(self, *, ignore_torn_tail: bool = False) -> list[JournalLine]:
-        """Every line, validated, in sequence order.
+    def _scan(
+        self, *, ignore_torn_tail: bool = False
+    ) -> list[tuple[int, JournalLine | None]]:
+        """Every non-blank line's `seq`, in file order, with its `JournalLine`.
+
+        The `JournalLine` is `None` for a line whose `event` is a string this
+        version's `EventKind` does not list: `read` skips it, but `last_seq`
+        still counts its `seq`. Such a line must still carry a positive `seq`;
+        everything else on it is ignored. Any other line is validated strictly
+        as a `JournalLine`, so a missing or non-string `event`, a non-object
+        line, or an unknown envelope key on a known event still raises.
 
         Blank lines are skipped: a crash between the write and the flush can
         leave one. Anything else that is not JSON is an error naming the line.
@@ -336,7 +362,7 @@ class Journal:
             )
         with self.path.open(encoding="utf-8") as handle:
             texts = handle.readlines()
-        lines: list[JournalLine] = []
+        scanned: list[tuple[int, JournalLine | None]] = []
         for number, text in enumerate(texts, start=1):
             if not text.strip():
                 continue
@@ -349,7 +375,31 @@ class Journal:
                 raise CorruptJournalError(
                     f"{self.path}:{number}: line is not JSON: {error}"
                 ) from error
-            lines.append(JournalLine.model_validate(record))
+            if (
+                isinstance(record, dict)
+                and isinstance(record.get("event"), str)
+                and record["event"] not in _EVENT_KINDS
+            ):
+                skipped = _UnknownEventLine.model_validate(record)
+                scanned.append((skipped.seq, None))
+                continue
+            line = JournalLine.model_validate(record)
+            scanned.append((line.seq, line))
+        return scanned
+
+    def read(self, *, ignore_torn_tail: bool = False) -> list[JournalLine]:
+        """Every line whose event this version knows, validated, in `seq` order.
+
+        A line whose `event` is a string outside `EventKind` (written by a
+        newer `am`) is skipped rather than raising; see `_scan` for what is
+        still an error and for `ignore_torn_tail`. Unknown keys inside a known
+        line's `payload` pass through untouched: `replay` judges payloads.
+        """
+        lines = [
+            line
+            for _, line in self._scan(ignore_torn_tail=ignore_torn_tail)
+            if line is not None
+        ]
         lines.sort(key=lambda line: line.seq)
         return lines
 
