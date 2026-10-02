@@ -16,6 +16,10 @@ tier` to stderr and exits 99, so an accidental real spawn fails loudly.
 
 A passing call phase over its tier's budget (unit 0.5s, `git` 2s; the opt-in tiers
 have none) is turned into a failure naming the tier, budget and measured time.
+
+At collection, before `-m` deselection, the run fails with a usage error when more
+than 5 items carry `e2e` or any `e2e` item's docstring has no line starting
+`justification:`, so the check also fires in the default run.
 """
 
 from __future__ import annotations
@@ -172,6 +176,45 @@ def e2e_tier_violations(items: Iterable[tuple[str, Iterable[str], str | None]]) 
                 f"{nodeid}: an e2e test's docstring needs a line starting `{JUSTIFICATION_PREFIX}`"
             )
     return violations
+
+
+def item_docstring(item: object) -> str | None:
+    """The docstring of the Python function behind `item`, or None.
+
+    Each parametrization of a function is its own item with that same function,
+    so all of them share its docstring. Non-function items have no docstring.
+    """
+    return getattr(getattr(item, "function", None), "__doc__", None)
+
+
+class E2ETierCap:
+    """The collection-time e2e cap and justification check, as its own plugin.
+
+    A plugin object because this module already defines
+    `pytest_collection_modifyitems` for the directory auto-mark. `tryfirst` puts
+    it ahead of pytest's own `-m` deselection, so the default run (which
+    deselects `e2e`) still sees every e2e item. It reads only the `e2e` marker,
+    which the auto-mark never adds, so its order against the auto-mark does not
+    matter.
+    """
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
+        violations = e2e_tier_violations(
+            (item.nodeid, [mark.name for mark in item.iter_markers()], item_docstring(item))
+            for item in items
+        )
+        if violations:
+            raise pytest.UsageError("e2e tier check failed:\n" + "\n".join(violations))
+
+
+E2E_CAP_PLUGIN_NAME = "agent-manager-e2e-tier-cap"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the e2e cap check once per session."""
+    if not config.pluginmanager.has_plugin(E2E_CAP_PLUGIN_NAME):
+        config.pluginmanager.register(E2ETierCap(), E2E_CAP_PLUGIN_NAME)
 
 
 UNIT_BUDGET_S = 0.5

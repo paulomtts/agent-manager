@@ -22,8 +22,10 @@ from conftest import (
     STUB_EXIT_CODE,
     STUB_NAMES,
     UNIT_BUDGET_S,
+    E2ETierCap,
     e2e_tier_violations,
     has_justification,
+    item_docstring,
     stub_script,
     tier_budget_violation,
 )
@@ -47,18 +49,18 @@ markers =
 """
 
 
-def run_nested(pytester: pytest.Pytester, source: str) -> pytest.RunResult:
+def run_nested(pytester: pytest.Pytester, source: str, *args: str) -> pytest.RunResult:
     """Run `source` as `test_nested.py` under a copy of the real tests/conftest.py.
 
     A subprocess, not in-process: tests/test_conftest_tiers.py has already put
     tests/conftest.py into `sys.modules["conftest"]`, so an in-process nested
     conftest import would hit ImportPathMismatchError. The child inherits this
-    process's environment, including `PATH`.
+    process's environment, including `PATH`. `args` go to the nested pytest.
     """
     pytester.makeconftest(REAL_CONFTEST.read_text())
     pytester.makeini(NESTED_INI)
     pytester.makepyfile(test_nested=source)
-    return pytester.runpytest_subprocess()
+    return pytester.runpytest_subprocess(*args)
 
 
 def test_budget_constants_match_the_v1_table():
@@ -343,3 +345,129 @@ def test_cap_and_justification_violations_are_reported_together():
 def test_marker_names_may_be_any_iterable():
     assert e2e_tier_violations([("t.py::test_paid", iter(["e2e"]), JUSTIFIED)]) == []
     assert e2e_tier_violations([("t.py::test_plain", iter(["skipif"]), None)]) == []
+
+
+# The nested session reads NESTED_INI, not pyproject.toml, so it has no addopts;
+# the cap tests pass the default selection explicitly to prove the check runs
+# before deselection.
+DEFAULT_SELECTION = "not brd and not e2e_fake and not soak and not e2e"
+
+
+def test_default_selection_matches_pyproject_addopts(pytestconfig):
+    assert DEFAULT_SELECTION in pytestconfig.getini("addopts")
+
+
+class _Mark:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeItem:
+    """The surface the new hooks read: `nodeid`, the marker chain, the test function."""
+
+    def __init__(self, nodeid: str, chain: tuple[str, ...] | list[str] = (), doc: str | None = None) -> None:
+        self.nodeid = nodeid
+        self._chain = [_Mark(name) for name in chain]
+
+        def function() -> None:
+            pass
+
+        function.__doc__ = doc
+        self.function = function
+
+    def iter_markers(self, name: str | None = None):
+        return iter(m for m in self._chain if name is None or m.name == name)
+
+
+def test_item_docstring_reads_the_underlying_function():
+    assert item_docstring(_FakeItem("t.py::test_paid", doc=JUSTIFIED)) == JUSTIFIED
+    assert item_docstring(_FakeItem("t.py::test_bare")) is None
+    assert item_docstring(object()) is None
+
+
+def test_cap_plugin_passes_five_justified_e2e_items():
+    items = [_FakeItem(f"t.py::test_{i}", chain=["skipif", "e2e"], doc=JUSTIFIED) for i in range(5)]
+    E2ETierCap().pytest_collection_modifyitems(items)
+
+
+def test_cap_plugin_raises_one_usage_error_listing_every_violation():
+    items = [_FakeItem(f"t.py::test_{i}", chain=["e2e"], doc=JUSTIFIED) for i in range(6)]
+    items.append(_FakeItem("t.py::test_bare", chain=["e2e"]))
+    with pytest.raises(pytest.UsageError) as excinfo:
+        E2ETierCap().pytest_collection_modifyitems(items)
+    lines = str(excinfo.value).splitlines()
+    assert lines[0] == "e2e tier check failed:"
+    assert lines[1].startswith(f"the e2e tier is capped at {E2E_CAP} tests, but 7 carry the e2e marker: ")
+    assert lines[2] == f"t.py::test_bare: {UNJUSTIFIED_MESSAGE}"
+    assert len(lines) == 3
+
+
+@pytest.mark.git
+def test_six_e2e_tests_fail_collection_under_the_default_selection(pytester):
+    source = "import pytest\n" + "".join(
+        f"\n@pytest.mark.e2e\ndef test_paid_{i}():\n    '''justification: only real claude shows this.'''\n"
+        for i in range(6)
+    )
+    result = run_nested(pytester, source, "-m", DEFAULT_SELECTION)
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*the e2e tier is capped at 5 tests, but 6 carry the e2e marker*"])
+
+
+@pytest.mark.git
+def test_parametrized_module_marked_e2e_counts_each_parametrization(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import pytest
+
+        pytestmark = pytest.mark.e2e
+
+        @pytest.mark.parametrize("n", range(6))
+        def test_paid(n):
+            '''justification: only real claude shows this.'''
+        """,
+        "-m",
+        DEFAULT_SELECTION,
+    )
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*the e2e tier is capped at 5 tests, but 6 carry the e2e marker*"])
+
+
+@pytest.mark.git
+def test_an_unjustified_e2e_test_fails_collection_under_the_default_selection(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import pytest
+
+        @pytest.mark.e2e
+        def test_unjustified():
+            '''Drives the real claude, with no reason given.'''
+
+        @pytest.mark.e2e
+        def test_justified():
+            '''Drives the real claude.
+
+            justification: only real claude shows this.
+            '''
+
+        def test_unmarked():
+            pass
+        """,
+        "-m",
+        DEFAULT_SELECTION,
+    )
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([f"*test_nested.py::test_unjustified: {UNJUSTIFIED_MESSAGE}*"])
+    result.stderr.no_fnmatch_line("*test_nested.py::test_justified:*")
+
+
+@pytest.mark.git
+def test_five_justified_e2e_tests_collect_and_are_deselected_by_default(pytester):
+    source = "import pytest\n\ndef test_unmarked():\n    pass\n" + "".join(
+        f"\n@pytest.mark.e2e\ndef test_paid_{i}():\n    '''justification: only real claude shows this.'''\n"
+        for i in range(5)
+    )
+    result = run_nested(pytester, source, "-m", DEFAULT_SELECTION)
+    assert result.ret == pytest.ExitCode.OK
+    result.assert_outcomes(passed=1, deselected=5)
