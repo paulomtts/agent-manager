@@ -3,6 +3,20 @@
 
 Card: b9c19b33-e2f0-4174-8be6-c32ca53e10cc. Parent story: 8460355c ("Move test_orchestrate.py off the real board"). Milestone: 66ed75cd. Governing spec: `docs/superpowers/specs/2026-10-02-test-tier-design.md` §3 decision V4, §4 file-map row for `tests/test_orchestrate.py`, §6 Testing. This narrows V4 to its fixture half. The comment-assertion half belongs to sibling a4e7c1a3.
 
+**CORRECTED — READ BEFORE ANYTHING ELSE BELOW.** This plan's "Known open blocker" (below, and repeated at
+several points) was confirmed on an earlier attempt, exactly as predicted: `FakeBoard._comment_add`
+refused `[[link]]` bodies that `comments._ref` legitimately writes into real run-end comments. **This
+has already been fixed, directly on this branch**, by the human/spec-owner — `19b53ab3` is a shipped
+card and cannot be reopened, so the fix landed here instead, which is the correct and authorized home
+for it: `tests/conftest.py`'s `_comment_add` no longer calls `_refuse_links` (the seeding helpers
+`add_card`/`add_comment` still do — only the production `run_brd` write path was wrong), and
+`tests/test_fake_board.py::test_a_comment_body_with_a_link_fails_loudly` was rewritten to
+`test_a_comment_body_with_a_link_is_recorded_without_indexing` to match. **Before doing anything else:
+run `git log --oneline -5` and `grep -n "_refuse_links" tests/conftest.py` in this worktree. If
+`_comment_add` already has no `_refuse_links` call, the blocker is resolved — skip every "Known open
+blocker" / "STOP rule" step below entirely and proceed with the rest of this plan normally. Do not
+revert the fix, do not re-escalate, do not treat the sections below as still applicable.**
+
 Note: the exploration summary that fed this spec was cut off at 8000 characters, partway through the test-placement paragraph (V6 discussion). It over-ran its brief. Nothing below depends on the missing text. The tier rule used here is taken from §3 V1 of the governing spec as quoted before the cut.
 
 ## Precondition
@@ -40,15 +54,16 @@ The only file that changes is `tests/test_orchestrate.py`. Line numbers below re
 ## Error paths
 
 - `FakeBoard` raises `AssertionError` for any argv outside its six shapes. If any test path still reaches `brd init/add/block`, or anything else unmodeled, the failure names the argv. That is a conversion bug in this subtask, so fix the seeding. Do not widen the fake.
-- `_refuse_links` raises `AssertionError` on `[[` in seeded descriptions and in `comment add` bodies. The fixture titles contain no `[[`.
-- **Known open blocker.** This must be checked first and escalated if it is confirmed.
+- `_refuse_links` raises `AssertionError` on `[[` in seeded descriptions. **It no longer applies to
+  `comment add` bodies on the production `run_brd` path** (see the correction at the top of this
+  document) — only `add_card`/`add_comment` (the seeding helpers) still refuse links.
+- ~~**Known open blocker.**~~ **RESOLVED, see the correction at the top of this document.** (Original
+  text kept for context only — do not act on the instructions in this sub-list; they predate the fix.)
   - `comments._ref` (`src/agent_manager/comments.py:264-266`) writes `[[card_id]]` backlinks into run-end comment bodies (escalated/parked lists, integrate-failure lines).
-  - `FakeBoard._comment_add` refuses those bodies with `AssertionError`.
-  - `comments.flush` only catches `BoardError`/`LockTimeoutError` (`comments.py:431`), so the error propagates.
-  - Any converted test whose run posts such a body would therefore change outcome. Examples are the tests asserting `escalated: [[...]]` / `parked: [[...]]`, plus any escalated or paused run with parked cards even where the body is not asserted.
-  - That breaks the "identical pass/fail" requirement.
-  - The fix lives in `FakeBoard` (V3's card 19b53ab3), which is out of this subtask's scope. Assertions belong to a4e7c1a3.
-  - If the before/after diff shows it, stop and escalate with the list of affected test names. Do not edit assertions, do not relax `_refuse_links` unilaterally, and do not exclude tests.
+  - `FakeBoard._comment_add` used to refuse those bodies with `AssertionError`; it no longer does.
+  - `comments.flush` only catches `BoardError`/`LockTimeoutError` (`comments.py:431`); this no longer matters since nothing raises here now.
+  - Converted tests posting such a body now behave identically to before the conversion.
+  - ~~The fix lives in `FakeBoard`...~~ Already fixed directly on this branch; proceed normally.
 
 ## Tests and verification
 
@@ -87,7 +102,7 @@ Verification, as prescribed by §6 V4/V5 and the card:
 - Add no tests and remove none. The set of test names in `tests/test_orchestrate.py` stays identical.
 - `_add_card(root: Path, title: str, parent: str | None = None) -> str` and `_block(root: Path, card_id: str, blocker: str) -> None` keep their exact signatures. `_milestone` and all call sites stay untouched.
 - `_block` must never write `status="blocked"`, because `blocked` is derived.
-- Do not widen `FakeBoard` and do not relax `_refuse_links`.
+- `_refuse_links` has already been narrowed to the seeding helpers only (see the top-of-document correction) — this is the authorized, shipped shape of `FakeBoard`, not something still to avoid.
 - `brd` must be on PATH for the baseline run. Otherwise every `requires_brd` test is SKIPPED in both runs and the diff proves nothing.
 - Verification: `uv run pytest tests/test_orchestrate.py -v` per-name outcomes identical before and after, wall time recorded and well under 445s, and full `uv run pytest` green.
 
@@ -95,7 +110,7 @@ Verification, as prescribed by §6 V4/V5 and the card:
 
 The spec forbids adding tests ("adds no tests and removes none"). So each line below is pinned by an existing test or by a verification step in Task 2, not by a new test function.
 
-1. **Run-end comments carrying `[[card_id]]` backlinks.** This is the known blocker. Reading the code confirms it: `comments._ref` feeds the `escalated:`/`parked:`/integrate-failed lines (`comments.py:324,330,336`), `FakeBoard._comment_add` raises `AssertionError` on `[[`, and `flush` lets it propagate. A person would expect an escalated run to still end escalated. Pinned by Task 2 Step 8 (the before/after diff gate) and its STOP rule.
+1. **Run-end comments carrying `[[card_id]]` backlinks.** This was the known blocker and is now fixed (see the top-of-document correction): `comments._ref` feeds the `escalated:`/`parked:`/integrate-failed lines (`comments.py:324,330,336`); `FakeBoard._comment_add` no longer raises on `[[`, so `flush` has nothing to propagate. An escalated run still ends escalated. Task 2 Step 8's before/after diff gate should now show identical outcomes, not a STOP.
 2. **A test path that still reaches the real `brd` binary.** A missed `brd` subprocess, or `board._run` used despite the patch, would pass on a dev box and break in a brd-less tier. Pinned by Task 2 Step 7 (PATH shim that logs any `brd` exec; the log must stay empty).
 3. **A story blocked after both stories exist** (`_milestone`'s `blocked_by` loop, `:3430-3431`). The dependent must read as `blocked` and be scheduled after its blocker, through the derived status alone. Pinned by `test_a_story_starts_when_its_blocker_finishes_not_its_level` in Task 2 Step 5.
 4. **Census order with chained subtasks.** Subtasks must run in creation/chain order. Pinned by `test_subtasks_run_in_order_each_stacked_on_the_one_before` in Task 2 Step 5.
@@ -406,7 +421,16 @@ tail -n 1 "${TMPDIR:-/tmp}/b9c19b33-after.log"
 ```
 Expected: `IDENTICAL`, and a summary line whose `in …s` figure (the AFTER wall time) is well under 445s.
 
-STOP rule, from the spec's "Known open blocker". If `diff` reports tests that went PASSED to FAILED, list why they failed:
+**The STOP rule below is OBSOLETE — the blocker it describes is already fixed on this branch (see the
+top-of-document correction).** `IDENTICAL` is the expected result of Step 8 now; the `[[link]]`
+failures this section describes should not appear. If `diff` is `IDENTICAL`, skip straight to Step 9.
+Only if `diff` reports PASSED→FAILED tests should you check whether they're the `[[link]]` failures
+(meaning the fix was somehow lost again — restore it from commit `ed2d7bb`/`bd20e57` rather than
+re-deriving the analysis below) or a genuinely new, different conversion bug (fix it as Step 8's own
+last paragraph already says: "it is a conversion bug in this task. Fix the helpers or the fixture.").
+
+<details><summary>Original STOP rule text, kept for historical context only — do not act on it</summary>
+
 ```bash
 grep -nE 'contains a \[\[link\]\]|^FAILED ' "${TMPDIR:-/tmp}/b9c19b33-after.log"
 ```
@@ -416,6 +440,8 @@ If the failures are `AssertionError: FakeBoard comment add body: ... contains a 
 - the root cause: `comments._ref` (`src/agent_manager/comments.py:264-266`) writes `[[id]]` into escalated/parked/integrate-failed run-end bodies, `FakeBoard._comment_add` refuses them, and `comments.flush` catches only `BoardError`/`LockTimeoutError` (`comments.py:431`). The fix belongs to FakeBoard (card 19b53ab3) or the assertions (card a4e7c1a3).
 
 Code reading predicts these will appear: at least `test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment`, `test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked`, `test_a_cancel_comments_each_parked_subtask_and_the_milestone`, `test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_cancelled`, `test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone`, plus any escalated run whose run-end comment is flushed. Report what the diff actually shows, not this prediction.
+
+</details>
 
 If the diff shows any other kind of change, it is a conversion bug in this task. Fix the helpers or the fixture and rerun this step.
 
