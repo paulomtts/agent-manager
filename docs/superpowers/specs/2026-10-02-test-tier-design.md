@@ -115,6 +115,15 @@ for items carrying no tier marker, shadows `PATH` with stub `brd`/`git`/`claude`
 instead of silently costing 150ms; a `pytest_runtest_makereport` check failing any unmarked test
 over 0.5s or `git`-marked test over 2s.
 
+**Whichever story lands the `justification:` collection check must also add the lines to the 5
+existing `e2e` tests in the same subtask, not defer it to V9.** Any enforcement rule and the tests
+it applies to must land together — the same lesson applies to V1's directory auto-mark versus the
+existing suite (see the note on bulk-marking below): a check that fails the moment it exists, against
+tests nobody has touched yet, is not a valid intermediate state, "a later story will fix it" is not
+an acceptable plan for getting from red to green. V9 then only verifies those justifications are
+accurate (not invented placeholders) rather than writing them; if V9 finds one wrong, it corrects it
+there, it does not add them from scratch.
+
 **V3 — `board.py` gets the injection seam every other side-effecting module already has.** A
 module-level `run_brd: Callable[[Sequence[str], Path, str | None], subprocess.CompletedProcess] =
 _run` (mirroring `steps/worktree.py:56`'s `GitRunner` and `steps/verify.py:95`'s `CommandRunner`);
@@ -161,7 +170,9 @@ files' non-concurrency tests move to `brd`. The three explicit concurrency/stres
 tests per spec §17, not regression tests that need to run on every subtask.
 
 **V9 — The `e2e` tier gets its cap and its accounting fixed.** The existing 5 `e2e` tests each gain
-a `justification:` docstring line (satisfying V2's collection check). `tests/harness/
+a `justification:` docstring line (satisfying V2's collection check) — in practice this already
+happened as part of landing V2's check itself (V2's own rule above), so V9's job here is to verify
+those lines are accurate, not write them from scratch. `tests/harness/
 test_launcher.py`'s grandchild-kill test (`:96-126`, a 2.0s sleep) moves to `soak`; its two
 remaining timeouts (`:76-93` 0.5s, `:337-346` 0.3s) shrink to 0.2s/0.1s without weakening what they
 assert. `tests/test_store.py:2800`'s `range(20)` lease-race parametrization (40 process spawns for
