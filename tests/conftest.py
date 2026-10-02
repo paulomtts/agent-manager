@@ -110,3 +110,24 @@ def default_tier_marker(rel_path: PurePath, existing: Iterable[str]) -> str | No
     if TIER_MARKERS.intersection(existing):
         return None
     return tier
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Add the directory default tier marker to each item that has no tier yet.
+
+    `tryfirst` so the markers exist before pytest's own `-m` deselection runs.
+    `iter_markers` walks function, class and module `pytestmark`, so a module
+    marked `e2e` (tests/e2e/test_real_harness*.py) keeps `e2e` alone.
+    """
+    rel_paths: dict[Path, PurePath | None] = {}
+    for item in items:
+        path = Path(item.path)
+        if path not in rel_paths:
+            rel_paths[path] = relative_to_tests(path)
+        rel_path = rel_paths[path]
+        if rel_path is None:
+            continue
+        marker = default_tier_marker(rel_path, {mark.name for mark in item.iter_markers()})
+        if marker is not None:
+            item.add_marker(marker)
