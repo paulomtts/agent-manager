@@ -2015,3 +2015,274 @@ async def _run_milestone_async(
             )
     finally:
         store.close()
+
+
+# ── the board run (card baef4f94) ───────────────────────────────────────────
+
+
+BoardStatus = Literal["done", "escalated", "stopped", "cancelled", "blocked"]
+"""How one milestone of a board run ended: its own run's outcome, or `blocked`
+when a blocker did not finish `done` and it was never dispatched."""
+
+
+def board_prefixes(
+    milestones: Sequence[models.CardNode],
+    branch_prefix_of: Callable[[models.CardNode], str],
+) -> dict[str, str]:
+    """Each open milestone's branch prefix, keyed by milestone id, in input order.
+
+    `branch_prefix_of` is the caller's: deriving a prefix is not this module's
+    job. This only checks it. A prefix that is not a non-blank string is
+    `ValueError`, as `run_milestone` refuses a missing one. So is a prefix two
+    milestones share: both would claim `branch:<prefix>-integrate`, and the
+    deduplicated board claim set would hide that until the second milestone's
+    own pre-flight refused it mid-run.
+    """
+    prefixes: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for card in milestones:
+        prefix = branch_prefix_of(card)
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(f"milestone {card.id} has no branch prefix (got {prefix!r})")
+        if prefix in owners:
+            raise ValueError(
+                f"milestones {owners[prefix]} and {card.id} share the branch prefix {prefix!r}"
+            )
+        owners[prefix] = card.id
+        prefixes[card.id] = prefix
+    return prefixes
+
+
+def board_claims(
+    milestones: Sequence[models.CardNode], prefixes: Mapping[str, str]
+) -> list[str]:
+    """Every open milestone's `milestone_claims`, in the order given, deduplicated.
+
+    The stories come from `census.flatten_milestone`, the census
+    `run_milestone` reads. The union keeps a key's first occurrence in its
+    place (`list(dict.fromkeys(...))`), the discipline `milestone_claims`
+    itself follows. Pure.
+    """
+    keys: list[str] = []
+    for card in milestones:
+        stories = census.flatten_milestone(card).stories
+        keys.extend(milestone_claims(card.id, stories, prefixes[card.id]))
+    return list(dict.fromkeys(keys))
+
+
+def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
+    """One `_run_milestone_async` payload read as a board status.
+
+    `done` is the only clean outcome. A cancel is `cancelled`, an escalation
+    (a paused one included) is `escalated`, a pause is `stopped`. Any other
+    shape is not clean, so it counts as `escalated`.
+    """
+    if payload.get("done") is True:
+        return "done"
+    if payload.get("cancelled") is True:
+        return "cancelled"
+    if payload.get("escalated") is True:
+        return "escalated"
+    if payload.get("paused") is True:
+        return "stopped"
+    return "escalated"
+
+
+def run_board(
+    *,
+    repo_dir: Path,
+    base_branch: str | None,
+    branch_prefix_of: Callable[[models.CardNode], str],
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    max_concurrent: int = 1,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Drive every open milestone on the board as one grafo tree, and report.
+
+    Refusals come first, in this order, and each leaves nothing behind. Bad
+    arguments are `ValueError` before the board is read: `max_concurrent < 1`
+    and a missing `base_branch`, as `run_milestone` refuses them. Then come the
+    open milestones: `board.roots()` leveled by `dag.board_levels`, so a done
+    milestone with nothing open under it drops out and a blocker cycle is
+    `DependencyCycleError`. Next, each milestone's prefix from
+    `branch_prefix_of` (`board_prefixes`: blank or shared is `ValueError`).
+    Last, one `cli.refuse_claimed` over every open milestone's
+    `milestone_claims`, unioned in level order (`board_claims`): a key another
+    live run holds is `ClaimedError` before any milestone starts, so there is
+    no run row, run directory or lease for any of them. Each milestone's own
+    pre-flight inside `_run_milestone_async` still runs and catches a claim
+    taken after this one.
+
+    Then one `asyncio.run` covers the whole board with one
+    `asyncio.Semaphore(max_concurrent)` that every milestone's lanes share
+    (`_run_board_async`). A milestone runs once every open blocker finished
+    `done`. A milestone whose blocker did not finish `done` is never
+    dispatched and is reported `blocked`. A milestone that raises is reported
+    `escalated` with `"<Type>: <msg>"` and never disturbs its siblings.
+
+    Returns the plain payload, not the CLI envelope:
+    `{"ok", "board": True, "levels": [{"level", "milestones": [ids]}],
+    "milestones": [entry, ...]}`. Entries are in level order. A dispatched
+    entry is `{"milestone_id", "status", **its run payload}`. `ok` is true
+    only when every entry is `done`. An empty board is `ok` with nothing run.
+
+    Known limitation, kept on purpose: there is no board-level Run record.
+    Each milestone keeps its own Run row and nothing else records what the
+    board run had dispatched, so a crash mid-board loses only that
+    bookkeeping. To recover, re-run `am run --board`: done milestones drop out
+    through `board_levels` and the claims. Or resume a stopped or escalated
+    milestone on its own with `am resume <run-id>`.
+    """
+    if max_concurrent < 1:
+        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+    if not base_branch:
+        raise ValueError("a board run needs a base branch")
+    root = runs.resolve_repo_dir(repo_dir)
+    levels = dag.board_levels(board.roots(repo_dir=root))
+    milestones = [card for level in levels for card in level]
+    prefixes = board_prefixes(milestones, branch_prefix_of)
+    levels_payload = [
+        {"level": index, "milestones": [card.id for card in level]}
+        for index, level in enumerate(levels)
+    ]
+    if not milestones:
+        return {"ok": True, "board": True, "levels": levels_payload, "milestones": []}
+    cli.refuse_claimed(root, board_claims(milestones, prefixes))
+    entries = asyncio.run(
+        _run_board_async(
+            milestones,
+            prefixes=prefixes,
+            root=root,
+            base_branch=base_branch,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            max_concurrent=max_concurrent,
+            control_interval=control_interval,
+        )
+    )
+    return {
+        "ok": all(entry["status"] == "done" for entry in entries),
+        "board": True,
+        "levels": levels_payload,
+        "milestones": entries,
+    }
+
+
+async def _run_board_async(
+    milestones: Sequence[models.CardNode],
+    *,
+    prefixes: Mapping[str, str],
+    root: Path,
+    base_branch: str,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: runs.RunnerFactory | None,
+    driver: Driver | None,
+    clock: Callable[[], datetime],
+    max_concurrent: int,
+    control_interval: float,
+) -> list[dict[str, Any]]:
+    """`run_board`'s one event loop: one entry per milestone, in `milestones` order.
+
+    The tree comes from `build_dag_tree`, with each milestone's blockers being
+    its `blocked_by` restricted to `milestones` (a done blocker is not here,
+    so it is satisfied). Every node waits on each of its own blockers'
+    `milestone_done` and reads `milestone_ok`, whatever the blocker count.
+    An edge only schedules, and a node never raises an `Exception`, so the
+    edge fires whether or not the blocker finished `done`. A node dispatches
+    only when every blocker is clean. Otherwise it records `blocked` with the
+    unclean blockers. A non-`Exception` `BaseException` (not a cancel) ends the
+    whole run through `run_until_killed`, as in `supervise`, because grafo
+    would drop it and hang. The `grafo` logger is at CRITICAL for exactly this
+    call.
+    """
+    grafo_logger = logging.getLogger(GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    grafo_logger.setLevel(logging.CRITICAL)
+    try:
+        slots = asyncio.Semaphore(max_concurrent)
+        open_ids = {card.id for card in milestones}
+        blockers = {
+            card.id: [
+                blocker for blocker in dict.fromkeys(card.blocked_by) if blocker in open_ids
+            ]
+            for card in milestones
+        }
+        milestone_done = {card.id: asyncio.Event() for card in milestones}
+        milestone_ok: dict[str, bool] = {}
+        entries: dict[str, dict[str, Any]] = {}
+        fatal: list[BaseException] = []
+        killed = asyncio.Event()
+
+        async def dispatch(card: models.CardNode) -> dict[str, Any]:
+            try:
+                payload = await _run_milestone_async(
+                    card.id,
+                    repo_dir=root,
+                    base_branch=base_branch,
+                    branch_prefix=prefixes[card.id],
+                    commands=commands,
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    driver=driver,
+                    clock=clock,
+                    max_concurrent=max_concurrent,
+                    control_interval=control_interval,
+                    slots=slots,
+                )
+            except Exception as error:
+                return {
+                    "milestone_id": card.id,
+                    "status": "escalated",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            return {"milestone_id": card.id, "status": milestone_status(payload), **payload}
+
+        def node_coroutine(card: models.CardNode) -> Callable[..., Awaitable[str]]:
+            async def run(**_forwarded: Any) -> str:
+                try:
+                    for blocker in blockers[card.id]:
+                        await milestone_done[blocker].wait()
+                    unclean = [
+                        blocker
+                        for blocker in blockers[card.id]
+                        if not milestone_ok.get(blocker, False)
+                    ]
+                    if unclean:
+                        entries[card.id] = {
+                            "milestone_id": card.id,
+                            "status": "blocked",
+                            "blocked_by": unclean,
+                        }
+                    else:
+                        entries[card.id] = await dispatch(card)
+                except BaseException as error:
+                    if not isinstance(error, (Exception, asyncio.CancelledError)):
+                        fatal.append(error)
+                        killed.set()
+                    raise
+                finally:
+                    milestone_ok[card.id] = entries.get(card.id, {}).get("status") == "done"
+                    milestone_done[card.id].set()
+                return card.id
+
+            return run
+
+        _nodes, roots = await build_dag_tree(
+            milestones,
+            id_of=lambda card: card.id,
+            blockers_of=lambda card: blockers[card.id],
+            node_factory=node_coroutine,
+        )
+        executor = grafo.TreeExecutor(uuid="board", roots=roots)
+        await run_until_killed(executor.run(), killed, fatal)
+        return [entries[card.id] for card in milestones]
+    finally:
+        grafo_logger.setLevel(level_before)

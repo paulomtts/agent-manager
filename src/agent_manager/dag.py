@@ -23,7 +23,9 @@ story's stack roots and ends and what each subtask's branch stacks on
 its ``RootPlan``, ``stack_bases``), all
 derived from the census and never discovered. All of them read
 ``census.StoryPlan`` and ``census.SubtaskPlan`` by attribute, keep census
-order, and ignore blockers outside the milestone.
+order, and ignore blockers outside the milestone. ``board_levels`` is the
+same leveling one level up: open milestone roots (``models.CardNode``)
+grouped by their own ``blocked_by`` edges, for display and claims only.
 
 This module is pure: no I/O, no subprocesses, no ``brd``.
 """
@@ -34,6 +36,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from agent_manager.census import StoryPlan, SubtaskPlan
+from agent_manager.models import CardNode
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -191,6 +194,50 @@ def compute_integrate_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
     whole milestone.
     """
     return topological_levels(stories)
+
+
+def _has_open_descendant(node: CardNode) -> bool:
+    """True when any card nested under ``node``, at any depth, is not ``done``."""
+    return any(
+        (child.status or "").lower() != "done" or _has_open_descendant(child)
+        for child in node.children
+    )
+
+
+def board_levels(roots: list[CardNode]) -> list[list[CardNode]]:
+    """Open milestone roots grouped into dependency levels, each in input order.
+
+    The board-wide twin of ``compute_levels``: a root still has work only if
+    it is not ``done`` and some card under it, at any depth, is not ``done``.
+    Any other root is dropped first, so its id sits outside the set and a
+    root it blocked lands in level 0. A kept root is ready once every blocker
+    is either outside the kept set (ignored: it is not this board's to order)
+    or already placed. The same ``CardNode`` objects come back; the input list
+    is not touched. Used only for display and for computing the claim set up
+    front; it never drives execution order.
+    """
+    pending = [
+        root
+        for root in roots
+        if (root.status or "").lower() != "done" and _has_open_descendant(root)
+    ]
+    ids = {root.id for root in pending}
+    placed: set[str] = set()
+    levels: list[list[CardNode]] = []
+    rest = list(pending)
+    while rest:
+        ready = [
+            root
+            for root in rest
+            if all(dep not in ids or dep in placed for dep in root.blocked_by or [])
+        ]
+        if not ready:
+            listed = ", ".join(f"#{root.id}" for root in rest)
+            raise DependencyCycleError(f"dag: dependency cycle among milestones {listed}")
+        levels.append(ready)
+        placed.update(root.id for root in ready)
+        rest = [root for root in rest if root.id not in placed]
+    return levels
 
 
 # ── cycle detection ─────────────────────────────────────────────────────────
