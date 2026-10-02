@@ -1650,11 +1650,39 @@ def _poll_watch(
             yield event
 
 
-def _stream_watch(run_id: str | None, *, since: int) -> None:
-    """The body of `am watch --follow`, once `watch_for` has accepted the call."""
-    _emit_stream_line(_watch_hello())
+def _follow_watch(
+    run_id: str | None,
+    *,
+    since: int,
+    sleep: Callable[[float], None],
+    max_polls: int | None,
+) -> Iterator[dict[str, Any]]:
+    """The backlog above `since`, then every line appended after it.
+
+    One pass at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
+    another pass, `max_polls` times or forever when it is `None`. One cursor
+    dict spans every pass, so no `seq` of a run is emitted twice and none is
+    skipped, however its lines are spread across polls.
+    """
     cursors: dict[str, int] = {}
-    for event in _poll_watch(run_id, since=since, cursors=cursors):
+    yield from _poll_watch(run_id, since=since, cursors=cursors)
+    polls = 0
+    while max_polls is None or polls < max_polls:
+        sleep(WATCH_POLL_SECONDS)
+        polls += 1
+        yield from _poll_watch(run_id, since=since, cursors=cursors)
+
+
+def _stream_watch(run_id: str | None, *, since: int) -> None:
+    """The body of `am watch --follow`, once `watch_for` has accepted the call.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll.
+    """
+    _emit_stream_line(_watch_hello())
+    for event in _follow_watch(
+        run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+    ):
         _emit_stream_line(event)
 
 

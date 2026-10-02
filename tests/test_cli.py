@@ -8029,3 +8029,118 @@ def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatc
         refusal = json.loads(refusal_lines[0])
         assert refusal["ok"] is False, argv
         assert refusal["error"]["type"] == kind, argv
+
+
+def test_watch_follow_observes_a_line_appended_after_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    backlog = _write_watch_journal(tmp_path, "run-a", [1, 2])
+    appended: list[dict[str, Any]] = []
+
+    def append_third() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [3]))
+
+    # Poll 1 sees seq 3; poll 2 sees nothing new, so seq 3 must not repeat.
+    result, sleeps = _watch_follow(
+        monkeypatch, "run-a", actions=[append_third, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert cli.WATCH_POLL_SECONDS == 0.25
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    assert lines[1:] == backlog + appended
+    assert [line["seq"] for line in lines[1:]] == [1, 2, 3]
+
+
+def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    old_owner = store_module.Journal("run-t")
+    for _ in range(2):
+        old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
+    # The new owner opens the journal now and caches seq 2, while the stuck
+    # old owner is still appending: only `reseek` keeps it from reusing seq 3.
+    new_owner = store_module.Journal("run-t")
+
+    def old_owner_keeps_writing() -> None:
+        for _ in range(2):
+            old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
+
+    def new_owner_takes_over() -> None:
+        new_owner.reseek()
+        for _ in range(2):
+            new_owner.append("phase_upsert", {"by": "new"}, card="card-1", phase="implement", attempt=1)
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        "run-t",
+        actions=[old_owner_keeps_writing, new_owner_takes_over, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    events = lines[1:]
+    seqs = [event["seq"] for event in events]
+    assert seqs == [1, 2, 3, 4, 5, 6]  # strictly increasing, contiguous, no repeat
+    assert [event["payload"]["by"] for event in events] == ["old"] * 4 + ["new"] * 2
+    assert {event["run_id"] for event in events} == {"run-t"}
+
+
+def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    # Nothing to watch yet: the hello line alone, and nothing created under runs/.
+    idle, _ = _watch_follow(monkeypatch, "--all", actions=[lambda: None, lambda: None])
+    assert idle.exit_code == 0, idle.output
+    assert _stream(idle) == [_hello(tmp_path)]
+    assert not _watch_runs_dir(tmp_path).exists()
+
+    third = json.dumps(_watch_line("run-new", 3), sort_keys=True)
+    created: list[dict[str, Any]] = []
+
+    def create_run_with_a_torn_tail() -> None:
+        created.extend(
+            _write_watch_journal(tmp_path, "run-new", [1, 2], tail=third[:20])
+        )
+
+    def finish_the_torn_line() -> None:
+        journal = _watch_runs_dir(tmp_path) / "run-new" / store_module.JOURNAL_NAME
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write(third[20:] + "\n")
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--all",
+        actions=[lambda: None, create_run_with_a_torn_tail, finish_the_torn_line],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    # Seqs 1 and 2 on poll 2 with seq 3 held back as a write in flight, then seq 3 on poll 3.
+    assert lines[1:] == created + [_watch_line("run-new", 3)]
+
+
+def test_watch_follow_tolerates_a_journal_that_disappears(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    backlog = _write_watch_journal(tmp_path, "run-a", [1])
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    recreated: list[dict[str, Any]] = []
+
+    def delete_journal() -> None:
+        journal.unlink()
+
+    def recreate_journal() -> None:
+        recreated.extend(_write_watch_journal(tmp_path, "run-a", [1, 2]))
+
+    result, _ = _watch_follow(
+        monkeypatch, "run-a", actions=[delete_journal, recreate_journal]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    # Seq 1 is not repeated: the run's cursor outlived the missing file.
+    assert lines[1:] == backlog + recreated[1:]
