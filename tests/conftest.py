@@ -9,6 +9,10 @@ It also gives directory-conventional tests a default tier marker: items under
 `tests/e2e/` get `e2e_fake` and items under `tests/steps/` get `git`, unless the
 item already carries a tier marker anywhere on its marker chain. The hook only
 adds markers; the addopts `-m` expression in pyproject.toml does the deselecting.
+
+Unit-tier items (no tier marker after collection) run with stub `brd`, `git` and
+`claude` scripts first on `PATH`; each stub prints `<name>: forbidden in the unit
+tier` to stderr and exits 99, so an accidental real spawn fails loudly.
 """
 
 from __future__ import annotations
@@ -154,3 +158,41 @@ def tier_budget_violation(markers: Iterable[str], duration: float) -> str | None
     if duration <= budget:
         return None
     return f"{tier}-tier budget exceeded: {duration:.3f}s > {budget:g}s"
+
+
+STUB_NAMES = ("brd", "git", "claude")
+STUB_EXIT_CODE = 99
+STUB_DIR_PREFIX = "unit-tier-stubs"
+
+
+def stub_script(name: str) -> str:
+    """A shell script that refuses to be `name`: one stderr line, exit 99, no delegation."""
+    return f"#!/bin/sh\necho '{name}: forbidden in the unit tier' >&2\nexit {STUB_EXIT_CODE}\n"
+
+
+@pytest.fixture(scope="session")
+def unit_tier_stub_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One directory of `brd`/`git`/`claude` stubs, built once per session."""
+    bin_dir = tmp_path_factory.mktemp(STUB_DIR_PREFIX)
+    for name in STUB_NAMES:
+        script = bin_dir / name
+        script.write_text(stub_script(name))
+        script.chmod(0o755)
+    return bin_dir
+
+
+@pytest.fixture(autouse=True)
+def unit_tier_path_shim(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the stubs first on `PATH` for items with no tier marker.
+
+    The same prepend-a-bin-dir technique as `fake_brd` (tests/steps/test_rollup.py)
+    and `brd_shim` (tests/e2e/test_board_comments.py), except the stubs never
+    hand off to a real binary. Items with any tier marker keep `PATH` exactly as
+    inherited, and the stub directory is only built once a unit item needs it. A
+    test that sets `PATH` itself runs after this and wins, as monkeypatch calls
+    stack. A binary invoked by absolute path bypasses the shim.
+    """
+    if TIER_MARKERS.intersection(mark.name for mark in request.node.iter_markers()):
+        return
+    bin_dir = request.getfixturevalue("unit_tier_stub_dir")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}")
