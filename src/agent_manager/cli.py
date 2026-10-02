@@ -1108,6 +1108,7 @@ RUN_EXAMPLES = """\
 Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
+  am run --board --verify "uv run pytest"                             # run every open milestone
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
 """
@@ -1142,7 +1143,8 @@ def run(
         "--dry-run",
         help=(
             "With --milestone: show the plan (story order, each subtask's branch "
-            "and base, merged bases) and write nothing."
+            "and base, merged bases) and write nothing. With --board: show every "
+            "open milestone by level, each with its own plan, and write nothing."
         ),
     ),
     max_concurrent: int | None = typer.Option(
@@ -1151,7 +1153,8 @@ def run(
         help=(
             "With --milestone: how many stories run at once "
             f"(default {DEFAULT_MAX_CONCURRENT}). A story starts as soon as its "
-            "blockers finish."
+            "blockers finish. With --board: how many stories run at once across "
+            "the whole board."
         ),
     ),
     repo_dir: Path = typer.Option(
@@ -1189,7 +1192,7 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card or a whole milestone end to end, or preview a milestone with --dry-run."""
+    """Drive one subtask card, a whole milestone, or every open milestone (--board) end to end, or preview a milestone or the board with --dry-run."""
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1205,6 +1208,18 @@ def run(
                 repo_dir=repo_dir,
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
+                max_concurrent=lanes,
+            )
+        elif whole_board:
+            # Read as `orchestrate.run_board` so a test can patch it there.
+            # No runner_factory and no driver: production gets the defaults.
+            # `lanes` is the board-wide bound on stories running at once.
+            payload = orchestrate.run_board(
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix_of=board_prefix_of(branch_prefix),
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
         elif milestone is not None and dry_run:
