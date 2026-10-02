@@ -2418,13 +2418,34 @@ def test_two_supervise_calls_sharing_one_semaphore_never_exceed_it_combined(proj
 def test_an_escalation_in_one_sharing_call_leaves_the_other_its_slots(project):
     """Milestone X's only lane escalates; milestone Y's three lanes share the
     same two-slot semaphore. The escalation stops only X (each call has its own
-    StopSignal), every Y lane still runs to done, the combined peak never
-    exceeds two, and both slots are free once both calls return."""
+    StopSignal), every Y lane still runs to done, the combined peak is exactly
+    two, and both slots are free once both calls return. Every lane stays in
+    flight until a third lane enters the driver or the window expires, so a
+    call that ignored the shared semaphore would push the peak past two."""
     shape_x = _milestone(project, {"X": 1})
     shape_y = _milestone(project, {"P": 1, "Q": 1, "R": 1})
     (x1,) = shape_x["subtasks"]["X"]
     y_subtasks = _subtasks_by_story(shape_y)
-    driver = GatedDriver(outcomes={x1: ("review", "reviewer found a blocker")})
+    arrivals = 0
+    third_arrived = asyncio.Event()
+
+    async def hold_until_a_third_lane_arrives(stop: StopSignal | None) -> None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 3:
+            third_arrived.set()
+        try:
+            await asyncio.wait_for(third_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
+
+    driver = GatedDriver(
+        gates={
+            card: hold_until_a_third_lane_arrives
+            for card in [x1, *(cards[0] for cards in y_subtasks.values())]
+        },
+        outcomes={x1: ("review", "reviewer found a blocker")},
+    )
     store_x, run_x, plan_x = _supervised_run(project, shape_x["milestone"])
     store_y, run_y, plan_y = _supervised_run(project, shape_y["milestone"])
 
@@ -2446,7 +2467,7 @@ def test_an_escalation_in_one_sharing_call_leaves_the_other_its_slots(project):
         store_x.close()
         store_y.close()
 
-    assert driver.high_water <= 2
+    assert driver.high_water == 2
     assert [(outcome.kind, outcome.subtask) for outcome in outcomes_x] == [("escalated", x1)]
     assert [outcome.kind for outcome in outcomes_y] == ["done", "done", "done"]
     assert sorted(call["card"] for call in driver.calls) == sorted(
