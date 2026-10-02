@@ -2598,6 +2598,65 @@ def test_the_async_core_awaited_in_a_running_loop_is_bounded_by_the_callers_sema
 
 @requires_git
 @requires_brd
+def test_cancelling_the_async_core_mid_integrate_waits_for_integrate_before_closing_the_store(
+    project, integrate_recorder, monkeypatch
+):
+    """Integrate runs on a worker thread that a cancel cannot stop. A caller
+    cancelling the core while Integrate is in flight must not unwind it (closing
+    the store, releasing the lease) until Integrate returns: Integrate still
+    reads and writes the run's store, and must stay under the run's lease."""
+    shape = _milestone(project, {"A": 1})
+    entered = threading.Event()
+    release = threading.Event()
+    store_errors: list[BaseException] = []
+
+    def slow_integrate(**kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        try:
+            kwargs["store"].load_run(kwargs["run_id"])
+        except Exception as error:  # noqa: BLE001 - the assertion reports it
+            store_errors.append(error)
+        return integrate_recorder(**kwargs)
+
+    monkeypatch.setattr(integration, "integrate_milestone", slow_integrate)
+
+    async def scenario() -> bool:
+        task = asyncio.create_task(
+            orchestrate._run_milestone_async(
+                shape["milestone"],
+                repo_dir=project,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                driver=FakeDriver(),
+                clock=lambda: STARTED_AT,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.2)
+        unwound_early = task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return unwound_early
+
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        unwound_early = asyncio.run(scenario())
+    finally:
+        release.set()
+        grafo_logger.setLevel(level_before)
+
+    assert unwound_early is False
+    assert store_errors == []
+    assert len(integrate_recorder.calls) == 1
+
+
+@requires_git
+@requires_brd
 def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
     project, integrate_recorder
 ):

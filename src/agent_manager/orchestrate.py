@@ -1590,6 +1590,29 @@ def run_milestone(
     )
 
 
+async def _in_thread_to_completion(function: Callable[..., T], /, **kwargs: Any) -> T:
+    """Await `function(**kwargs)` on a worker thread, and never unwind before it returns.
+
+    A thread cannot be cancelled, so a cancel arriving while it runs is held
+    until the thread finishes and only then re-raised: the caller's `finally`
+    blocks (closing the store, releasing the lease) never run under a call
+    that is still using them. The thread's own result or exception is dropped
+    once the caller has been cancelled.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(function, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                continue
+        if not future.cancelled():
+            future.exception()  # retrieved, so it is not logged as never retrieved
+        raise
+
+
 async def _run_milestone_async(
     milestone: str | None,
     *,
@@ -1615,8 +1638,10 @@ async def _run_milestone_async(
     bounds this run's lanes instead of `max_concurrent`, so several runs can
     share one semaphore; `None` lets `supervise` make its own
     `asyncio.Semaphore(max_concurrent)`, as `run_milestone` does. The run is
-    still recorded with `max_concurrent`. Blocking calls (board reads,
-    `refresh_git`, Integrate) stay synchronous on the loop thread.
+    still recorded with `max_concurrent`. Board reads and `refresh_git` stay
+    synchronous on the loop thread; Integrate stays a synchronous call but runs
+    on a worker thread (see its call site), and a cancel arriving meanwhile
+    waits for it to return before this coroutine unwinds.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1773,7 +1798,9 @@ async def _run_milestone_async(
             # coroutine is already running on the loop thread. `Store`'s
             # connection is `check_same_thread=False` for exactly this kind of
             # cross-thread, strictly sequential use (store.py).
-            outcome = await asyncio.to_thread(
+            # A cancel waits for that thread, so the store and lease below
+            # outlive it (`_in_thread_to_completion`).
+            outcome = await _in_thread_to_completion(
                 integration.integrate_milestone,
                 stories=plan.stories,
                 repo_dir=root,
