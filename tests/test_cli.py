@@ -2574,31 +2574,35 @@ M2_SHAPE = (
 
 
 @pytest.fixture
-def milestone_board(project) -> dict[str, Any]:
-    """A real brd board shaped like milestone 2, next to a decoy milestone.
+def milestone_board(project, fake_board) -> dict[str, Any]:
+    """A board shaped like milestone 2, next to a decoy milestone, seeded into
+    the in-memory `fake_board` (test-tier V5).
 
-    B is blocked by A and C by B. Each story's subtasks are chained with
-    `brd block` so the census order does not depend on creation timestamps.
-    The decoy root shares the word "skeleton", so only a longer substring
-    names milestone 2.
+    B is blocked by A and C by B. Each story's subtasks are chained the same
+    way. FakeBoard answers no `brd block`, so every edge is seeded with
+    `blocked_by` when the card is created, and the census order does not
+    depend on creation timestamps. The decoy root shares the word "skeleton",
+    so only a longer substring names milestone 2.
     """
-    _add_card(project, "Milestone 1: walking skeleton")
-    milestone = _add_card(project, "Milestone 2: make the skeleton real")
+    fake_board.add_card("Milestone 1: walking skeleton")
+    milestone = fake_board.add_card("Milestone 2: make the skeleton real")
     stories: dict[str, str] = {}
     subtasks: dict[str, list[str]] = {}
     titles: dict[str, str] = {}
     previous_story: str | None = None
     for key, story_title, subtask_titles in M2_SHAPE:
-        story = _add_card(project, story_title, milestone)
+        story = fake_board.add_card(
+            story_title,
+            parent_id=milestone,
+            blocked_by=[previous_story] if previous_story is not None else [],
+        )
         titles[story] = story_title
-        if previous_story is not None:
-            _block(project, story, previous_story)
         chain: list[str] = []
         for subtask_title in subtask_titles:
-            subtask = _add_card(project, subtask_title, story)
+            subtask = fake_board.add_card(
+                subtask_title, parent_id=story, blocked_by=chain[-1:]
+            )
             titles[subtask] = subtask_title
-            if chain:
-                _block(project, subtask, chain[-1])
             chain.append(subtask)
         stories[key] = story
         subtasks[key] = chain
