@@ -4047,6 +4047,52 @@ def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
     assert [story.card_id for story in after.stories] == ["8831189b"]
 
 
+def test_a_skipped_line_still_counts_toward_last_seq(repo):
+    # `append` promises no seq is ever repeated on disk: an older `am` resuming
+    # a newer `am`'s run must number its next line above the skipped one.
+    first = store.Journal(RUN_ID)
+    first.append("run_upsert", {"i": 0})
+    _append_raw(first, _unrecognised_line(2))
+
+    reopened = store.Journal(RUN_ID)
+    assert reopened.last_seq() == 2
+    assert reopened.append("run_upsert", {"i": 1}).seq == 3
+
+    again = store.Journal(RUN_ID)
+    assert again.last_seq() == 3
+    assert [line.seq for line in again.read()] == [1, 3]
+
+
+def test_reseek_counts_a_skipped_line(repo):
+    # Review Focus 5: a lease take-over re-reads the highest seq on disk.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(journal, _unrecognised_line(2))
+
+    journal.reseek()
+
+    assert journal.append("run_upsert", {"i": 1}).seq == 3
+
+
+def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
+    # Review Focus 5: `Store.open` builds the journal from `last_seq`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
+    finally:
+        st.close()
+
+    reopened = store.Store.open(repo, RUN_ID)
+    try:
+        line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
+    finally:
+        reopened.close()
+
+    assert line.seq == 3
+    assert [line.seq for line in store.Journal(RUN_ID).read()] == [1, 3]
+
+
 # -- board comment outbox ----------------------------------------------------------
 #
 # Board-comments spec B6/B7/B9: a row-only `board_comments` table outside the

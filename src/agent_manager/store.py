@@ -319,10 +319,14 @@ class Journal:
         return journal
 
     def last_seq(self) -> int:
-        """Highest sequence number already on disk, or 0 for a fresh journal."""
+        """Highest sequence number already on disk, or 0 for a fresh journal.
+
+        Counts lines `read` skips for an unrecognised `event` too: they are on
+        disk, so `append` must never number a line with one of their `seq`s.
+        """
         if not self.path.exists():
             return 0
-        return max((line.seq for line in self.read()), default=0)
+        return max((seq for seq, _ in self._scan()), default=0)
 
     def reseek(self) -> None:
         """Re-read the highest `seq` on disk into the cache, under the append lock.
