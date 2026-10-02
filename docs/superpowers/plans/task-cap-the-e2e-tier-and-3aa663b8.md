@@ -17,11 +17,15 @@ Parent story: 186fe934 "Define and enforce the test tiers". Source of truth: `do
 
 ## Out of scope
 
-pytest-xdist, the pygents engine, the checkpoint format, the harness adapter contract, `dispatch.py`'s LauncherFn seam, milestone 14's `am run --board`, FakeBoard/`run_brd` (V3), the V4–V8 conversions and splits, and the count and content of the 5 existing `e2e` tests. Do NOT add `justification:` lines to them. That is V9's work, owned by a sibling outside this story.
+pytest-xdist, the pygents engine, the checkpoint format, the harness adapter contract, `dispatch.py`'s LauncherFn seam, milestone 14's `am run --board`, FakeBoard/`run_brd` (V3), the V4–V8 conversions and splits.
+
+**CORRECTED (milestone spec commit 5e8fa37):** adding the `justification:` lines to the 5 existing `e2e` tests is now explicitly IN scope for this subtask (item 5 below), not V9's. The original split created a check that fails the instant it exists, against tests nobody had touched — V9's job becomes verifying those lines are accurate, not writing them.
+
+5. **Add `justification:` lines to the 5 existing `e2e` tests.** `tests/e2e/test_real_harness.py` (2 tests), `test_real_harness_integrate.py`, `test_real_harness_milestone.py`, `test_real_harness_parallel.py` (1 each). For each, add a docstring line starting `justification:` naming, honestly, what the real `claude` CLI's actual behavior verifies that the `e2e_fake` tier's deterministic fake-claude stand-in cannot observe (e.g. real inter-process concurrency/timing, real model compliance with the prompt/tool contract, real reasoning over a genuine merge conflict) — specific to what each individual test actually checks, not a copy-pasted generic line. Do not invent a justification that isn't true of the test.
 
 ## Expected verification state
 
-`uv run pytest` must otherwise be green. The 5 existing `e2e` tests (the `pytestmark = pytest.mark.e2e` modules `tests/e2e/test_real_harness.py`, `test_real_harness_integrate.py`, `test_real_harness_milestone.py` and `test_real_harness_parallel.py`) do not have `justification:` lines yet. The new check is therefore expected to fail collection until the V9 subtask lands. The PR description must say so and name V9 as the fix. If the implementer finds the default run blocked entirely, they report it and do not work around it by weakening the check or adding placeholder lines.
+`uv run pytest` (default invocation) must be green, with the e2e cap/justification check passing against the 5 now-justified tests. `uv run pytest --collect-only -m e2e` must list exactly 5 tests. If the implementer finds a reason one of the 5 tests cannot be honestly justified, they report it rather than inventing one — but the expectation is that all 5 can be, since each already has a real-harness-only dependency documented in its existing docstring.
 
 ## Error paths
 
@@ -517,19 +521,33 @@ than 5 items carry `e2e` or any `e2e` item's docstring has no line starting
 Run: `uv run pytest tests/test_tier_guards.py tests/test_conftest_tiers.py -v`
 Expected: PASS for every test.
 
-- [ ] **Step 5: Confirm the expected default-run block**
+- [ ] **Step 5: Add `justification:` lines to the 5 existing `e2e` tests, in the same step**
+
+CORRECTED: the check must not land ahead of the tests it applies to. Run `uv run pytest` first to
+confirm it currently fails exactly as expected (exit code 4, `ERROR: e2e tier check failed:`,
+5 lines naming `tests/e2e/test_real_harness*.py::<test>`), then add one `justification:` docstring
+line to each of those 5 tests (2 in `test_real_harness.py`, 1 each in `test_real_harness_integrate.py`,
+`test_real_harness_milestone.py`, `test_real_harness_parallel.py`) naming, honestly and specifically
+to what that test checks, what the real `claude` CLI verifies that `e2e_fake`'s deterministic
+stand-in cannot (real process concurrency/timing, real model tool-use compliance, real reasoning
+over a genuine conflict, etc.). Do not invent a justification that isn't true of the test.
 
 Run: `uv run pytest`
-Expected: exit code 4; stderr starts `ERROR: e2e tier check failed:` and lists exactly 5 lines of the form `tests/e2e/test_real_harness*.py::<test>: an e2e test's docstring needs a line starting `justification:``, and no `capped at` line. This is the spec's expected state until V9. Do not change the check or the e2e tests.
+Expected: PASS — the check's own tests pass, and the 5 `e2e` tests are deselected as normal with no
+collection error.
 
-Run: `uv run pytest --ignore-glob='*/e2e/test_real_harness*.py'`
-Expected: PASS (same results as before this task plus the new tests).
+Run: `uv run pytest --collect-only -m e2e`
+Expected: exactly 5 tests listed, no collection error.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/conftest.py tests/test_tier_guards.py
-git commit -m "Fail collection when the e2e tier is over its cap or unjustified"
+git add tests/conftest.py tests/test_tier_guards.py tests/e2e/test_real_harness.py tests/e2e/test_real_harness_integrate.py tests/e2e/test_real_harness_milestone.py tests/e2e/test_real_harness_parallel.py
+git commit -m "Fail collection when the e2e tier is over its cap or unjustified
+
+Adds the justification: lines to the 5 existing e2e tests in the same
+commit as the check, so the default suite never goes red for a test
+file this subtask didn't itself bring into compliance."
 ```
 
 ---
@@ -1376,25 +1394,25 @@ git commit -m "Replace every local requires_git/requires_brd copy with tier mark
 - [ ] **Step 1: Run the repo's verification command**
 
 Run: `uv run pytest`
-Expected: exit code 4. stderr is `ERROR: e2e tier check failed:` followed by exactly 5 lines, each `tests/e2e/test_real_harness*.py::<test>: an e2e test's docstring needs a line starting `justification:``, from `test_real_harness.py`, `test_real_harness_integrate.py`, `test_real_harness_milestone.py` and `test_real_harness_parallel.py`. There is no `capped at` line. Any other line is a bug to fix before continuing.
+Expected: PASS, full exit code 0. Task 2 Step 5 already added `justification:` lines to the 5
+existing `e2e` tests in the same commit as the check, so there is no red window — if this fails,
+it's a real bug to fix before continuing, not an expected state.
 
-- [ ] **Step 2: Run the rest of the default suite**
+- [ ] **Step 2: Confirm the e2e tier itself**
 
-Run: `uv run pytest --ignore-glob='*/e2e/test_real_harness*.py'`
-Expected: PASS, with no budget failures and no errors.
+Run: `uv run pytest --collect-only -m e2e`
+Expected: exactly 5 tests listed, no collection error.
 
 - [ ] **Step 3: Record the PR note**
 
 Put this paragraph in the PR description (and in the final report for the card):
 
 ```text
-Expected: `uv run pytest` fails collection (exit 4) on this branch. The new e2e check
-requires a `justification:` docstring line on every `e2e` test, and the 5 existing
-real-harness e2e tests (tests/e2e/test_real_harness*.py) do not have one yet. Adding
-those lines is spec V9's work (docs/superpowers/specs/2026-10-02-test-tier-design.md),
-owned by a sibling subtask outside this story; this branch deliberately adds no
-placeholder lines. With those four modules ignored
-(`uv run pytest --ignore-glob='*/e2e/test_real_harness*.py'`) the suite is green.
-Also folded in beyond the spec's list: the module-level `skipif(shutil.which("git"))`
-copies in tests/test_integration.py and tests/test_integrate_workflow.py.
+Added justification: docstring lines to the 5 existing real-harness e2e tests
+(tests/e2e/test_real_harness*.py) in the same commit as the new cap/justification
+collection check (docs/superpowers/specs/2026-10-02-test-tier-design.md, V2/V9), per
+the spec's correction that an enforcement rule and the tests it applies to must land
+together. uv run pytest is green. Also folded in beyond the spec's list: the
+module-level skipif(shutil.which("git")) copies in tests/test_integration.py and
+tests/test_integrate_workflow.py.
 ```
