@@ -6106,6 +6106,35 @@ def test_run_board_runs_every_milestone_on_one_shared_semaphore(board_seams):
         assert "resume_run_id" not in kwargs
 
 
+def test_run_board_forwards_every_run_shaping_argument_to_each_milestone(board_seams):
+    """Each milestone runs with the board's own `allow_no_verification`,
+    `runner_factory`, `driver`, `clock` and `control_interval`, not defaults."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+    runner_factory = object()
+    driver = object()
+
+    def clock() -> datetime:
+        return datetime(2026, 10, 2, tzinfo=timezone.utc)
+
+    _board(
+        board_seams,
+        allow_no_verification=True,
+        runner_factory=runner_factory,
+        driver=driver,
+        clock=clock,
+        control_interval=0.25,
+    )
+
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    for _milestone, kwargs in board_seams.runs.calls:
+        assert kwargs["allow_no_verification"] is True
+        assert kwargs["runner_factory"] is runner_factory
+        assert kwargs["driver"] is driver
+        assert kwargs["clock"] is clock
+        assert kwargs["control_interval"] == 0.25
+
+
 def test_run_board_isolates_a_milestone_that_raises_and_blocks_only_its_dependents(
     board_seams,
 ):
