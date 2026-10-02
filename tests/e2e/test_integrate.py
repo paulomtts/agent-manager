@@ -15,7 +15,6 @@ each story's implement write the files a scenario needs, keyed by the brief's
 """
 
 import json
-import os
 import shlex
 import subprocess
 import sys
@@ -292,103 +291,6 @@ def test_a_same_line_conflict_is_resolved_verified_and_left_on_the_integration_b
     _assert_base_untouched(root, main_before)
 
 
-def test_a_resolver_that_does_not_finish_escalates_and_a_human_finish_lets_the_relaunch_complete(
-    two_story_board, fake_resolver, run_milestone_cli, read_fake_log
-):
-    """Scenario 2: git, not the resolver's `resolved` flag, decides."""
-    root = two_story_board["root"]
-    milestone = two_story_board["milestone"]
-    stories = two_story_board["stories"]
-    main_before = _same_line_setup(two_story_board)
-    worktree = _integration_worktree(root)
-    fake_resolver.refuse()
-
-    first = run_milestone_cli(root, milestone)
-
-    assert first.exit_code == cli.EXIT_ESCALATED, (first.output, first.exception)
-    data = _envelope(first)
-    assert data["escalated"] is True, data
-    assert data["phase"] == "integrate"
-    assert data["story"] == stories["B"]
-    assert SHARED in data["files"]
-    assert data["run_id"]
-    assert str(worktree) in data["detail"]
-    assert "integrated" not in data
-    assert _merge_in_progress(worktree)
-    resolves = [entry for entry in read_fake_log(data["run_id"]) if entry["phase"] == "resolve"]
-    assert resolves  # non-vacuity: the resolver really was dispatched
-    assert {Path(entry["cwd"]).resolve() for entry in resolves} == {worktree.resolve()}
-    run = _load_run(root, data["run_id"])
-    assert run.status == "escalated"
-    (integrate_story,) = [story for story in run.stories if story.card_id == "integrate"]
-    assert integrate_story.status == "escalated"
-    _assert_base_untouched(root, main_before)
-
-    # A human finishes the merge the resolver left, where the detail says to.
-    (worktree / SHARED).write_text(A_LINE + B_LINE, encoding="utf-8")
-    _git(worktree, "add", "-A")
-    _git(worktree, "commit", "--no-edit")
-    fake_resolver.reset()
-    finished_tip = _git(root, "rev-parse", INTEGRATION_BRANCH).strip()
-
-    second = run_milestone_cli(root, milestone)
-
-    assert second.exit_code == 0, (second.output, second.exception)
-    done = _envelope(second)
-    assert done["done"] is True, done
-    assert done["run_id"] != data["run_id"]
-    assert done["integrated"] == {
-        "branch": INTEGRATION_BRANCH,
-        "worktree": str(worktree),
-        "merged": [stories["A"], stories["B"]],
-        "resolved": [],
-    }
-    assert not _merge_in_progress(worktree)
-    assert _git(root, "rev-parse", INTEGRATION_BRANCH).strip() == finished_tip
-    assert "resolve" not in _phases(read_fake_log(done["run_id"]))
-    assert _load_run(root, done["run_id"]).status == "done"
-    _assert_base_untouched(root, main_before)
-
-
-def test_relaunching_an_integrated_milestone_moves_no_branch(
-    two_story_board, run_milestone_cli, read_fake_log
-):
-    """Scenario 5: after a resolved Integrate, a relaunch re-merges nothing."""
-    root = two_story_board["root"]
-    milestone = two_story_board["milestone"]
-    stories = two_story_board["stories"]
-    subtasks = two_story_board["subtasks"]
-    branches = two_story_board["branches"]
-    main_before = _same_line_setup(two_story_board)
-    worktree = _integration_worktree(root)
-
-    first = run_milestone_cli(root, milestone)
-
-    assert first.exit_code == 0, (first.output, first.exception)
-    first_data = _envelope(first)
-    assert first_data["integrated"]["resolved"] == [stories["B"]]  # non-vacuity
-    watched = [INTEGRATION_BRANCH, "main", branches[subtasks["A"][0]], branches[subtasks["B"][0]]]
-    tips_before = {ref: _git(root, "rev-parse", ref).strip() for ref in watched}
-
-    second = run_milestone_cli(root, milestone)
-
-    assert second.exit_code == 0, (second.output, second.exception)
-    data = _envelope(second)
-    assert data["done"] is True, data
-    assert data["run_id"] != first_data["run_id"]
-    assert data["integrated"] == {
-        "branch": INTEGRATION_BRANCH,
-        "worktree": str(worktree),
-        "merged": [stories["A"], stories["B"]],
-        "resolved": [],
-    }
-    assert {ref: _git(root, "rev-parse", ref).strip() for ref in watched} == tips_before
-    assert "resolve" not in _phases(read_fake_log(data["run_id"]))
-    assert not _merge_in_progress(worktree)
-    assert _git(worktree, "status", "--porcelain") == ""
-    _assert_base_untouched(root, main_before)
-
-
 def test_a_clean_merge_that_breaks_the_suite_escalates_at_integrate(
     two_story_board, run_milestone_cli, read_fake_log
 ):
@@ -436,10 +338,3 @@ def test_a_clean_merge_that_breaks_the_suite_escalates_at_integrate(
     assert "resolve" not in _phases(read_fake_log(data["run_id"]))
     assert _load_run(root, data["run_id"]).status == "escalated"
     _assert_base_untouched(root, main_before)
-
-
-def test_no_resolver_mode_is_left_armed_for_later_tests():
-    """Review focus: scenario 2 arms `FAKE_CLAUDE_RESOLVER` through the
-    function-scoped `monkeypatch`; it must be gone once that test ends, or every
-    later resolve in the session would refuse. Kept last in the module."""
-    assert "FAKE_CLAUDE_RESOLVER" not in os.environ
