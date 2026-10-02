@@ -1370,20 +1370,17 @@ async def supervise(
 ) -> list[LaneOutcome]:
     """Run every census story as a grafo node and collect the outcomes (T1, T6).
 
-    One `grafo.Node` per story, `uuid=story.id`, `timeout=None` always (grafo's
-    60 s default would cancel a lane mid-phase). One edge per in-milestone
-    blocker, forwarding the blocker's tip as `tip_<short id>`, for a story
-    whose root is a single blocker. A story rooted on a `merged` base (two or
-    more in-milestone blockers) is instead one of the executor's roots itself,
-    with no incoming edge: grafo's dynamic worker pool can starve a 2+-parent
-    join forever when an unrelated sibling lane is still in flight (confirmed
-    outside this module, in the pinned grafo release; not a `dag`/`bases`
-    defect, and out of scope to fix in grafo). Its lane instead waits on each
-    blocker's own completion, signalled by `story_done`/`story_ok` below, and
-    reads the blocker's tip off `plan.tips` (`blocker_tips`); every lane sets
-    its own signal on exit, success or not, so this never hangs. The
-    executor's roots are therefore the stories with no in-milestone blocker,
-    plus every merged-root story; a milestone with no story has no tree to run.
+    The tree comes from `build_dag_tree` over `plan.stories`, each story's
+    blockers being its `plan.roots` in-milestone blockers: one node per story,
+    one edge per single-blocker story forwarding the blocker's tip as
+    `tip_<short id>`, and every story rooted on a `merged` base (two or more
+    in-milestone blockers) as an extra executor root, for the grafo
+    join-starvation reason `build_dag_tree` documents (a grafo limitation,
+    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's own completion,
+    signalled by `story_done`/`story_ok` below, and reads the blocker's tip
+    off `plan.tips` (`blocker_tips`); every lane sets its own signal on exit,
+    success or not, so this never hangs. A milestone with no story has no
+    tree to run.
 
     A lane that dies of a `BaseException` other than a cancellation ends the
     whole call at once, re-raised by `run_until_killed`: grafo alone would
@@ -1439,23 +1436,13 @@ async def supervise(
 
             return run
 
-        nodes = {
-            story.id: grafo.Node(coroutine=node_coroutine(story), uuid=story.id, timeout=None)
-            for story in plan.stories
-        }
-        for story in plan.stories:
-            root_plan = plan.roots[story.id]
-            if root_plan.kind == "merged":
-                continue
-            for blocker in root_plan.blockers:
-                await nodes[blocker].connect(
-                    nodes[story.id], forward=f"tip_{dag.short_id(blocker)}"
-                )
-        roots = [
-            nodes[story.id]
-            for story in plan.stories
-            if not plan.roots[story.id].blockers or plan.roots[story.id].kind == "merged"
-        ]
+        nodes, roots = await build_dag_tree(
+            items=plan.stories,
+            id_of=lambda story: story.id,
+            blockers_of=lambda story: plan.roots[story.id].blockers,
+            node_factory=node_coroutine,
+            forward=lambda blocker: f"tip_{dag.short_id(blocker.id)}",
+        )
         errors: list[BaseException] = []
         if roots:
             executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
