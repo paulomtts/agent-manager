@@ -131,3 +131,26 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         marker = default_tier_marker(rel_path, {mark.name for mark in item.iter_markers()})
         if marker is not None:
             item.add_marker(marker)
+
+
+UNIT_BUDGET_S = 0.5
+GIT_BUDGET_S = 2.0
+
+# Opt-in tiers have no per-test budget, and win over `git` when an item has both.
+_UNBUDGETED_TIERS = TIER_MARKERS - {"git"}
+
+
+def tier_budget_violation(markers: Iterable[str], duration: float) -> str | None:
+    """The budget failure message for a call phase of `duration` seconds, or None.
+
+    `markers` is every marker name on the item's chain. No tier marker means the
+    unit budget; `git` alone means the git budget; any opt-in tier means none.
+    A duration exactly on the budget passes.
+    """
+    names = set(markers)
+    if names & _UNBUDGETED_TIERS:
+        return None
+    tier, budget = ("git", GIT_BUDGET_S) if "git" in names else ("unit", UNIT_BUDGET_S)
+    if duration <= budget:
+        return None
+    return f"{tier}-tier budget exceeded: {duration:.3f}s > {budget:g}s"
