@@ -3323,14 +3323,14 @@ def test_board_prefix_of_without_a_prefix_is_the_milestones_own_stem():
     prefix_of = cli.board_prefix_of(None)
 
     assert prefix_of(BOARD_CARD) == dag.task_stem(BOARD_CARD)
-    assert prefix_of(BOARD_CARD).endswith("cbe34d00")
+    assert prefix_of(BOARD_CARD) == "milestone-14-run-the-cbe34d00"
 
 
 def test_board_prefix_of_with_a_prefix_joins_it_to_the_stem_and_never_reuses_it_verbatim():
     """Spec 3.2: a given prefix is `<prefix>-<stem>`, so two milestones never share it."""
     prefix_of = cli.board_prefix_of("sprint9")
 
-    assert prefix_of(BOARD_CARD) == f"sprint9-{dag.task_stem(BOARD_CARD)}"
+    assert prefix_of(BOARD_CARD) == "sprint9-milestone-14-run-the-cbe34d00"
     assert prefix_of(BOARD_CARD) != "sprint9"
 
 
@@ -3773,7 +3773,7 @@ def test_a_board_run_calls_run_board_once_with_the_run_options(tmp_path, monkeyp
         "allow_no_verification": True,
         "max_concurrent": cli.DEFAULT_MAX_CONCURRENT,
     }
-    assert prefix_of(BOARD_CARD) == dag.task_stem(BOARD_CARD)
+    assert prefix_of(BOARD_CARD) == "milestone-14-run-the-cbe34d00"
 
 
 def test_a_board_run_with_a_prefix_hands_run_board_prefix_dash_stem(tmp_path, monkeypatch):
@@ -3785,7 +3785,7 @@ def test_a_board_run_with_a_prefix_hands_run_board_prefix_dash_stem(tmp_path, mo
 
     assert result.exit_code == 0, result.output
     (kwargs,) = calls
-    assert kwargs["branch_prefix_of"](BOARD_CARD) == f"sprint9-{dag.task_stem(BOARD_CARD)}"
+    assert kwargs["branch_prefix_of"](BOARD_CARD) == "sprint9-milestone-14-run-the-cbe34d00"
     assert kwargs["branch_prefix_of"](BOARD_CARD) != "sprint9"
 
 
