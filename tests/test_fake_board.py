@@ -381,3 +381,34 @@ def test_a_comment_body_with_a_link_fails_loudly(fake_board):
 def test_a_write_argv_board_py_never_builds_fails_loudly(fake_board, argv, stdin):
     with pytest.raises(AssertionError, match="FakeBoard does not answer argv"):
         fake_board(argv, None, stdin)
+
+
+def test_seeding_a_stored_blocked_status_fails_loudly(fake_board):
+    # brd derives `blocked`, never stores it; seed blocked_by instead.
+    with pytest.raises(AssertionError, match="'blocked' is derived"):
+        fake_board.add_card("stored blocked", status="blocked")
+    assert fake_board.cards == {}
+
+
+def test_seeding_a_duplicate_card_id_fails_loudly(fake_board):
+    fake_board.add_card("first", card_id="c1")
+    with pytest.raises(AssertionError, match="duplicate card id 'c1'"):
+        fake_board.add_card("second", card_id="c1")
+    assert fake_board.cards["c1"].title == "first"
+
+
+@pytest.mark.parametrize(
+    ("card_id", "body", "match"),
+    [
+        ("no-such-card", "orphan", "unknown card 'no-such-card'"),
+        (None, "  \n\t", "no empty body"),
+        (None, "see [[other-card]]", r"\[\[link\]\]"),
+    ],
+    ids=["unknown-card", "empty-body", "link"],
+)
+def test_seeding_an_invalid_comment_fails_loudly(fake_board, card_id, body, match):
+    card = fake_board.add_card("Add FakeBoard")
+    with pytest.raises(AssertionError, match=match):
+        fake_board.add_comment(card_id or card, body)
+    assert fake_board.comments == []
+
