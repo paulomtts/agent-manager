@@ -7810,3 +7810,84 @@ def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
     assert envelope["ok"] is False
     assert envelope["error"]["type"] == "UnknownRunError"
     assert list(_watch_runs_dir(tmp_path).iterdir()) == []
+
+
+def test_watch_all_reads_across_more_than_one_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    # Written b first, so the order in the output is the sort, not creation order.
+    run_b = _write_watch_journal(tmp_path, "run-b", [1, 2])
+    run_a = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+
+    result = _watch("--all")
+
+    assert result.exit_code == 0, result.output
+    events = json.loads(result.stdout)["data"]["events"]
+    assert events == run_a + run_b
+    assert [(event["run_id"], event["seq"]) for event in events] == [
+        ("run-a", 1),
+        ("run-a", 2),
+        ("run-a", 3),
+        ("run-b", 1),
+        ("run-b", 2),
+    ]
+
+
+def test_watch_all_applies_since_to_each_runs_own_seq(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    run_a = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+    run_b = _write_watch_journal(tmp_path, "run-b", [1, 2, 3, 4])
+
+    result = _watch("--all", "--since", "2")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["events"] == run_a[2:] + run_b[2:]
+
+
+def test_watch_all_with_no_runs_directory_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _watch("--all")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"ok": True, "data": {"events": []}}
+    assert not _watch_runs_dir(tmp_path).exists()
+
+
+def test_watch_all_skips_a_run_with_no_journal_yet(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    run_a = _write_watch_journal(tmp_path, "run-a", [1])
+    (_watch_runs_dir(tmp_path) / "run-not-started").mkdir()
+    (_watch_runs_dir(tmp_path) / "stray.txt").write_text("not a run\n")
+
+    result = _watch("--all")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["events"] == run_a
+    assert sorted(p.name for p in (_watch_runs_dir(tmp_path) / "run-not-started").iterdir()) == []
+
+
+def test_watch_all_corrupt_journal_is_an_envelope(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1])
+    _write_watch_journal(tmp_path, "run-b", [1], tail="not json\n")
+
+    result = _watch("--all")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CorruptJournalError"
+
+
+def test_watch_rejects_run_id_with_all_and_neither(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1])
+
+    for argv in (["run-a", "--all"], []):
+        result = _watch(*argv)
+        assert result.exit_code == cli.EXIT_ERROR, (argv, result.output)
+        envelope = json.loads(result.stdout)
+        assert envelope["ok"] is False, argv
+        assert envelope["error"]["type"] == "CliError", argv
+        message = envelope["error"]["message"]
+        assert "RUN_ID" in message and "--all" in message, argv

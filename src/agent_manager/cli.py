@@ -1546,31 +1546,61 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
     return [line.model_dump(mode="json") for line in lines if line.seq > since]
 
 
-def watch_for(run_id: str, *, since: int = 0) -> dict[str, Any]:
-    """The payload of `am watch RUN_ID`: `{"events": [...]}`."""
+def watch_for(
+    run_id: str | None, *, all_runs: bool = False, since: int = 0
+) -> dict[str, Any]:
+    """The payload of `am watch`: `{"events": [...]}`.
+
+    Exactly one of `run_id` and `all_runs`. With `run_id`, a run with no
+    journal is `UnknownRunError`. With `all_runs`, every directory under
+    `<data dir>/runs/` is read, a run with no journal yet is skipped, and a
+    missing `runs/` is no events: a watcher pointed at the wrong data
+    directory sees nothing, not an error (am-watch design 3.7). Events are
+    ordered by `(run_id, seq)`; `since` filters each run's own `seq`.
+    """
+    if all_runs == (run_id is not None):
+        raise CliError(
+            "give exactly one of RUN_ID or --all:"
+            " `am watch RUN_ID` reads one run, `am watch --all` reads every run"
+        )
     if since < 0:
         raise CliError(f"--since must be 0 or more, got {since}")
-    _check_watch_run_id(run_id)
-    try:
-        return {"events": _journal_events(run_id, since=since)}
-    except store_module.MissingJournalError as error:
-        raise UnknownRunError(
-            f"run {run_id!r} has no journal under the data directory"
-            " (`agent-manager watch --all` reads every run there is)"
-        ) from error
+    if run_id is not None:
+        _check_watch_run_id(run_id)
+        try:
+            return {"events": _journal_events(run_id, since=since)}
+        except store_module.MissingJournalError as error:
+            raise UnknownRunError(
+                f"run {run_id!r} has no journal under the data directory"
+                " (`agent-manager watch --all` reads every run there is)"
+            ) from error
+    events: list[dict[str, Any]] = []
+    for each in paths.list_run_ids():
+        try:
+            events.extend(_journal_events(each, since=since))
+        except store_module.MissingJournalError:
+            continue
+    return {"events": events}
 
 
 @app.command("watch")
 def watch(
-    run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run whose journal is read."),
+    run_id: str | None = typer.Argument(
+        None,
+        metavar="[RUN_ID]",
+        help="The run whose journal is read. Omit it and pass --all for every run.",
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Read every run's journal under the data directory."
+    ),
     since: int = typer.Option(
         0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print a run's journal events once, as one envelope."""
+    """Print a run's journal events, or every run's, once, as one envelope."""
     try:
-        payload = watch_for(run_id, since=since)
+        payload = watch_for(run_id, all_runs=all_runs, since=since)
     except WATCH_HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
