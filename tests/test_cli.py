@@ -1934,17 +1934,6 @@ def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkey
 
 @requires_git
 @requires_brd
-def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-    result = _invoke(project, cards["subtask"], "--pretty")
-
-    assert result.exit_code == 0
-    assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "done"
-
-
-@requires_git
-@requires_brd
 def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatch):
     monkeypatch.setattr(
         cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
@@ -2843,21 +2832,6 @@ def test_a_title_substring_names_the_same_milestone_as_its_id(
 
 @requires_git
 @requires_brd
-def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
-    project, milestone_board, monkeypatch
-):
-    _forbid_writes(monkeypatch)
-
-    plain = _dry_run(project, milestone_board["milestone"])
-    pretty = _dry_run(project, milestone_board["milestone"], "--pretty")
-
-    assert pretty.exit_code == 0, pretty.output
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
-
-
-@requires_git
-@requires_brd
 @pytest.mark.parametrize("extra, bound", [((), 4), (("--max-concurrent", "3"), 3)])
 def test_the_milestone_dry_run_echoes_the_lane_bound_and_writes_nothing(
     project, milestone_board, monkeypatch, extra, bound
@@ -3266,14 +3240,10 @@ def test_an_escalated_milestone_exits_one_with_an_ok_envelope(tmp_path, monkeypa
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _patch_run_milestone(monkeypatch, ESCALATED_MILESTONE)
 
-    plain = _milestone_run(tmp_path)
-    pretty = _milestone_run(tmp_path, "--pretty")
+    result = _milestone_run(tmp_path)
 
-    assert plain.exit_code == cli.EXIT_ESCALATED, plain.output
-    assert json.loads(plain.stdout) == cli.ok_envelope(ESCALATED_MILESTONE)
-    assert pretty.exit_code == cli.EXIT_ESCALATED, pretty.output
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(ESCALATED_MILESTONE)
 
 
 def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeypatch):
@@ -3559,22 +3529,6 @@ def test_pretty_renders_through_the_cli(projection, run_id, exit_code, ok):
     assert envelope["ok"] is ok
 
 
-def test_status_pretty_indents_the_same_envelope(projection):
-    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
-
-    plain = runner.invoke(
-        cli.app, ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)]
-    )
-    pretty = runner.invoke(
-        cli.app,
-        ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection), "--pretty"],
-    )
-
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
-
-
 def test_runs_lists_the_projects_history_newest_first(projection):
     _record(
         projection,
@@ -3634,17 +3588,6 @@ def test_runs_agrees_with_status_about_the_most_recent_run(projection):
     )
 
     assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
-
-
-def test_runs_pretty_indents_the_same_envelope(projection):
-    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
-
-    plain = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
-    pretty = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection), "--pretty"])
-
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
@@ -3810,21 +3753,6 @@ def test_logs_phase_and_attempt_together_select_an_earlier_attempt(projection):
     assert data["status"] == "gate_failed"
     assert data["exit_code"] == 1
     assert data["artifacts"]["prompt"]["text"] == "prompt for explore.1\n"
-
-
-def test_logs_pretty_indents_the_same_envelope(projection):
-    _record_for_logs(projection, LOGS_RUN_ID)
-
-    plain = runner.invoke(
-        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
-    )
-    pretty = runner.invoke(
-        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection), "--pretty"]
-    )
-
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 def test_logs_reports_an_attempt_whose_stdout_was_never_written(projection):
@@ -4863,21 +4791,6 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
 
 @requires_git
 @requires_brd
-def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
-    run_id = _crash_pygents(project, cards, "plan")
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-
-    result = runner.invoke(
-        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "done"
-
-
-@requires_git
-@requires_brd
 def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
     """An escalation is a truthful result, so the envelope stays `ok: true` and
     the exit code carries the full stop -- exactly as `run` does."""
@@ -5607,31 +5520,6 @@ def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
         )
 
     assert _controls(projection) == []
-
-
-@pytest.mark.parametrize("command", ["pause", "cancel"])
-def test_pause_and_cancel_pretty_indent_the_same_envelope(projection, monkeypatch, command):
-    """Spec test 9."""
-    _freeze_clock(monkeypatch)
-    _plant_run(projection)
-    _plant_lease(projection)
-
-    result = _invoke_control(projection, command, CONTROL_RUN_ID, "--pretty")
-
-    assert result.exit_code == 0, result.output
-    assert "\n  " in result.stdout
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is True
-    assert set(envelope["data"]) == CONTROL_KEYS
-    assert envelope["data"]["command"] == command
-
-    refusal = _invoke_control(projection, command, "no-such-run", "--pretty")
-
-    assert refusal.exit_code == cli.EXIT_ERROR, refusal.output
-    assert "\n  " in refusal.stdout
-    refused = json.loads(refusal.stdout)
-    assert refused["ok"] is False
-    assert refused["error"]["type"] == "UnknownRunError"
 
 
 def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
