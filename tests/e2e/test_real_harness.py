@@ -188,8 +188,12 @@ def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoin
     """Non-vacuity: the pygents walk is the only one that checkpoints (its
     BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra.
 
-    justification: rides the same real-claude run as this module's main test
-    (no separate dispatch, no added cost); without it a refactor could make
-    the real run silently skip the pygents walk and nothing would notice."""
+    justification: none -- no real-claude-only behavior. The `e2e_fake` twin
+    `test_production_wiring.py::test_the_run_went_through_the_pygents_walk`
+    makes the same `checkpoint_rows > 0` assertion on the same no-injection
+    `cli.run_card` path, and the checkpoint is written by the engine's
+    BEFORE_TURN hook, not by anything the model does. Kept because shrinking
+    the e2e tier below 5 is out of scope (test-tier spec section 8); flagged
+    on brd card d4542989 instead of given an invented reason."""
     rows = checkpoint_rows(project, completed_run["run_id"])
     assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"
