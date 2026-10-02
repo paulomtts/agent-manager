@@ -2,8 +2,9 @@
 
 Two tiers, per design §14:
 
-- `plan_levels`, `story_tips`, `stale_story_anchors` and the payload helpers
-  are pure and get unit tests on hand-built plans or outcomes;
+- `plan_levels`, `story_tips`, `stale_story_anchors`, `build_dag_tree` and the
+  payload helpers are pure and get unit tests on hand-built plans, outcomes or
+  plain items;
 - `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
   real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
   `paths.data_dir()` never touches the developer's own -- with the harness
@@ -158,6 +159,161 @@ def test_a_milestone_with_nothing_pending_plans_no_levels():
     a = _plan_story(1, [_plan_subtask(11, "done")], status="done")
 
     assert orchestrate.plan_levels([a], branch_prefix="m3", base_branch="main") == []
+
+
+@dataclass(frozen=True)
+class _DagItem:
+    """A plain item for `build_dag_tree`: an id and the ids blocking it."""
+
+    id: str
+    blockers: tuple[str, ...] = ()
+
+
+def _dag_factory(
+    calls: dict[str, dict[str, Any]],
+) -> Callable[[_DagItem], Callable[..., Awaitable[str]]]:
+    """A `node_factory` whose coroutine records the kwargs it got and returns `out-<id>`."""
+
+    def factory(item: _DagItem) -> Callable[..., Awaitable[str]]:
+        async def run(**forwarded: Any) -> str:
+            calls[item.id] = forwarded
+            return f"out-{item.id}"
+
+        return run
+
+    return factory
+
+
+def _dag_forward(item: _DagItem) -> str:
+    """Reads `.id`, so it fails loudly if handed a blocker id instead of the item."""
+    return f"from_{item.id}"
+
+
+async def _build(
+    items: list[_DagItem],
+    calls: dict[str, dict[str, Any]],
+    forward: Callable[[_DagItem], str | None] | None = _dag_forward,
+) -> tuple[dict[str, grafo.Node], list[grafo.Node]]:
+    return await orchestrate.build_dag_tree(
+        items,
+        id_of=lambda item: item.id,
+        blockers_of=lambda item: item.blockers,
+        node_factory=_dag_factory(calls),
+        forward=forward,
+    )
+
+
+async def test_build_dag_tree_single_blocker_wires_edge():
+    """A <- B: one timeout-less node per item, keyed and ordered by item; B is
+    reached from A by an edge forwarding A's output as `forward(A)`; A alone
+    is a root."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b], calls)
+
+    assert list(nodes) == ["a", "b"]
+    assert [node.uuid for node in nodes.values()] == ["a", "b"]
+    assert [node._timeout for node in nodes.values()] == [None, None]
+    assert nodes["a"].children == [nodes["b"]]
+    assert nodes["b"].children == []
+    assert roots == [nodes["a"]]
+
+    await grafo.TreeExecutor(uuid="single", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {"from_a": "out-a"}}
+
+
+async def test_build_dag_tree_multi_blocker_is_root_not_edge():
+    """A and B both block C: C gets no incoming edge and is a root itself, so
+    `roots` is every item, in items order. The helper does no waiting: C runs
+    with no forwarded kwargs."""
+    a, b = _DagItem("a"), _DagItem("b")
+    c = _DagItem("c", ("a", "b"))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b, c], calls)
+
+    assert nodes["a"].children == []
+    assert nodes["b"].children == []
+    assert roots == [nodes["a"], nodes["b"], nodes["c"]]
+
+    await grafo.TreeExecutor(uuid="merged", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {}, "c": {}}
+
+
+async def test_build_dag_tree_no_forward_connects_without_kwarg():
+    """With `forward=None` the single-blocker edge still exists, but nothing is
+    forwarded along it."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b], calls, forward=None)
+
+    assert nodes["a"].children == [nodes["b"]]
+    assert nodes["a"]._forward_map == {}
+    assert roots == [nodes["a"]]
+
+    await grafo.TreeExecutor(uuid="unforwarded", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {}}
+
+
+async def test_build_dag_tree_forward_returning_none_connects_without_kwarg():
+    """A `forward` that returns `None` for a blocker behaves as no `forward` for
+    that edge only."""
+    a, b = _DagItem("a"), _DagItem("b", ("a",))
+    c, d = _DagItem("c"), _DagItem("d", ("c",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    def only_a(item: _DagItem) -> str | None:
+        return "from_a" if item.id == "a" else None
+
+    nodes, roots = await _build([a, b, c, d], calls, forward=only_a)
+
+    assert nodes["c"].children == [nodes["d"]]
+    assert nodes["c"]._forward_map == {}
+    assert roots == [nodes["a"], nodes["c"]]
+
+    await grafo.TreeExecutor(uuid="partial", roots=roots).run()
+
+    assert calls == {"a": {}, "b": {"from_a": "out-a"}, "c": {}, "d": {}}
+
+
+async def test_build_dag_tree_roots_follow_items_order():
+    """A merged item listed before a plain root keeps its place: roots are in
+    items order, not plain roots first."""
+    a, b = _DagItem("a"), _DagItem("b")
+    c = _DagItem("c", ("a", "b"))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, c, b], calls)
+
+    assert list(nodes) == ["a", "c", "b"]
+    assert roots == [nodes["a"], nodes["c"], nodes["b"]]
+
+
+async def test_build_dag_tree_merged_item_still_forwards_to_its_dependent():
+    """A merged item is a root, and a single-blocker item behind it is still
+    reached by an edge forwarding the merged item's output."""
+    a, b = _DagItem("a"), _DagItem("b")
+    joined = _DagItem("joined", ("a", "b"))
+    d = _DagItem("d", ("joined",))
+    calls: dict[str, dict[str, Any]] = {}
+
+    nodes, roots = await _build([a, b, joined, d], calls)
+
+    assert nodes["joined"].children == [nodes["d"]]
+    assert roots == [nodes["a"], nodes["b"], nodes["joined"]]
+
+    await grafo.TreeExecutor(uuid="joined", roots=roots).run()
+
+    assert calls["d"] == {"from_joined": "out-joined"}
+
+
+async def test_build_dag_tree_empty_items():
+    assert await _build([], {}) == ({}, [])
 
 
 def test_story_tips_name_every_story_with_subtasks_in_census_order():
@@ -2146,6 +2302,380 @@ def test_at_most_max_concurrent_lanes_run(project):
         card for cards in subtasks.values() for card in cards
     )
     assert driver.high_water == 2
+
+
+def _supervised_run(
+    project: Path, milestone: str
+) -> tuple[store_module.Store, str, orchestrate.SupervisorPlan]:
+    """What `run_milestone` sets up before it calls `supervise`, without the
+    lease, the git refresh or Integrate: a recorded run, its planned rows, and
+    the plan built from them. The caller closes the store."""
+    root = cli.resolve_repo_dir(project)
+    stories = census.flatten_milestone(board.tree(milestone, repo_dir=root)).stories
+    levels = orchestrate.plan_levels(stories, branch_prefix=PREFIX, base_branch="main")
+    run_id = cli.mint_run_id(milestone, STARTED_AT)
+    store = store_module.Store.open(root, run_id)
+    store.record_run(
+        models.Run(
+            id=run_id,
+            workflow=orchestrate.MILESTONE_WORKFLOW,
+            repo_dir=root,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            status="started",
+            started_at=STARTED_AT,
+            config=models.RunConfig(max_concurrent_stories=3),
+            milestone_id=milestone,
+        )
+    )
+    rows = orchestrate.record_plan(store, levels, root=root, branch_prefix=PREFIX)
+    plan = orchestrate.supervisor_plan(
+        stories, levels, rows, branch_prefix=PREFIX, base_branch="main"
+    )
+    return store, run_id, plan
+
+
+async def _supervise_shared(
+    project: Path,
+    store: store_module.Store,
+    run_id: str,
+    plan: orchestrate.SupervisorPlan,
+    driver: Any,
+    slots: asyncio.Semaphore,
+) -> list[orchestrate.LaneOutcome]:
+    """One `supervise` call on the shared `slots`, with its own `StopSignal`.
+    `max_concurrent=3` is deliberately larger than any shared semaphore these
+    tests pass: the caller's semaphore, not `max_concurrent`, is the bound."""
+    return await orchestrate.supervise(
+        plan,
+        store=store,
+        run_id=run_id,
+        lease_token=f"{run_id}-lease",
+        root=cli.resolve_repo_dir(project),
+        drive=driver,
+        commands=[],
+        allow_no_verification=True,
+        runner_factory=None,
+        max_concurrent=3,
+        stop=StopSignal(),
+        slots=slots,
+    )
+
+
+async def _refill(slots: asyncio.Semaphore, capacity: int) -> None:
+    """Acquire `slots` `capacity` times, then release them all: fails after
+    WAIT seconds if any lane left a slot held."""
+    for _ in range(capacity):
+        await _within(slots.acquire(), "a slot a finished lane should have released")
+    for _ in range(capacity):
+        slots.release()
+
+
+@requires_git
+@requires_brd
+def test_two_supervise_calls_sharing_one_semaphore_never_exceed_it_combined(project):
+    """Two milestones of three ready stories each, one shared two-slot
+    semaphore, `max_concurrent=3` per call. Every lane stays in flight until a
+    third lane enters the driver or the window expires: if each call used its
+    own semaphore, a third (and more) would arrive inside the window; shared,
+    only two lanes across both calls can ever be in flight."""
+    shape_a = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    shape_b = _milestone(project, {"D": 1, "E": 1, "F": 1})
+    subtasks = {**_subtasks_by_story(shape_a), **_subtasks_by_story(shape_b)}
+    arrivals = 0
+    third_arrived = asyncio.Event()
+
+    async def hold_until_a_third_lane_arrives(stop: StopSignal | None) -> None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 3:
+            third_arrived.set()
+        try:
+            await asyncio.wait_for(third_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
+
+    driver = GatedDriver(
+        gates={cards[0]: hold_until_a_third_lane_arrives for cards in subtasks.values()}
+    )
+    store_a, run_a, plan_a = _supervised_run(project, shape_a["milestone"])
+    store_b, run_b, plan_b = _supervised_run(project, shape_b["milestone"])
+
+    async def scenario() -> tuple[list[orchestrate.LaneOutcome], list[orchestrate.LaneOutcome]]:
+        shared = asyncio.Semaphore(2)
+        outcomes_a, outcomes_b = await asyncio.gather(
+            _supervise_shared(project, store_a, run_a, plan_a, driver, shared),
+            _supervise_shared(project, store_b, run_b, plan_b, driver, shared),
+        )
+        await _refill(shared, 2)
+        return outcomes_a, outcomes_b
+
+    # Two overlapping calls each save and restore grafo's level; restore it
+    # here so this test can never leave grafo silenced for later tests.
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        outcomes_a, outcomes_b = asyncio.run(scenario())
+    finally:
+        grafo_logger.setLevel(level_before)
+        store_a.close()
+        store_b.close()
+
+    assert driver.high_water == 2
+    assert sorted(call["card"] for call in driver.calls) == sorted(
+        card for cards in subtasks.values() for card in cards
+    )
+    for shape, outcomes, run_id in (
+        (shape_a, outcomes_a, run_a),
+        (shape_b, outcomes_b, run_b),
+    ):
+        assert [outcome.kind for outcome in outcomes] == ["done", "done", "done"]
+        assert {outcome.story for outcome in outcomes} == set(shape["stories"].values())
+        statuses = _statuses(_load(project, run_id))
+        del statuses["run"]  # only run_milestone records the run's final status
+        assert set(statuses.values()) == {"done"}
+
+
+@requires_git
+@requires_brd
+def test_an_escalation_in_one_sharing_call_leaves_the_other_its_slots(project):
+    """Milestone X's only lane escalates; milestone Y's three lanes share the
+    same two-slot semaphore. The escalation stops only X (each call has its own
+    StopSignal), every Y lane still runs to done, the combined peak is exactly
+    two, and both slots are free once both calls return. Every lane stays in
+    flight until a third lane enters the driver or the window expires, so a
+    call that ignored the shared semaphore would push the peak past two."""
+    shape_x = _milestone(project, {"X": 1})
+    shape_y = _milestone(project, {"P": 1, "Q": 1, "R": 1})
+    (x1,) = shape_x["subtasks"]["X"]
+    y_subtasks = _subtasks_by_story(shape_y)
+    arrivals = 0
+    third_arrived = asyncio.Event()
+
+    async def hold_until_a_third_lane_arrives(stop: StopSignal | None) -> None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 3:
+            third_arrived.set()
+        try:
+            await asyncio.wait_for(third_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
+
+    driver = GatedDriver(
+        gates={
+            card: hold_until_a_third_lane_arrives
+            for card in [x1, *(cards[0] for cards in y_subtasks.values())]
+        },
+        outcomes={x1: ("review", "reviewer found a blocker")},
+    )
+    store_x, run_x, plan_x = _supervised_run(project, shape_x["milestone"])
+    store_y, run_y, plan_y = _supervised_run(project, shape_y["milestone"])
+
+    async def scenario() -> tuple[list[orchestrate.LaneOutcome], list[orchestrate.LaneOutcome]]:
+        shared = asyncio.Semaphore(2)
+        outcomes_x, outcomes_y = await asyncio.gather(
+            _supervise_shared(project, store_x, run_x, plan_x, driver, shared),
+            _supervise_shared(project, store_y, run_y, plan_y, driver, shared),
+        )
+        await _refill(shared, 2)
+        return outcomes_x, outcomes_y
+
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        outcomes_x, outcomes_y = asyncio.run(scenario())
+    finally:
+        grafo_logger.setLevel(level_before)
+        store_x.close()
+        store_y.close()
+
+    assert driver.high_water == 2
+    assert [(outcome.kind, outcome.subtask) for outcome in outcomes_x] == [("escalated", x1)]
+    assert [outcome.kind for outcome in outcomes_y] == ["done", "done", "done"]
+    assert sorted(call["card"] for call in driver.calls) == sorted(
+        [x1, *(card for cards in y_subtasks.values() for card in cards)]
+    )
+
+
+def test_the_async_core_takes_run_milestones_parameters_plus_slots():
+    """`_run_milestone_async` is a coroutine function taking exactly
+    `run_milestone`'s parameters, same kinds and defaults, plus a keyword-only
+    `slots=None`; `run_milestone` itself gains nothing."""
+    assert inspect.iscoroutinefunction(orchestrate._run_milestone_async)
+    wrapper = inspect.signature(orchestrate.run_milestone).parameters
+    core = dict(inspect.signature(orchestrate._run_milestone_async).parameters)
+    slots = core.pop("slots")
+    assert slots.kind is inspect.Parameter.KEYWORD_ONLY
+    assert slots.default is None
+    assert "slots" not in wrapper
+    assert list(core) == list(wrapper)
+    for name, parameter in wrapper.items():
+        assert core[name].kind is parameter.kind, name
+        assert core[name].default == parameter.default, name
+
+
+def test_run_milestone_refuses_bad_arguments_before_starting_an_event_loop(
+    tmp_path, monkeypatch
+):
+    """Validation stays in the sync wrapper: a bad bound is refused before
+    `asyncio.run` is ever called."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    def no_loop(*args: Any, **kwargs: Any) -> Any:
+        for arg in args:
+            if inspect.iscoroutine(arg):
+                arg.close()
+        pytest.fail("an event loop was started before validation")
+
+    monkeypatch.setattr(orchestrate.asyncio, "run", no_loop)
+
+    with pytest.raises(ValueError, match="max_concurrent"):
+        orchestrate.run_milestone(
+            "Milestone 3",
+            repo_dir=tmp_path,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            max_concurrent=0,
+        )
+
+
+@requires_git
+@requires_brd
+def test_the_async_core_awaited_in_a_running_loop_is_bounded_by_the_callers_semaphore(
+    project, integrate_recorder
+):
+    """Three ready stories, `max_concurrent=3`, but the caller hands the core a
+    one-slot semaphore from its own running loop. Every lane stays in flight
+    until a second lane enters the driver or the window expires: bounded by
+    `max_concurrent`, a second lane would arrive inside the window; bounded by
+    the caller's semaphore, only one lane is ever in flight. The run still
+    finishes `done` with `run_milestone`'s payload and frees its slot."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    subtasks = _subtasks_by_story(shape)
+    arrivals = 0
+    second_arrived = asyncio.Event()
+
+    async def hold_until_a_second_lane_arrives(stop: StopSignal | None) -> None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 2:
+            second_arrived.set()
+        try:
+            await asyncio.wait_for(second_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
+
+    driver = GatedDriver(
+        gates={cards[0]: hold_until_a_second_lane_arrives for cards in subtasks.values()}
+    )
+
+    async def scenario() -> dict[str, Any]:
+        shared = asyncio.Semaphore(1)
+        result = await orchestrate._run_milestone_async(
+            shape["milestone"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            driver=driver,
+            clock=lambda: STARTED_AT,
+            max_concurrent=3,
+            slots=shared,
+        )
+        await _refill(shared, 1)
+        return result
+
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        grafo_logger.setLevel(level_before)
+
+    order = _census_stories(project, shape["milestone"])
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert driver.high_water == 1
+    assert sorted(call["card"] for call in driver.calls) == sorted(
+        card for cards in subtasks.values() for card in cards
+    )
+    assert set(result) == {
+        "done",
+        "run_id",
+        "levels",
+        "completed",
+        "tips",
+        "warnings",
+        "integrated",
+    }
+    assert result["done"] is True
+    assert result["run_id"] == run_id
+    assert result["levels"] == [{"level": 0, "stories": order}]
+    assert result["completed"] == [card for story in order for card in subtasks[story]]
+    assert set(result["integrated"]["merged"]) == set(order)
+    (integrate_call,) = integrate_recorder.calls
+    assert integrate_call["run_status"] == "started"
+    run = _load(project, run_id)
+    assert run.config == models.RunConfig(max_concurrent_stories=3)
+    assert set(_statuses(run).values()) == {"done"}
+
+
+@requires_git
+@requires_brd
+def test_cancelling_the_async_core_mid_integrate_waits_for_integrate_before_closing_the_store(
+    project, integrate_recorder, monkeypatch
+):
+    """Integrate runs on a worker thread that a cancel cannot stop. A caller
+    cancelling the core while Integrate is in flight must not unwind it (closing
+    the store, releasing the lease) until Integrate returns: Integrate still
+    reads and writes the run's store, and must stay under the run's lease."""
+    shape = _milestone(project, {"A": 1})
+    entered = threading.Event()
+    release = threading.Event()
+    store_errors: list[BaseException] = []
+
+    def slow_integrate(**kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        try:
+            kwargs["store"].load_run(kwargs["run_id"])
+        except Exception as error:  # noqa: BLE001 - the assertion reports it
+            store_errors.append(error)
+        return integrate_recorder(**kwargs)
+
+    monkeypatch.setattr(integration, "integrate_milestone", slow_integrate)
+
+    async def scenario() -> bool:
+        task = asyncio.create_task(
+            orchestrate._run_milestone_async(
+                shape["milestone"],
+                repo_dir=project,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                driver=FakeDriver(),
+                clock=lambda: STARTED_AT,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.2)
+        unwound_early = task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return unwound_early
+
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        unwound_early = asyncio.run(scenario())
+    finally:
+        release.set()
+        grafo_logger.setLevel(level_before)
+
+    assert unwound_early is False
+    assert store_errors == []
+    assert len(integrate_recorder.calls) == 1
 
 
 @requires_git

@@ -52,7 +52,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 import grafo
 
@@ -88,6 +88,10 @@ handler; `supervise` silences it so stdout stays one JSON line (T6)."""
 LaneKind = Literal["done", "escalated", "stopped", "pending"]
 """How one story's lane ended (supervisor-tree T6): finished, escalated, stopped
 (parked by the stop, or saw it before a subtask), or never started by the tree."""
+
+
+T = TypeVar("T")
+"""An item `build_dag_tree` turns into one grafo node."""
 
 
 @dataclass(frozen=True)
@@ -1408,6 +1412,54 @@ async def run_until_killed(
     await running
 
 
+async def build_dag_tree(
+    items: Sequence[T],
+    *,
+    id_of: Callable[[T], str],
+    blockers_of: Callable[[T], Sequence[str]],
+    node_factory: Callable[[T], Callable[..., Awaitable[Any]]],
+    forward: Callable[[T], str | None] | None = None,
+) -> tuple[dict[str, grafo.Node], list[grafo.Node]]:
+    """Build the grafo nodes and edges for `items`, and pick the executor's roots.
+
+    One `grafo.Node` per item, `uuid=id_of(item)`, `timeout=None` always
+    (grafo's 60 s default would cancel a long-running node). `nodes_by_id` is
+    keyed by `id_of(item)`, in `items` order.
+
+    An item with exactly one blocker gets one edge from that blocker. Its
+    output is forwarded as `forward(blocker_item)` -- `forward` is handed the
+    blocker item, not its id -- or not at all when `forward` is `None` or
+    returns `None`.
+
+    An item with two or more blockers gets no incoming edge and is one of the
+    executor's roots itself: grafo's dynamic worker pool can starve a
+    2+-parent join forever when an unrelated sibling node is still in flight
+    (confirmed in the pinned grafo release; not fixed here). This helper
+    creates no events and does no waiting: the coroutine `node_factory`
+    builds for such an item must wait on its blockers itself.
+
+    `roots` is, in `items` order, every item with no blocker plus every item
+    with two or more. A blocker id not among `items` is the caller's to
+    avoid; nothing is filtered or validated. Empty `items` gives `({}, [])`.
+    """
+    nodes = {
+        id_of(item): grafo.Node(coroutine=node_factory(item), uuid=id_of(item), timeout=None)
+        for item in items
+    }
+    items_by_id = {id_of(item): item for item in items}
+    roots: list[grafo.Node] = []
+    for item in items:
+        blockers = blockers_of(item)
+        if len(blockers) == 1:
+            (blocker,) = blockers
+            parent = nodes[blocker]
+            name = None if forward is None else forward(items_by_id[blocker])
+            await parent.connect(nodes[id_of(item)], forward=name)
+        else:
+            roots.append(nodes[id_of(item)])
+    return nodes, roots
+
+
 async def supervise(
     plan: SupervisorPlan,
     *,
@@ -1421,23 +1473,26 @@ async def supervise(
     runner_factory: runs.RunnerFactory | None,
     max_concurrent: int,
     stop: StopSignal,
+    slots: asyncio.Semaphore | None = None,
 ) -> list[LaneOutcome]:
     """Run every census story as a grafo node and collect the outcomes (T1, T6).
 
-    One `grafo.Node` per story, `uuid=story.id`, `timeout=None` always (grafo's
-    60 s default would cancel a lane mid-phase). One edge per in-milestone
-    blocker, forwarding the blocker's tip as `tip_<short id>`, for a story
-    whose root is a single blocker. A story rooted on a `merged` base (two or
-    more in-milestone blockers) is instead one of the executor's roots itself,
-    with no incoming edge: grafo's dynamic worker pool can starve a 2+-parent
-    join forever when an unrelated sibling lane is still in flight (confirmed
-    outside this module, in the pinned grafo release; not a `dag`/`bases`
-    defect, and out of scope to fix in grafo). Its lane instead waits on each
-    blocker's own completion, signalled by `story_done`/`story_ok` below, and
-    reads the blocker's tip off `plan.tips` (`blocker_tips`); every lane sets
-    its own signal on exit, success or not, so this never hangs. The
-    executor's roots are therefore the stories with no in-milestone blocker,
-    plus every merged-root story; a milestone with no story has no tree to run.
+    The tree comes from `build_dag_tree` over `plan.stories`, each story's
+    blockers being its `plan.roots` in-milestone blockers: one node per story,
+    one edge per single-blocker story forwarding the blocker's tip as
+    `tip_<short id>`, and every story rooted on a `merged` base (two or more
+    in-milestone blockers) as an extra executor root, for the grafo
+    join-starvation reason `build_dag_tree` documents (a grafo limitation,
+    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's
+    own completion, signalled by `story_done`/`story_ok` below, and reads the
+    blocker's tip off `plan.tips` (`blocker_tips`); every lane sets its own
+    signal on exit, success or not, so this never hangs. A milestone with no
+    story has no tree to run.
+
+    `slots` is the semaphore every lane takes its slot from: when given it is
+    used as is, so concurrent `supervise` calls handed the same one share one
+    budget and `max_concurrent` sizes nothing; when omitted this call makes its
+    own `asyncio.Semaphore(max_concurrent)`, as a solo run always has.
 
     A lane that dies of a `BaseException` other than a cancellation ends the
     whole call at once, re-raised by `run_until_killed`: grafo alone would
@@ -1451,7 +1506,8 @@ async def supervise(
     level_before = grafo_logger.level
     grafo_logger.setLevel(logging.CRITICAL)
     try:
-        slots = asyncio.Semaphore(max_concurrent)
+        if slots is None:
+            slots = asyncio.Semaphore(max_concurrent)
         finished: dict[str, LaneOutcome] = {}
         story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
         story_ok: dict[str, bool] = {}
@@ -1494,23 +1550,13 @@ async def supervise(
 
             return run
 
-        nodes = {
-            story.id: grafo.Node(coroutine=node_coroutine(story), uuid=story.id, timeout=None)
-            for story in plan.stories
-        }
-        for story in plan.stories:
-            root_plan = plan.roots[story.id]
-            if root_plan.kind == "merged":
-                continue
-            for blocker in root_plan.blockers:
-                await nodes[blocker].connect(
-                    nodes[story.id], forward=f"tip_{dag.short_id(blocker)}"
-                )
-        roots = [
-            nodes[story.id]
-            for story in plan.stories
-            if not plan.roots[story.id].blockers or plan.roots[story.id].kind == "merged"
-        ]
+        nodes, roots = await build_dag_tree(
+            items=plan.stories,
+            id_of=lambda story: story.id,
+            blockers_of=lambda story: plan.roots[story.id].blockers,
+            node_factory=node_coroutine,
+            forward=lambda blocker: f"tip_{dag.short_id(blocker.id)}",
+        )
         errors: list[BaseException] = []
         if roots:
             executor = grafo.TreeExecutor(uuid=run_id, roots=roots)
@@ -1657,6 +1703,77 @@ def run_milestone(
             raise ValueError(
                 "a fresh milestone run needs a milestone, a base branch and a branch prefix"
             )
+    return asyncio.run(
+        _run_milestone_async(
+            milestone,
+            repo_dir=repo_dir,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            max_concurrent=max_concurrent,
+            resume_run_id=resume_run_id,
+            control_interval=control_interval,
+        )
+    )
+
+
+async def _in_thread_to_completion(function: Callable[..., T], /, **kwargs: Any) -> T:
+    """Await `function(**kwargs)` on a worker thread, and never unwind before it returns.
+
+    A thread cannot be cancelled, so a cancel arriving while it runs is held
+    until the thread finishes and only then re-raised: the caller's `finally`
+    blocks (closing the store, releasing the lease) never run under a call
+    that is still using them. The thread's own result or exception is dropped
+    once the caller has been cancelled.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(function, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                continue
+        if not future.cancelled():
+            future.exception()  # retrieved, so it is not logged as never retrieved
+        raise
+
+
+async def _run_milestone_async(
+    milestone: str | None,
+    *,
+    repo_dir: Path,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    max_concurrent: int = 1,
+    resume_run_id: str | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+    slots: asyncio.Semaphore | None = None,
+) -> dict[str, Any]:
+    """`run_milestone`'s body without its argument validation, awaitable in a
+    caller's own event loop.
+
+    A caller that skips `run_milestone` must validate its own arguments first:
+    a fresh run needs `max_concurrent >= 1` and a `milestone`, `base_branch`
+    and `branch_prefix`. `slots`, when given, is forwarded to `supervise` and
+    bounds this run's lanes instead of `max_concurrent`, so several runs can
+    share one semaphore; `None` lets `supervise` make its own
+    `asyncio.Semaphore(max_concurrent)`, as `run_milestone` does. The run is
+    still recorded with `max_concurrent`. Board reads and `refresh_git` stay
+    synchronous on the loop thread; Integrate stays a synchronous call but runs
+    on a worker thread (see its call site), and a cancel arriving meanwhile
+    waits for it to return before this coroutine unwinds.
+    """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
     if resumed is not None:
@@ -1741,33 +1858,32 @@ def run_milestone(
 
             # `controlled` only ever parks the run through `stop` (C3); it
             # closes the window and runs a final sweep before returning.
-            outcomes = asyncio.run(
-                control.controlled(
-                    supervise(
-                        supervisor_plan(
-                            plan.stories,
-                            levels,
-                            rows,
-                            branch_prefix=branch_prefix,
-                            base_branch=base_branch,
-                            checkpoints=checkpoints,
-                        ),
-                        store=store,
-                        run_id=run_id,
-                        lease_token=lease.token,
-                        root=root,
-                        drive=drive,
-                        commands=list(commands),
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        max_concurrent=max_concurrent,
-                        stop=stop,
+            outcomes = await control.controlled(
+                supervise(
+                    supervisor_plan(
+                        plan.stories,
+                        levels,
+                        rows,
+                        branch_prefix=branch_prefix,
+                        base_branch=base_branch,
+                        checkpoints=checkpoints,
                     ),
                     store=store,
+                    run_id=run_id,
+                    lease_token=lease.token,
+                    root=root,
+                    drive=drive,
+                    commands=list(commands),
+                    allow_no_verification=allow_no_verification,
+                    runner_factory=runner_factory,
+                    max_concurrent=max_concurrent,
                     stop=stop,
-                    lease=lease,
-                    interval=control_interval,
-                )
+                    slots=slots,
+                ),
+                store=store,
+                stop=stop,
+                lease=lease,
+                interval=control_interval,
             )
             # Wave order, census order within a wave, never finish order.
             for outcome in outcomes:
@@ -1852,7 +1968,17 @@ def run_milestone(
             # so a test can replace it, as `driver` is. It needs a factory for a
             # conflicting tip; `None` is production's, read off `cli` now.
             factory = cli.default_runner_factory if runner_factory is None else runner_factory
-            outcome = integration.integrate_milestone(
+            # `integrate_milestone` stays a synchronous call (I6); it is run on a
+            # worker thread, not the loop thread, only because its conflict
+            # resolver (`runtime_engine.run_subtask`) makes its own nested
+            # `asyncio.run(...)` call, which `asyncio.run` refuses once this
+            # coroutine is already running on the loop thread. `Store`'s
+            # connection is `check_same_thread=False` for exactly this kind of
+            # cross-thread, strictly sequential use (store.py).
+            # A cancel waits for that thread, so the store and lease below
+            # outlive it (`_in_thread_to_completion`).
+            outcome = await _in_thread_to_completion(
+                integration.integrate_milestone,
                 stories=plan.stories,
                 repo_dir=root,
                 base_branch=base_branch,
