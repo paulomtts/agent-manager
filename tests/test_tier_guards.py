@@ -588,3 +588,14 @@ def test_missing_binaries_skip_their_tier_and_leave_unmarked_tests_alone(pyteste
 
     assert _skip_count("the brd CLI must be installed for the brd tier") == 1
     assert _skip_count("the git CLI must be installed for the git tier") == 2
+
+
+E2E_CONFTEST = Path(__file__).resolve().parent / "e2e" / "conftest.py"
+
+
+def test_the_e2e_toolchain_gate_uses_the_shared_binary_check():
+    source = E2E_CONFTEST.read_text(encoding="utf-8")
+    assert "from conftest import BINARY_TIERS, missing_binary" in source
+    assert "missing_binary(BINARY_TIERS)" in source
+    assert 'pytest.skip(f"the {missing} CLI must be installed for the e2e tier")' in source
+    assert "shutil.which" not in source
