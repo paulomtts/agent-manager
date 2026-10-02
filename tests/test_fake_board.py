@@ -358,17 +358,11 @@ def test_set_status_blocked_is_refused_like_brd(fake_board):
     assert fake_board.writes == []
 
 
-def test_a_comment_body_with_a_link_is_recorded_without_indexing(fake_board):
-    # comments._ref (B4) legitimately writes [[card_id]] backlinks into real
-    # run-end comments; the production write path records the body as-is and
-    # does not refuse it (unlike the seeding helpers, which do -- see
-    # test_seeding_an_invalid_comment_fails_loudly's "link" case).
+def test_a_comment_body_with_a_link_fails_loudly(fake_board):
     card = fake_board.add_card("Add FakeBoard")
-    comment_id = board.comment_add(card, "see [[other-card]]")
-    assert fake_board.writes == [("comment_add", card, "see [[other-card]]", "am")]
-    [comment] = fake_board.comments
-    assert comment.id == comment_id
-    assert comment.body == "see [[other-card]]"
+    with pytest.raises(AssertionError, match=r"\[\[link\]\]"):
+        board.comment_add(card, "see [[other-card]]")
+    assert fake_board.writes == []
 
 
 @pytest.mark.parametrize(

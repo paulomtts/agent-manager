@@ -123,12 +123,7 @@ class _FakeBrdError(Exception):
 
 
 def _refuse_links(text: str | None, where: str) -> None:
-    """Fail loudly on a `[[link]]` in SEEDED test data: real brd indexes it as a
-    ref, FakeBoard does not. Guards against a test author accidentally writing
-    seed data that assumes backlink indexing. Not called from `_comment_add`
-    (the production `run_brd` write path): `comments._ref` (B4) legitimately
-    writes `[[card_id]]` into real run-end comment bodies (escalated/parked/
-    integrate-failed), and that is not a test-authoring mistake to catch."""
+    """Fail loudly on a `[[link]]`: real brd indexes it as a ref, FakeBoard does not."""
     if text is not None and "[[" in text:
         raise AssertionError(
             f"FakeBoard {where}: {text!r} contains a [[link]]; real brd would "
@@ -316,6 +311,7 @@ class FakeBoard:
         self._require_entity(card_id)
         if not body.strip():
             raise _FakeBrdError("EmptyCommentError", "comment body is empty")
+        _refuse_links(body, "comment add body")
         comment = _FakeComment(
             id=str(uuid.uuid4()),
             entity_id=card_id,
