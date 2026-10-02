@@ -286,13 +286,7 @@ def test_the_real_claude_drives_two_independent_stories_in_parallel(
     """The whole deliverable: a real `claude -p` takes two independent stories
     to `done` side by side, each on its own branch cut from `main`, each
     subtask's commits carrying one Plan-Hash, the toy suite green on both
-    tips, `main` untouched, and the two implement phases overlapping.
-
-    justification: verifies real process-level concurrency between two
-    independently-spawned `claude -p` processes actually overlapping in wall
-    time -- a fake-claude stand-in's near-instant, deterministic replies
-    cannot exercise genuine scheduling/timing overlap between two real
-    external processes."""
+    tips, `main` untouched, and the two implement phases overlapping."""
     # `.get`, not `[...]`: an escalation payload has no `completed`.
     assert completed_run.get("done") is True, (
         completed_run.get("story"),

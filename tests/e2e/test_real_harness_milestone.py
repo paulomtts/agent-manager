@@ -265,12 +265,7 @@ def test_the_real_claude_drives_a_two_story_milestone_to_done(
 ):
     """The whole deliverable: a real `claude -p` takes both stories to `done`,
     stacked branch on branch, each subtask's commits carrying one Plan-Hash,
-    with the toy suite green on the last tip and `main` untouched.
-
-    justification: verifies the full stacked-branch milestone flow survives
-    the real CLI's actual output variability and timing across several
-    sequential real dispatches -- a fake-claude stand-in's fixed, instant
-    replies cannot exercise that variability."""
+    with the toy suite green on the last tip and `main` untouched."""
     # `.get`, not `[...]`: an escalation payload has no `status` or `completed`.
     assert completed_run.get("done") is True, (
         completed_run.get("story"),

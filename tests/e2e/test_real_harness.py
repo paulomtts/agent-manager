@@ -133,13 +133,7 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 ):
     """The whole deliverable: a real `claude -p` takes the toy subtask from
     `todo` to `done`, leaving a branch whose every commit carries one and the
-    same `Plan-Hash` trailer and whose every result file validates.
-
-    justification: verifies the harness's prompt/result-file contract against
-    the real `claude -p` CLI's actual behavior (argv, exit codes, tool
-    permissions, result-file handshake) -- a fake-claude stand-in's
-    deterministic replies cannot exercise whether the real model actually
-    complies with that contract."""
+    same `Plan-Hash` trailer and whose every result file validates."""
     assert completed_run["status"] == "done", (
         completed_run["failed_phase"],
         completed_run["detail"],
@@ -186,10 +180,6 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 
 def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
     """Non-vacuity: the pygents walk is the only one that checkpoints (its
-    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra.
-
-    justification: rides the same real-claude run as this module's main test
-    (no separate dispatch, no added cost); without it a refactor could make
-    the real run silently skip the pygents walk and nothing would notice."""
+    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra."""
     rows = checkpoint_rows(project, completed_run["run_id"])
     assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"

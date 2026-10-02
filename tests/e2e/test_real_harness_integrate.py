@@ -250,12 +250,7 @@ def test_the_real_claude_resolves_a_real_merge_conflict_at_integrate(
     """The whole deliverable: two real stories that rewrite the same line are
     folded into `e2e-real-i-integrate`, a real resolver finishes the conflicting
     merge, and git finds both functions, no markers, no merge in progress, a
-    clean tree and a green suite -- with `main` untouched and nothing pushed.
-
-    justification: verifies a real model genuinely resolving a real git merge
-    conflict through real tool calls -- a fake-claude stand-in never performs
-    actual reasoning over conflicting diffs, so it cannot exercise whether the
-    resolver role's prompt actually produces a correct resolution."""
+    clean tree and a green suite -- with `main` untouched and nothing pushed."""
     # 1. Done. `.get`, not `[...]`: an escalation payload has no `done`.
     assert completed_run.get("done") is True, (
         completed_run.get("phase"),
