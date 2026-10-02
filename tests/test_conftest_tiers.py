@@ -11,10 +11,18 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from conftest import TESTS_DIR, TIER_MARKERS, default_tier_marker, relative_to_tests
+from conftest import (
+    TESTS_DIR,
+    TIER_MARKERS,
+    default_tier_marker,
+    pytest_collection_modifyitems,
+    relative_to_tests,
+)
 
 
-def test_tier_markers_are_the_five_registered_tiers():
+def test_tier_markers_match_the_markers_registered_in_pyproject(pytestconfig):
+    registered = {line.split(":", 1)[0].strip() for line in pytestconfig.getini("markers")}
+    assert TIER_MARKERS <= registered
     assert TIER_MARKERS == frozenset({"git", "brd", "e2e_fake", "soak", "e2e"})
 
 
@@ -91,3 +99,63 @@ def test_relative_to_tests_accepts_an_explicit_tests_dir(tmp_path):
     rel = relative_to_tests(str(tmp_path / "e2e" / "test_x.py"), tests_dir=tmp_path)
     assert rel is not None
     assert rel.parts == ("e2e", "test_x.py")
+
+
+class _Mark:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeItem:
+    """Just the surface the hook touches: `path`, the marker chain, `add_marker`.
+
+    `own_markers` stays empty while `chain` stands in for markers inherited from a
+    class or a module `pytestmark`, so a hook reading only `own_markers` is caught.
+    """
+
+    def __init__(self, path, chain=()):
+        self.path = path
+        self.own_markers = []
+        self._chain = [_Mark(name) for name in chain]
+        self.added = []
+
+    def iter_markers(self, name=None):
+        return iter(m for m in self._chain if name is None or m.name == name)
+
+    def add_marker(self, marker):
+        self.added.append(marker)
+
+
+def test_hook_marks_an_unmarked_e2e_item_e2e_fake():
+    item = _FakeItem(TESTS_DIR / "e2e" / "test_x.py")
+    pytest_collection_modifyitems(None, [item])
+    assert item.added == ["e2e_fake"]
+
+
+def test_hook_marks_an_unmarked_steps_item_git():
+    item = _FakeItem(TESTS_DIR / "steps" / "test_worktree.py")
+    pytest_collection_modifyitems(None, [item])
+    assert item.added == ["git"]
+
+
+def test_hook_reads_the_inherited_marker_chain_not_only_own_markers():
+    item = _FakeItem(TESTS_DIR / "e2e" / "test_real_harness.py", chain=["skipif", "e2e"])
+    pytest_collection_modifyitems(None, [item])
+    assert item.added == []
+
+
+def test_hook_leaves_top_level_and_outside_items_alone():
+    top = _FakeItem(TESTS_DIR / "test_cli.py")
+    outside = _FakeItem(TESTS_DIR.parent / "e2e" / "test_x.py")
+    pytest_collection_modifyitems(None, [top, outside])
+    assert top.added == []
+    assert outside.added == []
+
+
+def test_hook_decides_each_item_in_a_shared_module_independently():
+    path = TESTS_DIR / "steps" / "test_rollup.py"
+    plain = _FakeItem(path)
+    brd = _FakeItem(path, chain=["brd"])
+    pytest_collection_modifyitems(None, [plain, brd])
+    assert plain.added == ["git"]
+    assert brd.added == []
