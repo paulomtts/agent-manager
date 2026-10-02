@@ -937,6 +937,22 @@ def dry_run_milestone(
     )
 
 
+def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], str]:
+    """Run-board spec 3.2: how one milestone's branch prefix is derived under `--board`.
+
+    With `--branch-prefix` omitted the prefix is the milestone card's own
+    `dag.task_stem`; given, it is `<branch_prefix>-<stem>`, never the given
+    value verbatim, so two milestones can never share it. Checking the result
+    (blank, shared) is `orchestrate.board_prefixes`'s job, not this one's.
+    """
+
+    def prefix_of(card: models.CardNode) -> str:
+        stem = dag.task_stem(card)
+        return stem if branch_prefix is None else f"{branch_prefix}-{stem}"
+
+    return prefix_of
+
+
 HANDLED: tuple[type[BaseException], ...] = (
     CliError,
     board.BoardError,

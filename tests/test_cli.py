@@ -3313,6 +3313,26 @@ def test_an_unhandled_error_from_a_milestone_run_crashes_loudly(tmp_path, monkey
     assert '"ok"' not in result.stdout
 
 
+BOARD_CARD = models.CardNode(id=SOME_CARD, title="Milestone 14: run the board", status="todo")
+"""A milestone root for the prefix tests. Its id is a real UUID, so `dag.task_stem` accepts it."""
+
+
+def test_board_prefix_of_without_a_prefix_is_the_milestones_own_stem():
+    """Spec 3.2: with --branch-prefix omitted, each milestone's prefix is its card stem."""
+    prefix_of = cli.board_prefix_of(None)
+
+    assert prefix_of(BOARD_CARD) == dag.task_stem(BOARD_CARD)
+    assert prefix_of(BOARD_CARD).endswith("cbe34d00")
+
+
+def test_board_prefix_of_with_a_prefix_joins_it_to_the_stem_and_never_reuses_it_verbatim():
+    """Spec 3.2: a given prefix is `<prefix>-<stem>`, so two milestones never share it."""
+    prefix_of = cli.board_prefix_of("sprint9")
+
+    assert prefix_of(BOARD_CARD) == f"sprint9-{dag.task_stem(BOARD_CARD)}"
+    assert prefix_of(BOARD_CARD) != "sprint9"
+
+
 @pytest.mark.parametrize(
     "first", ["agent_manager.cli", "agent_manager.orchestrate", "agent_manager.integration"]
 )
