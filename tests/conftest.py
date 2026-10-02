@@ -259,6 +259,15 @@ class FakeBoard:
                 return [self._node(self._require_card(card_id))]
             case ["brd", "tree"] if stdin is None:
                 return [self._node(card) for card in self._children_of(None)]
+            case ["brd", "update", card_id, "--status", status] if stdin is None:
+                return self._update_status(card_id, status)
+            case ["brd", "comment", "add", card_id, "-", "--author", author] if (
+                stdin is not None
+            ):
+                return self._comment_add(card_id, stdin, author)
+            case ["brd", "comment", "list", card_id] if stdin is None:
+                self._require_entity(card_id)
+                return [self._comment_dict(c) for c in self._comments_of(card_id)]
         raise AssertionError(
             f"FakeBoard does not answer argv {argv!r} (stdin={stdin!r})"
         )
@@ -278,6 +287,41 @@ class FakeBoard:
                 "CardNotFoundError", f"no card, issue, or document with id {card_id}"
             )
         return self._detail(card)
+
+    def _require_entity(self, entity_id: str) -> None:
+        # brd's entities.require: what `comment add`/`comment list` check first.
+        if entity_id not in self.cards:
+            raise _FakeBrdError("EntityNotFoundError", f"no entity with id {entity_id}")
+
+    def _update_status(self, card_id: str, status: str) -> dict:
+        # brd's core.update_card: the card must exist, then `blocked` is refused.
+        card = self._require_card(card_id)
+        if status == "blocked":
+            raise _FakeBrdError(
+                "InvalidStatusError",
+                "status cannot be set to 'blocked' directly; it is derived",
+            )
+        card.status = status
+        card.updated_at = self._now()
+        self.writes.append(("set_status", card_id, status))
+        return self._detail(card)
+
+    def _comment_add(self, card_id: str, body: str, author: str) -> dict:
+        # brd's comments.add: the entity must exist, then a blank body is refused.
+        self._require_entity(card_id)
+        if not body.strip():
+            raise _FakeBrdError("EmptyCommentError", "comment body is empty")
+        _refuse_links(body, "comment add body")
+        comment = _FakeComment(
+            id=str(uuid.uuid4()),
+            entity_id=card_id,
+            author=author,
+            body=body,
+            created_at=self._now(),
+        )
+        self.comments.append(comment)
+        self.writes.append(("comment_add", card_id, body, author))
+        return self._comment_dict(comment)
 
     def _children_of(self, parent_id: str | None) -> list[_FakeCard]:
         # brd: ORDER BY created_at (a stable sort keeps insertion order on ties).
