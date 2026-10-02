@@ -13,6 +13,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import asyncio
+import io
 import inspect
 import json
 import os
@@ -8208,3 +8209,25 @@ def test_watch_follow_closed_pipe_exits_zero_quietly(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
     assert _stream(result) == [_hello(tmp_path)]
+
+
+def test_watch_follow_closed_pipe_points_stdout_at_devnull(monkeypatch):
+    # The interpreter flushes stdout once more at exit; once the reader has
+    # gone, that flush must land on /dev/null, not on the dead pipe.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    with os.fdopen(write_end, "w") as dead_pipe:
+        monkeypatch.setattr(sys, "stdout", dead_pipe)
+        cli._silence_stdout()
+        target = os.fstat(dead_pipe.fileno())
+        devnull = os.stat(os.devnull)
+        assert (target.st_dev, target.st_ino) == (devnull.st_dev, devnull.st_ino)
+        dead_pipe.write("after the reader left\n")
+        dead_pipe.flush()  # would raise BrokenPipeError on the pipe
+
+
+def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkeypatch):
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    cli._silence_stdout()
+    assert sys.stdout is buffer
