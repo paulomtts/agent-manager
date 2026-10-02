@@ -2362,78 +2362,79 @@ def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
     }
 
 
-@requires_git
-@requires_brd
-def test_repeated_verify_options_reach_run_card_in_command_line_order(
-    project, cards, monkeypatch
-):
+VERIFY_CARD_ID = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
+VERIFY_STORY_ID = "story-1"
+"""Literal ids for the tests that replace `run_card` outright: the card is never
+looked up, so no repo or board is built for it (test-tier V5)."""
+
+
+def test_repeated_verify_options_reach_run_card_in_command_line_order(tmp_path, monkeypatch):
     """§12's suite is the caller's to supply, and the engine runs the commands in
     sequence -- so the order the operator typed is behaviour, not decoration."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen["card_id"] = card_id
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
     result = _invoke(
-        project,
-        cards["subtask"],
+        tmp_path,
+        VERIFY_CARD_ID,
         "--verify",
         "uv run pytest",
         "--verify",
         "uv run ruff check",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
 
 
-@requires_git
-@requires_brd
-def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
+def test_no_verify_option_means_an_empty_command_list_not_none(tmp_path, monkeypatch):
     """`gate_context` calls `list(commands)` and `verification_gate` tells an
     empty suite apart from a missing one, so `None` here would be a crash or a
     silently different verdict."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
-    result = _invoke(project, cards["subtask"])
+    result = _invoke(tmp_path, VERIFY_CARD_ID)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert seen["commands"] == []
 
 
-@requires_git
-@requires_brd
 def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
-    project, cards, monkeypatch
+    tmp_path, monkeypatch
 ):
     """Review Focus: one occurrence is one whole command string. The CLI does no
     word-splitting, no parsing and no validation -- whether a command is nonsense
     is the engine's business, not this layer's."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
     result = _invoke(
-        project,
-        cards["subtask"],
+        tmp_path,
+        VERIFY_CARD_ID,
         "--verify",
         "uv run pytest -k 'not slow'",
         "--verify",
         "",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
 
 
