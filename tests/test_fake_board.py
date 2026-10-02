@@ -412,3 +412,16 @@ def test_seeding_an_invalid_comment_fails_loudly(fake_board, card_id, body, matc
         fake_board.add_comment(card_id or card, body)
     assert fake_board.comments == []
 
+
+
+def test_a_parent_blocked_by_its_own_child_resolves_like_brd(fake_board):
+    # Real brd accepts `brd block <parent> --by <child>` and then reports both
+    # cards blocked: resolving the child walks to the parent, whose blocker is
+    # the child again, and brd's resolve_status cuts that loop as `todo`.
+    parent = fake_board.add_card("parent")
+    child = fake_board.add_card("child", parent_id=parent)
+    fake_board.cards[parent].blocked_by.append(child)
+
+    assert board.show(child).status == "blocked"
+    assert board.show(parent).status == "blocked"
+    assert board.tree(parent).children[0].status == "blocked"
