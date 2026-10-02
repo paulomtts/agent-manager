@@ -1177,3 +1177,52 @@ def test_board_comment_is_a_frozen_plain_dataclass():
     ]
     with pytest.raises(dataclasses.FrozenInstanceError):
         comment.body = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("call", "argv", "stdin"),
+    [
+        (lambda d: board.show("c1", repo_dir=d), board.show_argv("c1"), None),
+        (lambda d: board.tree("c1", repo_dir=d), board.tree_argv("c1"), None),
+        (lambda d: board.roots(repo_dir=d), board.roots_argv(), None),
+        (
+            lambda d: board.set_status("c1", "done", repo_dir=d),
+            board.set_status_argv("c1", "done"),
+            None,
+        ),
+        (
+            lambda d: board.comment_add("c1", "hello", repo_dir=d),
+            board.comment_add_argv("c1", "am"),
+            "hello",
+        ),
+        (
+            lambda d: board.comment_list("c1", repo_dir=d),
+            board.comment_list_argv("c1"),
+            None,
+        ),
+    ],
+    ids=["show", "tree", "roots", "set_status", "comment_add", "comment_list"],
+)
+def test_every_public_function_runs_brd_through_the_run_brd_seam(
+    call, argv, stdin, tmp_path, monkeypatch
+):
+    # Unit tier: the seam is replaced after import, so this only passes if each
+    # public function looks `run_brd` up at call time and calls it positionally
+    # as (argv, repo_dir, stdin). The fake's `ok: false` envelope must still go
+    # through `_decode`, surfacing as a `BoardError` carrying brd's error type.
+    calls: list[tuple[object, ...]] = []
+
+    def fake(*args, **kwargs):
+        assert kwargs == {}
+        calls.append(args)
+        envelope = {"ok": False, "error": {"type": "FakeError", "message": "faked"}}
+        return subprocess.CompletedProcess(list(args[0]), 1, json.dumps(envelope), "")
+
+    monkeypatch.setattr(board, "run_brd", fake)
+
+    with pytest.raises(board.BoardError) as excinfo:
+        call(tmp_path)
+
+    assert calls == [(argv, tmp_path, stdin)]
+    assert excinfo.value.error_type == "FakeError"
+    assert excinfo.value.message == "faked"
