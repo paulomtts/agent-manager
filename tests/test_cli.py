@@ -1306,6 +1306,7 @@ def fake_runner(seen: list[tuple[str, dict[str, Any]]] | None = None, fail: str 
     return runner
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_run_card_drives_the_task_workflow_to_done(project, cards):
@@ -1324,6 +1325,7 @@ def test_run_card_drives_the_task_workflow_to_done(project, cards):
     assert payload["detail"] is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_run_card_really_moves_the_card_on_the_board(project, cards):
@@ -1345,6 +1347,7 @@ def test_run_card_really_moves_the_card_on_the_board(project, cards):
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
@@ -1366,6 +1369,7 @@ def test_run_card_derives_its_branch_and_worktree_from_dag(project, cards):
     assert Path(payload["worktree"]).is_dir()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards, monkeypatch):
@@ -1383,6 +1387,7 @@ def test_a_relative_repo_dir_still_produces_an_absolute_worktree(project, cards,
     assert payload["status"] == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, cards):
@@ -1404,6 +1409,7 @@ def test_run_card_hands_the_engine_the_gate_parameters_task_yaml_binds(project, 
     assert context["provided_verification"] is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
@@ -1485,6 +1491,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
     }
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards):
@@ -1915,6 +1922,7 @@ def _invoke(project: Path, card_id: str, *extra: str):
     )
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
@@ -1928,6 +1936,7 @@ def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkey
     assert "\n" not in result.stdout.strip()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
@@ -1939,6 +1948,7 @@ def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
     assert json.loads(result.stdout)["data"]["status"] == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatch):
@@ -1962,6 +1972,7 @@ def _fail_board_writes(monkeypatch) -> None:
     monkeypatch.setattr(cli.board, "set_status", refuse)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
@@ -1984,6 +1995,7 @@ def test_a_failed_best_effort_board_phase_shows_up_in_warnings(
     assert any("mark_done" in warning for warning in payload["warnings"])
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
@@ -2018,6 +2030,7 @@ def test_the_runners_own_warnings_join_the_summarys_in_the_payload(
     assert any("mark_done" in warning for warning in payload["warnings"])
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards):
@@ -2042,6 +2055,7 @@ def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards)
     assert row[0].startswith("2026-09-23T14:05:06")
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
@@ -2074,6 +2088,7 @@ def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
     assert subtask_row == (cards["subtask"], payload["branch"], "main", "done")
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_no_run_artifact_is_written_inside_the_repository(project, cards):
@@ -2099,6 +2114,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
     assert (paths.run_dir(payload["run_id"]) / "journal.jsonl").is_file()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
@@ -2118,6 +2134,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
     ]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards):
@@ -2152,6 +2169,7 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
         conn.close()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_unknown_card_is_an_envelope_with_brds_own_message(project, cards, monkeypatch):
@@ -2166,6 +2184,7 @@ def test_an_unknown_card_is_an_envelope_with_brds_own_message(project, cards, mo
     assert not (paths.data_dir() / "runs").exists()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_parentless_card_is_refused_before_a_run_exists(project, cards, monkeypatch):
@@ -2179,6 +2198,7 @@ def test_a_parentless_card_is_refused_before_a_run_exists(project, cards, monkey
     assert not (paths.data_dir() / "runs").exists()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_failing_parent_lookup_is_an_envelope_and_leaves_no_run_directory(
@@ -2224,6 +2244,7 @@ def test_a_repo_dir_that_is_not_a_directory_is_an_envelope(tmp_path, monkeypatch
     assert "missing" in envelope["error"]["message"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
@@ -2250,6 +2271,7 @@ def test_a_card_id_that_is_not_a_uuid_is_an_envelope_not_a_traceback(
     assert "not a card id" in envelope["error"]["message"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, monkeypatch):
@@ -2270,6 +2292,7 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
     assert "explore" in envelope["error"]["message"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_no_harness_is_ever_launched(project, cards, monkeypatch):
@@ -2292,6 +2315,7 @@ def test_no_harness_is_ever_launched(project, cards, monkeypatch):
     assert payload["status"] == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_allow_no_verification_flips_the_gate_the_cli_supplies_arguments_for(
@@ -2358,6 +2382,7 @@ def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
     }
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_repeated_verify_options_reach_run_card_in_command_line_order(
@@ -2386,6 +2411,7 @@ def test_repeated_verify_options_reach_run_card_in_command_line_order(
     assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
@@ -2405,6 +2431,7 @@ def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, m
     assert seen["commands"] == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
@@ -2433,6 +2460,7 @@ def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
     assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_verify_values_reach_the_gate_context_through_the_real_run_card(
@@ -2463,6 +2491,7 @@ def test_verify_values_reach_the_gate_context_through_the_real_run_card(
     assert context["provided_verification"] is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
@@ -2493,6 +2522,7 @@ def test_run_without_branch_prefix_is_a_usage_error_not_an_envelope(
     assert not (paths.data_dir() / "runs").exists()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
@@ -2524,6 +2554,7 @@ def test_the_branch_prefix_the_operator_gave_lands_in_the_payloads_branch(
     assert data["branch"].startswith("m2/")
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_run_success_envelope_keys_are_frozen(project, cards, monkeypatch):
@@ -2687,6 +2718,7 @@ def _assert_nothing_written(project: Path, porcelain_before: str) -> None:
     assert _git(project, "status", "--porcelain") == porcelain_before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
@@ -2736,6 +2768,7 @@ def test_the_milestone_dry_run_stacks_each_story_on_the_previous_ones_tip(
     assert board.roots(repo_dir=project) == board_before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_done_work_is_already_done_and_still_anchors_the_stack(
@@ -2782,6 +2815,7 @@ def test_done_work_is_already_done_and_still_anchors_the_stack(
     assert board.roots(repo_dir=project) == board_before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_milestone_dry_run_shows_the_integrate_plan_and_writes_nothing(
@@ -2817,6 +2851,7 @@ def test_the_milestone_dry_run_shows_the_integrate_plan_and_writes_nothing(
     assert board.roots(repo_dir=project) == board_before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_title_substring_names_the_same_milestone_as_its_id(
@@ -2832,6 +2867,7 @@ def test_a_title_substring_names_the_same_milestone_as_its_id(
     assert json.loads(by_title.stdout) == json.loads(by_id.stdout)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
@@ -2847,6 +2883,7 @@ def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 @pytest.mark.parametrize("extra, bound", [((), 4), (("--max-concurrent", "3"), 3)])
@@ -2912,6 +2949,7 @@ def _refusal(result) -> dict[str, Any]:
     return envelope["error"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_story_cycle_from_the_board_is_an_envelope_naming_both_stories(
@@ -2958,6 +2996,7 @@ def test_a_story_cycle_from_the_board_is_an_envelope_naming_both_stories(
     _assert_nothing_written(project, porcelain_before)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
@@ -2983,6 +3022,7 @@ def test_a_story_cycle_in_the_census_is_named_as_a_trail_by_the_dag_check(
     _assert_nothing_written(project, porcelain_before)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monkeypatch):
@@ -3020,6 +3060,7 @@ def test_a_story_blocked_by_two_stories_dry_runs_on_a_merged_base(project, monke
     _assert_nothing_written(project, porcelain_before)
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_unknown_milestone_is_an_envelope(project, milestone_board, monkeypatch):
@@ -4561,6 +4602,7 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
     return run_id
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(project, cards):
@@ -4583,6 +4625,7 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):
@@ -4597,6 +4640,7 @@ def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards)
     assert [row for row in _attempt_rows(project) if row[5] == "started"] == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
@@ -4639,6 +4683,7 @@ def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
     assert found[0].author == "am"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
@@ -4677,6 +4722,7 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     assert payload["warnings"][0] == ours[0]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
@@ -4702,6 +4748,7 @@ def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
@@ -4728,6 +4775,7 @@ def test_a_pygents_resume_of_a_done_checkpoint_writes_nothing(project, cards):
     assert _resume_state(project) == before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project, cards):
@@ -4757,6 +4805,7 @@ def test_a_pygents_resume_refuses_a_phase_escalation_and_writes_nothing(project,
     assert _resume_state(project) == before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards):
@@ -4780,6 +4829,7 @@ def test_a_pygents_resume_across_a_workflow_change_writes_nothing(project, cards
     assert [(row[4], row[5]) for row in plan] == [(1, "started")]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
@@ -4803,6 +4853,7 @@ def test_a_pygents_resume_across_a_workflow_change_is_an_envelope_at_exit_three(
     assert _resume_state(project) == before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkeypatch):
@@ -4823,6 +4874,7 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
     assert "\n" not in result.stdout.strip()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
@@ -4838,6 +4890,7 @@ def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
     assert json.loads(result.stdout)["data"]["status"] == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
@@ -4858,6 +4911,7 @@ def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, m
     assert envelope["data"]["resumed_from"] == "plan"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_resume_launches_no_harness(project, cards, monkeypatch):
@@ -5039,6 +5093,7 @@ def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "
         opened.close()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
@@ -5078,6 +5133,7 @@ def test_a_milestone_that_escalated_resumes_under_its_own_run_id(
     assert board.show(shape["b1"], repo_dir=project).status == "done"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
@@ -5096,6 +5152,7 @@ def test_a_milestone_resume_marks_an_orphan_attempt_harness_error(
     assert [(row[3], row[4], row[5]) for row in rows] == [("review", 1, "harness_error")]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_milestone_resume_across_a_workflow_change_is_exit_three_and_writes_nothing(
@@ -6008,6 +6065,7 @@ def _controlled_card_run(project: Path, cards: dict[str, str], factory) -> dict[
     )
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_paused_card_run_parks_after_the_running_phase(project, cards, control_applied):
@@ -6039,6 +6097,7 @@ def test_a_paused_card_run_parks_after_the_running_phase(project, cards, control
     assert _card_lease(project, run_id) is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
@@ -6066,6 +6125,7 @@ def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
     assert _card_lease(project, run_id) is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
@@ -6105,6 +6165,7 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     assert [row.command for row in _card_controls(project, run_id)] == ["cancel"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
@@ -6136,6 +6197,7 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
     ],
     ids=["pause", "cancel", "cancel-over-escalation", "pause-keeps-escalation"],
 )
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_control_and_an_escalation_follow_c6_at_the_command(
@@ -6165,6 +6227,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
     assert envelope["data"]["status"] == status
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, cards):
@@ -6205,6 +6268,7 @@ def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, card
     assert _card_controls(project, run_id) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
@@ -6250,6 +6314,7 @@ def _resume_card_run(project: Path, run_id: str, factory) -> dict[str, Any]:
     )
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
@@ -6285,6 +6350,7 @@ def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
     assert all(row.handled_at is not None for row in _card_controls(project, run_id))
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
@@ -6312,6 +6378,7 @@ def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
     assert json.loads(again.stdout)["error"]["type"] == "NotResumableError"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch):
@@ -6465,6 +6532,7 @@ def _recorded_run_ids(project: Path) -> list[str]:
         conn.close()
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
@@ -6508,6 +6576,7 @@ def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
     assert _git(project, "branch", "--format=%(refname:short)").split() == ["main"]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir(
@@ -6540,6 +6609,7 @@ def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_dead_claim_does_not_refuse(project, cards):
@@ -6567,6 +6637,7 @@ def test_a_dead_claim_does_not_refuse(project, cards):
     assert _claim_rows(project) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkeypatch):
@@ -6602,6 +6673,7 @@ def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkey
     assert held == [control.card_claim(cards["subtask"])]
 
 
+@pytest.mark.brd
 @pytest.mark.parametrize("outcome", ["done", "escalated", "raises"])
 @requires_git
 @requires_brd
@@ -6648,6 +6720,7 @@ def test_a_card_run_releases_its_claims_on_every_exit(project, cards, monkeypatc
     assert _card_lease(project, run_id) is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypatch):
@@ -6697,6 +6770,7 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
     assert _loaded(project, run_id).status == "started"
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
@@ -6725,6 +6799,7 @@ def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
     assert _claim_rows(project) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
@@ -6761,6 +6836,7 @@ def test_a_resume_refuses_a_card_another_live_run_claims_and_writes_nothing(
     assert _card_lease(project, run_id) is None
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
@@ -6788,6 +6864,7 @@ def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
@@ -6846,6 +6923,7 @@ def test_status_lists_the_claims_of_the_live_lease(projection, monkeypatch, hear
     assert (_lease(projection), _claim_rows(projection)) == before
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypatch):
@@ -6920,6 +6998,7 @@ def _run_card_with(project: Path, cards: dict[str, str], factory) -> dict[str, A
     )
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_done_card_run_leaves_one_done_comment_on_the_card_only(project, cards):
@@ -6940,6 +7019,7 @@ def test_a_done_card_run_leaves_one_done_comment_on_the_card_only(project, cards
     assert _card_outbox(project) == [(f"{run_id}/{card}/done", "posted")]
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_an_escalated_card_run_leaves_one_escalation_comment_with_the_phase(project, cards):
@@ -6960,6 +7040,7 @@ def test_an_escalated_card_run_leaves_one_escalation_comment_with_the_phase(proj
     assert board.comment_list(cards["milestone"], repo_dir=project) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
@@ -6985,6 +7066,7 @@ def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
     assert board.comment_list(cards["milestone"], repo_dir=project) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
@@ -7001,6 +7083,7 @@ def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
     assert _card_outbox(project) == []
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
@@ -7021,6 +7104,7 @@ def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
     assert "phase: spec" in board.comment_list(card, repo_dir=project)[0].body
 
 
+@pytest.mark.brd
 @requires_git
 @requires_brd
 def test_a_card_comment_the_board_refuses_is_a_warning_and_changes_nothing_else(

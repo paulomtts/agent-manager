@@ -265,6 +265,7 @@ def test_a_parent_reported_blocked_is_not_rewritten_to_todo(temp_board):
     assert result["rolled_up"] == []
 
 
+@pytest.mark.soak
 @requires_brd
 def test_the_walk_is_capped_at_sixteen_ancestors(temp_board):
     # chain[0] is the root; chain[i] has exactly i ancestors.
@@ -390,6 +391,7 @@ def test_the_card_write_and_whole_walk_are_one_critical_section(
     assert counting.outermost_acquisitions == 1
 
 
+@pytest.mark.soak
 @requires_brd
 def test_a_failed_rollup_releases_the_board_lock(temp_board):
     with pytest.raises(board.BoardError):
@@ -435,6 +437,7 @@ _RACE_STORIES = 2
 _RACE_SUBTASKS_PER_STORY = 4
 
 
+@pytest.mark.soak
 @requires_brd
 def test_concurrent_rollups_reach_done(temp_board):
     # Parallel-stories P3: 8 sibling-and-cousin subtasks finishing at once must

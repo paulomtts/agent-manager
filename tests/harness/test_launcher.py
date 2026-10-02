@@ -74,6 +74,7 @@ def test_a_non_zero_exit_is_a_value_not_an_exception(tmp_path):
     assert outcome.timed_out is False
 
 
+@pytest.mark.soak
 def test_a_timeout_kills_the_child_and_returns_a_value(tmp_path):
     log = tmp_path / "stdout.log"
     outcome = launcher.run_direct(
@@ -95,6 +96,7 @@ def test_a_timeout_kills_the_child_and_returns_a_value(tmp_path):
     assert outcome.duration < 20.0
 
 
+@pytest.mark.soak
 def test_a_timeout_kills_the_processes_the_child_started(tmp_path):
     # A harness is itself a process launcher. Killing only the direct child
     # leaves its workers running against the worktree the run is about to
