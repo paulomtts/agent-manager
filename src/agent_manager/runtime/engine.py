@@ -215,6 +215,12 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
         )
     except C.Escalated as esc:
         _collect(agent, deps, summary)
+        if esc.result is not None:
+            # The failed phase's own `ContextItem` is never yielded -- only a
+            # successful phase's is -- so `_collect` cannot see it; this is the
+            # one place the agent's own explanation reaches `summary.results`
+            # for an escalation (read by `comments.agent_reason`).
+            summary.results[esc.phase] = esc.result
         checkpoint.save(agent, "escalated")
         return walk._escalate(
             summary, deps.store, deps.story_id, deps.subtask, esc.phase, esc.detail

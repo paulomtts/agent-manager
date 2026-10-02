@@ -1892,6 +1892,40 @@ def test_a_failed_agent_phase_escalates_the_subtask_and_stops(store, run_subtask
     assert subtasks == ["escalated"]
 
 
+def test_a_gate_failure_s_result_reaches_summary_results_for_the_failed_phase(
+    store, run_subtask
+):
+    # The bug milestone 12's board-comment proof found: a gate-failed phase's
+    # `ContextItem` is never yielded (only a successful phase's is), so
+    # `comments.agent_reason` always read `None` for a real escalation unless
+    # `AgentPhaseFailed.result` is threaded through `Escalated` into
+    # `summary.results[failed_phase]` here.
+    def agent_runner(phase, context, rendered):
+        raise AgentPhaseFailed(
+            phase.name,
+            outcome="gate_failed",
+            detail="phase 'explore' gate 'exploration_output_gate' failed: blocked=exploration",
+            result={"unresolved_blockers": ["the thing is broken"]},
+        )
+
+    workflow = _workflow(MIXED, {"step.work": lambda card: {}})
+
+    summary = run_subtask(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "explore"
+    assert summary.results == {
+        "explore": {"unresolved_blockers": ["the thing is broken"]}
+    }
+
+
 def test_an_unexpected_error_from_the_agent_runner_escalates_rather_than_crashing(store, run_subtask):
     # Symmetric with `_run_deterministic`'s deliberately total except: an
     # exception escaping the walk would leave the subtask recorded `started`
