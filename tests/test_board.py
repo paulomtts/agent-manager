@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1229,29 +1230,44 @@ def test_every_public_function_runs_brd_through_the_run_brd_seam(
 
 
 _VOLATILE_KEYS = frozenset({"id", "created_at", "updated_at"})
-"""Keys whose string values brd generates (uuid4s, now() timestamps); checked by type only."""
+"""Keys whose string values brd may generate (uuid4s, now() timestamps)."""
 
 
-def _assert_same_shape(fake: object, real: object, where: str) -> None:
+def _assert_same_shape(
+    fake: object, real: object, where: str, seeded: frozenset[str]
+) -> None:
     """FakeBoard's JSON matches real brd's: same key sets, value types, list
-    lengths and order at every level, and equal values everywhere except a
-    generated id or timestamp, which only has to be a non-empty string."""
+    lengths and order at every level, and equal values everywhere. The one
+    exception is an id or timestamp that each side generated on its own (one
+    that is not in `seeded`). That value only has to be a string in the same
+    format as real brd's: the same length, and for a timestamp the same UTC
+    offset."""
     assert type(fake) is type(real), (
         f"{where}: fake {type(fake).__name__} != real {type(real).__name__}"
     )
     if isinstance(real, dict):
         assert set(fake) == set(real), f"{where}: keys {sorted(fake)} != {sorted(real)}"
         for key, real_value in real.items():
-            if key in _VOLATILE_KEYS and isinstance(real_value, str):
-                assert isinstance(fake[key], str) and fake[key], (
-                    f"{where}.{key}: {fake[key]!r} is not a non-empty string"
+            path = f"{where}.{key}"
+            if key in _VOLATILE_KEYS and isinstance(real_value, str) and (
+                real_value not in seeded
+            ):
+                fake_value = fake[key]
+                assert isinstance(fake_value, str), f"{path}: {fake_value!r} is not a string"
+                assert len(fake_value) == len(real_value), (
+                    f"{path}: fake {fake_value!r} is not formatted like real {real_value!r}"
                 )
+                if key != "id":
+                    assert (
+                        datetime.fromisoformat(fake_value).utcoffset()
+                        == datetime.fromisoformat(real_value).utcoffset()
+                    ), f"{path}: fake {fake_value!r} offset != real {real_value!r}"
             else:
-                _assert_same_shape(fake[key], real_value, f"{where}.{key}")
+                _assert_same_shape(fake[key], real_value, path, seeded)
     elif isinstance(real, list):
         assert len(fake) == len(real), f"{where}: {len(fake)} items != {len(real)}"
         for index, (fake_item, real_item) in enumerate(zip(fake, real)):
-            _assert_same_shape(fake_item, real_item, f"{where}[{index}]")
+            _assert_same_shape(fake_item, real_item, f"{where}[{index}]", seeded)
     else:
         assert fake == real, f"{where}: fake {fake!r} != real {real!r}"
 
@@ -1270,8 +1286,12 @@ def test_fake_board_answers_every_argv_like_real_brd_for_the_same_card_tree(
     _brd_json(temp_board, "block", sibling, "--by", child)
 
     # Seed the fake from the real board's own ids and fields, oldest first.
+    # Every value copied here is identical on both sides, so the comparison
+    # below holds it to equality rather than to format alone.
+    seeded: set[str] = set()
     for card_id in (parent, child, sibling):
         raw = _brd_json(temp_board, "show", card_id)
+        seeded |= {raw["id"], raw["created_at"], raw["updated_at"]}
         fake_board.add_card(
             raw["title"],
             card_id=raw["id"],
@@ -1315,7 +1335,9 @@ def test_fake_board_answers_every_argv_like_real_brd_for_the_same_card_tree(
             f"{where}: fake exit {fake.returncode} != real {real.returncode} "
             f"(real stdout {real.stdout!r}, stderr {real.stderr!r})"
         )
-        _assert_same_shape(json.loads(fake.stdout), json.loads(real.stdout), where)
+        _assert_same_shape(
+            json.loads(fake.stdout), json.loads(real.stdout), where, frozenset(seeded)
+        )
 
     # The writes reached the fake as recorded entries, in order.
     assert fake_board.writes == [
