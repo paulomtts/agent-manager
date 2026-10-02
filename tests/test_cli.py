@@ -31,6 +31,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+import agent_manager
 from agent_manager import (
     board,
     census,
@@ -7894,3 +7895,137 @@ def test_watch_rejects_run_id_with_all_and_neither(tmp_path, monkeypatch):
         assert envelope["error"]["type"] == "CliError", argv
         message = envelope["error"]["message"]
         assert "RUN_ID" in message and "--all" in message, argv
+
+
+# ── am watch --follow (card cba3e48f) ──────────────────────────────────────
+#
+# Default (unit) tier per design §14, like the one-shot tests above: no git,
+# no brd, no harness. Polling is driven by replacing `cli._watch_sleep` and
+# bounding `cli.WATCH_MAX_POLLS`, so each poll sees exactly what the test wrote
+# before it, with no wall-clock wait and no signal.
+
+
+def _watch_line(run_id: str, seq: int) -> dict[str, Any]:
+    """One journal line in the shape `_write_watch_journal` writes, JSON-mode."""
+    return store_module.JournalLine(
+        seq=seq,
+        ts=WATCH_TS,
+        run_id=run_id,
+        event="phase_upsert",
+        card="card-1",
+        phase="implement",
+        attempt=1,
+        payload={"status": "started", "n": seq},
+    ).model_dump(mode="json")
+
+
+def _append_watch_journal(
+    tmp_path: Path, run_id: str, seqs: list[int], *, tail: str = ""
+) -> list[dict[str, Any]]:
+    """Append one line per seq to `run_id`'s journal, then `tail` verbatim."""
+    run_dir = _watch_runs_dir(tmp_path) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dumped = [_watch_line(run_id, seq) for seq in seqs]
+    text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
+    with (run_dir / store_module.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(text + tail)
+    return dumped
+
+
+def _watch_follow(monkeypatch, *args: str, actions=()):
+    """Run `am watch ARGS --follow` for exactly `len(actions)` polls after the backlog.
+
+    Sleep `i` runs `actions[i]` (an append, a delete, a takeover) before poll
+    `i` reads, so every poll sees a known state. Returns the result and the
+    seconds each sleep was asked for.
+    """
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        actions[len(sleeps) - 1]()
+
+    monkeypatch.setattr(cli, "_watch_sleep", fake_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", len(actions))
+    return runner.invoke(cli.app, ["watch", *args, "--follow"]), sleeps
+
+
+def _stream(result) -> list[dict[str, Any]]:
+    """Every stdout line of a follow run, parsed; each must be one JSON object."""
+    return [json.loads(line) for line in result.stdout.splitlines()]
+
+
+def _hello(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "event": "watch",
+        "schema": 1,
+        "am": agent_manager.__version__,
+        "runs_dir": str(_watch_runs_dir(tmp_path)),
+    }
+
+
+def test_watch_follow_hello_line_shape(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3, 4])
+
+    result, sleeps = _watch_follow(monkeypatch, "run-a", "--since", "2")
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == []
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    assert lines[1:] == written[2:]
+    assert [line["seq"] for line in lines[1:]] == [3, 4]
+    # Bare JournalLines: no envelope, and compact, one object per line.
+    assert all("ok" not in line for line in lines)
+    assert result.stdout.endswith("\n")
+    assert all(": " not in text for text in result.stdout.splitlines())
+    assert result.stderr == ""
+
+    # `--pretty` only shapes a refusal: the stream is byte-for-byte the same.
+    pretty, _ = _watch_follow(monkeypatch, "run-a", "--since", "2", "--pretty")
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result, sleeps = _watch_follow(monkeypatch, "no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == []
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownRunError"
+    assert "no-such-run" in envelope["error"]["message"]
+    assert "event" not in envelope
+    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
+    assert not _watch_runs_dir(tmp_path).exists()
+
+    # `--pretty` still indents a refusal, and it is still the only output.
+    pretty, _ = _watch_follow(monkeypatch, "no-such-run", "--pretty")
+    assert pretty.exit_code == cli.EXIT_ERROR, pretty.output
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == envelope
+
+    # Every other refusal the one-shot form makes is made before the stream too.
+    _write_watch_journal(tmp_path, "run-a", [1])
+    _write_watch_journal(tmp_path, "run-c", [1], tail="not json\n")
+    for argv, kind in (
+        (["../escape"], "UnknownRunError"),
+        (["run-a", "--since", "-1"], "CliError"),
+        (["--all", "run-a"], "CliError"),
+        ([], "CliError"),
+        (["run-c"], "CorruptJournalError"),
+    ):
+        refused, sleeps = _watch_follow(monkeypatch, *argv)
+        assert refused.exit_code == cli.EXIT_ERROR, (argv, refused.output)
+        assert sleeps == [], argv
+        refusal_lines = refused.stdout.splitlines()
+        assert len(refusal_lines) == 1, (argv, refused.stdout)
+        refusal = json.loads(refusal_lines[0])
+        assert refusal["ok"] is False, argv
+        assert refusal["error"]["type"] == kind, argv

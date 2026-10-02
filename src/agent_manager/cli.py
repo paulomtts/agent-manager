@@ -19,7 +19,10 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import os
 import sqlite3
+import sys
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -43,6 +46,7 @@ from agent_manager import (
     prompt,
     store as store_module,
 )
+from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
@@ -1583,6 +1587,77 @@ def watch_for(
     return {"events": events}
 
 
+WATCH_POLL_SECONDS = 0.25
+"""How long `am watch --follow` sleeps between polls (am-watch design 3.2).
+
+Internal: no output line carries it, so a later move to inotify changes no
+byte of the stream.
+"""
+
+WATCH_MAX_POLLS: int | None = None
+"""How many polls follow the backlog before the stream ends by itself.
+
+`None` in production: poll until Ctrl-C or a closed pipe. Tests bound it so a
+`CliRunner` invocation returns.
+"""
+
+
+def _watch_sleep(seconds: float) -> None:
+    """The pause between polls. A module attribute so tests can replace it."""
+    time.sleep(seconds)
+
+
+def _watch_hello() -> dict[str, Any]:
+    """The first line of `am watch --follow`, and the only one that is not a
+    JournalLine: where a future schema bump is announced (design 3.6)."""
+    return {
+        "event": "watch",
+        "schema": 1,
+        "am": __version__,
+        "runs_dir": str(paths.data_dir() / "runs"),
+    }
+
+
+def _emit_stream_line(obj: Mapping[str, Any]) -> None:
+    """One compact JSON object and a newline on stdout, flushed at once, so a
+    consumer reading a pipe gets each line as it is written."""
+    sys.stdout.write(render(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _poll_watch(
+    run_id: str | None, *, since: int, cursors: dict[str, int]
+) -> Iterator[dict[str, Any]]:
+    """One pass over the watched runs: each line above its run's cursor.
+
+    `cursors` maps a run directory name to the highest `seq` already emitted
+    for it, so the cursor is `(run_id, seq)` and nothing else (design 3.3). A
+    lease takeover appends to the same file at a higher `seq` and needs no
+    case of its own. A run not yet in `cursors` starts at `since`. With
+    `--all` the runs are listed again on every pass, so a run that appears
+    later is picked up. A run with no journal, now or any more, has nothing
+    to emit. A torn last line is skipped by `_journal_events` and emitted on a
+    later pass once it is complete.
+    """
+    run_ids = [run_id] if run_id is not None else paths.list_run_ids()
+    for each in run_ids:
+        try:
+            events = _journal_events(each, since=cursors.get(each, since))
+        except store_module.MissingJournalError:
+            continue
+        for event in events:
+            cursors[each] = event["seq"]
+            yield event
+
+
+def _stream_watch(run_id: str | None, *, since: int) -> None:
+    """The body of `am watch --follow`, once `watch_for` has accepted the call."""
+    _emit_stream_line(_watch_hello())
+    cursors: dict[str, int] = {}
+    for event in _poll_watch(run_id, since=since, cursors=cursors):
+        _emit_stream_line(event)
+
+
 @app.command("watch")
 def watch(
     run_id: str | None = typer.Argument(
@@ -1596,14 +1671,28 @@ def watch(
     since: int = typer.Option(
         0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
     ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help="Keep printing events, one JSON object per line, until interrupted.",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print a run's journal events, or every run's, once, as one envelope."""
+    """Print a run's journal events, or every run's, once as one envelope.
+
+    With --follow, print a hello line and then each event as its own line of
+    JSON, the backlog first and then new ones as they are appended, until
+    interrupted. A refusal is still one envelope at exit 3, printed before
+    any stream line.
+    """
     try:
         payload = watch_for(run_id, all_runs=all_runs, since=since)
     except WATCH_HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if follow:
+        _stream_watch(run_id, since=since)
+        return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
