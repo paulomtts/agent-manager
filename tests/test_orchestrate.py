@@ -2475,6 +2475,127 @@ def test_an_escalation_in_one_sharing_call_leaves_the_other_its_slots(project):
     )
 
 
+def test_the_async_core_takes_run_milestones_parameters_plus_slots():
+    """`_run_milestone_async` is a coroutine function taking exactly
+    `run_milestone`'s parameters, same kinds and defaults, plus a keyword-only
+    `slots=None`; `run_milestone` itself gains nothing."""
+    assert inspect.iscoroutinefunction(orchestrate._run_milestone_async)
+    wrapper = inspect.signature(orchestrate.run_milestone).parameters
+    core = dict(inspect.signature(orchestrate._run_milestone_async).parameters)
+    slots = core.pop("slots")
+    assert slots.kind is inspect.Parameter.KEYWORD_ONLY
+    assert slots.default is None
+    assert "slots" not in wrapper
+    assert list(core) == list(wrapper)
+    for name, parameter in wrapper.items():
+        assert core[name].kind is parameter.kind, name
+        assert core[name].default == parameter.default, name
+
+
+def test_run_milestone_refuses_bad_arguments_before_starting_an_event_loop(
+    tmp_path, monkeypatch
+):
+    """Validation stays in the sync wrapper: a bad bound is refused before
+    `asyncio.run` is ever called."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    def no_loop(*args: Any, **kwargs: Any) -> Any:
+        for arg in args:
+            if inspect.iscoroutine(arg):
+                arg.close()
+        pytest.fail("an event loop was started before validation")
+
+    monkeypatch.setattr(orchestrate.asyncio, "run", no_loop)
+
+    with pytest.raises(ValueError, match="max_concurrent"):
+        orchestrate.run_milestone(
+            "Milestone 3",
+            repo_dir=tmp_path,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            max_concurrent=0,
+        )
+
+
+@requires_git
+@requires_brd
+def test_the_async_core_awaited_in_a_running_loop_is_bounded_by_the_callers_semaphore(
+    project, integrate_recorder
+):
+    """Three ready stories, `max_concurrent=3`, but the caller hands the core a
+    one-slot semaphore from its own running loop. Every lane stays in flight
+    until a second lane enters the driver or the window expires: bounded by
+    `max_concurrent`, a second lane would arrive inside the window; bounded by
+    the caller's semaphore, only one lane is ever in flight. The run still
+    finishes `done` with `run_milestone`'s payload and frees its slot."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
+    subtasks = _subtasks_by_story(shape)
+    arrivals = 0
+    second_arrived = asyncio.Event()
+
+    async def hold_until_a_second_lane_arrives(stop: StopSignal | None) -> None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 2:
+            second_arrived.set()
+        try:
+            await asyncio.wait_for(second_arrived.wait(), OVERSHOOT_WINDOW)
+        except TimeoutError:
+            pass
+
+    driver = GatedDriver(
+        gates={cards[0]: hold_until_a_second_lane_arrives for cards in subtasks.values()}
+    )
+
+    async def scenario() -> dict[str, Any]:
+        shared = asyncio.Semaphore(1)
+        result = await orchestrate._run_milestone_async(
+            shape["milestone"],
+            repo_dir=project,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            driver=driver,
+            clock=lambda: STARTED_AT,
+            max_concurrent=3,
+            slots=shared,
+        )
+        await _refill(shared, 1)
+        return result
+
+    grafo_logger = logging.getLogger(orchestrate.GRAFO_LOGGER)
+    level_before = grafo_logger.level
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        grafo_logger.setLevel(level_before)
+
+    order = _census_stories(project, shape["milestone"])
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    assert driver.high_water == 1
+    assert sorted(call["card"] for call in driver.calls) == sorted(
+        card for cards in subtasks.values() for card in cards
+    )
+    assert set(result) == {
+        "done",
+        "run_id",
+        "levels",
+        "completed",
+        "tips",
+        "warnings",
+        "integrated",
+    }
+    assert result["done"] is True
+    assert result["run_id"] == run_id
+    assert result["levels"] == [{"level": 0, "stories": order}]
+    assert result["completed"] == [card for story in order for card in subtasks[story]]
+    assert set(result["integrated"]["merged"]) == set(order)
+    (integrate_call,) = integrate_recorder.calls
+    assert integrate_call["run_status"] == "started"
+    run = _load(project, run_id)
+    assert run.config == models.RunConfig(max_concurrent_stories=3)
+    assert set(_statuses(run).values()) == {"done"}
+
+
 @requires_git
 @requires_brd
 def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
