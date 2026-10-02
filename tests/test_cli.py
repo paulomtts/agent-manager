@@ -3530,6 +3530,35 @@ def test_status_of_a_run_that_died_before_its_first_phase_is_ok_with_no_rows(pro
     assert envelope["data"]["stories"][0]["subtasks"][0]["card_id"] == "card-1"
 
 
+@pytest.mark.parametrize(
+    "run_id, exit_code, ok",
+    [
+        ("20260923T090000Z-cbe34d00", 0, True),
+        ("no-such-run", cli.EXIT_ERROR, False),
+    ],
+    ids=["ok-envelope", "error-envelope"],
+)
+def test_pretty_renders_through_the_cli(projection, run_id, exit_code, ok):
+    """Test-tier V5: the one CliRunner check of `--pretty`. Every command hands its
+    envelope to the same `render(..., pretty=pretty)`, and
+    `test_render_indents_under_pretty` pins what `render` does, so this checks
+    only that the flag reaches it through Typer -- for an ok envelope and for a
+    refusal -- on `status`, the cheapest command (no git, no brd, no subprocess)."""
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+    argv = ["status", run_id, "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == exit_code, plain.output
+    assert pretty.exit_code == exit_code, pretty.output
+    assert "\n" not in plain.stdout.strip()
+    assert "\n  " in pretty.stdout
+    envelope = json.loads(pretty.stdout)
+    assert envelope == json.loads(plain.stdout)
+    assert envelope["ok"] is ok
+
+
 def test_status_pretty_indents_the_same_envelope(projection):
     _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
 
