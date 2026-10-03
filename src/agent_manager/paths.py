@@ -70,3 +70,18 @@ def highest_attempt(run_id: str, card: str, phase: str) -> int:
     while (card_dir / f"{phase}.{attempt + 1}").exists():
         attempt += 1
     return attempt
+
+
+def list_run_ids() -> list[str]:
+    """Every run id that has a directory under `data_dir()/runs`, sorted.
+
+    Lists only. Unlike `run_dir`, it creates neither the `runs` directory nor
+    any run directory, so a reader that walks every run (`am watch --all`)
+    leaves the data directory as it found it. A missing `runs` directory is an
+    empty list, not an error. Plain files beside the run directories are not
+    runs and are skipped.
+    """
+    runs = data_dir() / "runs"
+    if not runs.is_dir():
+        return []
+    return sorted(entry.name for entry in runs.iterdir() if entry.is_dir())

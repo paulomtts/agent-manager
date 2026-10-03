@@ -318,3 +318,24 @@ def test_highest_attempt_stops_at_the_first_gap(monkeypatch, tmp_path):
     paths.attempt_dir("run-abc", "abc123", "implement", 3)
 
     assert paths.highest_attempt("run-abc", "abc123", "implement") == 1
+
+
+def test_list_run_ids_lists_only_directories_sorted(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    runs = tmp_path / "agent-manager" / "runs"
+    (runs / "run-b").mkdir(parents=True)
+    (runs / "run-a").mkdir()
+    (runs / "stray.txt").write_text("not a run\n")
+
+    assert paths.list_run_ids() == ["run-a", "run-b"]
+    # Listing only: nothing was added or removed under runs/.
+    assert sorted(p.name for p in runs.iterdir()) == ["run-a", "run-b", "stray.txt"]
+
+
+def test_list_run_ids_is_empty_and_creates_nothing_without_a_runs_directory(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.list_run_ids() == []
+    assert not (tmp_path / "agent-manager" / "runs").exists()

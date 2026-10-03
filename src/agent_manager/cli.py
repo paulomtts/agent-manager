@@ -19,7 +19,10 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import os
 import sqlite3
+import sys
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -39,9 +42,11 @@ from agent_manager import (
     locks,
     models,
     orchestrate,
+    paths,
     prompt,
     store as store_module,
 )
+from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
@@ -1506,6 +1511,245 @@ def logs(
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_module.JournalError)
+"""`HANDLED` plus `JournalError`, for `watch` only.
+
+A corrupt journal is a refusal for a reader, so `watch` turns it into an
+`ok: false` envelope at exit 3. It is not added to `HANDLED` itself: for the
+commands that write a journal, a corrupt one is still a bug that should crash
+with its stack intact. `MissingJournalError` never reaches this tuple; `watch_for`
+turns it into `UnknownRunError` first.
+"""
+
+
+def _check_watch_run_id(run_id: str) -> None:
+    """Refuse a run id that is a path rather than one directory name.
+
+    `Journal._for_reading` joins the id onto `<data dir>/runs/`, so `..` or a
+    `/` would read a `journal.jsonl` outside the runs directory.
+    """
+    if run_id in ("", ".", "..") or Path(run_id).name != run_id:
+        raise UnknownRunError(
+            f"run id {run_id!r} is not a run directory name"
+            " (`agent-manager watch --all` reads every run there is)"
+        )
+
+
+def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
+    """`run_id`'s journal lines with `seq > since`, JSON-mode, in `seq` order.
+
+    Opened through `Journal._for_reading`, never `Journal(run_id)`: the normal
+    constructor calls `paths.run_dir`, which would create a directory for a run
+    that does not exist (am-watch design 3.7). A torn last line is an append in
+    flight and is skipped. Raises `MissingJournalError` when there is no journal.
+    """
+    lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+    return [line.model_dump(mode="json") for line in lines if line.seq > since]
+
+
+def watch_for(
+    run_id: str | None, *, all_runs: bool = False, since: int = 0
+) -> dict[str, Any]:
+    """The payload of `am watch`: `{"events": [...]}`.
+
+    Exactly one of `run_id` and `all_runs`. With `run_id`, a run with no
+    journal is `UnknownRunError`. With `all_runs`, every directory under
+    `<data dir>/runs/` is read, a run with no journal yet is skipped, and a
+    missing `runs/` is no events: a watcher pointed at the wrong data
+    directory sees nothing, not an error (am-watch design 3.7). Events are
+    ordered by `(run_id, seq)`; `since` filters each run's own `seq`.
+    """
+    if all_runs == (run_id is not None):
+        raise CliError(
+            "give exactly one of RUN_ID or --all:"
+            " `am watch RUN_ID` reads one run, `am watch --all` reads every run"
+        )
+    if since < 0:
+        raise CliError(f"--since must be 0 or more, got {since}")
+    if run_id is not None:
+        _check_watch_run_id(run_id)
+        try:
+            return {"events": _journal_events(run_id, since=since)}
+        except store_module.MissingJournalError as error:
+            raise UnknownRunError(
+                f"run {run_id!r} has no journal under the data directory"
+                " (`agent-manager watch --all` reads every run there is)"
+            ) from error
+    events: list[dict[str, Any]] = []
+    for each in paths.list_run_ids():
+        try:
+            events.extend(_journal_events(each, since=since))
+        except store_module.MissingJournalError:
+            continue
+    return {"events": events}
+
+
+WATCH_POLL_SECONDS = 0.25
+"""How long `am watch --follow` sleeps between polls (am-watch design 3.2).
+
+Internal: no output line carries it, so a later move to inotify changes no
+byte of the stream.
+"""
+
+WATCH_MAX_POLLS: int | None = None
+"""How many polls follow the backlog before the stream ends by itself.
+
+`None` in production: poll until Ctrl-C or a closed pipe. Tests bound it so a
+`CliRunner` invocation returns.
+"""
+
+
+def _watch_sleep(seconds: float) -> None:
+    """The pause between polls. A module attribute so tests can replace it."""
+    time.sleep(seconds)
+
+
+def _watch_hello() -> dict[str, Any]:
+    """The first line of `am watch --follow`, and the only one that is not a
+    JournalLine: where a future schema bump is announced (design 3.6)."""
+    return {
+        "event": "watch",
+        "schema": 1,
+        "am": __version__,
+        "runs_dir": str(paths.data_dir() / "runs"),
+    }
+
+
+def _emit_stream_line(obj: Mapping[str, Any]) -> None:
+    """One compact JSON object and a newline on stdout, flushed at once, so a
+    consumer reading a pipe gets each line as it is written."""
+    sys.stdout.write(render(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _poll_watch(
+    run_id: str | None, *, since: int, cursors: dict[str, int]
+) -> Iterator[dict[str, Any]]:
+    """One pass over the watched runs: each line above its run's cursor.
+
+    `cursors` maps a run directory name to the highest `seq` already emitted
+    for it, so the cursor is `(run_id, seq)` and nothing else (design 3.3). A
+    lease takeover appends to the same file at a higher `seq` and needs no
+    case of its own. A run not yet in `cursors` starts at `since`. With
+    `--all` the runs are listed again on every pass, so a run that appears
+    later is picked up. A run with no journal, now or any more, has nothing
+    to emit. A torn last line is skipped by `_journal_events` and emitted on a
+    later pass once it is complete.
+    """
+    run_ids = [run_id] if run_id is not None else paths.list_run_ids()
+    for each in run_ids:
+        try:
+            events = _journal_events(each, since=cursors.get(each, since))
+        except store_module.MissingJournalError:
+            continue
+        for event in events:
+            cursors[each] = event["seq"]
+            yield event
+
+
+def _follow_watch(
+    run_id: str | None,
+    *,
+    since: int,
+    sleep: Callable[[float], None],
+    max_polls: int | None,
+) -> Iterator[dict[str, Any]]:
+    """The backlog above `since`, then every line appended after it.
+
+    One pass at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
+    another pass, `max_polls` times or forever when it is `None`. One cursor
+    dict spans every pass, so no `seq` of a run is emitted twice and none is
+    skipped, however its lines are spread across polls.
+    """
+    cursors: dict[str, int] = {}
+    yield from _poll_watch(run_id, since=since, cursors=cursors)
+    polls = 0
+    while max_polls is None or polls < max_polls:
+        sleep(WATCH_POLL_SECONDS)
+        polls += 1
+        yield from _poll_watch(run_id, since=since, cursors=cursors)
+
+
+def _silence_stdout() -> None:
+    """Point fd 1 at /dev/null once the reader has closed the pipe.
+
+    Without it, the interpreter's own flush of stdout at exit raises a second
+    `BrokenPipeError` and prints it (Python docs, "Note on SIGPIPE"). A
+    stdout with no file descriptor (a test runner's buffer) is left alone.
+    """
+    try:
+        descriptor = sys.stdout.fileno()
+    except (OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, descriptor)
+    os.close(devnull)
+
+
+def _stream_watch(run_id: str | None, *, since: int) -> None:
+    """The body of `am watch --follow`, once `watch_for` has accepted the call.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll. Ctrl-C and a closed pipe are
+    how a stream normally ends: exit 0, nothing on stderr. A journal that
+    turns corrupt after the hello line cannot get an envelope, because every
+    line after the first must be a JournalLine. So its message goes to stderr
+    and the exit is `EXIT_ERROR`.
+    """
+    try:
+        _emit_stream_line(_watch_hello())
+        for event in _follow_watch(
+            run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+        ):
+            _emit_stream_line(event)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        _silence_stdout()
+        return
+    except WATCH_HANDLED as error:
+        typer.echo(f"am watch: {error}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+@app.command("watch")
+def watch(
+    run_id: str | None = typer.Argument(
+        None,
+        metavar="[RUN_ID]",
+        help="The run whose journal is read. Omit it and pass --all for every run.",
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Read every run's journal under the data directory."
+    ),
+    since: int = typer.Option(
+        0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
+    ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help="Keep printing events, one JSON object per line, until interrupted.",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Print a run's journal events, or every run's, once as one envelope.
+
+    With --follow, print a hello line and then each event as its own line of
+    JSON, the backlog first and then new ones as they are appended, until
+    interrupted. A refusal is still one envelope at exit 3, printed before
+    any stream line.
+    """
+    try:
+        payload = watch_for(run_id, all_runs=all_runs, since=since)
+    except WATCH_HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    if follow:
+        _stream_watch(run_id, since=since)
+        return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
