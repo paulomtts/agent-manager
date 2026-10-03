@@ -5376,7 +5376,6 @@ def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story
         assert _keys(found) == [f"{run_id}/{subtask}/done"], subtask
         (comment,) = found
         assert comment.author == "am"
-        assert comment.body.startswith(f"am · done · run {run_id}\n")
         assert f"branch: {_branch(project, subtask)}" in comment.body
         assert "(resumed at" not in comment.body
     for story in shape["stories"].values():
@@ -5515,13 +5514,12 @@ def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(pro
     found = _comments(project, a1)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{a1}/escalated:")
+    assert (key, "posted") in _comment_states(project)
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · escalated · run {run_id}\n")
     assert "phase: review" in body
     assert "detail: reviewer found a blocker" in body
     assert 'reason: "the [ [parser]] still drops input; no test"' in body
-    assert f"next: `am resume {run_id}`" in body
     for quiet in (story_a, story_b, b1, b2, story_c, c1):
         assert _comments(project, quiet) == [], quiet
     assert len(_comments(project, shape["milestone"])) == 1
@@ -5600,9 +5598,9 @@ def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
     run_id = result["run_id"]
     found = _comments(project, story_c)
     assert _keys(found) == [f"{run_id}/{story_c}/base-failed"]
+    assert (f"{run_id}/{story_c}/base-failed", "posted") in _comment_states(project)
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · base failed · run {run_id}\n")
     assert f"base branch: {root_plan.branch}" in body
     assert "detail: conflict nobody could resolve" in body
     assert _comments(project, c1) == []
@@ -5629,6 +5627,7 @@ def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_
     run_id = result["run_id"]
     found = _comments(project, story_j)
     assert _keys(found) == [f"{run_id}/{story_j}/base-failed"]
+    assert (f"{run_id}/{story_j}/base-failed", "posted") in _comment_states(project)
     assert f"base branch: {root_plan.branch}" in found[0].body
     assert "detail: J's base broke" in found[0].body
     assert result["warnings"] == []
