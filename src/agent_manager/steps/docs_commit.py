@@ -221,13 +221,30 @@ def _split_commit(raw: str) -> tuple[list[str], str]:
     return headers.split("\n"), message
 
 
+_SIGNATURE_HEADERS = ("gpgsig", "gpgsig-sha256")
+"""Commit headers holding a signature, which a rewrite would invalidate."""
+
+
 def _rebuild_commit(headers: list[str], parent: str, message: str) -> str:
     """The raw text of a commit object: `headers` with the parent replaced.
 
     Every other header line -- `tree`, `author`, `committer` -- is carried
     over verbatim, which is how name, email, timestamp and timezone survive.
+    A signature header and its continuation lines (those starting with a
+    space) are dropped: the rewritten commit is unsigned, as after a rebase.
     """
-    kept = [f"parent {parent}" if line.startswith("parent ") else line for line in headers]
+    kept: list[str] = []
+    dropping = False
+    for line in headers:
+        if line.startswith(" "):
+            if not dropping:
+                kept.append(line)
+            continue
+        key = line.split(" ", 1)[0]
+        dropping = key in _SIGNATURE_HEADERS
+        if dropping:
+            continue
+        kept.append(f"parent {parent}" if key == "parent" else line)
     return "\n".join(kept) + "\n\n" + message
 
 

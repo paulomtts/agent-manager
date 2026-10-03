@@ -770,3 +770,40 @@ def test_commits_reachable_from_origin_base_are_never_rewritten(repo: Path) -> N
     assert _rev(repo, "HEAD~2") == u0
     assert _message(repo, "HEAD~1").splitlines()[-1] == f"Plan-Hash: {digest}"
     assert f"Plan-Hash: {digest}" not in _message(repo, u0)
+
+
+def test_a_signed_commit_is_rewritten_unsigned(repo: Path, tmp_path: Path) -> None:
+    """A rewritten commit's old signature would no longer verify, so it is not
+    carried over -- the header line and its continuation lines both go, as
+    after a rebase. The signed object is crafted by hand: no gpg needed."""
+    _task_branch(repo)
+    base = _commit_file(repo, "before.txt", "unstamped before the signed one")
+    tree = _rev(repo, "HEAD^{tree}")
+    raw = (
+        f"tree {tree}\n"
+        f"parent {base}\n"
+        "author Signer <signer@example.com> 1000000000 +0200\n"
+        "committer Signer <signer@example.com> 1000000000 +0200\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+        " \n"
+        " not-a-real-signature\n"
+        " -----END PGP SIGNATURE-----\n"
+        "\n"
+        "signed draft\n"
+    )
+    object_file = tmp_path / "signed-commit"
+    object_file.write_text(raw, encoding="utf-8")
+    signed = _git(repo, "hash-object", "-t", "commit", "-w", str(object_file)).strip()
+    _git(repo, "update-ref", "refs/heads/task", signed)
+    _write_documents(repo)
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result["backfilled"] == [base, signed]
+    _before_new, signed_new, _docs = _range(repo)
+    rewritten = _git(repo, "cat-file", "commit", signed_new)
+    assert "gpgsig" not in rewritten
+    assert "not-a-real-signature" not in rewritten
+    assert "author Signer <signer@example.com> 1000000000 +0200\n" in rewritten
+    assert _message(repo, signed_new).splitlines()[-1] == f"Plan-Hash: {digest}"
