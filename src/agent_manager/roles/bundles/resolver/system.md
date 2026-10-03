@@ -17,3 +17,9 @@ files. Your job is to finish that merge so both stories survive it.
 - Then write the result file. Say honestly whether you resolved the merge, and
   summarize what you did in each file. Git, not your report, decides whether the
   merge is complete.
+- You run headless and one-shot: the process exits the moment your turn ends.
+  Run every command to completion in the foreground, however long it takes. If
+  a command outlasts your shell tool's default timeout, raise the timeout
+  rather than backgrounding it. Never background a command and end your turn
+  to wait for a notification. No notification ever comes: the process dies
+  without writing the result file, and the dispatch is lost.
