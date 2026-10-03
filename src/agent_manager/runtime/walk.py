@@ -455,6 +455,31 @@ def _with_log_dir(
     return bound
 
 
+RUN_ID_PARAMETER = "run_id"
+"""The parameter a deterministic step declares to be handed the store's run id."""
+
+
+def _with_run_id(
+    fn: Callable[..., Any], kwargs: dict[str, Any], store: Any
+) -> dict[str, Any]:
+    """`kwargs` with the store's run id, for a step that declares `run_id`.
+
+    Spec e2efd21d B3, the `_with_log_dir` rule: only a step whose signature
+    names `run_id` gets it, and the engine's value wins over anything the
+    binding table or the document's `args` said. A store with no run id
+    supplies nothing, and the step's own default applies. Not a reserved
+    context key, for the same reason `log_dir` is not: this injection
+    already wins.
+    """
+    if RUN_ID_PARAMETER not in inspect.signature(fn).parameters:
+        return kwargs
+    bound = {key: value for key, value in kwargs.items() if key != RUN_ID_PARAMETER}
+    run_id = getattr(store, "run_id", None)
+    if run_id:
+        bound[RUN_ID_PARAMETER] = run_id
+    return bound
+
+
 def run_one_step(
     *,
     phase: phase_model.Step,
@@ -481,6 +506,7 @@ def run_one_step(
             phase.run, table, phase.args, phase=phase.name, function=label
         )
         kwargs = _with_log_dir(phase.run, kwargs, store, subtask.card_id, phase.name)
+        kwargs = _with_run_id(phase.run, kwargs, store)
         result = phase.run(**kwargs)
         if not isinstance(result, Mapping):
             raise EngineError(

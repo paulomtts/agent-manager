@@ -190,3 +190,17 @@ def test_every_resolve_input_renders_through_the_shipped_table() -> None:
     assert bodies["merge_tip"] == MERGE_TIP
     assert json.loads(bodies["conflict_files"]) == CONFLICT_FILES
     assert json.loads(bodies["verification"]) == SUITE
+
+
+def test_integrates_verify_binds_the_synthetic_subtasks_card_id():
+    """Spec e2efd21d B3: the integrate walk's verify step gets `card` from the
+    table -- the synthetic subtask's `card_id` -- and exports it as
+    `AM_CARD_ID`. `run_id` is not in the table; the engine injects it."""
+    phase = INTEGRATE.phase("verify")
+
+    kwargs = walk.bind_arguments(
+        phase.run, _context(), phase.args, phase="verify", function="verify.run_suite"
+    )
+
+    assert kwargs["card"] == SUBTASK.card_id
+    assert "run_id" not in kwargs
