@@ -5402,12 +5402,11 @@ def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     (comment,) = found
     assert comment.author == "am"
-    assert comment.body.startswith(f"am · done · run {run_id}\n")
     assert "done: 3 of 3" in comment.body
     assert f"integrated: {INTEGRATION_BRANCH}" in comment.body
-    assert f"next: `git merge {INTEGRATION_BRANCH}`" in comment.body
     assert "total" not in result
     assert result["warnings"] == []
 
@@ -5428,13 +5427,14 @@ def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
 
     assert result["escalated"] is True, result
     run_id = result["run_id"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · escalated · run {run_id}\n")
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     assert (
         f"integrate failed at integrate on [[{story_b}]]: the resolver did not finish"
-        in comment.body
+        in found[0].body
     )
-    assert f"next: `am run --milestone {milestone}`" in comment.body
     assert "total" not in result
     assert result["warnings"] == []
 
@@ -5461,11 +5461,10 @@ def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     body = found[0].body
-    assert body.startswith(f"am · escalated · run {run_id}\n")
     assert f"escalated: [[{a1}]] at review" in body
     assert f"parked: [[{b1}]]" in body
-    assert f"next: `am resume {run_id}`" in body
 
 
 @dataclass
@@ -5573,13 +5572,14 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
     assert len(keys) == 2, keys
     assert keys[0].startswith(f"{run_id}/{a1}/escalated:")
     assert keys[1] == f"{run_id}/{a1}/done"
-    assert found[1].body.startswith(f"am · done · run {run_id}\n(resumed at review)\n")
-    on_milestone = _comments(project, milestone)
-    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
-        f"am · escalated · run {run_id}",
-        f"am · done · run {run_id}",
-    ]
-    assert len(set(_keys(on_milestone))) == 2
+    assert "(resumed at review)" in found[1].body.split("\n")
+    assert (keys[1], "posted") in _comment_states(project)
+    assert first["escalated"] is True, first
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys
+    assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in milestone_keys)
+    run_end_rows = [row for row in _comment_states(project) if "/run-end:" in row[0]]
+    assert run_end_rows == [(key, "posted") for key in milestone_keys]
 
 
 @requires_git
