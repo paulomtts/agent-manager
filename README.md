@@ -73,6 +73,10 @@ written, and run in the order given. With no `--verify`, pass
 gate refuses to go on. `--repo-dir` defaults to `.` and `--base-branch` to
 `master`.
 
+Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
+`AM_CARD_ID` (the card being verified) added to its environment.
+The base-branch and final integration checks run their commands with neither set.
+
 Some combinations are refused before anything is read: `--card` together with
 `--milestone`, neither of them, a blank `--milestone`, `--dry-run` with
 `--card`, `--max-concurrent` with `--card`, and a `--max-concurrent` below 1.
