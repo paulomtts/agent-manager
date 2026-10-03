@@ -7,6 +7,7 @@ is faked only where a test must observe argv that a real run would also produce.
 """
 
 import hashlib
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -171,6 +172,98 @@ def _recorder(calls: list[list[str]], inner=None):
     return runner
 
 
+OTHER_HASH = "0123abcd"
+"""A valid Plan-Hash that is not the plan's: a commit stamped by an earlier plan."""
+
+DRAFT_AUTHOR = "Draft Author <draft@example.com>"
+
+
+def _task_branch(root: Path) -> None:
+    """Create and check out `task` from `main`."""
+    _git(root, "checkout", "-q", "-b", "task", "main")
+
+
+def _commit_file(
+    root: Path,
+    name: str,
+    message: str,
+    *,
+    author: str | None = None,
+    author_date: str | None = None,
+    committer_date: str | None = None,
+) -> str:
+    """Write `name`, commit it alone with `message`, return the new full sha.
+
+    Fixed dates in a foreign timezone make "the rewrite kept the dates" a real
+    check: a rewrite that stamped "now" would differ in every field.
+    """
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{name}: {message}\n", encoding="utf-8")
+    _git(root, "add", "--", name)
+    env = dict(os.environ)
+    if author_date is not None:
+        env["GIT_AUTHOR_DATE"] = author_date
+    if committer_date is not None:
+        env["GIT_COMMITTER_DATE"] = committer_date
+    argv = ["git", "-C", str(root), "commit", "-q", "-m", message]
+    if author is not None:
+        argv += ["--author", author]
+    subprocess.run(argv, capture_output=True, text=True, check=True, env=env)
+    return _rev(root, "HEAD")
+
+
+def _rev(root: Path, revision: str) -> str:
+    return _git(root, "rev-parse", "--verify", revision).strip()
+
+
+def _range(root: Path, tip: str = "HEAD") -> list[str]:
+    """`main..tip`, oldest first."""
+    return _git(root, "rev-list", "--reverse", f"main..{tip}").split()
+
+
+def _digest(root: Path) -> str:
+    return hashlib.sha256((root / PLAN_RELATIVE).read_bytes()).hexdigest()[:8]
+
+
+def _identity(root: Path, revision: str) -> str:
+    """Author and committer name, email and raw date (with timezone)."""
+    return _git(
+        root, "show", "-s", "--date=raw", "--format=%an%n%ae%n%ad%n%cn%n%ce%n%cd", revision
+    )
+
+
+def _drafts_scenario(root: Path) -> dict[str, str]:
+    """`task` off `main`: unstamped draft A (ending in a Co-Authored-By block),
+    B stamped with another valid hash, unstamped draft C. The documents are
+    written but not committed. Returns the original shas."""
+    _task_branch(root)
+    a = _commit_file(
+        root,
+        "drafts/a.md",
+        "draft spec\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+        author=DRAFT_AUTHOR,
+        author_date="2001-02-03T04:05:06+0530",
+        committer_date="2002-03-04T05:06:07-0700",
+    )
+    b = _commit_file(
+        root,
+        "drafts/b.md",
+        f"stamped by an earlier plan\n\nPlan-Hash: {OTHER_HASH}",
+        author_date="2003-04-05T06:07:08+0100",
+        committer_date="2004-05-06T07:08:09+0000",
+    )
+    c = _commit_file(
+        root,
+        "drafts/c.md",
+        "draft plan",
+        author_date="2005-06-07T08:09:10-0300",
+        committer_date="2006-07-08T09:10:11+0900",
+    )
+    _write_documents(root)
+    return {"A": a, "B": b, "C": c}
+
+
 def test_the_step_makes_one_commit_whose_subject_and_trailer_are_exact(repo: Path) -> None:
     _write_documents(repo)
     before = _commit_count(repo)
@@ -225,20 +318,39 @@ def test_an_unrelated_already_staged_file_is_not_swept_into_the_docs_commit(
     assert "README.md" in _git(repo, "diff", "--cached", "--name-only")
 
 
-def test_the_step_runs_no_forbidden_git_verb(repo: Path) -> None:
+@pytest.mark.parametrize("scenario", ["documents_only", "unstamped_drafts"])
+def test_the_step_runs_no_forbidden_git_verb(repo: Path, scenario: str) -> None:
     """Design §9: this step may add and commit. Sweeping (`add -A`, `add .`) or
     destroying (`reset`, `clean`, `checkout -f`) or publishing (`push`) is how a
-    resumed run loses a human's work."""
-    _write_documents(repo)
+    resumed run loses a human's work. The backfill rewrites history, so it
+    must do that without `rebase`, `filter-branch`, `cherry-pick` or
+    `commit --amend` too."""
+    if scenario == "unstamped_drafts":
+        _drafts_scenario(repo)
+    else:
+        _write_documents(repo)
     calls: list[list[str]] = []
 
     _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
 
     assert calls  # non-vacuity: a step that ran no git at all would pass emptily
+    if scenario == "unstamped_drafts":
+        # non-vacuity: the backfill's own argv went through the guard below
+        assert any("update-ref" in argv for argv in calls), calls
     for argv in calls:
         assert "-A" not in argv, argv
         assert "--all" not in argv, argv
-        for verb in ("reset", "clean", "push", "rm", "restore"):
+        assert "--amend" not in argv, argv
+        for verb in (
+            "reset",
+            "clean",
+            "push",
+            "rm",
+            "restore",
+            "rebase",
+            "filter-branch",
+            "cherry-pick",
+        ):
             assert verb not in argv, argv
         if "add" in argv:
             assert "." not in argv, argv
@@ -391,3 +503,190 @@ def test_a_worktree_reached_through_a_symlink_still_works(
 
     assert reducers.is_plan_hash(result["plan_hash"])
     assert _commit_count(repo) == 2
+
+
+def test_unstamped_drafts_gain_the_current_hash_and_the_stamped_one_is_untouched(
+    repo: Path,
+) -> None:
+    """The Milestone 14/17 hand backfill, made deterministic: A and C gain the
+    current trailer; B keeps its own message byte-for-byte; trees, authors,
+    committers and dates all survive; `main` never moves."""
+    original = _drafts_scenario(repo)
+    main_before = _rev(repo, "main")
+    old_tip = _rev(repo, "HEAD")
+    before_messages = {
+        key: _git(repo, "show", "-s", "--format=%B", sha) for key, sha in original.items()
+    }
+    before_identity = {key: _identity(repo, sha) for key, sha in original.items()}
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result == {"plan_hash": digest, "backfilled": [original["A"], original["C"]]}
+    a_new, b_new, c_new, docs = _range(repo)
+    rewritten = {"A": a_new, "B": b_new, "C": c_new}
+    for key in ("A", "C"):
+        message = _git(repo, "show", "-s", "--format=%B", rewritten[key])
+        assert message.rstrip("\n").endswith(f"Plan-Hash: {digest}"), message
+        parsed = _git(
+            repo, "show", "-s", "--format=%(trailers:key=Plan-Hash,valueonly)", rewritten[key]
+        )
+        assert parsed.strip() == digest
+    co_authored = _git(
+        repo, "show", "-s", "--format=%(trailers:key=Co-Authored-By,valueonly)", a_new
+    )
+    assert co_authored.strip() == "Claude <noreply@anthropic.com>"
+    b_message = _git(repo, "show", "-s", "--format=%B", b_new)
+    assert b_message == before_messages["B"]
+    assert digest not in b_message
+    assert b_new != original["B"]  # its parent changed, so its sha did too
+    assert _git(repo, "diff", old_tip, c_new) == ""
+    for key, sha in rewritten.items():
+        assert _identity(repo, sha) == before_identity[key], key
+    assert _message(repo, docs).splitlines()[0] == f"docs: add spec and plan for {TITLE}"
+    assert _message(repo, docs).splitlines()[-1] == f"Plan-Hash: {digest}"
+    assert _rev(repo, "main") == main_before
+    # Review's own count: every commit on the branch now carries the trailer.
+    log = _git(repo, "log", "main..HEAD", "--format=%B")
+    assert sum(line == f"Plan-Hash: {digest}" for line in log.splitlines()) == 3
+
+
+def test_a_branch_with_nothing_unstamped_is_left_exactly_as_it_was(repo: Path) -> None:
+    _task_branch(repo)
+    _write_documents(repo)
+    digest = _digest(repo)
+    _commit_file(repo, "a.txt", f"current\n\nPlan-Hash: {digest}")
+    _commit_file(repo, "b.txt", f"earlier\n\nPlan-Hash: {OTHER_HASH}")
+    old_tip = _rev(repo, "task")
+    before = _range(repo)
+
+    result = _run(repo)
+
+    assert result["backfilled"] == []
+    assert _rev(repo, "HEAD~1") == old_tip
+    assert _range(repo, "HEAD~1") == before
+
+
+def test_commits_below_the_first_unstamped_keep_their_shas(repo: Path) -> None:
+    _task_branch(repo)
+    stamped = _commit_file(repo, "s.txt", f"stamped\n\nPlan-Hash: {OTHER_HASH}")
+    unstamped = _commit_file(repo, "u.txt", "unstamped")
+    _write_documents(repo)
+
+    result = _run(repo)
+
+    assert result["backfilled"] == [unstamped]
+    s_new, u_new, _docs = _range(repo)
+    assert s_new == stamped
+    assert u_new != unstamped
+
+
+def test_drafts_that_already_hold_the_documents_are_stamped_instead_of_raising(
+    repo: Path,
+) -> None:
+    """The Milestone 14/17 scenario: a role committed the final spec and plan
+    itself. Nothing is staged, so `_branch_carries` decides -- and after the
+    backfill it finds the trailer instead of raising UntaggedDocumentsError."""
+    _task_branch(repo)
+    _write_documents(repo)
+    _git(repo, "add", "--", SPEC_RELATIVE, PLAN_RELATIVE)
+    _git(repo, "commit", "-q", "-m", "docs: drafts committed by the role")
+    draft = _rev(repo, "HEAD")
+    before = _commit_count(repo)
+
+    result = _run(repo)
+
+    assert result == {"plan_hash": _digest(repo), "backfilled": [draft]}
+    assert _commit_count(repo) == before
+    assert _message(repo).splitlines()[-1] == f"Plan-Hash: {_digest(repo)}"
+
+
+def test_the_backfill_leaves_index_and_worktree_as_they_were(repo: Path) -> None:
+    """Identical trees mean the index and the working tree cannot tell the
+    rewrite happened: a staged file stays staged (and out of the docs commit),
+    an unstaged edit stays unstaged, and no temp file lands in the worktree."""
+    _task_branch(repo)
+    unstamped = _commit_file(repo, "notes.txt", "unstamped draft")
+    _write_documents(repo)
+    (repo / "README.md").write_text("staged by somebody else\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    (repo / "notes.txt").write_text("edited, not staged\n", encoding="utf-8")
+    documents = {f"?? {SPEC_RELATIVE}", f"?? {PLAN_RELATIVE}"}
+    before = set(_git(repo, "status", "--porcelain", "--untracked-files=all").splitlines())
+    assert documents <= before
+
+    result = _run(repo)
+
+    assert result["backfilled"] == [unstamped]
+    after = set(_git(repo, "status", "--porcelain", "--untracked-files=all").splitlines())
+    assert after == before - documents
+    assert "M  README.md" in after
+    assert " M notes.txt" in after
+    committed = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(committed) == sorted([SPEC_RELATIVE, PLAN_RELATIVE])
+
+
+def test_a_second_call_after_a_backfill_is_a_no_op(repo: Path) -> None:
+    _drafts_scenario(repo)
+    first = _run(repo)
+    head = _rev(repo, "HEAD")
+
+    second = _run(repo)
+
+    assert first["backfilled"] != []  # non-vacuity: the first call rewrote
+    assert second == {"plan_hash": first["plan_hash"], "backfilled": []}
+    assert _rev(repo, "HEAD") == head
+
+
+def test_the_backfill_moves_the_ref_once_and_records_it_in_the_reflog(repo: Path) -> None:
+    _drafts_scenario(repo)
+    old_tip = _rev(repo, "HEAD")
+    digest = _digest(repo)
+    calls: list[list[str]] = []
+
+    _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
+
+    updates = [argv for argv in calls if "update-ref" in argv]
+    assert len(updates) == 1, updates
+    update = updates[0]
+    assert "refs/heads/task" in update
+    assert update[-1] == old_tip  # the expected old value: a compare-and-swap
+    reflog = _git(repo, "reflog", "--format=%gs", "task").splitlines()
+    assert f"docs_commit: backfill Plan-Hash {digest}" in reflog
+    # task@{0} is the docs commit, task@{1} the backfilled tip, task@{2} the
+    # pre-rewrite tip -- still recoverable.
+    assert _rev(repo, "task@{2}") == old_tip
+
+
+def test_a_malformed_plan_hash_does_not_count_as_stamped(repo: Path) -> None:
+    """Review's grep would not count `Plan-Hash: zzz`, so the backfill must
+    not treat it as stamped either."""
+    _task_branch(repo)
+    malformed = _commit_file(repo, "m.txt", "draft\n\nPlan-Hash: zzz")
+    _write_documents(repo)
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result["backfilled"] == [malformed]
+    m_new, _docs = _range(repo)
+    lines = _message(repo, m_new).splitlines()
+    assert "Plan-Hash: zzz" in lines
+    assert lines[-1] == f"Plan-Hash: {digest}"
+
+
+def test_a_branch_moved_meanwhile_makes_the_update_ref_refuse(repo: Path) -> None:
+    """The final `update-ref` names the old tip, so a writer that moved the
+    branch between the step's read and its write wins: git refuses and the
+    `GitError` propagates."""
+    _drafts_scenario(repo)
+
+    def racing_runner(argv: list[str]) -> str:
+        if "update-ref" in argv:
+            _git(repo, "commit", "-q", "--allow-empty", "-m", "racer")
+        return docs_commit.run_git(argv)
+
+    with pytest.raises(docs_commit.GitError):
+        _run(repo, git_runner=racing_runner)
+
+    assert _message(repo) == "racer"

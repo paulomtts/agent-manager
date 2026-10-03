@@ -6,6 +6,14 @@ before `implement`, because the hash it stamps is the hash of the plan file
 *with* the validated marker already on disk, which is exactly the hash `review`
 recomputes independently (design §9).
 
+Before committing, it backfills: any commit on the unmerged task branch that
+carries no Plan-Hash trailer (a draft a role committed despite being told not
+to) is rewritten to carry the current one, so `review` does not read it as
+debris. The rewrite rebuilds raw commit objects -- same tree, same author and
+committer lines -- and moves the branch once with a compare-and-swap
+`update-ref`. Nothing is reset, checked out or rebased, so the index and the
+working tree never notice.
+
 Every invocation is an argument list handed to `subprocess` through the
 injected `GitRunner` (the seam `steps/worktree.py` established): there is no
 shell string and nothing to quote.
@@ -14,8 +22,10 @@ shell string and nothing to quote.
 import hashlib
 import os
 import re
+import tempfile
 from pathlib import Path
 
+from agent_manager.steps import reducers
 from agent_manager.steps.worktree import GitError, GitRunner, run_git
 
 _HASH_LENGTH = 8
@@ -192,6 +202,109 @@ def _document_paths(worktree_path: str, spec_path: str, plan_path: str) -> tuple
     return root / spec_path, root / plan_path
 
 
+def _is_stamped(message: str) -> bool:
+    """Whether some line of `message` is `Plan-Hash: ` plus a well-formed hash.
+
+    Any valid hash counts, a stale one included: such commits are left alone.
+    `Plan-Hash: zzz` does not count, exactly as review's grep would not.
+    """
+    return any(
+        line.startswith(TRAILER_PREFIX)
+        and reducers.is_plan_hash(line[len(TRAILER_PREFIX) :].rstrip())
+        for line in message.split("\n")
+    )
+
+
+def _split_commit(raw: str) -> tuple[list[str], str]:
+    """A raw `cat-file commit` object as (header lines, message)."""
+    headers, _, message = raw.partition("\n\n")
+    return headers.split("\n"), message
+
+
+def _rebuild_commit(headers: list[str], parent: str, message: str) -> str:
+    """The raw text of a commit object: `headers` with the parent replaced.
+
+    Every other header line -- `tree`, `author`, `committer` -- is carried
+    over verbatim, which is how name, email, timestamp and timezone survive.
+    """
+    kept = [f"parent {parent}" if line.startswith("parent ") else line for line in headers]
+    return "\n".join(kept) + "\n\n" + message
+
+
+def _backfill(
+    git_runner: GitRunner, worktree_path: str, base_branch: str, digest: str
+) -> list[str]:
+    """Stamp every unstamped commit in `base_branch..HEAD` with `digest`.
+
+    Returns the pre-rewrite shas of the commits that gained the trailer,
+    oldest first. Commits before the first unstamped one keep their shas;
+    from there on each is recreated on its recreated parent. The branch moves
+    once, as a compare-and-swap against the tip read here.
+    """
+    ref = git_runner(["-C", worktree_path, "symbolic-ref", "-q", "HEAD"]).strip()
+    old_tip = git_runner(
+        ["-C", worktree_path, "rev-parse", "--verify", "HEAD^{commit}"]
+    ).strip()
+    listing = git_runner(
+        [
+            "-C",
+            worktree_path,
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            "--parents",
+            old_tip,
+            f"^{base_branch}",
+            "--",
+        ]
+    )
+    rows = [line.split() for line in listing.splitlines() if line.strip()]
+    commits = [
+        (row[0], git_runner(["-C", worktree_path, "cat-file", "commit", row[0]]))
+        for row in rows
+    ]
+    first = next(
+        (
+            index
+            for index, (_, raw) in enumerate(commits)
+            if not _is_stamped(_split_commit(raw)[1])
+        ),
+        None,
+    )
+    if first is None:
+        return []
+
+    parent = rows[first][1]
+    backfilled: list[str] = []
+    # Outside the worktree: an extra file there would fail review's porcelain
+    # check. `GitRunner` has no stdin, so `hash-object` reads a file.
+    with tempfile.TemporaryDirectory(prefix="agent-manager-docs-commit-") as scratch:
+        object_file = Path(scratch) / "commit"
+        for sha, raw in commits[first:]:
+            headers, message = _split_commit(raw)
+            if not _is_stamped(message):
+                message = with_trailer(message, digest)
+                backfilled.append(sha)
+            object_file.write_bytes(_rebuild_commit(headers, parent, message).encode("utf-8"))
+            parent = git_runner(
+                ["-C", worktree_path, "hash-object", "-t", "commit", "-w", str(object_file)]
+            ).strip()
+
+    git_runner(
+        [
+            "-C",
+            worktree_path,
+            "update-ref",
+            "-m",
+            f"docs_commit: backfill Plan-Hash {digest}",
+            ref,
+            parent,
+            old_tip,
+        ]
+    )
+    return backfilled
+
+
 def commit_documents(
     card_details: object,
     spec_path: str,
@@ -224,7 +337,10 @@ def commit_documents(
             )
 
     digest = plan_hash(plan_file.read_bytes())
-    backfilled: list[str] = []
+    # Before the add/commit below: when a role already committed the documents
+    # themselves, nothing is staged and `_branch_carries` decides -- which it
+    # can only answer yes to once those drafts carry the trailer.
+    backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
