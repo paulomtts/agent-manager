@@ -339,3 +339,58 @@ def test_list_run_ids_is_empty_and_creates_nothing_without_a_runs_directory(
 
     assert paths.list_run_ids() == []
     assert not (tmp_path / "agent-manager" / "runs").exists()
+
+
+def test_attempt_path_names_the_attempt_dir_location_without_creating_it(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    located = paths.attempt_path("run-abc", "abc123", "verify", 2)
+
+    assert located == tmp_path / "agent-manager" / "runs" / "run-abc" / "abc123" / "verify.2"
+    assert not (tmp_path / "agent-manager" / "runs").exists()
+    assert paths.attempt_dir("run-abc", "abc123", "verify", 2) == located
+
+
+def test_recorded_attempts_is_empty_and_creates_nothing_for_a_missing_run(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.recorded_attempts("run-abc", "abc123", "verify") == []
+    assert not (tmp_path / "agent-manager" / "runs").exists()
+
+
+def test_recorded_attempts_lists_the_contiguous_attempts_and_creates_nothing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    for n in (1, 2, 3):
+        paths.attempt_dir("run-abc", "abc123", "verify", n)
+    paths.attempt_dir("run-abc", "abc123", "implement", 1)
+    card_dir = tmp_path / "agent-manager" / "runs" / "run-abc" / "abc123"
+    before = sorted(p.name for p in card_dir.iterdir())
+
+    assert paths.recorded_attempts("run-abc", "abc123", "verify") == [1, 2, 3]
+    assert paths.recorded_attempts("run-abc", "abc123", "review") == []
+    assert sorted(p.name for p in card_dir.iterdir()) == before
+
+
+def test_recorded_attempts_stops_at_the_first_gap(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    paths.attempt_dir("run-abc", "abc123", "verify", 1)
+    paths.attempt_dir("run-abc", "abc123", "verify", 3)
+
+    assert paths.recorded_attempts("run-abc", "abc123", "verify") == [1]
+
+
+def test_recorded_attempts_ignores_a_plain_file_in_an_attempts_place(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    card_dir = paths.run_dir("run-abc") / "abc123"
+    card_dir.mkdir()
+    (card_dir / "verify.1").write_text("not a directory\n")
+
+    assert paths.recorded_attempts("run-abc", "abc123", "verify") == []

@@ -72,6 +72,29 @@ def highest_attempt(run_id: str, card: str, phase: str) -> int:
     return attempt
 
 
+def attempt_path(run_id: str, card: str, phase: str, attempt: int) -> Path:
+    """Where `attempt_dir` puts one attempt, without creating anything.
+
+    For readers (`am logs`): `attempt_dir` and `run_dir` mkdir as a side
+    effect, and a read-only command must not mint a run directory.
+    """
+    return data_dir() / "runs" / run_id / card / f"{phase}.{attempt}"
+
+
+def recorded_attempts(run_id: str, card: str, phase: str) -> list[int]:
+    """The attempt numbers `phase` of `card` has a directory for: `[1, ..., k]`.
+
+    The same contiguous scan as `highest_attempt` -- it stops at the first
+    absent `{phase}.N` -- but read-only: it creates neither the `runs`
+    directory, the run's directory, nor the card's. A plain file where an
+    attempt directory would be is not an attempt.
+    """
+    numbers: list[int] = []
+    while attempt_path(run_id, card, phase, len(numbers) + 1).is_dir():
+        numbers.append(len(numbers) + 1)
+    return numbers
+
+
 def list_run_ids() -> list[str]:
     """Every run id that has a directory under `data_dir()/runs`, sorted.
 
