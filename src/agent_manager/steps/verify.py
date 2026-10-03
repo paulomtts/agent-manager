@@ -18,6 +18,7 @@ there is no shell string and nothing to quote.
 
 import re
 import shlex
+import signal
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -77,6 +78,24 @@ def command_diagnostic(stdout: object, stderr: object, fallback: object) -> str:
         or ("" if fallback is None else str(fallback).strip())
         or NO_OUTPUT
     )
+
+
+def exit_label(exit_code: int) -> str:
+    """A red command's exit code as a human reads it.
+
+    `exit 1` for a positive code. A negative code is `subprocess.run`'s way of
+    saying the child was killed by that signal, so it is named:
+    `exit -9 (signal SIGKILL)`, else `exit -200 (signal 200)` for a number the
+    platform does not know. It never raises.
+    """
+    if exit_code >= 0:
+        return f"exit {exit_code}"
+    number = -exit_code
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = str(number)
+    return f"exit {exit_code} (signal {name})"
 
 
 @dataclass(frozen=True)
@@ -301,16 +320,21 @@ def run_suite(
             continue
 
         shown = _display(command, argv)
-        diagnostic = command_diagnostic(
-            completed.stdout,
-            completed.stderr,
-            f"{shown} exited with code {completed.exit_code}",
-        )
+        # The label leads, so no stream content -- a green-looking summary, or
+        # a line long enough to be truncated -- can hide that the command
+        # failed. No fallback: the label already carries the code.
+        label = exit_label(completed.exit_code)
+        diagnostic = command_diagnostic(completed.stdout, completed.stderr, None)
         verified.append(
-            {"command": command, "ok": False, "tail": plain_text(diagnostic)}
+            {
+                "command": command,
+                "ok": False,
+                "exit_code": completed.exit_code,
+                "tail": plain_text(f"{label} — {diagnostic}"),
+            }
         )
         result["detail"] = plain_text(
-            f"verification failed: {shown} — {diagnostic}", DETAIL_MAX
+            f"verification failed: {shown} — {label} — {diagnostic}", DETAIL_MAX
         )
         # Nothing is marked done after a red command (ship.mjs:89).
         return result

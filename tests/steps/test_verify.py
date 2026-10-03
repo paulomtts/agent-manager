@@ -29,6 +29,7 @@ from agent_manager.steps.verify import (
     CommandResult,
     VerifyError,
     command_diagnostic,
+    exit_label,
     last_line,
     plain_text,
 )
@@ -116,6 +117,36 @@ def test_command_diagnostic_never_returns_an_empty_string():
     assert command_diagnostic(None, None, None) == "no output"
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "label"),
+    [
+        (1, "exit 1"),
+        (2, "exit 2"),
+        # A fake runner's out-of-range code is shown as given, never clamped.
+        (300, "exit 300"),
+    ],
+)
+def test_exit_label_formats_codes_verbatim(exit_code: int, label: str):
+    assert exit_label(exit_code) == label
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "label"),
+    [
+        (-9, "exit -9 (signal SIGKILL)"),
+        (-15, "exit -15 (signal SIGTERM)"),
+        (-11, "exit -11 (signal SIGSEGV)"),
+    ],
+)
+def test_exit_label_names_the_signal_of_a_negative_code(exit_code: int, label: str):
+    # `subprocess.run` reports a child killed by signal N as returncode -N.
+    assert exit_label(exit_code) == label
+
+
+def test_exit_label_falls_back_to_the_bare_number_for_an_unknown_signal():
+    assert exit_label(-200) == "exit -200 (signal 200)"
+
+
 def test_a_single_green_command_passes_with_its_last_stdout_line(tmp_path: Path):
     command = _py("print('banner'); print('7 passed')")
     result = verify.run_suite([command], str(tmp_path))
@@ -182,9 +213,17 @@ def test_a_red_command_reports_its_stderr_line(tmp_path: Path):
     result = verify.run_suite([command], str(tmp_path))
     assert result["passed"] is False
     assert result["verified"] == [
-        {"command": command, "ok": False, "tail": "AssertionError: boom"}
+        {
+            "command": command,
+            "ok": False,
+            "exit_code": 1,
+            "tail": "exit 1 — AssertionError: boom",
+        }
     ]
-    assert result["detail"] == f"verification failed: {command} — AssertionError: boom"
+    assert (
+        result["detail"]
+        == f"verification failed: {command} — exit 1 — AssertionError: boom"
+    )
 
 
 def test_a_red_command_with_a_stdout_only_diagnostic_reports_that_stdout_line(
@@ -196,7 +235,8 @@ def test_a_red_command_with_a_stdout_only_diagnostic_reports_that_stdout_line(
     result = verify.run_suite([command], str(tmp_path))
     assert result["passed"] is False
     assert result["verified"][0]["ok"] is False
-    assert result["verified"][0]["tail"] == "ERROR: 3 lint problems"
+    assert result["verified"][0]["exit_code"] == 2
+    assert result["verified"][0]["tail"] == "exit 2 — ERROR: 3 lint problems"
     assert "ERROR: 3 lint problems" in result["detail"]
 
 
@@ -213,9 +253,8 @@ def test_a_red_command_stops_the_commands_after_it(tmp_path: Path):
 def test_a_silent_red_command_still_carries_a_tail_and_a_detail(tmp_path: Path):
     command = _py("raise SystemExit(3)")
     result = verify.run_suite([command], str(tmp_path))
-    assert result["verified"][0]["tail"] == f"{command} exited with code 3"
-    assert result["detail"].startswith("verification failed:")
-    assert "exited with code 3" in result["detail"]
+    assert result["verified"][0]["tail"] == "exit 3 — no output"
+    assert result["detail"] == f"verification failed: {command} — exit 3 — no output"
 
 
 def test_undecodable_output_is_replaced_rather_than_crashing_the_step(tmp_path: Path):
@@ -240,10 +279,157 @@ def test_ansi_colour_and_over_long_lines_are_flattened_in_the_result(tmp_path: P
         return CommandResult(exit_code=1, stdout="", stderr=noisy)
 
     result = verify.run_suite(["fake-linter"], str(tmp_path), runner=runner)
-    assert result["verified"][0]["tail"] == "E" * 300 + "…"
+    assert result["verified"][0]["tail"] == "exit 1 — " + "E" * 291 + "…"
     # `detail` is flattened too, and carries its own larger cap (600), so it is
     # not silently clipped to a per-command tail's 300.
-    assert result["detail"] == f"verification failed: fake-linter — {'E' * 400}"
+    assert result["detail"] == f"verification failed: fake-linter — exit 1 — {'E' * 400}"
+
+
+def test_a_red_command_with_a_green_looking_last_line_names_its_exit_code(
+    tmp_path: Path,
+):
+    # The milestone-17 incident, against a real process: the runner printed a
+    # green summary and exited 1, and the result used to say only "7 passed".
+    command = _py("print('7 passed'); raise SystemExit(1)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is False
+    assert result["verified"] == [
+        {"command": command, "ok": False, "exit_code": 1, "tail": "exit 1 — 7 passed"}
+    ]
+    assert result["detail"] == f"verification failed: {command} — exit 1 — 7 passed"
+
+
+def test_a_command_killed_by_a_signal_is_reported_as_that_signal(tmp_path: Path):
+    # Real, not faked: the negative-returncode convention belongs to
+    # `subprocess`, and only a real child shows it. POSIX only.
+    command = _py("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+    result = verify.run_suite([command], str(tmp_path))
+    assert result["passed"] is False
+    row = result["verified"][0]
+    assert row["exit_code"] == -9
+    assert row["tail"] == "exit -9 (signal SIGKILL) — no output"
+    assert result["detail"].endswith("— exit -9 (signal SIGKILL) — no output")
+
+
+def test_a_signal_style_code_from_the_runner_is_labelled_with_its_name(
+    tmp_path: Path,
+):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=-11, stdout="", stderr="Segmentation fault\n")
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["passed"] is False
+    assert result["verified"] == [
+        {
+            "command": "fake-suite",
+            "ok": False,
+            "exit_code": -11,
+            "tail": "exit -11 (signal SIGSEGV) — Segmentation fault",
+        }
+    ]
+    assert (
+        result["detail"]
+        == "verification failed: fake-suite — exit -11 (signal SIGSEGV) — Segmentation fault"
+    )
+
+
+def test_an_unknown_negative_code_falls_back_to_the_bare_number(tmp_path: Path):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=-200, stdout="", stderr="")
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["exit_code"] == -200
+    assert result["verified"][0]["tail"] == "exit -200 (signal 200) — no output"
+
+
+def test_the_exit_code_survives_over_long_and_ansi_stream_content(tmp_path: Path):
+    # Truncation cuts from the end, and the label comes first, so no stream
+    # content can push the code out of `tail` or `detail`.
+    noisy = "\x1b[32m" + "P" * 5000 + "\x1b[0m"
+
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=2, stdout=noisy, stderr="")
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["exit_code"] == 2
+    assert result["verified"][0]["tail"] == "exit 2 — " + "P" * 291 + "…"
+    detail = result["detail"]
+    assert detail.startswith("verification failed: fake-suite — exit 2 — ")
+    assert len(detail) == 601
+    assert "\x1b" not in detail
+
+
+def test_a_green_stdout_under_an_unrelated_stderr_line_still_leads_with_the_code(
+    tmp_path: Path,
+):
+    # stderr's last line still wins over stdout (unchanged preference order);
+    # the leading exit label is what stops the green stdout from misleading.
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(
+            exit_code=1,
+            stdout="7 passed\n",
+            stderr="DeprecationWarning: old API\n",
+        )
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["tail"] == "exit 1 — DeprecationWarning: old API"
+    assert (
+        result["detail"]
+        == "verification failed: fake-suite — exit 1 — DeprecationWarning: old API"
+    )
+
+
+def test_a_crlf_diagnostic_leaves_no_carriage_return_in_the_tail(tmp_path: Path):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=1, stdout="", stderr="boom  \r\n\r\n")
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["tail"] == "exit 1 — boom"
+    assert result["detail"] == "verification failed: fake-suite — exit 1 — boom"
+
+
+def test_an_out_of_range_positive_code_is_reported_verbatim(tmp_path: Path):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=300, stdout="", stderr="weird\n")
+
+    result = verify.run_suite(["fake-suite"], str(tmp_path), runner=runner)
+    assert result["verified"][0]["exit_code"] == 300
+    assert result["verified"][0]["tail"] == "exit 300 — weird"
+
+
+def test_a_red_argv_command_keeps_its_sequence_and_shows_its_joined_argv(
+    tmp_path: Path,
+):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return CommandResult(exit_code=1, stdout="", stderr="")
+
+    result = verify.run_suite([("fake", "suite")], str(tmp_path), runner=runner)
+    assert result["verified"] == [
+        {
+            "command": ("fake", "suite"),
+            "ok": False,
+            "exit_code": 1,
+            "tail": "exit 1 — no output",
+        }
+    ]
+    assert result["detail"] == "verification failed: fake suite — exit 1 — no output"
+
+
+def test_only_the_red_row_after_green_rows_gains_an_exit_code(tmp_path: Path):
+    # The passing path is unchanged: green rows keep their exact three keys.
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        if argv == ["red"]:
+            return CommandResult(exit_code=1, stdout="1 failed\n", stderr="")
+        return CommandResult(exit_code=0, stdout="fine\n", stderr="")
+
+    result = verify.run_suite(["one", "two", "red"], str(tmp_path), runner=runner)
+    assert result["passed"] is False
+    assert result["verified"] == [
+        {"command": "one", "ok": True, "tail": "fine"},
+        {"command": "two", "ok": True, "tail": "fine"},
+        {"command": "red", "ok": False, "exit_code": 1, "tail": "exit 1 — 1 failed"},
+    ]
+    assert set(result) == {"passed", "verified", "detail"}
 
 
 def test_a_command_that_cannot_be_launched_raises_verify_error(tmp_path: Path):
@@ -530,9 +716,17 @@ def test_a_failing_typecheck_fails_the_suite_and_stops_lint(tmp_path: Path):
     assert result["passed"] is False
     assert result["verified"] == [
         {"command": suite, "ok": True, "tail": "5 passed"},
-        {"command": typecheck, "ok": False, "tail": "error: 2 type errors"},
+        {
+            "command": typecheck,
+            "ok": False,
+            "exit_code": 1,
+            "tail": "exit 1 — error: 2 type errors",
+        },
     ]
-    assert result["detail"] == f"verification failed: {typecheck} — error: 2 type errors"
+    assert (
+        result["detail"]
+        == f"verification failed: {typecheck} — exit 1 — error: 2 type errors"
+    )
     assert not marker.exists()
 
 
@@ -544,10 +738,11 @@ def test_a_silent_failing_typecheck_still_carries_a_tail_and_a_detail(tmp_path: 
     assert result["verified"][-1] == {
         "command": typecheck,
         "ok": False,
-        "tail": f"{typecheck} exited with code 3",
+        "exit_code": 3,
+        "tail": "exit 3 — no output",
     }
     assert result["detail"].startswith("verification failed:")
-    assert "exited with code 3" in result["detail"]
+    assert "— exit 3 — no output" in result["detail"]
 
 
 def test_a_failing_lint_after_a_green_typecheck_names_the_lint_command(tmp_path: Path):
@@ -562,8 +757,11 @@ def test_a_failing_lint_after_a_green_typecheck_names_the_lint_command(tmp_path:
     assert result["passed"] is False
     assert [entry["ok"] for entry in result["verified"]] == [True, True, False]
     assert result["verified"][-1]["command"] == first_lint
-    assert result["verified"][-1]["tail"] == "E501 line too long"
-    assert result["detail"] == f"verification failed: {first_lint} — E501 line too long"
+    assert result["verified"][-1]["tail"] == "exit 1 — E501 line too long"
+    assert (
+        result["detail"]
+        == f"verification failed: {first_lint} — exit 1 — E501 line too long"
+    )
     assert not marker.exists()
 
 
