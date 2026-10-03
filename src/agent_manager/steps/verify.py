@@ -163,9 +163,9 @@ def _display(command: object, argv: list[str]) -> str:
     return command if isinstance(command, str) else " ".join(argv)
 
 
+# The two files `run_suite` writes in `log_dir`; `cli.logs` reads them back.
 STDOUT_LOG = "stdout.log"
 STDERR_LOG = "stderr.log"
-"""The two files `run_suite` writes in `log_dir`; `cli.logs` reads them back."""
 
 
 def _start_logs(log_dir: Path) -> None:
