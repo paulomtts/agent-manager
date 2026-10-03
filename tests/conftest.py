@@ -7,8 +7,10 @@ The guard below fails the session if the real directory changed during it.
 
 It also gives directory-conventional tests a default tier marker: items under
 `tests/e2e/` get `e2e_fake` and items under `tests/steps/` get `git`, unless the
-item already carries a tier marker anywhere on its marker chain. The hook only
-adds markers; the addopts `-m` expression in pyproject.toml does the deselecting.
+item already carries a tier marker anywhere on its marker chain or its module is
+in `_AUTO_MARK_EXEMPT` (tests/e2e/test_fake_claude.py, which marks its tests one
+by one). The hook only adds markers; the addopts `-m` expression in
+pyproject.toml does the deselecting.
 
 Unit-tier items (no tier marker after collection) run with stub `brd`, `git` and
 `claude` scripts first on `PATH`; each stub prints `<name>: forbidden in the unit
@@ -107,6 +109,12 @@ TIER_MARKERS = frozenset({"git", "brd", "e2e_fake", "soak", "e2e"})
 
 _DIRECTORY_TIERS = {"e2e": "e2e_fake", "steps": "git"}
 
+# Modules the directory auto-mark skips, as posix paths relative to tests/. One
+# exact file each, never a prefix. Their tests carry their tier markers one by
+# one, and unmarked ones stay in the unit tier: see the module docstring of
+# tests/e2e/test_fake_claude.py for why that module is the exception.
+_AUTO_MARK_EXEMPT = frozenset({"e2e/test_fake_claude.py"})
+
 
 def relative_to_tests(path: os.PathLike[str] | str, tests_dir: Path = TESTS_DIR) -> PurePath | None:
     """`path` relative to `tests_dir`, or None when it lies outside it.
@@ -122,10 +130,13 @@ def relative_to_tests(path: os.PathLike[str] | str, tests_dir: Path = TESTS_DIR)
 def default_tier_marker(rel_path: PurePath, existing: Iterable[str]) -> str | None:
     """The tier marker an item at `rel_path` (relative to tests/) should get.
 
-    None when its first directory is neither `e2e` nor `steps`, or when
-    `existing` (every marker name on the item's chain) already holds a tier.
+    None when its first directory is neither `e2e` nor `steps`, when it is one of
+    the `_AUTO_MARK_EXEMPT` modules, or when `existing` (every marker name on the
+    item's chain) already holds a tier.
     """
     if len(rel_path.parts) < 2:
+        return None
+    if rel_path.as_posix() in _AUTO_MARK_EXEMPT:
         return None
     tier = _DIRECTORY_TIERS.get(rel_path.parts[0])
     if tier is None:

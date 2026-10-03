@@ -59,6 +59,22 @@ def test_nested_dir_under_e2e_still_gets_e2e_fake():
     assert default_tier_marker(PurePosixPath("e2e/sub/test_x.py"), set()) == "e2e_fake"
 
 
+def test_default_tier_marker_exempts_fake_claude_module():
+    assert default_tier_marker(PurePosixPath("e2e/test_fake_claude.py"), set()) is None
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "tier"),
+    [
+        ("e2e/test_fake_claude_other.py", "e2e_fake"),
+        ("e2e/sub/test_fake_claude.py", "e2e_fake"),
+        ("steps/test_fake_claude.py", "git"),
+    ],
+)
+def test_default_tier_marker_exemption_is_file_scoped(rel_path, tier):
+    assert default_tier_marker(PurePosixPath(rel_path), set()) == tier
+
+
 @pytest.mark.parametrize(
     ("rel_path", "existing"),
     [
@@ -159,3 +175,10 @@ def test_hook_decides_each_item_in_a_shared_module_independently():
     pytest_collection_modifyitems(None, [plain, brd])
     assert plain.added == ["git"]
     assert brd.added == []
+
+
+def test_hook_leaves_unmarked_fake_claude_items_unmarked():
+    """The real hook, not only the helper: the module's pure tests stay unit tier."""
+    item = _FakeItem(TESTS_DIR / "e2e" / "test_fake_claude.py")
+    pytest_collection_modifyitems(None, [item])
+    assert item.added == []
