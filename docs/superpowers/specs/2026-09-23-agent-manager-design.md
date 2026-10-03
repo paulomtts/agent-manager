@@ -509,15 +509,31 @@ retry and persistence code that the Workflow runtime provided for free.
 - **Pure functions** (`dag.py`, `steps/reducers.py`) — unit tests ported
   alongside the logic from the existing `.test.mjs` files, which are the
   behavioural specification for naming, census and every gate.
-- **Steps** — against temporary git repositories and a temporary `brd` board;
-  no network.
+
+Tests are split into six tiers by pytest marker; the rationale is in
+`2026-10-02-test-tier-design.md`. A test's tier is chosen by what it actually
+spawns or touches, not by the directory it lives in.
+
+| Tier | Marker / how to run | Default or opt-in | What belongs there | Budget |
+|---|---|---|---|---|
+| `unit` | no marker; `uv run pytest` | default | Pure functions and anything driven through an injected fake (`FakeLauncher`, `FakeDriver`, a fake `board_api`, `FakeBoard`); no subprocess of any kind | ≤0.5s per test, tier ≤30s |
+| `git` | `@pytest.mark.git`; `uv run pytest` | default | Real `git` in `tmp_path` only; no `brd`, no `claude` | ≤2s per test, tier ≤45s |
+| `brd` | `@pytest.mark.brd`; `uv run pytest -m brd` | opt-in | The real-`brd` adapter contract | tier ≤90s |
+| `e2e_fake` | `@pytest.mark.e2e_fake`; `uv run pytest -m e2e_fake` | opt-in | Production wiring under the fake `claude`, one test per scenario family | tier ≤8min |
+| `soak` | `@pytest.mark.soak`; `uv run pytest -m soak` | opt-in, nightly | Concurrency/race stress | no budget |
+| `e2e` | `@pytest.mark.e2e`; `uv run pytest -m e2e` | opt-in; real `claude`, costs real money | The real-harness runs `e2e_fake` cannot stand in for | hard-capped at 5 tests, each with a `justification:` docstring line naming what `e2e_fake` cannot observe |
+
+The default run, `uv run pytest`, runs `unit` + `git` only; its target is
+≤90s serial.
+
 - **Adapters** — `build_command` is pure and asserted per harness; the launcher
   is injected, so no harness is executed in unit tests.
 - **Engine** — driven with a fake adapter that returns canned result files,
   including invalid ones, gate-failing ones, and a simulated crash mid-phase to
   assert resume.
-- **End to end** — one slow, opt-in test that runs a two-subtask toy milestone
-  with a real harness, marked and excluded from the default suite.
+- **End to end** — the `e2e` tier in the table above: slow, opt-in tests that
+  run a toy milestone with a real harness, marked and excluded from the default
+  suite, hard-capped at 5, each with a `justification:` docstring line.
 
 The project verifies with `pytest`, matching `brd`.
 
