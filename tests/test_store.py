@@ -182,6 +182,31 @@ def test_open_db_does_not_retry_an_error_other_than_database_is_locked(repo):
     assert time.monotonic() - started < 2
 
 
+def test_enable_wal_does_not_retry_an_operational_error_other_than_locked(
+    tmp_path, monkeypatch
+):
+    # A read-only connection makes the WAL pragma raise
+    # OperationalError('attempt to write a readonly database'): the same class as
+    # the locked error, but a different message, so it must not be retried.
+    path = tmp_path / "ro.db"
+    writer = sqlite3.connect(path)
+    writer.execute("CREATE TABLE t (x)")
+    writer.commit()
+    writer.close()
+    pauses: list[float] = []
+    monkeypatch.setattr(store.time, "sleep", pauses.append)
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 2.0)
+
+    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+            store._enable_wal(reader)
+    finally:
+        reader.close()
+
+    assert pauses == []
+
+
 def test_open_db_does_not_sleep_when_nothing_holds_a_lock(repo, monkeypatch):
     # Behavior 6: uncontended, the pragma runs once and open_db never pauses.
     pauses: list[float] = []
