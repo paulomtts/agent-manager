@@ -5134,8 +5134,18 @@ RESUME_KEYS = {
 """Today's resume payload keys; the pygents branch adds and drops none (G10)."""
 
 
-def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
-    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run."""
+def _crash_pygents(
+    project: Path,
+    cards: dict[str, str],
+    phase: str,
+    *,
+    commands: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
+) -> str:
+    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run.
+
+    `commands` and `allow_no_verification` are what the run starts with: the
+    seed, and so the suite a resumed walk keeps."""
     run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
     with pytest.raises(_Killed):
         cli.run_card(
@@ -5143,6 +5153,8 @@ def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
             repo_dir=project,
             base_branch="main",
             branch_prefix="m1",
+            commands=commands,
+            allow_no_verification=allow_no_verification,
             clock=lambda: CRASHED_AT,
             runner_factory=_resume_factory(crash_at=phase, crash_with=_Killed),
         )
@@ -5404,6 +5416,168 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     assert len(ours) == 1, payload["warnings"]
     assert "not posted" in ours[0] and "brd is down" in ours[0]
     assert payload["warnings"][0] == ours[0]
+
+
+KEPT = "verification: kept from checkpoint"
+
+
+def _kept_warnings(payload: dict[str, Any]) -> list[str]:
+    return [w for w in payload["warnings"] if w.startswith(KEPT)]
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_a_different_verify_announces_the_kept_suite(project, cards):
+    """Card 5b19aa93, spec T4: one warning naming the kept suite, not the passed one."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _kept_warnings(payload) == ["verification: kept from checkpoint: ['true']"]
+    assert not [w for w in payload["warnings"] if "echo instrumented" in w]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_the_same_verify_says_nothing_of_the_suite(project, cards):
+    """Spec T5: the passed suite is the kept one, so there is nothing to announce."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, commands=["true"], runner_factory=_resume_factory()
+    )
+
+    assert _kept_warnings(payload) == []
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_no_verify_says_nothing_of_the_suite(project, cards):
+    """Spec T6: `--verify` omitted (`commands=()`) is not a different suite."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert _kept_warnings(payload) == []
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+@pytest.mark.parametrize(
+    "passed",
+    [
+        pytest.param(["echo kept", "true"], id="reordered"),
+        pytest.param(["true", "echo kept", "true"], id="one-extra"),
+        pytest.param(["true ", "echo kept"], id="trailing-space"),
+    ],
+)
+def test_a_task_resume_with_a_reordered_or_respaced_verify_announces_the_kept_suite(
+    project, cards, passed
+):
+    """Spec T7 and Review Focus 2: equality is exact and order-sensitive."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true", "echo kept"))
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, commands=passed, runner_factory=_resume_factory()
+    )
+
+    assert _kept_warnings(payload) == [
+        "verification: kept from checkpoint: ['true', 'echo kept']"
+    ]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_an_opted_out_task_resume_with_a_verify_announces_an_empty_kept_suite(
+    project, cards
+):
+    """Spec T8 and Review Focus 3: an opted-out run kept `[]`, and says so."""
+    run_id = _crash_pygents(project, cards, "plan", allow_no_verification=True)
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["uv run pytest"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _kept_warnings(payload) == ["verification: kept from checkpoint: []"]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_the_kept_suite_warning_follows_the_flush_warnings(project, cards, monkeypatch):
+    """Spec T9 and Review Focus 4: B7's flush warnings lead, the kept suite is next."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.enqueue_comment(
+            run_id=run_id,
+            card_id=cards["subtask"],
+            key=key,
+            body=f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}",
+            now=datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        opened.close()
+
+    def down(card_id, *, repo_dir=None):
+        raise board.BoardError(
+            "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+        )
+
+    monkeypatch.setattr(board, "comment_list", down)
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert set(payload) == RESUME_KEYS
+    flush_at = [
+        i for i, w in enumerate(payload["warnings"]) if f"board comment {key} " in w
+    ]
+    kept_at = [i for i, w in enumerate(payload["warnings"]) if w.startswith(KEPT)]
+    assert flush_at == [0], payload["warnings"]
+    assert kept_at == [1], payload["warnings"]
+    assert payload["warnings"][1] == "verification: kept from checkpoint: ['true']"
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_refused_task_resume_with_a_differing_verify_says_nothing_of_the_suite(
+    project, cards, monkeypatch
+):
+    """Review Focus 5: a refusal is today's error envelope, exit 3, nothing written."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", run_id, "--repo-dir", str(project), "--verify", "echo instrumented"],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    assert KEPT not in result.stdout
+    assert _resume_state(project) == before
 
 
 @pytest.mark.brd
