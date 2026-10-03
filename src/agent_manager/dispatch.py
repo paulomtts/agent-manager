@@ -408,16 +408,32 @@ class AgentRunner:
         retry_on = () if phase.retry is None else tuple(phase.retry.on)
         feedback: list[str] = []
         verdict = Verdict("harness_error", detail="no attempt was made")
+        # The first harness_error of this call gets one more dispatch, outside
+        # the retry budget (1fadbbdd): a harness that died without a result --
+        # a turn ended early, a timeout, a crash -- may well succeed on a fresh
+        # process, and `retry.on` is the schema/gate contract, not this one.
+        redispatched = False
+        counted = 0
 
         try:
-            for _ in range(budget):
-                verdict = self._attempt(
+            while True:
+                n, verdict = self._attempt(
                     phase, context, rendered, tuple(feedback), target, role, cwd, model
                 )
                 if verdict.status == "ok":
                     self._record_phase(phase, "done", started_at, self.clock(), None)
                     return verdict.result
-                if verdict.fatal or verdict.status not in retry_on:
+                if verdict.status == "harness_error" and not redispatched:
+                    # No feedback: the harness produced nothing for a complaint
+                    # to correct, so the brief is re-sent as it was.
+                    redispatched = True
+                    self.warnings.append(
+                        f"phase {phase.name!r}: attempt {n} ended harness_error "
+                        f"({verdict.detail}); dispatching once more"
+                    )
+                    continue
+                counted += 1
+                if verdict.fatal or verdict.status not in retry_on or counted >= budget:
                     break
                 # Carried as data, not folded into `rendered`: `_attempt` composes
                 # the whole brief from the base prompt every time, so re-feeding a
@@ -450,12 +466,14 @@ class AgentRunner:
         role: RoleBundle,
         cwd: Path,
         model: type[BaseModel] | None,
-    ) -> Verdict:
+    ) -> tuple[int, Verdict]:
         """One dispatch: directory, brief, argv, launcher, result, gates.
 
         The brief is composed here rather than by the caller because addendum R2
         puts this attempt's own `result.json` in it, and that path only exists
         once `next_attempt` and `paths.attempt_dir` have fixed the directory.
+        The attempt number is returned with the verdict so the caller can name
+        it: on a resumed run it need not be the loop's iteration count.
         """
         n = next_attempt(self.run_id, self.card_id, phase.name)
         attempt_dir = paths.attempt_dir(self.run_id, self.card_id, phase.name, n)
@@ -552,7 +570,7 @@ class AgentRunner:
                 stdout_path=stdout_path,
             ),
         )
-        return verdict
+        return n, verdict
 
     def _worktree(self, context: Mapping[str, Any], phase_name: str) -> Path:
         """The cwd D7 pins the harness to: the subtask's own worktree."""

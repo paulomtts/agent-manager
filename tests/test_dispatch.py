@@ -291,12 +291,14 @@ class FakeLauncher:
 
     `results[i]` is attempt i+1's `result.json` text, or `None` to write no
     result file at all; the last entry repeats for any further attempt.
+    `exit_codes`, when given, overrides `exit_code` per call by the same rule.
     """
 
     results: list[str | None]
     stdout: str = "usage: tokens\n"
     exit_code: int | None = 0
     timed_out: bool = False
+    exit_codes: list[int | None] | None = None
     calls: list[list[str]] = field(default_factory=list)
     prompts: list[str] = field(default_factory=list)
 
@@ -312,9 +314,12 @@ class FakeLauncher:
         if canned is not None:
             result_path = Path(argv[argv.index("--result") + 1])
             result_path.write_text(canned, encoding="utf-8")
+        exit_code = self.exit_code
+        if self.exit_codes is not None:
+            exit_code = self.exit_codes[min(len(self.calls) - 1, len(self.exit_codes) - 1)]
         return Outcome(
             argv=list(argv),
-            exit_code=self.exit_code,
+            exit_code=exit_code,
             timed_out=self.timed_out,
             duration=1.25,
             stdout_path=stdout_path,
@@ -710,9 +715,10 @@ def test_a_non_json_result_is_schema_invalid_and_retried(store, tmp_path, worktr
     ]
 
 
-def test_a_missing_result_file_is_harness_error_and_is_not_retried(store, tmp_path, worktree):
-    # Spec tests 6 and 13: harness_error can never appear in retry.on, so
-    # attempts remaining does not mean a re-dispatch.
+def test_two_harness_errors_fail_the_phase_as_today(store, tmp_path, worktree):
+    # Spec tests 6 and 13 still hold -- harness_error is never a `retry.on`
+    # retry -- but the first one gets the single redispatch (1fadbbdd), so
+    # the phase fails after two dispatches, on attempt 2's detail.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[None])
     runner, _ = _runner(store, launcher, tmp_path, worktree)
@@ -720,9 +726,23 @@ def test_a_missing_result_file_is_harness_error_and_is_not_retried(store, tmp_pa
     with pytest.raises(AgentPhaseFailed) as caught:
         runner(workflow.phase("explore"), _context(worktree), _rendered())
 
+    second = paths.attempt_dir(RUN_ID, CARD, "explore", 2) / "result.json"
     assert caught.value.outcome == "harness_error"
-    assert len(launcher.calls) == 1
-    assert _attempt_statuses(store) == [(1, "started"), (1, "harness_error")]
+    assert caught.value.detail == f"the harness wrote no result file at {second}"
+    assert caught.value.result is None
+    assert len(launcher.calls) == 2
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "harness_error"), (2, "started"), (2, "harness_error")
+    ]
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+    failed_detail = [
+        line.payload["detail"]
+        for line in store.journal.read()
+        if line.event == "phase_upsert"
+    ][-1]
+    assert failed_detail == caught.value.detail
+    assert len(runner.warnings) == 1
+    assert "attempt 1 ended harness_error" in runner.warnings[0]
 
 
 def test_a_non_zero_exit_is_harness_error(store, tmp_path, worktree):
@@ -749,6 +769,262 @@ def test_a_timeout_is_harness_error_and_the_log_survives(store, tmp_path, worktr
 
     assert caught.value.outcome == "harness_error"
     assert (paths.attempt_dir(RUN_ID, CARD, "explore", 1) / "stdout.log").is_file()
+
+
+def _redispatch_warning(n: int, detail: str) -> str:
+    return (
+        f"phase 'explore': attempt {n} ended harness_error ({detail}); "
+        "dispatching once more"
+    )
+
+
+def _no_result_file(n: int) -> str:
+    path = paths.attempt_dir(RUN_ID, CARD, "explore", n) / "result.json"
+    return f"the harness wrote no result file at {path}"
+
+
+def test_a_harness_error_is_redispatched_once_and_the_second_attempt_can_succeed(
+    store, tmp_path, worktree
+):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 2
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "harness_error"), (2, "started"), (2, "ok")
+    ]
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "done")]
+    assert runner.warnings == [_redispatch_warning(1, _no_result_file(1))]
+
+
+def test_an_ok_first_attempt_dispatches_once(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert len(launcher.calls) == 1
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+    assert runner.warnings == []
+
+
+def test_a_redispatch_brief_carries_no_harness_error_feedback(store, tmp_path, worktree):
+    # D4: nothing is appended for a harness_error, so the redispatched brief is
+    # the failed one with only its own attempt directory swapped in.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    first_dir = str(paths.attempt_dir(RUN_ID, CARD, "explore", 1))
+    second_dir = str(paths.attempt_dir(RUN_ID, CARD, "explore", 2))
+    assert dispatch.FEEDBACK_HEADING not in launcher.prompts[1]
+    assert "wrote no result file" not in launcher.prompts[1]
+    assert launcher.prompts[1] == launcher.prompts[0].replace(first_dir, second_dir)
+
+
+def test_the_redispatch_warning_names_the_journalled_attempt_number(
+    store, tmp_path, worktree
+):
+    # A resumed run finds explore.1 and explore.2 on disk, so its first
+    # attempt here is 3 -- the warning must say 3, not 1.
+    paths.attempt_dir(RUN_ID, CARD, "explore", 1)
+    paths.attempt_dir(RUN_ID, CARD, "explore", 2)
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert _attempt_statuses(store) == [
+        (3, "started"), (3, "harness_error"), (4, "started"), (4, "ok")
+    ]
+    assert runner.warnings == [_redispatch_warning(3, _no_result_file(3))]
+
+
+def test_a_redispatch_does_not_consume_the_retry_budget(store, tmp_path, worktree):
+    # D2: Retry(2, ...) still has both of its attempts after the redispatch.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, NOT_JSON, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 3
+    assert [status for _n, status in _attempt_statuses(store) if status != "started"] == [
+        "harness_error", "schema_invalid", "ok"
+    ]
+    assert _phase_statuses(store)[-1] == ("explore", "done")
+
+
+def test_a_redispatch_plus_a_spent_retry_budget_stops_at_budget_plus_one(
+    store, tmp_path, worktree
+):
+    # Review Focus 1: budget 2 plus the redispatch is three attempts, never four.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, NOT_JSON])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "schema_invalid"
+    assert len(launcher.calls) == 3
+    assert [status for _n, status in _attempt_statuses(store) if status != "started"] == [
+        "harness_error", "schema_invalid", "schema_invalid"
+    ]
+
+
+def test_a_harness_error_after_a_schema_retry_is_still_redispatched(
+    store, tmp_path, worktree
+):
+    def document(functions):
+        return _agentic(functions["output_gate"], retry=phases.Retry(2, ("schema_invalid",)))
+
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[NOT_JSON, None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 3
+    # D4: attempt 1's validator text is still in attempt 3's brief.
+    third = launcher.prompts[2]
+    assert dispatch.FEEDBACK_HEADING in third
+    assert "not valid JSON" in third.split(dispatch.FEEDBACK_HEADING, 1)[1]
+    assert third.count(dispatch.FEEDBACK_HEADING) == 1
+    assert runner.warnings == [_redispatch_warning(2, _no_result_file(2))]
+
+
+def test_a_second_harness_error_after_a_schema_retry_fails_the_phase(
+    store, tmp_path, worktree
+):
+    # Review Focus 3: the allowance is per call, not per streak.
+    def document(functions):
+        return _agentic(functions["output_gate"], retry=phases.Retry(2, ("schema_invalid",)))
+
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[NOT_JSON, None])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "harness_error"
+    assert caught.value.detail == _no_result_file(3)
+    assert len(launcher.calls) == 3
+    assert len(runner.warnings) == 1
+
+
+def test_a_phase_with_no_retry_block_still_gets_the_redispatch(store, tmp_path, worktree):
+    def document(functions):
+        return _agentic(functions["output_gate"], retry=None)
+
+    workflow = _workflow(document, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 2
+    assert _phase_statuses(store)[-1] == ("explore", "done")
+
+
+def test_a_broken_gate_on_the_redispatch_fails_at_once(store, tmp_path, worktree):
+    # Behavior 4: the redispatch is judged like any attempt, and a broken gate
+    # is still fatal however much budget is left.
+    def output_gate(result):
+        raise RuntimeError("the gate itself is broken")
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": output_gate})
+    launcher = FakeLauncher(results=[None, VALID_RESULT])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "gate_failed"
+    assert len(launcher.calls) == 2
+
+
+def test_a_non_zero_exit_is_redispatched(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[VALID_RESULT], exit_codes=[3, 0])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert len(launcher.calls) == 2
+    assert runner.warnings == [_redispatch_warning(1, "the harness exited 3")]
+
+
+def test_a_timeout_is_redispatched(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[None], exit_code=None, timed_out=True)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "harness_error"
+    assert len(launcher.calls) == 2
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "harness_error"), (2, "started"), (2, "harness_error")
+    ]
+    assert len(runner.warnings) == 1
+    assert "timed out" in runner.warnings[0]
+
+
+def test_a_result_less_phase_redispatches_a_bad_exit(store, tmp_path, worktree):
+    # Behavior 9: judged on exit status alone, a non-zero exit is still a
+    # harness_error and still gets the redispatch.
+    def document(functions):
+        return _agentic(
+            name="spec", result=None, retry=None, writes="docs/superpowers/specs/{stem}.md"
+        )
+
+    workflow = _workflow(document, {})
+    launcher = FakeLauncher(results=[None], exit_codes=[2, 0])
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("spec"), _context(worktree), _rendered())
+
+    assert result is None
+    assert len(launcher.calls) == 2
+    assert runner.warnings == [
+        "phase 'spec': attempt 1 ended harness_error (the harness exited 2); "
+        "dispatching once more"
+    ]
+
+
+def test_a_launcher_exception_is_not_redispatched(store, tmp_path, worktree):
+    # Behavior 8 / Review Focus 5: a raise is not a harness_error verdict.
+    calls = []
+
+    def explode(argv, *, cwd, timeout, stdout_path):
+        calls.append(list(argv))
+        raise OSError("the harness binary vanished")
+
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    runner, _ = _runner(store, explode, tmp_path, worktree)
+
+    with pytest.raises(OSError, match="the harness binary vanished"):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert len(calls) == 1
+    assert _attempt_statuses(store) == [(1, "started")]
+    assert _phase_statuses(store) == [("explore", "started"), ("explore", "failed")]
+    assert runner.warnings == []
 
 
 def test_a_retryable_gate_failure_re_dispatches_with_the_gate_detail(
