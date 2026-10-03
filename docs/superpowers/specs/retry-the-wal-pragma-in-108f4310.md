@@ -33,7 +33,7 @@ The RESERVED case is the race this card fixes. It is why
 
 - The projection is per-project SQLite in WAL mode, separate from the
   append-only journal: D5 (`docs/superpowers/specs/2026-09-23-agent-manager-design.md:70`)
-  and §11 Concurrency (same file, lines 444-450: "a single writer for the
+  and §11 Concurrency (same file, lines 447-448: "a single writer for the
   journal, and SQLite in WAL mode"). After `open_db` returns, the connection is
   still in WAL mode.
 - Several `am` processes may run on one repository at once (§11 status note,
