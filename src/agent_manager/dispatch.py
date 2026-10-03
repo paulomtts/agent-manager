@@ -407,7 +407,6 @@ class AgentRunner:
         budget = 1 if phase.retry is None else phase.retry.max_attempts
         retry_on = () if phase.retry is None else tuple(phase.retry.on)
         feedback: list[str] = []
-        verdict = Verdict("harness_error", detail="no attempt was made")
         # The first harness_error of this call gets one more dispatch, outside
         # the retry budget (1fadbbdd): a harness that died without a result --
         # a turn ended early, a timeout, a crash -- may well succeed on a fresh
