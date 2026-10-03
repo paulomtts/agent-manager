@@ -231,6 +231,17 @@ def _rebuild_commit(headers: list[str], parent: str, message: str) -> str:
     return "\n".join(kept) + "\n\n" + message
 
 
+def _resolves(git_runner: GitRunner, worktree_path: str, revision: str) -> bool:
+    """Whether `revision` names a commit in this repository."""
+    try:
+        git_runner(
+            ["-C", worktree_path, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"]
+        )
+    except GitError:
+        return False
+    return True
+
+
 def _backfill(
     git_runner: GitRunner, worktree_path: str, base_branch: str, digest: str
 ) -> list[str]:
@@ -241,10 +252,23 @@ def _backfill(
     from there on each is recreated on its recreated parent. The branch moves
     once, as a compare-and-swap against the tip read here.
     """
-    ref = git_runner(["-C", worktree_path, "symbolic-ref", "-q", "HEAD"]).strip()
+    if not _resolves(git_runner, worktree_path, base_branch):
+        # Today's behaviour; if review's range cannot resolve either, review
+        # reports that, not this step.
+        return []
+    try:
+        ref = git_runner(["-C", worktree_path, "symbolic-ref", "-q", "HEAD"]).strip()
+    except GitError:
+        # Detached HEAD: there is no branch to rewrite by name.
+        return []
     old_tip = git_runner(
         ["-C", worktree_path, "rev-parse", "--verify", "HEAD^{commit}"]
     ).strip()
+    # `origin/<base>` too: `worktree.ensure` may have branched from it, and a
+    # local base behind its remote must not put upstream commits in range.
+    excluded = [f"^{base_branch}"]
+    if _resolves(git_runner, worktree_path, f"origin/{base_branch}"):
+        excluded.append(f"^origin/{base_branch}")
     listing = git_runner(
         [
             "-C",
@@ -254,11 +278,15 @@ def _backfill(
             "--topo-order",
             "--parents",
             old_tip,
-            f"^{base_branch}",
+            *excluded,
             "--",
         ]
     )
     rows = [line.split() for line in listing.splitlines() if line.strip()]
+    if any(len(row) != 2 for row in rows):
+        # A merge (several parents) or a root (none): out of scope, and
+        # review_gate's "only N of M commits" message already covers it.
+        return []
     commits = [
         (row[0], git_runner(["-C", worktree_path, "cat-file", "commit", row[0]]))
         for row in rows

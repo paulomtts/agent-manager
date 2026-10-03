@@ -690,3 +690,83 @@ def test_a_branch_moved_meanwhile_makes_the_update_ref_refuse(repo: Path) -> Non
         _run(repo, git_runner=racing_runner)
 
     assert _message(repo) == "racer"
+
+
+def _assert_untouched_and_docs_landed(repo: Path, old_tip: str, result: dict) -> None:
+    """No rewrite: the pre-call tip is the docs commit's parent, unchanged."""
+    assert result["backfilled"] == []
+    assert _rev(repo, "HEAD~1") == old_tip
+    assert _message(repo).splitlines()[0] == f"docs: add spec and plan for {TITLE}"
+
+
+def test_a_merge_commit_in_range_leaves_the_branch_untouched(repo: Path) -> None:
+    """Out of scope by the card: review's gate message already covers a branch
+    carrying merges, so the backfill must not half-handle one."""
+    _task_branch(repo)
+    _commit_file(repo, "x.txt", "unstamped on task")
+    _git(repo, "checkout", "-q", "-b", "side", "main")
+    _commit_file(repo, "y.txt", "unstamped on side")
+    _git(repo, "checkout", "-q", "task")
+    _git(repo, "merge", "-q", "--no-ff", "side", "-m", "merge side")
+    _commit_file(repo, "u.txt", "unstamped after the merge")
+    _write_documents(repo)
+    old_tip = _rev(repo, "HEAD")
+
+    result = _run(repo)
+
+    _assert_untouched_and_docs_landed(repo, old_tip, result)
+
+
+def test_a_root_commit_in_range_leaves_the_branch_untouched(repo: Path) -> None:
+    _git(repo, "checkout", "-q", "--orphan", "task")
+    _commit_file(repo, "orphan.txt", "unstamped root")
+    _write_documents(repo)
+    old_tip = _rev(repo, "HEAD")
+
+    result = _run(repo)
+
+    _assert_untouched_and_docs_landed(repo, old_tip, result)
+
+
+def test_an_unresolvable_base_leaves_the_branch_untouched(repo: Path) -> None:
+    _task_branch(repo)
+    _commit_file(repo, "u.txt", "unstamped")
+    _write_documents(repo)
+    old_tip = _rev(repo, "HEAD")
+
+    result = _run(repo, base_branch="no-such-branch")
+
+    _assert_untouched_and_docs_landed(repo, old_tip, result)
+
+
+def test_a_detached_head_leaves_the_branch_untouched(repo: Path) -> None:
+    """The step does not rewrite a ref it cannot name."""
+    _task_branch(repo)
+    _commit_file(repo, "u.txt", "unstamped")
+    _git(repo, "checkout", "-q", "--detach", "task")
+    _write_documents(repo)
+    old_tip = _rev(repo, "HEAD")
+
+    result = _run(repo)
+
+    _assert_untouched_and_docs_landed(repo, old_tip, result)
+    assert _rev(repo, "task") == old_tip
+
+
+def test_commits_reachable_from_origin_base_are_never_rewritten(repo: Path) -> None:
+    """`worktree.ensure` may branch from `origin/<base>` while the local base
+    lags behind it; upstream commits must never be rewritten."""
+    _git(repo, "checkout", "-q", "-b", "upstream", "main")
+    u0 = _commit_file(repo, "u0.txt", "unstamped upstream commit")
+    _git(repo, "update-ref", "refs/remotes/origin/main", u0)
+    _git(repo, "checkout", "-q", "-b", "task", "upstream")
+    u1 = _commit_file(repo, "u1.txt", "unstamped task commit")
+    _write_documents(repo)
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result["backfilled"] == [u1]
+    assert _rev(repo, "HEAD~2") == u0
+    assert _message(repo, "HEAD~1").splitlines()[-1] == f"Plan-Hash: {digest}"
+    assert f"Plan-Hash: {digest}" not in _message(repo, u0)
