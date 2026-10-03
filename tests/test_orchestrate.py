@@ -5,9 +5,10 @@ Two tiers, per design §14:
 - `plan_levels`, `story_tips`, `stale_story_anchors`, `build_dag_tree` and the
   payload helpers are pure and get unit tests on hand-built plans, outcomes or
   plain items;
-- `run_milestone` runs on Steps-tier fixtures -- a real temporary git repo and a
-  real temporary brd board, with `XDG_DATA_HOME` under `tmp_path` so
-  `paths.data_dir()` never touches the developer's own -- with the harness
+- `run_milestone` runs on git-tier fixtures -- a real temporary git repo and an
+  in-memory `FakeBoard` (tests/conftest.py) behind `board.run_brd`, with
+  `XDG_DATA_HOME` under `tmp_path` so `paths.data_dir()` never touches the
+  developer's own -- with the harness
   replaced at the injected `driver` seam by an awaitable fake that runs on the
   run's one event loop (supervisor-tree T3). No runner, adapter or `claude` is
   involved; production wiring under a fake `claude` belongs to tests/e2e.
@@ -799,7 +800,7 @@ def test_a_base_only_lanes_outcome_follows_the_waves_in_census_order():
     ]
 
 
-# ── the runner, on a real repo and a real board ─────────────────────────────
+# ── the runner, on a real repo and a FakeBoard ──────────────────────────────
 
 
 STARTED_AT = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
@@ -843,31 +844,58 @@ def _local_branches(cwd: Path) -> list[str]:
     return _git(cwd, "branch", "--format=%(refname:short)").split()
 
 
+def _active_fake_board() -> Any:
+    """The FakeBoard the `project` fixture installed as `board.run_brd`.
+
+    Duck-typed: conftest classes are not importable from a test module under
+    `--import-mode=importlib`, so `isinstance(..., FakeBoard)` is unavailable.
+    """
+    fake = board.run_brd
+    if not (hasattr(fake, "add_card") and hasattr(fake, "cards")):
+        raise AssertionError(
+            "_add_card/_block seed the FakeBoard that the `project` fixture installs "
+            f"as board.run_brd; board.run_brd is {fake!r} -- request `project`"
+        )
+    return fake
+
+
 def _add_card(root: Path, title: str, parent: str | None = None) -> str:
-    argv = ["brd", "add", "--title", title]
-    if parent is not None:
-        argv += ["--parent", parent]
-    completed = subprocess.run(argv, cwd=root, check=True, capture_output=True, text=True)
-    return json.loads(completed.stdout)["data"]["id"]
+    """Seed one card on the project's FakeBoard and return its id.
+
+    `root` is kept so call sites read as before; one FakeBoard is one board.
+    """
+    return _active_fake_board().add_card(title, parent_id=parent)
 
 
 def _block(root: Path, card_id: str, blocker: str) -> None:
-    subprocess.run(
-        ["brd", "block", card_id, "--by", blocker],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    """Make `blocker` block `card_id`, as `brd block card_id --by blocker` would.
+
+    Appends to the seeded card's `blocked_by` after the fact, because story
+    blocks are added once both stories exist. Never stores `blocked` -- it is
+    derived -- and is seeding, so it is not a `FakeBoard.writes` entry.
+    """
+    fake = _active_fake_board()
+    for wanted in (card_id, blocker):
+        if wanted not in fake.cards:
+            raise AssertionError(f"_block: unknown card {wanted!r}")
+    blocked_by = fake.cards[card_id].blocked_by
+    if blocker not in blocked_by:
+        blocked_by.append(blocker)
 
 
 @pytest.fixture
-def project(tmp_path, monkeypatch) -> Path:
-    """One directory that is both a real git repo on `main` and a real brd board.
+def project(tmp_path, monkeypatch, fake_board) -> Path:
+    """A real git repo on `main`, with a fresh FakeBoard as its board.
 
-    XDG_DATA_HOME points into tmp_path, which isolates brd's own database and
-    `paths.data_dir()`, so no run artifact can land in the developer's home.
-    The repo has no remote.
+    `fake_board` (tests/conftest.py) installs an empty in-memory board as
+    `board.run_brd`; `_add_card`/`_block` seed it, and every `board.*` call --
+    from `run_milestone` or from a test body -- is answered by it. No `brd`
+    process starts. Git stays real: worktrees and branches are what these
+    tests are about.
+
+    XDG_DATA_HOME points into tmp_path, so `paths.data_dir()` never lands a
+    run artifact in the developer's home. The repo has no remote and one
+    commit, "base".
     """
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     root = tmp_path / "project"
@@ -881,15 +909,6 @@ def project(tmp_path, monkeypatch) -> Path:
     (root / "README.md").write_text("base\n", encoding="utf-8")
     _git(root, "add", "README.md")
     _git(root, "commit", "-m", "base")
-    subprocess.run(
-        ["brd", "init", "--name", "temp-board"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    _git(root, "add", "-A")
-    _git(root, "commit", "-m", "brd init")
     return root
 
 
@@ -5877,7 +5896,6 @@ def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story
         assert _keys(found) == [f"{run_id}/{subtask}/done"], subtask
         (comment,) = found
         assert comment.author == "am"
-        assert comment.body.startswith(f"am · done · run {run_id}\n")
         assert f"branch: {_branch(project, subtask)}" in comment.body
         assert "(resumed at" not in comment.body
     for story in shape["stories"].values():
@@ -5904,12 +5922,11 @@ def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     (comment,) = found
     assert comment.author == "am"
-    assert comment.body.startswith(f"am · done · run {run_id}\n")
     assert "done: 3 of 3" in comment.body
     assert f"integrated: {INTEGRATION_BRANCH}" in comment.body
-    assert f"next: `git merge {INTEGRATION_BRANCH}`" in comment.body
     assert "total" not in result
     assert result["warnings"] == []
 
@@ -5930,13 +5947,14 @@ def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
 
     assert result["escalated"] is True, result
     run_id = result["run_id"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · escalated · run {run_id}\n")
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     assert (
         f"integrate failed at integrate on [[{story_b}]]: the resolver did not finish"
-        in comment.body
+        in found[0].body
     )
-    assert f"next: `am run --milestone {milestone}`" in comment.body
     assert "total" not in result
     assert result["warnings"] == []
 
@@ -5945,7 +5963,7 @@ def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
 @pytest.mark.git
 def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked(project):
     """Spec test 2, milestone half: the run-end names the escalated subtask and
-    the parked one, and tells a human to resume."""
+    the parked one, and is posted (its resume hint is `test_comments.py`'s job)."""
     shape = _milestone(project, {"A": 1, "B": 2})
     milestone = shape["milestone"]
     (a1,) = shape["subtasks"]["A"]
@@ -5963,11 +5981,10 @@ def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     body = found[0].body
-    assert body.startswith(f"am · escalated · run {run_id}\n")
     assert f"escalated: [[{a1}]] at review" in body
     assert f"parked: [[{b1}]]" in body
-    assert f"next: `am resume {run_id}`" in body
 
 
 @dataclass
@@ -6016,13 +6033,12 @@ def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(pro
     found = _comments(project, a1)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{a1}/escalated:")
+    assert (key, "posted") in _comment_states(project)
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · escalated · run {run_id}\n")
     assert "phase: review" in body
     assert "detail: reviewer found a blocker" in body
     assert 'reason: "the [ [parser]] still drops input; no test"' in body
-    assert f"next: `am resume {run_id}`" in body
     for quiet in (story_a, story_b, b1, b2, story_c, c1):
         assert _comments(project, quiet) == [], quiet
     assert len(_comments(project, shape["milestone"])) == 1
@@ -6076,13 +6092,14 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
     assert len(keys) == 2, keys
     assert keys[0].startswith(f"{run_id}/{a1}/escalated:")
     assert keys[1] == f"{run_id}/{a1}/done"
-    assert found[1].body.startswith(f"am · done · run {run_id}\n(resumed at review)\n")
-    on_milestone = _comments(project, milestone)
-    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
-        f"am · escalated · run {run_id}",
-        f"am · done · run {run_id}",
-    ]
-    assert len(set(_keys(on_milestone))) == 2
+    assert "(resumed at review)" in found[1].body.split("\n")
+    assert (keys[1], "posted") in _comment_states(project)
+    assert first["escalated"] is True, first
+    milestone_keys = _keys(_comments(project, milestone))
+    assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys
+    assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in milestone_keys)
+    run_end_rows = [row for row in _comment_states(project) if "/run-end:" in row[0]]
+    assert run_end_rows == [(key, "posted") for key in milestone_keys]
 
 
 @pytest.mark.brd
@@ -6101,9 +6118,9 @@ def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
     run_id = result["run_id"]
     found = _comments(project, story_c)
     assert _keys(found) == [f"{run_id}/{story_c}/base-failed"]
+    assert (f"{run_id}/{story_c}/base-failed", "posted") in _comment_states(project)
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · base failed · run {run_id}\n")
     assert f"base branch: {root_plan.branch}" in body
     assert "detail: conflict nobody could resolve" in body
     assert _comments(project, c1) == []
@@ -6130,6 +6147,7 @@ def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_
     run_id = result["run_id"]
     found = _comments(project, story_j)
     assert _keys(found) == [f"{run_id}/{story_j}/base-failed"]
+    assert (f"{run_id}/{story_j}/base-failed", "posted") in _comment_states(project)
     assert f"base branch: {root_plan.branch}" in found[0].body
     assert "detail: J's base broke" in found[0].body
     assert result["warnings"] == []
@@ -6347,10 +6365,8 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
         assert _keys(found) == [f"{run_id}/{subtask}/cancelled"], subtask
         (comment,) = found
         assert comment.author == "am"
-        assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
         assert "stopped before: implement" in comment.body
         assert f"branch: {_branch(project, subtask)}" in comment.body
-        assert f"relaunch: `am run --milestone {milestone}`" in comment.body
     assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
     for story in shape["stories"].values():
         assert _comments(project, story) == [], story
@@ -6358,10 +6374,8 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
     (key,) = _keys(on_milestone)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
     body = on_milestone[0].body
-    assert body.startswith(f"am · cancelled · run {run_id}\n")
     assert "done: 1 of 3" in body
     assert "parked: " + ", ".join(f"[[{card}]]" for card in parked) in body
-    assert f"next: `am run --milestone {milestone}`" in body
     cancelled_keys = [key for key, _state in _comment_states(project) if key.endswith("/cancelled")]
     assert cancelled_keys == [f"{run_id}/{card}/cancelled" for card in parked]
     assert all(state == "posted" for _key, state in _comment_states(project))
@@ -6398,11 +6412,14 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
     a1_keys = _keys(_comments(project, a1))
     assert len(a1_keys) == 1 and a1_keys[0].startswith(f"{run_id}/{a1}/escalated:"), a1_keys
     assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/cancelled"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
-    assert f"escalated: [[{a1}]] at review" in comment.body
-    assert f"parked: [[{b1}]]" in comment.body
-    assert f"next: `am run --milestone {milestone}`" in comment.body
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    states = _comment_states(project)
+    assert (f"{run_id}/{b1}/cancelled", "posted") in states
+    assert (key, "posted") in states
+    assert f"escalated: [[{a1}]] at review" in found[0].body
+    assert f"parked: [[{b1}]]" in found[0].body
 
 
 @pytest.mark.brd
@@ -6410,7 +6427,8 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
 def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_phase(project):
     """Review Focus 1: `queued` never reached the driver, so its stopped
     outcome has no `before_phase`; q1 still gets one `cancelled` comment,
-    with its branch and relaunch hint and no `stopped before:` line."""
+    with its branch, posted, and no `stopped before:` line (the relaunch
+    hint text is `test_comments.py`'s job)."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
     milestone = shape["milestone"]
     (first, second, queued) = _census_levels(project, milestone)[0]
@@ -6435,7 +6453,7 @@ def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_ph
     body = found[0].body
     assert "stopped before:" not in body
     assert f"branch: {_branch(project, q1)}" in body
-    assert f"relaunch: `am run --milestone {milestone}`" in body
+    assert (f"{run_id}/{q1}/cancelled", "posted") in _comment_states(project)
     for subtask in (f1, s1):
         assert "stopped before: implement" in _comments(project, subtask)[0].body
 
@@ -6466,8 +6484,9 @@ def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
     assert _comments(project, c1) == []
     assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
     assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/done"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    (key,) = _keys(_comments(project, milestone))
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     assert result["warnings"] == []
 
 
@@ -6503,8 +6522,9 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
 @pytest.mark.brd
 @pytest.mark.git
 def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
-    """Spec test 2: one comment in total, on the milestone, telling a human
-    to resume; parked a1, pending a2 and b1, and every story get nothing."""
+    """Spec test 2: one comment in total, on the milestone, posted (its
+    resume hint is `test_comments.py`'s job); parked a1, pending a2 and b1,
+    and every story get nothing."""
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
     milestone = shape["milestone"]
     a1, a2 = shape["subtasks"]["A"]
@@ -6519,12 +6539,11 @@ def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert _comment_states(project) == [(key, "posted")]
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · paused · run {run_id}\n")
     assert "done: 0 of 3" in body
     assert f"parked: [[{a1}]]" in body
-    assert f"next: `am resume {run_id}`" in body
     for quiet in (a1, a2, b1, *shape["stories"].values()):
         assert _comments(project, quiet) == [], quiet
     assert "total" not in result
@@ -6547,14 +6566,11 @@ def test_a_paused_then_resumed_run_leaves_a_paused_then_a_done_run_end(project):
     again = _resume(project, run_id, FakeDriver(), control_interval=0)
 
     assert again["done"] is True, again
-    on_milestone = _comments(project, milestone)
-    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
-        f"am · paused · run {run_id}",
-        f"am · done · run {run_id}",
-    ]
-    keys = _keys(on_milestone)
-    assert len(set(keys)) == 2, keys
+    keys = _keys(_comments(project, milestone))
+    assert len(keys) == 2 and len(set(keys)) == 2, keys
     assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in keys)
+    run_end_rows = [row for row in _comment_states(project) if "/run-end:" in row[0]]
+    assert run_end_rows == [(key, "posted") for key in keys]
 
 
 # ── run_board helpers (card baef4f94) ───────────────────────────────────────
