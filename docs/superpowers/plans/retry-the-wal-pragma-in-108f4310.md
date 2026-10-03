@@ -586,3 +586,4 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 | T1, T2 | Step 2 |
 | T3 | Step 8, Step 9 |
 | E1 | Step 10 |
+<!-- task-pipeline: validated -->
