@@ -14,6 +14,7 @@ specification (design §14, Pure-functions tier).
 """
 
 import inspect
+import json
 import os
 import shlex
 import subprocess
@@ -1070,3 +1071,95 @@ def test_an_unwritable_log_dir_raises_before_any_command_runs(tmp_path: Path):
         )
 
     assert calls == []
+
+
+# ── AM_RUN_ID / AM_CARD_ID in a verification command's environment (e2efd21d) ─
+#
+# The real-subprocess tests spawn `sys.executable` only, `tmp_path` only: git
+# tier by this directory's auto-mark, like the file's other real-process tests.
+
+_ENV_PROBE = (
+    "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+    "('AM_RUN_ID', 'AM_CARD_ID', 'AM_TEST_SENTINEL', 'PATH')}))"
+)
+"""A child that prints the four variables these tests care about as JSON."""
+
+
+def _child_env(tmp_path: Path, env=None) -> dict[str, object]:
+    """Run `_ENV_PROBE` through `run_command` and decode what the child saw."""
+    argv = [sys.executable, "-c", _ENV_PROBE]
+    if env is None:
+        completed = verify.run_command(argv, str(tmp_path))
+    else:
+        completed = verify.run_command(argv, str(tmp_path), env=env)
+    assert completed.exit_code == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_run_command_overlays_both_ids_on_the_inherited_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+    monkeypatch.delenv("AM_RUN_ID", raising=False)
+    monkeypatch.delenv("AM_CARD_ID", raising=False)
+
+    seen = _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] == "r-1"
+    assert seen["AM_CARD_ID"] == "c-1"
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+    assert seen["PATH"] == os.environ["PATH"]
+
+
+def test_run_command_overlay_replaces_a_stale_inherited_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Review Focus 1: an `am` running as some outer run's verification.
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+
+    seen = _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] == "r-1"
+    assert seen["AM_CARD_ID"] == "c-1"
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+
+
+def test_run_command_without_env_never_leaks_an_inherited_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+
+    seen = _child_env(tmp_path)
+
+    assert seen["AM_RUN_ID"] is None
+    assert seen["AM_CARD_ID"] is None
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+    assert seen["PATH"] == os.environ["PATH"]
+
+
+def test_run_command_overlay_with_one_id_still_drops_the_other_inherited_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+
+    seen = _child_env(tmp_path, env={"AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] is None
+    assert seen["AM_CARD_ID"] == "c-1"
+
+
+def test_run_command_does_not_change_the_parents_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "outer")
+    monkeypatch.delenv("AM_CARD_ID", raising=False)
+
+    _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert os.environ["AM_RUN_ID"] == "outer"
+    assert "AM_CARD_ID" not in os.environ

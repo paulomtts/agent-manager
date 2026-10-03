@@ -16,6 +16,7 @@ Every invocation is an argument list handed to `subprocess` (design §5 line
 there is no shell string and nothing to quote.
 """
 
+import os
 import re
 import shlex
 import signal
@@ -133,12 +134,39 @@ class VerifyError(RuntimeError):
         super().__init__(f"{message} (argv={self.argv!r})")
 
 
-def run_command(argv: list[str], cwd: str) -> CommandResult:
+RUN_ID_ENV = "AM_RUN_ID"
+CARD_ID_ENV = "AM_CARD_ID"
+# The two variables a verification command reads to learn which run and card
+# it is verifying (spec e2efd21d). Only `run_suite` called by the walk sets them.
+
+
+def _child_environment(env: Mapping[str, str] | None) -> dict[str, str]:
+    """The parent's environment minus both ids, with `env` applied on top.
+
+    Both ids are removed first even when inherited: an `am` that is itself
+    some outer run's verification must never report that outer id as this
+    command's.
+    """
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in (RUN_ID_ENV, CARD_ID_ENV)
+    }
+    if env is not None:
+        child.update(env)
+    return child
+
+
+def run_command(
+    argv: list[str], cwd: str, env: Mapping[str, str] | None = None
+) -> CommandResult:
     """The default `CommandRunner`: really run `argv` in `cwd`.
 
     `shell=False` (the default) is the whole point -- see the module docstring.
     `errors="replace"` keeps a command that emits non-UTF-8 bytes from crashing
-    the step; its diagnostic still has to reach a human.
+    the step; its diagnostic still has to reach a human. `env` is only an
+    overlay: the child inherits everything else, never an inherited
+    `AM_RUN_ID`/`AM_CARD_ID` (`_child_environment`).
     """
     completed = subprocess.run(
         argv,
@@ -146,6 +174,7 @@ def run_command(argv: list[str], cwd: str) -> CommandResult:
         capture_output=True,
         text=True,
         errors="replace",
+        env=_child_environment(env),
     )
     return CommandResult(
         exit_code=completed.returncode,
