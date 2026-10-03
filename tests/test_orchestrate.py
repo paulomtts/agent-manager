@@ -5443,7 +5443,7 @@ def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
 @requires_brd
 def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked(project):
     """Spec test 2, milestone half: the run-end names the escalated subtask and
-    the parked one, and tells a human to resume."""
+    the parked one, and is posted (its resume hint is `test_comments.py`'s job)."""
     shape = _milestone(project, {"A": 1, "B": 2})
     milestone = shape["milestone"]
     (a1,) = shape["subtasks"]["A"]
@@ -5907,7 +5907,8 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
 def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_phase(project):
     """Review Focus 1: `queued` never reached the driver, so its stopped
     outcome has no `before_phase`; q1 still gets one `cancelled` comment,
-    with its branch and relaunch hint and no `stopped before:` line."""
+    with its branch, posted, and no `stopped before:` line (the relaunch
+    hint text is `test_comments.py`'s job)."""
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1})
     milestone = shape["milestone"]
     (first, second, queued) = _census_levels(project, milestone)[0]
@@ -6001,8 +6002,9 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
 @requires_git
 @requires_brd
 def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
-    """Spec test 2: one comment in total, on the milestone, telling a human
-    to resume; parked a1, pending a2 and b1, and every story get nothing."""
+    """Spec test 2: one comment in total, on the milestone, posted (its
+    resume hint is `test_comments.py`'s job); parked a1, pending a2 and b1,
+    and every story get nothing."""
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
     milestone = shape["milestone"]
     a1, a2 = shape["subtasks"]["A"]
