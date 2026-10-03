@@ -44,6 +44,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
+The one exception is `am watch --follow`, which prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)).
 
 ### Milestone runs
 
@@ -407,7 +408,7 @@ On a `--card` run, a pause parks the walk before its next phase. The report's `s
 
 #### Not there yet
 
-- `watch` and `retry` do not exist.
+- `retry` does not exist.
 - `am pause --wait` does not exist, Integrate cannot be paused or cancelled, and there is no way to pause a single story: a pause or cancel always applies to the whole run.
 - There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate.
 
