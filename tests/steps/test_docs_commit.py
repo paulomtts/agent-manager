@@ -137,12 +137,17 @@ def _write_documents(root: Path) -> None:
 
 
 def _run(root: Path, **overrides):
-    """Call the step against `root` with the standard arguments."""
+    """Call the step against `root` with the standard arguments.
+
+    `base_branch` is `main`: every test that never leaves `main` has an empty
+    backfill range, so the backfill is a no-op there.
+    """
     arguments = {
         "card_details": FakeCard(title=TITLE),
         "spec_path": SPEC_RELATIVE,
         "plan_path": PLAN_RELATIVE,
         "worktree": str(root),
+        "base_branch": "main",
     }
     arguments.update(overrides)
     return docs_commit.commit_documents(**arguments)
@@ -184,7 +189,7 @@ def test_the_returned_hash_is_the_hash_of_the_plan_file_on_disk(repo: Path) -> N
     result = _run(repo)
 
     expected = hashlib.sha256((repo / PLAN_RELATIVE).read_bytes()).hexdigest()[:8]
-    assert result == {"plan_hash": expected}
+    assert result == {"plan_hash": expected, "backfilled": []}
     assert reducers.is_plan_hash(result["plan_hash"])
 
 
@@ -329,6 +334,9 @@ def _exploding_runner(argv: list[str]) -> str:
         ({"card_details": None}, "needs card_details carrying a non-blank"),
         ({"card_details": FakeCard(title="  ")}, "needs card_details carrying a non-blank"),
         ({"spec_path": "../escape.md"}, "outside the worktree"),
+        ({"base_branch": ""}, "needs a non-empty base_branch"),
+        ({"base_branch": "   "}, "needs a non-empty base_branch"),
+        ({"base_branch": None}, "needs a non-empty base_branch"),
     ],
 )
 def test_a_bad_argument_raises_value_error_before_any_git_runs(

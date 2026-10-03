@@ -161,6 +161,15 @@ def _required_title(card_details: object) -> str:
     return title
 
 
+def _required_base_branch(value: object) -> str:
+    """The non-blank base branch name, or `ValueError` before any git call."""
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError(
+            f"docs_commit.commit_documents needs a non-empty base_branch, got {value!r}"
+        )
+    return value.strip()
+
+
 def _inside(root: str, candidate: Path, field: str) -> Path:
     """`candidate`, proven to live under `root`, or `ValueError`.
 
@@ -188,6 +197,7 @@ def commit_documents(
     spec_path: str,
     plan_path: str,
     worktree: str | Path,
+    base_branch: str,
     git_runner: GitRunner = run_git,
 ) -> dict[str, object]:
     """Commit the spec and the plan, tagged with the plan's Plan-Hash.
@@ -200,6 +210,7 @@ def commit_documents(
     spec_path = _required_relative_path(spec_path, "spec_path")
     plan_path = _required_relative_path(plan_path, "plan_path")
     title = _required_title(card_details)
+    base_branch = _required_base_branch(base_branch)
 
     spec_file, plan_file = _document_paths(worktree_path, spec_path, plan_path)
     spec_file = _inside(worktree_path, spec_file, "spec_path")
@@ -213,6 +224,7 @@ def commit_documents(
             )
 
     digest = plan_hash(plan_file.read_bytes())
+    backfilled: list[str] = []
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
@@ -223,7 +235,7 @@ def commit_documents(
         # The resume path (design §9): "these two paths hold no change", so a
         # plan edited between runs still earns its own commit and hash.
         if _branch_carries(git_runner, worktree_path, digest):
-            return {"plan_hash": digest}
+            return {"plan_hash": digest, "backfilled": backfilled}
         raise UntaggedDocumentsError(
             plan_hash=digest, spec_path=spec_path, plan_path=plan_path
         )
@@ -244,4 +256,4 @@ def commit_documents(
             plan_path,
         ]
     )
-    return {"plan_hash": digest}
+    return {"plan_hash": digest, "backfilled": backfilled}
