@@ -1243,11 +1243,15 @@ def project(tmp_path, monkeypatch) -> Path:
 
 
 @pytest.fixture
-def cards(project) -> dict[str, str]:
-    """A milestone -> story -> subtask chain, the shape `run --card` requires."""
-    milestone = _add_card(project, "Milestone 1: walking skeleton")
-    story = _add_card(project, "The CLI: run, status, logs, resume", milestone)
-    subtask = _add_card(project, "Add run --card end to end", story)
+def cards(project, fake_board) -> dict[str, str]:
+    """A milestone -> story -> subtask chain, the shape `run --card` requires.
+
+    The cards live in the in-memory `fake_board` (test-tier V5); `project` still
+    supplies the real git repo the CLI runs in.
+    """
+    milestone = fake_board.add_card("Milestone 1: walking skeleton")
+    story = fake_board.add_card("The CLI: run, status, logs, resume", parent_id=milestone)
+    subtask = fake_board.add_card("Add run --card end to end", parent_id=story)
     return {"milestone": milestone, "story": story, "subtask": subtask}
 
 
@@ -1922,17 +1926,6 @@ def test_the_command_prints_an_ok_envelope_and_exits_zero(project, cards, monkey
 
 @pytest.mark.brd
 @pytest.mark.git
-def test_pretty_indents_the_same_envelope(project, cards, monkeypatch):
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-    result = _invoke(project, cards["subtask"], "--pretty")
-
-    assert result.exit_code == 0
-    assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "done"
-
-
-@pytest.mark.brd
-@pytest.mark.git
 def test_an_escalated_subtask_is_ok_true_and_exit_one(project, cards, monkeypatch):
     monkeypatch.setattr(
         cli, "default_runner_factory", lambda **kwargs: fake_runner(fail="review")
@@ -2350,78 +2343,79 @@ def _fake_payload(card_id: str, story_id: str) -> dict[str, Any]:
     }
 
 
-@pytest.mark.brd
-@pytest.mark.git
-def test_repeated_verify_options_reach_run_card_in_command_line_order(
-    project, cards, monkeypatch
-):
+VERIFY_CARD_ID = "cbe34d00-9d8d-4f41-9c94-f99e665771b0"
+VERIFY_STORY_ID = "story-1"
+"""Literal ids for the tests that replace `run_card` outright: the card is never
+looked up, so no repo or board is built for it (test-tier V5)."""
+
+
+def test_repeated_verify_options_reach_run_card_in_command_line_order(tmp_path, monkeypatch):
     """§12's suite is the caller's to supply, and the engine runs the commands in
     sequence -- so the order the operator typed is behaviour, not decoration."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen["card_id"] = card_id
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
     result = _invoke(
-        project,
-        cards["subtask"],
+        tmp_path,
+        VERIFY_CARD_ID,
         "--verify",
         "uv run pytest",
         "--verify",
         "uv run ruff check",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert list(seen["commands"]) == ["uv run pytest", "uv run ruff check"]
 
 
-@pytest.mark.brd
-@pytest.mark.git
-def test_no_verify_option_means_an_empty_command_list_not_none(project, cards, monkeypatch):
+def test_no_verify_option_means_an_empty_command_list_not_none(tmp_path, monkeypatch):
     """`gate_context` calls `list(commands)` and `verification_gate` tells an
     empty suite apart from a missing one, so `None` here would be a crash or a
     silently different verdict."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
-    result = _invoke(project, cards["subtask"])
+    result = _invoke(tmp_path, VERIFY_CARD_ID)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert seen["commands"] == []
 
 
-@pytest.mark.brd
-@pytest.mark.git
 def test_a_verify_value_is_passed_through_verbatim_including_spaces_and_empties(
-    project, cards, monkeypatch
+    tmp_path, monkeypatch
 ):
     """Review Focus: one occurrence is one whole command string. The CLI does no
     word-splitting, no parsing and no validation -- whether a command is nonsense
     is the engine's business, not this layer's."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     seen: dict[str, Any] = {}
 
     def fake_run_card(card_id, **kwargs):
         seen.update(kwargs)
-        return _fake_payload(card_id, cards["story"])
+        return _fake_payload(card_id, VERIFY_STORY_ID)
 
     monkeypatch.setattr(cli, "run_card", fake_run_card)
     result = _invoke(
-        project,
-        cards["subtask"],
+        tmp_path,
+        VERIFY_CARD_ID,
         "--verify",
         "uv run pytest -k 'not slow'",
         "--verify",
         "",
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert list(seen["commands"]) == ["uv run pytest -k 'not slow'", ""]
 
 
@@ -2562,31 +2556,35 @@ M2_SHAPE = (
 
 
 @pytest.fixture
-def milestone_board(project) -> dict[str, Any]:
-    """A real brd board shaped like milestone 2, next to a decoy milestone.
+def milestone_board(project, fake_board) -> dict[str, Any]:
+    """A board shaped like milestone 2, next to a decoy milestone, seeded into
+    the in-memory `fake_board` (test-tier V5).
 
-    B is blocked by A and C by B. Each story's subtasks are chained with
-    `brd block` so the census order does not depend on creation timestamps.
-    The decoy root shares the word "skeleton", so only a longer substring
-    names milestone 2.
+    B is blocked by A and C by B. Each story's subtasks are chained the same
+    way. FakeBoard answers no `brd block`, so every edge is seeded with
+    `blocked_by` when the card is created, and the census order does not
+    depend on creation timestamps. The decoy root shares the word "skeleton",
+    so only a longer substring names milestone 2.
     """
-    _add_card(project, "Milestone 1: walking skeleton")
-    milestone = _add_card(project, "Milestone 2: make the skeleton real")
+    fake_board.add_card("Milestone 1: walking skeleton")
+    milestone = fake_board.add_card("Milestone 2: make the skeleton real")
     stories: dict[str, str] = {}
     subtasks: dict[str, list[str]] = {}
     titles: dict[str, str] = {}
     previous_story: str | None = None
     for key, story_title, subtask_titles in M2_SHAPE:
-        story = _add_card(project, story_title, milestone)
+        story = fake_board.add_card(
+            story_title,
+            parent_id=milestone,
+            blocked_by=[previous_story] if previous_story is not None else [],
+        )
         titles[story] = story_title
-        if previous_story is not None:
-            _block(project, story, previous_story)
         chain: list[str] = []
         for subtask_title in subtask_titles:
-            subtask = _add_card(project, subtask_title, story)
+            subtask = fake_board.add_card(
+                subtask_title, parent_id=story, blocked_by=chain[-1:]
+            )
             titles[subtask] = subtask_title
-            if chain:
-                _block(project, subtask, chain[-1])
             chain.append(subtask)
         stories[key] = story
         subtasks[key] = chain
@@ -2822,21 +2820,6 @@ def test_a_title_substring_names_the_same_milestone_as_its_id(
     assert by_id.exit_code == 0, by_id.output
     assert by_title.exit_code == 0, by_title.output
     assert json.loads(by_title.stdout) == json.loads(by_id.stdout)
-
-
-@pytest.mark.brd
-@pytest.mark.git
-def test_the_milestone_dry_run_pretty_indents_the_same_envelope(
-    project, milestone_board, monkeypatch
-):
-    _forbid_writes(monkeypatch)
-
-    plain = _dry_run(project, milestone_board["milestone"])
-    pretty = _dry_run(project, milestone_board["milestone"], "--pretty")
-
-    assert pretty.exit_code == 0, pretty.output
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 @pytest.mark.brd
@@ -3249,14 +3232,10 @@ def test_an_escalated_milestone_exits_one_with_an_ok_envelope(tmp_path, monkeypa
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _patch_run_milestone(monkeypatch, ESCALATED_MILESTONE)
 
-    plain = _milestone_run(tmp_path)
-    pretty = _milestone_run(tmp_path, "--pretty")
+    result = _milestone_run(tmp_path)
 
-    assert plain.exit_code == cli.EXIT_ESCALATED, plain.output
-    assert json.loads(plain.stdout) == cli.ok_envelope(ESCALATED_MILESTONE)
-    assert pretty.exit_code == cli.EXIT_ESCALATED, pretty.output
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(ESCALATED_MILESTONE)
 
 
 def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeypatch):
@@ -3507,8 +3486,8 @@ def _board_dry_run(repo_dir: Path, *extra: str):
     )
 
 
-@requires_git
-@requires_brd
+@pytest.mark.git
+@pytest.mark.brd
 def test_the_board_dry_run_previews_every_open_milestone_by_level_and_writes_nothing(
     project, monkeypatch
 ):
@@ -4104,20 +4083,33 @@ def test_status_of_a_run_that_died_before_its_first_phase_is_ok_with_no_rows(pro
     assert envelope["data"]["stories"][0]["subtasks"][0]["card_id"] == "card-1"
 
 
-def test_status_pretty_indents_the_same_envelope(projection):
+@pytest.mark.parametrize(
+    "run_id, exit_code, ok",
+    [
+        ("20260923T090000Z-cbe34d00", 0, True),
+        ("no-such-run", cli.EXIT_ERROR, False),
+    ],
+    ids=["ok-envelope", "error-envelope"],
+)
+def test_pretty_renders_through_the_cli(projection, run_id, exit_code, ok):
+    """Test-tier V5: the one CliRunner check of `--pretty`. Every command hands its
+    envelope to the same `render(..., pretty=pretty)`, and
+    `test_render_indents_under_pretty` pins what `render` does, so this checks
+    only that the flag reaches it through Typer -- for an ok envelope and for a
+    refusal -- on `status`, the cheapest command (no git, no brd, no subprocess)."""
     _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+    argv = ["status", run_id, "--repo-dir", str(projection)]
 
-    plain = runner.invoke(
-        cli.app, ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection)]
-    )
-    pretty = runner.invoke(
-        cli.app,
-        ["status", "20260923T090000Z-cbe34d00", "--repo-dir", str(projection), "--pretty"],
-    )
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
 
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+    assert plain.exit_code == exit_code, plain.output
+    assert pretty.exit_code == exit_code, pretty.output
+    assert "\n" not in plain.stdout.strip()
+    assert "\n  " in pretty.stdout
+    envelope = json.loads(pretty.stdout)
+    assert envelope == json.loads(plain.stdout)
+    assert envelope["ok"] is ok
 
 
 def test_runs_lists_the_projects_history_newest_first(projection):
@@ -4179,17 +4171,6 @@ def test_runs_agrees_with_status_about_the_most_recent_run(projection):
     )
 
     assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
-
-
-def test_runs_pretty_indents_the_same_envelope(projection):
-    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
-
-    plain = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
-    pretty = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection), "--pretty"])
-
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
@@ -4355,21 +4336,6 @@ def test_logs_phase_and_attempt_together_select_an_earlier_attempt(projection):
     assert data["status"] == "gate_failed"
     assert data["exit_code"] == 1
     assert data["artifacts"]["prompt"]["text"] == "prompt for explore.1\n"
-
-
-def test_logs_pretty_indents_the_same_envelope(projection):
-    _record_for_logs(projection, LOGS_RUN_ID)
-
-    plain = runner.invoke(
-        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
-    )
-    pretty = runner.invoke(
-        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection), "--pretty"]
-    )
-
-    assert pretty.exit_code == 0
-    assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 def test_logs_reports_an_attempt_whose_stdout_was_never_written(projection):
@@ -5408,21 +5374,6 @@ def test_the_resume_command_prints_an_ok_envelope_and_exits_zero(project, cards,
 
 @pytest.mark.brd
 @pytest.mark.git
-def test_resume_pretty_indents_the_same_envelope(project, cards, monkeypatch):
-    run_id = _crash_pygents(project, cards, "plan")
-    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
-
-    result = runner.invoke(
-        cli.app, ["resume", run_id, "--repo-dir", str(project), "--pretty"]
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "done"
-
-
-@pytest.mark.brd
-@pytest.mark.git
 def test_a_resumed_walk_that_escalates_is_ok_true_and_exit_one(project, cards, monkeypatch):
     """An escalation is a truthful result, so the envelope stays `ok: true` and
     the exit code carries the full stop -- exactly as `run` does."""
@@ -6152,31 +6103,6 @@ def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
         )
 
     assert _controls(projection) == []
-
-
-@pytest.mark.parametrize("command", ["pause", "cancel"])
-def test_pause_and_cancel_pretty_indent_the_same_envelope(projection, monkeypatch, command):
-    """Spec test 9."""
-    _freeze_clock(monkeypatch)
-    _plant_run(projection)
-    _plant_lease(projection)
-
-    result = _invoke_control(projection, command, CONTROL_RUN_ID, "--pretty")
-
-    assert result.exit_code == 0, result.output
-    assert "\n  " in result.stdout
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is True
-    assert set(envelope["data"]) == CONTROL_KEYS
-    assert envelope["data"]["command"] == command
-
-    refusal = _invoke_control(projection, command, "no-such-run", "--pretty")
-
-    assert refusal.exit_code == cli.EXIT_ERROR, refusal.output
-    assert "\n  " in refusal.stdout
-    refused = json.loads(refusal.stdout)
-    assert refused["ok"] is False
-    assert refused["error"]["type"] == "UnknownRunError"
 
 
 def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
