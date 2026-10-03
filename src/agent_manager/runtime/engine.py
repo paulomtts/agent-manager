@@ -54,6 +54,26 @@ def pending_phase(checkpoint: Checkpoint) -> str | None:
     return None if turn is None else turn["kwargs"]["phase"]
 
 
+def kept_commands(checkpoint: Checkpoint) -> list[str] | None:
+    """The verification commands `checkpoint`'s walk keeps, or `None` if it does not say.
+
+    Read-only, as `pending_phase` is: it reads the `"subtask"` seed item out of
+    the stored `Agent.to_dict()` and builds nothing. A resume continues with
+    the checkpoint's pool, so this seed -- not a newly passed `--verify` -- is
+    the suite the resumed walk verifies with (card 5b19aa93). A pool with no
+    seed, a seed with no `commands`, or `commands` that are not a list give
+    `None`, never an exception: a report must never fail a resume.
+    """
+    pool = checkpoint.agent.get("context_pool") or {}
+    for item in pool.get("items") or ():
+        if item.get("id") != context.SUBTASK:
+            continue
+        content = item.get("content")
+        commands = content.get("commands") if isinstance(content, dict) else None
+        return list(commands) if isinstance(commands, list) else None
+    return None
+
+
 def run_subtask(
     workflow: Workflow,
     store: Any,

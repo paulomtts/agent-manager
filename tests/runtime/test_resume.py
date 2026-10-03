@@ -481,6 +481,87 @@ def test_a_done_checkpoint_has_no_pending_phase(store):
     assert runtime_engine.pending_phase(done) is None
 
 
+def _checkpoint_with(agent: dict) -> store_module.Checkpoint:
+    return store_module.Checkpoint(
+        run_id=RUN_ID,
+        card_id=CARD_ID,
+        seq=0,
+        workflow="task",
+        digest="any",
+        reason="turn",
+        agent=agent,
+        saved_at=FIXED,
+    )
+
+
+def _pool(*items: dict) -> dict:
+    return {"context_pool": {"limit": None, "items": list(items), "hooks": {}, "tags": []}}
+
+
+def test_kept_commands_reads_the_seeds_commands_in_stored_order():
+    """Spec T1: the `"subtask"` seed item's `commands`, among other items."""
+    checkpoint = _checkpoint_with(
+        _pool(
+            {"id": "explore", "description": "result", "content": {"commands": ["no"]}},
+            {
+                "id": "subtask",
+                "description": "fixed subtask context",
+                "content": {"card": CARD_ID, "commands": ["uv run pytest", "uv run ruff check"]},
+            },
+            {"id": "spec", "description": "result", "content": {"spec": "SPEC"}},
+        )
+    )
+
+    assert runtime_engine.kept_commands(checkpoint) == ["uv run pytest", "uv run ruff check"]
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        pytest.param({}, id="no-context-pool"),
+        pytest.param({"context_pool": None}, id="null-context-pool"),
+        pytest.param({"context_pool": {}}, id="no-items"),
+        pytest.param(
+            _pool({"id": "spec", "description": "result", "content": {"commands": ["x"]}}),
+            id="no-subtask-item",
+        ),
+        pytest.param(
+            _pool({"id": "subtask", "description": "seed", "content": {"card": CARD_ID}}),
+            id="no-commands-key",
+        ),
+        pytest.param(
+            _pool({"id": "subtask", "description": "seed", "content": {"commands": "true"}}),
+            id="commands-not-a-list",
+        ),
+        pytest.param(
+            _pool({"id": "subtask", "description": "seed", "content": None}),
+            id="content-not-a-dict",
+        ),
+    ],
+)
+def test_kept_commands_is_none_when_the_seed_does_not_say(agent):
+    """Spec T2: unknown, never an exception -- a report must not break a resume."""
+    assert runtime_engine.kept_commands(_checkpoint_with(agent)) is None
+
+
+def test_kept_commands_is_empty_for_an_opted_out_seed():
+    """Spec T3: a run started with `--allow-no-verification` kept `[]`, not "unknown"."""
+    checkpoint = _checkpoint_with(
+        _pool({"id": "subtask", "description": "seed", "content": {"commands": []}})
+    )
+
+    assert runtime_engine.kept_commands(checkpoint) == []
+
+
+def test_kept_commands_reads_a_real_checkpoints_seed(store):
+    """The shape above is the one the engine really saves."""
+    ran: list[str] = []
+    with pytest.raises(_Crash):
+        _go(_five(ran, {"c"}), store, commands=["uv run pytest"])
+
+    assert runtime_engine.kept_commands(store.latest_checkpoint(CARD_ID)) == ["uv run pytest"]
+
+
 def _boom(card: str) -> dict[str, Any]:
     raise RuntimeError("boom")
 
