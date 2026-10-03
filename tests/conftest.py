@@ -112,8 +112,10 @@ _DIRECTORY_TIERS = {"e2e": "e2e_fake", "steps": "git"}
 # Modules the directory auto-mark skips, as posix paths relative to tests/. One
 # exact file each, never a prefix. Their tests carry their tier markers one by
 # one, and unmarked ones stay in the unit tier: see the module docstring of
-# tests/e2e/test_fake_claude.py for why that module is the exception.
-_AUTO_MARK_EXEMPT = frozenset({"e2e/test_fake_claude.py"})
+# tests/e2e/test_fake_claude.py for why that module is the exception, and
+# tests/e2e/test_run_board.py's test_this_module_runs_in_the_default_suite_unmarked
+# for why that module needs the same treatment.
+_AUTO_MARK_EXEMPT = frozenset({"e2e/test_fake_claude.py", "e2e/test_run_board.py"})
 
 
 def relative_to_tests(path: os.PathLike[str] | str, tests_dir: Path = TESTS_DIR) -> PurePath | None:
