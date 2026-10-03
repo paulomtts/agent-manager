@@ -385,7 +385,6 @@ def test_the_card_write_and_whole_walk_are_one_critical_section(
     assert counting.outermost_acquisitions == 1
 
 
-@pytest.mark.soak
 @pytest.mark.brd
 def test_a_failed_rollup_releases_the_board_lock(temp_board):
     with pytest.raises(board.BoardError):
