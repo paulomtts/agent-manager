@@ -1426,21 +1426,18 @@ async def build_dag_tree(
     (grafo's 60 s default would cancel a long-running node). `nodes_by_id` is
     keyed by `id_of(item)`, in `items` order.
 
-    An item with exactly one blocker gets one edge from that blocker. Its
-    output is forwarded as `forward(blocker_item)` -- `forward` is handed the
-    blocker item, not its id -- or not at all when `forward` is `None` or
-    returns `None`.
+    Every blocker of an item gets one edge to it, in `blockers_of` order,
+    whatever the blocker count: grafo enqueues a node only once every parent
+    returned, and never once a parent raised, so an item with two or more
+    blockers is a real join. Each edge forwards its blocker's output as
+    `forward(blocker_item)` -- `forward` is handed the blocker item, not its
+    id, once per edge -- or nothing on that edge when `forward` is `None` or
+    returns `None`. This helper creates no events and does no waiting.
 
-    An item with two or more blockers gets no incoming edge and is one of the
-    executor's roots itself: grafo's dynamic worker pool can starve a
-    2+-parent join forever when an unrelated sibling node is still in flight
-    (confirmed in the pinned grafo release; not fixed here). This helper
-    creates no events and does no waiting: the coroutine `node_factory`
-    builds for such an item must wait on its blockers itself.
-
-    `roots` is, in `items` order, every item with no blocker plus every item
-    with two or more. A blocker id not among `items` is the caller's to
-    avoid; nothing is filtered or validated. Empty `items` gives `({}, [])`.
+    `roots` is, in `items` order, every item with no blocker; an item with
+    one or more blockers is never a root. A blocker id not among `items` is
+    the caller's to avoid; nothing is filtered, validated or de-duplicated.
+    Empty `items` gives `({}, [])`.
     """
     nodes = {
         id_of(item): grafo.Node(coroutine=node_factory(item), uuid=id_of(item), timeout=None)
@@ -1450,13 +1447,13 @@ async def build_dag_tree(
     roots: list[grafo.Node] = []
     for item in items:
         blockers = blockers_of(item)
-        if len(blockers) == 1:
-            (blocker,) = blockers
+        if not blockers:
+            roots.append(nodes[id_of(item)])
+            continue
+        for blocker in blockers:
             parent = nodes[blocker]
             name = None if forward is None else forward(items_by_id[blocker])
             await parent.connect(nodes[id_of(item)], forward=name)
-        else:
-            roots.append(nodes[id_of(item)])
     return nodes, roots
 
 
@@ -1478,16 +1475,15 @@ async def supervise(
     """Run every census story as a grafo node and collect the outcomes (T1, T6).
 
     The tree comes from `build_dag_tree` over `plan.stories`, each story's
-    blockers being its `plan.roots` in-milestone blockers: one node per story,
-    one edge per single-blocker story forwarding the blocker's tip as
-    `tip_<short id>`, and every story rooted on a `merged` base (two or more
-    in-milestone blockers) as an extra executor root, for the grafo
-    join-starvation reason `build_dag_tree` documents (a grafo limitation,
-    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's
-    own completion, signalled by `story_done`/`story_ok` below, and reads the
-    blocker's tip off `plan.tips` (`blocker_tips`); every lane sets its own
-    signal on exit, success or not, so this never hangs. A milestone with no
-    story has no tree to run.
+    blockers being its `plan.roots` in-milestone blockers: one node per story
+    and one edge per blocker, each forwarding the blocker's tip as
+    `tip_<short id>`, so a story rooted on a `merged` base (two or more
+    in-milestone blockers) is a grafo join, not an executor root. Such a
+    story's lane waits on each blocker's own completion, signalled by
+    `story_done`/`story_ok` below, and reads the blocker's tip off
+    `plan.tips` (`blocker_tips`); every lane sets its own signal on exit,
+    success or not, so this never hangs. A milestone with no story has no
+    tree to run.
 
     `slots` is the semaphore every lane takes its slot from: when given it is
     used as is, so concurrent `supervise` calls handed the same one share one
