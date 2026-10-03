@@ -24,14 +24,19 @@ REAL_DATA_DIR = _real_data_dir()
 
 
 def _snapshot(root: Path) -> frozenset[str]:
-    """Every path under `root` with its size and mtime; empty when `root` is absent."""
+    """Every path under `root`; empty when `root` is absent.
+
+    Paths only, not sizes or mtimes: a live `am` run heartbeats its lease into
+    the real data directory every few seconds, so when THIS suite runs as that
+    run's own verification (dogfooding), pre-existing files are always being
+    modified by the parent process. A leaking test's signature is a path that
+    appears (a fresh run directory, a journal) or disappears, and that is what
+    the guard flags; pure modification of a file that already existed at
+    session start is the parent run's legitimate churn, not a leak.
+    """
     if not root.exists():
         return frozenset()
-    entries = set()
-    for path in root.rglob("*"):
-        stat = path.stat()
-        entries.add(f"{path.relative_to(root)}|{stat.st_size}|{stat.st_mtime_ns}")
-    return frozenset(entries)
+    return frozenset(str(path.relative_to(root)) for path in root.rglob("*"))
 
 
 _ORIGINAL_XDG = os.environ.get("XDG_DATA_HOME")
