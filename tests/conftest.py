@@ -64,10 +64,23 @@ def _snapshot(root: Path) -> frozenset[str]:
     appears (a fresh run directory, a journal) or disappears, and that is what
     the guard flags; pure modification of a file that already existed at
     session start is the parent run's legitimate churn, not a leak.
+
+    `runs/` itself is excluded from the comparison, not just mtimes within it:
+    a milestone run dispatches several subtasks at once, and a sibling lane
+    phase-transitioning (writing a fresh attempt directory) while THIS verify
+    is in flight is also the parent's legitimate churn, even though the path
+    is brand new -- it belongs to the run doing the dogfooding, not to this
+    suite. The guard still catches a leak anywhere else under the data
+    directory (`projects/`, a stray top-level entry); narrowing it further to
+    "new paths under this run's own id only" needs a marker a verification
+    command doesn't have yet (see card e2efd21d, AM_RUN_ID).
     """
     if not root.exists():
         return frozenset()
-    return frozenset(str(path.relative_to(root)) for path in root.rglob("*"))
+    return frozenset(
+        str(rel) for path in root.rglob("*")
+        if (rel := path.relative_to(root)).parts[:1] != ("runs",)
+    )
 
 
 _ORIGINAL_XDG = os.environ.get("XDG_DATA_HOME")
@@ -97,7 +110,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         return
     after = _snapshot(REAL_DATA_DIR)
     if after != before:
-        changed = sorted(p.split("|", 1)[0] for p in after ^ before)
+        changed = sorted(after ^ before)
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
         message = (
             f"the test session changed the real data directory {REAL_DATA_DIR} "
