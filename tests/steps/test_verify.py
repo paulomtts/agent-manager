@@ -14,6 +14,7 @@ specification (design §14, Pure-functions tier).
 """
 
 import inspect
+import json
 import os
 import shlex
 import subprocess
@@ -547,14 +548,26 @@ def test_run_suite_takes_explore_by_name_before_the_keyword_only_runner():
     # `walk.bind_arguments` binds strictly by parameter name, so the name
     # `explore` is what wires the Explore phase's result in -- no YAML edit.
     # `log_dir` is the name `walk.run_one_step` looks for to hand over the
-    # attempt directory (spec e1b1e7d5, Decision 1).
+    # attempt directory (spec e1b1e7d5, Decision 1). `run_id` is injected the
+    # same way, and `card` is bound from the table (spec e2efd21d).
     parameters = inspect.signature(verify.run_suite).parameters
-    assert list(parameters) == ["commands", "worktree", "explore", "runner", "log_dir"]
+    assert list(parameters) == [
+        "commands",
+        "worktree",
+        "explore",
+        "runner",
+        "log_dir",
+        "run_id",
+        "card",
+    ]
     assert parameters["explore"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert parameters["explore"].default is None
     assert parameters["runner"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["log_dir"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["log_dir"].default is None
+    for name in ("run_id", "card"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is None
 
 
 def test_typecheck_and_lint_run_after_the_suite_in_order(tmp_path: Path):
@@ -1070,3 +1083,265 @@ def test_an_unwritable_log_dir_raises_before_any_command_runs(tmp_path: Path):
         )
 
     assert calls == []
+
+
+# ── AM_RUN_ID / AM_CARD_ID in a verification command's environment (e2efd21d) ─
+#
+# The real-subprocess tests spawn `sys.executable` only, `tmp_path` only: git
+# tier by this directory's auto-mark, like the file's other real-process tests.
+
+_ENV_PROBE = (
+    "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+    "('AM_RUN_ID', 'AM_CARD_ID', 'AM_TEST_SENTINEL', 'PATH')}))"
+)
+"""A child that prints the four variables these tests care about as JSON."""
+
+
+def _child_env(tmp_path: Path, env=None) -> dict[str, object]:
+    """Run `_ENV_PROBE` through `run_command` and decode what the child saw."""
+    argv = [sys.executable, "-c", _ENV_PROBE]
+    if env is None:
+        completed = verify.run_command(argv, str(tmp_path))
+    else:
+        completed = verify.run_command(argv, str(tmp_path), env=env)
+    assert completed.exit_code == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_run_command_overlays_both_ids_on_the_inherited_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+    monkeypatch.delenv("AM_RUN_ID", raising=False)
+    monkeypatch.delenv("AM_CARD_ID", raising=False)
+
+    seen = _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] == "r-1"
+    assert seen["AM_CARD_ID"] == "c-1"
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+    assert seen["PATH"] == os.environ["PATH"]
+
+
+def test_run_command_overlay_replaces_a_stale_inherited_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Review Focus 1: an `am` running as some outer run's verification.
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+
+    seen = _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] == "r-1"
+    assert seen["AM_CARD_ID"] == "c-1"
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+
+
+def test_run_command_without_env_never_leaks_an_inherited_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+    monkeypatch.setenv("AM_TEST_SENTINEL", "kept")
+
+    seen = _child_env(tmp_path)
+
+    assert seen["AM_RUN_ID"] is None
+    assert seen["AM_CARD_ID"] is None
+    assert seen["AM_TEST_SENTINEL"] == "kept"
+    assert seen["PATH"] == os.environ["PATH"]
+
+
+def test_run_command_overlay_with_one_id_still_drops_the_other_inherited_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+
+    seen = _child_env(tmp_path, env={"AM_CARD_ID": "c-1"})
+
+    assert seen["AM_RUN_ID"] is None
+    assert seen["AM_CARD_ID"] == "c-1"
+
+
+def test_run_command_does_not_change_the_parents_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("AM_RUN_ID", "outer")
+    monkeypatch.delenv("AM_CARD_ID", raising=False)
+
+    _child_env(tmp_path, env={"AM_RUN_ID": "r-1", "AM_CARD_ID": "c-1"})
+
+    assert os.environ["AM_RUN_ID"] == "outer"
+    assert "AM_CARD_ID" not in os.environ
+
+
+def _env_recorder() -> tuple[list[tuple[tuple, dict]], verify.CommandRunner]:
+    """A runner that accepts `env` and records each call's args and kwargs."""
+    calls: list[tuple[tuple, dict]] = []
+
+    def runner(*args, **kwargs) -> CommandResult:
+        calls.append((args, kwargs))
+        return CommandResult(exit_code=0, stdout="fine\n", stderr="")
+
+    return calls, runner
+
+
+def test_both_ids_reach_every_planned_command_including_explore_extras(
+    tmp_path: Path,
+):
+    # T1
+    calls, runner = _env_recorder()
+    explore = {"verification": {"typecheck": "mypy .", "lint": ["ruff check ."]}}
+
+    result = verify.run_suite(
+        ["uv run pytest"],
+        str(tmp_path),
+        explore,
+        runner=runner,
+        run_id="run-7",
+        card="e2efd21d",
+    )
+
+    assert result["passed"] is True
+    expected_env = {"AM_RUN_ID": "run-7", "AM_CARD_ID": "e2efd21d"}
+    assert calls == [
+        ((["uv", "run", "pytest"], str(tmp_path)), {"env": expected_env}),
+        ((["mypy", "."], str(tmp_path)), {"env": expected_env}),
+        ((["ruff", "check", "."], str(tmp_path)), {"env": expected_env}),
+    ]
+
+
+def test_no_ids_call_a_strict_two_parameter_runner_exactly_as_before(
+    tmp_path: Path,
+):
+    # T2: a direct `run_suite` call (bases.py, integration.py) at the seam.
+    calls, runner = _recorder()
+
+    result = verify.run_suite(["a b", "c"], str(tmp_path), runner=runner)
+
+    assert result["passed"] is True
+    assert calls == [(["a", "b"], str(tmp_path)), (["c"], str(tmp_path))]
+
+
+@pytest.mark.parametrize(
+    ("ids", "overlay"),
+    [
+        ({"card": "c-1"}, {"AM_CARD_ID": "c-1"}),
+        ({"run_id": "r-1"}, {"AM_RUN_ID": "r-1"}),
+        ({"run_id": "", "card": "c-1"}, {"AM_CARD_ID": "c-1"}),
+        ({"run_id": "r-1", "card": "   "}, {"AM_RUN_ID": "r-1"}),
+    ],
+)
+def test_the_overlay_holds_only_the_present_ids(
+    tmp_path: Path, ids: dict[str, str], overlay: dict[str, str]
+):
+    # T3
+    calls, runner = _env_recorder()
+
+    verify.run_suite(["a"], str(tmp_path), runner=runner, **ids)
+
+    assert calls == [((["a"], str(tmp_path)), {"env": overlay})]
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        {"run_id": "", "card": ""},
+        {"run_id": "   ", "card": "\t"},
+        {"run_id": None, "card": "  "},
+    ],
+)
+def test_blank_ids_count_as_absent(tmp_path: Path, ids: dict[str, object]):
+    # T4: the runner gets two positional arguments and nothing else.
+    calls, runner = _recorder()
+
+    result = verify.run_suite(["a"], str(tmp_path), runner=runner, **ids)
+
+    assert result["passed"] is True
+    assert calls == [(["a"], str(tmp_path))]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"), [("card", 123), ("run_id", ["r-1"]), ("card", b"c-1")]
+)
+def test_a_non_string_id_raises_before_anything_runs(
+    tmp_path: Path, name: str, value: object
+):
+    # T5
+    calls, runner = _env_recorder()
+
+    with pytest.raises(ValueError) as excinfo:
+        verify.run_suite(["a"], str(tmp_path), runner=runner, **{name: value})
+
+    assert calls == []
+    assert name in str(excinfo.value)
+    assert repr(value) in str(excinfo.value)
+
+
+def test_a_non_string_id_raises_before_the_logs_are_started(tmp_path: Path):
+    calls, runner = _env_recorder()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    with pytest.raises(ValueError):
+        verify.run_suite(
+            ["a"], str(tmp_path), runner=runner, log_dir=log_dir, run_id=7
+        )
+
+    assert calls == []
+    assert list(log_dir.iterdir()) == []
+
+
+def test_ids_do_not_change_the_result_or_the_logs(tmp_path: Path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    plain_logs = tmp_path / "plain"
+    plain_logs.mkdir()
+    id_logs = tmp_path / "ids"
+    id_logs.mkdir()
+    commands = [_py("print('ok')"), _py("print('bad'); raise SystemExit(1)")]
+
+    without = verify.run_suite(commands, str(worktree), log_dir=plain_logs)
+    with_ids = verify.run_suite(
+        commands, str(worktree), log_dir=id_logs, run_id="r-1", card="c-1"
+    )
+
+    assert with_ids == without
+    assert _logs(id_logs) == _logs(plain_logs)
+
+
+def test_the_default_runner_exports_both_ids_to_a_real_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # T8: B2 and B1 composed, end to end through a real process. The
+    # no-id half runs under a stale parent value too (Review Focus 1).
+    monkeypatch.setenv("AM_RUN_ID", "stale")
+    monkeypatch.setenv("AM_CARD_ID", "stale")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    with_ids = tmp_path / "with-ids.json"
+    without_ids = tmp_path / "without-ids.json"
+
+    def probe(target: Path) -> str:
+        return _py(
+            "import json, os, pathlib; "
+            f"pathlib.Path({str(target)!r}).write_text(json.dumps("
+            "{k: os.environ.get(k) for k in ('AM_RUN_ID', 'AM_CARD_ID')}))"
+        )
+
+    first = verify.run_suite(
+        [probe(with_ids)], str(worktree), run_id="run-7", card="e2efd21d"
+    )
+    second = verify.run_suite([probe(without_ids)], str(worktree))
+
+    assert first["passed"] is True and second["passed"] is True
+    assert json.loads(with_ids.read_text()) == {
+        "AM_RUN_ID": "run-7",
+        "AM_CARD_ID": "e2efd21d",
+    }
+    assert json.loads(without_ids.read_text()) == {
+        "AM_RUN_ID": None,
+        "AM_CARD_ID": None,
+    }

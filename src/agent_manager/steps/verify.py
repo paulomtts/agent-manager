@@ -16,6 +16,7 @@ Every invocation is an argument list handed to `subprocess` (design §5 line
 there is no shell string and nothing to quote.
 """
 
+import os
 import re
 import shlex
 import signal
@@ -111,8 +112,13 @@ class CommandResult:
     stderr: str
 
 
-CommandRunner = Callable[[list[str], str], CommandResult]
+CommandRunner = Callable[..., CommandResult]
 """Takes an argv and a working directory, returns a `CommandResult`.
+
+Called as `runner(argv, cwd)`, and as `runner(argv, cwd, env=overlay)` when the
+walk supplied a run or card id (spec e2efd21d): `overlay` holds only the
+present `AM_RUN_ID`/`AM_CARD_ID` keys, never a whole environment, so a runner
+that never sees ids may keep a strict two-parameter signature.
 
 Raises `FileNotFoundError` or `PermissionError` if the command cannot be
 launched at all; a non-zero exit is a return value, not an exception.
@@ -133,12 +139,39 @@ class VerifyError(RuntimeError):
         super().__init__(f"{message} (argv={self.argv!r})")
 
 
-def run_command(argv: list[str], cwd: str) -> CommandResult:
+RUN_ID_ENV = "AM_RUN_ID"
+CARD_ID_ENV = "AM_CARD_ID"
+# The two variables a verification command reads to learn which run and card
+# it is verifying (spec e2efd21d). Only `run_suite` called by the walk sets them.
+
+
+def _child_environment(env: Mapping[str, str] | None) -> dict[str, str]:
+    """The parent's environment minus both ids, with `env` applied on top.
+
+    Both ids are removed first even when inherited: an `am` that is itself
+    some outer run's verification must never report that outer id as this
+    command's.
+    """
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in (RUN_ID_ENV, CARD_ID_ENV)
+    }
+    if env is not None:
+        child.update(env)
+    return child
+
+
+def run_command(
+    argv: list[str], cwd: str, env: Mapping[str, str] | None = None
+) -> CommandResult:
     """The default `CommandRunner`: really run `argv` in `cwd`.
 
     `shell=False` (the default) is the whole point -- see the module docstring.
     `errors="replace"` keeps a command that emits non-UTF-8 bytes from crashing
-    the step; its diagnostic still has to reach a human.
+    the step; its diagnostic still has to reach a human. `env` is only an
+    overlay: the child inherits everything else, never an inherited
+    `AM_RUN_ID`/`AM_CARD_ID` (`_child_environment`).
     """
     completed = subprocess.run(
         argv,
@@ -146,6 +179,7 @@ def run_command(argv: list[str], cwd: str) -> CommandResult:
         capture_output=True,
         text=True,
         errors="replace",
+        env=_child_environment(env),
     )
     return CommandResult(
         exit_code=completed.returncode,
@@ -309,6 +343,30 @@ def _required_worktree(worktree: object) -> str:
     return text
 
 
+def _id_overlay(run_id: object, card: object) -> dict[str, str]:
+    """The `AM_RUN_ID`/`AM_CARD_ID` overlay for the ids that are present.
+
+    `None` and a blank string both mean absent and are left out. Anything
+    else that is not a `str` is a caller bug, raised up front like
+    `run_suite`'s other `ValueError`s, before a single process starts.
+    """
+    overlay: dict[str, str] = {}
+    for name, key, value in (
+        ("run_id", RUN_ID_ENV, run_id),
+        ("card", CARD_ID_ENV, card),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(
+                f"verify.run_suite needs {name} to be a string, got {value!r}"
+            )
+        if value.strip() == "":
+            continue
+        overlay[key] = value
+    return overlay
+
+
 def run_suite(
     commands: object,
     worktree: object,
@@ -316,6 +374,8 @@ def run_suite(
     *,
     runner: CommandRunner = run_command,
     log_dir: Path | None = None,
+    run_id: str | None = None,
+    card: str | None = None,
 ) -> dict[str, object]:
     """Run each verification command in `worktree` and report what happened.
 
@@ -338,9 +398,16 @@ def run_suite(
     verbatim. It lives under the data directory, never the worktree, so this
     step stays read-only with respect to the repository. An `OSError` writing
     it propagates. The returned dict is the same with or without it.
+
+    `run_id` (injected by `walk.run_one_step`) and `card` (bound from the
+    table) become `AM_RUN_ID`/`AM_CARD_ID` in every command's environment,
+    explore extras included (spec e2efd21d). With neither present -- a direct
+    call -- the runner is called as `runner(argv, cwd)`, exactly as before,
+    and `run_command` then runs the command with neither variable set.
     """
     planned = [*_plan_commands(commands), *_plan_explore_commands(explore)]
     worktree_path = _required_worktree(worktree)
+    overlay = _id_overlay(run_id, card)
     if log_dir is not None:
         _start_logs(Path(log_dir))
     result: dict[str, object] = {"passed": False, "verified": [], "detail": ""}
@@ -348,7 +415,10 @@ def run_suite(
 
     for command, argv in planned:
         try:
-            completed = runner(argv, worktree_path)
+            if overlay:
+                completed = runner(argv, worktree_path, env=overlay)
+            else:
+                completed = runner(argv, worktree_path)
         except (FileNotFoundError, PermissionError, NotADirectoryError) as exc:
             raise VerifyError(
                 f"could not run {_display(command, argv)}: {exc}", argv=argv

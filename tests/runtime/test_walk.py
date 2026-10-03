@@ -513,3 +513,117 @@ def test_a_red_verify_through_run_one_step_leaves_its_logs_under_the_run_dir(
     assert (log_dir / verify.STDERR_LOG).read_text(encoding="utf-8") == (
         f"==> {command} (exit 1)\nE boom\n"
     )
+
+
+# ── the engine-supplied run id (spec e2efd21d, B3) ───────────────────────────
+#
+# Unit tier: fake steps (and the real verify step with a fake runner via the
+# document's `args`), a real temp Store, no spawn.
+
+
+def _run_id_step(seen: list[object]):
+    def run_id_step(run_id=None):
+        seen.append(run_id)
+        return {}
+
+    return run_id_step
+
+
+def test_run_one_step_hands_a_declaring_step_the_stores_run_id(store):
+    # T9
+    seen: list[object] = []
+
+    outcome = _run(store, Step("verify", _run_id_step(seen)))
+
+    assert outcome.ok is True
+    assert seen == [RUN_ID]
+
+
+def test_the_engines_run_id_overrides_document_args_and_the_binding_table(store):
+    # T10 / Review Focus 5: `bind_arguments` accepts the args key, since the
+    # step declares it, and the engine's value still wins.
+    seen: list[object] = []
+    step = Step("verify", _run_id_step(seen), args={"run_id": "other"})
+
+    outcome = _run(store, step, table={"run_id": "from-the-table"})
+
+    assert outcome.ok is True
+    assert seen == [RUN_ID]
+
+
+def test_a_store_with_no_run_id_leaves_the_steps_run_id_default():
+    # T11
+    seen: list[object] = []
+
+    outcome = walk.run_one_step(
+        phase=Step("verify", _run_id_step(seen), args={"run_id": "other"}),
+        table={"run_id": "from-the-table"},
+        store=_RunlessStore(),
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is True
+    assert seen == [None]
+
+
+def test_a_step_that_does_not_declare_run_id_is_called_without_it(store):
+    # T12
+    seen: list[dict[str, object]] = []
+
+    def step(**kwargs):
+        seen.append(kwargs)
+        return {}
+
+    def plain(card):
+        seen.append({"card": card})
+        return {}
+
+    first = _run(store, Step("verify", step), table={"run_id": "from-the-table"})
+    second = _run(
+        store, Step("verify", plain), table={"run_id": "x", "card": CARD_ID}
+    )
+
+    assert first.ok is True and second.ok is True
+    assert seen == [{}, {"card": CARD_ID}]
+
+
+def test_the_real_verify_step_hands_its_runner_the_walks_run_and_card_ids(
+    store, tmp_path
+):
+    """Card test (T13): a fake runner sees both variables with the walk's ids."""
+    calls: list[tuple[list[str], str, object]] = []
+
+    def runner(argv, cwd, env=None):
+        calls.append((argv, cwd, env))
+        return verify.CommandResult(exit_code=0, stdout="ok\n", stderr="")
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    step = Step(
+        "verify",
+        verify.run_suite,
+        args={"runner": runner},
+        gates=(reducers.verification_passed_gate,),
+    )
+
+    outcome = _run(
+        store,
+        step,
+        table={
+            "commands": ["uv run pytest"],
+            "worktree": str(worktree),
+            "card": CARD_ID,
+        },
+    )
+
+    assert outcome.ok is True
+    assert set(outcome.result) == {"passed", "verified", "detail"}
+    assert calls == [
+        (
+            ["uv", "run", "pytest"],
+            str(worktree),
+            {"AM_RUN_ID": RUN_ID, "AM_CARD_ID": CARD_ID},
+        )
+    ]
