@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from agent_manager import models, prompt
+from agent_manager import models, paths, prompt
 from agent_manager.runtime.errors import EngineError
 from agent_manager.store import Store
 from agent_manager.workflow import phases as phase_model
@@ -421,6 +421,40 @@ def _bind_result(context: dict[str, Any], phase_name: str, result: Any) -> None:
         context[phase_name] = result
 
 
+LOG_DIR_PARAMETER = "log_dir"
+"""The parameter a deterministic step declares to be handed its attempt directory."""
+
+
+def _with_log_dir(
+    fn: Callable[..., Any],
+    kwargs: dict[str, Any],
+    store: Any,
+    card: str,
+    phase_name: str,
+) -> dict[str, Any]:
+    """`kwargs` with the engine's `log_dir`, for a step that declares one.
+
+    Spec e1b1e7d5 Decision 1: only a step whose signature names `log_dir`
+    gets a directory, and only then is one created -- every other step is
+    untouched and nothing appears on disk for it. The directory is
+    `paths.attempt_dir(run, card, phase, n)` with `n` one past the highest
+    already on disk, the numbering agent phases use (`dispatch.next_attempt`),
+    so a re-run after resume lands in a fresh `<phase>.N`. The engine's value
+    wins over anything the binding table or the document's `args` said. A
+    store with no run id (`checkpoint._floor` makes the same check) supplies
+    nothing, and the step's own default applies.
+    """
+    if LOG_DIR_PARAMETER not in inspect.signature(fn).parameters:
+        return kwargs
+    bound = {key: value for key, value in kwargs.items() if key != LOG_DIR_PARAMETER}
+    run_id = getattr(store, "run_id", None)
+    if not run_id:
+        return bound
+    attempt = paths.highest_attempt(run_id, card, phase_name) + 1
+    bound[LOG_DIR_PARAMETER] = paths.attempt_dir(run_id, card, phase_name, attempt)
+    return bound
+
+
 def run_one_step(
     *,
     phase: phase_model.Step,
@@ -446,6 +480,7 @@ def run_one_step(
         kwargs = bind_arguments(
             phase.run, table, phase.args, phase=phase.name, function=label
         )
+        kwargs = _with_log_dir(phase.run, kwargs, store, subtask.card_id, phase.name)
         result = phase.run(**kwargs)
         if not isinstance(result, Mapping):
             raise EngineError(

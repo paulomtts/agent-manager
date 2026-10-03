@@ -52,6 +52,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
 from agent_manager.workflow import task as task_workflow
 
@@ -410,7 +411,7 @@ def logs_payload(
     phase: models.PhaseRun,
     attempt: models.Attempt,
 ) -> dict[str, Any]:
-    """§10's `logs` output: what was selected, and the three artifacts of it.
+    """§10's `logs` output: what was selected, and the artifacts of it.
 
     The locations come from the `Attempt` row the projection already holds, never
     from `paths.attempt_dir` -- that helper creates the directory it names, and
@@ -433,6 +434,70 @@ def logs_payload(
             "prompt": read_artifact(attempt.prompt_path),
             "result": read_artifact(attempt.result_path),
             "stdout": read_artifact(attempt.stdout_path),
+            # The launcher merges an agent's stderr into stdout; the key is
+            # here so agent and deterministic payloads share one shape.
+            "stderr": read_artifact(None),
+        },
+    }
+
+
+def select_step_attempt(
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    recorded: Sequence[int],
+    attempt: int | None = None,
+) -> int:
+    """Which attempt of a deterministic phase `logs` should report, or a refusal.
+
+    A deterministic phase has no `Attempt` rows (spec e1b1e7d5 Decision 2), so
+    its attempts are the `<phase>.N` directories on disk, which the caller
+    scans (`paths.recorded_attempts`) and passes in -- keeping this, like
+    `select_attempt`, pure. Same defaults and the same wording as
+    `select_attempt`: the highest number with no `attempt`.
+    """
+    if attempt is None:
+        if not recorded:
+            raise UnknownAttemptError(
+                f"phase {phase.name!r} of card {subtask.card_id!r} has no recorded"
+                " attempt yet"
+            )
+        return max(recorded)
+    if attempt in recorded:
+        return attempt
+    numbers = ", ".join(str(n) for n in recorded) or "none"
+    raise UnknownAttemptError(
+        f"phase {phase.name!r} of card {subtask.card_id!r} has no attempt {attempt};"
+        f" recorded attempts: {numbers}"
+    )
+
+
+def step_logs_payload(
+    run: models.Run,
+    story: models.StoryRun,
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    attempt: int,
+    directory: Path,
+) -> dict[str, Any]:
+    """`logs_payload`'s shape for a deterministic phase's on-disk attempt.
+
+    `status` and `exit_code` are `None`: no `Attempt` row exists to carry
+    them, and each command's exit label is in its log header instead. A step
+    writes no prompt or result, so those two are always absent.
+    """
+    return {
+        "run_id": run.id,
+        "story_id": story.card_id,
+        "card": subtask.card_id,
+        "phase": phase.name,
+        "attempt": attempt,
+        "status": None,
+        "exit_code": None,
+        "artifacts": {
+            "prompt": read_artifact(None),
+            "result": read_artifact(None),
+            "stdout": read_artifact(directory / verify_step.STDOUT_LOG),
+            "stderr": read_artifact(directory / verify_step.STDERR_LOG),
         },
     }
 
@@ -1463,6 +1528,11 @@ def logs_for(
 
     `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
     "most recent run" reading of it to default to.
+
+    A `--phase` naming a deterministic phase is answered from disk: its
+    attempts are the `<phase>.N` directories `run_one_step` created, and the
+    payload carries that attempt's `stdout.log` and `stderr.log` (spec
+    e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1480,6 +1550,21 @@ def logs_for(
                 f" (`agent-manager status {run_id}` lists the cards that are)"
             )
         story, subtask = found
+        step = next(
+            (
+                item
+                for item in subtask.phases
+                if item.name == phase and item.kind == "deterministic"
+            ),
+            None,
+        )
+        if step is not None:
+            # Read-only on disk: `recorded_attempts` and `attempt_path` create
+            # nothing, unlike `attempt_dir` and `run_dir`.
+            recorded = paths.recorded_attempts(run_id, card, step.name)
+            n = select_step_attempt(subtask, step, recorded, attempt)
+            directory = paths.attempt_path(run_id, card, step.name, n)
+            return step_logs_payload(run, story, subtask, step, n, directory)
         chosen_phase, chosen_attempt = select_attempt(
             subtask, phase=phase, attempt=attempt
         )
@@ -1503,7 +1588,7 @@ def logs(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print one attempt's prompt, result and captured stdout."""
+    """Print one attempt's prompt, result and captured stdout/stderr."""
     try:
         payload = logs_for(
             run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
@@ -1782,7 +1867,10 @@ def _resume_from_checkpoint(
     records the run `cancelled` (`card_run_status`).
 
     Once the checkpoint is accepted, the run's pending board comments are
-    flushed (board-comments B7) and their warnings lead the payload's.
+    flushed (board-comments B7) and their warnings lead the payload's. Next
+    comes, when a passed `commands` differs from the suite the checkpoint
+    keeps (`runtime_engine.kept_commands`), one `verification: kept from
+    checkpoint: [...]` warning naming the kept suite (card 5b19aa93).
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -1804,6 +1892,15 @@ def _resume_from_checkpoint(
             checkpoint = store.latest_checkpoint(subtask.card_id)
             phase = checkpoint_resume_phase(
                 checkpoint, card_id=subtask.card_id, run_id=run.id
+            )
+            # Card 5b19aa93: the walk keeps the checkpoint's suite, not
+            # `commands`. Say so when a passed `--verify` differs from it; an
+            # omitted flag or an unknown kept suite says nothing.
+            kept = runtime_engine.kept_commands(checkpoint)
+            kept_warning = (
+                [f"verification: kept from checkpoint: {kept!r}"]
+                if commands and kept is not None and list(commands) != kept
+                else []
             )
             # Board-comments B7: this run's leftover comments go out under this
             # life's lease, after every refusal and before the walk goes on; a
@@ -1864,7 +1961,7 @@ def _resume_from_checkpoint(
             "failed_phase": summary.failed_phase,
             "detail": summary.detail,
             "skipped": list(summary.skipped),
-            "warnings": [*flushed, *drive.warnings],
+            "warnings": [*flushed, *kept_warning, *drive.warnings],
             "resumed_from": phase,
             "discarded_attempts": [
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
@@ -1909,7 +2006,9 @@ def resume_run(
     reason the record exists. The two knobs the record does *not* carry --
     `models.RunConfig` has no suite commands and no `allow_no_verification` --
     are still taken as arguments. A walk continued from a checkpoint never
-    reads them: its binding comes from the checkpoint's pool. On a milestone
+    reads them: its binding comes from the checkpoint's pool, and a `task`
+    resume whose `commands` differ from that pool's adds a `verification:
+    kept from checkpoint: [...]` warning. On a milestone
     they also reach what starts afresh -- subtasks with no checkpoint, merged
     bases and Integrate.
 
@@ -1982,8 +2081,9 @@ def resume(
         "--verify",
         help=(
             "A walk continued from a checkpoint keeps the suite the run started "
-            "with. On a milestone run, this is the suite for what starts afresh: "
-            "subtasks with no checkpoint, merged bases and Integrate."
+            "with, and says so in `warnings` when it differs. On a milestone run, "
+            "this is the suite for what starts afresh: subtasks with no "
+            "checkpoint, merged bases and Integrate."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),

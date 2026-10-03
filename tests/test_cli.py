@@ -17,6 +17,7 @@ import io
 import inspect
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -4308,6 +4309,7 @@ def test_logs_with_no_flags_reports_the_latest_attempt_of_the_latest_phase(proje
     assert data["artifacts"]["prompt"]["text"] == "prompt for implement.1\n"
     assert data["artifacts"]["result"]["text"] == '{"phase": "implement", "attempt": 1}'
     assert data["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+    assert data["artifacts"]["stderr"] == {"path": None, "present": False, "text": None}
     assert "\n" not in result.stdout.strip()
 
 
@@ -4464,6 +4466,184 @@ def test_logs_writes_nothing(projection):
     assert _runs_snapshot() == tree_before
     assert _attempt_rows(projection) == rows_before
     assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def _write_step_logs(run_id: str, n: int) -> Path:
+    """`verify.<n>/` as `run_one_step` + `verify.run_suite` leave it.
+
+    The *test* calls `paths.attempt_dir`, which creates the directory; `logs`
+    must only read it.
+    """
+    directory = paths.attempt_dir(run_id, "card-1", "verify", n)
+    (directory / "stdout.log").write_text(
+        f"==> uv run pytest (exit 1)\nstdout of verify.{n}\n", encoding="utf-8"
+    )
+    (directory / "stderr.log").write_text(
+        f"==> uv run pytest (exit 1)\nstderr of verify.{n}\n", encoding="utf-8"
+    )
+    return directory
+
+
+def test_logs_for_a_deterministic_phase_reads_its_highest_attempt_off_disk(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    second = _write_step_logs(LOGS_RUN_ID, 2)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+
+    result = runner.invoke(cli.app, [*base, "--phase", "verify"])
+
+    assert result.exit_code == 0, result.stdout
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert data["run_id"] == LOGS_RUN_ID
+    assert data["story_id"] == "story-1"
+    assert data["card"] == "card-1"
+    assert data["phase"] == "verify"
+    assert data["attempt"] == 2
+    assert data["status"] is None
+    assert data["exit_code"] is None
+    artifacts = data["artifacts"]
+    assert artifacts["prompt"] == {"path": None, "present": False, "text": None}
+    assert artifacts["result"] == {"path": None, "present": False, "text": None}
+    assert artifacts["stdout"] == {
+        "path": str(second / "stdout.log"),
+        "present": True,
+        "text": "==> uv run pytest (exit 1)\nstdout of verify.2\n",
+    }
+    assert artifacts["stderr"] == {
+        "path": str(second / "stderr.log"),
+        "present": True,
+        "text": "==> uv run pytest (exit 1)\nstderr of verify.2\n",
+    }
+
+    earlier = runner.invoke(cli.app, [*base, "--phase", "verify", "--attempt", "1"])
+
+    assert earlier.exit_code == 0, earlier.stdout
+    earlier_data = json.loads(earlier.stdout)["data"]
+    assert earlier_data["attempt"] == 1
+    assert earlier_data["artifacts"]["stdout"]["text"] == (
+        "==> uv run pytest (exit 1)\nstdout of verify.1\n"
+    )
+
+
+def test_logs_for_a_deterministic_phase_reports_a_missing_log_file_as_absent(
+    projection,
+):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    directory = _write_step_logs(LOGS_RUN_ID, 1)
+    (directory / "stderr.log").unlink()
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    artifacts = json.loads(result.stdout)["data"]["artifacts"]
+    assert artifacts["stdout"]["present"] is True
+    assert artifacts["stderr"] == {
+        "path": str(directory / "stderr.log"),
+        "present": False,
+        "text": None,
+    }
+
+
+def test_logs_for_a_deterministic_phase_with_no_attempt_on_disk_is_an_envelope(
+    projection,
+):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    tree_before = _runs_snapshot()
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownAttemptError"
+    assert envelope["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no recorded attempt yet"
+    )
+    assert _runs_snapshot() == tree_before
+    assert not (paths.data_dir() / "runs" / LOGS_RUN_ID / "card-1" / "verify.1").exists()
+
+
+def test_logs_for_a_deterministic_phase_names_the_attempts_it_has(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    _write_step_logs(LOGS_RUN_ID, 2)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)]
+
+    for wanted in ("7", "0"):
+        result = runner.invoke(cli.app, [*base, "--attempt", wanted])
+
+        assert result.exit_code == cli.EXIT_ERROR
+        envelope = json.loads(result.stdout)
+        assert envelope["error"]["type"] == "UnknownAttemptError"
+        assert envelope["error"]["message"] == (
+            f"phase 'verify' of card 'card-1' has no attempt {wanted};"
+            " recorded attempts: 1, 2"
+        )
+
+
+def test_logs_for_a_deterministic_phase_with_no_runs_directory_creates_nothing(
+    projection,
+):
+    """Review Focus 4: the projection survives but `runs/` is gone. `logs`
+    refuses, and leaves `runs/` absent rather than minting it."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    runs_root = paths.data_dir() / "runs"
+    shutil.rmtree(runs_root)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)]
+
+    latest = runner.invoke(cli.app, base)
+    numbered = runner.invoke(cli.app, [*base, "--attempt", "1"])
+
+    assert latest.exit_code == cli.EXIT_ERROR
+    assert json.loads(latest.stdout)["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no recorded attempt yet"
+    )
+    assert numbered.exit_code == cli.EXIT_ERROR
+    assert json.loads(numbered.stdout)["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no attempt 1; recorded attempts: none"
+    )
+    assert not runs_root.exists()
+
+
+def test_logs_with_no_flags_still_skips_a_deterministic_phase_with_logs_on_disk(
+    projection,
+):
+    """Decision 4: the no-flag default stays pure over recorded `Attempt` rows."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)["data"]
+    assert data["phase"] == "implement"
+    assert data["artifacts"]["stderr"] == {"path": None, "present": False, "text": None}
+
+
+def test_logs_for_a_deterministic_phase_writes_nothing(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == 0
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
 
 
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
@@ -4954,8 +5134,18 @@ RESUME_KEYS = {
 """Today's resume payload keys; the pygents branch adds and drops none (G10)."""
 
 
-def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
-    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run."""
+def _crash_pygents(
+    project: Path,
+    cards: dict[str, str],
+    phase: str,
+    *,
+    commands: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
+) -> str:
+    """Drive a real pygents `run_card` until it is killed inside `phase`, and name the run.
+
+    `commands` and `allow_no_verification` are what the run starts with: the
+    seed, and so the suite a resumed walk keeps."""
     run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
     with pytest.raises(_Killed):
         cli.run_card(
@@ -4963,6 +5153,8 @@ def _crash_pygents(project: Path, cards: dict[str, str], phase: str) -> str:
             repo_dir=project,
             base_branch="main",
             branch_prefix="m1",
+            commands=commands,
+            allow_no_verification=allow_no_verification,
             clock=lambda: CRASHED_AT,
             runner_factory=_resume_factory(crash_at=phase, crash_with=_Killed),
         )
@@ -5224,6 +5416,168 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     assert len(ours) == 1, payload["warnings"]
     assert "not posted" in ours[0] and "brd is down" in ours[0]
     assert payload["warnings"][0] == ours[0]
+
+
+KEPT = "verification: kept from checkpoint"
+
+
+def _kept_warnings(payload: dict[str, Any]) -> list[str]:
+    return [w for w in payload["warnings"] if w.startswith(KEPT)]
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_a_different_verify_announces_the_kept_suite(project, cards):
+    """Card 5b19aa93, spec T4: one warning naming the kept suite, not the passed one."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _kept_warnings(payload) == ["verification: kept from checkpoint: ['true']"]
+    assert not [w for w in payload["warnings"] if "echo instrumented" in w]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_the_same_verify_says_nothing_of_the_suite(project, cards):
+    """Spec T5: the passed suite is the kept one, so there is nothing to announce."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, commands=["true"], runner_factory=_resume_factory()
+    )
+
+    assert _kept_warnings(payload) == []
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_task_resume_with_no_verify_says_nothing_of_the_suite(project, cards):
+    """Spec T6: `--verify` omitted (`commands=()`) is not a different suite."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert _kept_warnings(payload) == []
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+@pytest.mark.parametrize(
+    "passed",
+    [
+        pytest.param(["echo kept", "true"], id="reordered"),
+        pytest.param(["true", "echo kept", "true"], id="one-extra"),
+        pytest.param(["true ", "echo kept"], id="trailing-space"),
+    ],
+)
+def test_a_task_resume_with_a_reordered_or_respaced_verify_announces_the_kept_suite(
+    project, cards, passed
+):
+    """Spec T7 and Review Focus 2: equality is exact and order-sensitive."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true", "echo kept"))
+
+    payload = cli.resume_run(
+        run_id, repo_dir=project, commands=passed, runner_factory=_resume_factory()
+    )
+
+    assert _kept_warnings(payload) == [
+        "verification: kept from checkpoint: ['true', 'echo kept']"
+    ]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_an_opted_out_task_resume_with_a_verify_announces_an_empty_kept_suite(
+    project, cards
+):
+    """Spec T8 and Review Focus 3: an opted-out run kept `[]`, and says so."""
+    run_id = _crash_pygents(project, cards, "plan", allow_no_verification=True)
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["uv run pytest"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _kept_warnings(payload) == ["verification: kept from checkpoint: []"]
+    assert set(payload) == RESUME_KEYS
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_the_kept_suite_warning_follows_the_flush_warnings(project, cards, monkeypatch):
+    """Spec T9 and Review Focus 4: B7's flush warnings lead, the kept suite is next."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.enqueue_comment(
+            run_id=run_id,
+            card_id=cards["subtask"],
+            key=key,
+            body=f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}",
+            now=datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        opened.close()
+
+    def down(card_id, *, repo_dir=None):
+        raise board.BoardError(
+            "brd is down", argv=["brd", "comment", "list", card_id], exit_code=1
+        )
+
+    monkeypatch.setattr(board, "comment_list", down)
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert set(payload) == RESUME_KEYS
+    flush_at = [
+        i for i, w in enumerate(payload["warnings"]) if f"board comment {key} " in w
+    ]
+    kept_at = [i for i, w in enumerate(payload["warnings"]) if w.startswith(KEPT)]
+    assert flush_at == [0], payload["warnings"]
+    assert kept_at == [1], payload["warnings"]
+    assert payload["warnings"][1] == "verification: kept from checkpoint: ['true']"
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_refused_task_resume_with_a_differing_verify_says_nothing_of_the_suite(
+    project, cards, monkeypatch
+):
+    """Review Focus 5: a refusal is today's error envelope, exit 3, nothing written."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", run_id, "--repo-dir", str(project), "--verify", "echo instrumented"],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CheckpointMismatchError"
+    assert KEPT not in result.stdout
+    assert _resume_state(project) == before
 
 
 @pytest.mark.brd
