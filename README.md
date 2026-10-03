@@ -422,6 +422,91 @@ and section 10 of the
 [supervisor-tree addendum](docs/superpowers/specs/2026-09-25-supervisor-tree-design.md#10-deferred)
 for everything deferred.
 
+### Watching a run
+
+`am watch` prints a run's journal: the append-only log, one JSON object per line, that every run writes to `<data dir>/runs/<run-id>/journal.jsonl` (`<data dir>` is defined under [Several am processes](#several-am-processes)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine writes under the same `<data dir>/runs/`, one `am watch --all` sees the runs of every repository at once.
+
+```bash
+am watch 20260923T140506Z-19efcddc
+am watch --all --since 40
+am watch 20260923T140506Z-19efcddc --follow
+```
+
+The shape is `am watch RUN_ID | --all [--since SEQ] [--follow]`:
+
+- Give exactly one of `RUN_ID` and `--all`.
+- `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
+- `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+
+Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
+
+These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3:
+
+- both `RUN_ID` and `--all`, or neither;
+- a `--since` below 0;
+- a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
+- a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
+
+Watching a run id that does not exist creates no run directory.
+
+#### Following with `--follow`
+
+`--follow` turns the output into a stream. The first line is a hello line, the only line that is not a journal line:
+
+```
+{"am":"0.1.0","event":"watch","runs_dir":"/home/you/.local/share/agent-manager/runs","schema":1}
+```
+
+`am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
+
+Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. A journal that turns corrupt after the stream has started cannot get an envelope, because every line after the hello line must be a journal line: `am watch` prints `am watch: <message>` on stderr and exits 3.
+
+`am watch --follow` checks for new lines about every 250 ms. That interval is internal and is not part of the contract.
+
+#### The journal line
+
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store.py`):
+
+```
+{"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}
+```
+
+| Field | What it holds |
+|---|---|
+| `seq` | the line's number in its run's journal, from 1, increasing |
+| `ts` | when the line was written, ISO 8601 in UTC |
+| `run_id` | the run |
+| `event` | which kind of node the line records, one of the five below |
+| `story` | the story id; `null` on a `run_upsert` |
+| `card` | the subtask id on subtask, phase and attempt lines; otherwise `null` |
+| `phase` | the phase name on phase and attempt lines; otherwise `null` |
+| `attempt` | the attempt number on an attempt line; otherwise `null` |
+| `payload` | the node itself, as the run recorded it, without its children |
+
+Every line records one node of the run's tree. A status change is the same node recorded again with its new status; there is no separate transition event.
+
+| `event` | Covers |
+|---|---|
+| `run_upsert` | the run starting and finishing: `started`, then `done`, `escalated`, `stopped` or `cancelled` |
+| `story_upsert` | a story's own progress: `pending`, `started`, `done`, `stopped`, `escalated` |
+| `subtask_upsert` | a subtask's status: `pending`, `started`, `done`, `stopped`, `escalated` (recorded `started` again on a resume) |
+| `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed |
+| `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its cost, token and duration fields |
+
+There is no separate "run finished" or "escalation" event. A run has finished when a `run_upsert` line's `payload.status` is `done`, `escalated`, `stopped` or `cancelled`, and it escalated when that status is `escalated`.
+
+#### Reading the stream safely
+
+The journal line is a public contract, version 1. A consumer that follows these rules keeps working across `am` versions:
+
+- Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
+- Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
+- An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
+- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run) are in the `payload` of its first line, a `run_upsert`.
+- The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
+
 ## Resuming: what runs again
 
 `am resume <run-id>`, and a relaunch that continues an open checkpoint from an earlier run, go on at the turn the newest checkpoint saved, which is before the interrupted phase ran. Whether that phase runs again depends on its kind and on what was recorded before the process stopped:
