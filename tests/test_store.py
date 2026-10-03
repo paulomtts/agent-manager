@@ -3854,6 +3854,245 @@ def test_replay_journal_writes_nothing(repo):
     assert attempts == 0
 
 
+# -- reading event kinds this version does not recognise (am-watch §3.4) ------
+#
+# Default suite, unmarked: real temp JSONL/SQLite files, no git, brd or
+# subprocess. A newer `am` may journal an event kind this version's `EventKind`
+# does not list; reading skips that line, writing stays strict.
+
+UNRECOGNISED_EVENT = "future_upsert"
+
+
+def _unrecognised_line(seq: int, run_id: str = RUN_ID, **extra: object) -> dict:
+    """A well-formed envelope whose `event` this version's `EventKind` lacks."""
+    assert UNRECOGNISED_EVENT not in get_args(store.EventKind)
+    record: dict = {
+        "seq": seq,
+        "ts": "2026-10-02T10:00:00+00:00",
+        "run_id": run_id,
+        "event": UNRECOGNISED_EVENT,
+        "payload": {"anything": "at all"},
+    }
+    record.update(extra)
+    return record
+
+
+def test_read_skips_a_line_whose_event_it_does_not_recognise(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(journal, _unrecognised_line(2))
+    _append_raw(
+        journal,
+        {
+            "seq": 3,
+            "ts": "2026-10-02T10:01:00+00:00",
+            "run_id": RUN_ID,
+            "event": "run_upsert",
+            "payload": {"i": 2},
+        },
+    )
+
+    lines = journal.read()
+
+    assert [line.seq for line in lines] == [1, 3]
+    assert [line.payload["i"] for line in lines] == [0, 2]
+    assert all(line.event == "run_upsert" for line in lines)
+
+
+def test_an_unrecognised_event_is_skipped_whatever_else_the_line_holds(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(
+        journal,
+        _unrecognised_line(
+            2,
+            operator="someone",
+            ts="not a timestamp",
+            story=123,
+            attempt="first",
+            payload={"nested": [1, {"x": None}], "status": "whatever"},
+        ),
+    )
+
+    assert [line.seq for line in journal.read()] == [1]
+
+
+def test_an_unrecognised_event_without_a_valid_seq_still_raises(repo):
+    # Review Focus 1: `last_seq` must recover a skipped line's seq, so a line
+    # with no usable seq is not tolerated just because its event is unknown.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    without_seq = _unrecognised_line(2)
+    del without_seq["seq"]
+    _append_raw(journal, without_seq)
+
+    with pytest.raises(ValidationError) as excinfo:
+        journal.read()
+    assert "seq" in str(excinfo.value)
+
+    journal.path.write_text("", encoding="utf-8")
+    _append_raw(journal, _unrecognised_line(0))
+    with pytest.raises(ValidationError) as excinfo:
+        journal.read()
+    assert "seq" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"seq": 2, "ts": "2026-10-02T10:00:00+00:00", "run_id": "r", "payload": {}}',
+        '{"seq": 2, "ts": "2026-10-02T10:00:00+00:00", "run_id": "r", "event": null, "payload": {}}',
+        '{"seq": 2, "ts": "2026-10-02T10:00:00+00:00", "run_id": "r", "event": 5, "payload": {}}',
+        '["future_upsert"]',
+        "null",
+    ],
+    ids=["no-event", "null-event", "int-event", "array", "json-null"],
+)
+def test_a_line_without_a_string_event_or_not_an_object_still_raises(repo, raw):
+    # Review Focus 2: only a *string* event outside EventKind is skipped.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write(raw + "\n")
+
+    with pytest.raises(ValidationError):
+        journal.read()
+
+
+def test_read_passes_unknown_payload_keys_on_a_known_event_through(repo):
+    # Review Focus 4: §3.4's "ignore unknown payload keys" holds at the read
+    # layer because `payload` is an untyped dict; `replay()` still judges it.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(
+        journal,
+        {
+            "seq": 2,
+            "ts": "2026-10-02T10:00:00+00:00",
+            "run_id": RUN_ID,
+            "event": "run_upsert",
+            "payload": {"i": 1, "future_key": {"deep": True}},
+        },
+    )
+
+    assert journal.read()[1].payload == {"i": 1, "future_key": {"deep": True}}
+
+
+def test_ignore_torn_tail_and_an_unrecognised_event_are_both_skipped(repo):
+    # Review Focus 3.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(journal, _unrecognised_line(2))
+    with journal.path.open("a", encoding="utf-8") as handle:
+        handle.write('{"seq": 3, "run_id"')
+
+    assert [line.payload["i"] for line in journal.read(ignore_torn_tail=True)] == [0]
+    with pytest.raises(store.CorruptJournalError) as excinfo:
+        journal.read()
+    assert ":3:" in str(excinfo.value)
+
+
+def test_append_still_refuses_an_unrecognised_event(repo):
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(journal, _unrecognised_line(2))
+    before = journal.path.read_bytes()
+
+    with pytest.raises(ValidationError):
+        journal.append(UNRECOGNISED_EVENT, {})  # type: ignore[arg-type]
+
+    assert journal.path.read_bytes() == before
+    assert journal._lock.locked() is False
+
+
+def test_replay_and_rebuild_of_its_own_run_skip_an_unrecognised_event(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        before = st.replay_journal(RUN_ID)
+        _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
+        replayed = st.replay_journal(RUN_ID)
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert replayed == before
+    assert rebuilt == before
+    assert loaded == before
+
+
+def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
+    other = store.Store.open(repo, ADOPTING_RUN_ID)
+    try:
+        other.record_run(_run(repo, ADOPTING_RUN_ID))
+        other.record_story(_story())
+        next_seq = other.journal.last_seq() + 1
+    finally:
+        other.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        before = st.replay_journal(ADOPTING_RUN_ID)
+        path = paths.run_dir(ADOPTING_RUN_ID) / store.JOURNAL_NAME
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_unrecognised_line(next_seq, ADOPTING_RUN_ID)) + "\n")
+            handle.write('{"seq": 99')
+        after = st.replay_journal(ADOPTING_RUN_ID)
+    finally:
+        st.close()
+
+    assert after == before
+    assert after.id == ADOPTING_RUN_ID
+    assert [story.card_id for story in after.stories] == ["8831189b"]
+
+
+def test_a_skipped_line_still_counts_toward_last_seq(repo):
+    # `append` promises no seq is ever repeated on disk: an older `am` resuming
+    # a newer `am`'s run must number its next line above the skipped one.
+    first = store.Journal(RUN_ID)
+    first.append("run_upsert", {"i": 0})
+    _append_raw(first, _unrecognised_line(2))
+
+    reopened = store.Journal(RUN_ID)
+    assert reopened.last_seq() == 2
+    assert reopened.append("run_upsert", {"i": 1}).seq == 3
+
+    again = store.Journal(RUN_ID)
+    assert again.last_seq() == 3
+    assert [line.seq for line in again.read()] == [1, 3]
+
+
+def test_reseek_counts_a_skipped_line(repo):
+    # Review Focus 5: a lease take-over re-reads the highest seq on disk.
+    journal = store.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    _append_raw(journal, _unrecognised_line(2))
+
+    journal.reseek()
+
+    assert journal.append("run_upsert", {"i": 1}).seq == 3
+
+
+def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
+    # Review Focus 5: `Store.open` builds the journal from `last_seq`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
+    finally:
+        st.close()
+
+    reopened = store.Store.open(repo, RUN_ID)
+    try:
+        line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
+    finally:
+        reopened.close()
+
+    assert line.seq == 3
+    assert [line.seq for line in store.Journal(RUN_ID).read()] == [1, 3]
+
+
 # -- board comment outbox ----------------------------------------------------------
 #
 # Board-comments spec B6/B7/B9: a row-only `board_comments` table outside the
