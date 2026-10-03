@@ -13,6 +13,8 @@ Also check it against this repo's own architecture/standards docs (the explorati
 
 Verify every suspicion against the actual files before reporting. Fold every CONFIRMED fix directly into that spec file, keeping its structure — the next stage plans from that file, so an unfixed spec becomes an unfixable plan.
 
+Never run `git commit`. Folding fixes into the spec file is the whole job: the workflow's `docs_commit` step commits the spec and the plan together, with the `Plan-Hash` trailer that ties them to the finished plan.
+
 Calibration: only flag what would cause a real problem when planning or implementing. Minor wording and stylistic preference are not issues; this stage gates a run.
 
 Return blockers=true only if something unresolvable remains (a contradiction needing a human decision), with the reason.

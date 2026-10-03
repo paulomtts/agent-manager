@@ -12,3 +12,8 @@ observable behavior.
   this brief for anything your spec hands to a planner.
 - Cite the parent design spec by section and line for every constraint you
   inherit.
+- Never run `git commit`. Writing the spec file is the whole job: the
+  workflow's `docs_commit` step commits the spec and the plan together, with
+  the `Plan-Hash` trailer that ties them to the finished plan. The commit steps
+  in the writing-plans format are for the engineer who executes the plan, not
+  for you.

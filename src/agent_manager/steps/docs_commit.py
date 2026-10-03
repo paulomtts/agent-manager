@@ -6,6 +6,14 @@ before `implement`, because the hash it stamps is the hash of the plan file
 *with* the validated marker already on disk, which is exactly the hash `review`
 recomputes independently (design §9).
 
+Before committing, it backfills: any commit on the unmerged task branch that
+carries no Plan-Hash trailer (a draft a role committed despite being told not
+to) is rewritten to carry the current one, so `review` does not read it as
+debris. The rewrite rebuilds raw commit objects -- same tree, same author and
+committer lines -- and moves the branch once with a compare-and-swap
+`update-ref`. Nothing is reset, checked out or rebased, so the index and the
+working tree never notice.
+
 Every invocation is an argument list handed to `subprocess` through the
 injected `GitRunner` (the seam `steps/worktree.py` established): there is no
 shell string and nothing to quote.
@@ -13,8 +21,11 @@ shell string and nothing to quote.
 
 import hashlib
 import os
+import re
+import tempfile
 from pathlib import Path
 
+from agent_manager.steps import reducers
 from agent_manager.steps.worktree import GitError, GitRunner, run_git
 
 _HASH_LENGTH = 8
@@ -45,6 +56,33 @@ TRAILER_PREFIX = "Plan-Hash: "
 The trailing space is part of it: `Plan-Hash:a1b2c3d4` is not a git trailer and
 would not be counted by anything downstream.
 """
+
+
+_TRAILER_LINE = re.compile(r"[A-Za-z0-9-]+: ")
+"""A git trailer line's shape: `Token: value`, matched at the line start."""
+
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
+"""A blank (or whitespace-only) line between two paragraphs of a message."""
+
+
+def with_trailer(message: str, digest: str) -> str:
+    """`message` with `Plan-Hash: <digest>` appended as a git trailer.
+
+    Pure. Trailing newlines are stripped first. If the message has more than
+    one paragraph and its last paragraph is a trailer block (every line
+    `Token: value`, e.g. `Co-Authored-By: ...`), the trailer joins that block;
+    otherwise it starts a new paragraph. The result ends with one newline, and
+    the trailer sits at column 0 of its own line so review's anchored
+    `^Plan-Hash: <hash>` grep counts it.
+    """
+    body = message.rstrip("\n")
+    paragraphs = _PARAGRAPH_BREAK.split(body)
+    last = paragraphs[-1].split("\n")
+    joins_block = len(paragraphs) > 1 and all(
+        _TRAILER_LINE.match(line) for line in last
+    )
+    separator = "\n" if joins_block else "\n\n"
+    return f"{body}{separator}{TRAILER_PREFIX}{digest}\n"
 
 
 class UntaggedDocumentsError(RuntimeError):
@@ -133,6 +171,15 @@ def _required_title(card_details: object) -> str:
     return title
 
 
+def _required_base_branch(value: object) -> str:
+    """The non-blank base branch name, or `ValueError` before any git call."""
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError(
+            f"docs_commit.commit_documents needs a non-empty base_branch, got {value!r}"
+        )
+    return value.strip()
+
+
 def _inside(root: str, candidate: Path, field: str) -> Path:
     """`candidate`, proven to live under `root`, or `ValueError`.
 
@@ -155,11 +202,160 @@ def _document_paths(worktree_path: str, spec_path: str, plan_path: str) -> tuple
     return root / spec_path, root / plan_path
 
 
+def _is_stamped(message: str) -> bool:
+    """Whether some line of `message` is `Plan-Hash: ` plus a well-formed hash.
+
+    Any valid hash counts, a stale one included: such commits are left alone.
+    `Plan-Hash: zzz` does not count, exactly as review's grep would not.
+    """
+    return any(
+        line.startswith(TRAILER_PREFIX)
+        and reducers.is_plan_hash(line[len(TRAILER_PREFIX) :].rstrip())
+        for line in message.split("\n")
+    )
+
+
+def _split_commit(raw: str) -> tuple[list[str], str]:
+    """A raw `cat-file commit` object as (header lines, message)."""
+    headers, _, message = raw.partition("\n\n")
+    return headers.split("\n"), message
+
+
+_SIGNATURE_HEADERS = ("gpgsig", "gpgsig-sha256")
+"""Commit headers holding a signature, which a rewrite would invalidate."""
+
+
+def _rebuild_commit(headers: list[str], parent: str, message: str) -> str:
+    """The raw text of a commit object: `headers` with the parent replaced.
+
+    Every other header line -- `tree`, `author`, `committer` -- is carried
+    over verbatim, which is how name, email, timestamp and timezone survive.
+    A signature header and its continuation lines (those starting with a
+    space) are dropped: the rewritten commit is unsigned, as after a rebase.
+    """
+    kept: list[str] = []
+    dropping = False
+    for line in headers:
+        if line.startswith(" "):
+            if not dropping:
+                kept.append(line)
+            continue
+        key = line.split(" ", 1)[0]
+        dropping = key in _SIGNATURE_HEADERS
+        if dropping:
+            continue
+        kept.append(f"parent {parent}" if key == "parent" else line)
+    return "\n".join(kept) + "\n\n" + message
+
+
+def _resolves(git_runner: GitRunner, worktree_path: str, revision: str) -> bool:
+    """Whether `revision` names a commit in this repository."""
+    try:
+        git_runner(
+            ["-C", worktree_path, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"]
+        )
+    except GitError:
+        return False
+    return True
+
+
+def _backfill(
+    git_runner: GitRunner, worktree_path: str, base_branch: str, digest: str
+) -> list[str]:
+    """Stamp every unstamped commit in `base_branch..HEAD` with `digest`.
+
+    Returns the pre-rewrite shas of the commits that gained the trailer,
+    oldest first. Commits before the first unstamped one keep their shas;
+    from there on each is recreated on its recreated parent. The branch moves
+    once, as a compare-and-swap against the tip read here.
+    """
+    if not _resolves(git_runner, worktree_path, base_branch):
+        # Today's behaviour; if review's range cannot resolve either, review
+        # reports that, not this step.
+        return []
+    try:
+        ref = git_runner(["-C", worktree_path, "symbolic-ref", "-q", "HEAD"]).strip()
+    except GitError:
+        # Detached HEAD: there is no branch to rewrite by name.
+        return []
+    old_tip = git_runner(
+        ["-C", worktree_path, "rev-parse", "--verify", "HEAD^{commit}"]
+    ).strip()
+    # `origin/<base>` too: `worktree.ensure` may have branched from it, and a
+    # local base behind its remote must not put upstream commits in range.
+    excluded = [f"^{base_branch}"]
+    if _resolves(git_runner, worktree_path, f"origin/{base_branch}"):
+        excluded.append(f"^origin/{base_branch}")
+    listing = git_runner(
+        [
+            "-C",
+            worktree_path,
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            "--parents",
+            old_tip,
+            *excluded,
+            "--",
+        ]
+    )
+    rows = [line.split() for line in listing.splitlines() if line.strip()]
+    if any(len(row) != 2 for row in rows):
+        # A merge (several parents) or a root (none): out of scope, and
+        # review_gate's "only N of M commits" message already covers it.
+        return []
+    commits = [
+        (row[0], git_runner(["-C", worktree_path, "cat-file", "commit", row[0]]))
+        for row in rows
+    ]
+    first = next(
+        (
+            index
+            for index, (_, raw) in enumerate(commits)
+            if not _is_stamped(_split_commit(raw)[1])
+        ),
+        None,
+    )
+    if first is None:
+        return []
+
+    parent = rows[first][1]
+    backfilled: list[str] = []
+    # Outside the worktree: an extra file there would fail review's porcelain
+    # check. `GitRunner` has no stdin, so `hash-object` reads a file.
+    with tempfile.TemporaryDirectory(prefix="agent-manager-docs-commit-") as scratch:
+        object_file = Path(scratch) / "commit"
+        for sha, raw in commits[first:]:
+            headers, message = _split_commit(raw)
+            if not _is_stamped(message):
+                message = with_trailer(message, digest)
+                backfilled.append(sha)
+            object_file.write_bytes(_rebuild_commit(headers, parent, message).encode("utf-8"))
+            parent = git_runner(
+                ["-C", worktree_path, "hash-object", "-t", "commit", "-w", str(object_file)]
+            ).strip()
+
+    git_runner(
+        [
+            "-C",
+            worktree_path,
+            "update-ref",
+            "-m",
+            f"docs_commit: backfill Plan-Hash {digest}",
+            ref,
+            parent,
+            old_tip,
+        ]
+    )
+    return backfilled
+
+
 def commit_documents(
     card_details: object,
     spec_path: str,
     plan_path: str,
     worktree: str | Path,
+    base_branch: str,
     git_runner: GitRunner = run_git,
 ) -> dict[str, object]:
     """Commit the spec and the plan, tagged with the plan's Plan-Hash.
@@ -172,6 +368,7 @@ def commit_documents(
     spec_path = _required_relative_path(spec_path, "spec_path")
     plan_path = _required_relative_path(plan_path, "plan_path")
     title = _required_title(card_details)
+    base_branch = _required_base_branch(base_branch)
 
     spec_file, plan_file = _document_paths(worktree_path, spec_path, plan_path)
     spec_file = _inside(worktree_path, spec_file, "spec_path")
@@ -185,6 +382,10 @@ def commit_documents(
             )
 
     digest = plan_hash(plan_file.read_bytes())
+    # Before the add/commit below: when a role already committed the documents
+    # themselves, nothing is staged and `_branch_carries` decides -- which it
+    # can only answer yes to once those drafts carry the trailer.
+    backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
@@ -195,7 +396,7 @@ def commit_documents(
         # The resume path (design §9): "these two paths hold no change", so a
         # plan edited between runs still earns its own commit and hash.
         if _branch_carries(git_runner, worktree_path, digest):
-            return {"plan_hash": digest}
+            return {"plan_hash": digest, "backfilled": backfilled}
         raise UntaggedDocumentsError(
             plan_hash=digest, spec_path=spec_path, plan_path=plan_path
         )
@@ -216,4 +417,4 @@ def commit_documents(
             plan_path,
         ]
     )
-    return {"plan_hash": digest}
+    return {"plan_hash": digest, "backfilled": backfilled}

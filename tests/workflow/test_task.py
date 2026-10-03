@@ -101,8 +101,8 @@ def test_docs_commit_sits_between_the_marker_and_the_coder() -> None:
     phase = TASK.phase("docs_commit")
     assert isinstance(phase, Step)
     assert phase.run is docs_commit.commit_documents
-    # No args: `bind_arguments` takes card_details, spec_path, plan_path and
-    # worktree from the context by parameter name. Not best-effort and not
+    # No args: `bind_arguments` takes card_details, spec_path, plan_path,
+    # worktree and base_branch from the context by parameter name. Not best-effort and not
     # gated: an uncommitted or untagged pair of documents must escalate.
     assert dict(phase.args) == {}
     assert phase.gates == ()

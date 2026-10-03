@@ -263,8 +263,8 @@ def test_the_engine_can_bind_mark_validated_out_of_the_subtask_context():
 
 
 def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context():
-    """The phase carries no `args`, so all four parameters have to come from the
-    context by name -- `card_details` and `worktree` from
+    """The phase carries no `args`, so all five parameters have to come from the
+    context by name -- `card_details`, `worktree` and `base_branch` from
     `walk.subtask_context`, `spec_path` and `plan_path` from
     `walk._document_paths`. `git_runner` has a default and must NOT be bound
     out of a context that happens to hold no such key."""
@@ -279,6 +279,7 @@ def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context():
             "card": "ba15da20",
             "card_details": card,
             "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+            "base_branch": "m2/story-docs",
             "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
             "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
             "commands": ["uv run pytest"],
@@ -293,6 +294,7 @@ def test_the_engine_can_bind_the_docs_commit_step_out_of_the_subtask_context():
         "spec_path": "docs/superpowers/specs/task-docs-ba15da20.md",
         "plan_path": "docs/superpowers/plans/task-docs-ba15da20.md",
         "worktree": Path("/repo/.claude/worktrees/m2/task-docs-ba15da20"),
+        "base_branch": "m2/story-docs",
     }
 
 
