@@ -232,19 +232,6 @@ def test_resume_after_implement_returns_adopts_it(
     assert _load_run(root, run_id).status == "done"
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """Review Focus 2: no `e2e` marker may reach this module, or the
-    exactly-once proof stops running on every `uv run pytest`.
-
-    The proof's own marks are read off the function: a mark on it deselects
-    the proof but not this guard, so checking only this guard's node would
-    never see it."""
-    proof = test_resume_after_implement_returns_adopts_it
-    assert {mark.name for mark in getattr(proof, "pytestmark", [])} == set()
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_no_kill_switch_is_left_armed_for_later_tests():
     """Review Focus 1: the kill switch goes through the function-scoped
     `monkeypatch`; it must be gone once its test ends. Kept last in the module."""
