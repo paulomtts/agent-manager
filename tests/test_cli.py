@@ -17,6 +17,7 @@ import io
 import inspect
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -4308,6 +4309,7 @@ def test_logs_with_no_flags_reports_the_latest_attempt_of_the_latest_phase(proje
     assert data["artifacts"]["prompt"]["text"] == "prompt for implement.1\n"
     assert data["artifacts"]["result"]["text"] == '{"phase": "implement", "attempt": 1}'
     assert data["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+    assert data["artifacts"]["stderr"] == {"path": None, "present": False, "text": None}
     assert "\n" not in result.stdout.strip()
 
 
@@ -4464,6 +4466,184 @@ def test_logs_writes_nothing(projection):
     assert _runs_snapshot() == tree_before
     assert _attempt_rows(projection) == rows_before
     assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def _write_step_logs(run_id: str, n: int) -> Path:
+    """`verify.<n>/` as `run_one_step` + `verify.run_suite` leave it.
+
+    The *test* calls `paths.attempt_dir`, which creates the directory; `logs`
+    must only read it.
+    """
+    directory = paths.attempt_dir(run_id, "card-1", "verify", n)
+    (directory / "stdout.log").write_text(
+        f"==> uv run pytest (exit 1)\nstdout of verify.{n}\n", encoding="utf-8"
+    )
+    (directory / "stderr.log").write_text(
+        f"==> uv run pytest (exit 1)\nstderr of verify.{n}\n", encoding="utf-8"
+    )
+    return directory
+
+
+def test_logs_for_a_deterministic_phase_reads_its_highest_attempt_off_disk(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    second = _write_step_logs(LOGS_RUN_ID, 2)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+
+    result = runner.invoke(cli.app, [*base, "--phase", "verify"])
+
+    assert result.exit_code == 0, result.stdout
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert data["run_id"] == LOGS_RUN_ID
+    assert data["story_id"] == "story-1"
+    assert data["card"] == "card-1"
+    assert data["phase"] == "verify"
+    assert data["attempt"] == 2
+    assert data["status"] is None
+    assert data["exit_code"] is None
+    artifacts = data["artifacts"]
+    assert artifacts["prompt"] == {"path": None, "present": False, "text": None}
+    assert artifacts["result"] == {"path": None, "present": False, "text": None}
+    assert artifacts["stdout"] == {
+        "path": str(second / "stdout.log"),
+        "present": True,
+        "text": "==> uv run pytest (exit 1)\nstdout of verify.2\n",
+    }
+    assert artifacts["stderr"] == {
+        "path": str(second / "stderr.log"),
+        "present": True,
+        "text": "==> uv run pytest (exit 1)\nstderr of verify.2\n",
+    }
+
+    earlier = runner.invoke(cli.app, [*base, "--phase", "verify", "--attempt", "1"])
+
+    assert earlier.exit_code == 0, earlier.stdout
+    earlier_data = json.loads(earlier.stdout)["data"]
+    assert earlier_data["attempt"] == 1
+    assert earlier_data["artifacts"]["stdout"]["text"] == (
+        "==> uv run pytest (exit 1)\nstdout of verify.1\n"
+    )
+
+
+def test_logs_for_a_deterministic_phase_reports_a_missing_log_file_as_absent(
+    projection,
+):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    directory = _write_step_logs(LOGS_RUN_ID, 1)
+    (directory / "stderr.log").unlink()
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    artifacts = json.loads(result.stdout)["data"]["artifacts"]
+    assert artifacts["stdout"]["present"] is True
+    assert artifacts["stderr"] == {
+        "path": str(directory / "stderr.log"),
+        "present": False,
+        "text": None,
+    }
+
+
+def test_logs_for_a_deterministic_phase_with_no_attempt_on_disk_is_an_envelope(
+    projection,
+):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    tree_before = _runs_snapshot()
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "UnknownAttemptError"
+    assert envelope["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no recorded attempt yet"
+    )
+    assert _runs_snapshot() == tree_before
+    assert not (paths.data_dir() / "runs" / LOGS_RUN_ID / "card-1" / "verify.1").exists()
+
+
+def test_logs_for_a_deterministic_phase_names_the_attempts_it_has(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    _write_step_logs(LOGS_RUN_ID, 2)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)]
+
+    for wanted in ("7", "0"):
+        result = runner.invoke(cli.app, [*base, "--attempt", wanted])
+
+        assert result.exit_code == cli.EXIT_ERROR
+        envelope = json.loads(result.stdout)
+        assert envelope["error"]["type"] == "UnknownAttemptError"
+        assert envelope["error"]["message"] == (
+            f"phase 'verify' of card 'card-1' has no attempt {wanted};"
+            " recorded attempts: 1, 2"
+        )
+
+
+def test_logs_for_a_deterministic_phase_with_no_runs_directory_creates_nothing(
+    projection,
+):
+    """Review Focus 4: the projection survives but `runs/` is gone. `logs`
+    refuses, and leaves `runs/` absent rather than minting it."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    runs_root = paths.data_dir() / "runs"
+    shutil.rmtree(runs_root)
+    base = ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)]
+
+    latest = runner.invoke(cli.app, base)
+    numbered = runner.invoke(cli.app, [*base, "--attempt", "1"])
+
+    assert latest.exit_code == cli.EXIT_ERROR
+    assert json.loads(latest.stdout)["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no recorded attempt yet"
+    )
+    assert numbered.exit_code == cli.EXIT_ERROR
+    assert json.loads(numbered.stdout)["error"]["message"] == (
+        "phase 'verify' of card 'card-1' has no attempt 1; recorded attempts: none"
+    )
+    assert not runs_root.exists()
+
+
+def test_logs_with_no_flags_still_skips_a_deterministic_phase_with_logs_on_disk(
+    projection,
+):
+    """Decision 4: the no-flag default stays pure over recorded `Attempt` rows."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)["data"]
+    assert data["phase"] == "implement"
+    assert data["artifacts"]["stderr"] == {"path": None, "present": False, "text": None}
+
+
+def test_logs_for_a_deterministic_phase_writes_nothing(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    result = runner.invoke(
+        cli.app,
+        ["logs", LOGS_RUN_ID, "card-1", "--phase", "verify", "--repo-dir", str(projection)],
+    )
+
+    assert result.exit_code == 0
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
 
 
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
