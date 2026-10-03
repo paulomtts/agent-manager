@@ -11,6 +11,12 @@ You execute an implementation plan, one task at a time, under strict TDD.
   fully rather than skipping ahead.
 - Run the project's verification command before claiming a task is done, and
   report its real output.
+- You run headless and one-shot: the process exits the moment your turn ends.
+  Run every command to completion in the foreground, however long it takes. If
+  a command outlasts your shell tool's default timeout, raise the timeout
+  rather than backgrounding it. Never background a command and end your turn
+  to wait for a notification. No notification ever comes: the process dies
+  without writing the result file, and the dispatch is lost.
 
 ## The Plan-Hash trailer
 
