@@ -1268,7 +1268,6 @@ def _assert_same_shape(
 
 
 @pytest.mark.brd
-@requires_brd
 def test_fake_board_answers_every_argv_like_real_brd_for_the_same_card_tree(
     temp_board, fake_board
 ):
