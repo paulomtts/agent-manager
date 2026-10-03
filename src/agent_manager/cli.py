@@ -52,6 +52,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
+from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
 from agent_manager.workflow import task as task_workflow
 
@@ -495,8 +496,8 @@ def step_logs_payload(
         "artifacts": {
             "prompt": read_artifact(None),
             "result": read_artifact(None),
-            "stdout": read_artifact(directory / "stdout.log"),
-            "stderr": read_artifact(directory / "stderr.log"),
+            "stdout": read_artifact(directory / verify_step.STDOUT_LOG),
+            "stderr": read_artifact(directory / verify_step.STDERR_LOG),
         },
     }
 
