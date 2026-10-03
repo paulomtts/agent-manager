@@ -3188,6 +3188,7 @@ def _taker(repo: Path, run_id: str, token: str) -> "subprocess.Popen[str]":
     )
 
 
+@pytest.mark.soak
 @pytest.mark.parametrize("attempt", range(20))
 def test_two_processes_taking_one_dead_lease_leave_exactly_one_owner(repo, attempt):
     _plant_lease(repo, RUN_ID, token="t0")  # a dead owner: t0 is dead to both children
@@ -3220,6 +3221,22 @@ def test_two_processes_taking_one_dead_lease_leave_exactly_one_owner(repo, attem
     finally:
         conn.close()
     assert lease is not None and lease.token == winner
+
+
+def _lease_race_marks() -> dict[str, tuple]:
+    test = test_two_processes_taking_one_dead_lease_leave_exactly_one_owner
+    return {mark.name: mark.args for mark in getattr(test, "pytestmark", [])}
+
+
+def test_the_lease_race_parametrization_runs_all_twenty_attempts_in_soak():
+    # Test-tier spec V9, option A: the two-process lease race is a concurrency
+    # stress probe (40 real child spawns for one property), so it lives in the
+    # opt-in `soak` tier with all 20 attempts instead of being shrunk into the
+    # unit tier's 0.5s budget. Marks are read off the function because a soak
+    # mark deselects the race test from the default run but not this guard.
+    marks = _lease_race_marks()
+    assert set(marks) == {"parametrize", "soak"}
+    assert marks["parametrize"] == ("attempt", range(20))
 
 
 def test_a_taken_over_store_writes_nothing(repo, stores):
