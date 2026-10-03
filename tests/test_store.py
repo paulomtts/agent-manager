@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +104,96 @@ def test_open_db_connection_can_be_used_from_another_thread(repo):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     finally:
         conn.close()
+
+
+def _hold_fresh_db_reserved(repo: Path) -> sqlite3.Connection:
+    """A second connection holding a RESERVED lock on a fresh, pre-WAL database.
+
+    It must be `BEGIN IMMEDIATE`: SQLite fails `PRAGMA journal_mode=WAL` at once
+    against a RESERVED lock without calling the busy handler, which is the race
+    `open_db` retries. `BEGIN EXCLUSIVE` would make the busy handler run and so
+    prove nothing.
+    """
+    path = paths.project_db_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+def test_open_db_waits_out_a_writer_holding_a_fresh_db_before_wal(repo):
+    holder = _hold_fresh_db_reserved(repo)
+    opened: list[sqlite3.Connection] = []
+    errors: list[BaseException] = []
+
+    def open_it() -> None:
+        try:
+            opened.append(store.open_db(repo))
+        except BaseException as error:  # surfaced by the assertion below
+            errors.append(error)
+
+    worker = threading.Thread(target=open_it)
+    try:
+        worker.start()
+        time.sleep(0.3)
+        holder.execute("ROLLBACK")
+    finally:
+        holder.close()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    conn = opened[0]
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_open_db_reraises_database_is_locked_after_the_deadline(repo, monkeypatch):
+    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 0.3)
+    holder = _hold_fresh_db_reserved(repo)
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            store.open_db(repo)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert elapsed >= 0.3
+    assert elapsed < 5
+
+
+def test_open_db_does_not_retry_an_error_other_than_database_is_locked(repo):
+    # Junk bytes make the WAL pragma raise DatabaseError('file is not a
+    # database') at once. With the default 30 s deadline, a retry would show up
+    # as a long wait.
+    path = paths.project_db_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a database" * 200)
+
+    started = time.monotonic()
+    with pytest.raises(sqlite3.DatabaseError, match="file is not a database"):
+        store.open_db(repo)
+
+    assert time.monotonic() - started < 2
+
+
+def test_open_db_does_not_sleep_when_nothing_holds_a_lock(repo, monkeypatch):
+    # Behavior 6: uncontended, the pragma runs once and open_db never pauses.
+    pauses: list[float] = []
+    monkeypatch.setattr(store.time, "sleep", pauses.append)
+
+    conn = store.open_db(repo)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+
+    assert pauses == []
 
 
 def test_open_db_creates_every_projection_table(repo):

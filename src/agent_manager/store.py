@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -169,6 +170,40 @@ transactions: a lease take-over, or one fenced journal line and row
 (multi-process X4, X9)."""
 
 
+_WAL_RETRY_FIRST_PAUSE = 0.05
+"""Seconds `_enable_wal` waits after the first locked attempt; each later pause doubles."""
+
+_WAL_RETRY_PAUSE_CAP = 0.5
+"""The longest single pause `_enable_wal` takes between attempts."""
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch `conn` to WAL mode, retrying while the database is locked.
+
+    SQLite does not call the busy handler when this pragma meets another
+    connection's RESERVED lock on a database still in rollback-journal mode; it
+    fails at once with `database is locked`. So the pragma alone is retried,
+    pausing 0.05 s and doubling up to 0.5 s, each pause clamped to the time left,
+    until `BUSY_TIMEOUT_SECONDS` (read now, so tests can patch it) has passed
+    since the first attempt. Then the last error is re-raised unchanged. Any
+    other error propagates on the first attempt.
+    """
+    deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+    pause = _WAL_RETRY_FIRST_PAUSE
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if "database is locked" not in str(error):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(pause, remaining))
+            pause = min(pause * 2, _WAL_RETRY_PAUSE_CAP)
+
+
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("phases", "detail", "TEXT"),
     ("runs", "milestone_id", "TEXT"),
@@ -200,8 +235,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the per-project projection, applying the schema idempotently.
 
-    WAL mode is set before the schema so a reader never blocks the writer. Every
-    `CREATE` is `IF NOT EXISTS`, so reopening an existing database never
+    WAL mode is set before the schema so a reader never blocks the writer. The
+    WAL switch is retried until `BUSY_TIMEOUT_SECONDS`, because SQLite does not
+    call the busy handler for that pragma when another connection holds a write
+    lock. Every `CREATE` is `IF NOT EXISTS`, so reopening an existing database never
     destroys what is already there. The only migration is additive:
     `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
     table lacks, as a nullable column. Existing rows keep their data and read
@@ -220,7 +257,7 @@ def open_db(root: Path) -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    _enable_wal(conn)
     conn.executescript(_SCHEMA)
     _add_missing_columns(conn)
     conn.commit()
