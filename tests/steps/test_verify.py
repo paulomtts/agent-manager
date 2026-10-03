@@ -546,11 +546,15 @@ def test_argv_sequences_and_a_path_worktree_are_accepted(tmp_path: Path):
 def test_run_suite_takes_explore_by_name_before_the_keyword_only_runner():
     # `walk.bind_arguments` binds strictly by parameter name, so the name
     # `explore` is what wires the Explore phase's result in -- no YAML edit.
+    # `log_dir` is the name `walk.run_one_step` looks for to hand over the
+    # attempt directory (spec e1b1e7d5, Decision 1).
     parameters = inspect.signature(verify.run_suite).parameters
-    assert list(parameters) == ["commands", "worktree", "explore", "runner"]
+    assert list(parameters) == ["commands", "worktree", "explore", "runner", "log_dir"]
     assert parameters["explore"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert parameters["explore"].default is None
     assert parameters["runner"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["log_dir"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["log_dir"].default is None
 
 
 def test_typecheck_and_lint_run_after_the_suite_in_order(tmp_path: Path):
@@ -839,3 +843,230 @@ def test_the_engine_binds_no_explore_when_the_workflow_has_no_explore_phase(
         "verified": [{"command": suite, "ok": True, "tail": "5 passed"}],
         "detail": "",
     }
+
+
+# ── persisted output (spec e1b1e7d5) ─────────────────────────────────────────
+#
+# With `log_dir`, every command that ran gets one headed section in each of
+# `stdout.log` and `stderr.log`, verbatim. Real processes where a real process
+# can produce the stream; a fake runner for the signal code and the
+# unlaunchable command, as the rest of this module does.
+
+
+def _logs(log_dir: Path) -> tuple[str, str]:
+    return (
+        (log_dir / "stdout.log").read_text(encoding="utf-8"),
+        (log_dir / "stderr.log").read_text(encoding="utf-8"),
+    )
+
+
+def _tree(root: Path) -> list[str]:
+    """Every path under `root`, relative and sorted; `[]` when absent."""
+    if not root.exists():
+        return []
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+
+def test_a_red_commands_full_streams_are_logged_verbatim_under_its_header(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    command = _py(
+        "import sys; "
+        "sys.stdout.write('A' * 700 + '\\nline two\\n7 passed\\n'); "
+        "sys.stderr.write('E first\\nE second\\n'); "
+        "raise SystemExit(1)"
+    )
+
+    result = verify.run_suite([command], str(worktree), log_dir=log_dir)
+
+    assert result["passed"] is False
+    stdout, stderr = _logs(log_dir)
+    assert stdout == f"==> {command} (exit 1)\n" + "A" * 700 + "\nline two\n7 passed\n"
+    assert stderr == f"==> {command} (exit 1)\nE first\nE second\n"
+
+
+def test_a_clean_suite_keeps_both_logs_with_one_section_per_command_in_order(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    # Stale content from an earlier writer is truncated, never appended to.
+    (log_dir / "stdout.log").write_text("stale\n", encoding="utf-8")
+    (log_dir / "stderr.log").write_text("stale\n", encoding="utf-8")
+    first = _py("import sys; print('one'); sys.stderr.write('warn one\\n')")
+    second = _py("print('two')")
+
+    result = verify.run_suite([first, second], str(worktree), log_dir=log_dir)
+
+    assert result["passed"] is True
+    stdout, stderr = _logs(log_dir)
+    assert stdout == f"==> {first} (exit 0)\none\n==> {second} (exit 0)\ntwo\n"
+    assert stderr == f"==> {first} (exit 0)\nwarn one\n==> {second} (exit 0)\n"
+
+
+def test_a_command_after_a_red_one_never_runs_and_gets_no_section(tmp_path: Path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    red = _py("print('red'); raise SystemExit(2)")
+    never = _py("print('never')")
+
+    verify.run_suite([red, never], str(worktree), log_dir=log_dir)
+
+    stdout, stderr = _logs(log_dir)
+    assert stdout == f"==> {red} (exit 2)\nred\n"
+    assert stderr == f"==> {red} (exit 2)\n"
+    assert stdout.count("==> ") == 1
+    assert stderr.count("==> ") == 1
+
+
+def test_no_log_dir_writes_nothing_and_returns_the_same_result(tmp_path: Path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    data_home = Path(os.environ["XDG_DATA_HOME"])
+    commands = [_py("print('ok')"), _py("print('bad'); raise SystemExit(1)")]
+    worktree_before = _tree(worktree)
+    data_before = _tree(data_home)
+
+    without = verify.run_suite(commands, str(worktree))
+
+    assert _tree(worktree) == worktree_before
+    assert _tree(data_home) == data_before
+    with_logs = verify.run_suite(commands, str(worktree), log_dir=log_dir)
+    assert with_logs == without
+    assert set(with_logs) == {"passed", "verified", "detail"}
+
+
+def test_a_stream_without_a_trailing_newline_still_ends_its_section_on_a_line_of_its_own(
+    tmp_path: Path,
+):
+    outcomes = {
+        "first": CommandResult(exit_code=0, stdout="no newline", stderr=""),
+        "second": CommandResult(exit_code=-9, stdout="", stderr="killed"),
+    }
+
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        return outcomes[argv[0]]
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    verify.run_suite(["first", "second"], str(tmp_path), runner=runner, log_dir=log_dir)
+
+    stdout, stderr = _logs(log_dir)
+    assert stdout == (
+        "==> first (exit 0)\nno newline\n==> second (exit -9 (signal SIGKILL))\n"
+    )
+    assert stderr == (
+        "==> first (exit 0)\n==> second (exit -9 (signal SIGKILL))\nkilled\n"
+    )
+
+
+def test_an_unlaunchable_command_keeps_the_sections_of_the_commands_before_it(
+    tmp_path: Path,
+):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        if argv[0] == "missing-cmd":
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        return CommandResult(exit_code=0, stdout="fine\n", stderr="warn\n")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    with pytest.raises(VerifyError) as excinfo:
+        verify.run_suite(
+            ["ok-cmd", "missing-cmd"], str(tmp_path), runner=runner, log_dir=log_dir
+        )
+
+    assert "missing-cmd" in str(excinfo.value)
+    stdout, stderr = _logs(log_dir)
+    assert stdout == "==> ok-cmd (exit 0)\nfine\n"
+    assert stderr == "==> ok-cmd (exit 0)\nwarn\n"
+
+
+def test_an_unlaunchable_first_command_leaves_both_logs_present_and_empty(
+    tmp_path: Path,
+):
+    def runner(argv: list[str], cwd: str) -> CommandResult:
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    with pytest.raises(VerifyError):
+        verify.run_suite(["missing-cmd"], str(tmp_path), runner=runner, log_dir=log_dir)
+
+    assert _logs(log_dir) == ("", "")
+
+
+def test_explore_typecheck_and_lint_get_sections_after_the_suite(tmp_path: Path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    suite = _py("print('suite')")
+    typecheck = _py("print('types')")
+    lint = _py("print('lint')")
+    explore = {"verification": {"typecheck": typecheck, "lint": [lint]}}
+
+    verify.run_suite([suite], str(worktree), explore, log_dir=log_dir)
+
+    stdout, stderr = _logs(log_dir)
+    assert stdout == (
+        f"==> {suite} (exit 0)\nsuite\n"
+        f"==> {typecheck} (exit 0)\ntypes\n"
+        f"==> {lint} (exit 0)\nlint\n"
+    )
+    assert stderr == (
+        f"==> {suite} (exit 0)\n==> {typecheck} (exit 0)\n==> {lint} (exit 0)\n"
+    )
+
+
+def test_a_huge_output_is_logged_in_full(tmp_path: Path):
+    # Review Focus 1: the 300/600-character caps belong to `tail`/`detail`
+    # only; the log is the place the whole stream survives.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    command = _py("import sys; sys.stdout.write('y' * 200000)")
+
+    result = verify.run_suite([command], str(worktree), log_dir=log_dir)
+
+    assert result["passed"] is True
+    stdout, _ = _logs(log_dir)
+    assert stdout == f"==> {command} (exit 0)\n" + "y" * 200000 + "\n"
+
+
+def test_undecodable_output_is_logged_with_replacement_characters(tmp_path: Path):
+    # Review Focus 2: `run_command` already replaced the bad byte; writing the
+    # replacement character back out must not raise.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    command = _py("import sys; sys.stdout.buffer.write(b'ok \\xff done\\n')")
+
+    verify.run_suite([command], str(worktree), log_dir=log_dir)
+
+    stdout, _ = _logs(log_dir)
+    assert stdout == f"==> {command} (exit 0)\nok � done\n"
+
+
+def test_an_unwritable_log_dir_raises_before_any_command_runs(tmp_path: Path):
+    # Review Focus 5: a log that cannot be written is an error, never a green
+    # suite with its evidence silently missing.
+    calls, runner = _recorder()
+
+    with pytest.raises(OSError):
+        verify.run_suite(
+            ["uv run pytest"], str(tmp_path), runner=runner, log_dir=tmp_path / "absent"
+        )
+
+    assert calls == []

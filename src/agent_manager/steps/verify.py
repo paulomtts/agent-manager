@@ -163,6 +163,40 @@ def _display(command: object, argv: list[str]) -> str:
     return command if isinstance(command, str) else " ".join(argv)
 
 
+STDOUT_LOG = "stdout.log"
+STDERR_LOG = "stderr.log"
+"""The two files `run_suite` writes in `log_dir`; `cli.logs` reads them back."""
+
+
+def _start_logs(log_dir: Path) -> None:
+    """Create (or truncate) both logs, so a suite that dies early still leaves them."""
+    for name in (STDOUT_LOG, STDERR_LOG):
+        (log_dir / name).write_text("", encoding="utf-8")
+
+
+def _append_section(path: Path, header: str, text: str) -> None:
+    """One command's section: its header line, then `text` verbatim.
+
+    A trailing newline is added only when `text` lacks one, so the next header
+    always starts its own line. The file is closed -- flushed -- before the
+    next command starts, so a process that dies mid-suite keeps what finished.
+    `errors="replace"` matches `run_command`'s read side: a stream can never
+    make the log write itself raise anything but an `OSError`.
+    """
+    with path.open("a", encoding="utf-8", errors="replace") as handle:
+        handle.write(header)
+        handle.write(text)
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+
+
+def _log_command(log_dir: Path, shown: str, completed: CommandResult) -> None:
+    """Append one section per stream for a command that ran."""
+    header = f"==> {shown} ({exit_label(completed.exit_code)})\n"
+    _append_section(log_dir / STDOUT_LOG, header, completed.stdout)
+    _append_section(log_dir / STDERR_LOG, header, completed.stderr)
+
+
 def _argv_for(command: object) -> list[str] | None:
     """`command` as an argv, or `None` if it is a blank entry to skip.
 
@@ -281,6 +315,7 @@ def run_suite(
     explore: object = None,
     *,
     runner: CommandRunner = run_command,
+    log_dir: Path | None = None,
 ) -> dict[str, object]:
     """Run each verification command in `worktree` and report what happened.
 
@@ -295,9 +330,19 @@ def run_suite(
     `verification.lint` command run after `commands` and are reported, and fail
     the suite, exactly like `--verify` commands (pygents design G9 item 4).
     Every command, extra or not, is planned before the first one runs.
+
+    `log_dir` is the attempt directory `walk.run_one_step` hands a step that
+    declares it (spec e1b1e7d5). When set, `stdout.log` and `stderr.log` are
+    created there before the first command, and every command that ran
+    appends a `==> <command> (<exit label>)` section with its full stream,
+    verbatim. It lives under the data directory, never the worktree, so this
+    step stays read-only with respect to the repository. An `OSError` writing
+    it propagates. The returned dict is the same with or without it.
     """
     planned = [*_plan_commands(commands), *_plan_explore_commands(explore)]
     worktree_path = _required_worktree(worktree)
+    if log_dir is not None:
+        _start_logs(Path(log_dir))
     result: dict[str, object] = {"passed": False, "verified": [], "detail": ""}
     verified: list[dict[str, object]] = result["verified"]  # type: ignore[assignment]
 
@@ -309,6 +354,10 @@ def run_suite(
                 f"could not run {_display(command, argv)}: {exc}", argv=argv
             ) from exc
 
+        shown = _display(command, argv)
+        if log_dir is not None:
+            _log_command(Path(log_dir), shown, completed)
+
         if completed.exit_code == 0:
             verified.append(
                 {
@@ -319,7 +368,6 @@ def run_suite(
             )
             continue
 
-        shown = _display(command, argv)
         # The label leads, so no stream content -- a green-looking summary, or
         # a line long enough to be truncated -- can hide that the command
         # failed. No fallback: the label already carries the code.
