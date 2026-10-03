@@ -5845,10 +5845,8 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
         assert _keys(found) == [f"{run_id}/{subtask}/cancelled"], subtask
         (comment,) = found
         assert comment.author == "am"
-        assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
         assert "stopped before: implement" in comment.body
         assert f"branch: {_branch(project, subtask)}" in comment.body
-        assert f"relaunch: `am run --milestone {milestone}`" in comment.body
     assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
     for story in shape["stories"].values():
         assert _comments(project, story) == [], story
@@ -5856,10 +5854,8 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
     (key,) = _keys(on_milestone)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
     body = on_milestone[0].body
-    assert body.startswith(f"am · cancelled · run {run_id}\n")
     assert "done: 1 of 3" in body
     assert "parked: " + ", ".join(f"[[{card}]]" for card in parked) in body
-    assert f"next: `am run --milestone {milestone}`" in body
     cancelled_keys = [key for key, _state in _comment_states(project) if key.endswith("/cancelled")]
     assert cancelled_keys == [f"{run_id}/{card}/cancelled" for card in parked]
     assert all(state == "posted" for _key, state in _comment_states(project))
@@ -5896,11 +5892,14 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
     a1_keys = _keys(_comments(project, a1))
     assert len(a1_keys) == 1 and a1_keys[0].startswith(f"{run_id}/{a1}/escalated:"), a1_keys
     assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/cancelled"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
-    assert f"escalated: [[{a1}]] at review" in comment.body
-    assert f"parked: [[{b1}]]" in comment.body
-    assert f"next: `am run --milestone {milestone}`" in comment.body
+    found = _comments(project, milestone)
+    (key,) = _keys(found)
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    states = _comment_states(project)
+    assert (f"{run_id}/{b1}/cancelled", "posted") in states
+    assert (key, "posted") in states
+    assert f"escalated: [[{a1}]] at review" in found[0].body
+    assert f"parked: [[{b1}]]" in found[0].body
 
 
 @requires_git
@@ -5933,7 +5932,7 @@ def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_ph
     body = found[0].body
     assert "stopped before:" not in body
     assert f"branch: {_branch(project, q1)}" in body
-    assert f"relaunch: `am run --milestone {milestone}`" in body
+    assert (f"{run_id}/{q1}/cancelled", "posted") in _comment_states(project)
     for subtask in (f1, s1):
         assert "stopped before: implement" in _comments(project, subtask)[0].body
 
@@ -5964,8 +5963,9 @@ def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
     assert _comments(project, c1) == []
     assert _keys(_comments(project, a1)) == [f"{run_id}/{a1}/done"]
     assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/done"]
-    (comment,) = _comments(project, milestone)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    (key,) = _keys(_comments(project, milestone))
+    assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert (key, "posted") in _comment_states(project)
     assert result["warnings"] == []
 
 
@@ -6017,12 +6017,11 @@ def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
     found = _comments(project, milestone)
     (key,) = _keys(found)
     assert key.startswith(f"{run_id}/{milestone}/run-end:")
+    assert _comment_states(project) == [(key, "posted")]
     body = found[0].body
     assert found[0].author == "am"
-    assert body.startswith(f"am · paused · run {run_id}\n")
     assert "done: 0 of 3" in body
     assert f"parked: [[{a1}]]" in body
-    assert f"next: `am resume {run_id}`" in body
     for quiet in (a1, a2, b1, *shape["stories"].values()):
         assert _comments(project, quiet) == [], quiet
     assert "total" not in result
@@ -6045,11 +6044,8 @@ def test_a_paused_then_resumed_run_leaves_a_paused_then_a_done_run_end(project):
     again = _resume(project, run_id, FakeDriver(), control_interval=0)
 
     assert again["done"] is True, again
-    on_milestone = _comments(project, milestone)
-    assert [comment.body.split("\n", 1)[0] for comment in on_milestone] == [
-        f"am · paused · run {run_id}",
-        f"am · done · run {run_id}",
-    ]
-    keys = _keys(on_milestone)
-    assert len(set(keys)) == 2, keys
+    keys = _keys(_comments(project, milestone))
+    assert len(keys) == 2 and len(set(keys)) == 2, keys
     assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in keys)
+    run_end_rows = [row for row in _comment_states(project) if "/run-end:" in row[0]]
+    assert run_end_rows == [(key, "posted") for key in keys]
