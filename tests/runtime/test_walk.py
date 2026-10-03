@@ -9,6 +9,7 @@ transitive import through `runtime/__init__.py`.
 """
 
 import functools
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -16,8 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import models, store as store_module
+from agent_manager import models, paths, store as store_module
 from agent_manager.runtime import walk
+from agent_manager.steps import reducers, verify
 from agent_manager.runtime.errors import EngineError
 from agent_manager.workflow.phases import AgentPhase, Step
 
@@ -393,3 +395,121 @@ def test_a_callable_gate_without_a_name_is_named_by_its_repr():
 
     assert verdict.kind == "fail"
     assert verdict.detail["message"] == f"phase 'explore' gate {name!r} failed: blocked=x"
+
+
+# ── the engine-supplied log directory (spec e1b1e7d5, Decision 1) ────────────
+#
+# Unit tier: fake step functions and a real temp Store (file I/O only), like
+# the run_one_step tests above. The one test that runs the real verify step
+# spawns a real interpreter and is marked `git` explicitly.
+
+
+def _attempt(n: int, phase: str = "verify") -> Path:
+    """Where the engine puts attempt `n`; computed without creating it."""
+    return paths.run_dir(RUN_ID) / CARD_ID / f"{phase}.{n}"
+
+
+def _logging_step(seen: list[object]):
+    def logging_step(log_dir=None):
+        seen.append(log_dir)
+        return {}
+
+    return logging_step
+
+
+def test_run_one_step_hands_a_declaring_step_a_fresh_attempt_dir_each_call(store):
+    seen: list[object] = []
+    step = Step("verify", _logging_step(seen))
+
+    first = _run(store, step)
+    second = _run(store, step)
+
+    assert first.ok is True and second.ok is True
+    assert seen == [_attempt(1), _attempt(2)]
+    assert _attempt(1).is_dir()
+    assert _attempt(2).is_dir()
+
+
+def test_run_one_step_creates_no_attempt_dir_for_a_step_that_does_not_declare_log_dir(
+    store,
+):
+    outcome = _run(store, Step("verify", lambda: {}))
+
+    assert outcome.ok is True
+    assert not _attempt(1).exists()
+
+
+def test_the_engines_log_dir_overrides_document_args_and_the_binding_table(store):
+    seen: list[object] = []
+    step = Step("verify", _logging_step(seen), args={"log_dir": "/elsewhere"})
+
+    _run(store, step, table={"log_dir": "/from-the-table"})
+
+    assert seen == [_attempt(1)]
+
+
+def test_run_one_step_never_overwrites_an_earlier_attempt_directory(store):
+    # Review Focus 3: a re-run after resume finds `verify.1` from the previous
+    # process on disk and lands in `verify.2`.
+    earlier = paths.attempt_dir(RUN_ID, CARD_ID, "verify", 1)
+    (earlier / "stdout.log").write_text("the first run's evidence\n", encoding="utf-8")
+    seen: list[object] = []
+
+    _run(store, Step("verify", _logging_step(seen)))
+
+    assert seen == [_attempt(2)]
+    assert (earlier / "stdout.log").read_text(encoding="utf-8") == (
+        "the first run's evidence\n"
+    )
+
+
+class _RunlessStore:
+    """A store with no run id: only `record_phase`, which the walk calls."""
+
+    def record_phase(self, story_id, card_id, phase) -> None:
+        pass
+
+
+def test_a_store_with_no_run_id_leaves_the_steps_default(tmp_path):
+    seen: list[object] = []
+
+    outcome = walk.run_one_step(
+        phase=Step("verify", _logging_step(seen), args={"log_dir": "/elsewhere"}),
+        table={},
+        store=_RunlessStore(),
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        clock=lambda: FIXED,
+    )
+
+    assert outcome.ok is True
+    assert seen == [None]
+
+
+@pytest.mark.git
+def test_a_red_verify_through_run_one_step_leaves_its_logs_under_the_run_dir(
+    store, tmp_path
+):
+    """Card test: production wiring with the real step and the real gate."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    script = (
+        "import sys; print('7 passed'); sys.stderr.write('E boom\\n'); "
+        "raise SystemExit(1)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    step = Step("verify", verify.run_suite, gates=(reducers.verification_passed_gate,))
+
+    outcome = _run(
+        store, step, table={"commands": [command], "worktree": str(worktree)}
+    )
+
+    assert outcome.ok is False
+    assert _phase_rows(store)[-1][:2] == ("verify", "failed")
+    log_dir = _attempt(1)
+    assert (log_dir / verify.STDOUT_LOG).read_text(encoding="utf-8") == (
+        f"==> {command} (exit 1)\n7 passed\n"
+    )
+    assert (log_dir / verify.STDERR_LOG).read_text(encoding="utf-8") == (
+        f"==> {command} (exit 1)\nE boom\n"
+    )
