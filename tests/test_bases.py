@@ -19,7 +19,6 @@ import asyncio
 import dataclasses
 import inspect
 import json
-import shutil
 import subprocess
 import sys
 import threading
@@ -35,11 +34,6 @@ from agent_manager.dag import RootPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.store import Checkpoint, Store
-
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the bases steps-tier tests",
-)
 
 BASE = "m7/base-cccccccc"
 ROOT = RootPlan("merged", BASE, ("A", "B"))
@@ -219,7 +213,7 @@ def test_build_is_a_plain_coroutine_that_does_not_import_grafo():
     )
 
 
-@requires_git
+@pytest.mark.git
 async def test_two_clean_tips_merge_into_the_base(two_story_repo: Path, MASTER_BEFORE: str):
     repo = two_story_repo
 
@@ -238,7 +232,7 @@ async def test_two_clean_tips_merge_into_the_base(two_story_repo: Path, MASTER_B
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_building_twice_merges_nothing_the_second_time(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -255,7 +249,7 @@ async def test_building_twice_merges_nothing_the_second_time(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_tip_already_inside_the_other_is_already_merged(
     repo: Path, tmp_path: Path, MASTER_BEFORE: str
 ):
@@ -272,7 +266,7 @@ async def test_a_tip_already_inside_the_other_is_already_merged(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_removed_base_worktree_is_re_added_and_nothing_is_re_merged(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -290,7 +284,7 @@ async def test_a_removed_base_worktree_is_re_added_and_nothing_is_re_merged(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_tip_given_as_a_sha_is_merged_and_reported_as_given(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -483,12 +477,12 @@ def _bases_story(store: Store) -> models.StoryRun:
     return run.stories[0]
 
 
-@requires_git
 @pytest.mark.parametrize(
     "tips",
     [["m7/a", "m7/gone"], ["m7/gone", "m7/b"]],
     ids=["missing-later-tip", "missing-first-tip"],
 )
+@pytest.mark.git
 async def test_a_missing_tip_fails_naming_the_ref(
     two_story_repo: Path, tmp_path: Path, MASTER_BEFORE: str, tips: list[str]
 ):
@@ -507,7 +501,7 @@ async def test_a_missing_tip_fails_naming_the_ref(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_no_tips_is_refused_before_any_git(two_story_repo: Path, MASTER_BEFORE: str):
     repo = two_story_repo
 
@@ -519,7 +513,7 @@ async def test_no_tips_is_refused_before_any_git(two_story_repo: Path, MASTER_BE
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_conflict_is_resolved_by_the_integrate_resolver(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -541,7 +535,7 @@ async def test_a_conflict_is_resolved_by_the_integrate_resolver(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_the_resolver_walk_is_journalled_under_the_bases_story(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -571,7 +565,7 @@ async def test_the_resolver_walk_is_journalled_under_the_bases_story(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_clean_build_records_no_bases_story(
     two_story_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -585,7 +579,7 @@ async def test_a_clean_build_records_no_bases_story(
     assert rev(two_story_repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_two_bases_in_one_run_share_one_bases_story(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -608,7 +602,7 @@ async def test_two_bases_in_one_run_share_one_bases_story(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_conflict_without_a_resolver_fails_for_a_human(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -630,7 +624,7 @@ async def test_a_conflict_without_a_resolver_fails_for_a_human(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_conflict_with_no_store_fails_for_a_human(
     conflicting_repo: Path, MASTER_BEFORE: str
 ):
@@ -644,7 +638,7 @@ async def test_a_conflict_with_no_store_fails_for_a_human(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_conflict_with_no_story_id_fails_for_a_human(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -664,7 +658,7 @@ async def test_a_conflict_with_no_story_id_fails_for_a_human(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_two_conflicts_in_one_base_are_each_resolved(
     conflicting_repo: Path, tmp_path: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -689,7 +683,7 @@ async def test_two_conflicts_in_one_base_are_each_resolved(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_relaunch_after_a_resolved_conflict_dispatches_nothing(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -709,7 +703,7 @@ async def test_a_relaunch_after_a_resolved_conflict_dispatches_nothing(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_missing_run_id_falls_back_to_the_stores(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -726,7 +720,7 @@ async def test_a_missing_run_id_falls_back_to_the_stores(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_resolver_that_gives_up_fails_the_base(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -758,7 +752,7 @@ async def test_a_resolver_that_gives_up_fails_the_base(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_stop_during_the_resolver_parks_it(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -800,7 +794,7 @@ async def test_a_stop_during_the_resolver_parks_it(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_relaunch_after_an_escalation_does_not_re_dispatch(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -824,7 +818,7 @@ async def test_a_relaunch_after_an_escalation_does_not_re_dispatch(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_red_suite_after_a_resolved_conflict_fails_the_base(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -849,7 +843,7 @@ async def test_a_red_suite_after_a_resolved_conflict_fails_the_base(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_merge_in_progress_fails_for_a_human(
     two_story_repo: Path, tmp_path: Path, MASTER_BEFORE: str
 ):
@@ -880,7 +874,7 @@ def test_the_resolver_card_is_base_and_the_story_id():
     assert bases.resolver_card_id(STORY_C) == CARD_C
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_resumed_resolver_parked_after_its_merge_continues_at_verify(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -931,7 +925,7 @@ async def test_a_resumed_resolver_parked_after_its_merge_continues_at_verify(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_resumed_resolver_rewound_to_its_failed_turn_finishes_the_merge(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -965,7 +959,7 @@ async def test_a_resumed_resolver_rewound_to_its_failed_turn_finishes_the_merge(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_resumed_resolver_with_no_runner_factory_fails_for_a_human(
     conflicting_repo: Path, store: Store, MASTER_BEFORE: str
 ):
@@ -990,7 +984,7 @@ async def test_a_resumed_resolver_with_no_runner_factory_fails_for_a_human(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_a_failing_verify_fails_the_base(two_story_repo: Path, MASTER_BEFORE: str):
     repo = two_story_repo
 
@@ -1005,7 +999,7 @@ async def test_a_failing_verify_fails_the_base(two_story_repo: Path, MASTER_BEFO
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_an_empty_suite_is_judged_before_running(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -1023,7 +1017,7 @@ async def test_an_empty_suite_is_judged_before_running(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_verification_runs_in_the_base_worktree(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -1040,7 +1034,7 @@ async def test_verification_runs_in_the_base_worktree(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_every_git_and_verify_call_runs_off_the_event_loop_thread(
     two_story_repo: Path, MASTER_BEFORE: str, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1074,7 +1068,7 @@ async def test_every_git_and_verify_call_runs_off_the_event_loop_thread(
     assert rev(repo, "master") == MASTER_BEFORE
 
 
-@requires_git
+@pytest.mark.git
 async def test_git_and_verify_around_a_resolved_conflict_run_off_the_loop_thread(
     conflicting_repo: Path,
     store: Store,

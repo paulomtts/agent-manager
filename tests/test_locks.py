@@ -211,6 +211,7 @@ def test_a_positive_timeout_retries_and_gets_the_lock_once_it_is_freed(
         _reap(child)
 
 
+@pytest.mark.soak
 def test_the_timeout_bounds_the_wait_across_both_layers(tmp_path):
     # `local` is held by another thread for most of the timeout, and the flock
     # by another process for all of it: the two waits share one budget.
