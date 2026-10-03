@@ -5,7 +5,8 @@ the sibling `brd` project.
 
 ## Verification
 
-Run the full suite with:
+Run the default suite (the `unit` + `git` tiers; see "Test tiers" below for the
+opt-in ones) with:
 
 ```bash
 uv run pytest
