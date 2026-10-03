@@ -20,7 +20,6 @@ import ast
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -44,11 +43,6 @@ from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
 from agent_manager.store import Store
 from agent_manager.workflow import integrate as integrate_workflow
-
-pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for integrate_milestone's tests",
-)
 
 BASE = "main"
 PREFIX = "m5"
@@ -381,6 +375,7 @@ def _clean_milestone(repo: Repo) -> tuple[list[StoryPlan], list[str]]:
     return [story_b, story_c, empty, story_a], [tip_c, tip_a, tip_b]
 
 
+@pytest.mark.git
 def test_clean_tips_merge_in_level_then_census_order_and_dispatch_no_agent(
     repo: Repo, store: Store
 ) -> None:
@@ -409,6 +404,7 @@ def test_clean_tips_merge_in_level_then_census_order_and_dispatch_no_agent(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_a_failing_final_verification_escalates_after_the_merges(
     repo: Repo, store: Store
 ) -> None:
@@ -429,6 +425,7 @@ def test_a_failing_final_verification_escalates_after_the_merges(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_empty_commands_without_the_opt_out_escalate_after_merging(
     repo: Repo, store: Store
 ) -> None:
@@ -446,6 +443,7 @@ def test_empty_commands_without_the_opt_out_escalate_after_merging(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_empty_commands_with_the_opt_out_skip_the_final_check(
     repo: Repo, store: Store
 ) -> None:
@@ -461,6 +459,7 @@ def test_empty_commands_with_the_opt_out_skip_the_final_check(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_an_already_integrated_milestone_is_a_no_op(repo: Repo, store: Store) -> None:
     stories, tips = _clean_milestone(repo)
     before = _protected(repo, tips)
@@ -484,6 +483,7 @@ def test_an_already_integrated_milestone_is_a_no_op(repo: Repo, store: Store) ->
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_a_missing_story_tip_propagates_the_git_error(repo: Repo, store: Store) -> None:
     """A story whose last subtask never produced a branch is a bad ref. That is
     a git failure other than a merge in progress, so it propagates."""
@@ -511,6 +511,7 @@ def _conflicting_pair(repo: Repo) -> tuple[list[StoryPlan], list[str]]:
     return [story_a, story_b], [tip_a, tip_b]
 
 
+@pytest.mark.git
 def test_a_merge_already_in_progress_escalates_without_dispatching(
     repo: Repo, store: Store
 ) -> None:
@@ -549,6 +550,7 @@ def _integrate_story(store: Store) -> models.StoryRun:
     return run.stories[0]
 
 
+@pytest.mark.git
 def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     repo: Repo, store: Store
 ) -> None:
@@ -681,6 +683,7 @@ def test_resolve_conflict_walks_integrate_with_the_same_arguments(
     }
 
 
+@pytest.mark.git
 def test_a_refusing_resolver_escalates_and_leaves_merge_head_in_place(
     repo: Repo, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -711,6 +714,7 @@ def test_a_refusing_resolver_escalates_and_leaves_merge_head_in_place(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_two_conflicting_tips_dispatch_once_each_under_one_integrate_story(
     repo: Repo, store: Store
 ) -> None:
@@ -743,6 +747,7 @@ def test_two_conflicting_tips_dispatch_once_each_under_one_integrate_story(
     _assert_protected(repo, before, tips)
 
 
+@pytest.mark.git
 def test_a_relaunch_after_a_human_finished_the_merge_succeeds_without_dispatch(
     repo: Repo, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -7,7 +7,6 @@ except where a test must force an output git itself would never print.
 """
 
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -20,11 +19,6 @@ from lockhelpers import _holder, _probe, _reap, _release
 from agent_manager import locks, paths
 from agent_manager.steps import worktree
 from agent_manager.steps.worktree import GitError
-
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the worktree step's steps-tier tests",
-)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -135,13 +129,11 @@ def test_branch_exists_ignores_blank_and_padded_lines():
     assert worktree.branch_exists("main\n\n\n", "") is False
 
 
-@requires_git
 def test_run_git_returns_stdout(repo: Path):
     out = worktree.run_git(["-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"])
     assert out.strip() == "main"
 
 
-@requires_git
 def test_run_git_raises_git_error_carrying_argv_and_exit_code(tmp_path: Path):
     argv = ["-C", str(tmp_path), "rev-parse", "--verify", "origin/nope"]
     with pytest.raises(GitError) as excinfo:
@@ -208,7 +200,6 @@ def test_bad_arguments_raise_before_any_git_invocation(kwargs, expected):
     assert calls == []
 
 
-@requires_git
 def test_a_fresh_branch_and_missing_worktree_is_created(repo: Path, tmp_path: Path):
     wt = tmp_path / "wt"
 
@@ -231,7 +222,6 @@ def test_a_fresh_branch_and_missing_worktree_is_created(repo: Path, tmp_path: Pa
     assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-9"
 
 
-@requires_git
 def test_a_directory_that_is_not_a_registered_worktree_propagates_gits_failure(
     repo: Path, tmp_path: Path
 ):
@@ -254,7 +244,6 @@ def test_a_directory_that_is_not_a_registered_worktree_propagates_gits_failure(
     assert "add" in excinfo.value.argv
 
 
-@requires_git
 def test_an_exact_branch_match_is_required_before_checking_out(
     repo: Path, tmp_path: Path
 ):
@@ -274,7 +263,6 @@ def test_an_exact_branch_match_is_required_before_checking_out(
     assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-"
 
 
-@requires_git
 def test_a_second_identical_call_is_a_no_op(repo: Path, tmp_path: Path):
     wt = tmp_path / "wt"
     args = {
@@ -294,7 +282,6 @@ def test_a_second_identical_call_is_a_no_op(repo: Path, tmp_path: Path):
     assert _head(wt) == head_before
 
 
-@requires_git
 def test_an_existing_worktree_add_is_never_attempted_a_second_time(
     repo: Path, tmp_path: Path
 ):
@@ -313,7 +300,6 @@ def test_an_existing_worktree_add_is_never_attempted_a_second_time(
     assert not any("add" in argv for argv in calls)
 
 
-@requires_git
 def test_uncommitted_local_changes_survive_untouched(repo: Path, tmp_path: Path):
     wt = tmp_path / "wt"
     args = {
@@ -334,7 +320,6 @@ def test_uncommitted_local_changes_survive_untouched(repo: Path, tmp_path: Path)
     assert _git(wt, "status", "--porcelain") == status_before
 
 
-@requires_git
 def test_a_non_normalized_worktree_path_still_counts_as_existing(
     repo: Path, tmp_path: Path
 ):
@@ -360,7 +345,6 @@ def test_a_non_normalized_worktree_path_still_counts_as_existing(
     assert result["created"] is False
 
 
-@requires_git
 def test_a_sibling_worktree_at_another_path_does_not_count_as_this_one(
     repo: Path, tmp_path: Path
 ):
@@ -380,7 +364,6 @@ def test_a_sibling_worktree_at_another_path_does_not_count_as_this_one(
     assert sibling.is_dir()
 
 
-@requires_git
 def test_an_existing_branchs_commits_survive_the_checkout_path(
     repo: Path, tmp_path: Path
 ):
@@ -408,7 +391,6 @@ def test_an_existing_branchs_commits_survive_the_checkout_path(
     assert (wt / "prior.txt").read_text() == "work from a killed run\n"
 
 
-@requires_git
 def test_commit_count_counts_only_the_commits_on_top_of_the_base(
     repo: Path, tmp_path: Path
 ):
@@ -430,7 +412,6 @@ def test_commit_count_counts_only_the_commits_on_top_of_the_base(
     assert result["commit_count"] == 2
 
 
-@requires_git
 def test_an_unparseable_commit_count_is_zero_rather_than_a_crash(
     repo: Path, tmp_path: Path
 ):
@@ -455,7 +436,6 @@ def test_an_unparseable_commit_count_is_zero_rather_than_a_crash(
     assert result["created"] is True
 
 
-@requires_git
 def test_a_non_numeric_commit_count_is_zero_rather_than_a_crash(
     repo: Path, tmp_path: Path
 ):
@@ -493,7 +473,6 @@ def repo_with_origin(repo: Path, tmp_path: Path) -> Path:
     return repo
 
 
-@requires_git
 def test_a_base_with_no_origin_falls_back_to_the_local_ref(
     repo: Path, tmp_path: Path
 ):
@@ -513,7 +492,6 @@ def test_a_base_with_no_origin_falls_back_to_the_local_ref(
     assert _head(wt) == local_head
 
 
-@requires_git
 def test_origin_is_preferred_over_the_local_ref_when_it_resolves(
     repo_with_origin: Path, tmp_path: Path
 ):
@@ -535,7 +513,6 @@ def test_origin_is_preferred_over_the_local_ref_when_it_resolves(
     assert not (wt / "local-only.txt").exists()
 
 
-@requires_git
 def test_the_origin_probe_is_recorded_and_its_failure_is_not_an_error(
     repo: Path, tmp_path: Path
 ):
@@ -565,7 +542,6 @@ def _assert_no_forbidden_git(calls: list[list[str]]) -> None:
         assert not ("worktree" in argv and "remove" in argv), argv
 
 
-@requires_git
 def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path):
     # Create path, resume-a-branch path and already-exists path, in one run.
     staging = tmp_path / "staging-wt"
@@ -605,7 +581,6 @@ def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path)
     assert (tmp_path / "wt-8" / "prior.txt").is_file()
 
 
-@requires_git
 def test_every_spelling_of_one_repository_shares_one_lock(repo: Path, tmp_path: Path):
     # Trailing slash, a `..` hop and a symlinked path all name the same
     # repository, so they must serialize on the same lock.
@@ -648,7 +623,6 @@ def _is_add(argv: list[str]) -> bool:
     return "worktree" in argv and "add" in argv
 
 
-@requires_git
 def test_eight_distinct_lanes_in_parallel_all_succeed(repo: Path, tmp_path: Path):
     lanes = 8
     barrier = threading.Barrier(lanes)
@@ -703,7 +677,6 @@ def test_eight_distinct_lanes_in_parallel_all_succeed(repo: Path, tmp_path: Path
         assert _git(wt, "rev-parse", "HEAD").strip() == main_head
 
 
-@requires_git
 def test_two_threads_ensuring_the_same_worktree_both_succeed(
     repo: Path, tmp_path: Path
 ):
@@ -766,7 +739,6 @@ def _finishes_while_held(lock: threading.Lock, call) -> tuple[bool, object]:
     return finished, outcome.get("result")
 
 
-@requires_git
 def test_a_failed_add_releases_the_repository_lock(repo: Path, tmp_path: Path):
     stray = tmp_path / "stray"
     stray.mkdir()
@@ -791,7 +763,6 @@ def test_a_failed_add_releases_the_repository_lock(repo: Path, tmp_path: Path):
     assert result["created"] is True
 
 
-@requires_git
 def test_a_same_branch_at_a_different_path_surfaces_gits_error_and_frees_the_lock(
     repo: Path, tmp_path: Path
 ):
@@ -815,7 +786,6 @@ def test_a_same_branch_at_a_different_path_surfaces_gits_error_and_frees_the_loc
     assert _probe(repo, "git") == "free"
 
 
-@requires_git
 def test_a_different_repository_is_never_blocked_by_this_ones_lock(
     repo: Path, tmp_path: Path
 ):
@@ -835,7 +805,6 @@ def test_a_different_repository_is_never_blocked_by_this_ones_lock(
     assert isinstance(result, dict) and result["created"] is True
 
 
-@requires_git
 def test_an_existing_worktree_takes_no_lock(repo: Path, tmp_path: Path):
     args = {
         "branch": "m4/resume",
@@ -869,7 +838,6 @@ def test_the_repository_lock_is_reentrant(tmp_path: Path):
         lock.release()
 
 
-@requires_git
 def test_git_lock_is_keyed_by_the_resolved_repository(repo: Path):
     lock = worktree.git_lock(repo)
 
@@ -881,7 +849,6 @@ def test_git_lock_is_keyed_by_the_resolved_repository(repo: Path):
     assert lock._local is worktree._repo_lock(str(repo))
 
 
-@requires_git
 def test_worktree_add_waits_for_the_git_lock_of_another_process(
     repo: Path, tmp_path: Path, monkeypatch
 ):
@@ -940,7 +907,6 @@ def test_worktree_add_waits_for_the_git_lock_of_another_process(
     assert list(repo.rglob("*.lock")) == []  # no lock file in the repository
 
 
-@requires_git
 def test_a_git_lock_timeout_propagates_and_no_worktree_is_added(
     repo: Path, tmp_path: Path, monkeypatch
 ):

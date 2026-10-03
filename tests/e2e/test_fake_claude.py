@@ -1,9 +1,28 @@
 """Tests for the fake `claude` of the production-wiring tier.
 
-The parsing and payload-generation tests are pure-functions tier (design §14
-lines 477-492); the four `_run_fake` tests below drive the whole script as a
-child process and belong to the production-wiring tier, like the fixture they
-underwrite.
+Tier follows what a test touches, not the directory it sits in (V1 of
+`docs/superpowers/specs/2026-10-02-test-tier-design.md`, which supersedes the
+design doc's old testing section). Each test here is marked on its own:
+
+- `@pytest.mark.e2e_fake`: the tests that call `_run_fake`, which runs
+  `fake_claude.py` as a child process. A test that also builds a git repo is
+  still `e2e_fake` only: one test, one tier.
+- `@pytest.mark.git`: the tests that build a real git repo in `tmp_path`
+  through `_implement_repo`, directly or via `_review_worktree` or
+  `_conflicted_repo`, and call the script's functions in-process.
+- no marker: the pure parsing, schema and payload tests, in the default `unit`
+  tier with its PATH shim and 0.5s budget.
+
+This module is the one exception to the `tests/e2e/` directory auto-mark
+(`_AUTO_MARK_EXEMPT` in `tests/conftest.py`). Every other module under
+`tests/e2e/` drives production wiring, so `e2e_fake` is the right default
+there. Most tests here only exercise the fake's helpers as plain functions;
+auto-marking them would keep them out of the default run for no reason. They
+stay in this file, rather than moving to a separate parsing module, because
+they share its by-path load of the script and its brief and schema fixtures.
+There is no module-level `pytestmark`, which would mark the pure tests too.
+`test_each_test_here_carries_exactly_the_tier_its_helpers_touch` fails when a
+test's marker disagrees with the helpers it reaches.
 
 `tests/e2e/fake_claude.py` is a script, not a package module: it is copied to a
 tmp directory and executed as `claude` by the production-wiring tier. It is
@@ -49,6 +68,111 @@ def _conftest_constant(name):
         ):
             return ast.literal_eval(node.value)
     raise AssertionError(f"tests/e2e/conftest.py defines no {name}")
+
+
+_TIERS = frozenset({"git", "brd", "e2e_fake", "soak", "e2e"})
+"""`tests/conftest.py`'s `TIER_MARKERS`, written out: that conftest is not
+imported here, for the same reason `_conftest_constant` parses its sibling."""
+
+
+def test_the_tier_set_here_is_the_root_conftests_tier_markers():
+    """`_TIERS` is a hand copy; a tier added to `tests/conftest.py` and not here
+    would be invisible to the marker guard below."""
+    tree = ast.parse(
+        (Path(__file__).parents[1] / "conftest.py").read_text(encoding="utf-8")
+    )
+    [value] = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "TIER_MARKERS"
+            for target in node.targets
+        )
+    ]
+    assert isinstance(value, ast.Call) and value.func.id == "frozenset"
+    assert _TIERS == ast.literal_eval(value.args[0])
+
+
+def _tier_marks(node):
+    """The tier names among `node`'s `@pytest.mark.<name>` decorators, called or bare."""
+    names = set()
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Attribute)
+            and target.value.attr == "mark"
+        ):
+            names.add(target.attr)
+    return names & _TIERS
+
+
+def _expected_tiers():
+    """Each test function in this module mapped to (the tiers it needs, the tiers it has).
+
+    Needs `e2e_fake` when it reaches `_run_fake`, else `git` when it reaches
+    `_implement_repo` (directly or through `_review_worktree`/`_conflicted_repo`),
+    else no tier. Reaching is transitive over this module's top-level functions.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    calls = {
+        name: {
+            call.func.id
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in functions
+        }
+        for name, node in functions.items()
+    }
+
+    def reaches(start, target):
+        seen, stack = {start}, [start]
+        while stack:
+            for callee in calls[stack.pop()]:
+                if callee == target:
+                    return True
+                if callee not in seen:
+                    seen.add(callee)
+                    stack.append(callee)
+        return False
+
+    expected = {}
+    for name, node in functions.items():
+        if not name.startswith("test_"):
+            continue
+        if reaches(name, "_run_fake"):
+            want = {"e2e_fake"}
+        elif reaches(name, "_implement_repo"):
+            want = {"git"}
+        else:
+            want = set()
+        expected[name] = (want, _tier_marks(node))
+    return expected
+
+
+def test_each_test_here_carries_exactly_the_tier_its_helpers_touch():
+    """This module is exempt from the `tests/e2e/` auto-mark, so its markers are
+    the only thing keeping a process- or git-touching test out of the unit tier.
+    `_run_fake` spawns by absolute path, which the unit PATH shim cannot catch."""
+    expected = _expected_tiers()
+
+    wrong = {
+        name: f"needs {sorted(want)}, has {sorted(has)}"
+        for name, (want, has) in expected.items()
+        if want != has
+    }
+
+    assert wrong == {}
+    wants = [want for want, _ in expected.values()]
+    # Non-vacuity: the walk really finds all three kinds.
+    assert {"e2e_fake"} in wants
+    assert {"git"} in wants
+    assert set() in wants
 
 
 def test_the_prompt_path_is_parsed_out_of_the_adapters_p_sentence():
@@ -268,6 +392,7 @@ def _run_fake(prompt_path, cwd):
     )
 
 
+@pytest.mark.e2e_fake
 def test_the_fake_writes_a_gate_passing_critic_result_where_the_brief_says(tmp_path):
     """Production-wiring tier's own fixture check: the script end to end, driven
     only by a brief on disk."""
@@ -292,6 +417,7 @@ def test_the_fake_writes_a_gate_passing_critic_result_where_the_brief_says(tmp_p
     assert len(payload["summary"]) > 60
 
 
+@pytest.mark.e2e_fake
 def test_the_fake_logs_its_phase_and_cwd_beside_the_run_directory(tmp_path):
     attempt = tmp_path / "runs" / "r1" / "card" / "validate_spec.1"
     attempt.mkdir(parents=True)
@@ -313,6 +439,7 @@ def test_the_fake_logs_its_phase_and_cwd_beside_the_run_directory(tmp_path):
     assert entry["result_path"] == str(result_path)
 
 
+@pytest.mark.e2e_fake
 def test_a_brief_without_a_result_contract_makes_the_fake_exit_non_zero(tmp_path):
     """Review focus / addendum R2: no contract, no run. This is what makes the
     production-wiring test fail loudly if prompt composition ever regresses."""
@@ -328,6 +455,7 @@ def test_a_brief_without_a_result_contract_makes_the_fake_exit_non_zero(tmp_path
     assert "Result contract" in completed.stderr
 
 
+@pytest.mark.e2e_fake
 def test_a_feedback_block_after_the_contract_does_not_hide_the_contract(tmp_path):
     """Review focus: `dispatch._append_feedback` appends
     `## feedback on the previous attempt` AFTER the contract on a retry."""
@@ -418,6 +546,7 @@ def _head_message(repo):
     ).stdout
 
 
+@pytest.mark.git
 def test_the_fake_coder_takes_its_trailer_hash_from_the_brief_not_the_plan_file(
     tmp_path,
 ):
@@ -439,6 +568,7 @@ def test_the_fake_coder_takes_its_trailer_hash_from_the_brief_not_the_plan_file(
     assert on_disk not in message
 
 
+@pytest.mark.git
 def test_an_implement_brief_with_no_plan_hash_section_stops_the_fake(tmp_path):
     """The mechanism that makes the production-wiring test fail if the input is
     ever dropped from `implement`'s `inputs` in `builtin/task.yaml`."""
@@ -456,6 +586,7 @@ def test_an_implement_brief_with_no_plan_hash_section_stops_the_fake(tmp_path):
     assert "implement" in str(caught.value)
 
 
+@pytest.mark.git
 def test_a_padded_plan_hash_section_still_produces_a_single_line_trailer(tmp_path):
     """Review focus: a body padded with blank lines must not end the commit
     message in a blank `Plan-Hash:` line that `review_gate` reads as debris."""
@@ -501,6 +632,7 @@ def _implement(repo, plan=PLAN_RELATIVE):
     )
 
 
+@pytest.mark.git
 def test_a_stacked_subtask_with_its_own_plan_commits_its_own_implementation(tmp_path):
     """Review focus: a milestone stacks a2 on a1's branch, so a2's worktree already
     holds a1's implementation file. The file's content names the brief's plan
@@ -518,6 +650,7 @@ def test_a_stacked_subtask_with_its_own_plan_commits_its_own_implementation(tmp_
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 def test_a_second_implement_on_the_same_plan_resumes_instead_of_failing(tmp_path):
     """Review focus / spec "Re-entering B": a relaunched subtask's implementation
     is already committed. The fake reports `resumed` rather than dying on
@@ -589,6 +722,7 @@ def test_the_review_fail_marker_name_is_the_one_the_e2e_fixtures_write():
     assert fake_claude.REVIEW_FAIL_MARKER == "fake-claude-review-fail"
 
 
+@pytest.mark.git
 def test_without_a_marker_the_review_passes_the_real_review_gate(tmp_path):
     _, worktree = _review_worktree(tmp_path)
 
@@ -601,6 +735,7 @@ def test_without_a_marker_the_review_passes_the_real_review_gate(tmp_path):
     assert review_gate(payload, REVIEW_BRANCH, "main") is None
 
 
+@pytest.mark.git
 def test_a_marker_naming_the_briefs_branch_makes_a_review_the_real_gate_blocks(tmp_path):
     """Spec: the trigger is the brief's `## branch` matched against a marker in the
     repo's git common dir. The failing result is schema-shaped (every field went
@@ -622,6 +757,7 @@ def test_a_marker_naming_the_briefs_branch_makes_a_review_the_real_gate_blocks(t
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 def test_a_marker_naming_only_other_branches_does_not_fail_this_review(tmp_path):
     """Whole-line equality, never a prefix test: a branch that merely starts with
     this one's name must not fail it."""
@@ -658,6 +794,7 @@ def test_a_rendezvous_marker_name_is_stable_per_cwd_and_filesystem_safe(tmp_path
     assert len(stem) == 16 and set(stem) <= set("0123456789abcdef")
 
 
+@pytest.mark.git
 def test_without_a_rendezvous_dir_implement_neither_waits_nor_writes_a_marker(
     tmp_path, monkeypatch
 ):
@@ -675,6 +812,7 @@ def test_without_a_rendezvous_dir_implement_neither_waits_nor_writes_a_marker(
     assert sorted(path.name for path in tmp_path.iterdir()) == before
 
 
+@pytest.mark.git
 def test_a_met_rendezvous_writes_a_marker_named_for_the_cwd_and_implements(
     tmp_path, monkeypatch
 ):
@@ -695,6 +833,7 @@ def test_a_met_rendezvous_writes_a_marker_named_for_the_cwd_and_implements(
     assert _head(repo) != before
 
 
+@pytest.mark.git
 def test_a_rendezvous_counts_markers_other_lanes_left(tmp_path, monkeypatch):
     """Count 2 with one peer marker already present: the second arrival passes
     straight through, which is how two lanes release each other."""
@@ -714,6 +853,7 @@ def test_a_rendezvous_counts_markers_other_lanes_left(tmp_path, monkeypatch):
     assert len(list(folder.glob(f"*{fake_claude.RENDEZVOUS_SUFFIX}"))) == 2
 
 
+@pytest.mark.git
 def test_an_unmet_rendezvous_fails_the_fake_before_it_commits(tmp_path, monkeypatch):
     folder = tmp_path / "rendezvous"
     monkeypatch.setenv(fake_claude.RENDEZVOUS_DIR_ENV, str(folder))
@@ -731,6 +871,7 @@ def test_an_unmet_rendezvous_fails_the_fake_before_it_commits(tmp_path, monkeypa
     assert _head(repo) == before
 
 
+@pytest.mark.git
 def test_the_same_cwd_arriving_twice_counts_once(tmp_path, monkeypatch):
     """Review focus: a retried implement in one worktree must not satisfy a
     count of 2 on its own, or a single lane would fake an overlap."""
@@ -763,6 +904,7 @@ def test_a_missing_or_bad_rendezvous_count_is_refused(tmp_path, monkeypatch, raw
     assert fake_claude.RENDEZVOUS_COUNT_ENV in str(caught.value)
 
 
+@pytest.mark.e2e_fake
 def test_a_rendezvous_failure_makes_the_fake_process_exit_1(tmp_path, monkeypatch):
     """The `__main__` mapping, end to end: the child inherits the env (as it does
     under `launcher.run_direct`), refuses the count, writes no result."""
@@ -943,6 +1085,7 @@ def test_an_unreleased_hold_times_out_naming_the_release_file(tmp_path, monkeypa
     assert (folder / f"{HOLD_SHORT}.held").is_file()
 
 
+@pytest.mark.e2e_fake
 def test_the_fake_process_holds_before_it_implements(tmp_path, monkeypatch):
     """`main` wires the hold in: the child writes its marker, finds the
     release, then implements and writes its result."""
@@ -1006,6 +1149,7 @@ def test_the_implement_edits_marker_name_is_the_conftest_twin():
     )
 
 
+@pytest.mark.git
 def test_the_marker_entry_for_the_briefs_branch_is_written_and_committed(tmp_path):
     repo = _implement_repo(tmp_path)
     _write_edits(
@@ -1025,6 +1169,7 @@ def test_the_marker_entry_for_the_briefs_branch_is_written_and_committed(tmp_pat
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 def test_a_marker_entry_for_another_branch_writes_nothing_extra(tmp_path):
     repo = _implement_repo(tmp_path)
     _write_edits(repo, {OTHER_BRANCH: {"shared.txt": "story B\n"}})
@@ -1036,6 +1181,7 @@ def test_a_marker_entry_for_another_branch_writes_nothing_extra(tmp_path):
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 def test_a_marker_with_no_branch_section_in_the_brief_stops_the_fake(tmp_path):
     """Review focus: the edits are keyed by the brief's `## branch`. A brief
     without it must fail loudly, never quietly skip the edits."""
@@ -1051,6 +1197,7 @@ def test_a_marker_with_no_branch_section_in_the_brief_stops_the_fake(tmp_path):
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 @pytest.mark.parametrize("relative", ["../outside.txt", "/tmp/absolute.txt", ""])
 def test_a_marker_path_outside_the_worktree_is_refused_before_any_write(
     tmp_path, relative
@@ -1069,6 +1216,7 @@ def test_a_marker_path_outside_the_worktree_is_refused_before_any_write(
     assert not (tmp_path / "outside.txt").exists()
 
 
+@pytest.mark.git
 def test_a_marker_that_is_not_json_is_refused(tmp_path):
     repo = _implement_repo(tmp_path)
     (repo / ".git" / fake_claude.IMPLEMENT_EDITS_MARKER).write_text(
@@ -1081,6 +1229,7 @@ def test_a_marker_that_is_not_json_is_refused(tmp_path):
     assert "not valid JSON" in str(caught.value)
 
 
+@pytest.mark.git
 @pytest.mark.parametrize("table", [[], "a string", 1])
 def test_a_marker_that_is_not_an_object_of_branches_is_refused(tmp_path, table):
     repo = _implement_repo(tmp_path)
@@ -1095,6 +1244,7 @@ def test_a_marker_that_is_not_an_object_of_branches_is_refused(tmp_path, table):
     assert _porcelain(repo) == ""
 
 
+@pytest.mark.git
 @pytest.mark.parametrize(
     "entry", [["shared.txt"], "shared.txt", {"shared.txt": 1}, {"shared.txt": None}]
 )
@@ -1253,6 +1403,7 @@ def test_the_resolver_env_var_name_is_pinned():
     assert fake_claude.RESOLVER_REFUSE == "refuse"
 
 
+@pytest.mark.git
 @pytest.mark.parametrize("style", ["merge", "diff3", "zdiff3"])
 def test_the_resolver_keeps_both_sides_commits_and_the_real_gate_passes(
     tmp_path, monkeypatch, style
@@ -1271,6 +1422,7 @@ def test_the_resolver_keeps_both_sides_commits_and_the_real_gate_passes(
     assert merge_completed_gate(payload, repo) is None
 
 
+@pytest.mark.git
 def test_an_empty_resolver_env_value_means_resolve(tmp_path, monkeypatch):
     monkeypatch.setenv(fake_claude.RESOLVER_ENV, "")
     repo = _conflicted_repo(tmp_path)
@@ -1280,6 +1432,7 @@ def test_an_empty_resolver_env_value_means_resolve(tmp_path, monkeypatch):
     assert not _merge_head_exists(repo)
 
 
+@pytest.mark.git
 def test_a_refusing_resolver_claims_resolved_but_git_still_says_no(
     tmp_path, monkeypatch
 ):
@@ -1301,6 +1454,7 @@ def test_a_refusing_resolver_claims_resolved_but_git_still_says_no(
     assert verdict is not None and "MERGE_HEAD" in verdict["detail"]
 
 
+@pytest.mark.git
 def test_an_unknown_resolver_env_value_fails_the_fake_and_touches_nothing(
     tmp_path, monkeypatch
 ):
@@ -1317,6 +1471,7 @@ def test_an_unknown_resolver_env_value_fails_the_fake_and_touches_nothing(
     assert (repo / "shared.txt").read_bytes() == before
 
 
+@pytest.mark.git
 @pytest.mark.parametrize(
     ("missing", "brief"),
     [("merge_tip", {"tip": None}), ("conflict_files", {"files": None})],
@@ -1334,6 +1489,7 @@ def test_a_resolve_brief_missing_a_section_fails_the_fake(
     assert _merge_head_exists(repo)
 
 
+@pytest.mark.git
 @pytest.mark.parametrize(
     "files", ["not json", '{"shared.txt": 1}', "[1]", '[""]', '"shared.txt"']
 )
@@ -1350,6 +1506,7 @@ def test_a_malformed_conflict_files_section_fails_the_fake(
     assert _merge_head_exists(repo)
 
 
+@pytest.mark.git
 def test_a_merge_tip_that_is_not_merge_head_fails_the_fake(tmp_path, monkeypatch):
     monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
     repo = _conflicted_repo(tmp_path)
@@ -1361,6 +1518,7 @@ def test_a_merge_tip_that_is_not_merge_head_fails_the_fake(tmp_path, monkeypatch
     assert _merge_head_exists(repo)
 
 
+@pytest.mark.git
 def test_a_resolve_with_no_merge_in_progress_fails_the_fake(tmp_path, monkeypatch):
     monkeypatch.delenv(fake_claude.RESOLVER_ENV, raising=False)
     repo = _implement_repo(tmp_path)
@@ -1372,6 +1530,7 @@ def test_a_resolve_with_no_merge_in_progress_fails_the_fake(tmp_path, monkeypatc
     assert "MERGE_HEAD" in str(caught.value)
 
 
+@pytest.mark.git
 def test_a_listed_conflict_file_that_is_not_there_fails_before_any_write(
     tmp_path, monkeypatch
 ):
@@ -1529,6 +1688,7 @@ def test_a_critic_blocks_env_naming_a_missing_file_stops_the_fake(tmp_path, monk
     assert str(missing) in str(caught.value)
 
 
+@pytest.mark.e2e_fake
 def test_a_bad_critic_blocks_budget_makes_the_fake_process_exit_1(tmp_path, monkeypatch):
     """The `__main__` mapping, end to end: the child inherits the env (as it does
     under `launcher.run_direct`), refuses the budget, writes no result."""
@@ -1550,6 +1710,7 @@ def test_a_bad_critic_blocks_budget_makes_the_fake_process_exit_1(tmp_path, monk
     assert not result_path.exists()
 
 
+@pytest.mark.e2e_fake
 def test_a_blocking_critic_process_writes_the_blocked_result(tmp_path, monkeypatch):
     """The whole script, driven by a brief plus the env switch: the brief says
     nothing about blocking, the budget alone decides (Rule 4)."""

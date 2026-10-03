@@ -98,13 +98,6 @@ def _sleeper() -> subprocess.Popen:
     )
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """No `e2e` marker may reach this module, or the multi-process proof stops
-    running on every `uv run pytest`."""
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_am_returns_the_exit_code_and_the_parsed_envelope(tmp_path, am):
     code, envelope = am("runs", "--repo-dir", str(tmp_path / "no-such-repo"))
 

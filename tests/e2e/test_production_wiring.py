@@ -167,20 +167,6 @@ def test_the_implement_commit_carries_a_plan_hash_trailer_review_agrees_with(
     assert f"\n## plan_hash\n{expected}\n" in brief, brief
 
 
-def test_this_module_runs_in_the_default_suite_unmarked(request):
-    """Spec "Suite placement": this test costs nothing and must keep running by
-    default. Sibling 34d3388b registers the `e2e` marker and adds
-    `-m "not e2e"` to addopts; when it lands, nothing in THIS module may carry
-    that marker, or the production wiring stops being checked on every run.
-
-    Asserted against the collected node's markers rather than the file's text:
-    a text scan would trip over its own assertion strings, and a marker applied
-    from a conftest would not appear in this file at all.
-    """
-    assert {mark.name for mark in request.node.own_markers} == set()
-    assert {mark.name for mark in request.node.parent.own_markers} == set()
-
-
 def test_the_engine_authored_the_docs_commit_before_the_coder_ran(
     project, completed_run, worktree
 ):

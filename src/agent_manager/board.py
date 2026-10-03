@@ -30,6 +30,7 @@ Naming, slugs, branches and ref matching are `dag.py`'s job, not this module's.
 import json
 import subprocess
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -135,7 +136,7 @@ def comment_list_argv(card_id: str) -> list[str]:
 
 
 def _run(
-    argv: list[str], repo_dir: Path | None, *, input: str | None = None
+    argv: list[str], repo_dir: Path | None, input: str | None = None
 ) -> "subprocess.CompletedProcess[str]":
     """Run one `brd` argv list, returning the completed process.
 
@@ -162,6 +163,22 @@ def _run(
         raise BoardError(detail, argv=argv, exit_code=completed.returncode)
 
     return completed
+
+
+run_brd: Callable[
+    [Sequence[str], Path | None, str | None], subprocess.CompletedProcess[str]
+] = _run
+"""The seam every public function runs `brd` through: `run_brd(argv, repo_dir, stdin)`.
+
+Mirrors `GitRunner`/`run_git` in `steps/worktree.py` and
+`CommandRunner`/`run_command` in `steps/verify.py`, but as a module global
+rather than a parameter, so no public signature changes. Called positionally
+-- `stdin` is the comment body for `comment_add` and `None` everywhere else --
+and looked up at call time, so `monkeypatch.setattr(board, "run_brd", fake)`
+takes effect. Whatever it returns still goes through `_decode` and
+`_validated`, so a replacement's malformed envelope fails exactly as real brd's
+would. Defaults to `_run`, which spawns the real binary.
+"""
 
 
 def _decode(stdout: str, *, argv: list[str], exit_code: int) -> object:
@@ -236,7 +253,7 @@ def show(card_id: str, *, repo_dir: Path | None = None) -> models.Card:
     the engine caches the card at run start (design §7 line 287).
     """
     argv = show_argv(card_id)
-    completed = _run(argv, repo_dir)
+    completed = run_brd(argv, repo_dir, None)
     data = _decode(
         completed.stdout, argv=argv, exit_code=completed.returncode
     )
@@ -251,7 +268,7 @@ def tree(card_id: str, *, repo_dir: Path | None = None) -> models.CardNode:
     come from brd -- nothing is re-sorted or re-parented here.
     """
     argv = tree_argv(card_id)
-    completed = _run(argv, repo_dir)
+    completed = run_brd(argv, repo_dir, None)
     data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
     if not isinstance(data, list) or len(data) != 1:
         found = len(data) if isinstance(data, list) else type(data).__name__
@@ -272,7 +289,7 @@ def roots(*, repo_dir: Path | None = None) -> list[models.CardNode]:
     re-sorted or re-parented here.
     """
     argv = roots_argv()
-    completed = _run(argv, repo_dir)
+    completed = run_brd(argv, repo_dir, None)
     data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
     if not isinstance(data, list):
         raise BoardError(
@@ -306,7 +323,7 @@ def set_status(
     """
     argv = set_status_argv(card_id, status)
     with write_lock(repo_dir):
-        completed = _run(argv, repo_dir)
+        completed = run_brd(argv, repo_dir, None)
         data = _decode(
             completed.stdout, argv=argv, exit_code=completed.returncode
         )
@@ -330,7 +347,7 @@ def comment_add(
     failures -- an unknown card, an empty body -- surface as `BoardError`.
     """
     argv = comment_add_argv(card_id, author)
-    completed = _run(argv, repo_dir, input=body)
+    completed = run_brd(argv, repo_dir, body)
     data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
     if not isinstance(data, dict) or not isinstance(data.get("id"), str):
         raise BoardError(
@@ -353,7 +370,7 @@ def comment_list(
     list; an unknown card surfaces brd's `EntityNotFoundError` as `BoardError`.
     """
     argv = comment_list_argv(card_id)
-    completed = _run(argv, repo_dir)
+    completed = run_brd(argv, repo_dir, None)
     data = _decode(completed.stdout, argv=argv, exit_code=completed.returncode)
     if not isinstance(data, list):
         raise BoardError(

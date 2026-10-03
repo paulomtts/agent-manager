@@ -9,20 +9,15 @@ parts (argv construction, envelope decoding) that need no board at all.
 import dataclasses
 import inspect
 import json
-import shutil
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 from lockhelpers import _holder, _probe, _reap
 
 from agent_manager import board, census, locks, models
-
-requires_brd = pytest.mark.skipif(
-    shutil.which("brd") is None,
-    reason="the brd CLI must be installed for the board adapter's steps-tier tests",
-)
 
 
 def test_show_argv_is_a_list_of_plain_arguments():
@@ -278,7 +273,7 @@ def _brd_json(root: Path, *args: str) -> object:
     return json.loads(completed.stdout)["data"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_reads_a_card_from_a_real_board(temp_board):
     milestone = _add_card(temp_board, "Milestone 1")
     story = _add_card(temp_board, "Naming and the brd board adapter", milestone)
@@ -293,14 +288,14 @@ def test_show_reads_a_card_from_a_real_board(temp_board):
     assert card.parent_id == story
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_reports_a_top_level_card_with_no_parent(temp_board):
     milestone = _add_card(temp_board, "Milestone 1")
     card = board.show(milestone, repo_dir=temp_board)
     assert card.parent_id is None
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_of_a_nonexistent_card_raises_board_error_with_brds_message(temp_board):
     with pytest.raises(board.BoardError) as excinfo:
         board.show("no-such-card", repo_dir=temp_board)
@@ -310,7 +305,7 @@ def test_show_of_a_nonexistent_card_raises_board_error_with_brds_message(temp_bo
     assert excinfo.value.argv == ["brd", "show", "no-such-card"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
     # No `.brd` marker anywhere above: brd answers with an ok:false
     # ProjectNotFoundError envelope and exits 1. That must surface as this
@@ -324,7 +319,7 @@ def test_show_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
     assert excinfo.value.exit_code == 1
 
 
-@requires_brd
+@pytest.mark.brd
 def test_tree_returns_the_root_node_not_a_list(temp_board):
     # brd's build_tree always returns list[dict]; a bare id just makes it a
     # singleton. Callers want the node.
@@ -335,7 +330,7 @@ def test_tree_returns_the_root_node_not_a_list(temp_board):
     assert node.title == "Milestone 1"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_tree_preserves_milestone_story_subtask_nesting(temp_board):
     milestone = _add_card(temp_board, "Milestone 1")
     story = _add_card(temp_board, "Naming and the brd board adapter", milestone)
@@ -351,7 +346,7 @@ def test_tree_preserves_milestone_story_subtask_nesting(temp_board):
     assert story_node.children[1].children == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_tree_rooted_at_a_leaf_has_no_children(temp_board):
     milestone = _add_card(temp_board, "Milestone 1")
     subtask = _add_card(temp_board, "Add the brd board adapter", milestone)
@@ -360,7 +355,7 @@ def test_tree_rooted_at_a_leaf_has_no_children(temp_board):
     assert node.children == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_tree_does_not_re_sort_or_re_parent_what_brd_returned(temp_board):
     # Ordering and depth are brd's. Compare against brd's own raw JSON.
     milestone = _add_card(temp_board, "Milestone 1")
@@ -413,7 +408,7 @@ def _without_volatile(nodes: list[dict]) -> list[dict]:
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_moves_the_status_and_a_later_show_sees_it(temp_board):
     subtask = _add_card(temp_board, "Add the brd board adapter")
 
@@ -424,7 +419,7 @@ def test_set_status_moves_the_status_and_a_later_show_sees_it(temp_board):
     assert board.show(subtask, repo_dir=temp_board).status == "in_progress"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_is_idempotent(temp_board):
     # Design §9 line 376. Resume discards in-flight attempts and re-runs the
     # whole phase, so mark_in_progress/mark_done run twice on the same card; a
@@ -440,7 +435,7 @@ def test_set_status_is_idempotent(temp_board):
     assert board.show(subtask, repo_dir=temp_board).status == "done"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_round_trips_through_the_model_types(temp_board):
     story = _add_card(temp_board, "Naming and the brd board adapter")
     subtask = _add_card(temp_board, "Add the brd board adapter", story)
@@ -455,7 +450,7 @@ def test_set_status_round_trips_through_the_model_types(temp_board):
     assert read_back.description == written.description
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_of_a_nonexistent_card_raises_board_error(temp_board):
     with pytest.raises(board.BoardError) as excinfo:
         board.set_status("no-such-card", "done", repo_dir=temp_board)
@@ -470,7 +465,7 @@ def test_set_status_of_a_nonexistent_card_raises_board_error(temp_board):
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_blocked_propagates_brds_own_rejection(temp_board):
     # brd derives `blocked` and refuses to store it. board.py special-cases
     # nothing: the ok:false envelope becomes a BoardError like any other.
@@ -492,7 +487,7 @@ def test_write_lock_is_reentrant():
         board.WRITE_LOCK.release()
 
 
-@requires_brd
+@pytest.mark.brd
 def test_set_status_waits_for_the_board_write_lock(temp_board):
     subtask = _add_card(temp_board, "Serialize board writes")
     outcome: dict[str, object] = {}
@@ -520,7 +515,7 @@ def test_set_status_waits_for_the_board_write_lock(temp_board):
     assert _brd_json(temp_board, "show", subtask)["status"] == "in_progress"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_reads_do_not_wait_for_the_board_write_lock(temp_board):
     subtask = _add_card(temp_board, "Serialize board writes")
     outcome: dict[str, object] = {}
@@ -541,7 +536,7 @@ def test_reads_do_not_wait_for_the_board_write_lock(temp_board):
     assert [node.id for node in outcome["roots"]] == [subtask]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_lone_set_status_refuses_while_another_process_holds_the_board_lock(
     temp_board, monkeypatch
 ):
@@ -572,7 +567,8 @@ def _stress_status(writer: int, write: int) -> str:
     return _STRESS_STATUSES[(writer + write) % len(_STRESS_STATUSES)]
 
 
-@requires_brd
+@pytest.mark.soak
+@pytest.mark.brd
 def test_brd_update_survives_concurrent_writers(temp_board):
     # Main spec §17 "brd concurrency" / parallel-stories P3: this deliberately
     # bypasses board.py and WRITE_LOCK, calling `brd update` straight from 8
@@ -620,7 +616,7 @@ def test_brd_update_survives_concurrent_writers(temp_board):
         assert _brd_json(temp_board, "show", card_id)["status"] == expected
 
 
-@requires_brd
+@pytest.mark.brd
 def test_nothing_but_status_is_ever_written_to_the_board(temp_board, tmp_path):
     # Decision D5: the board receives status transitions and nothing else. No
     # run, phase or attempt artefact may appear on it.
@@ -672,7 +668,7 @@ def _raw_by_id(nodes: list[dict], card_id: str) -> dict:
     raise LookupError(card_id)
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_and_tree_carry_blocked_by_and_created_at_from_a_real_board(temp_board):
     milestone = _add_card(temp_board, "Milestone 1")
     first = _add_card(temp_board, "story a", milestone)
@@ -710,7 +706,7 @@ def test_show_and_tree_carry_blocked_by_and_created_at_from_a_real_board(temp_bo
     assert blocked_node.status == "blocked"
 
 
-@requires_brd
+@pytest.mark.brd
 def test_show_passes_status_and_blocked_by_through_after_the_blocker_is_done(temp_board):
     # Whatever brd decides a done blocker means, the adapter must not second-guess it.
     blocker = _add_card(temp_board, "blocker")
@@ -725,13 +721,13 @@ def test_show_passes_status_and_blocked_by_through_after_the_blocker_is_done(tem
     assert card.blocked_by == raw["blocked_by"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_roots_of_an_empty_board_is_an_empty_list(temp_board):
     # brd tree with no id on an empty board answers {"ok": true, "data": []}.
     assert board.roots(repo_dir=temp_board) == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_roots_returns_every_milestone_with_children_nested(temp_board):
     first = _add_card(temp_board, "Milestone 1")
     first_story = _add_card(temp_board, "story one", first)
@@ -762,7 +758,7 @@ def test_roots_returns_every_milestone_with_children_nested(temp_board):
         assert parsed.blocked_by == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_roots_carries_a_cross_milestone_blocked_by_edge(temp_board):
     first = _add_card(temp_board, "Milestone 1")
     blocker = _add_card(temp_board, "story a", first)
@@ -783,7 +779,7 @@ def test_roots_carries_a_cross_milestone_blocked_by_edge(temp_board):
     assert _node_by_id(nodes, blocker).blocked_by == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_census_from_a_real_board(temp_board):
     # Steps tier (design §14): board.roots -> find_milestone -> flatten_milestone
     # over real `brd tree` output. Every dependent card is created BEFORE its
@@ -842,7 +838,7 @@ def test_census_from_a_real_board(temp_board):
     assert "blocked" not in every_status
 
 
-@requires_brd
+@pytest.mark.brd
 def test_roots_outside_a_brd_project_raises_board_error(tmp_path, monkeypatch):
     # No `.brd` marker anywhere above: brd's ok:false ProjectNotFoundError must
     # surface as BoardError, not as an empty board.
@@ -890,7 +886,7 @@ def _fake_brd_answering(tmp_path: Path, data: object) -> Path:
     return fake_brd
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_add_returns_the_new_comments_id(temp_board):
     card = _add_card(temp_board, "Add board.comment_add")
 
@@ -903,7 +899,7 @@ def test_comment_add_returns_the_new_comments_id(temp_board):
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_add_passes_an_explicit_author(temp_board):
     card = _add_card(temp_board, "Add board.comment_add")
 
@@ -914,7 +910,7 @@ def test_comment_add_passes_an_explicit_author(temp_board):
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_add_on_an_unknown_card_raises_board_error(temp_board):
     with pytest.raises(board.BoardError) as excinfo:
         board.comment_add("no-such-card", "orphan", repo_dir=temp_board)
@@ -932,7 +928,7 @@ def test_comment_add_on_an_unknown_card_raises_board_error(temp_board):
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_add_of_a_blank_body_raises_brds_own_rejection(temp_board):
     # brd refuses whitespace-only bodies; board.py special-cases nothing.
     card = _add_card(temp_board, "Add board.comment_add")
@@ -983,13 +979,13 @@ def _hostile_body(marker: Path) -> str:
     return body
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_list_of_a_card_with_no_comments_is_empty(temp_board):
     card = _add_card(temp_board, "Add board.comment_list")
     assert board.comment_list(card, repo_dir=temp_board) == []
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_list_returns_comments_oldest_first_with_their_authors(temp_board):
     card = _add_card(temp_board, "Add board.comment_list")
     first = board.comment_add(card, "first", repo_dir=temp_board)
@@ -1009,7 +1005,7 @@ def test_comment_list_returns_comments_oldest_first_with_their_authors(temp_boar
     assert [comment.id for comment in comments] == [c["id"] for c in raw]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_a_long_hostile_body_round_trips_exactly_through_stdin(temp_board, tmp_path):
     marker = tmp_path / "pwned"
     body = _hostile_body(marker)
@@ -1024,7 +1020,7 @@ def test_a_long_hostile_body_round_trips_exactly_through_stdin(temp_board, tmp_p
     assert not marker.exists()
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_list_on_an_unknown_card_raises_board_error(temp_board):
     with pytest.raises(board.BoardError) as excinfo:
         board.comment_list("no-such-card", repo_dir=temp_board)
@@ -1034,7 +1030,7 @@ def test_comment_list_on_an_unknown_card_raises_board_error(temp_board):
     assert excinfo.value.argv == ["brd", "comment", "list", "no-such-card"]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_list_includes_comments_am_did_not_write(temp_board):
     # A human's comment, written with brd directly, is listed in brd's order
     # with its real author -- the later outbox flush scans this list.
@@ -1051,7 +1047,7 @@ def test_comment_list_includes_comments_am_did_not_write(temp_board):
     assert listed[0].id == mine
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_add_does_not_deduplicate(temp_board):
     # Idempotence is the outbox's job, not this primitive's.
     card = _add_card(temp_board, "Add board.comment_add")
@@ -1065,7 +1061,7 @@ def test_comment_add_does_not_deduplicate(temp_board):
     ]
 
 
-@requires_brd
+@pytest.mark.brd
 def test_comment_list_is_scoped_to_one_card(temp_board):
     one = _add_card(temp_board, "card one")
     two = _add_card(temp_board, "card two")
@@ -1177,3 +1173,168 @@ def test_board_comment_is_a_frozen_plain_dataclass():
     ]
     with pytest.raises(dataclasses.FrozenInstanceError):
         comment.body = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("call", "argv", "stdin"),
+    [
+        (lambda d: board.show("c1", repo_dir=d), board.show_argv("c1"), None),
+        (lambda d: board.tree("c1", repo_dir=d), board.tree_argv("c1"), None),
+        (lambda d: board.roots(repo_dir=d), board.roots_argv(), None),
+        (
+            lambda d: board.set_status("c1", "done", repo_dir=d),
+            board.set_status_argv("c1", "done"),
+            None,
+        ),
+        (
+            lambda d: board.comment_add("c1", "hello", repo_dir=d),
+            board.comment_add_argv("c1", "am"),
+            "hello",
+        ),
+        (
+            lambda d: board.comment_list("c1", repo_dir=d),
+            board.comment_list_argv("c1"),
+            None,
+        ),
+    ],
+    ids=["show", "tree", "roots", "set_status", "comment_add", "comment_list"],
+)
+def test_every_public_function_runs_brd_through_the_run_brd_seam(
+    call, argv, stdin, tmp_path, monkeypatch
+):
+    # Unit tier: the seam is replaced after import, so this only passes if each
+    # public function looks `run_brd` up at call time and calls it positionally
+    # as (argv, repo_dir, stdin). The fake's `ok: false` envelope must still go
+    # through `_decode`, surfacing as a `BoardError` carrying brd's error type.
+    calls: list[tuple[object, ...]] = []
+
+    def fake(*args, **kwargs):
+        assert kwargs == {}
+        calls.append(args)
+        envelope = {"ok": False, "error": {"type": "FakeError", "message": "faked"}}
+        return subprocess.CompletedProcess(list(args[0]), 1, json.dumps(envelope), "")
+
+    monkeypatch.setattr(board, "run_brd", fake)
+
+    with pytest.raises(board.BoardError) as excinfo:
+        call(tmp_path)
+
+    assert calls == [(argv, tmp_path, stdin)]
+    assert excinfo.value.error_type == "FakeError"
+    assert excinfo.value.message == "faked"
+
+
+_VOLATILE_KEYS = frozenset({"id", "created_at", "updated_at"})
+"""Keys whose string values brd may generate (uuid4s, now() timestamps)."""
+
+
+def _assert_same_shape(
+    fake: object, real: object, where: str, seeded: frozenset[str]
+) -> None:
+    """FakeBoard's JSON matches real brd's: same key sets, value types, list
+    lengths and order at every level, and equal values everywhere. The one
+    exception is an id or timestamp that each side generated on its own (one
+    that is not in `seeded`). That value only has to be a string in the same
+    format as real brd's: the same length, and for a timestamp the same UTC
+    offset."""
+    assert type(fake) is type(real), (
+        f"{where}: fake {type(fake).__name__} != real {type(real).__name__}"
+    )
+    if isinstance(real, dict):
+        assert set(fake) == set(real), f"{where}: keys {sorted(fake)} != {sorted(real)}"
+        for key, real_value in real.items():
+            path = f"{where}.{key}"
+            if key in _VOLATILE_KEYS and isinstance(real_value, str) and (
+                real_value not in seeded
+            ):
+                fake_value = fake[key]
+                assert isinstance(fake_value, str), f"{path}: {fake_value!r} is not a string"
+                assert len(fake_value) == len(real_value), (
+                    f"{path}: fake {fake_value!r} is not formatted like real {real_value!r}"
+                )
+                if key != "id":
+                    assert (
+                        datetime.fromisoformat(fake_value).utcoffset()
+                        == datetime.fromisoformat(real_value).utcoffset()
+                    ), f"{path}: fake {fake_value!r} offset != real {real_value!r}"
+            else:
+                _assert_same_shape(fake[key], real_value, path, seeded)
+    elif isinstance(real, list):
+        assert len(fake) == len(real), f"{where}: {len(fake)} items != {len(real)}"
+        for index, (fake_item, real_item) in enumerate(zip(fake, real)):
+            _assert_same_shape(fake_item, real_item, f"{where}[{index}]", seeded)
+    else:
+        assert fake == real, f"{where}: fake {fake!r} != real {real!r}"
+
+
+@pytest.mark.brd
+def test_fake_board_answers_every_argv_like_real_brd_for_the_same_card_tree(
+    temp_board, fake_board
+):
+    # Test-tier V3: the conftest FakeBoard is the unit tier's brd, so it is
+    # pinned against the real binary -- the same "conftest twin" idea as
+    # tests/e2e/test_fake_claude.py:39-50 -- and cannot drift silently.
+    parent = _add_card(temp_board, "Milestone 1")
+    child = _add_card(temp_board, "Add FakeBoard", parent)
+    sibling = _add_card(temp_board, "Pin it against real brd", parent)
+    _brd_json(temp_board, "block", sibling, "--by", child)
+
+    # Seed the fake from the real board's own ids and fields, oldest first.
+    # Every value copied here is identical on both sides, so the comparison
+    # below holds it to equality rather than to format alone.
+    seeded: set[str] = set()
+    for card_id in (parent, child, sibling):
+        raw = _brd_json(temp_board, "show", card_id)
+        seeded |= {raw["id"], raw["created_at"], raw["updated_at"]}
+        fake_board.add_card(
+            raw["title"],
+            card_id=raw["id"],
+            parent_id=raw["parent_id"],
+            description=raw["description"],
+            blocked_by=raw["blocked_by"],
+            created_at=raw["created_at"],
+            updated_at=raw["updated_at"],
+        )
+
+    exchanges: list[tuple[list[str], str | None]] = [
+        # Writes first, on both boards, so the reads below see them.
+        (board.set_status_argv(child, "in_progress"), None),
+        (board.comment_add_argv(child, "am"), "first outcome\nwith a second line\n"),
+        # Reads: show (with the comment embedded), tree, roots, comment list.
+        (board.show_argv(parent), None),
+        (board.show_argv(child), None),
+        (board.show_argv(sibling), None),
+        (board.tree_argv(parent), None),
+        (board.tree_argv(sibling), None),
+        (board.roots_argv(), None),
+        (board.comment_list_argv(child), None),
+        (board.comment_list_argv(parent), None),
+        # Error paths: brd's error type and message, verbatim, with exit 1.
+        (board.show_argv("no-such-card"), None),
+        (board.tree_argv("no-such-card"), None),
+        (board.set_status_argv("no-such-card", "done"), None),
+        (board.set_status_argv(child, "blocked"), None),
+        (board.comment_add_argv("no-such-card", "am"), "orphan"),
+        (board.comment_add_argv(child, "am"), "  \n\t"),
+        (board.comment_list_argv("no-such-card"), None),
+    ]
+
+    for argv, stdin in exchanges:
+        where = " ".join(argv)
+        real = subprocess.run(
+            argv, cwd=temp_board, capture_output=True, text=True, input=stdin
+        )
+        fake = fake_board(argv, temp_board, stdin)
+        assert fake.returncode == real.returncode, (
+            f"{where}: fake exit {fake.returncode} != real {real.returncode} "
+            f"(real stdout {real.stdout!r}, stderr {real.stderr!r})"
+        )
+        _assert_same_shape(
+            json.loads(fake.stdout), json.loads(real.stdout), where, frozenset(seeded)
+        )
+
+    # The writes reached the fake as recorded entries, in order.
+    assert fake_board.writes == [
+        ("set_status", child, "in_progress"),
+        ("comment_add", child, "first outcome\nwith a second line\n", "am"),
+    ]

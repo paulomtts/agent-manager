@@ -18,7 +18,6 @@ pushes.
 """
 
 import json
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -37,10 +36,7 @@ from agent_manager.steps.integrate import merge_tip
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.workflow import integrate as integrate_workflow
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the integrate workflow's engine-tier tests",
-)
+pytestmark = pytest.mark.git
 
 RUN_ID = "run-2026-09-25-integrate"
 STORY_ID = "integrate"

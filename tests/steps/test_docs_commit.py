@@ -7,7 +7,6 @@ is faked only where a test must observe argv that a real run would also produce.
 """
 
 import hashlib
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,11 +14,6 @@ from pathlib import Path
 import pytest
 
 from agent_manager.steps import docs_commit, reducers
-
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the docs-commit step's steps-tier tests",
-)
 
 SPEC_RELATIVE = "docs/superpowers/specs/task-commit-the-spec-and-ba15da20.md"
 PLAN_RELATIVE = "docs/superpowers/plans/task-commit-the-spec-and-ba15da20.md"
@@ -129,7 +123,6 @@ def _recorder(calls: list[list[str]], inner=None):
     return runner
 
 
-@requires_git
 def test_the_step_makes_one_commit_whose_subject_and_trailer_are_exact(repo: Path) -> None:
     _write_documents(repo)
     before = _commit_count(repo)
@@ -142,7 +135,6 @@ def test_the_step_makes_one_commit_whose_subject_and_trailer_are_exact(repo: Pat
     assert message.splitlines()[-1] == f"Plan-Hash: {result['plan_hash']}"
 
 
-@requires_git
 def test_the_returned_hash_is_the_hash_of_the_plan_file_on_disk(repo: Path) -> None:
     _write_documents(repo)
 
@@ -153,7 +145,6 @@ def test_the_returned_hash_is_the_hash_of_the_plan_file_on_disk(repo: Path) -> N
     assert reducers.is_plan_hash(result["plan_hash"])
 
 
-@requires_git
 def test_only_the_two_declared_documents_are_committed(repo: Path) -> None:
     """A stray untracked file and an unrelated modified tracked file both
     survive uncommitted: the step names its two pathspecs and never sweeps."""
@@ -170,7 +161,6 @@ def test_only_the_two_declared_documents_are_committed(repo: Path) -> None:
     assert "README.md" in porcelain
 
 
-@requires_git
 def test_an_unrelated_already_staged_file_is_not_swept_into_the_docs_commit(
     repo: Path,
 ) -> None:
@@ -187,7 +177,6 @@ def test_an_unrelated_already_staged_file_is_not_swept_into_the_docs_commit(
     assert "README.md" in _git(repo, "diff", "--cached", "--name-only")
 
 
-@requires_git
 def test_the_step_runs_no_forbidden_git_verb(repo: Path) -> None:
     """Design §9: this step may add and commit. Sweeping (`add -A`, `add .`) or
     destroying (`reset`, `clean`, `checkout -f`) or publishing (`push`) is how a
@@ -210,7 +199,6 @@ def test_the_step_runs_no_forbidden_git_verb(repo: Path) -> None:
             assert "-f" not in argv, argv
 
 
-@requires_git
 def test_a_second_call_commits_nothing_and_returns_the_same_hash(repo: Path) -> None:
     """Design §9 resume: re-running the phase after a kill is a no-op, and the
     commit count does not grow."""
@@ -224,7 +212,6 @@ def test_a_second_call_commits_nothing_and_returns_the_same_hash(repo: Path) -> 
     assert _commit_count(repo) == after_first
 
 
-@requires_git
 def test_a_plan_edited_between_runs_gets_its_own_commit_with_the_new_hash(
     repo: Path,
 ) -> None:
@@ -243,7 +230,6 @@ def test_a_plan_edited_between_runs_gets_its_own_commit_with_the_new_hash(
     assert _message(repo).splitlines()[-1] == f"Plan-Hash: {second['plan_hash']}"
 
 
-@requires_git
 def test_documents_committed_without_a_trailer_raise_instead_of_lying(
     repo: Path,
 ) -> None:
@@ -270,7 +256,6 @@ def _exploding_runner(argv: list[str]) -> str:
     raise AssertionError(f"pre-flight must run no git command, but ran: {argv!r}")
 
 
-@requires_git
 @pytest.mark.parametrize(
     ("overrides", "needle"),
     [
@@ -320,7 +305,6 @@ def test_a_bad_argument_raises_value_error_before_any_git_runs(
     assert needle in str(caught.value)
 
 
-@requires_git
 def test_a_document_path_resolving_outside_the_worktree_is_refused(
     repo: Path, tmp_path: Path
 ) -> None:
@@ -343,7 +327,6 @@ def test_a_document_path_resolving_outside_the_worktree_is_refused(
     assert str(outside) in message
 
 
-@requires_git
 def test_a_worktree_reached_through_a_symlink_still_works(
     repo: Path, tmp_path: Path
 ) -> None:

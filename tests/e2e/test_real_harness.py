@@ -133,7 +133,13 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 ):
     """The whole deliverable: a real `claude -p` takes the toy subtask from
     `todo` to `done`, leaving a branch whose every commit carries one and the
-    same `Plan-Hash` trailer and whose every result file validates."""
+    same `Plan-Hash` trailer and whose every result file validates.
+
+    justification: verifies the harness's prompt/result-file contract against
+    the real `claude -p` CLI's actual behavior (argv, exit codes, tool
+    permissions, result-file handshake) -- a fake-claude stand-in's
+    deterministic replies cannot exercise whether the real model actually
+    complies with that contract."""
     assert completed_run["status"] == "done", (
         completed_run["failed_phase"],
         completed_run["detail"],
@@ -180,6 +186,14 @@ def test_the_real_claude_drives_the_toy_card_to_done_on_one_tagged_branch(
 
 def test_the_run_went_through_the_pygents_walk(project, completed_run, checkpoint_rows):
     """Non-vacuity: the pygents walk is the only one that checkpoints (its
-    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra."""
+    BEFORE_TURN hook). Reuses the module's one paid run; costs nothing extra.
+
+    justification: none -- no real-claude-only behavior. The `e2e_fake` twin
+    `test_production_wiring.py::test_the_run_went_through_the_pygents_walk`
+    makes the same `checkpoint_rows > 0` assertion on the same no-injection
+    `cli.run_card` path, and the checkpoint is written by the engine's
+    BEFORE_TURN hook, not by anything the model does. Kept because shrinking
+    the e2e tier below 5 is out of scope (test-tier spec section 8); flagged
+    on brd card d4542989 instead of given an invented reason."""
     rows = checkpoint_rows(project, completed_run["run_id"])
     assert rows > 0, "the run wrote no checkpoint: it never reached the pygents walk"

@@ -83,7 +83,7 @@ def test_a_timeout_kills_the_child_and_returns_a_value(tmp_path):
             "import time; print('before the sleep', flush=True); time.sleep(30)",
         ],
         cwd=tmp_path,
-        timeout=0.5,
+        timeout=0.2,
         stdout_path=log,
     )
     assert outcome.timed_out is True
@@ -95,6 +95,7 @@ def test_a_timeout_kills_the_child_and_returns_a_value(tmp_path):
     assert outcome.duration < 20.0
 
 
+@pytest.mark.soak
 def test_a_timeout_kills_the_processes_the_child_started(tmp_path):
     # A harness is itself a process launcher. Killing only the direct child
     # leaves its workers running against the worktree the run is about to
@@ -343,7 +344,7 @@ def test_on_spawn_is_called_once_with_the_live_process(tmp_path):
         seen.append((process, process.poll()))
 
     outcome = launcher.run_direct(
-        [sys.executable, "-c", "import time; time.sleep(0.3); print('done')"],
+        [sys.executable, "-c", "import time; time.sleep(0.1); print('done')"],
         cwd=tmp_path,
         timeout=30.0,
         stdout_path=tmp_path / "stdout.log",
@@ -397,3 +398,18 @@ def test_kill_tree_is_public_and_the_old_name_is_an_alias():
     launcher.kill_tree(fake)
     assert fake.killed is True
     assert fake.waited is True
+
+
+def _marks(test_function) -> set[str]:
+    return {mark.name for mark in getattr(test_function, "pytestmark", [])}
+
+
+def test_only_the_grandchild_kill_launcher_test_is_soak():
+    # Test-tier spec V9: the grandchild-kill probe is the one launcher test that
+    # belongs in soak. The other two slow-looking tests were shrunk to fit the
+    # unit budget so they keep running on every `uv run pytest`; a soak marker
+    # creeping back onto them would deselect them silently. Marks are read off
+    # the functions because a mark there deselects them but not this guard.
+    assert _marks(test_a_timeout_kills_the_processes_the_child_started) == {"soak"}
+    assert _marks(test_a_timeout_kills_the_child_and_returns_a_value) == set()
+    assert _marks(test_on_spawn_is_called_once_with_the_live_process) == set()

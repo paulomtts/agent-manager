@@ -16,7 +16,6 @@ specification (design §14, Pure-functions tier).
 import inspect
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,11 +31,6 @@ from agent_manager.steps.verify import (
     command_diagnostic,
     last_line,
     plain_text,
-)
-
-requires_git = pytest.mark.skipif(
-    shutil.which("git") is None,
-    reason="the git CLI must be installed for the verify step's read-only test",
 )
 
 
@@ -158,7 +152,6 @@ def test_an_empty_command_list_passes_with_nothing_verified(tmp_path: Path):
     }
 
 
-@requires_git
 def test_run_suite_leaves_the_worktree_and_the_repo_untouched(tmp_path: Path):
     # Design §9: "`verify.run_suite` is read-only."
     repo = tmp_path / "repo"

@@ -10,7 +10,6 @@ real child processes and every test in a module reads the same finished run.
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import BINARY_TIERS, missing_binary
 from typer.testing import CliRunner
 
 from agent_manager import board, census, cli, dag, models, paths, store
@@ -142,10 +142,16 @@ def module_monkeypatch():
 
 @pytest.fixture(scope="module")
 def toolchain() -> None:
-    """Skip the whole module when the real CLIs this tier needs are missing."""
-    for tool in ("git", "brd"):
-        if shutil.which(tool) is None:
-            pytest.skip(f"the {tool} CLI must be installed for the e2e tier")
+    """Skip the whole module when the real CLIs this tier needs are missing.
+
+    A fixture, not a marker: these items carry neither `git` nor `brd` (adding
+    one would stop the directory auto-mark and pull them into the default run),
+    so the root conftest's skip hook never fires for them. The check itself is
+    the root conftest's `missing_binary`, the suite's one binary-presence check.
+    """
+    missing = missing_binary(BINARY_TIERS)
+    if missing is not None:
+        pytest.skip(f"the {missing} CLI must be installed for the e2e tier")
 
 
 def _init_project(root: Path, board_name: str) -> Path:

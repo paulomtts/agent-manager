@@ -1,12 +1,16 @@
-"""Default-suite e2e tier: `orchestrate.run_board` through the production wiring (card baef4f94).
+"""`orchestrate.run_board` through the production wiring (card baef4f94).
 
 Board-run spec §3.8 and main spec §14. `orchestrate.run_board` is called
 directly (`am run --board` is sibling d78b3118's) with no `runner_factory`
 and no `driver`, so every milestone reaches `_run_milestone_async`,
 `supervise`, `cli.drive_subtask_async`, `cli.default_runner_factory`, the
 real `ClaudeAdapter` and `launcher.run_direct`. The only stand-in is the fake
-`claude` first on `PATH` (`fake_claude_bin`). Unmarked on purpose, like
-`test_parallel_milestone.py`: the `e2e` marker is the real-money tier.
+`claude` first on `PATH` (`fake_claude_bin`). The `e2e` marker is the
+real-money tier; everything here is `e2e_fake` instead (exempted from the
+directory auto-mark in `tests/conftest.py`, same as `test_fake_claude.py`),
+except `test_this_module_runs_in_the_default_suite_unmarked` below, which
+stays in the default suite on purpose so board wiring is checked on every
+`uv run pytest`.
 
 Every milestone here has one story holding one subtask, so a milestone's lane
 holds one slot of the board's shared semaphore for its whole run. Each test
@@ -178,6 +182,7 @@ def test_this_module_runs_in_the_default_suite_unmarked(request):
     assert {mark.name for mark in request.node.parent.own_markers} == set()
 
 
+@pytest.mark.e2e_fake
 def test_two_independent_milestones_both_finish(board_root):
     """Spec test 1."""
     root = board_root
@@ -205,6 +210,7 @@ def test_two_independent_milestones_both_finish(board_root):
     assert _git(root, "rev-parse", "main").strip() == main_before
 
 
+@pytest.mark.e2e_fake
 def test_a_blocked_by_pair_runs_in_order(board_root):
     """Spec test 2: two slots are free, so only the dependency can order them."""
     root = board_root
@@ -227,6 +233,7 @@ def test_a_blocked_by_pair_runs_in_order(board_root):
     assert a_end <= b_start, (a_end, b_start)
 
 
+@pytest.mark.e2e_fake
 def test_an_escalated_milestone_blocks_its_dependent_and_not_its_sibling(board_root):
     """Spec test 3: A's review fails through the production gate."""
     root = board_root
@@ -265,6 +272,7 @@ def test_an_escalated_milestone_blocks_its_dependent_and_not_its_sibling(board_r
     assert board.show(b["subtask"], repo_dir=root).status == b_status_before
 
 
+@pytest.mark.e2e_fake
 def test_one_shared_slot_runs_two_independent_milestones_one_after_the_other(board_root):
     """Spec test 4, cap 1: one semaphore across both milestones, so their lanes never overlap."""
     root = board_root
@@ -280,6 +288,7 @@ def test_one_shared_slot_runs_two_independent_milestones_one_after_the_other(boa
     assert x_end <= y_start or y_end <= x_start, (x_start, x_end, y_start, y_end)
 
 
+@pytest.mark.e2e_fake
 def test_two_shared_slots_let_two_milestones_meet_inside_implement(board_root, rendezvous):
     """Spec test 4, cap 2: the rendezvous at count 2 completes only if both
     milestones' implements were running at the same time."""
@@ -294,6 +303,7 @@ def test_two_shared_slots_let_two_milestones_meet_inside_implement(board_root, r
     assert len(rendezvous.markers()) == 2
 
 
+@pytest.mark.e2e_fake
 def test_a_claim_on_a_later_milestone_refuses_the_whole_board_up_front(board_root):
     """Spec test 5: the single upfront `refuse_claimed` runs before any milestone starts."""
     root = board_root
@@ -318,6 +328,7 @@ def test_a_claim_on_a_later_milestone_refuses_the_whole_board_up_front(board_roo
     } == statuses_before
 
 
+@pytest.mark.e2e_fake
 def test_no_rendezvous_is_left_armed_for_later_tests():
     """Kept last in the module: the rendezvous is armed through the
     function-scoped `monkeypatch`, so it must be gone once a test ends."""
