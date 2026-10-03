@@ -42,6 +42,49 @@ def test_plan_hash_changes_when_one_byte_of_the_plan_changes() -> None:
     assert docs_commit.plan_hash(b"a") != docs_commit.plan_hash(b"b")
 
 
+TRAILER_DIGEST = "a1b2c3d4"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param("wip", "wip\n\nPlan-Hash: a1b2c3d4\n", id="subject-only"),
+        pytest.param(
+            "subject\n\nbody line one\nbody line two\n",
+            "subject\n\nbody line one\nbody line two\n\nPlan-Hash: a1b2c3d4\n",
+            id="subject-and-body",
+        ),
+        pytest.param(
+            "subject\n\nbody\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n",
+            "subject\n\nbody\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n"
+            "Plan-Hash: a1b2c3d4\n",
+            id="co-authored-block",
+        ),
+        pytest.param(
+            "subject\n\nbody\n\n\n\n",
+            "subject\n\nbody\n\nPlan-Hash: a1b2c3d4\n",
+            id="extra-trailing-newlines",
+        ),
+        pytest.param(
+            "subject\n\nNote this: the colon is mid-line prose\n",
+            "subject\n\nNote this: the colon is mid-line prose\n\nPlan-Hash: a1b2c3d4\n",
+            id="prose-with-a-colon",
+        ),
+        pytest.param(
+            "fix: the thing",
+            "fix: the thing\n\nPlan-Hash: a1b2c3d4\n",
+            id="subject-that-looks-like-a-trailer",
+        ),
+    ],
+)
+def test_trailer_rule(message: str, expected: str) -> None:
+    """Pure: (message, digest) -> message. A trailer block is the LAST paragraph
+    of a multi-paragraph message whose every line is `Token: value`; the new
+    trailer joins it. Anything else gets a blank line first. A lone subject is
+    never a trailer block, however much it looks like one."""
+    assert docs_commit.with_trailer(message, TRAILER_DIGEST) == expected
+
+
 @dataclass
 class FakeCard:
     """The one field the step reads off `models.Card`.

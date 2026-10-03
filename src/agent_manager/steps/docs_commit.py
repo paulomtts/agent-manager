@@ -13,6 +13,7 @@ shell string and nothing to quote.
 
 import hashlib
 import os
+import re
 from pathlib import Path
 
 from agent_manager.steps.worktree import GitError, GitRunner, run_git
@@ -45,6 +46,33 @@ TRAILER_PREFIX = "Plan-Hash: "
 The trailing space is part of it: `Plan-Hash:a1b2c3d4` is not a git trailer and
 would not be counted by anything downstream.
 """
+
+
+_TRAILER_LINE = re.compile(r"[A-Za-z0-9-]+: ")
+"""A git trailer line's shape: `Token: value`, matched at the line start."""
+
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
+"""A blank (or whitespace-only) line between two paragraphs of a message."""
+
+
+def with_trailer(message: str, digest: str) -> str:
+    """`message` with `Plan-Hash: <digest>` appended as a git trailer.
+
+    Pure. Trailing newlines are stripped first. If the message has more than
+    one paragraph and its last paragraph is a trailer block (every line
+    `Token: value`, e.g. `Co-Authored-By: ...`), the trailer joins that block;
+    otherwise it starts a new paragraph. The result ends with one newline, and
+    the trailer sits at column 0 of its own line so review's anchored
+    `^Plan-Hash: <hash>` grep counts it.
+    """
+    body = message.rstrip("\n")
+    paragraphs = _PARAGRAPH_BREAK.split(body)
+    last = paragraphs[-1].split("\n")
+    joins_block = len(paragraphs) > 1 and all(
+        _TRAILER_LINE.match(line) for line in last
+    )
+    separator = "\n" if joins_block else "\n\n"
+    return f"{body}{separator}{TRAILER_PREFIX}{digest}\n"
 
 
 class UntaggedDocumentsError(RuntimeError):
