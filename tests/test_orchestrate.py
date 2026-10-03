@@ -3841,6 +3841,79 @@ def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
 
 @pytest.mark.brd
 @pytest.mark.git
+def test_a_merged_root_story_with_one_escalated_blocker_is_never_driven(project, fake_bases):
+    """C is blocked by A and B. B finishes clean, then A escalates: C is never
+    driven, no base is built, and C and c1 stay `pending`, as a
+    single-blocker dependent of an escalated story does. A regression pin
+    (spec §5 I1): today's early return in `lane` and grafo's own gate after
+    the fix give the same outcome."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    b_returned = asyncio.Event()
+
+    async def after_b_returned(stop: StopSignal | None) -> None:
+        await _within(b_returned.wait(), "b1 to return")
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: after_b_returned},
+        returned={b1: b_returned},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert fake_bases.calls == []
+    assert (result["escalated"], result["story"], result["subtask"]) == (True, story_a, a1)
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+    assert (statuses[story_b], statuses[b1]) == ("done", "done")
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_merged_root_story_behind_an_edge_child_completes_instead_of_hanging(
+    project, fake_bases
+):
+    """Spec §1.1 through `supervise`: D is blocked by A, C by B and D. B
+    returns, then A after a wall-clock gap, so D is ready only after grafo
+    shrank its pool. The run completes and C is built and driven."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "D": 1, "C": 1},
+        blocked_by={"D": ["A"], "C": ["B", "D"]},
+    )
+    story_c, story_d = shape["stories"]["C"], shape["stories"]["D"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    b_returned = asyncio.Event()
+
+    async def after_b_returned_and_a_gap(stop: StopSignal | None) -> None:
+        await _within(b_returned.wait(), "b1 to return")
+        # The pool-shrink window is wall-clock, not ordering (spec §1.1): A
+        # must return after B's worker shrank grafo's pool.
+        await asyncio.sleep(0.05)
+
+    driver = GatedDriver(gates={a1: after_b_returned_and_a_gap}, returned={b1: b_returned})
+
+    result = _run_or_fail_if_it_hangs(
+        lambda: _run(project, shape["milestone"], driver, max_concurrent=2)
+    )
+
+    assert result["done"] is True, result
+    assert [call["story_id"] for call in fake_bases.calls] == [story_c]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("done", "done")
+    assert (statuses[story_d], statuses[d1]) == ("done", "done")
+
+
+@pytest.mark.brd
+@pytest.mark.git
 def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
 
