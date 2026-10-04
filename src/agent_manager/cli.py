@@ -2298,3 +2298,66 @@ def cancel(
 ) -> None:
     """Ask a running run to stop at its next phase boundary and close it for good."""
     _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
+
+
+def _reset_message(run_id: str) -> str:
+    """What `am reset` tells the operator after closing `run_id` (am-reset §3.5)."""
+    return (
+        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        " and a relaunch starts its cards from their first phase"
+    )
+
+
+def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
+    """Close a run nobody is driving by recording it `cancelled` (am-reset §3.2-3.3).
+
+    The run is loaded read-only, exactly as `resume_run` loads it. Then, as
+    `_resume_from_checkpoint` does up to its first write and no further:
+    `Store.open`, the run's own lease with no claims (a reset drives no card
+    and no branch), and one fenced `record_run` of `cancelled`. No checkpoint
+    row is written or deleted, and no other row is touched. The lease is
+    released and the store closed on every exit.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    store = Store.open(root, run.id)
+    try:
+        with run_lease(store):
+            store.record_run(run.model_copy(update={"status": "cancelled"}))
+    finally:
+        store.close()
+    return {
+        "run_id": run.id,
+        "previous_status": run.status,
+        "status": "cancelled",
+        "already_cancelled": False,
+        # af52db54 fills this in from the run's checkpoints.
+        "cards": [],
+        "message": _reset_message(run.id),
+    }
+
+
+@app.command("reset")
+def reset(
+    run_id: str = typer.Argument(
+        ..., metavar="RUN_ID", help="The run nobody is driving to close."
+    ),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Close a run nobody is driving: record it cancelled under its own lease.
+
+    A running run wants `am cancel` instead; a finished one needs nothing.
+    """
+    try:
+        payload = reset_run(run_id, repo_dir=repo_dir)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))

@@ -8574,3 +8574,164 @@ def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkey
     monkeypatch.setattr(sys, "stdout", buffer)
     cli._silence_stdout()
     assert sys.stdout is buffer
+
+
+# ── am reset (card 736d6728) ─────────────────────────────────────────────────
+#
+# `am reset RUN_ID` closes a run nobody is driving: read-only refusals, then
+# the run's own lease with no claims, one fenced `run_upsert` of `cancelled`,
+# and the lease released. Unit tier: the projection fixture and the store
+# only, no subprocess. `cards` stays `[]` here; af52db54 fills it in.
+
+RESET_KEYS = {
+    "run_id",
+    "previous_status",
+    "status",
+    "already_cancelled",
+    "cards",
+    "message",
+}
+
+RESET_MESSAGE = (
+    f"run {CONTROL_RUN_ID} is cancelled; `am resume {CONTROL_RUN_ID}` refuses it,"
+    " and a relaunch starts its cards from their first phase"
+)
+
+
+def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
+    return runner.invoke(cli.app, ["reset", run_id, "--repo-dir", str(root), *extra])
+
+
+def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_module.JournalLine]:
+    return store_module.Journal(run_id).read()
+
+
+def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return store_module.run_status(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _plant_parked_checkpoint(root: Path) -> None:
+    """One open `parked` checkpoint of card-1 under the run, as a paused walk leaves it."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+    try:
+        opened.save_checkpoint(
+            "card-1",
+            workflow=task_workflow.TASK.name,
+            digest=task_workflow.TASK.digest(),
+            reason="parked",
+            agent={
+                "current_turn": None,
+                "queue": [{"kwargs": {"phase": "plan", "loop": 0}}],
+            },
+            saved_at=CONTROL_NOW,
+        )
+    finally:
+        opened.close()
+
+
+def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
+    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+    try:
+        return opened.latest_open_checkpoint("card-1", task_workflow.TASK.name)
+    finally:
+        opened.close()
+
+
+@pytest.mark.parametrize(
+    "worktree_present", [True, False], ids=["worktree-present", "worktree-removed"]
+)
+def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
+    projection, worktree_present
+):
+    """Spec test 1 (store half; `cards`/`open_in` are af52db54's)."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection)
+    worktree = projection / ".claude" / "worktrees" / "m1" / "task-x"
+    if worktree_present:
+        worktree.mkdir(parents=True)
+    assert _open_checkpoint(projection) is not None
+    lines_before = _journal_lines()
+    checkpoints_before = _checkpoint_rows(projection)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == RESET_KEYS
+    assert data == {
+        "run_id": CONTROL_RUN_ID,
+        "previous_status": "stopped",
+        "status": "cancelled",
+        "already_cancelled": False,
+        "cards": [],
+        "message": RESET_MESSAGE,
+    }
+    assert _recorded_status(projection) == "cancelled"
+    lines_after = _journal_lines()
+    assert lines_after[: len(lines_before)] == lines_before
+    (added,) = lines_after[len(lines_before) :]
+    assert added.event == "run_upsert"
+    assert added.seq == lines_before[-1].seq + 1
+    first = next(line for line in lines_before if line.event == "run_upsert")
+    # The same write whether or not the worktree exists: only `status` moved.
+    assert added.payload == {**first.payload, "status": "cancelled"}
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _open_checkpoint(projection) is None
+    assert worktree.exists() is worktree_present
+    assert _lease(projection) is None
+    rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "cancelled"
+    finally:
+        rebuilt.close()
+
+
+def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
+    """Spec test 7: no "nothing to reset" refusal."""
+    _plant_run(projection, status="stopped")
+    assert _checkpoint_rows(projection) == []
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["cards"] == []
+    assert data["status"] == "cancelled"
+    assert _recorded_status(projection) == "cancelled"
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+@pytest.mark.parametrize("status", ["stopped", "escalated", "started"])
+def test_reset_closes_every_resettable_status_of_either_workflow(
+    projection, status, workflow
+):
+    """Review Focus 2: every status but `done`/`cancelled` resets, a
+    `started` run with no lease included, whatever the workflow."""
+    _plant_run(projection, status=status, workflow=workflow)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["previous_status"] == status
+    assert data["already_cancelled"] is False
+    assert _recorded_status(projection) == "cancelled"
+    assert _lease(projection) is None
+
+
+def test_reset_pretty_prints_an_indented_envelope(projection):
+    """Review Focus 1."""
+    _plant_run(projection, status="stopped")
+
+    result = _invoke_reset(projection, CONTROL_RUN_ID, "--pretty")
+
+    assert result.exit_code == 0, result.output
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "cancelled"
