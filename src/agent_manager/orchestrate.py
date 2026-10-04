@@ -2409,11 +2409,16 @@ def run_board(
     Refusals come first, in this order, and each leaves nothing behind. Bad
     arguments are `ValueError` before the board is read: `max_concurrent < 1`
     and a missing `base_branch`, as `run_milestone` refuses them. Then come the
-    open milestones: `board.roots()` leveled by `dag.board_levels`, so a done
-    milestone with nothing open under it drops out and a blocker cycle is
-    `DependencyCycleError`. Next, each milestone's prefix from
-    `branch_prefix_of` (`board_prefixes`: blank or shared is `ValueError`).
-    Last, one `cli.refuse_claimed` over every open milestone's
+    open milestones: `board.roots()`, read once, leveled by `dag.board_levels`,
+    so a done milestone with nothing open under it drops out and a blocker
+    cycle is `DependencyCycleError`. Next, each milestone's prefix from
+    `branch_prefix_of`, and each non-open blocker root's too (`board_prefixes`
+    with `roots=`: blank or shared is `ValueError`). Next, each open
+    milestone's base (`milestone_bases` over every root): its one open
+    blocker's `<prefix>-integrate`, or its one unlanded blocker's when that
+    branch exists locally (`_local_branch_exists`), else `base_branch`; two
+    such blockers is `MilestoneBlockersError`, before the claims check. Last,
+    one `cli.refuse_claimed` over every open milestone's
     `milestone_claims`, unioned in level order (`board_claims`): a key another
     live run holds is `ClaimedError` before any milestone starts, so there is
     no run row, run directory or lease for any of them. Each milestone's own
@@ -2422,8 +2427,8 @@ def run_board(
 
     Then one `asyncio.run` covers the whole board with one
     `asyncio.Semaphore(max_concurrent)` that every milestone's lanes share
-    (`_run_board_async`). A milestone runs once every open blocker finished
-    `done`. A milestone whose blocker did not finish `done` is never
+    (`_run_board_async`), each milestone on its own base. A milestone runs
+    once every open blocker finished `done`. A milestone whose blocker did not finish `done` is never
     dispatched and is reported `blocked`. A milestone that raises is reported
     `escalated` with `"<Type>: <msg>"` and never disturbs its siblings.
 
@@ -2445,9 +2450,11 @@ def run_board(
     if not base_branch:
         raise ValueError("a board run needs a base branch")
     root = runs.resolve_repo_dir(repo_dir)
-    levels = dag.board_levels(board.roots(repo_dir=root))
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
     milestones = [card for level in levels for card in level]
-    prefixes = board_prefixes(milestones, branch_prefix_of)
+    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
+    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
     levels_payload = [
         {"level": index, "milestones": [card.id for card in level]}
         for index, level in enumerate(levels)
@@ -2459,8 +2466,8 @@ def run_board(
         _run_board_async(
             milestones,
             prefixes=prefixes,
+            bases=bases,
             root=root,
-            base_branch=base_branch,
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
@@ -2482,8 +2489,8 @@ async def _run_board_async(
     milestones: Sequence[models.CardNode],
     *,
     prefixes: Mapping[str, str],
+    bases: Mapping[str, str],
     root: Path,
-    base_branch: str,
     commands: Sequence[str],
     allow_no_verification: bool,
     runner_factory: runs.RunnerFactory | None,
@@ -2494,7 +2501,10 @@ async def _run_board_async(
 ) -> list[dict[str, Any]]:
     """`run_board`'s one event loop: one entry per milestone, in `milestones` order.
 
-    The tree comes from `build_dag_tree`, with each milestone's blockers being
+    Each milestone is dispatched on its own entry in `bases` (`milestone_bases`'
+    answer), never on one shared base; `bases` keys every open milestone, so a
+    missing key is a caller bug and surfaces as that milestone's `escalated`
+    entry. The tree comes from `build_dag_tree`, with each milestone's blockers being
     its `blocked_by` restricted to `milestones` (a done blocker is not here,
     so it is satisfied). grafo itself holds a node back until every one of its
     parents' edges has fired, so by the time a node body runs, every blocker's
@@ -2528,7 +2538,7 @@ async def _run_board_async(
                 payload = await _run_milestone_async(
                     card.id,
                     repo_dir=root,
-                    base_branch=base_branch,
+                    base_branch=bases[card.id],
                     branch_prefix=prefixes[card.id],
                     commands=commands,
                     allow_no_verification=allow_no_verification,
