@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -3724,6 +3725,130 @@ def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypa
     assert result["subtask"] == a1
     assert result["detail"] == "RuntimeError: checkpoints table unreadable"
     assert driver.calls == []
+
+
+# ── a relaunch after `am reset` starts the card fresh (card 522adfb5) ───────
+#
+# am-reset spec §3.6 / test 8, through the lane with `FakeDriver`. Git tier,
+# not unit: the `project` fixture and the worktree under test need real git;
+# the board is the in-memory FakeBoard, so no `brd` marker.
+
+FIRST_PHASE = "worktree"
+"""`TASK`'s first phase: where a walk handed no `resume_from` begins."""
+
+
+def _continuable(project: Path, run_id: str, card_id: str) -> store_module.Checkpoint | None:
+    """What a relaunch's lane would continue `card_id` from, read as the lane reads it."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        return runs.continuable_checkpoint(opened, card_id)
+    finally:
+        opened.close()
+
+
+def _escalated_first_run(project: Path) -> tuple[str, str, str, Path]:
+    """A one-story, one-subtask milestone run once and escalated at a1's review.
+
+    Returns (milestone id, a1, the run id, a1's recorded worktree path). The
+    run ended, so its lease is released and `am reset` finds nobody driving it.
+    `FakeDriver` saves no checkpoint: each test plants the rows it needs.
+    """
+    shape = _milestone(project, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    first_driver = FakeDriver(outcomes={a1: ("review", "boom")})
+    first = _run(project, shape["milestone"], first_driver)
+    assert first["escalated"] is True, first
+    return shape["milestone"], a1, first["run_id"], Path(first_driver.calls[0]["worktree"])
+
+
+@pytest.mark.git
+@pytest.mark.parametrize("reason", ["parked", "turn"])
+@pytest.mark.parametrize(
+    "worktree_present", [True, False], ids=["worktree-present", "worktree-removed"]
+)
+def test_a_relaunch_after_am_reset_starts_the_card_fresh_at_worktree(
+    project, worktree_present, reason
+):
+    """am-reset spec test 8: a1's newest checkpoint is an open row of run X.
+    Before the reset a relaunch would continue it; after `cli.reset_run(X)`
+    the lane hands a1 no `resume_from`, so its walk begins at `worktree`,
+    whether a1's worktree directory survived or was removed by hand. Review
+    Focus 3: a crash's `turn` row closes the same way as a pause's `parked`."""
+    milestone, a1, reset_id, wt = _escalated_first_run(project)
+    planted = _plant(project, reset_id, a1, reason, queue=("review",))
+    _git(project, "worktree", "add", "-b", _branch(project, a1), str(wt), "main")
+    if not worktree_present:
+        shutil.rmtree(wt)
+    found = _continuable(project, reset_id, a1)
+    assert found is not None
+    assert (found.run_id, found.seq) == (reset_id, planted.seq)
+
+    reset = cli.reset_run(reset_id, repo_dir=project)
+
+    assert reset["status"] == "cancelled"
+    assert reset["already_cancelled"] is False
+    assert reset["cards"] == [
+        {"card_id": a1, "workflow": task_workflow.TASK.name, "open_in": None}
+    ]
+    assert _continuable(project, reset_id, a1) is None
+    driver = CheckpointDriver()
+
+    result = _run(project, milestone, driver, clock=lambda: LATER)
+
+    assert result["done"] is True, result
+    assert result["run_id"] != reset_id
+    assert result["completed"] == [a1]
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert driver.resumed[a1] is _ABSENT
+    assert driver.calls[0]["worktree"] == wt
+    assert task_workflow.TASK.phases[0].name == FIRST_PHASE
+    assert wt.is_dir() is worktree_present
+
+
+@pytest.mark.git
+def test_a_relaunch_after_am_reset_does_not_fall_back_to_an_older_runs_open_row(project):
+    """Review Focus 1: an earlier run with no `runs` row (so not cancelled)
+    holds an older open row of a1, and the reset run holds the newest. The
+    newest row decides, so a1 is closed: `open_in` is null and the relaunch
+    starts a1 fresh rather than continuing the older row."""
+    milestone, a1, reset_id, _wt = _escalated_first_run(project)
+    older = cli.mint_run_id(milestone, EARLIER)
+    _plant(project, older, a1, "parked", minute=0)
+    _plant(project, reset_id, a1, "parked", queue=("review",), minute=5)
+
+    reset = cli.reset_run(reset_id, repo_dir=project)
+
+    assert reset["cards"] == [
+        {"card_id": a1, "workflow": task_workflow.TASK.name, "open_in": None}
+    ]
+    driver = CheckpointDriver()
+    result = _run(project, milestone, driver, clock=lambda: LATER)
+    assert result["done"] is True, result
+    assert driver.resumed[a1] is _ABSENT
+
+
+@pytest.mark.git
+def test_a_relaunch_after_am_reset_continues_the_run_open_in_names(project):
+    """Review Focus 2: another run (no `runs` row, so not cancelled) saved a
+    newer open row of a1 than the reset run did. The reset reports that run
+    in `open_in`, and the relaunch does continue a1 from exactly that row:
+    the envelope tells the truth about what a relaunch adopts."""
+    milestone, a1, reset_id, _wt = _escalated_first_run(project)
+    _plant(project, reset_id, a1, "parked", queue=("review",), minute=0)
+    other = cli.mint_run_id(milestone, EARLIER.replace(minute=30))
+    newer = _plant(project, other, a1, "parked", queue=("implement",), minute=5)
+
+    reset = cli.reset_run(reset_id, repo_dir=project)
+
+    assert reset["cards"] == [
+        {"card_id": a1, "workflow": task_workflow.TASK.name, "open_in": other}
+    ]
+    driver = CheckpointDriver()
+    result = _run(project, milestone, driver, clock=lambda: LATER)
+    assert result["done"] is True, result
+    got = driver.resumed[a1]
+    assert got is not _ABSENT
+    assert (got.run_id, got.seq) == (other, newer.seq)
 
 
 # ── merged bases (supervisor-tree §5, card 8eca88e2) ────────────────────────
