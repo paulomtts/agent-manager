@@ -143,3 +143,65 @@ def test_watch_documents_from_now():
     assert "- `--from-now` without `--follow`;" in section
     assert "only lines appended after the command started" in section
     assert '"schema":1' in section
+
+
+def test_logs_section_shape_line():
+    section = _section(LOGS_TITLE)
+    assert (
+        "The shape is `am logs RUN_ID CARD [--phase P] [--attempt N] [--follow]"
+        " [--since-offset BYTES] [--repo-dir DIR]`:" in section
+    )
+    titles = [title for _, _, title in _headings()]
+    assert (
+        titles.index("Watching a run")
+        < titles.index(LOGS_TITLE)
+        < titles.index("Resuming: what runs again")
+    )
+    for refusal in (
+        "- an unknown run, card, phase or attempt, as for the one-shot;",
+        "- a `--since-offset` below 0;",
+        "- `--since-offset` without `--follow`, whatever its value, 0 included;",
+        "- an agent attempt that recorded no stdout path, since there is no file to follow.",
+    ):
+        assert refusal in section, refusal
+    assert 'only a stream starts with `"event":"logs"`' in section
+    assert "`am logs: <message>`" in section
+    assert "stdout.log" in section
+    assert "U+FFFD" in section
+    assert "next chunk's `offset` is always exact" in section
+    assert "takes no lease, no claim and no lock" in section
+    assert ADDITIVE in section
+    assert IGNORE_UNKNOWN in section
+
+
+def test_logs_examples_match_code():
+    examples = _fenced_json_lines(_section(LOGS_TITLE))
+    hellos = [item for item in examples if item[1].get("event") == "logs"]
+    ends = [item for item in examples if item[1].get("event") == "end"]
+    chunks = [item for item in examples if "event" not in item[1]]
+    assert len(hellos) == 1
+    assert len(ends) == 1
+    assert len(chunks) >= 2
+    assert len(examples) == len(hellos) + len(ends) + len(chunks)
+    assert examples[0] is hellos[0]
+    assert examples[-1] is ends[0]
+
+    hello_raw, hello = hellos[0]
+    assert set(hello) == set(cli._logs_hello(Path("x"), 0))
+    assert hello["schema"] == 1
+    assert hello["path"].endswith("/stdout.log")
+    assert hello_raw == cli.render(cli._logs_hello(Path(hello["path"]), hello["offset"]))
+
+    expected = hello["offset"]
+    for raw, chunk in chunks:
+        assert set(chunk) == {"offset", "text"}
+        assert raw == cli.render(chunk)
+        assert chunk["offset"] == expected
+        expected += len(chunk["text"].encode("utf-8"))
+
+    end_raw, end = ends[0]
+    assert set(end) == {"event", "status"}
+    assert end["event"] == "end"
+    terminal = set(typing.get_args(models.AttemptStatus)) - {"started"}
+    assert end["status"] in terminal
+    assert end_raw == cli.render(end)
