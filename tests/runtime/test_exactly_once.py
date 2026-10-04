@@ -129,9 +129,6 @@ class FakeAdapter:
             str(d.result_path),
         ]
 
-    def parse_usage(self, stdout: str):
-        return None
-
 
 @dataclass
 class FakeLauncher:
