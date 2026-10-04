@@ -5591,6 +5591,54 @@ def test_logs_follow_mid_stream_error_goes_to_stderr(projection, monkeypatch):
     assert result.stderr == "am logs: the log went away\n"
 
 
+def _verify_phase(status: str) -> tuple[models.SubtaskRun, models.PhaseRun]:
+    subtask = models.SubtaskRun(card_id="card-1", branch="m1/task-x", base_branch="main")
+    return subtask, models.PhaseRun(name="verify", kind="deterministic", status=status)
+
+
+@pytest.mark.parametrize(
+    ("status", "recorded", "n", "expected"),
+    [
+        ("done", [1, 2], 2, "ok"),
+        ("failed", [1, 2], 2, "gate_failed"),
+        ("escalated", [1], 1, "gate_failed"),
+        ("stopped", [1], 1, "gate_failed"),
+        ("cancelled", [1], 1, "gate_failed"),
+        ("started", [1, 2], 1, "gate_failed"),
+        ("done", [1, 2], 1, "gate_failed"),
+        ("pending", [1], 1, None),
+        ("started", [1], 1, None),
+    ],
+    ids=[
+        "latest-done",
+        "latest-failed",
+        "latest-escalated",
+        "latest-stopped",
+        "latest-cancelled",
+        "superseded-while-started",
+        "superseded-while-done",
+        "latest-pending",
+        "latest-started",
+    ],
+)
+def test_step_end_status(status, recorded, n, expected):
+    """Card 4.2's mapping for a deterministic phase: superseded or failed is
+    `gate_failed`, latest and `done` is `ok`, latest and running is `None`."""
+    subtask, phase = _verify_phase(status)
+
+    assert cli.step_end_status(subtask, phase, n, recorded) == expected
+
+
+@pytest.mark.parametrize(("n", "recorded"), [(3, [1, 2]), (1, [])])
+def test_step_end_status_refuses_an_attempt_no_longer_on_disk(n, recorded):
+    """Review Focus 5: the followed `<phase>.N` directory is gone, so the
+    re-lookup refuses instead of reporting an end it cannot know."""
+    subtask, phase = _verify_phase("done")
+
+    with pytest.raises(cli.UnknownAttemptError, match=f"has no attempt {n} any more"):
+        cli.step_end_status(subtask, phase, n, recorded)
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""

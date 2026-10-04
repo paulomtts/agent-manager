@@ -487,6 +487,35 @@ def select_step_attempt(
     )
 
 
+def step_end_status(
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    n: int,
+    recorded: Sequence[int],
+) -> str | None:
+    """The `logs --follow` end status of deterministic attempt `n`, or `None`.
+
+    A deterministic phase has no `Attempt` row, so card 4.2 maps it onto the
+    `AttemptStatus` vocabulary: attempt `n` is over once a later `<phase>.M`
+    directory exists, or once the phase is neither `pending` nor `started`.
+    It ended `ok` only when it is the latest attempt and the phase is `done`;
+    a superseded attempt, or a phase `failed`, `escalated`, `stopped` or
+    `cancelled`, ended `gate_failed`. Pure: the caller scans `recorded` with
+    the read-only `paths.recorded_attempts`.
+    """
+    if n not in recorded:
+        numbers = ", ".join(str(item) for item in recorded) or "none"
+        raise UnknownAttemptError(
+            f"phase {phase.name!r} of card {subtask.card_id!r} has no attempt {n}"
+            f" any more; recorded attempts: {numbers}"
+        )
+    if max(recorded) > n:
+        return "gate_failed"
+    if phase.status in ("pending", "started"):
+        return None
+    return "ok" if phase.status == "done" else "gate_failed"
+
+
 def step_logs_payload(
     run: models.Run,
     story: models.StoryRun,
