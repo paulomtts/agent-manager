@@ -7153,6 +7153,45 @@ def test_run_board_treats_an_already_done_blocker_as_satisfied(board_seams):
     assert board_seams.runs.called() == [later.id]
 
 
+def test_run_board_payload_has_one_run_per_milestone_and_no_board_level_run(board_seams):
+    """Card a7fcc076: a board run has no board-level Run. The payload carries
+    no top-level `run_id`; each dispatched milestone's entry carries its own
+    run's `run_id`, distinct per milestone. An escalated (raised) entry and a
+    blocked entry were never given a run, so they carry no `run_id` at all.
+    A done entry is `milestone_id` and `status` plus the run payload's own
+    keys, which here are the fake's `done` and `run_id`."""
+    a, b, c = _board_milestone(1), _board_milestone(2), _board_milestone(3)
+    d = _board_milestone(4, blocked_by=(3,))
+    board_seams.cards = [a, b, c, d]
+    board_seams.runs.outcomes[c.id] = RuntimeError("boom")
+
+    result = _board(board_seams)
+
+    assert set(result) == {"ok", "board", "levels", "milestones"}
+    assert "run_id" not in result
+    assert result["ok"] is False
+    assert result["board"] is True
+    assert result["levels"] == [
+        {"level": 0, "milestones": [a.id, b.id, c.id]},
+        {"level": 1, "milestones": [d.id]},
+    ]
+    for level in result["levels"]:
+        assert set(level) == {"level", "milestones"}
+    by_id = _by_id(result)
+    assert set(by_id) == {a.id, b.id, c.id, d.id}
+    for done in (a, b):
+        assert set(by_id[done.id]) == {"milestone_id", "status", "done", "run_id"}
+        assert by_id[done.id]["status"] == "done"
+    assert set(by_id[c.id]) == {"milestone_id", "status", "error"}
+    assert by_id[c.id]["status"] == "escalated"
+    assert by_id[c.id]["error"] == "RuntimeError: boom"
+    assert set(by_id[d.id]) == {"milestone_id", "status", "blocked_by"}
+    assert by_id[d.id]["status"] == "blocked"
+    assert by_id[d.id]["blocked_by"] == [c.id]
+    run_ids = [by_id[done.id]["run_id"] for done in (a, b)]
+    assert len(set(run_ids)) == len(run_ids)
+
+
 def test_run_board_ends_on_a_base_exception_instead_of_hanging(board_seams):
     """Review Focus 5: grafo drops a non-`Exception` and would hang `gather()`;
     the board run re-raises it through `run_until_killed`."""
