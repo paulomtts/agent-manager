@@ -4453,7 +4453,12 @@ def _resume_root(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _record_resume_run(
-    root: Path, run_id: str = RESUME_RUN_ID, *, workflow: str = "milestone", status: str = "escalated"
+    root: Path,
+    run_id: str = RESUME_RUN_ID,
+    *,
+    workflow: str = "milestone",
+    status: str = "escalated",
+    base_branch: str = "main",
 ) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4462,7 +4467,7 @@ def _record_resume_run(
                 id=run_id,
                 workflow=workflow,
                 repo_dir=root,
-                base_branch="main",
+                base_branch=base_branch,
                 branch_prefix=PREFIX,
                 status=status,
                 config=models.RunConfig(max_concurrent_stories=3),
@@ -6832,6 +6837,174 @@ def test_board_prefixes_refuses_two_milestones_on_one_prefix():
         )
 
 
+# ── board_prefixes over blocker roots (card 8198b0b4) ───────────────────────
+
+
+def _prefix_recording(calls: list[str], prefix_of: Callable[[models.CardNode], str] = _prefix_of):
+    """`prefix_of`, recording the id of every card it is called on in `calls`."""
+
+    def prefix(card: models.CardNode) -> str:
+        calls.append(card.id)
+        return prefix_of(card)
+
+    return prefix
+
+
+def test_board_prefixes_keys_a_done_blocker_root_after_the_given_milestones():
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocker, blocked])
+
+    assert list(prefixes.items()) == [(blocked.id, "p00000002"), (blocker.id, "p00000001")]
+
+
+@pytest.mark.parametrize(
+    "status, done_children",
+    [
+        ("done", True),
+        ("merged", True),
+        ("canceled", False),
+        ("archived", False),
+        ("todo", True),
+    ],
+)
+def test_board_prefixes_keys_a_blocker_root_of_any_non_open_status(status, done_children):
+    """Review Focus 5: which blockers matter is `milestone_bases`' call, not this one's."""
+    blocker = _board_milestone(1, status=status, done_children=done_children)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    assert not dag.milestone_is_open(blocker)
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocker, blocked])
+
+    assert prefixes[blocker.id] == _prefix_of(blocker)
+
+
+def test_board_prefixes_never_derives_a_root_nobody_blocks_on():
+    """Review Focus 1: an unrelated old milestone cannot newly break a board."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    unrelated = _board_milestone(3, status="done", done_children=True)
+    calls: list[str] = []
+
+    def prefix_of(card: models.CardNode) -> str:
+        calls.append(card.id)
+        if card.id == unrelated.id:
+            raise ValueError(f"not a card id: {card.id!r}")
+        return _prefix_of(card)
+
+    prefixes = orchestrate.board_prefixes(
+        [blocked], prefix_of, roots=[blocker, blocked, unrelated]
+    )
+
+    assert list(prefixes) == [blocked.id, blocker.id]
+    assert unrelated.id not in calls
+
+
+def test_board_prefixes_keys_only_direct_blockers_of_the_given_milestones():
+    """A(done) <- B(done) <- C(open): B is C's blocker and gets a key, A does not."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,), status="done", done_children=True)
+    c = _board_milestone(3, blocked_by=(2,))
+
+    prefixes = orchestrate.board_prefixes([c], _prefix_of, roots=[a, b, c])
+
+    assert list(prefixes) == [c.id, b.id]
+
+
+def test_board_prefixes_ignores_a_blocker_id_that_is_not_a_root():
+    blocked = models.CardNode(
+        id=_plan_id(2), title="milestone 2", status="todo", blocked_by=[_plan_id(99)]
+    )
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocked])
+
+    assert prefixes == {blocked.id: "p00000002"}
+
+
+def test_board_prefixes_keys_a_blocker_named_twice_once():
+    """Review Focus 3: one entry, one derivation, no collision with itself."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    two = _board_milestone(2, blocked_by=(1, 1))
+    three = _board_milestone(3, blocked_by=(1,))
+    calls: list[str] = []
+
+    prefixes = orchestrate.board_prefixes(
+        [two, three], _prefix_recording(calls), roots=[blocker, two, three, blocker]
+    )
+
+    assert list(prefixes.items()) == [
+        (two.id, "p00000002"),
+        (three.id, "p00000003"),
+        (blocker.id, "p00000001"),
+    ]
+    assert calls.count(blocker.id) == 1
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", None])
+def test_board_prefixes_refuses_a_blank_prefix_for_a_blocker_root(prefix):
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    def prefix_of(card: models.CardNode) -> str:
+        return prefix if card.id == blocker.id else _prefix_of(card)
+
+    with pytest.raises(ValueError, match=f"milestone {blocker.id} has no branch prefix"):
+        orchestrate.board_prefixes([blocked], prefix_of, roots=[blocker, blocked])
+
+
+def test_board_prefixes_refuses_a_blocker_root_sharing_an_open_milestones_prefix():
+    """Review Focus 4: both would name one integrate branch; stacking would use the wrong one."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    with pytest.raises(
+        ValueError,
+        match=f"milestones {blocked.id} and {blocker.id} share the branch prefix 'm14'",
+    ):
+        orchestrate.board_prefixes([blocked], lambda card: "m14", roots=[blocker, blocked])
+
+
+@pytest.mark.parametrize(
+    "milestones",
+    [
+        [_board_milestone(1), _board_milestone(2)],
+        [_board_milestone(1), _board_milestone(2, blocked_by=(1,))],
+    ],
+    ids=["independent", "open-blocker"],
+)
+def test_board_prefixes_with_roots_but_no_non_open_blocker_is_todays_result(milestones):
+    """Review Focus 2: an open blocker already given is not re-added; order is untouched."""
+    calls: list[str] = []
+
+    today = orchestrate.board_prefixes(milestones, _prefix_of)
+    with_roots = orchestrate.board_prefixes(milestones, _prefix_recording(calls), roots=milestones)
+
+    assert list(with_roots.items()) == list(today.items())
+    assert list(today.items()) == [
+        (milestones[0].id, "p00000001"),
+        (milestones[1].id, "p00000002"),
+    ]
+    assert calls == [milestones[0].id, milestones[1].id]
+
+
+def test_a_blocker_keeps_its_prefix_once_done_and_milestone_bases_stacks_on_it():
+    """Spec 2.3: the prefix a blocker ran under names the integrate branch it left behind."""
+    prefix_of = cli.board_prefix_of(None)
+    open_blocker = _board_milestone(1)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    done_blocker = _board_milestone(1, status="done", done_children=True)
+    assert done_blocker.id == open_blocker.id and done_blocker.title == open_blocker.title
+
+    while_open = orchestrate.board_prefixes([open_blocker, blocked], prefix_of)
+    once_done = orchestrate.board_prefixes([blocked], prefix_of, roots=[done_blocker, blocked])
+
+    assert once_done[done_blocker.id] == while_open[open_blocker.id] == prefix_of(done_blocker)
+    assert orchestrate.milestone_bases(
+        [done_blocker, blocked], once_done, lambda branch: True, "master"
+    ) == {blocked.id: f"{prefix_of(done_blocker)}-integrate"}
+
+
 def test_board_claims_unions_each_milestones_claims_first_occurrence_first():
     one, two = _board_milestone(1), _board_milestone(2)
     prefixes = {one.id: "pa", two.id: "pb"}
@@ -6872,11 +7045,366 @@ def test_milestone_status_reads_a_run_milestone_payload(payload, status):
     assert orchestrate.milestone_status(payload) == status
 
 
+# ── milestone_bases (card 40ac07f3) ─────────────────────────────────────────
+
+
+def _prefixes(*ns: int) -> dict[str, str]:
+    """`{_plan_id(n): f"p{n}"}`: milestone `n`'s integrate branch is `p<n>-integrate`."""
+    return {_plan_id(n): f"p{n}" for n in ns}
+
+
+def _recording_exists(*present: str) -> tuple[Callable[[str], bool], list[str]]:
+    """A `branch_exists` that answers from `present` and records every call."""
+    calls: list[str] = []
+
+    def exists(branch: str) -> bool:
+        calls.append(branch)
+        return branch in present
+
+    return exists, calls
+
+
+def test_milestone_bases_puts_unblocked_open_milestones_on_the_base_branch_in_input_order():
+    """Spec test 1: no blockers -> base_branch; keys are the open ones, input order."""
+    two, one, done = _board_milestone(2), _board_milestone(1), _board_milestone(3, status="done")
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([two, one, done], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [(two.id, "master"), (one.id, "master")]
+    assert calls == []
+
+
+def test_milestone_bases_of_no_open_milestones_is_empty():
+    exists, _ = _recording_exists()
+    assert orchestrate.milestone_bases([], {}, exists, "master") == {}
+    assert (
+        orchestrate.milestone_bases(
+            [_board_milestone(1, status="done")], _prefixes(1), exists, "master"
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "done_children"),
+    [("merged", True), ("canceled", False), ("archived", False)],
+)
+def test_milestone_bases_ignores_a_landed_blocker_without_checking_its_branch(
+    status, done_children
+):
+    """Spec tests 2-3, Review Focus 5: a canceled/archived blocker with open work
+    under it is still landed, never a stack candidate."""
+    blocker = _board_milestone(1, status=status, done_children=done_children)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == []
+
+
+def test_milestone_bases_stacks_on_one_open_blocker_without_checking_its_branch():
+    """Spec test 4: the open blocker's run creates its branch; existence is not asked."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocker.id: "master", blocked.id: "p1-integrate"}
+    assert calls == []
+
+
+def test_milestone_bases_stacks_on_a_done_blocker_whose_integrate_branch_exists():
+    """Spec test 5."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_treats_a_done_blocker_without_its_branch_as_landed():
+    """Spec test 6: "assume landed; today's behaviour"."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_refuses_a_milestone_with_two_open_blockers():
+    """Spec test 7."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    blocked = _board_milestone(3, blocked_by=(1, 2))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases([one, two, blocked], _prefixes(1, 2, 3), exists, "master")
+
+    assert isinstance(caught.value, ValueError)
+    message = str(caught.value)
+    assert blocked.id in message
+    assert one.id in message and two.id in message
+    assert "chain" in message
+    assert "merged" not in message, "the mark-merged hint is only for unlanded blockers"
+
+
+def test_milestone_bases_refuses_an_open_blocker_plus_a_done_blocker_with_its_branch():
+    """Spec test 8: picking one would drop the other's unmerged work."""
+    one = _board_milestone(1)
+    two = _board_milestone(2, status="done", done_children=True)
+    blocked = _board_milestone(3, blocked_by=(1, 2))
+    exists, _ = _recording_exists("p2-integrate")
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases([one, two, blocked], _prefixes(1, 2, 3), exists, "master")
+
+    message = str(caught.value)
+    assert blocked.id in message
+    assert one.id in message and two.id in message
+    assert "chain" in message
+    assert "merged" in message
+    assert message.count(two.id) == 2, "the done blocker is named again in the hint"
+    assert message.count(one.id) == 1, "the open blocker cannot be marked merged"
+
+
+def test_milestone_bases_stacks_on_the_one_open_blocker_when_the_others_are_satisfied():
+    """Spec test 9: open + done-without-branch + merged -> the open one."""
+    one = _board_milestone(1)
+    two = _board_milestone(2, status="done", done_children=True)
+    three = _board_milestone(3, status="merged", done_children=True)
+    blocked = _board_milestone(4, blocked_by=(1, 2, 3))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases(
+        [one, two, three, blocked], _prefixes(1, 2, 3, 4), exists, "master"
+    )
+
+    assert bases == {one.id: "master", blocked.id: "p1-integrate"}
+    assert calls == ["p2-integrate"]
+
+
+def test_milestone_bases_stacks_a_chain_of_open_milestones():
+    """Spec test 10 / §2.4: A <- B <- C, all open."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([a, b, c], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [
+        (a.id, "master"),
+        (b.id, "p1-integrate"),
+        (c.id, "p2-integrate"),
+    ]
+
+
+def test_milestone_bases_stacks_a_chain_whose_head_is_done_with_its_branch():
+    """Spec test 11 / §2.4: A done with its branch, B and C open."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([a, b, c], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [(b.id, "p1-integrate"), (c.id, "p2-integrate")]
+
+
+def test_milestone_bases_ignores_a_blocker_that_is_not_a_milestone():
+    """Spec test 12: an unknown id needs no prefix and counts as satisfied."""
+    blocked = _board_milestone(1, blocked_by=(99,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocked], _prefixes(1), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == []
+
+
+def test_milestone_bases_counts_a_duplicated_blocker_once():
+    """Spec test 13: blocked_by=(1, 1) is S1, not a false S2 refusal."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1, 1))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases[blocked.id] == "p1-integrate"
+
+
+def test_milestone_bases_reads_blocker_statuses_in_any_case():
+    """Spec test 14: MERGED is landed; Done goes through branch_exists."""
+    merged = _board_milestone(1, status="MERGED", done_children=True)
+    on_merged = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+    assert orchestrate.milestone_bases(
+        [merged, on_merged], _prefixes(1, 2), exists, "master"
+    ) == {on_merged.id: "master"}
+    assert calls == []
+
+    done = _board_milestone(1, status="Done", done_children=True)
+    exists, calls = _recording_exists("p1-integrate")
+    assert orchestrate.milestone_bases(
+        [done, on_merged], _prefixes(1, 2), exists, "master"
+    ) == {on_merged.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_gives_non_open_milestones_no_key():
+    """Spec test 15: the keys are exactly what board_levels would dispatch."""
+    done = _board_milestone(1, status="done")
+    finished_tree = _board_milestone(2, done_children=True)
+    live = _board_milestone(3)
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases(
+        [done, finished_tree, live], _prefixes(1, 2, 3), exists, "master"
+    )
+
+    assert list(bases) == [live.id]
+    assert list(bases) == [
+        node.id for level in dag.board_levels([done, finished_tree, live]) for node in level
+    ]
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        pytest.param(_board_milestone(1), id="open"),
+        pytest.param(_board_milestone(1, status="done", done_children=True), id="done"),
+    ],
+)
+def test_milestone_bases_refuses_a_needed_blocker_with_no_prefix(blocker):
+    """Spec test 16: a caller bug, so ValueError, not MilestoneBlockersError."""
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(ValueError) as caught:
+        orchestrate.milestone_bases([blocker, blocked], _prefixes(2), exists, "master")
+
+    assert not isinstance(caught.value, orchestrate.MilestoneBlockersError)
+    message = str(caught.value)
+    assert blocked.id in message and blocker.id in message
+    assert "no branch prefix" in message
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", None])
+def test_milestone_bases_refuses_a_blank_prefix_for_a_needed_blocker(prefix):
+    """Review Focus 4: a blank prefix would name the branch `-integrate`."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1,))
+    prefixes = {blocker.id: prefix, blocked.id: "p2"}
+    exists, _ = _recording_exists()
+
+    with pytest.raises(ValueError, match="no branch prefix") as caught:
+        orchestrate.milestone_bases([blocker, blocked], prefixes, exists, "master")
+
+    assert not isinstance(caught.value, orchestrate.MilestoneBlockersError)
+
+
+def test_milestone_bases_needs_no_prefix_for_a_landed_blocker():
+    """Spec test 16, second half."""
+    blocker = _board_milestone(1, status="merged", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+
+
+@pytest.mark.parametrize(
+    ("present", "expected"),
+    [(("p1-integrate",), "p1-integrate"), ((), "master")],
+)
+def test_milestone_bases_treats_a_todo_blocker_with_nothing_open_like_done(present, expected):
+    """Spec test 17: the "unlanded" non-done case."""
+    blocker = _board_milestone(1, status="todo", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists(*present)
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: expected}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_a_repeated_milestone_checks_its_blocker_branch_once():
+    """Review Focus 1: at most one branch_exists call per (M, B) pair."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases(
+        [blocker, blocked, blocked], _prefixes(1, 2), exists, "master"
+    )
+
+    assert bases == {blocked.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_does_not_depend_on_input_order_for_classification():
+    """Review Focus 2: a chain given C, B, A gets the same bases, keyed C, B, A."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([c, b, a], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [
+        (c.id, "p2-integrate"),
+        (b.id, "p1-integrate"),
+        (a.id, "master"),
+    ]
+
+
+def test_milestone_bases_refuses_the_first_offending_milestone_naming_blockers_in_blocked_by_order():
+    """Review Focus 3: one problem at a time, deterministically worded."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    first = _board_milestone(3, blocked_by=(2, 1))
+    second = _board_milestone(4, blocked_by=(1, 2))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases(
+            [one, two, first, second], _prefixes(1, 2, 3, 4), exists, "master"
+        )
+
+    message = str(caught.value)
+    assert first.id in message
+    assert second.id not in message
+    assert message.index(two.id) < message.index(one.id)
+
+
+def test_milestone_bases_leaves_its_inputs_alone():
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1, 1))
+    milestones = [a, b]
+    before = [card.model_copy(deep=True) for card in milestones]
+    prefixes = _prefixes(1, 2)
+    exists, _ = _recording_exists()
+
+    orchestrate.milestone_bases(milestones, prefixes, exists, "master")
+
+    assert milestones == before
+    assert prefixes == _prefixes(1, 2)
+
+
 # ── run_board at its seams (card baef4f94) ──────────────────────────────────
 #
-# `board.roots`, `cli.refuse_claimed` and `orchestrate._run_milestone_async`
-# are replaced, so these exercise `run_board`'s own validation, leveling,
-# claim union, tree, isolation and payload with no git, brd or harness.
+# `board.roots`, `cli.refuse_claimed`, `orchestrate._run_milestone_async` and
+# `orchestrate._local_branch_exists` are replaced, so these exercise
+# `run_board`'s own validation, leveling, bases, claim union, tree, isolation
+# and payload with no git, brd or harness.
 # Production wiring is `tests/e2e/test_run_board.py`'s.
 
 
@@ -6907,6 +7435,10 @@ class BoardSeams:
     runs: FakeMilestoneRuns
     cards: list[models.CardNode] = field(default_factory=list)
     claims: list[list[str]] = field(default_factory=list)
+    branches: set[str] = field(default_factory=set)
+    """The local branches `orchestrate._local_branch_exists` reports; none by default."""
+    asked: list[tuple[Path, str]] = field(default_factory=list)
+    """Every `(root, branch)` the faked `_local_branch_exists` was asked about."""
 
 
 @pytest.fixture
@@ -6919,6 +7451,15 @@ def board_seams(tmp_path, monkeypatch) -> BoardSeams:
         seams.claims.append(list(keys))
 
     monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+    def local_branch_exists(root: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            seams.asked.append((root, branch))
+            return branch in seams.branches
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", local_branch_exists)
     return seams
 
 
@@ -7140,31 +7681,52 @@ def test_run_board_blocks_the_dependent_of_a_milestone_that_did_not_finish_done(
     assert board_seams.runs.called() == [a.id]
 
 
-def test_run_board_runs_a_two_blocker_milestone_only_after_both_finish_done(board_seams):
+def _board_async(seams: BoardSeams, milestones: list[models.CardNode]) -> list[dict[str, Any]]:
+    """`_run_board_async` straight, every milestone on `main`: its gating, not
+    `run_board`'s refusals (which refuse a two-blocker milestone)."""
+    return asyncio.run(
+        orchestrate._run_board_async(
+            milestones,
+            prefixes={card.id: _prefix_of(card) for card in milestones},
+            bases={card.id: "main" for card in milestones},
+            root=seams.root,
+            commands=(),
+            allow_no_verification=False,
+            runner_factory=None,
+            driver=None,
+            clock=orchestrate._utcnow,
+            max_concurrent=2,
+            control_interval=control.CONTROL_POLL_SECONDS,
+        )
+    )
+
+
+def test_run_board_async_runs_a_two_blocker_milestone_only_after_both_finish_done(
+    board_seams,
+):
     a, b = _board_milestone(1), _board_milestone(2)
     c = _board_milestone(3, blocked_by=(1, 2))
-    board_seams.cards = [a, b, c]
 
-    result = _board(board_seams)
+    entries = _board_async(board_seams, [a, b, c])
 
-    assert result["ok"] is True
-    assert result["levels"] == [
-        {"level": 0, "milestones": [a.id, b.id]},
-        {"level": 1, "milestones": [c.id]},
-    ]
     assert board_seams.runs.called()[-1] == c.id
-    assert _by_id(result)[c.id]["status"] == "done"
+    assert {entry["milestone_id"]: entry for entry in entries}[c.id]["status"] == "done"
 
 
-def test_run_board_blocks_a_two_blocker_milestone_on_only_its_unclean_blocker(board_seams):
+def test_run_board_async_blocks_a_two_blocker_milestone_on_only_its_unclean_blocker(
+    board_seams,
+):
     a, b = _board_milestone(1), _board_milestone(2)
     c = _board_milestone(3, blocked_by=(1, 2))
-    board_seams.cards = [a, b, c]
     board_seams.runs.outcomes[b.id] = {"escalated": True, "run_id": "r"}
 
-    result = _board(board_seams)
+    entries = _board_async(board_seams, [a, b, c])
 
-    assert _by_id(result)[c.id] == {"milestone_id": c.id, "status": "blocked", "blocked_by": [b.id]}
+    assert {entry["milestone_id"]: entry for entry in entries}[c.id] == {
+        "milestone_id": c.id,
+        "status": "blocked",
+        "blocked_by": [b.id],
+    }
     assert c.id not in board_seams.runs.called()
 
 
@@ -7233,6 +7795,525 @@ def test_run_board_ends_on_a_base_exception_instead_of_hanging(board_seams):
 
     with pytest.raises(Fatal):
         _board(board_seams)
+
+
+# ── run_board bases (card 5b772688) ─────────────────────────────────────────
+
+
+def _bases(seams: BoardSeams) -> dict[str, str]:
+    """Each dispatched milestone's `base_branch`, keyed by milestone id."""
+    return {milestone: kwargs["base_branch"] for milestone, kwargs in seams.runs.calls}
+
+
+def test_run_board_stacks_a_blocked_milestone_on_its_open_blockers_integrate_branch(
+    board_seams,
+):
+    """Spec test 1: an open blocker's branch is this board run's to create; git is never asked."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+
+    result = _board(board_seams)
+
+    assert result["ok"] is True
+    assert _bases(board_seams) == {
+        a.id: "main",
+        b.id: integration.integration_branch(_prefix_of(a)),
+    }
+    assert _bases(board_seams)[b.id] == "p00000001-integrate"
+    assert board_seams.asked == []
+
+
+def test_run_board_stacks_a_three_milestone_chain_each_on_the_one_before(board_seams):
+    """Spec test 2: A <- B <- C, all open."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    board_seams.cards = [c, b, a]  # board order is not chain order
+
+    _board(board_seams)
+
+    assert _bases(board_seams) == {
+        a.id: "main",
+        b.id: "p00000001-integrate",
+        c.id: "p00000002-integrate",
+    }
+    assert board_seams.runs.called() == [a.id, b.id, c.id]
+
+
+def test_run_board_refuses_a_two_open_blocker_milestone_before_any_claim_check(board_seams):
+    """Spec test 3: nothing was claimed or dispatched, so no run row, run
+    directory or lease can exist."""
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    board_seams.cards = [a, b, c]
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        _board(board_seams)
+
+    message = str(caught.value)
+    for card_id in (c.id, a.id, b.id):
+        assert card_id in message
+    assert "chain them" in message
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize("present", [True, False], ids=["present", "absent"])
+def test_run_board_stacks_on_an_unlanded_done_blockers_integrate_branch_only_when_it_exists(
+    board_seams, present
+):
+    """Spec test 4: the check is bound to the resolved repository and asked once.
+    Also proves `roots=` reaches `board_prefixes` (else "has no branch prefix")."""
+    done = _board_milestone(1, status="done", done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [done, later]
+    if present:
+        board_seams.branches.add("p00000001-integrate")
+
+    result = _board(board_seams)
+
+    assert result["ok"] is True
+    assert result["levels"] == [{"level": 0, "milestones": [later.id]}]
+    assert _bases(board_seams) == {later.id: "p00000001-integrate" if present else "main"}
+    assert board_seams.asked == [
+        (runs.resolve_repo_dir(board_seams.root), "p00000001-integrate")
+    ]
+
+
+@pytest.mark.parametrize("status", ["merged", "canceled", "archived"])
+def test_run_board_never_asks_git_about_a_landed_blocker(board_seams, status):
+    """Spec test 5: a landed blocker's work is in the base already, branch or not."""
+    landed = _board_milestone(1, status=status, done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [landed, later]
+    board_seams.branches.add("p00000001-integrate")
+
+    _board(board_seams)
+
+    assert _bases(board_seams) == {later.id: "main"}
+    assert board_seams.asked == []
+
+
+def test_run_board_refuses_an_open_and_an_unlanded_blocker_with_its_branch(board_seams):
+    """Spec test 6: the unlanded blocker's branch makes it a second candidate."""
+    a = _board_milestone(1)
+    d = _board_milestone(4, status="done", done_children=True)
+    c = _board_milestone(3, blocked_by=(1, 4))
+    board_seams.cards = [a, d, c]
+    board_seams.branches.add("p00000004-integrate")
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        _board(board_seams)
+
+    message = str(caught.value)
+    assert c.id in message and a.id in message
+    assert f"mark {d.id} merged" in message
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_refuses_a_cycle_before_two_blockers(board_seams):
+    """Spec test 7, cycle first (a guard: passes before and after the change)."""
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    x = _board_milestone(4, blocked_by=(5,))
+    y = _board_milestone(5, blocked_by=(4,))
+    board_seams.cards = [a, b, c, x, y]
+
+    with pytest.raises(dag.DependencyCycleError):
+        _board(board_seams)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_refuses_a_shared_prefix_before_two_blockers(board_seams):
+    """Spec test 7, prefixes before bases (a guard: passes before and after the change)."""
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    board_seams.cards = [a, b, c]
+
+    with pytest.raises(ValueError, match="share the branch prefix") as caught:
+        _board(board_seams, branch_prefix_of=lambda card: "same")
+
+    assert not isinstance(caught.value, orchestrate.MilestoneBlockersError)
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_refuses_two_blockers_before_the_claims_check(board_seams, monkeypatch):
+    """Spec test 7, bases before claims: the claim refusal is never reached."""
+    a, b = _board_milestone(1), _board_milestone(2)
+    c = _board_milestone(3, blocked_by=(1, 2))
+    board_seams.cards = [a, b, c]
+
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        raise cli.ClaimedError("held elsewhere", key=keys[-1], run_id=OTHER_RUN_ID)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+    with pytest.raises(orchestrate.MilestoneBlockersError):
+        _board(board_seams)
+
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_checks_a_non_open_blocker_roots_prefix_before_any_claim_check(
+    board_seams,
+):
+    """Spec test 8: 1.2's prefix check now covers a `done` blocker root too."""
+    done = _board_milestone(1, status="done", done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [done, later]
+
+    def prefix_of(card: models.CardNode) -> str:
+        return "" if card.id == done.id else _prefix_of(card)
+
+    with pytest.raises(ValueError, match="has no branch prefix"):
+        _board(board_seams, branch_prefix_of=prefix_of)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+# ── board pre-flight / engine seam (card 203a9a5e) ──────────────────────────
+#
+# `preflight_board` and `run_board_engine`, the two stages `run_board` now
+# composes, driven through the same `board_seams` fakes: no git, brd or harness.
+
+
+def _preflight(seams: BoardSeams, **overrides: Any) -> "orchestrate.BoardPreflight":
+    """`orchestrate.preflight_board` with `_board`'s defaults.
+
+    The return annotation is a string: this file has no `from __future__ import
+    annotations`, and a bare one would fail at import before the class exists."""
+    kwargs: dict[str, Any] = {
+        "repo_dir": seams.root,
+        "base_branch": "main",
+        "branch_prefix_of": _prefix_of,
+        "max_concurrent": 2,
+    }
+    kwargs.update(overrides)
+    return orchestrate.preflight_board(**kwargs)
+
+
+def test_preflight_board_returns_the_state_the_engine_runs_on(board_seams):
+    """A done, unlanded blocker `a` (its branch exists), then `b` <- `c`, given out of order."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    board_seams.cards = [c, b, a]
+    board_seams.branches.add("p00000001-integrate")
+
+    pre = _preflight(board_seams)
+
+    root = runs.resolve_repo_dir(board_seams.root)
+    assert pre.root == root
+    assert pre.base_branch == "main"
+    assert pre.max_concurrent == 2
+    assert [card.id for card in pre.milestones] == [b.id, c.id]
+    assert [[card.id for card in level] for level in pre.levels] == [[b.id], [c.id]]
+    assert list(pre.prefixes) == [b.id, c.id, a.id]
+    assert pre.prefixes[a.id] == "p00000001"
+    assert pre.bases == {b.id: "p00000001-integrate", c.id: "p00000002-integrate"}
+    assert pre.levels_payload == [
+        {"level": 0, "milestones": [b.id]},
+        {"level": 1, "milestones": [c.id]},
+    ]
+    assert board_seams.asked == [(root, "p00000001-integrate")]
+    assert board_seams.claims == [orchestrate.board_claims(pre.milestones, pre.prefixes)]
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"max_concurrent": 0}, {"base_branch": None}, {"base_branch": ""}]
+)
+def test_preflight_board_refuses_bad_arguments_before_it_reads_the_board(
+    board_seams, monkeypatch, overrides
+):
+    def no_read(*, repo_dir=None):
+        pytest.fail("preflight_board read the board before refusing its arguments")
+
+    monkeypatch.setattr(board, "roots", no_read)
+
+    with pytest.raises(ValueError):
+        _preflight(board_seams, **overrides)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize(
+    ("cards", "overrides", "error", "match"),
+    [
+        pytest.param(
+            lambda: [_board_milestone(1, blocked_by=(2,)), _board_milestone(2, blocked_by=(1,))],
+            {},
+            dag.DependencyCycleError,
+            None,
+            id="cycle",
+        ),
+        pytest.param(
+            lambda: [_board_milestone(1), _board_milestone(2)],
+            {"branch_prefix_of": lambda card: "same"},
+            ValueError,
+            "branch prefix",
+            id="shared-prefix",
+        ),
+        pytest.param(
+            lambda: [
+                _board_milestone(1),
+                _board_milestone(2),
+                _board_milestone(3, blocked_by=(1, 2)),
+            ],
+            {},
+            orchestrate.MilestoneBlockersError,
+            "chain them",
+            id="two-open-blockers",
+        ),
+    ],
+)
+def test_preflight_board_refuses_each_board_problem_before_the_claim_check(
+    board_seams, cards, overrides, error, match
+):
+    board_seams.cards = cards()
+
+    with pytest.raises(error, match=match):
+        _preflight(board_seams, **overrides)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_lets_a_claim_conflict_propagate_with_nothing_started(
+    board_seams, monkeypatch
+):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2, blocked_by=(1,))]
+
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        raise cli.ClaimedError("held elsewhere", key=keys[-1], run_id=OTHER_RUN_ID)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight(board_seams)
+
+    assert caught.value.run_id == OTHER_RUN_ID
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_lets_a_git_failure_from_the_branch_check_propagate(
+    board_seams, monkeypatch
+):
+    """Review Focus 4: a broken repository never passes the pre-flight silently."""
+    done = _board_milestone(1, status="done", done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [done, later]
+    asked: list[str] = []
+
+    def broken_branch_exists(root: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            asked.append(branch)
+            raise worktree.GitError("not a git repository", argv=["git"], exit_code=128)
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", broken_branch_exists)
+
+    with pytest.raises(worktree.GitError) as caught:
+        _preflight(board_seams)
+
+    assert caught.value.exit_code == 128
+    assert asked == ["p00000001-integrate"]
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_on_a_board_with_nothing_open_skips_the_claim_check(board_seams):
+    """Review Focus 1: today's empty-board return comes before the claim check."""
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+
+    pre = _preflight(board_seams)
+
+    assert pre.milestones == []
+    assert pre.levels == []
+    assert pre.levels_payload == []
+    assert pre.bases == {}
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_never_starts_an_event_loop(board_seams, monkeypatch):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2, blocked_by=(1,))]
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("preflight_board started the board run")
+
+    monkeypatch.setattr(orchestrate.asyncio, "run", fail)
+    monkeypatch.setattr(orchestrate, "_run_board_async", fail)
+
+    pre = _preflight(board_seams)
+
+    assert [card.id for card in pre.milestones] == [_board_milestone(1).id, _board_milestone(2).id]
+    assert board_seams.runs.calls == []
+
+
+def test_run_board_engine_runs_a_preflight_without_reading_the_board_again(
+    board_seams, monkeypatch
+):
+    """Review Focus 3: the engine runs the approved pre-flight, never a fresh read."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    pre = _preflight(board_seams)
+
+    def no_read(*, repo_dir=None):
+        pytest.fail("run_board_engine read the board again")
+
+    monkeypatch.setattr(board, "roots", no_read)
+    board_seams.claims = []
+
+    result = orchestrate.run_board_engine(pre)
+
+    assert result["ok"] is True
+    assert result["board"] is True
+    assert result["levels"] == pre.levels_payload
+    assert [entry["milestone_id"] for entry in result["milestones"]] == [a.id, b.id]
+    assert _bases(board_seams) == {a.id: "main", b.id: "p00000001-integrate"}
+    assert board_seams.claims == []
+    assert pre.levels_payload == [
+        {"level": 0, "milestones": [a.id]},
+        {"level": 1, "milestones": [b.id]},
+    ]
+    assert pre.bases == {a.id: "main", b.id: "p00000001-integrate"}
+
+
+def test_run_board_engine_gives_the_same_payload_run_board_gives(board_seams):
+    """Review Focus 5: one board, both entry points, one payload."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    board_seams.runs.outcomes[a.id] = {"escalated": True, "run_id": "r"}
+
+    engine_result = orchestrate.run_board_engine(_preflight(board_seams))
+    board_seams.runs.calls.clear()
+    board_result = _board(board_seams)
+
+    assert engine_result == board_result
+    assert engine_result["ok"] is False
+    assert _by_id(engine_result)[b.id] == {
+        "milestone_id": b.id,
+        "status": "blocked",
+        "blocked_by": [a.id],
+    }
+    assert board_seams.runs.called() == [a.id]
+
+
+def test_run_board_engine_uses_the_preflights_lane_bound_and_forwards_run_arguments(
+    board_seams,
+):
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+    pre = _preflight(board_seams, max_concurrent=3)
+    runner_factory = object()
+    driver = object()
+
+    def clock() -> datetime:
+        return datetime(2026, 10, 4, tzinfo=timezone.utc)
+
+    orchestrate.run_board_engine(
+        pre,
+        commands=("git status",),
+        allow_no_verification=True,
+        runner_factory=runner_factory,
+        driver=driver,
+        clock=clock,
+        control_interval=0.25,
+    )
+
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    slots = [kwargs["slots"] for _milestone, kwargs in board_seams.runs.calls]
+    assert isinstance(slots[0], asyncio.Semaphore)
+    assert all(semaphore is slots[0] for semaphore in slots)
+    for milestone, kwargs in board_seams.runs.calls:
+        assert kwargs["max_concurrent"] == 3
+        assert kwargs["repo_dir"] == pre.root
+        assert kwargs["branch_prefix"] == pre.prefixes[milestone]
+        assert kwargs["base_branch"] == pre.bases[milestone]
+        assert list(kwargs["commands"]) == ["git status"]
+        assert kwargs["allow_no_verification"] is True
+        assert kwargs["runner_factory"] is runner_factory
+        assert kwargs["driver"] is driver
+        assert kwargs["clock"] is clock
+        assert kwargs["control_interval"] == 0.25
+
+
+def test_run_board_engine_on_an_empty_preflight_starts_no_event_loop(board_seams, monkeypatch):
+    """Review Focus 1: nothing open, so nothing to run and no loop to start."""
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+    pre = _preflight(board_seams)
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("run_board_engine started a run on an empty board")
+
+    monkeypatch.setattr(orchestrate, "_run_board_async", fail)
+    monkeypatch.setattr(orchestrate.asyncio, "run", fail)
+
+    result = orchestrate.run_board_engine(pre)
+
+    assert result == {"ok": True, "board": True, "levels": [], "milestones": []}
+    assert board_seams.runs.calls == []
+
+
+# ── _local_branch_exists (card 5b772688) ────────────────────────────────────
+
+
+def _branch_repo(tmp_path: Path) -> Path:
+    """A repo with one commit on `main`, branch `m-integrate`, tag
+    `t-integrate` and remote-tracking ref `origin/r-integrate`."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True
+    )
+    _git(root, "config", "user.email", "tests@example.com")
+    _git(root, "config", "user.name", "agent-manager tests")
+    _git(root, "config", "commit.gpgsign", "false")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-m", "base")
+    _git(root, "branch", "m-integrate")
+    _git(root, "tag", "t-integrate")
+    _git(root, "update-ref", "refs/remotes/origin/r-integrate", "HEAD")
+    return root
+
+
+@pytest.mark.git
+def test_local_branch_exists_answers_only_for_local_branches(tmp_path):
+    exists = orchestrate._local_branch_exists(_branch_repo(tmp_path))
+
+    assert exists("m-integrate") is True
+    assert exists("main") is True
+    assert exists("absent-integrate") is False
+    assert exists("t-integrate") is False
+    assert exists("r-integrate") is False
+
+
+@pytest.mark.git
+def test_local_branch_exists_propagates_a_git_error_that_is_not_an_answer(
+    tmp_path, monkeypatch
+):
+    """A broken repository is not "the branch is missing": exit 128 propagates."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    exists = orchestrate._local_branch_exists(not_a_repo)
+
+    with pytest.raises(worktree.GitError) as caught:
+        exists("m-integrate")
+
+    assert caught.value.exit_code != 1
 
 
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
@@ -7463,6 +8544,26 @@ def test_a_resumed_milestone_preflight_leaves_refresh_git_to_the_recorded_stage(
         assert recorded.checkpoints == {}
         assert refreshed == [_expected_claims(milestone, [subtask])]
     assert len(refreshed) == 1
+
+
+def test_a_resumed_milestone_keeps_its_recorded_stacked_base(tmp_path, monkeypatch, fake_board):
+    """Card 5b772688 (parent L69-70): `am resume` keeps the base the run was
+    stacked on, whatever base the caller passes; `milestone_bases` is not consulted."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _seam_resume_board(fake_board)
+    _record_resume_run(root, base_branch="pstack-integrate")
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    def no_bases(*args, **kwargs):
+        raise AssertionError("resume must not re-derive the base")
+
+    monkeypatch.setattr(orchestrate, "milestone_bases", no_bases)
+
+    pre = orchestrate.preflight_milestone(
+        None, repo_dir=root, base_branch="main", resume_run_id=RESUME_RUN_ID
+    )
+
+    assert pre.base_branch == "pstack-integrate"
 
 
 def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
@@ -7789,3 +8890,298 @@ def test_the_detached_milestone_child_drives_the_recorded_plan_and_reports_it(
     assert closes == [(0, 0)]
     assert _lease(root, run_id) is None
     assert _claim_rows(root) == []
+
+
+# ── am run --board --detach (card 03f027ea) ─────────────────────────────────
+#
+# Unit tier: `board_seams` fakes the board, the claim check, the milestone
+# runs and the branch check, and `_FakeDetacher` forks nothing; a test that
+# needs the child runs `fake.body()` inline. The real fork is
+# `tests/e2e/test_detached_run.py`'s.
+
+BOARD_DETACH_AT = datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc)
+"""The fixed clock: its stamp is `20261004T090000Z`."""
+
+
+def _detach_board(seams: BoardSeams, detacher: Any, **overrides: Any) -> dict[str, Any]:
+    """`orchestrate.detach_board` with `_board`'s defaults and the fixed clock."""
+    kwargs: dict[str, Any] = {
+        "repo_dir": seams.root,
+        "base_branch": "main",
+        "branch_prefix_of": _prefix_of,
+        "max_concurrent": 2,
+        "detacher": detacher,
+        "clock": lambda: BOARD_DETACH_AT,
+    }
+    kwargs.update(overrides)
+    return orchestrate.detach_board(**kwargs)
+
+
+def _board_stem(seams: BoardSeams) -> str:
+    return f"20261004T090000Z-{paths.project_digest(runs.resolve_repo_dir(seams.root))}"
+
+
+def _boards() -> Path:
+    """`<data dir>/boards`, without creating it (unlike `paths.boards_dir`)."""
+    return paths.data_dir() / "boards"
+
+
+def _claim_conflict(monkeypatch) -> None:
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        raise cli.ClaimedError("held elsewhere", key=keys[-1], run_id=OTHER_RUN_ID)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+
+@pytest.mark.parametrize(
+    ("cards", "overrides", "conflict", "error"),
+    [
+        pytest.param(
+            lambda: [_board_milestone(1, blocked_by=(2,)), _board_milestone(2, blocked_by=(1,))],
+            {},
+            False,
+            dag.DependencyCycleError,
+            id="cycle",
+        ),
+        pytest.param(
+            lambda: [
+                _board_milestone(1),
+                _board_milestone(2),
+                _board_milestone(3, blocked_by=(1, 2)),
+            ],
+            {},
+            False,
+            orchestrate.MilestoneBlockersError,
+            id="two-open-blockers",
+        ),
+        pytest.param(
+            lambda: [_board_milestone(1)], {}, True, cli.ClaimedError, id="claim-conflict"
+        ),
+        pytest.param(
+            lambda: [_board_milestone(1)],
+            {"max_concurrent": 0},
+            False,
+            ValueError,
+            id="max-concurrent-0",
+        ),
+    ],
+)
+def test_detach_board_refuses_in_the_foreground_and_forks_nothing(
+    board_seams, monkeypatch, cards, overrides, conflict, error
+):
+    """Spec test 7 / Review Focus 2: `preflight_board`'s very refusal, no fork,
+    and `<data dir>/boards` absent, not just empty."""
+    board_seams.cards = cards()
+    if conflict:
+        _claim_conflict(monkeypatch)
+    fake = _FakeDetacher()
+
+    with pytest.raises(error) as detached:
+        _detach_board(board_seams, fake, **overrides)
+    with pytest.raises(error) as direct:
+        _preflight(board_seams, **overrides)
+
+    assert type(detached.value) is type(direct.value)
+    assert str(detached.value) == str(direct.value)
+    assert fake.calls == []
+    assert not _boards().exists()
+    assert board_seams.runs.calls == []
+
+
+def test_detach_board_hands_the_board_to_a_child_and_reports_where_its_files_go(board_seams):
+    """Spec test 8: the six keys, the files' names and modes, one go, and no
+    milestone run in the parent."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    fake = _FakeDetacher()
+
+    data = _detach_board(board_seams, fake)
+
+    stem = _board_stem(board_seams)
+    log = _boards() / f"{stem}{detach.BOARD_LOG_SUFFIX}"
+    report = _boards() / f"{stem}{detach.BOARD_REPORT_SUFFIX}"
+    assert set(data) == {"board", "detached", "pid", "log", "report", "levels"}
+    assert data["board"] is True
+    assert data["detached"] is True
+    assert data["pid"] == FAKE_CHILD_PID
+    assert data["log"] == str(log)
+    assert data["report"] == str(report)
+    assert data["levels"] == [
+        {"level": 0, "milestones": [a.id]},
+        {"level": 1, "milestones": [b.id]},
+    ]
+    assert data["levels"] == _preflight(board_seams).levels_payload
+    assert log.read_bytes() == b""
+    assert stat.S_IMODE(os.stat(log).st_mode) == 0o600
+    assert not report.exists()
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert board_seams.runs.calls == []
+
+
+def test_the_detached_board_child_writes_the_envelope_a_foreground_board_run_prints(
+    board_seams,
+):
+    """Spec test 9: the report is `render(ok_envelope(run_board's payload))`
+    plus a newline, mode 0600, with no temp file left beside it."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    fake = _FakeDetacher()
+    data = _detach_board(board_seams, fake)
+
+    fake.body()
+
+    called = board_seams.runs.called()
+    board_seams.runs.calls.clear()
+    foreground = _board(board_seams)
+    report = Path(data["report"])
+    assert called == [a.id, b.id]
+    assert report.read_text(encoding="utf-8") == cli.render(cli.ok_envelope(foreground)) + "\n"
+    assert stat.S_IMODE(os.stat(report).st_mode) == 0o600
+    assert sorted(entry.name for entry in _boards().iterdir()) == sorted(
+        [Path(data["log"]).name, report.name]
+    )
+
+
+def test_the_detached_board_child_forwards_the_run_arguments(board_seams):
+    one = _board_milestone(1)
+    board_seams.cards = [one]
+    fake = _FakeDetacher()
+    runner_factory = object()
+    driver = object()
+    _detach_board(
+        board_seams,
+        fake,
+        max_concurrent=3,
+        commands=("git status",),
+        allow_no_verification=True,
+        runner_factory=runner_factory,
+        driver=driver,
+        control_interval=0.25,
+    )
+
+    fake.body()
+
+    ((milestone, kwargs),) = board_seams.runs.calls
+    assert milestone == one.id
+    assert kwargs["max_concurrent"] == 3
+    assert list(kwargs["commands"]) == ["git status"]
+    assert kwargs["allow_no_verification"] is True
+    assert kwargs["runner_factory"] is runner_factory
+    assert kwargs["driver"] is driver
+    assert kwargs["clock"]() == BOARD_DETACH_AT
+    assert kwargs["control_interval"] == 0.25
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error"),
+    [
+        pytest.param(RuntimeError("boom"), "RuntimeError: boom", id="milestone-raises"),
+        pytest.param(
+            cli.ClaimedError("claimed since the check", key="branch:x", run_id=OTHER_RUN_ID),
+            "ClaimedError: claimed since the check",
+            id="late-claim",
+        ),
+    ],
+)
+def test_the_detached_board_child_reports_an_escalated_milestone_inside_an_ok_envelope(
+    board_seams, outcome, error
+):
+    """Spec test 10 / Review Focus 4: `ok_envelope` whose `data.ok` is false;
+    a claim taken after the up-front check is an `escalated` entry."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    board_seams.runs.outcomes[a.id] = outcome
+    fake = _FakeDetacher()
+    data = _detach_board(board_seams, fake)
+
+    fake.body()
+
+    envelope = json.loads(Path(data["report"]).read_text(encoding="utf-8"))
+    assert envelope["ok"] is True
+    assert envelope["data"]["ok"] is False
+    entries = {entry["milestone_id"]: entry for entry in envelope["data"]["milestones"]}
+    assert entries[a.id] == {"milestone_id": a.id, "status": "escalated", "error": error}
+    assert entries[b.id] == {"milestone_id": b.id, "status": "blocked", "blocked_by": [a.id]}
+
+
+def test_the_detached_board_child_reports_a_handled_engine_error_as_an_error_envelope(
+    board_seams, monkeypatch
+):
+    """Spec test 11, first half: the engine is read at call time, in the child."""
+    board_seams.cards = [_board_milestone(1)]
+    fake = _FakeDetacher()
+    data = _detach_board(board_seams, fake)
+
+    def engine(pre: Any, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError("x")
+
+    monkeypatch.setattr(orchestrate, "run_board_engine", engine)
+    fake.body()
+
+    report = Path(data["report"])
+    assert json.loads(report.read_text(encoding="utf-8")) == {
+        "ok": False,
+        "error": {"type": "ValueError", "message": "x"},
+    }
+    assert stat.S_IMODE(os.stat(report).st_mode) == 0o600
+
+
+def test_the_detached_board_child_writes_no_report_for_an_unhandled_engine_error(
+    board_seams, monkeypatch
+):
+    """Spec test 11, second half: a bug propagates (its traceback goes to the log)."""
+    board_seams.cards = [_board_milestone(1)]
+    fake = _FakeDetacher()
+    data = _detach_board(board_seams, fake)
+
+    def engine(pre: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("engine bug")
+
+    monkeypatch.setattr(orchestrate, "run_board_engine", engine)
+    with pytest.raises(RuntimeError, match="engine bug"):
+        fake.body()
+
+    assert not Path(data["report"]).exists()
+    assert [entry.name for entry in _boards().iterdir()] == [Path(data["log"]).name]
+
+
+def test_detach_board_on_a_board_with_nothing_open_still_hands_off(board_seams):
+    """Spec test 12 / Review Focus 3."""
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+    fake = _FakeDetacher()
+
+    data = _detach_board(board_seams, fake)
+
+    assert data["levels"] == []
+    assert fake.calls == [Path(data["log"])]
+    assert fake.events == ["go"]
+    assert board_seams.claims == []
+    fake.body()
+    assert json.loads(Path(data["report"]).read_text(encoding="utf-8")) == {
+        "ok": True,
+        "data": {"ok": True, "board": True, "levels": [], "milestones": []},
+    }
+    assert board_seams.runs.calls == []
+
+
+def test_detach_board_refuses_a_log_that_already_exists_and_forks_nothing(board_seams):
+    """Spec test 13 / Review Focus 1: two board detaches in one second."""
+    board_seams.cards = [_board_milestone(1)]
+    stem = _board_stem(board_seams)
+    existing = paths.boards_dir() / f"{stem}{detach.BOARD_LOG_SUFFIX}"
+    existing.write_text("an earlier board run\n", encoding="utf-8")
+    fake = _FakeDetacher()
+
+    with pytest.raises(orchestrate.BoardLogExistsError) as caught:
+        _detach_board(board_seams, fake)
+
+    assert isinstance(caught.value, ValueError)
+    assert str(existing) in str(caught.value)
+    assert fake.calls == []
+    assert existing.read_text(encoding="utf-8") == "an earlier board run\n"
+    assert not (_boards() / f"{stem}{detach.BOARD_REPORT_SUFFIX}").exists()
+    assert board_seams.runs.calls == []

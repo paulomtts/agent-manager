@@ -25,7 +25,8 @@ derived from the census and never discovered. All of them read
 ``census.StoryPlan`` and ``census.SubtaskPlan`` by attribute, keep census
 order, and ignore blockers outside the milestone. ``board_levels`` is the
 same leveling one level up: open milestone roots (``models.CardNode``)
-grouped by their own ``blocked_by`` edges, for display and claims only.
+grouped by their own ``blocked_by`` edges, for display and claims only;
+``milestone_is_open`` is the one test of which roots are open.
 
 This module is pure: no I/O, no subprocesses, no ``brd``.
 """
@@ -208,6 +209,21 @@ def _has_open_descendant(node: CardNode) -> bool:
     )
 
 
+def milestone_is_open(root: CardNode) -> bool:
+    """True when the milestone ``root`` still has work a board run would dispatch.
+
+    The one definition of an open milestone, shared by ``board_levels`` and
+    ``orchestrate.milestone_bases``. A root is open when it is neither finished
+    nor out of play and some in-play card under it, at any depth, is not
+    finished.
+    """
+    return (
+        not is_finished(root.status)
+        and not is_out_of_play(root.status)
+        and _has_open_descendant(root)
+    )
+
+
 def board_levels(roots: list[CardNode]) -> list[list[CardNode]]:
     """Open milestone roots grouped into dependency levels, each in input order.
 
@@ -220,13 +236,7 @@ def board_levels(roots: list[CardNode]) -> list[list[CardNode]]:
     is not touched. Used only for display and for computing the claim set up
     front; it never drives execution order.
     """
-    pending = [
-        root
-        for root in roots
-        if not is_finished(root.status)
-        and not is_out_of_play(root.status)
-        and _has_open_descendant(root)
-    ]
+    pending = [root for root in roots if milestone_is_open(root)]
     ids = {root.id for root in pending}
     placed: set[str] = set()
     levels: list[list[CardNode]] = []

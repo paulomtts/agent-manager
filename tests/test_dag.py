@@ -13,6 +13,7 @@ from agent_manager.dag import (
     compute_levels,
     is_story_closed,
     is_subtask_done,
+    milestone_is_open,
     remaining_subtasks,
     short_id,
     slugify,
@@ -800,3 +801,53 @@ def test_board_levels_ignores_out_of_play_cards(status):
 def test_board_levels_blocker_released_by_a_finished_milestone(status):
     roots = [_root("a", status=status), _root("b", ["a"])]
     assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+# ── milestone_is_open: the one definition of an open milestone ──────────────
+
+
+@pytest.mark.parametrize(
+    ("root", "is_open"),
+    [
+        pytest.param(_root("a"), True, id="todo-with-an-open-child"),
+        pytest.param(
+            _root("a", status="in_progress", children=[_card("a1", "done", [_card("a1x", "todo")])]),
+            True,
+            id="open-grandchild",
+        ),
+        pytest.param(_root("a", status="done"), False, id="done-root"),
+        pytest.param(_root("a", status="Done"), False, id="done-root-any-case"),
+        pytest.param(_root("a", status="merged"), False, id="merged-root"),
+        pytest.param(_root("a", status="MERGED"), False, id="merged-root-any-case"),
+        pytest.param(_root("a", status="canceled"), False, id="canceled-with-open-child"),
+        pytest.param(_root("a", status="archived"), False, id="archived-with-open-child"),
+        pytest.param(
+            _root("a", children=[_card("a1", "done"), _card("a2", "merged")]),
+            False,
+            id="todo-with-only-finished-children",
+        ),
+        pytest.param(
+            _root("a", children=[_card("a1", "canceled", [_card("a1x", "todo")])]),
+            False,
+            id="todo-whose-only-open-child-is-canceled",
+        ),
+        pytest.param(_root("a", children=[]), False, id="todo-with-no-children"),
+    ],
+)
+def test_milestone_is_open(root, is_open):
+    assert milestone_is_open(root) is is_open
+
+
+def test_board_levels_keeps_exactly_the_milestones_milestone_is_open_keeps():
+    """Review: "open" cannot drift between the leveling and the base decision."""
+    roots = [
+        _root("a"),
+        _root("b", status="done"),
+        _root("c", status="merged"),
+        _root("d", status="canceled"),
+        _root("e", children=[_card("e1", "done")]),
+        _root("f", children=[_card("f1", "canceled", [_card("f1x", "todo")])]),
+        _root("g", ["a"]),
+    ]
+    kept = [node.id for level in board_levels(roots) for node in level]
+    assert kept == [root.id for root in roots if milestone_is_open(root)]

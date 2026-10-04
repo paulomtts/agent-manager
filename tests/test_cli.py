@@ -3279,6 +3279,18 @@ def test_board_prefix_of_with_a_prefix_joins_it_to_the_stem_and_never_reuses_it_
     assert prefix_of(BOARD_CARD) != "sprint9"
 
 
+@pytest.mark.parametrize("status", ["done", "merged", "canceled"])
+@pytest.mark.parametrize("branch_prefix", [None, "sprint9"])
+def test_board_prefix_of_ignores_status_so_a_finished_milestone_keeps_its_prefix(
+    status, branch_prefix
+):
+    """Card 8198b0b4: a blocker that is no longer open gets the prefix it ran under."""
+    prefix_of = cli.board_prefix_of(branch_prefix)
+    finished = BOARD_CARD.model_copy(update={"status": status})
+
+    assert prefix_of(finished) == prefix_of(BOARD_CARD)
+
+
 BLANK_BOARD_PREFIX = "--branch-prefix with --board needs a non-blank prefix, not a blank string"
 PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
 
@@ -3429,20 +3441,47 @@ def _forbid_board_dry_run_writes(monkeypatch) -> None:
 
 
 def _expected_board_milestone(
-    card: models.CardNode, prefix: str, *, root: Path, max_concurrent: int
+    card: models.CardNode,
+    prefix: str,
+    *,
+    root: Path,
+    max_concurrent: int,
+    base_branch: str = "main",
 ) -> dict[str, Any]:
     return {
         "milestone_id": card.id,
         "title": card.title,
         "branch_prefix": prefix,
+        "base_branch": base_branch,
         "plan": cli.dry_run_payload(
             census.flatten_milestone(card).stories,
             repo_dir=root,
             branch_prefix=prefix,
-            base_branch="main",
+            base_branch=base_branch,
             max_concurrent=max_concurrent,
         ),
     }
+
+
+def _answer_local_branches(monkeypatch, existing: set[str]) -> dict[str, list[Any]]:
+    """Replace `orchestrate._local_branch_exists` with a fake that answers from `existing`.
+
+    No `git` runs. Returns what the fake saw: `roots`, each repo root the
+    factory was built for, and `asked`, each branch it was asked about, in order.
+    """
+    seen: dict[str, list[Any]] = {"roots": [], "asked": []}
+
+    def factory(root: Path):
+        seen["roots"].append(root)
+
+        def exists(branch: str) -> bool:
+            seen["asked"].append(branch)
+            return branch in existing
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", factory)
+    return seen
 
 
 def _board_dry_run(repo_dir: Path, *extra: str):
@@ -3468,7 +3507,9 @@ def test_the_board_dry_run_previews_every_open_milestone_by_level_and_writes_not
 ):
     """Spec test 13: two milestones, the second blocked by the first, on a real
     temporary brd board. Two levels, each milestone with its derived prefix and
-    its own `dry_run_payload` nested as `plan`; nothing run, nothing written."""
+    its own `dry_run_payload` nested as `plan`; the second milestone stacks on
+    the first's `<prefix>-integrate`, reported as `base_branch` and planned
+    against; nothing run, nothing written."""
     first = _add_card(project, "Milestone A: the adapter")
     first_story = _add_card(project, "Story A1: read cards", first)
     _add_card(project, "a1: read one card", first_story)
@@ -3496,24 +3537,42 @@ def test_the_board_dry_run_previews_every_open_milestone_by_level_and_writes_not
     assert data["board"] is True
     assert data["max_concurrent"] == cli.DEFAULT_MAX_CONCURRENT
     root = cli.resolve_repo_dir(project)
+    first_prefix = dag.task_stem(roots[first])
     expected = [
         {
-            "level": index,
+            "level": 0,
             "milestones": [
                 _expected_board_milestone(
-                    roots[card_id],
-                    dag.task_stem(roots[card_id]),
+                    roots[first],
+                    first_prefix,
                     root=root,
                     max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
                 )
             ],
-        }
-        for index, card_id in enumerate([first, second])
+        },
+        {
+            "level": 1,
+            "milestones": [
+                _expected_board_milestone(
+                    roots[second],
+                    dag.task_stem(roots[second]),
+                    root=root,
+                    max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                    base_branch=integration.integration_branch(first_prefix),
+                )
+            ],
+        },
     ]
     assert data["levels"] == _as_json(expected)
     for level in data["levels"]:
         for entry in level["milestones"]:
-            assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+            assert set(entry) == {
+                "milestone_id",
+                "title",
+                "branch_prefix",
+                "base_branch",
+                "plan",
+            }
     _assert_nothing_written(project, porcelain_before)
     assert board.roots(repo_dir=project) == board_before
 
@@ -3561,32 +3620,45 @@ def test_the_board_dry_run_derives_prefixes_from_a_given_prefix_and_drops_done_m
     third = _board_milestone(3, blocked_by=(second.id,))
     _serve_roots(monkeypatch, [done, second, third])
     _forbid_board_dry_run_writes(monkeypatch)
+    # The done milestone blocks `second`, so its integrate branch is looked up;
+    # the fake answers "absent" without spawning git (unit tier).
+    seen = _answer_local_branches(monkeypatch, set())
 
     result = _board_dry_run(tmp_path, "--branch-prefix", "sprint9", "--max-concurrent", "2")
 
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)["data"]
     root = cli.resolve_repo_dir(tmp_path)
+    second_prefix = f"sprint9-{dag.task_stem(second)}"
     assert data == _as_json(
         {
             "board": True,
             "max_concurrent": 2,
             "levels": [
                 {
-                    "level": index,
+                    "level": 0,
                     "milestones": [
                         _expected_board_milestone(
-                            card,
-                            f"sprint9-{dag.task_stem(card)}",
-                            root=root,
-                            max_concurrent=2,
+                            second, second_prefix, root=root, max_concurrent=2
                         )
                     ],
-                }
-                for index, card in enumerate([second, third])
+                },
+                {
+                    "level": 1,
+                    "milestones": [
+                        _expected_board_milestone(
+                            third,
+                            f"sprint9-{dag.task_stem(third)}",
+                            root=root,
+                            max_concurrent=2,
+                            base_branch=integration.integration_branch(second_prefix),
+                        )
+                    ],
+                },
             ],
         }
     )
+    assert seen["asked"] == [integration.integration_branch(f"sprint9-{dag.task_stem(done)}")]
     assert list(paths.data_dir().iterdir()) == []
 
 
@@ -3610,7 +3682,8 @@ def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_pat
 
     `data` is exactly `{board, max_concurrent, levels}`; each level is
     `{level, milestones}`; each milestone is exactly `{milestone_id, title,
-    branch_prefix, plan}`, and `plan` is that milestone's `dry_run_payload`
+    branch_prefix, base_branch, plan}` (card 5bfe746d added `base_branch`, the
+    branch the milestone starts from), and `plan` is that milestone's `dry_run_payload`
     (`{max_concurrent, levels, already_done, integrate}`). `ok` is only on
     the envelope, never inside `data`, and nothing carries a `run_id`: a
     preview mints no run and opens no Store."""
@@ -3635,10 +3708,224 @@ def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_pat
     entries = [entry for level in data["levels"] for entry in level["milestones"]]
     assert [entry["milestone_id"] for entry in entries] == [first.id, second.id]
     for entry in entries:
-        assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+        assert set(entry) == {"milestone_id", "title", "branch_prefix", "base_branch", "plan"}
         assert set(entry["plan"]) == {"max_concurrent", "levels", "already_done", "integrate"}
         assert "ok" not in entry["plan"]
         assert "run_id" not in entry["plan"]
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_the_board_dry_run_puts_independent_milestones_on_the_base_branch(
+    tmp_path, monkeypatch
+):
+    """Card 5bfe746d, spec T2: no `blocked_by` between milestones, so each entry's
+    `base_branch` is `--base-branch` and its plan is today's, and git is never asked."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    second = _board_milestone(2)
+    _serve_roots(monkeypatch, [first, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    seen = _answer_local_branches(monkeypatch, set())
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    root = cli.resolve_repo_dir(tmp_path)
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        card,
+                        dag.task_stem(card),
+                        root=root,
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                    )
+                    for card in (first, second)
+                ],
+            }
+        ]
+    )
+    assert seen["asked"] == []
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("given", [None, "sprint9"], ids=["derived-prefix", "given-prefix"])
+def test_the_board_dry_run_stacks_a_milestone_on_its_open_blockers_integrate_branch(
+    tmp_path, monkeypatch, given
+):
+    """Card 5bfe746d, spec T3/T10: M2 blocked by the open M1 starts from M1's
+    `<prefix>-integrate`. That is its `base_branch`, its plan is computed
+    against it (story `root`, first subtask `base`, integrate tips), and with
+    `--branch-prefix sprint9` it reads `sprint9-<stem(M1)>-integrate`. An open
+    blocker never asks git; nothing is written."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(first.id,))
+    _serve_roots(monkeypatch, [first, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    seen = _answer_local_branches(monkeypatch, set())
+    extra = () if given is None else ("--branch-prefix", given)
+
+    def prefix(card: models.CardNode) -> str:
+        stem = dag.task_stem(card)
+        return stem if given is None else f"{given}-{stem}"
+
+    result = _board_dry_run(tmp_path, *extra)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    root = cli.resolve_repo_dir(tmp_path)
+    stacked = integration.integration_branch(prefix(first))
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        first,
+                        prefix(first),
+                        root=root,
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                    )
+                ],
+            },
+            {
+                "level": 1,
+                "milestones": [
+                    _expected_board_milestone(
+                        second,
+                        prefix(second),
+                        root=root,
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                        base_branch=stacked,
+                    )
+                ],
+            },
+        ]
+    )
+    first_entry = data["levels"][0]["milestones"][0]
+    second_entry = data["levels"][1]["milestones"][0]
+    assert first_entry["base_branch"] == "main"
+    assert second_entry["base_branch"] == stacked
+    story_row = second_entry["plan"]["levels"][0]["stories"][0]
+    assert story_row["root"] == stacked
+    assert story_row["subtasks"][0]["base"] == stacked
+    assert seen["asked"] == []
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("exists", [True, False], ids=["branch-kept", "branch-gone"])
+def test_the_board_dry_run_stacks_on_a_done_blockers_branch_only_while_it_exists_locally(
+    tmp_path, monkeypatch, exists
+):
+    """Card 5bfe746d, spec T4/T10: M1 is `done` (so not previewed) and blocks M2.
+    M2 stacks on `<stem(M1)>-integrate` only when that local branch exists;
+    otherwise it starts from `--base-branch`, today's behaviour. The git seam is
+    built for the resolved repo dir and asked exactly that one branch."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    _serve_roots(monkeypatch, [done, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    integrate = integration.integration_branch(dag.task_stem(done))
+    seen = _answer_local_branches(monkeypatch, {integrate} if exists else set())
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    root = cli.resolve_repo_dir(tmp_path)
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        second,
+                        dag.task_stem(second),
+                        root=root,
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                        base_branch=integrate if exists else "main",
+                    )
+                ],
+            }
+        ]
+    )
+    assert seen == {"roots": [root], "asked": [integrate]}
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("status", ["merged", "canceled", "archived"])
+def test_the_board_dry_run_never_stacks_on_or_asks_git_about_a_landed_blocker(
+    tmp_path, monkeypatch, status
+):
+    """Card 5bfe746d, spec T5: a landed blocker is ignored even when its integrate
+    branch would answer "exists"; git is never asked and M2 starts from `main`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    landed = _board_milestone(1, status=status)
+    second = _board_milestone(2, blocked_by=(landed.id,))
+    _serve_roots(monkeypatch, [landed, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    seen = _answer_local_branches(
+        monkeypatch, {integration.integration_branch(dag.task_stem(landed))}
+    )
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    root = cli.resolve_repo_dir(tmp_path)
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        second,
+                        dag.task_stem(second),
+                        root=root,
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                    )
+                ],
+            }
+        ]
+    )
+    assert seen["asked"] == []
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def test_the_board_dry_run_stacks_on_the_one_open_blocker_among_landed_and_unknown_ones(
+    tmp_path, monkeypatch
+):
+    """Review focus: M3 is blocked by the open M1, the merged M2 and an id that is
+    no milestone on the board. Only M1 is a stack candidate, so M3 starts from
+    M1's integrate branch: no `MilestoneBlockersError`, and git is never asked."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    merged = _board_milestone(2, status="merged")
+    third = _board_milestone(3, blocked_by=(first.id, merged.id, _plan_id(99)))
+    _serve_roots(monkeypatch, [first, merged, third])
+    _forbid_board_dry_run_writes(monkeypatch)
+    seen = _answer_local_branches(monkeypatch, set())
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    entries = {
+        entry["milestone_id"]: entry
+        for level in data["levels"]
+        for entry in level["milestones"]
+    }
+    assert set(entries) == {first.id, third.id}
+    assert entries[first.id]["base_branch"] == "main"
+    assert entries[third.id]["base_branch"] == integration.integration_branch(
+        dag.task_stem(first)
+    )
+    assert seen["asked"] == []
     assert list(paths.data_dir().iterdir()) == []
 
 
@@ -3662,15 +3949,43 @@ def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_pat
             ],
             "ValueError",
         ),
+        (
+            [
+                _board_milestone(1),
+                _board_milestone(2),
+                _board_milestone(3, blocked_by=(_plan_id(1), _plan_id(2))),
+            ],
+            "MilestoneBlockersError",
+        ),
+        (
+            [
+                _board_milestone(1, status="done", title="Milestone twin"),
+                _board_milestone(
+                    2,
+                    card_id="00000001-0000-4000-8000-000000000001",
+                    title="Milestone twin",
+                    blocked_by=(_plan_id(1),),
+                ),
+            ],
+            "ValueError",
+        ),
     ],
-    ids=["milestone-cycle", "non-uuid-milestone", "shared-derived-prefix"],
+    ids=[
+        "milestone-cycle",
+        "non-uuid-milestone",
+        "shared-derived-prefix",
+        "two-open-blockers",
+        "blocker-shares-a-prefix",
+    ],
 )
 def test_a_board_dry_run_refusal_is_an_envelope_and_writes_nothing(
     tmp_path, monkeypatch, roots, error_type
 ):
     """Review focus: a cycle among milestones, a milestone id `dag.task_stem`
-    cannot read, and two milestones deriving one prefix are each the same
-    `HANDLED` refusal the real run gives: `ok: false`, exit 3."""
+    cannot read, two milestones deriving one prefix, a milestone blocked by two
+    open milestones (`MilestoneBlockersError`) and a done blocker root deriving
+    an open milestone's prefix are each the same `HANDLED` refusal the real run
+    gives: `ok: false`, exit 3. None of these cases asks git."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _serve_roots(monkeypatch, roots)
     _forbid_board_dry_run_writes(monkeypatch)
@@ -3678,6 +3993,93 @@ def test_a_board_dry_run_refusal_is_an_envelope_and_writes_nothing(
     error = _refusal(_board_dry_run(tmp_path))
 
     assert error["type"] == error_type
+    assert list(paths.data_dir().iterdir()) == []
+
+
+def _bare_main_repo(path: Path) -> Path:
+    """A real git repo at `path` on `main` with one empty commit, no brd board."""
+    path.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)], check=True, capture_output=True, text=True
+    )
+    _git(path, "config", "user.email", "tests@example.com")
+    _git(path, "config", "user.name", "agent-manager tests")
+    _git(path, "config", "commit.gpgsign", "false")
+    _git(path, "commit", "--allow-empty", "-m", "base")
+    return path
+
+
+@pytest.mark.git
+@pytest.mark.parametrize(
+    "ref_kind, stacks", [("branch", True), ("tag", False)], ids=["local-branch", "tag-only"]
+)
+def test_the_board_dry_run_asks_real_git_for_a_done_blockers_local_integrate_branch(
+    tmp_path, monkeypatch, ref_kind, stacks
+):
+    """Card 5bfe746d, spec T9: the unreplaced `_local_branch_exists` against a real
+    repo. M1 is `done` and blocks M2. A local branch `<stem(M1)>-integrate`
+    stacks M2 on it; a tag of the same name, with no branch, does not, and M2
+    stays on `main`. The repo's branches, tags and work tree are untouched."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    repo = _bare_main_repo(tmp_path / "repo")
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    integrate = integration.integration_branch(dag.task_stem(done))
+    _git(repo, ref_kind, integrate)
+    _serve_roots(monkeypatch, [done, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    refs_before = _git(repo, "show-ref")
+    porcelain_before = _git(repo, "status", "--porcelain")
+
+    result = _board_dry_run(repo)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        second,
+                        dag.task_stem(second),
+                        root=cli.resolve_repo_dir(repo),
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                        base_branch=integrate if stacks else "main",
+                    )
+                ],
+            }
+        ]
+    )
+    assert _git(repo, "show-ref") == refs_before
+    assert _git(repo, "status", "--porcelain") == porcelain_before
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.git
+def test_the_board_dry_run_lets_a_git_error_from_a_non_repository_propagate(
+    tmp_path, monkeypatch
+):
+    """Card 5bfe746d, spec 2.3 / review focus: `--repo-dir` is no git repository and
+    M2's blocker is `done`, so its integrate branch must be looked up. git exits
+    128, which is not an answer: the `GitError` propagates (no envelope), as it
+    does from `run_board`, rather than silently previewing M2 on `main`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    # Stop git's repository discovery at tmp_path, so an enclosing repo can't answer.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    _serve_roots(monkeypatch, [done, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(not_a_repo)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, orchestrate.worktree.GitError)
+    assert result.exception.exit_code == 128
+    assert '"ok"' not in result.stdout
     assert list(paths.data_dir().iterdir()) == []
 
 
@@ -3891,8 +4293,12 @@ def test_a_board_run_exits_escalated_only_when_some_milestone_escalated(
         dag.DependencyCycleError("dag: dependency cycle among milestones #a, #b"),
         board.BoardError("brd refused", argv=["brd", "tree"]),
         cli.CliError("run 20261001T000000Z-00000001 already claims branch:m-integrate"),
+        orchestrate.MilestoneBlockersError(
+            "milestone X is blocked by 2 milestones that are not landed (A, B); "
+            "a milestone stacks on at most one: chain them (A <- B <- C)"
+        ),
     ],
-    ids=["ValueError", "DependencyCycleError", "BoardError", "CliError"],
+    ids=["ValueError", "DependencyCycleError", "BoardError", "CliError", "MilestoneBlockersError"],
 )
 def test_a_handled_error_from_a_board_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 12: every `HANDLED` refusal is `ok: false` at exit 3."""
@@ -10562,7 +10968,6 @@ def _alive_heartbeats() -> list[threading.Thread]:
 
 
 DRY_RUN_DETACH = "--dry-run writes nothing and cannot be detached"
-BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
 
 
 @pytest.mark.parametrize(
@@ -10579,18 +10984,36 @@ BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
             "'--detach' / '--dry-run'",
         ),
         (
-            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": False},
-            BOARD_DETACH,
-            "'--detach' / '--board'",
+            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
         ),
     ],
 )
-def test_check_run_targets_refuses_detach_with_dry_run_or_board(kwargs, message, hint):
+def test_check_run_targets_refuses_detach_with_dry_run(kwargs, message, hint):
     with pytest.raises(typer.BadParameter) as caught:
         cli._check_run_targets(detach=True, **kwargs)
 
     assert caught.value.message == message
     assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"branch_prefix": None},
+        {"branch_prefix": "p"},
+        {"branch_prefix": "p", "max_concurrent": 2},
+    ],
+)
+def test_check_run_targets_accepts_detach_with_board(kwargs):
+    """Card 03f027ea: `--board --detach` is no longer a usage error."""
+    assert (
+        cli._check_run_targets(
+            card=None, milestone=None, board=True, dry_run=False, detach=True, **kwargs
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -10607,14 +11030,14 @@ def test_check_run_targets_accepts_detach_with_card_or_milestone(kwargs):
 
 
 @pytest.mark.parametrize(
-    ("targets", "word"),
+    "targets",
     [
-        (["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"], "detached"),
-        (["--board"], "applies"),
+        ["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"],
+        ["--board", "--dry-run"],
     ],
 )
-def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
-    tmp_path, monkeypatch, targets, word
+def test_detach_with_dry_run_is_a_usage_error_that_detaches_nothing(
+    tmp_path, monkeypatch, targets
 ):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _forbid_board_paths(monkeypatch)
@@ -10627,9 +11050,136 @@ def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
 
     assert result.exit_code == 2, result.output
     assert '"ok"' not in result.stdout
-    assert word in result.output
+    assert "detached" in result.output
     assert fake.calls == []
     assert not (paths.data_dir() / "runs").exists()
+    assert not (paths.data_dir() / "boards").exists()
+
+
+# ── am run --board --detach (card 03f027ea) ─────────────────────────────────
+
+
+DETACHED_BOARD_PAYLOAD: dict[str, Any] = {
+    "board": True,
+    "detached": True,
+    "pid": FAKE_CHILD_PID,
+    "log": "/data/agent-manager/boards/20261004T090000Z-abc.log",
+    "report": "/data/agent-manager/boards/20261004T090000Z-abc.report.json",
+    "levels": [{"level": 0, "milestones": [SOME_CARD]}],
+}
+
+
+def _patch_detach_board(monkeypatch, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replace `orchestrate.detach_board`, forbid every other run path, record calls."""
+    _forbid_board_paths(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def fake_detach_board(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return payload
+
+    monkeypatch.setattr(orchestrate, "detach_board", fake_detach_board)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("max_concurrent must be at least 1, got 0"),
+        dag.DependencyCycleError("dag: dependency cycle among milestones #a, #b"),
+        orchestrate.MilestoneBlockersError(
+            "milestone X is blocked by 2 milestones that are not landed (A, B); "
+            "a milestone stacks on at most one: chain them (A <- B <- C)"
+        ),
+        cli.ClaimedError(
+            "run 20261001T000000Z-00000001 already claims branch:m-integrate",
+            key="branch:m-integrate",
+            run_id="20261001T000000Z-00000001",
+        ),
+        board.BoardError("brd refused", argv=["brd", "tree"]),
+    ],
+    ids=["ValueError", "DependencyCycleError", "MilestoneBlockersError", "ClaimedError", "BoardError"],
+)
+def test_a_board_detach_preflight_refusal_is_an_envelope_that_forks_nothing(
+    tmp_path, monkeypatch, error
+):
+    """Spec test 4 / Review Focus 2: the real `detach_board` over a refusing
+    `preflight_board`: exit 3, no fork, `<data dir>/boards` absent."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def refuse(**kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(orchestrate, "preflight_board", refuse)
+
+    refusal = _refusal(_board_run(tmp_path, "--detach"))
+
+    assert refusal == {"type": type(error).__name__, "message": str(error)}
+    assert fake.calls == []
+    assert not (paths.data_dir() / "boards").exists()
+
+
+def test_a_board_detach_calls_detach_board_once_with_the_run_options(tmp_path, monkeypatch):
+    """Spec test 5: the kwargs are compared whole, so an extra key fails;
+    `detacher` is `detach.fork_detacher` read at call time."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_detach_board(monkeypatch, DETACHED_BOARD_PAYLOAD)
+    sentinel = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", sentinel)
+
+    result = _board_run(
+        tmp_path,
+        "--detach",
+        "--verify",
+        "X",
+        "--max-concurrent",
+        "3",
+        "--branch-prefix",
+        "p",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(DETACHED_BOARD_PAYLOAD)
+    (kwargs,) = calls
+    prefix_of = kwargs.pop("branch_prefix_of")
+    assert kwargs.pop("detacher") is sentinel
+    assert kwargs == {
+        "repo_dir": tmp_path,
+        "base_branch": "main",
+        "commands": ["X"],
+        "allow_no_verification": False,
+        "max_concurrent": 3,
+    }
+    assert prefix_of(BOARD_CARD) == cli.board_prefix_of("p")(BOARD_CARD)
+    assert prefix_of(BOARD_CARD) == "p-milestone-14-run-the-cbe34d00"
+    assert sentinel.calls == []
+
+
+def test_a_board_detach_exits_0_even_when_its_payload_reads_as_escalated(
+    tmp_path, monkeypatch
+):
+    """Spec test 6 / Review Focus 4: the board escalation check is skipped."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    payload = {**DETACHED_BOARD_PAYLOAD, "milestones": [{"status": "escalated"}]}
+    _patch_detach_board(monkeypatch, payload)
+    monkeypatch.setattr(detach, "fork_detacher", _FakeDetacher())
+
+    result = _board_run(tmp_path, "--detach")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+def test_run_help_and_examples_document_the_board_detach():
+    """Spec §3.6."""
+    assert 'am run --board --verify "uv run pytest" --detach' in cli.RUN_EXAMPLES
+    help_text = inspect.signature(cli.run).parameters["detach_run"].default.help
+    assert "--board" in help_text
+    assert "<data dir>/boards/<stamp>-<digest>.log" in help_text
+    assert "<stamp>-<digest>.report.json" in help_text
 
 
 def _handed_off_card_run(root: Path, card_id: str) -> tuple[Any, str]:

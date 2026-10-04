@@ -223,6 +223,44 @@ def test_run_dir_is_idempotent(monkeypatch, tmp_path):
     assert (second / "journal.jsonl").read_text() == "{}\n"
 
 
+def test_project_digest_is_the_project_db_stem_and_64_hex(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    digest = paths.project_digest(project_root)
+
+    assert paths.project_db_path(project_root).name == f"{digest}.db"
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+def test_project_digest_matches_a_fixed_vector():
+    assert paths.project_digest(Path("/nonexistent/repo")) == (
+        "5b6e8e2d129e523b4fabf8a73dcdc18cb7f253565385fd9e6e5c0888ba865785"
+    )
+
+
+def test_boards_dir_is_under_data_dir_and_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    result = paths.boards_dir()
+
+    assert result == tmp_path / "agent-manager" / "boards"
+    assert result.is_dir()
+
+
+def test_boards_dir_is_idempotent_and_keeps_what_is_inside(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    first = paths.boards_dir()
+    (first / "a.log").write_text("x\n", encoding="utf-8")
+
+    second = paths.boards_dir()
+
+    assert second == first
+    assert (second / "a.log").read_text(encoding="utf-8") == "x\n"
+
+
 def test_attempt_dir_layout(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     result = paths.attempt_dir("run-abc", "abc123", "implement", 2)

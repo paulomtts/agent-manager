@@ -1299,8 +1299,10 @@ def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], st
 
     With `--branch-prefix` omitted the prefix is the milestone card's own
     `dag.task_stem`; given, it is `<branch_prefix>-<stem>`, never the given
-    value verbatim, so two milestones can never share it. Checking the result
-    (blank, shared) is `orchestrate.board_prefixes`'s job, not this one's.
+    value verbatim, so two milestones can never share it. It reads only the
+    card's title and id, never its status, so a milestone that is no longer
+    open gets the prefix it ran under. Checking the result (blank, shared) is
+    `orchestrate.board_prefixes`'s job, not this one's.
     """
 
     def prefix_of(card: models.CardNode) -> str:
@@ -1317,22 +1319,37 @@ def dry_run_board(
     base_branch: str,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
-    """`--dry-run --board`: every open milestone, by level, each with its own preview.
+    """`--dry-run --board`: every open milestone, by level, each on its own base.
 
-    Read-only by construction, like `dry_run_milestone`. `board.roots()` is
-    read once (each root already nests its whole tree), leveled by
-    `dag.board_levels` (a done milestone drops out, a cycle is
-    `DependencyCycleError`), and each milestone's prefix comes from
-    `orchestrate.board_prefixes` over `board_prefix_of`, the very check
-    `run_board` makes. Each milestone's `plan` is its own `dry_run_payload`.
-    No `Store` is opened, no claim is checked, no runner is built, and
+    Read-only by construction, like `dry_run_milestone`, and composed the way
+    `run_board` composes its refusals. `board.roots()` is read once (each root
+    already nests its whole tree), leveled by `dag.board_levels` (a done
+    milestone drops out, a cycle is `DependencyCycleError`). Each milestone's
+    prefix, and each non-open blocker root's, comes from
+    `orchestrate.board_prefixes(..., roots=)` over `board_prefix_of`, the very
+    check `run_board` makes. Each milestone's base comes from
+    `orchestrate.milestone_bases` with `orchestrate._local_branch_exists`, read
+    at call time: its one open blocker's `<prefix>-integrate`, or its one
+    unlanded blocker's when that branch exists locally, else `base_branch`;
+    two such blockers is `MilestoneBlockersError`. The base is the entry's
+    `base_branch`, and its `plan` (its own `dry_run_payload`) is computed
+    against it. The only I/O past the board read is that read-only
+    `git rev-parse`, asked only about an unlanded, non-open blocker. No
+    `Store` is opened, no claim is checked, no runner is built, and
     `orchestrate.run_board` is never called. Every refusal is a type already
-    in `HANDLED`.
+    in `HANDLED`; a `GitError` from a broken repository propagates, as it
+    does from `run_board`.
     """
     root = resolve_repo_dir(repo_dir)
-    levels = dag.board_levels(board.roots(repo_dir=root))
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
     milestones = [card for level in levels for card in level]
-    prefixes = orchestrate.board_prefixes(milestones, board_prefix_of(branch_prefix))
+    prefixes = orchestrate.board_prefixes(
+        milestones, board_prefix_of(branch_prefix), roots=all_roots
+    )
+    bases = orchestrate.milestone_bases(
+        all_roots, prefixes, orchestrate._local_branch_exists(root), base_branch
+    )
     return {
         "board": True,
         "max_concurrent": max_concurrent,
@@ -1344,11 +1361,12 @@ def dry_run_board(
                         "milestone_id": card.id,
                         "title": card.title,
                         "branch_prefix": prefixes[card.id],
+                        "base_branch": bases[card.id],
                         "plan": dry_run_payload(
                             census.flatten_milestone(card).stories,
                             repo_dir=root,
                             branch_prefix=prefixes[card.id],
-                            base_branch=base_branch,
+                            base_branch=bases[card.id],
                             max_concurrent=max_concurrent,
                         ),
                     }
@@ -1555,8 +1573,7 @@ def _check_run_targets(
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
     `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
-    nothing to hand off, and with `--board`, whose run was not split into
-    pre-flight, recorded stage and engine.
+    nothing to hand off.
     """
     if board and card is not None:
         raise typer.BadParameter(
@@ -1598,11 +1615,6 @@ def _check_run_targets(
             "--dry-run writes nothing and cannot be detached",
             param_hint="'--detach' / '--dry-run'",
         )
-    if detach and board:
-        raise typer.BadParameter(
-            "--detach applies to --card and --milestone, not --board",
-            param_hint="'--detach' / '--board'",
-        )
     if dry_run and card is not None:
         raise typer.BadParameter(
             "--dry-run previews a milestone and does not apply to --card",
@@ -1626,6 +1638,7 @@ Examples:
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
   am run --board --verify "uv run pytest"                             # run every open milestone
+  am run --board --verify "uv run pytest" --detach                    # ... in the background
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
 """
@@ -1668,10 +1681,14 @@ def run(
         False,
         "--detach",
         help=(
-            "With --card or --milestone: check, record and lease the run here, "
-            "then hand it to a background process in its own session and print "
-            "its run id, pid and log. Its output goes to "
-            "<data dir>/runs/<run-id>/run.log and its final envelope to report.json."
+            "With --card, --milestone or --board: make every check here (and, for "
+            "--card or --milestone, record and lease the run), then hand the run to "
+            "a background process in its own session and print its pid and log. "
+            "A card or milestone run's output goes to "
+            "<data dir>/runs/<run-id>/run.log and its final envelope to "
+            "report.json; a board's output goes to "
+            "<data dir>/boards/<stamp>-<digest>.log and its final envelope to "
+            "<stamp>-<digest>.report.json."
         ),
     ),
     max_concurrent: int | None = typer.Option(
@@ -1737,6 +1754,18 @@ def run(
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
                 max_concurrent=lanes,
+            )
+        elif whole_board and detach_run:
+            # Read as `orchestrate.detach_board` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_board(
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix_of=board_prefix_of(branch_prefix),
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
+                detacher=detach.fork_detacher,
             )
         elif whole_board:
             # Read as `orchestrate.run_board` so a test can patch it there.

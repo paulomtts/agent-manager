@@ -541,3 +541,28 @@ def test_status_sets_live_in_one_place():
         assert census.is_out_of_play(status) and not census.is_finished(status)
     for status in ("todo", "in_progress", "blocked", None, ""):
         assert not census.is_finished(status) and not census.is_out_of_play(status)
+
+
+@pytest.mark.parametrize(
+    ("status", "landed"),
+    [
+        ("merged", True),
+        ("MERGED", True),
+        ("canceled", True),
+        ("Archived", True),
+        ("done", False),
+        ("Done", False),
+        ("todo", False),
+        ("in_progress", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_is_landed_means_merged_or_out_of_play_in_any_case(status, landed):
+    assert census.is_landed(status) is landed
+
+
+def test_landed_statuses_are_finished_but_not_plain_done_or_out_of_play():
+    assert census.LANDED_STATUSES <= census.FINISHED_STATUSES | census.OUT_OF_PLAY_STATUSES
+    assert "done" not in census.LANDED_STATUSES
+    assert census.LANDED_STATUSES == frozenset({"merged", "canceled", "archived"})
