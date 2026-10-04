@@ -1012,6 +1012,137 @@ def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
     assert "tokens" in str(excinfo.value)
 
 
+# -- retired attempt usage keys (remove-cost-tracking §4.3) -------------------
+#
+# Every journal written before 2026-10-03 carries `tokens_in`, `tokens_out`
+# and `cost` on each attempt line. `Attempt` no longer declares them, so
+# `replay` sheds exactly those three names from an attempt payload and stays
+# strict about everything else. Unit tier: real temp DB and journal.
+
+_RETIRED_NULL = {"tokens_in": None, "tokens_out": None, "cost": None}
+_RETIRED_SET = {"tokens_in": 8000, "tokens_out": 1500, "cost": 0.31}
+
+
+def _append_old_attempt(journal: store.Journal, extra: dict) -> None:
+    """Re-record implement attempt 1 as `ok`, the way an `am` from before
+    2026-10-03 wrote it: today's payload plus `extra`."""
+    payload = models.Attempt(
+        n=1,
+        dispatch=_dispatch(card="ef248597", phase="implement"),
+        status="ok",
+        exit_code=0,
+        duration=12.5,
+    ).model_dump(mode="json")
+    _append_raw(
+        journal,
+        {
+            "seq": journal.last_seq() + 1,
+            "ts": "2026-09-23T10:20:00+00:00",
+            "run_id": RUN_ID,
+            "event": "attempt_upsert",
+            "story": "8831189b",
+            "card": "ef248597",
+            "phase": "implement",
+            "attempt": 1,
+            "payload": {**payload, **extra},
+        },
+    )
+
+
+@pytest.mark.parametrize("retired", [_RETIRED_NULL, _RETIRED_SET], ids=["null", "non_null"])
+def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, retired):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, retired)
+        replayed = st.replay_journal(RUN_ID)
+        # The projection already holds this run, so the rebuild runs its
+        # `diverging` pre-check over the same old lines first.
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+        assert loaded is not None
+        mismatches = store.diverging(st.journal.read(), loaded)
+    finally:
+        st.close()
+
+    assert replayed == rebuilt == loaded
+    attempt = rebuilt.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (attempt.n, attempt.status, attempt.exit_code, attempt.duration) == (
+        1,
+        "ok",
+        0,
+        12.5,
+    )
+    for key in retired:
+        assert not hasattr(attempt, key)
+    assert set(retired).isdisjoint(attempt.model_dump())
+    assert mismatches == []
+
+
+@pytest.mark.parametrize("read", ["replay_journal", "rebuild_from_journal"])
+def test_an_attempt_line_with_any_other_unknown_key_still_raises_naming_only_it(
+    repo, read
+):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, {**_RETIRED_NULL, "operator": "x"})
+        with pytest.raises(ValidationError) as excinfo:
+            getattr(st, read)(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("operator",)]
+    assert "operator" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "event", ["run_upsert", "story_upsert", "subtask_upsert", "phase_upsert"]
+)
+def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
+    # No other node ever carried these keys, so on any other line they are
+    # still an unknown key and still fail loudly.
+    coordinates, payload = {
+        "run_upsert": ({}, _run(repo).model_dump(mode="json", exclude={"stories"})),
+        "story_upsert": (
+            {"story": "8831189b"},
+            _story().model_dump(mode="json", exclude={"subtasks"}),
+        ),
+        "subtask_upsert": (
+            {"story": "8831189b"},
+            _subtask("ef248597", base="m1/task-fdebc746").model_dump(
+                mode="json", exclude={"phases"}
+            ),
+        ),
+        "phase_upsert": (
+            {"story": "8831189b", "card": "ef248597"},
+            models.PhaseRun(name="implement", kind="agent", status="started").model_dump(
+                mode="json", exclude={"attempts"}
+            ),
+        ),
+    }[event]
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_raw(
+            st.journal,
+            {
+                "seq": st.journal.last_seq() + 1,
+                "ts": "2026-09-23T10:20:00+00:00",
+                "run_id": RUN_ID,
+                "event": event,
+                **coordinates,
+                "payload": {**payload, "cost": None},
+            },
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            st.replay_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("cost",)]
+
+
 def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
     st = store.Store.open(repo, RUN_ID)
     try:

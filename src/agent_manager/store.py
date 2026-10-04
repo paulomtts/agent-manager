@@ -341,6 +341,26 @@ class JournalLine(BaseModel):
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
 
 
+_RETIRED_ATTEMPT_KEYS: frozenset[str] = frozenset({"tokens_in", "tokens_out", "cost"})
+"""Attempt payload keys dropped before validation (remove-cost-tracking design,
+docs/superpowers/specs/2026-10-03-remove-cost-tracking-design.md §4.3).
+
+Every journal written before 2026-10-03 carries them on each `attempt_upsert`
+line, as null. `models.Attempt` no longer declares them and forbids unknown
+keys, so without this every old journal would stop replaying: the projection
+could not be rebuilt, and resume adoption would silently decline every old run.
+A named allow-list rather than `extra="ignore"`: any other unknown key still
+fails, and only attempt payloads are touched."""
+
+
+def _current_attempt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """`payload` without `_RETIRED_ATTEMPT_KEYS`, whatever their values, as a
+    new dict. The journal line's own payload is never mutated."""
+    return {
+        key: value for key, value in payload.items() if key not in _RETIRED_ATTEMPT_KEYS
+    }
+
+
 class _UnknownEventLine(BaseModel):
     """What a line with an unrecognised `event` must still carry: its `seq`.
 
@@ -561,7 +581,10 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
 
     Nothing here is defensive: a line that fails `models` validation raises the
     `pydantic.ValidationError` straight out, because an old-schema line has to
-    fail loudly rather than quietly drop a field from the projection.
+    fail loudly rather than quietly drop a field from the projection. The one
+    exception is `_RETIRED_ATTEMPT_KEYS`: an `attempt_upsert` payload sheds
+    those three named keys, which every pre-2026-10-03 journal carries, before
+    it is validated, and any other unknown key still raises.
     """
     run: models.Run | None = None
 
@@ -611,7 +634,8 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
             continue
 
         phase = _find(subtask.phases, "name", line.phase, "phase", line.seq)
-        _upsert(phase.attempts, "n", models.Attempt.model_validate(line.payload), None)
+        attempt = models.Attempt.model_validate(_current_attempt_payload(line.payload))
+        _upsert(phase.attempts, "n", attempt, None)
 
     if run is None:
         raise JournalError("journal contains no run_upsert line")
@@ -656,7 +680,8 @@ _NODE_MODELS: dict[str, type[BaseModel]] = {
     "phase_upsert": models.PhaseRun,
     "attempt_upsert": models.Attempt,
 }
-"""The model each event's payload validates as, exactly as `replay` reads it."""
+"""The model each event's payload validates as, exactly as `replay` reads it
+(an `attempt_upsert` payload first sheds `_RETIRED_ATTEMPT_KEYS`)."""
 
 _LEVELS: tuple[tuple[str, str], ...] = (
     ("stories", "card_id"),
@@ -699,7 +724,12 @@ def _journaled_statuses(lines: list[JournalLine]) -> dict[_NodeKey, set[str]]:
     """Every status each node was ever journaled at, at any seq (§3.2)."""
     seen: dict[_NodeKey, set[str]] = {}
     for line in sorted(lines, key=lambda item: item.seq):
-        node: Any = _NODE_MODELS[line.event].model_validate(line.payload)
+        payload = (
+            _current_attempt_payload(line.payload)
+            if line.event == "attempt_upsert"
+            else line.payload
+        )
+        node: Any = _NODE_MODELS[line.event].model_validate(payload)
         seen.setdefault(_line_node(line, node), set()).add(node.status)
     return seen
 

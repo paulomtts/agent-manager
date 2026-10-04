@@ -2490,6 +2490,39 @@ def test_a_source_journal_that_fails_validation_declines(store, tmp_path, worktr
     assert len(launcher.calls) == 1
 
 
+def test_a_source_run_whose_ok_attempt_carries_retired_usage_keys_is_still_adopted(
+    store, tmp_path, worktree
+):
+    # Remove-cost-tracking §5.3 item 2: every journal written before
+    # 2026-10-03 carries `tokens_in`/`tokens_out`/`cost` (null) on its attempt
+    # lines. `adopt` turns replay's ValidationError into a silent decline, so
+    # without the replay shim every old run would quietly redispatch.
+    _succeed_once(store, tmp_path, worktree)
+    [ok] = _terminal_attempts(store)
+    store.journal.append(
+        "attempt_upsert",
+        {**ok, **dict.fromkeys(_USAGE_KEYS)},
+        story=STORY_ID,
+        card=CARD,
+        phase="explore",
+        attempt=1,
+    )
+    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    try:
+        launcher = FakeLauncher(results=[VALID_RESULT])
+        runner, _ = _runner(other, launcher, tmp_path, worktree, run_id=OTHER_RUN_ID)
+        adopted = runner.adopt(
+            _passing_phase(), _context(worktree), source_run=RUN_ID, floor=0
+        )
+    finally:
+        other.close()
+
+    assert adopted == dispatch.Adopted(EXPLORED, 1, RUN_ID)
+    assert launcher.calls == []
+    assert _declines(runner) == []
+    assert runner.warnings == [_reused(1)]
+
+
 def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
     _succeed_once(store, tmp_path, worktree)
     recorded = store.replay_journal(RUN_ID).stories[0].subtasks[0].phases[0]
