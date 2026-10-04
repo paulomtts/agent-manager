@@ -968,6 +968,87 @@ def recorded_card_run(pre: CardPreflight) -> Iterator[RecordedRun]:
         store.close()
 
 
+async def run_card_engine(
+    pre: CardPreflight,
+    recorded: RecordedRun,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Stage 3 of `run --card`: walk a recorded, leased run and report (card 5daa944e).
+
+    The walk runs under `control.controlled` with the recorded stage's lease,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request` (C11). Then the outcome rows are
+    recorded and, still under the lease, the card gets at most one comment
+    (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
+    the payload's `warnings`. The caller owns the store and the lease.
+    """
+    store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
+    stop = StopSignal()
+    # `controlled` only ever parks the walk through `stop` (C3); it
+    # closes the window and runs a final sweep before returning.
+    drive = await control.controlled(
+        drive_subtask_async(
+            store=store,
+            run_id=run_id,
+            card=pre.card,
+            parent=pre.parent,
+            subtask=pre.subtask,
+            repo_dir=pre.root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            stop=stop,
+        ),
+        store=store,
+        stop=stop,
+        lease=lease,
+        interval=control_interval,
+    )
+    summary = drive.summary
+    run_status = card_run_status(summary, stop)
+
+    store.record_run(pre.run_record.model_copy(update={"status": run_status}))
+    store.record_story(pre.story.model_copy(update={"status": summary.status}))
+    store.record_subtask(
+        pre.story.card_id, pre.subtask.model_copy(update={"status": summary.status})
+    )
+
+    # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
+    # still under the lease, so the outbox write is fenced. A board
+    # failure is a warning (B8); a lost lease propagates.
+    comment = card_outcome_comment(
+        run_id=run_id,
+        card=pre.card,
+        summary=summary,
+        stop=stop,
+        branch=pre.branch,
+        token=lease.token,
+    )
+    if comment is not None:
+        # `orchestrate` imports `cli`, so it is read here, at call time.
+        from agent_manager import orchestrate
+
+        drive.warnings.extend(orchestrate.post_comment(store, pre.root, comment, run_id=run_id))
+
+    return {
+        "run_id": run_id,
+        "card_id": pre.card.id,
+        "story_id": pre.parent.id,
+        "branch": pre.branch,
+        "base_branch": pre.base_branch,
+        "worktree": str(pre.worktree),
+        "status": run_status,
+        "failed_phase": summary.failed_phase,
+        "detail": summary.detail,
+        "skipped": list(summary.skipped),
+        "warnings": drive.warnings,
+    }
+
+
 def run_card(
     card_id: str,
     *,
@@ -982,6 +1063,13 @@ def run_card(
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
+    Three stages (card 5daa944e), composed here: `preflight_card` (the board
+    reads and every refusal, then the run id and the `started` records, with
+    no side effect), `recorded_card_run` (the store opened, the lease and
+    the `card:<id>` claim taken, the `started` rows written) and
+    `run_card_engine` (the walk, the outcome rows and the card comment),
+    which runs under one `asyncio.run`.
+
     The order is the spec's and it is load-bearing: the board reads happen before
     a run id exists (so a bad card leaves no run directory), and the run, story
     and subtask rows are written before the walk starts (so `status` and `resume`
@@ -995,131 +1083,30 @@ def run_card(
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
     the run `cancelled` (`card_run_status`). No control cancels a running phase.
+    The lease and claim are released before `store.close()` on every exit.
 
     Board comments (card 5d9a875f): once the rows are recorded, still under
     the lease, the card gets at most one comment (`card_outcome_comment`);
     a flush's warnings join the payload's `warnings` and nothing else changes.
     """
-    root = resolve_repo_dir(repo_dir)
-    card = board.show(card_id, repo_dir=root)
-    if not card.parent_id:
-        raise ParentlessCardError(
-            f"card {card.id} ({card.title!r}) has no parent card; `run --card` drives "
-            "a subtask of a story, and the story is what every run record is keyed by"
-        )
-    parent = board.show(card.parent_id, repo_dir=root)
-
-    branch = dag.task_branch(branch_prefix, card)
-    worktree = worktree_for(root, branch)
-    claims = [control.card_claim(card.id)]
-    # Read-only and before `Store.open`, so a refused card leaves no run
-    # directory (X5); `take_lease` below re-checks atomically.
-    refuse_claimed(root, claims)
-    started_at = clock()
-    run_id = mint_run_id(card.id, started_at)
-
-    store = Store.open(root, run_id)
-    try:
-        run_record = models.Run(
-            id=run_id,
-            workflow=WORKFLOW_NAME,
-            repo_dir=root,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            status="started",
-            started_at=started_at,
-            config=models.RunConfig(),
-        )
-        story = models.StoryRun(
-            card_id=parent.id,
-            title=parent.title,
-            level=0,
-            status="started",
-            tip_branch=branch,
-        )
-        subtask = models.SubtaskRun(
-            card_id=card.id,
-            branch=branch,
-            base_branch=base_branch,
-            status="started",
-            worktree_path=worktree,
-        )
-        # Inside the `try` that closes the store, so the claims and the lease
-        # are released before `store.close()` on every exit, a raising walk
-        # included (C2, X5). Taken before `record_run`, so every run write is
-        # fenced by this token; a lost race is `ClaimedError` with nothing
-        # written but the empty run directory.
-        with run_lease(store, claims=claims) as lease:
-            store.record_run(run_record)
-            store.record_story(story)
-            store.record_subtask(story.card_id, subtask)
-
-            stop = StopSignal()
-            # `controlled` only ever parks the walk through `stop` (C3); it
-            # closes the window and runs a final sweep before returning.
-            drive = asyncio.run(
-                control.controlled(
-                    drive_subtask_async(
-                        store=store,
-                        run_id=run_id,
-                        card=card,
-                        parent=parent,
-                        subtask=subtask,
-                        repo_dir=root,
-                        commands=commands,
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        stop=stop,
-                    ),
-                    store=store,
-                    stop=stop,
-                    lease=lease,
-                    interval=control_interval,
-                )
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                recorded,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
             )
-            summary = drive.summary
-            run_status = card_run_status(summary, stop)
-
-            store.record_run(run_record.model_copy(update={"status": run_status}))
-            store.record_story(story.model_copy(update={"status": summary.status}))
-            store.record_subtask(
-                story.card_id, subtask.model_copy(update={"status": summary.status})
-            )
-
-            # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
-            # still under the lease, so the outbox write is fenced. A board
-            # failure is a warning (B8); a lost lease propagates.
-            comment = card_outcome_comment(
-                run_id=run_id,
-                card=card,
-                summary=summary,
-                stop=stop,
-                branch=branch,
-                token=lease.token,
-            )
-            if comment is not None:
-                # `orchestrate` imports `cli`, so it is read here, at call time.
-                from agent_manager import orchestrate
-
-                drive.warnings.extend(
-                    orchestrate.post_comment(store, root, comment, run_id=run_id)
-                )
-
-        return {
-            "run_id": run_id,
-            "card_id": card.id,
-            "story_id": parent.id,
-            "branch": branch,
-            "base_branch": base_branch,
-            "worktree": str(worktree),
-            "status": run_status,
-            "failed_phase": summary.failed_phase,
-            "detail": summary.detail,
-            "skipped": list(summary.skipped),
-            "warnings": drive.warnings,
-        }
-    finally:
-        store.close()
+        )
 
 
 DEFAULT_MAX_CONCURRENT = 4

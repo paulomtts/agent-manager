@@ -9271,3 +9271,94 @@ def test_a_claim_taken_after_card_preflight_is_refused_on_entry_with_nothing_rec
     assert closes == [(0, 0)]
     assert _recorded_run_ids(root) == []
     assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def _done_drive(calls: list[dict[str, Any]]):
+    """A fake `drive_subtask_async` that records its keywords and finishes `done`."""
+
+    async def drive(**kwargs: Any) -> cli.SubtaskDrive:
+        calls.append(kwargs)
+        return cli.SubtaskDrive(summary=SubtaskSummary(status="done"), warnings=[])
+
+    return drive
+
+
+def test_run_card_hands_the_engine_the_lease_of_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    handed: dict[str, Any] = {}
+
+    real_recorded = cli.recorded_card_run
+
+    @contextmanager
+    def spying_recorded(pre):
+        with real_recorded(pre) as recorded:
+            handed["recorded"] = recorded
+            yield recorded
+
+    real_controlled = control.controlled
+
+    async def spying_controlled(work, **kwargs):
+        handed["controlled"] = kwargs["lease"]
+        return await real_controlled(work, **kwargs)
+
+    real_comment = cli.card_outcome_comment
+
+    def spying_comment(**kwargs):
+        handed["token"] = kwargs["token"]
+        return real_comment(**kwargs)
+
+    monkeypatch.setattr(cli, "recorded_card_run", spying_recorded)
+    monkeypatch.setattr(control, "controlled", spying_controlled)
+    monkeypatch.setattr(cli, "card_outcome_comment", spying_comment)
+
+    result = cli.run_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        control_interval=0.01,
+    )
+
+    recorded = handed["recorded"]
+    assert handed["controlled"] is recorded.lease
+    assert handed["token"] == recorded.lease.token
+    assert recorded.run_id == result["run_id"] == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert [call["run_id"] for call in calls] == [result["run_id"]]
+    assert calls[0]["store"] is recorded.store
+    assert result["status"] == "done"
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_card_engine_still_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    """Spec: a crash in the engine still propagates, still releases the lease
+    and claims, and still closes the store. A characterization pin: it passes
+    before the split and must keep passing after it."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    async def crashing_drive(**kwargs: Any) -> Any:
+        raise RuntimeError("drive bug")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", crashing_drive)
+    closes = _close_snapshots(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="drive bug"):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=root,
+            branch_prefix="m1",
+            base_branch="main",
+            clock=lambda: SEAM_AT,
+            control_interval=0.01,
+        )
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
