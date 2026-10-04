@@ -189,9 +189,6 @@ class _FakeAdapter:
             str(d.result_path),
         ]
 
-    def parse_usage(self, stdout: str) -> None:
-        return None
-
 
 _CONFLICT_HEADING = "\n## conflict_files\n"
 

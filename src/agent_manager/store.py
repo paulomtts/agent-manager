@@ -89,9 +89,6 @@ CREATE TABLE IF NOT EXISTS attempts (
     status       TEXT NOT NULL,
     exit_code    INTEGER,
     duration     REAL,
-    tokens_in    INTEGER,
-    tokens_out   INTEGER,
-    cost         REAL,
     prompt_path  TEXT,
     result_path  TEXT,
     stdout_path  TEXT,
@@ -246,7 +243,10 @@ def open_db(root: Path) -> sqlite3.Connection:
     `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
     table lacks, as a nullable column. Existing rows keep their data and read
     the new column as NULL. It is a no-op on a database that already has the
-    column, so opening the same database any number of times is safe.
+    column, so opening the same database any number of times is safe. Nothing
+    is ever dropped: an `attempts` table created before 2026-10-03 keeps its
+    `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
+    any more, so they stay NULL.
 
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
@@ -339,6 +339,26 @@ class JournalLine(BaseModel):
 
 
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
+
+
+_RETIRED_ATTEMPT_KEYS: frozenset[str] = frozenset({"tokens_in", "tokens_out", "cost"})
+"""Attempt payload keys dropped before validation (remove-cost-tracking design,
+docs/superpowers/specs/2026-10-03-remove-cost-tracking-design.md §4.3).
+
+Every journal written before 2026-10-03 carries them on each `attempt_upsert`
+line, as null. `models.Attempt` no longer declares them and forbids unknown
+keys, so without this every old journal would stop replaying: the projection
+could not be rebuilt, and resume adoption would silently decline every old run.
+A named allow-list rather than `extra="ignore"`: any other unknown key still
+fails, and only attempt payloads are touched."""
+
+
+def _current_attempt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """`payload` without `_RETIRED_ATTEMPT_KEYS`, whatever their values, as a
+    new dict. The journal line's own payload is never mutated."""
+    return {
+        key: value for key, value in payload.items() if key not in _RETIRED_ATTEMPT_KEYS
+    }
 
 
 class _UnknownEventLine(BaseModel):
@@ -561,7 +581,10 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
 
     Nothing here is defensive: a line that fails `models` validation raises the
     `pydantic.ValidationError` straight out, because an old-schema line has to
-    fail loudly rather than quietly drop a field from the projection.
+    fail loudly rather than quietly drop a field from the projection. The one
+    exception is `_RETIRED_ATTEMPT_KEYS`: an `attempt_upsert` payload sheds
+    those three named keys, which every pre-2026-10-03 journal carries, before
+    it is validated, and any other unknown key still raises.
     """
     run: models.Run | None = None
 
@@ -611,7 +634,8 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
             continue
 
         phase = _find(subtask.phases, "name", line.phase, "phase", line.seq)
-        _upsert(phase.attempts, "n", models.Attempt.model_validate(line.payload), None)
+        attempt = models.Attempt.model_validate(_current_attempt_payload(line.payload))
+        _upsert(phase.attempts, "n", attempt, None)
 
     if run is None:
         raise JournalError("journal contains no run_upsert line")
@@ -656,7 +680,8 @@ _NODE_MODELS: dict[str, type[BaseModel]] = {
     "phase_upsert": models.PhaseRun,
     "attempt_upsert": models.Attempt,
 }
-"""The model each event's payload validates as, exactly as `replay` reads it."""
+"""The model each event's payload validates as, exactly as `replay` reads it
+(an `attempt_upsert` payload first sheds `_RETIRED_ATTEMPT_KEYS`)."""
 
 _LEVELS: tuple[tuple[str, str], ...] = (
     ("stories", "card_id"),
@@ -699,7 +724,12 @@ def _journaled_statuses(lines: list[JournalLine]) -> dict[_NodeKey, set[str]]:
     """Every status each node was ever journaled at, at any seq (§3.2)."""
     seen: dict[_NodeKey, set[str]] = {}
     for line in sorted(lines, key=lambda item: item.seq):
-        node: Any = _NODE_MODELS[line.event].model_validate(line.payload)
+        payload = (
+            _current_attempt_payload(line.payload)
+            if line.event == "attempt_upsert"
+            else line.payload
+        )
+        node: Any = _NODE_MODELS[line.event].model_validate(payload)
         seen.setdefault(_line_node(line, node), set()).add(node.status)
     return seen
 
@@ -923,9 +953,6 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
                             status=attempt_row["status"],
                             exit_code=attempt_row["exit_code"],
                             duration=attempt_row["duration"],
-                            tokens_in=attempt_row["tokens_in"],
-                            tokens_out=attempt_row["tokens_out"],
-                            cost=attempt_row["cost"],
                             prompt_path=attempt_row["prompt_path"],
                             result_path=attempt_row["result_path"],
                             stdout_path=attempt_row["stdout_path"],
@@ -1604,18 +1631,15 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO attempts (run_id, story_id, card_id, phase, n, status,
-                                  exit_code, duration, tokens_in, tokens_out, cost,
+                                  exit_code, duration,
                                   prompt_path, result_path, stdout_path, dispatch)
             VALUES (:run_id, :story_id, :card_id, :phase, :n, :status,
-                    :exit_code, :duration, :tokens_in, :tokens_out, :cost,
+                    :exit_code, :duration,
                     :prompt_path, :result_path, :stdout_path, :dispatch)
             ON CONFLICT(run_id, story_id, card_id, phase, n) DO UPDATE SET
                 status=excluded.status,
                 exit_code=excluded.exit_code,
                 duration=excluded.duration,
-                tokens_in=excluded.tokens_in,
-                tokens_out=excluded.tokens_out,
-                cost=excluded.cost,
                 prompt_path=excluded.prompt_path,
                 result_path=excluded.result_path,
                 stdout_path=excluded.stdout_path,
@@ -1630,9 +1654,6 @@ class Store:
                 "status": attempt.status,
                 "exit_code": attempt.exit_code,
                 "duration": attempt.duration,
-                "tokens_in": attempt.tokens_in,
-                "tokens_out": attempt.tokens_out,
-                "cost": attempt.cost,
                 "prompt_path": _text(attempt.prompt_path),
                 "result_path": _text(attempt.result_path),
                 "stdout_path": _text(attempt.stdout_path),

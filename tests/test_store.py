@@ -657,7 +657,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
             "8831189b",
             "ef248597",
             "implement",
-            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, cost=0.42),
+            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, duration=4.5),
         )
 
         assert attempt_line.story == "8831189b"
@@ -673,7 +673,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
         attempt_row = st.connection.execute("SELECT * FROM attempts").fetchone()
         assert attempt_row["status"] == "ok"
         assert attempt_row["exit_code"] == 0
-        assert attempt_row["cost"] == pytest.approx(0.42)
+        assert attempt_row["duration"] == pytest.approx(4.5)
         assert json.loads(attempt_row["dispatch"])["role"] == "coder"
     finally:
         st.close()
@@ -810,9 +810,6 @@ def _record_full_run(st: store.Store, repo: Path) -> None:
             status="ok",
             exit_code=0,
             duration=31.25,
-            tokens_in=8000,
-            tokens_out=1500,
-            cost=0.31,
             prompt_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/prompt.txt"),
             result_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/result.json"),
             stdout_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log"),
@@ -858,14 +855,14 @@ def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
 
     finished = subtask.phases[0].attempts[0]
     assert finished.status == "ok"
-    assert finished.cost == pytest.approx(0.31)
+    assert finished.duration == pytest.approx(31.25)
     assert finished.stdout_path == Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log")
     assert finished.dispatch.role == "coder"
 
     in_flight = subtask.phases[1].attempts[0]
     assert in_flight.status == "started"
     assert in_flight.exit_code is None
-    assert in_flight.cost is None
+    assert in_flight.duration is None
 
 
 def test_load_run_returns_none_for_an_unknown_run(repo):
@@ -951,9 +948,6 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     assert attempt.status == "started"
     assert attempt.exit_code is None
     assert attempt.duration is None
-    assert attempt.tokens_in is None
-    assert attempt.tokens_out is None
-    assert attempt.cost is None
     assert row["status"] == "started"
     assert row["exit_code"] is None
 
@@ -1016,6 +1010,137 @@ def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
     finally:
         st.close()
     assert "tokens" in str(excinfo.value)
+
+
+# -- retired attempt usage keys (remove-cost-tracking §4.3) -------------------
+#
+# Every journal written before 2026-10-03 carries `tokens_in`, `tokens_out`
+# and `cost` on each attempt line. `Attempt` no longer declares them, so
+# `replay` sheds exactly those three names from an attempt payload and stays
+# strict about everything else. Unit tier: real temp DB and journal.
+
+_RETIRED_NULL = {"tokens_in": None, "tokens_out": None, "cost": None}
+_RETIRED_SET = {"tokens_in": 8000, "tokens_out": 1500, "cost": 0.31}
+
+
+def _append_old_attempt(journal: store.Journal, extra: dict) -> None:
+    """Re-record implement attempt 1 as `ok`, the way an `am` from before
+    2026-10-03 wrote it: today's payload plus `extra`."""
+    payload = models.Attempt(
+        n=1,
+        dispatch=_dispatch(card="ef248597", phase="implement"),
+        status="ok",
+        exit_code=0,
+        duration=12.5,
+    ).model_dump(mode="json")
+    _append_raw(
+        journal,
+        {
+            "seq": journal.last_seq() + 1,
+            "ts": "2026-09-23T10:20:00+00:00",
+            "run_id": RUN_ID,
+            "event": "attempt_upsert",
+            "story": "8831189b",
+            "card": "ef248597",
+            "phase": "implement",
+            "attempt": 1,
+            "payload": {**payload, **extra},
+        },
+    )
+
+
+@pytest.mark.parametrize("retired", [_RETIRED_NULL, _RETIRED_SET], ids=["null", "non_null"])
+def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, retired):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, retired)
+        replayed = st.replay_journal(RUN_ID)
+        # The projection already holds this run, so the rebuild runs its
+        # `diverging` pre-check over the same old lines first.
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+        assert loaded is not None
+        mismatches = store.diverging(st.journal.read(), loaded)
+    finally:
+        st.close()
+
+    assert replayed == rebuilt == loaded
+    attempt = rebuilt.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (attempt.n, attempt.status, attempt.exit_code, attempt.duration) == (
+        1,
+        "ok",
+        0,
+        12.5,
+    )
+    for key in retired:
+        assert not hasattr(attempt, key)
+    assert set(retired).isdisjoint(attempt.model_dump())
+    assert mismatches == []
+
+
+@pytest.mark.parametrize("read", ["replay_journal", "rebuild_from_journal"])
+def test_an_attempt_line_with_any_other_unknown_key_still_raises_naming_only_it(
+    repo, read
+):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, {**_RETIRED_NULL, "operator": "x"})
+        with pytest.raises(ValidationError) as excinfo:
+            getattr(st, read)(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("operator",)]
+    assert "operator" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "event", ["run_upsert", "story_upsert", "subtask_upsert", "phase_upsert"]
+)
+def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
+    # No other node ever carried these keys, so on any other line they are
+    # still an unknown key and still fail loudly.
+    coordinates, payload = {
+        "run_upsert": ({}, _run(repo).model_dump(mode="json", exclude={"stories"})),
+        "story_upsert": (
+            {"story": "8831189b"},
+            _story().model_dump(mode="json", exclude={"subtasks"}),
+        ),
+        "subtask_upsert": (
+            {"story": "8831189b"},
+            _subtask("ef248597", base="m1/task-fdebc746").model_dump(
+                mode="json", exclude={"phases"}
+            ),
+        ),
+        "phase_upsert": (
+            {"story": "8831189b", "card": "ef248597"},
+            models.PhaseRun(name="implement", kind="agent", status="started").model_dump(
+                mode="json", exclude={"attempts"}
+            ),
+        ),
+    }[event]
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_raw(
+            st.journal,
+            {
+                "seq": st.journal.last_seq() + 1,
+                "ts": "2026-09-23T10:20:00+00:00",
+                "run_id": RUN_ID,
+                "event": event,
+                **coordinates,
+                "payload": {**payload, "cost": None},
+            },
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            st.replay_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("cost",)]
 
 
 def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
@@ -2079,6 +2204,121 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
         rebuilt.close()
 
     assert _phase_details(after) == _EXPECTED_DETAILS
+
+
+# -- attempts without usage columns ------------------------------------------
+#
+# Remove-cost-tracking §5.3 items 4-5: a fresh `attempts` table has no
+# tokens/cost columns, and a table created before that keeps them, unwritten
+# and unread, because migration is additive-only. Unit tier: real temp DB and
+# journal, no subprocess.
+
+ATTEMPT_COLUMNS = [
+    "run_id",
+    "story_id",
+    "card_id",
+    "phase",
+    "n",
+    "status",
+    "exit_code",
+    "duration",
+    "prompt_path",
+    "result_path",
+    "stdout_path",
+    "dispatch",
+]
+
+LEGACY_ATTEMPT_COLUMNS = [
+    *ATTEMPT_COLUMNS[:8],
+    "tokens_in",
+    "tokens_out",
+    "cost",
+    *ATTEMPT_COLUMNS[8:],
+]
+"""The `attempts` columns as they shipped before 2026-10-03, in table order."""
+
+
+def _attempt_columns(conn: sqlite3.Connection) -> list[str]:
+    return [row["name"] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()]
+
+
+def test_a_fresh_attempts_table_has_no_usage_columns(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = _attempt_columns(conn)
+    finally:
+        conn.close()
+
+    assert columns == ATTEMPT_COLUMNS
+    assert len(columns) == 12
+
+
+_LEGACY_ATTEMPTS = """
+DROP TABLE attempts;
+CREATE TABLE attempts (
+    run_id       TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    card_id      TEXT NOT NULL,
+    phase        TEXT NOT NULL,
+    n            INTEGER NOT NULL,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    duration     REAL,
+    tokens_in    INTEGER,
+    tokens_out   INTEGER,
+    cost         REAL,
+    prompt_path  TEXT,
+    result_path  TEXT,
+    stdout_path  TEXT,
+    dispatch     TEXT NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id, phase, n)
+);
+"""
+"""The `attempts` table exactly as it shipped before 2026-10-03, empty."""
+
+
+def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
+    legacy = store.open_db(repo)
+    legacy.executescript(_LEGACY_ATTEMPTS)
+    legacy.commit()
+    legacy.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        columns = _attempt_columns(st.connection)
+        _record_full_run(st, repo)
+        # Re-recording implement attempt 1 takes the ON CONFLICT path.
+        st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_dispatch(card="ef248597", phase="implement"),
+                status="ok",
+                exit_code=0,
+                duration=7.5,
+            ),
+        )
+        usage = [
+            tuple(row)
+            for row in st.connection.execute(
+                "SELECT tokens_in, tokens_out, cost FROM attempts ORDER BY phase, n"
+            ).fetchall()
+        ]
+        loaded = st.load_run(RUN_ID)
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        after = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert columns == LEGACY_ATTEMPT_COLUMNS
+    assert usage == [(None, None, None), (None, None, None)]
+    assert loaded is not None
+    implement = loaded.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (implement.status, implement.exit_code, implement.duration) == ("ok", 0, 7.5)
+    assert rebuilt == loaded
+    assert after == loaded
 
 
 # -- run milestone id ----------------------------------------------------------
@@ -4780,7 +5020,9 @@ def test_diverging_ignores_every_field_but_status(repo):
     _raw_sql(repo, "UPDATE stories SET title = 'hand-edited', tip_branch = NULL, level = 3")
     _raw_sql(repo, "UPDATE subtasks SET branch = 'elsewhere', worktree_path = NULL")
     _raw_sql(repo, "UPDATE phases SET detail = 'hand-edited', ended_at = NULL")
-    _raw_sql(repo, "UPDATE attempts SET cost = 9.5, exit_code = 42, tokens_in = 7")
+    _raw_sql(
+        repo, "UPDATE attempts SET duration = 9.5, exit_code = 42, stdout_path = '/elsewhere'"
+    )
 
     assert _diverging_now(repo) == []
 

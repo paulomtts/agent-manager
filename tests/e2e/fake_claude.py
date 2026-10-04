@@ -817,9 +817,7 @@ def main(argv):
     entry = {"phase": phase, "cwd": str(cwd), "result_path": str(result_path)}
     with log_path(result_path).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
-    # stdout is a log, never a channel (D4). Usage-free on purpose: the adapter
-    # scans it with `parse_usage`, and inventing token counts here would
-    # journal fiction.
+    # stdout is a log, never a channel (D4); nothing reads it.
     print(f"fake-claude ok phase={phase}")
     return 0
 

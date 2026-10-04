@@ -501,7 +501,7 @@ Every line records one node of the run's tree. A status change is the same node 
 | `story_upsert` | a story's own progress: `pending`, `started`, `done`, `stopped`, `escalated` |
 | `subtask_upsert` | a subtask's status: `pending`, `started`, `done`, `stopped`, `escalated` (recorded `started` again on a resume) |
 | `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed |
-| `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its cost, token and duration fields |
+| `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its `exit_code` and `duration` |
 
 There is no separate "run finished" or "escalation" event. A run has finished when a `run_upsert` line's `payload.status` is `done`, `escalated`, `stopped` or `cancelled`, and it escalated when that status is `escalated`.
 

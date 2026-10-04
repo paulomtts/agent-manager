@@ -2145,9 +2145,6 @@ class _FakeAdapter:
     def build_command(self, d: models.Dispatch) -> list[str]:
         return ["fake-harness", "--role", d.role, "--result", str(d.result_path)]
 
-    def parse_usage(self, stdout: str) -> None:
-        return None
-
 
 class _CannedLauncher:
     """A `LauncherFn` double: writes `results[role]` as the result file and
