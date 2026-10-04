@@ -2198,19 +2198,34 @@ when a blocker did not finish `done` and it was never dispatched."""
 def board_prefixes(
     milestones: Sequence[models.CardNode],
     branch_prefix_of: Callable[[models.CardNode], str],
+    *,
+    roots: Sequence[models.CardNode] = (),
 ) -> dict[str, str]:
-    """Each open milestone's branch prefix, keyed by milestone id, in input order.
+    """Each given milestone's branch prefix, then each of its blocker roots', keyed by id.
+
+    The given milestones come first, in input order. Then each card in `roots`
+    (every milestone root the caller read, open or not) that one of them lists
+    in `blocked_by` and that has no key yet, in `roots` order, whatever its
+    status: a blocker that is no longer open keeps the prefix it ran under, so
+    `milestone_bases` can name the integrate branch it left behind. Whether that
+    blocker matters is `milestone_bases`' call, not this one's. Only direct
+    blockers are keyed; a `roots` card nobody here blocks on is never derived,
+    and a `blocked_by` id that is not in `roots` is ignored. With no `roots`
+    the result is the given milestones' alone.
 
     `branch_prefix_of` is the caller's: deriving a prefix is not this module's
-    job. This only checks it. A prefix that is not a non-blank string is
-    `ValueError`, as `run_milestone` refuses a missing one. So is a prefix two
-    milestones share: both would claim `branch:<prefix>-integrate`, and the
-    deduplicated board claim set would hide that until the second milestone's
-    own pre-flight refused it mid-run.
+    job. This only checks it, for every entry alike. A prefix that is not a
+    non-blank string is `ValueError`, as `run_milestone` refuses a missing one.
+    So is a prefix two entries share: two milestones would both claim
+    `branch:<prefix>-integrate`, and the deduplicated board claim set would hide
+    that until the second milestone's own pre-flight refused it mid-run; a
+    blocker root sharing one would have its blocked milestone stack on the
+    other's branch.
     """
     prefixes: dict[str, str] = {}
     owners: dict[str, str] = {}
-    for card in milestones:
+
+    def add(card: models.CardNode) -> None:
         prefix = branch_prefix_of(card)
         if not isinstance(prefix, str) or not prefix.strip():
             raise ValueError(f"milestone {card.id} has no branch prefix (got {prefix!r})")
@@ -2220,6 +2235,13 @@ def board_prefixes(
             )
         owners[prefix] = card.id
         prefixes[card.id] = prefix
+
+    for card in milestones:
+        add(card)
+    blocker_ids = {blocker_id for card in milestones for blocker_id in card.blocked_by}
+    for card in roots:
+        if card.id in blocker_ids and card.id not in prefixes:
+            add(card)
     return prefixes
 
 

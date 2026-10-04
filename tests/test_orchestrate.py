@@ -6832,6 +6832,175 @@ def test_board_prefixes_refuses_two_milestones_on_one_prefix():
         )
 
 
+# ── board_prefixes over blocker roots (card 8198b0b4) ───────────────────────
+
+
+def _prefix_recording(calls: list[str], prefix_of: Callable[[models.CardNode], str] = _prefix_of):
+    """`prefix_of`, recording the id of every card it is called on in `calls`."""
+
+    def prefix(card: models.CardNode) -> str:
+        calls.append(card.id)
+        return prefix_of(card)
+
+    return prefix
+
+
+def test_board_prefixes_keys_a_done_blocker_root_after_the_given_milestones():
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocker, blocked])
+
+    assert list(prefixes.items()) == [(blocked.id, "p00000002"), (blocker.id, "p00000001")]
+
+
+@pytest.mark.parametrize(
+    "status, done_children",
+    [
+        ("done", True),
+        ("merged", True),
+        ("canceled", False),
+        ("archived", False),
+        ("todo", True),
+    ],
+)
+def test_board_prefixes_keys_a_blocker_root_of_any_non_open_status(status, done_children):
+    """Review Focus 5: which blockers matter is `milestone_bases`' call, not this one's."""
+    blocker = _board_milestone(1, status=status, done_children=done_children)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    assert not dag.milestone_is_open(blocker)
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocker, blocked])
+
+    assert prefixes[blocker.id] == _prefix_of(blocker)
+
+
+def test_board_prefixes_never_derives_a_root_nobody_blocks_on():
+    """Review Focus 1: an unrelated old milestone cannot newly break a board."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    unrelated = _board_milestone(3, status="done", done_children=True)
+    calls: list[str] = []
+
+    def prefix_of(card: models.CardNode) -> str:
+        calls.append(card.id)
+        if card.id == unrelated.id:
+            raise ValueError(f"not a card id: {card.id!r}")
+        return _prefix_of(card)
+
+    prefixes = orchestrate.board_prefixes(
+        [blocked], prefix_of, roots=[blocker, blocked, unrelated]
+    )
+
+    assert list(prefixes) == [blocked.id, blocker.id]
+    assert unrelated.id not in calls
+
+
+def test_board_prefixes_keys_only_direct_blockers_of_the_given_milestones():
+    """A(done) <- B(done) <- C(open): B is C's blocker and gets a key, A does not."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,), status="done", done_children=True)
+    c = _board_milestone(3, blocked_by=(2,))
+
+    prefixes = orchestrate.board_prefixes([c], _prefix_of, roots=[a, b, c])
+
+    assert list(prefixes) == [c.id, b.id]
+
+
+def test_board_prefixes_ignores_a_blocker_id_that_is_not_a_root():
+    blocked = models.CardNode(
+        id=_plan_id(2), title="milestone 2", status="todo", blocked_by=[_plan_id(99)]
+    )
+
+    prefixes = orchestrate.board_prefixes([blocked], _prefix_of, roots=[blocked])
+
+    assert prefixes == {blocked.id: "p00000002"}
+
+
+def test_board_prefixes_keys_a_blocker_named_twice_once():
+    """Review Focus 3: one entry, one derivation, no collision with itself."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    two = _board_milestone(2, blocked_by=(1, 1))
+    three = _board_milestone(3, blocked_by=(1,))
+    calls: list[str] = []
+
+    prefixes = orchestrate.board_prefixes(
+        [two, three], _prefix_recording(calls), roots=[blocker, two, three, blocker]
+    )
+
+    assert list(prefixes.items()) == [
+        (two.id, "p00000002"),
+        (three.id, "p00000003"),
+        (blocker.id, "p00000001"),
+    ]
+    assert calls.count(blocker.id) == 1
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", None])
+def test_board_prefixes_refuses_a_blank_prefix_for_a_blocker_root(prefix):
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    def prefix_of(card: models.CardNode) -> str:
+        return prefix if card.id == blocker.id else _prefix_of(card)
+
+    with pytest.raises(ValueError, match=f"milestone {blocker.id} has no branch prefix"):
+        orchestrate.board_prefixes([blocked], prefix_of, roots=[blocker, blocked])
+
+
+def test_board_prefixes_refuses_a_blocker_root_sharing_an_open_milestones_prefix():
+    """Review Focus 4: both would name one integrate branch; stacking would use the wrong one."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+
+    with pytest.raises(
+        ValueError,
+        match=f"milestones {blocked.id} and {blocker.id} share the branch prefix 'm14'",
+    ):
+        orchestrate.board_prefixes([blocked], lambda card: "m14", roots=[blocker, blocked])
+
+
+@pytest.mark.parametrize(
+    "milestones",
+    [
+        [_board_milestone(1), _board_milestone(2)],
+        [_board_milestone(1), _board_milestone(2, blocked_by=(1,))],
+    ],
+    ids=["independent", "open-blocker"],
+)
+def test_board_prefixes_with_roots_but_no_non_open_blocker_is_todays_result(milestones):
+    """Review Focus 2: an open blocker already given is not re-added; order is untouched."""
+    calls: list[str] = []
+
+    today = orchestrate.board_prefixes(milestones, _prefix_of)
+    with_roots = orchestrate.board_prefixes(milestones, _prefix_recording(calls), roots=milestones)
+
+    assert list(with_roots.items()) == list(today.items())
+    assert list(today.items()) == [
+        (milestones[0].id, "p00000001"),
+        (milestones[1].id, "p00000002"),
+    ]
+    assert calls == [milestones[0].id, milestones[1].id]
+
+
+def test_a_blocker_keeps_its_prefix_once_done_and_milestone_bases_stacks_on_it():
+    """Spec 2.3: the prefix a blocker ran under names the integrate branch it left behind."""
+    prefix_of = cli.board_prefix_of(None)
+    open_blocker = _board_milestone(1)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    done_blocker = _board_milestone(1, status="done", done_children=True)
+    assert done_blocker.id == open_blocker.id and done_blocker.title == open_blocker.title
+
+    while_open = orchestrate.board_prefixes([open_blocker, blocked], prefix_of)
+    once_done = orchestrate.board_prefixes([blocked], prefix_of, roots=[done_blocker, blocked])
+
+    assert once_done[done_blocker.id] == while_open[open_blocker.id] == prefix_of(done_blocker)
+    assert orchestrate.milestone_bases(
+        [done_blocker, blocked], once_done, lambda branch: True, "master"
+    ) == {blocked.id: f"{prefix_of(done_blocker)}-integrate"}
+
+
+
 def test_board_claims_unions_each_milestones_claims_first_occurrence_first():
     one, two = _board_milestone(1), _board_milestone(2)
     prefixes = {one.id: "pa", two.id: "pb"}
