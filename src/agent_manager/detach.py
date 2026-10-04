@@ -1,8 +1,10 @@
 """Hand a run's engine to a child in its own session (`am run --detach`, card aff9fdbf).
 
-Process-level pieces only: the run's `run.log` and `report.json`, and
-`fork_detacher`, which forks the child. What the child runs, and the lease
-hand-off around it, live in `cli` (`hand_off_to_child`, `run_detached_child`).
+Process-level pieces only: a run's `run.log` and `report.json`, a detached
+board's `<stamp>-<digest>.log` and `.report.json` under `<data dir>/boards/`
+(card 03f027ea), and `fork_detacher`, which forks the child. What the child
+runs, and the lease hand-off around it, live in `cli` (`hand_off_to_child`,
+`run_detached_child`) and `orchestrate` (`detach_board`).
 This module imports only `paths` and the stdlib.
 
 Fork, not a re-exec: the child runs stage 3 on the very `pre` and `recorded`
@@ -33,6 +35,12 @@ REPORT_NAME = "report.json"
 
 FILE_MODE = 0o600
 """Both files are the operator's alone: they can quote prompts and paths."""
+
+BOARD_LOG_SUFFIX = ".log"
+"""A detached board's stdout and stderr: `<data dir>/boards/<stamp>-<digest>.log`."""
+
+BOARD_REPORT_SUFFIX = ".report.json"
+"""A detached board's final envelope: `<data dir>/boards/<stamp>-<digest>.report.json`."""
 
 _GO = b"g"
 """The one byte the parent writes once the lease row names the child."""
@@ -70,15 +78,49 @@ def create_run_log(run_id: str) -> Path:
     return path
 
 
-def write_report(run_id: str, text: str) -> Path:
-    """Write `text` and a newline to the run's `report.json`, atomically, mode 0600.
+def create_board_log(stem: str) -> Path:
+    """`<data dir>/boards/<stem>.log`, created exclusively and empty, mode exactly 0600.
 
-    A temp file in the same directory, fsynced, then `os.replace`d over the
-    target, so a reader sees no file or a whole one, never a partial one.
+    `O_EXCL`: a board run has no run id to keep two runs apart, so a second
+    board detach on the same repository in the same second must not share
+    the first one's log. That is `FileExistsError`, with the existing file
+    left as it was. `fchmod` after the open, because `O_CREAT`'s mode is
+    masked by the umask.
     """
-    directory = paths.run_dir(run_id)
-    target = directory / REPORT_NAME
-    fd, temp = tempfile.mkstemp(dir=directory, prefix=".report-", suffix=".tmp")
+    path = paths.boards_dir() / f"{stem}{BOARD_LOG_SUFFIX}"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, FILE_MODE)
+    try:
+        os.fchmod(fd, FILE_MODE)
+    finally:
+        os.close(fd)
+    return path
+
+
+def board_report_path(stem: str) -> Path:
+    """Where a detached board's report will be: `<data dir>/boards/<stem>.report.json`.
+
+    Creates the `boards` directory, never the file: the child writes it when
+    the board run ends.
+    """
+    return paths.boards_dir() / f"{stem}{BOARD_REPORT_SUFFIX}"
+
+
+def write_report(run_id: str, text: str) -> Path:
+    """Write `text` and a newline to the run's `report.json`, atomically, mode 0600."""
+    return _write_atomically(paths.run_dir(run_id) / REPORT_NAME, text)
+
+
+def write_board_report(path: Path, text: str) -> Path:
+    """Write `text` and a newline to a detached board's report `path`, atomically, mode 0600."""
+    return _write_atomically(path, text)
+
+
+def _write_atomically(target: Path, text: str) -> Path:
+    """`text` and a newline to `target`: a temp file in the same directory,
+    fsynced, chmodded 0600, then `os.replace`d over the target, so a reader
+    sees no file or a whole one, never a partial one, and no temp file stays.
+    """
+    fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".report-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text + "\n")
