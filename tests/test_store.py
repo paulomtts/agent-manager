@@ -2024,12 +2024,17 @@ def test_list_runs_current_picks_the_latest_started_phase_among_parallel_ones(re
 
 
 def test_list_runs_current_breaks_a_started_at_tie_by_story_then_card_then_position(repo):
-    """Each run records the loser first, so insertion order cannot pass for
-    the tie-break."""
+    """The keys are ranked, not just present: in `run-story` the winning story
+    holds the card id that sorts last, and in `run-card` the winning card's
+    started phase sits at the higher position, so any other key order picks
+    the other phase. `run-story` and `run-card` record the loser first, so
+    insertion order cannot pass for the tie-break. `position` is assigned in
+    insertion order, so in `run-position` the winner is recorded first, and
+    the names are chosen so that ordering by name would pick the other."""
     same = _progress_at(5)
     by_story = _progress_run(repo, "run-story")
     try:
-        for story_id, card in (("bbbb", "c-of-b"), ("aaaa", "c-of-a")):
+        for story_id, card in (("bbbb", "c-a"), ("aaaa", "c-z")):
             by_story.record_story(_tree_story(story_id))
             by_story.record_subtask(story_id, _tree_subtask(card))
             by_story.record_phase(story_id, card, _tree_phase("implement", "started", same))
@@ -2038,9 +2043,11 @@ def test_list_runs_current_breaks_a_started_at_tie_by_story_then_card_then_posit
     by_card = _progress_run(repo, "run-card")
     try:
         by_card.record_story(_tree_story("story-1"))
-        for card in ("c2", "c1"):
-            by_card.record_subtask("story-1", _tree_subtask(card))
-            by_card.record_phase("story-1", card, _tree_phase("implement", "started", same))
+        by_card.record_subtask("story-1", _tree_subtask("c2"))
+        by_card.record_phase("story-1", "c2", _tree_phase("implement", "started", same))
+        by_card.record_subtask("story-1", _tree_subtask("c1"))
+        by_card.record_phase("story-1", "c1", _tree_phase("explore", "done", same))
+        by_card.record_phase("story-1", "c1", _tree_phase("implement", "started", same))
     finally:
         by_card.close()
     by_position = _progress_run(repo, "run-position")
@@ -2055,7 +2062,7 @@ def test_list_runs_current_breaks_a_started_at_tie_by_story_then_card_then_posit
     currents = {run_id: progress["current"] for run_id, progress in _progress_of(repo).items()}
 
     assert currents == {
-        "run-story": {"card": "c-of-a", "phase": "implement", "attempt": None},
+        "run-story": {"card": "c-z", "phase": "implement", "attempt": None},
         "run-card": {"card": "c1", "phase": "implement", "attempt": None},
         "run-position": {"card": "card-1", "phase": "zeta", "attempt": None},
     }
