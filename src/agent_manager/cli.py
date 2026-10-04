@@ -1319,22 +1319,37 @@ def dry_run_board(
     base_branch: str,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
 ) -> dict[str, Any]:
-    """`--dry-run --board`: every open milestone, by level, each with its own preview.
+    """`--dry-run --board`: every open milestone, by level, each on its own base.
 
-    Read-only by construction, like `dry_run_milestone`. `board.roots()` is
-    read once (each root already nests its whole tree), leveled by
-    `dag.board_levels` (a done milestone drops out, a cycle is
-    `DependencyCycleError`), and each milestone's prefix comes from
-    `orchestrate.board_prefixes` over `board_prefix_of`, the very check
-    `run_board` makes. Each milestone's `plan` is its own `dry_run_payload`.
-    No `Store` is opened, no claim is checked, no runner is built, and
+    Read-only by construction, like `dry_run_milestone`, and composed the way
+    `run_board` composes its refusals. `board.roots()` is read once (each root
+    already nests its whole tree), leveled by `dag.board_levels` (a done
+    milestone drops out, a cycle is `DependencyCycleError`). Each milestone's
+    prefix, and each non-open blocker root's, comes from
+    `orchestrate.board_prefixes(..., roots=)` over `board_prefix_of`, the very
+    check `run_board` makes. Each milestone's base comes from
+    `orchestrate.milestone_bases` with `orchestrate._local_branch_exists`, read
+    at call time: its one open blocker's `<prefix>-integrate`, or its one
+    unlanded blocker's when that branch exists locally, else `base_branch`;
+    two such blockers is `MilestoneBlockersError`. The base is the entry's
+    `base_branch`, and its `plan` (its own `dry_run_payload`) is computed
+    against it. The only I/O past the board read is that read-only
+    `git rev-parse`, asked only about an unlanded, non-open blocker. No
+    `Store` is opened, no claim is checked, no runner is built, and
     `orchestrate.run_board` is never called. Every refusal is a type already
-    in `HANDLED`.
+    in `HANDLED`; a `GitError` from a broken repository propagates, as it
+    does from `run_board`.
     """
     root = resolve_repo_dir(repo_dir)
-    levels = dag.board_levels(board.roots(repo_dir=root))
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
     milestones = [card for level in levels for card in level]
-    prefixes = orchestrate.board_prefixes(milestones, board_prefix_of(branch_prefix))
+    prefixes = orchestrate.board_prefixes(
+        milestones, board_prefix_of(branch_prefix), roots=all_roots
+    )
+    bases = orchestrate.milestone_bases(
+        all_roots, prefixes, orchestrate._local_branch_exists(root), base_branch
+    )
     return {
         "board": True,
         "max_concurrent": max_concurrent,
@@ -1346,11 +1361,12 @@ def dry_run_board(
                         "milestone_id": card.id,
                         "title": card.title,
                         "branch_prefix": prefixes[card.id],
+                        "base_branch": bases[card.id],
                         "plan": dry_run_payload(
                             census.flatten_milestone(card).stories,
                             repo_dir=root,
                             branch_prefix=prefixes[card.id],
-                            base_branch=base_branch,
+                            base_branch=bases[card.id],
                             max_concurrent=max_concurrent,
                         ),
                     }
