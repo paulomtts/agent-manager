@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7487,4 +7488,45 @@ def test_a_crashing_milestone_engine_still_releases_its_lease_before_closing(
         _run(root, shape["milestone"], FakeDriver())
 
     assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+
+
+def test_run_milestone_hands_the_engine_the_lease_of_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    """`_run_milestone_async` composes the three stages: the run it reports is
+    the one the recorded stage opened, and the walk and Integrate ran on that
+    stage's store under that stage's lease."""
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    handed: dict[str, Any] = {}
+
+    real_recorded = orchestrate.recorded_milestone_run
+
+    @contextmanager
+    def spying_recorded(pre):
+        with real_recorded(pre) as recorded:
+            handed["recorded"] = recorded
+            yield recorded
+
+    real_controlled = control.controlled
+
+    async def spying_controlled(work, **kwargs):
+        handed["controlled"] = kwargs["lease"]
+        return await real_controlled(work, **kwargs)
+
+    monkeypatch.setattr(orchestrate, "recorded_milestone_run", spying_recorded)
+    monkeypatch.setattr(control, "controlled", spying_controlled)
+    driver = FakeDriver()
+
+    result = _run(root, shape["milestone"], driver)
+
+    recorded = handed["recorded"]
+    assert handed["controlled"] is recorded.lease
+    assert recorded.run_id == result["run_id"] == runs.mint_run_id(shape["milestone"], STARTED_AT)
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert [call["store"] for call in integrate_recorder.calls] == [recorded.store]
+    assert result["done"] is True
     assert _claim_rows(root) == []
