@@ -8975,3 +8975,31 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
     assert _journal_lines() == lines_before
     assert _recorded_status(projection) == "done"
     assert _lease(projection) is None
+
+
+def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection):
+    """Spec test 9: `Store.open` reads the journal's highest `seq`, and a
+    non-JSON line in its middle is `CorruptJournalError` -- a refusal at
+    exit 3, not a traceback."""
+    _plant_run(projection, status="stopped")
+    path = store_module.Journal(CONTROL_RUN_ID).path
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CorruptJournalError"
+    assert f"{path}:2:" in envelope["error"]["message"]
+    assert _recorded_status(projection) == "stopped"
+    assert _lease(projection) is None
+
+
+def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
+    """Only the torn-journal subclass is a refusal; a missing journal or
+    any other `JournalError` stays a bug with its stack."""
+    assert isinstance(store_module.CorruptJournalError("torn"), cli.HANDLED)
+    assert not isinstance(store_module.MissingJournalError("gone"), cli.HANDLED)
+    assert not isinstance(store_module.JournalError("other"), cli.HANDLED)

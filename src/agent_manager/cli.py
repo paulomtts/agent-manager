@@ -1154,6 +1154,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     ValueError,
     locks.LockTimeoutError,
     store_module.LeaseLostError,
+    store_module.CorruptJournalError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1164,8 +1165,12 @@ while another `am` process held a project lock past its timeout (spec X7) is a
 refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostError`
 is in it because another process took this run's lease over mid-walk (spec X4):
 the fence stopped every write, and the operator gets the envelope naming the new
-holder. It is a `BaseException`, so it has to be listed by name. Anything outside
-this tuple is a bug in this program and should crash loudly with its stack intact.
+holder. It is a `BaseException`, so it has to be listed by name.
+`store_module.CorruptJournalError` is in it because a crashed run can leave a
+torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
+is a refusal naming the file and line, not a bug; only that subclass, not
+`JournalError` as a whole. Anything outside this tuple is a bug in this program
+and should crash loudly with its stack intact.
 """
 
 
