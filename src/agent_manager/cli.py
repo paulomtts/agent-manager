@@ -2329,8 +2329,10 @@ def _not_resettable_error(run_id: str) -> NotResettableError:
     )
 
 
-def _reset_message(run_id: str) -> str:
-    """What `am reset` tells the operator after closing `run_id` (am-reset §3.5)."""
+def _reset_message(run_id: str, *, already: bool) -> str:
+    """What `am reset` tells the operator about `run_id` (am-reset §3.5)."""
+    if already:
+        return f"run {run_id} was already cancelled; nothing was written"
     return (
         f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
@@ -2349,6 +2351,10 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     fenced `record_run` of `cancelled`. No checkpoint row is written or
     deleted, and no other row is touched. The lease is released and the store
     closed on every exit.
+
+    A run already `cancelled` is not refused: the lease is taken and released
+    around the check, and nothing is journalled (`already_cancelled: true`).
+    A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -2369,21 +2375,41 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
             raise _not_resettable_error(run.id)
     finally:
         conn.close()
+
     store = Store.open(root, run.id)
     try:
-        with run_lease(store):
-            store.record_run(run.model_copy(update={"status": "cancelled"}))
+        # `take_lease` re-checks liveness atomically: a live holder that
+        # appeared since the check above refuses here as `RunIsLiveError`,
+        # and a dead one is taken over. The status is read again under the
+        # lease, so two resets serialise (the second sees `cancelled` and
+        # writes nothing) and a run that finished meanwhile is never
+        # overwritten. No claims: a reset drives no card and no branch.
+        with run_lease(store) as lease:
+            current = store.load_run(run.id) or run
+            if current.status == "done":
+                raise _not_resettable_error(run.id)
+            already = current.status == "cancelled"
+            if not already:
+                store.record_run(current.model_copy(update={"status": "cancelled"}))
     finally:
         store.close()
-    return {
+    payload: dict[str, Any] = {
         "run_id": run.id,
-        "previous_status": run.status,
+        "previous_status": current.status,
         "status": "cancelled",
-        "already_cancelled": False,
+        "already_cancelled": already,
         # af52db54 fills this in from the run's checkpoints.
         "cards": [],
-        "message": _reset_message(run.id),
+        "message": _reset_message(run.id, already=already),
     }
+    if lease.displaced is not None:
+        # A dead holder's lease was taken over (X5): say whose, as resume does.
+        payload["took_over"] = {
+            "pid": lease.displaced.pid,
+            "host": lease.displaced.host,
+            "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+        }
+    return payload
 
 
 @app.command("reset")

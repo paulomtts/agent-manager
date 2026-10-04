@@ -8828,3 +8828,150 @@ def test_reset_refuses_a_finished_run_and_writes_nothing(
 def test_not_resettable_error_is_a_handled_cli_error():
     assert isinstance(cli.NotResettableError("finished"), cli.CliError)
     assert isinstance(cli.NotResettableError("finished"), cli.HANDLED)
+
+
+@pytest.mark.parametrize(
+    "stale, pid",
+    [(True, None), (False, 0)],
+    ids=["stale-heartbeat", "dead-pid-on-this-host"],
+)
+def test_reset_takes_over_a_dead_lease_and_names_its_holder(
+    projection, monkeypatch, stale, pid
+):
+    """Spec test 3, the crash case. `control.Lease` judges liveness on the
+    real clock, so the planted heartbeat is relative to the real now."""
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_run(projection, status="started")
+    heartbeat = now - timedelta(seconds=31) if stale else now
+    _plant_lease(projection, token="crashed", pid=pid, heartbeat_at=heartbeat)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == RESET_KEYS | {"took_over"}
+    assert data["took_over"] == {
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE,
+        "heartbeat_at": heartbeat.isoformat(),
+    }
+    assert data["previous_status"] == "started"
+    assert data["already_cancelled"] is False
+    assert _recorded_status(projection) == "cancelled"
+    assert len(_journal_lines()) == len(lines_before) + 1
+    assert _lease(projection) is None
+
+
+def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
+    """Spec test 4."""
+    _plant_run(projection, status="cancelled")
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data == {
+        "run_id": CONTROL_RUN_ID,
+        "previous_status": "cancelled",
+        "status": "cancelled",
+        "already_cancelled": True,
+        "cards": [],
+        "message": f"run {CONTROL_RUN_ID} was already cancelled; nothing was written",
+    }
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "cancelled"
+    assert _lease(projection) is None
+
+
+def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
+    """Spec test 8, second case: the second reset sees `cancelled` under the
+    lease and is a no-op."""
+    _plant_run(projection, status="stopped")
+    upserts_before = [line for line in _journal_lines() if line.event == "run_upsert"]
+
+    first = _invoke_reset(projection)
+    second = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert json.loads(first.stdout)["data"]["already_cancelled"] is False
+    second_data = json.loads(second.stdout)["data"]
+    assert second_data["already_cancelled"] is True
+    assert second_data["previous_status"] == "cancelled"
+    upserts_after = [line for line in _journal_lines() if line.event == "run_upsert"]
+    assert len(upserts_after) == len(upserts_before) + 1
+    assert _lease(projection) is None
+
+
+def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
+    projection, monkeypatch
+):
+    """Spec test 8, first case: two stores on one database. The holder's
+    lease is live; `lease_is_live` is blinded for the read-only check only,
+    so `take_lease`'s atomic re-check is what refuses."""
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_run(projection, status="started")
+    holder = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        holder.take_lease(
+            token="holder", pid=os.getpid(), host=HERE, now=now, is_live=lambda row: True
+        )
+    finally:
+        holder.close()
+    real = control.lease_is_live
+    seen: list[str] = []
+
+    def blind_first(lease, **kwargs):
+        seen.append(lease.token)
+        if len(seen) == 1:
+            return False
+        return real(lease, **kwargs)
+
+    monkeypatch.setattr(control, "lease_is_live", blind_first)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "RunIsLiveError"
+    assert seen[:2] == ["holder", "holder"]
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "started"
+    lease = _lease(projection)
+    assert lease is not None and lease.token == "holder"
+
+
+def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
+    projection, monkeypatch
+):
+    """Review Focus 4: the run finished between the read-only check and
+    `take_lease`. The read-only load is made to see `stopped`; the load
+    under the lease sees the real `done` and refuses before writing."""
+    _plant_run(projection, status="done")
+    real = store_module.load_run
+    calls: list[str] = []
+
+    def stale_first(conn, run_id):
+        loaded = real(conn, run_id)
+        calls.append(run_id)
+        if len(calls) == 1 and loaded is not None:
+            return loaded.model_copy(update={"status": "stopped"})
+        return loaded
+
+    monkeypatch.setattr(store_module, "load_run", stale_first)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotResettableError"
+    assert len(calls) == 2
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "done"
+    assert _lease(projection) is None
