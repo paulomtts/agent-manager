@@ -295,7 +295,7 @@ class FakeLauncher:
     """
 
     results: list[str | None]
-    stdout: str = "usage: tokens\n"
+    stdout: str = "fake-harness ran\n"
     exit_code: int | None = 0
     timed_out: bool = False
     exit_codes: list[int | None] | None = None
@@ -328,7 +328,7 @@ class FakeLauncher:
 
 def _outcome(tmp_path: Path, *, exit_code: int | None = 0, timed_out: bool = False) -> Outcome:
     log = tmp_path / "stdout.log"
-    log.write_text("usage: tokens\n", encoding="utf-8")
+    log.write_text("fake-harness ran\n", encoding="utf-8")
     return Outcome(
         argv=["fake-harness"],
         exit_code=exit_code,
