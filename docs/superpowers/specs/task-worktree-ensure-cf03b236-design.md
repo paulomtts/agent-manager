@@ -28,7 +28,7 @@ Only `src/agent_manager/steps/worktree.py` (`ensure`) and its tests: new and ext
 ## Error paths
 
 - Any git failure on the `-f` add propagates as `GitError` and releases the lock, the same as the existing add.
-- Under `-f`, a branch checked out live elsewhere is not a concern for the stale case: the only other registration of the branch is the dead one being replaced.
+- `-f` also overrides git's "branch already checked out" refusal. When the stale registration at this path held a different branch and the requested branch is checked out live at another path, `-f` is withheld so git's refusal surfaces as `GitError` instead of checking the branch out twice.
 
 ## Tests
 

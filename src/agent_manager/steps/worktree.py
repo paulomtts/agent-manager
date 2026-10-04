@@ -147,6 +147,25 @@ def _is_live_worktree(candidate: str, registered: list[str]) -> bool:
     return _is_registered(candidate, registered) and Path(candidate).is_dir()
 
 
+def _branch_live_elsewhere(candidate: str, porcelain: str, branch: str) -> bool:
+    """Whether `branch` is checked out in a live worktree other than `candidate`.
+
+    `worktree add -f` also overrides git's "branch already checked out"
+    refusal, so a stale path whose dead registration held some OTHER branch
+    must not be forced while `branch` is live elsewhere: that would check one
+    branch out twice.
+    """
+    real = os.path.realpath(candidate)
+    path: str | None = None
+    for line in porcelain.split("\n"):
+        if line.startswith(_WORKTREE_PREFIX):
+            path = line[len(_WORKTREE_PREFIX) :].strip()
+        elif line.strip() == f"branch refs/heads/{branch}" and path is not None:
+            if os.path.realpath(path) != real and Path(path).is_dir():
+                return True
+    return False
+
+
 def _commit_count(git_runner: GitRunner, worktree_path: str, resolved_base: str) -> int:
     """Commits on HEAD that are not on `resolved_base`, or 0 if unreadable.
 
@@ -270,9 +289,10 @@ def ensure(
         with git_lock(repo_path):
             # Another thread may have created this very worktree between the
             # unlocked read and now: look again before adding.
-            registered = worktree_paths(
-                git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
+            porcelain = git_runner(
+                ["-C", repo_path, "worktree", "list", "--porcelain"]
             )
+            registered = worktree_paths(porcelain)
             if _is_live_worktree(worktree_path, registered):
                 worktree_existed = True
             else:
@@ -280,8 +300,15 @@ def ensure(
                 # is git's override for exactly that "missing but already
                 # registered" refusal; it touches bookkeeping, never branch
                 # content. A clean add never gets it, so git still refuses a
-                # branch that is checked out live at another path.
-                force = ["-f"] if _is_registered(worktree_path, registered) else []
+                # branch that is checked out live at another path -- and
+                # neither does a stale add whose branch is live elsewhere,
+                # since `-f` would override that refusal too.
+                force = (
+                    ["-f"]
+                    if _is_registered(worktree_path, registered)
+                    and not _branch_live_elsewhere(worktree_path, porcelain, branch)
+                    else []
+                )
                 if branch_existed:
                     # Check the existing branch out. Never re-cut it from
                     # base: a killed run's commits live on that branch and

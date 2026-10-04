@@ -1179,3 +1179,33 @@ def test_recovering_a_stale_worktree_leaves_every_other_worktree_registered(
     assert sibling.is_dir()
     assert not other_stale.exists()
     _assert_no_forbidden_git(calls)
+
+
+def test_a_stale_path_never_forces_a_branch_already_live_at_another_path(
+    repo: Path, tmp_path: Path
+):
+    # `-f` also overrides git's "branch already checked out" refusal. When the
+    # stale registration at this path belongs to a different branch and the
+    # requested branch is live elsewhere, forcing would check one branch out
+    # twice. git's refusal must surface instead, and nothing may be added.
+    wt = tmp_path / "wt"
+    _rm_rf_after_a_commit(repo, wt, "m1/other")
+    live = tmp_path / "live-wt"
+    _git(repo, "worktree", "add", str(live), "-b", "m1/task-9")
+
+    calls: list[list[str]] = []
+    with pytest.raises(GitError) as excinfo:
+        worktree.ensure(
+            branch="m1/task-9",
+            base="main",
+            worktree=str(wt),
+            repo_dir=str(repo),
+            git_runner=_recorder(calls, worktree.run_git),
+        )
+
+    assert "add" in excinfo.value.argv
+    assert not any("-f" in argv or "--force" in argv for argv in calls), calls
+    assert not wt.exists()
+    porcelain = _git(repo, "worktree", "list", "--porcelain")
+    assert porcelain.count("branch refs/heads/m1/task-9\n") == 1
+    assert _repo_lock_is_free(repo)
