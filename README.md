@@ -65,7 +65,7 @@ that matches several root cards is refused with the list of matches, and one
 that matches none is refused with the list of root cards. Both come back as
 `{"ok": false, "error": {...}}` with exit code 3.
 
-`--branch-prefix` is required. Every branch the run cuts is named
+`--branch-prefix` is required with `--card` and `--milestone`, and optional with `--board` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)). Every branch the run cuts is named
 `<prefix>/task-<title slug>-<first 8 hex of the card id>`, and its worktree is
 `<repo>/.claude/worktrees/<branch>`. `--verify` is repeatable, passed through as
 written, and run in the order given. With no `--verify`, pass
@@ -77,12 +77,8 @@ Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
 The base-branch and final integration checks run their commands with neither set.
 
-Some combinations are refused before anything is read: `--card` together with
-`--milestone`, neither of them, a blank `--milestone`, `--dry-run` with
-`--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1, and
-`--detach` with `--dry-run` or with `--board`.
-These are usage errors, like a missing `--branch-prefix`: Typer prints the
-message on stderr, nothing is printed on stdout, and the exit code is 2.
+Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, none of the three, a blank `--milestone`, a missing `--branch-prefix` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run` or with `--board`.
+These are usage errors: Typer prints the message on stderr, nothing is printed on stdout, and the exit code is 2.
 
 #### Running detached with `--detach`
 
@@ -602,7 +598,7 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
 - An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
-- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run) are in the `payload` of its first line, a `run_upsert`.
+- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run) are in the `payload` of its first line, a `run_upsert`. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
 
 ## Resuming: what runs again
