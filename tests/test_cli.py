@@ -13,6 +13,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import asyncio
+import dataclasses
 import io
 import inspect
 import json
@@ -5943,6 +5944,47 @@ def test_logs_follow_relookup_lost_attempt_errors(projection, monkeypatch):
         f"am logs: run {LOGS_RUN_ID!r} is not in the projection for "
     )
     assert result.stderr.endswith("\n")
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        (
+            lambda s: {"subtask": s.subtask.model_copy(update={"card_id": "card-9"})},
+            cli.UnknownCardError,
+            "card 'card-9' is not in run",
+        ),
+        (
+            lambda s: {"phase": s.phase.model_copy(update={"name": "gone"})},
+            cli.UnknownPhaseError,
+            "card 'card-1' has no phase 'gone' any more",
+        ),
+        (
+            lambda s: {"attempt": s.attempt.model_copy(update={"n": 9})},
+            cli.UnknownAttemptError,
+            "phase 'implement' of card 'card-1' has no attempt 9 any more",
+        ),
+        (
+            lambda s: {"attempt": None, "step_attempt": None},
+            cli.CliError,
+            "neither an attempt row nor a step attempt",
+        ),
+    ],
+    ids=["card", "phase", "attempt", "no-attempt-key"],
+)
+def test_logs_end_status_refuses_what_it_can_no_longer_find(
+    projection, change, error, message
+):
+    """Each lookup step of the re-lookup refuses rather than guessing, so the
+    stream reports it on stderr at exit 3 instead of crashing."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    selection = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert cli.logs_end_status(selection, repo_dir=projection) is None
+
+    stale = dataclasses.replace(selection, **change(selection))
+
+    with pytest.raises(error, match=re.escape(message)):
+        cli.logs_end_status(stale, repo_dir=projection)
 
 
 @pytest.mark.parametrize(
