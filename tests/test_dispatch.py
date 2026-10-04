@@ -30,7 +30,7 @@ from agent_manager import (
 )
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
-from agent_manager.harness.base import Outcome, Usage
+from agent_manager.harness.base import Outcome
 from agent_manager.roles.loader import load_role
 from agent_manager.runtime import bridge, walk
 from agent_manager.workflow import phases
@@ -214,9 +214,6 @@ class FakeAdapter:
             "--result",
             str(d.result_path),
         ]
-
-    def parse_usage(self, stdout: str) -> Usage | None:
-        return Usage(tokens_in=11, tokens_out=22, cost=0.5) if "usage" in stdout else None
 
 
 def test_an_explicit_harness_assignment_wins(tmp_path):
@@ -671,11 +668,10 @@ _USAGE_KEYS = frozenset({"tokens_in", "tokens_out", "cost"})
 
 def test_the_outcome_is_journalled_on_the_attempt(store, tmp_path, worktree):
     # §5.2: `Attempt` no longer declares the three usage fields, so the
-    # journalled payload carries no such keys at all. The log is deliberately
-    # the old bait -- FakeAdapter's `parse_usage` would turn it into 11/22/0.5
-    # if anything still asked.
+    # journalled payload carries no such keys at all. Nothing reads the log
+    # (D4), so nothing it says can put them back.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    launcher = FakeLauncher(results=[VALID_RESULT], stdout="usage: tokens\n")
+    launcher = FakeLauncher(results=[VALID_RESULT], stdout="fake-harness ran\n")
     runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
@@ -754,30 +750,10 @@ def test_the_engine_never_opens_the_harness_log(store, tmp_path, worktree, monke
     assert _USAGE_KEYS.isdisjoint(terminal)
 
 
-class UsageRefusingAdapter(FakeAdapter):
-    """A `FakeAdapter` whose `parse_usage` must never be reached."""
-
-    def parse_usage(self, stdout: str) -> Usage | None:
-        raise AssertionError("dispatch must never ask the adapter for usage")
-
-
-def test_dispatch_never_asks_the_adapter_for_usage(store, tmp_path, worktree):
-    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    launcher = FakeLauncher(results=[VALID_RESULT], stdout="usage: tokens\n")
-    runner, _ = _runner(
-        store, launcher, tmp_path, worktree, adapter=UsageRefusingAdapter()
-    )
-
-    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
-
-    assert result == {"summary": "explored the tree", "ok": True}
-    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
-
-
 def test_a_timed_out_attempt_journals_its_duration_and_no_usage(store, tmp_path, worktree):
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(
-        results=[None], exit_code=None, timed_out=True, stdout="usage: tokens\n"
+        results=[None], exit_code=None, timed_out=True, stdout="fake-harness ran\n"
     )
     runner, _ = _runner(store, launcher, tmp_path, worktree)
 
