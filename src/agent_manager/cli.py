@@ -839,6 +839,98 @@ def card_outcome_comment(
     return None
 
 
+@dataclass(frozen=True)
+class CardPreflight:
+    """What `preflight_card` read and decided for one `run --card` (card 5daa944e).
+
+    Everything the recorded stage and the engine read afterwards, built with
+    no side effect: no store, no run directory, no lease. The three records
+    are the `started` rows `recorded_card_run` writes. Internal state, so a
+    dataclass.
+    """
+
+    root: Path
+    card: models.Card
+    parent: models.Card
+    branch: str
+    worktree: Path
+    base_branch: str
+    claims: list[str]
+    run_id: str
+    run_record: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+
+
+def preflight_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str = "master",
+    clock: Callable[[], datetime] = _utcnow,
+) -> CardPreflight:
+    """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
+
+    In today's order: the card, `ParentlessCardError`, its parent, the branch
+    and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
+    and before any store exists, so a refused card leaves no run directory
+    (X5). Only then is the clock read and the run id minted, and the
+    `started` run, story and subtask records built. Nothing is written.
+    """
+    root = resolve_repo_dir(repo_dir)
+    card = board.show(card_id, repo_dir=root)
+    if not card.parent_id:
+        raise ParentlessCardError(
+            f"card {card.id} ({card.title!r}) has no parent card; `run --card` drives "
+            "a subtask of a story, and the story is what every run record is keyed by"
+        )
+    parent = board.show(card.parent_id, repo_dir=root)
+
+    branch = dag.task_branch(branch_prefix, card)
+    worktree = worktree_for(root, branch)
+    claims = [control.card_claim(card.id)]
+    # Read-only and before `Store.open`, so a refused card leaves no run
+    # directory (X5); `take_lease` in the recorded stage re-checks atomically.
+    refuse_claimed(root, claims)
+    started_at = clock()
+    run_id = mint_run_id(card.id, started_at)
+    return CardPreflight(
+        root=root,
+        card=card,
+        parent=parent,
+        branch=branch,
+        worktree=worktree,
+        base_branch=base_branch,
+        claims=claims,
+        run_id=run_id,
+        run_record=models.Run(
+            id=run_id,
+            workflow=WORKFLOW_NAME,
+            repo_dir=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            status="started",
+            started_at=started_at,
+            config=models.RunConfig(),
+        ),
+        story=models.StoryRun(
+            card_id=parent.id,
+            title=parent.title,
+            level=0,
+            status="started",
+            tip_branch=branch,
+        ),
+        subtask=models.SubtaskRun(
+            card_id=card.id,
+            branch=branch,
+            base_branch=base_branch,
+            status="started",
+            worktree_path=worktree,
+        ),
+    )
+
+
 def run_card(
     card_id: str,
     *,

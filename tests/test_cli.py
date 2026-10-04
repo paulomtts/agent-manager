@@ -9068,3 +9068,104 @@ def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeyp
         _watch_line("run-a", 3),
         _watch_line("run-d", 1),
     ]
+
+# ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is a plain directory, and no git, brd or claude process ever starts.
+
+SEAM_AT = datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc)
+SEAM_LATER = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+
+def _seam_root(tmp_path: Path, monkeypatch) -> Path:
+    """A plain repo directory (no git, no brd) with the data dir under tmp_path."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _seam_cards(fake_board) -> dict[str, str]:
+    """The milestone -> story -> subtask chain `run --card` needs, on the FakeBoard."""
+    milestone = fake_board.add_card("Milestone 1: walking skeleton")
+    story = fake_board.add_card("The CLI: run, status, logs, resume", parent_id=milestone)
+    subtask = fake_board.add_card("Add run --card end to end", parent_id=story)
+    return {"milestone": milestone, "story": story, "subtask": subtask}
+
+
+def _preflight(root: Path, card_id: str, at: datetime = SEAM_AT) -> Any:
+    return cli.preflight_card(
+        card_id, repo_dir=root, branch_prefix="m1", base_branch="main", clock=lambda: at
+    )
+
+
+def test_preflight_card_refuses_a_parentless_card_and_creates_no_run_directory(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    loose = fake_board.add_card("A card with no story")
+
+    with pytest.raises(cli.ParentlessCardError):
+        _preflight(root, loose)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_card_refuses_a_card_another_live_run_claims(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight(root, cards["subtask"])
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    card = board.show(cards["subtask"], repo_dir=root)
+    branch = dag.task_branch("m1", card)
+
+    pre = _preflight(root, cards["subtask"])
+
+    assert pre.root == root
+    assert (pre.card.id, pre.parent.id) == (cards["subtask"], cards["story"])
+    assert pre.run_id == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert pre.branch == branch
+    assert pre.worktree == cli.worktree_for(root, branch)
+    assert pre.base_branch == "main"
+    assert pre.claims == [control.card_claim(cards["subtask"])]
+    assert (pre.run_record.id, pre.run_record.status) == (pre.run_id, "started")
+    assert (pre.run_record.workflow, pre.run_record.started_at) == (cli.WORKFLOW_NAME, SEAM_AT)
+    assert (pre.run_record.base_branch, pre.run_record.branch_prefix) == ("main", "m1")
+    assert (pre.story.card_id, pre.story.status, pre.story.tip_branch) == (
+        cards["story"],
+        "started",
+        branch,
+    )
+    assert (pre.subtask.card_id, pre.subtask.status, pre.subtask.branch) == (
+        cards["subtask"],
+        "started",
+        branch,
+    )
+    assert pre.subtask.worktree_path == cli.worktree_for(root, branch)
+    assert _run_dirs() == []
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == []
+    assert fake_board.writes == []
