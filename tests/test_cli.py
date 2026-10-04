@@ -10968,7 +10968,6 @@ def _alive_heartbeats() -> list[threading.Thread]:
 
 
 DRY_RUN_DETACH = "--dry-run writes nothing and cannot be detached"
-BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
 
 
 @pytest.mark.parametrize(
@@ -10985,18 +10984,36 @@ BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
             "'--detach' / '--dry-run'",
         ),
         (
-            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": False},
-            BOARD_DETACH,
-            "'--detach' / '--board'",
+            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
         ),
     ],
 )
-def test_check_run_targets_refuses_detach_with_dry_run_or_board(kwargs, message, hint):
+def test_check_run_targets_refuses_detach_with_dry_run(kwargs, message, hint):
     with pytest.raises(typer.BadParameter) as caught:
         cli._check_run_targets(detach=True, **kwargs)
 
     assert caught.value.message == message
     assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"branch_prefix": None},
+        {"branch_prefix": "p"},
+        {"branch_prefix": "p", "max_concurrent": 2},
+    ],
+)
+def test_check_run_targets_accepts_detach_with_board(kwargs):
+    """Card 03f027ea: `--board --detach` is no longer a usage error."""
+    assert (
+        cli._check_run_targets(
+            card=None, milestone=None, board=True, dry_run=False, detach=True, **kwargs
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -11013,14 +11030,14 @@ def test_check_run_targets_accepts_detach_with_card_or_milestone(kwargs):
 
 
 @pytest.mark.parametrize(
-    ("targets", "word"),
+    "targets",
     [
-        (["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"], "detached"),
-        (["--board"], "applies"),
+        ["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"],
+        ["--board", "--dry-run"],
     ],
 )
-def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
-    tmp_path, monkeypatch, targets, word
+def test_detach_with_dry_run_is_a_usage_error_that_detaches_nothing(
+    tmp_path, monkeypatch, targets
 ):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     _forbid_board_paths(monkeypatch)
@@ -11033,9 +11050,136 @@ def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
 
     assert result.exit_code == 2, result.output
     assert '"ok"' not in result.stdout
-    assert word in result.output
+    assert "detached" in result.output
     assert fake.calls == []
     assert not (paths.data_dir() / "runs").exists()
+    assert not (paths.data_dir() / "boards").exists()
+
+
+# ── am run --board --detach (card 03f027ea) ─────────────────────────────────
+
+
+DETACHED_BOARD_PAYLOAD: dict[str, Any] = {
+    "board": True,
+    "detached": True,
+    "pid": FAKE_CHILD_PID,
+    "log": "/data/agent-manager/boards/20261004T090000Z-abc.log",
+    "report": "/data/agent-manager/boards/20261004T090000Z-abc.report.json",
+    "levels": [{"level": 0, "milestones": [SOME_CARD]}],
+}
+
+
+def _patch_detach_board(monkeypatch, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replace `orchestrate.detach_board`, forbid every other run path, record calls."""
+    _forbid_board_paths(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def fake_detach_board(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return payload
+
+    monkeypatch.setattr(orchestrate, "detach_board", fake_detach_board)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("max_concurrent must be at least 1, got 0"),
+        dag.DependencyCycleError("dag: dependency cycle among milestones #a, #b"),
+        orchestrate.MilestoneBlockersError(
+            "milestone X is blocked by 2 milestones that are not landed (A, B); "
+            "a milestone stacks on at most one: chain them (A <- B <- C)"
+        ),
+        cli.ClaimedError(
+            "run 20261001T000000Z-00000001 already claims branch:m-integrate",
+            key="branch:m-integrate",
+            run_id="20261001T000000Z-00000001",
+        ),
+        board.BoardError("brd refused", argv=["brd", "tree"]),
+    ],
+    ids=["ValueError", "DependencyCycleError", "MilestoneBlockersError", "ClaimedError", "BoardError"],
+)
+def test_a_board_detach_preflight_refusal_is_an_envelope_that_forks_nothing(
+    tmp_path, monkeypatch, error
+):
+    """Spec test 4 / Review Focus 2: the real `detach_board` over a refusing
+    `preflight_board`: exit 3, no fork, `<data dir>/boards` absent."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def refuse(**kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(orchestrate, "preflight_board", refuse)
+
+    refusal = _refusal(_board_run(tmp_path, "--detach"))
+
+    assert refusal == {"type": type(error).__name__, "message": str(error)}
+    assert fake.calls == []
+    assert not (paths.data_dir() / "boards").exists()
+
+
+def test_a_board_detach_calls_detach_board_once_with_the_run_options(tmp_path, monkeypatch):
+    """Spec test 5: the kwargs are compared whole, so an extra key fails;
+    `detacher` is `detach.fork_detacher` read at call time."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_detach_board(monkeypatch, DETACHED_BOARD_PAYLOAD)
+    sentinel = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", sentinel)
+
+    result = _board_run(
+        tmp_path,
+        "--detach",
+        "--verify",
+        "X",
+        "--max-concurrent",
+        "3",
+        "--branch-prefix",
+        "p",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(DETACHED_BOARD_PAYLOAD)
+    (kwargs,) = calls
+    prefix_of = kwargs.pop("branch_prefix_of")
+    assert kwargs.pop("detacher") is sentinel
+    assert kwargs == {
+        "repo_dir": tmp_path,
+        "base_branch": "main",
+        "commands": ["X"],
+        "allow_no_verification": False,
+        "max_concurrent": 3,
+    }
+    assert prefix_of(BOARD_CARD) == cli.board_prefix_of("p")(BOARD_CARD)
+    assert prefix_of(BOARD_CARD) == "p-milestone-14-run-the-cbe34d00"
+    assert sentinel.calls == []
+
+
+def test_a_board_detach_exits_0_even_when_its_payload_reads_as_escalated(
+    tmp_path, monkeypatch
+):
+    """Spec test 6 / Review Focus 4: the board escalation check is skipped."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    payload = {**DETACHED_BOARD_PAYLOAD, "milestones": [{"status": "escalated"}]}
+    _patch_detach_board(monkeypatch, payload)
+    monkeypatch.setattr(detach, "fork_detacher", _FakeDetacher())
+
+    result = _board_run(tmp_path, "--detach")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+def test_run_help_and_examples_document_the_board_detach():
+    """Spec §3.6."""
+    assert 'am run --board --verify "uv run pytest" --detach' in cli.RUN_EXAMPLES
+    help_text = inspect.signature(cli.run).parameters["detach_run"].default.help
+    assert "--board" in help_text
+    assert "<data dir>/boards/<stamp>-<digest>.log" in help_text
+    assert "<stamp>-<digest>.report.json" in help_text
 
 
 def _handed_off_card_run(root: Path, card_id: str) -> tuple[Any, str]:

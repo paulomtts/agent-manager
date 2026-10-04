@@ -1573,8 +1573,7 @@ def _check_run_targets(
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
     `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
-    nothing to hand off, and with `--board`, whose run was not split into
-    pre-flight, recorded stage and engine.
+    nothing to hand off.
     """
     if board and card is not None:
         raise typer.BadParameter(
@@ -1616,11 +1615,6 @@ def _check_run_targets(
             "--dry-run writes nothing and cannot be detached",
             param_hint="'--detach' / '--dry-run'",
         )
-    if detach and board:
-        raise typer.BadParameter(
-            "--detach applies to --card and --milestone, not --board",
-            param_hint="'--detach' / '--board'",
-        )
     if dry_run and card is not None:
         raise typer.BadParameter(
             "--dry-run previews a milestone and does not apply to --card",
@@ -1644,6 +1638,7 @@ Examples:
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
   am run --board --verify "uv run pytest"                             # run every open milestone
+  am run --board --verify "uv run pytest" --detach                    # ... in the background
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
 """
@@ -1686,10 +1681,14 @@ def run(
         False,
         "--detach",
         help=(
-            "With --card or --milestone: check, record and lease the run here, "
-            "then hand it to a background process in its own session and print "
-            "its run id, pid and log. Its output goes to "
-            "<data dir>/runs/<run-id>/run.log and its final envelope to report.json."
+            "With --card, --milestone or --board: make every check here (and, for "
+            "--card or --milestone, record and lease the run), then hand the run to "
+            "a background process in its own session and print its pid and log. "
+            "A card or milestone run's output goes to "
+            "<data dir>/runs/<run-id>/run.log and its final envelope to "
+            "report.json; a board's output goes to "
+            "<data dir>/boards/<stamp>-<digest>.log and its final envelope to "
+            "<stamp>-<digest>.report.json."
         ),
     ),
     max_concurrent: int | None = typer.Option(
@@ -1755,6 +1754,18 @@ def run(
                 branch_prefix=branch_prefix,
                 base_branch=base_branch,
                 max_concurrent=lanes,
+            )
+        elif whole_board and detach_run:
+            # Read as `orchestrate.detach_board` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_board(
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix_of=board_prefix_of(branch_prefix),
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
+                detacher=detach.fork_detacher,
             )
         elif whole_board:
             # Read as `orchestrate.run_board` so a test can patch it there.
