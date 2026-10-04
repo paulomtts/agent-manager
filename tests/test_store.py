@@ -3551,6 +3551,72 @@ def test_a_lease_is_touched_only_through_its_own_token(repo):
         lease.token = "t2"  # type: ignore[misc]
 
 
+# -- lease hand-off (am run --detach, card aff9fdbf) ----------------------------
+
+
+def test_set_lease_holder_moves_pid_and_host_only_for_its_own_token(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        lease = st.take_lease(
+            token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
+        ).lease
+
+        st.set_lease_holder("other", pid=7, host="elsewhere")
+        assert store.read_lease(st.connection, RUN_ID) == lease
+
+        st.set_lease_holder("t1", pid=7, host="elsewhere")
+        assert store.read_lease(st.connection, RUN_ID) == dataclasses.replace(
+            lease, pid=7, host="elsewhere"
+        )
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+
+def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
+    first = store.Store.open(repo, RUN_ID)
+    second = store.Store.open(repo, RUN_ID)
+    try:
+        first.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=lambda row: False)
+        assert first.record_run(_run(repo)).seq == 1
+        first.bind_lease(None)
+
+        held = second.adopt_lease("t1")
+
+        assert held.token == "t1"
+        # Opened before line 1 was written: only the reseek numbers this line 2.
+        assert second.record_run(_run(repo)).seq == 2
+        thief = store.Store.open(repo, RUN_ID)
+        try:
+            thief.take_lease(token="thief", pid=9, host="h", now=_at(1), is_live=lambda row: False)
+        finally:
+            thief.close()
+        with pytest.raises(store.LeaseLostError):
+            second.record_run(_run(repo))
+    finally:
+        first.close()
+        second.close()
+
+
+def test_adopt_lease_refuses_a_token_that_does_not_hold_the_run(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.LeaseLostError) as missing:
+            st.adopt_lease("t1")
+        assert missing.value.holder is None
+
+        st.take_lease(token="t2", pid=1, host="h", now=_at(0), is_live=lambda row: False)
+        st.bind_lease(None)
+        with pytest.raises(store.LeaseLostError) as other:
+            st.adopt_lease("t1")
+        assert other.value.holder is not None and other.value.holder.token == "t2"
+
+        # Still unbound: bound to t1, this write would have been fenced out.
+        assert st.record_run(_run(repo)).event == "run_upsert"
+    finally:
+        st.close()
+
+
 def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched(repo):
     # Review Focus 3: a resumed run takes a new token; the old one is dead, and
     # a token string shared with another run never reaches that run's row.

@@ -49,7 +49,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,7 @@ from agent_manager import (
     comments,
     control,
     dag,
+    detach,
     integration,
     models,
     runs,
@@ -1555,6 +1557,374 @@ def milestone_card_ids(
     return list(dict.fromkeys(ids))
 
 
+# ── the three stages of a milestone run (card 5daa944e) ─────────────────────
+
+
+@dataclass(frozen=True)
+class MilestonePreflight:
+    """What `preflight_milestone` read and decided for one milestone run.
+
+    Everything the recorded stage and the engine read afterwards. On a resume,
+    `base_branch`, `branch_prefix` and `max_concurrent` are the recorded
+    run's, and `resumed` is that run as it was left. `drive` is the chosen
+    driver. Internal state, so a dataclass.
+    """
+
+    root: Path
+    resumed: models.Run | None
+    milestone_card: models.CardNode
+    plan: census.Census
+    levels: list[list[PlannedStory]]
+    tips: list[dict[str, str]]
+    keys: list[str]
+    base_branch: str
+    branch_prefix: str
+    max_concurrent: int
+    run_id: str
+    run_record: models.Run
+    drive: Driver
+
+
+def preflight_milestone(
+    milestone: str | None,
+    *,
+    repo_dir: Path,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
+    max_concurrent: int = 1,
+    clock: Callable[[], datetime] = _utcnow,
+    resume_run_id: str | None = None,
+    driver: Driver | None = None,
+) -> MilestonePreflight:
+    """Stage 1 of a milestone run: every read and refusal, then the run record (card 5daa944e).
+
+    In today's order: the resumable run (resume only), the board roots, the
+    milestone (`census.find_milestone`'s unknown/ambiguous refusal, or
+    `find_run_milestone`), its census, `plan_levels` (the cycle refusal), the
+    tips, the claims, and `cli.refuse_claimed` as the last refusal --
+    read-only, before `refresh_git` and before any store, so a key another
+    live run holds leaves no fetch, prune, run row or run directory. A fresh
+    run then refreshes git (its first side effect, still before the store),
+    reads the clock and mints the run id; a resume keeps its own id and
+    refreshes git later, under the lease. The store is never opened here.
+    """
+    root = runs.resolve_repo_dir(repo_dir)
+    resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
+    if resumed is not None:
+        base_branch = resumed.base_branch
+        branch_prefix = resumed.branch_prefix
+        max_concurrent = resumed.config.max_concurrent_stories
+    roots = board.roots(repo_dir=root)
+    if resumed is None:
+        milestone_card = census.find_milestone(roots, milestone)
+    else:
+        milestone_card = find_run_milestone(roots, resumed)
+    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    drive = cli.drive_subtask_async if driver is None else driver
+    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
+    # The last refusal (X5, X6): read-only, before `refresh_git` and before
+    # `Store.open`, so a milestone, remaining subtask or integration branch
+    # another live run claims leaves no fetch, prune, run row or run
+    # directory. A resume's own rows are not a conflict; `take_lease` in the
+    # recorded stage re-checks atomically.
+    cli.refuse_claimed(root, keys, run_id=None if resumed is None else resumed.id)
+
+    if resumed is None:
+        # The first side effect. It runs after every refusal and before the store
+        # is opened, so a failed fetch leaves no run directory behind.
+        refresh_git(root)
+        started_at = clock()
+        run_id = runs.mint_run_id(milestone_card.id, started_at)
+        run_record = models.Run(
+            id=run_id,
+            workflow=MILESTONE_WORKFLOW,
+            repo_dir=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            status="started",
+            started_at=started_at,
+            config=models.RunConfig(max_concurrent_stories=max_concurrent),
+            milestone_id=milestone_card.id,
+        )
+    else:
+        run_id = resumed.id
+        # Stamps a run recorded before `milestone_id` existed, so the next
+        # resume no longer needs the short-id fallback.
+        run_record = resumed.model_copy(
+            update={"status": "started", "milestone_id": milestone_card.id}
+        )
+    return MilestonePreflight(
+        root=root,
+        resumed=resumed,
+        milestone_card=milestone_card,
+        plan=plan,
+        levels=levels,
+        tips=tips,
+        keys=keys,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        run_id=run_id,
+        run_record=run_record,
+        drive=drive,
+    )
+
+
+@dataclass(frozen=True)
+class RecordedMilestoneRun:
+    """A milestone run past its recorded stage (card 5daa944e).
+
+    Its id, its open store, the lease it holds, the plan rows `record_plan`
+    wrote, and on a resume each open card's checkpoint (`None` on a fresh
+    run). Internal state, so a dataclass.
+    """
+
+    run_id: str
+    store: Store
+    lease: control.Lease
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
+    checkpoints: dict[str, Checkpoint] | None
+
+
+@contextmanager
+def recorded_milestone_run(pre: MilestonePreflight) -> Iterator[RecordedMilestoneRun]:
+    """Stage 2 of a milestone run: open the store, take the lease, record the plan (card 5daa944e).
+
+    On a resume the checkpoints are read first: the store's own refusal, a
+    checkpoint saved under another workflow, is read-only and comes before
+    the lease, before git and before any write. Then `cli.run_lease` takes
+    the lease with `pre.keys`, inside the `try` that closes the store, so the
+    claims and the lease are released before `store.close()` on every exit
+    (live control C2, X5), an exception in the block included. It is taken
+    before `record_run`, so every run write is fenced by this token; a lost
+    race is `ClaimedError` or `RunIsLiveError` with nothing recorded. A
+    resume refreshes git first under the lease. Then the run is recorded
+    `started` and the whole plan `pending`; a resume then reopens its rows.
+    """
+    store = Store.open(pre.root, pre.run_id)
+    try:
+        checkpoints: dict[str, Checkpoint] | None = None
+        cards: list[tuple[str, Workflow]] = []
+        if pre.resumed is not None:
+            cards = open_cards(
+                pre.plan.stories, branch_prefix=pre.branch_prefix, base_branch=pre.base_branch
+            )
+            checkpoints = resume_checkpoints(store, cards)
+        with cli.run_lease(store, claims=pre.keys) as lease:
+            if pre.resumed is not None:
+                # A resume's first side effect, under this life's lease (X5):
+                # a run still live elsewhere was refused on entry, before git.
+                refresh_git(pre.root)
+            store.record_run(pre.run_record)
+            rows = record_plan(store, pre.levels, root=pre.root, branch_prefix=pre.branch_prefix)
+            if pre.resumed is not None:
+                # After `record_plan`, which records every planned row `pending`.
+                reopen_rows(store, pre.resumed, {card_id for card_id, _workflow in cards})
+            yield RecordedMilestoneRun(
+                run_id=pre.run_id,
+                store=store,
+                lease=lease,
+                rows=rows,
+                checkpoints=checkpoints,
+            )
+    finally:
+        store.close()
+
+
+async def run_milestone_engine(
+    pre: MilestonePreflight,
+    recorded: RecordedMilestoneRun,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+    slots: asyncio.Semaphore | None = None,
+) -> dict[str, Any]:
+    """Stage 3 of a milestone run: drive a recorded, leased run to its report (card 5daa944e).
+
+    From the first engine-side action to the last: the start flush of the
+    milestone's pending comments and the stale-story re-roll, then
+    `control.controlled(supervise(...))` under the recorded stage's lease
+    (`lease_token=lease.token`), then the outcome precedence, Integrate, the
+    final run record, the run-end comment and the report. The driver and the
+    lane bound are `pre.drive` and `pre.max_concurrent` (a resume's bound is
+    the recorded run's). The caller owns the store and the lease; a crash
+    propagates.
+    """
+    store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
+    rows, checkpoints = recorded.rows, recorded.checkpoints
+    root, plan, levels, tips = pre.root, pre.plan, pre.levels, pre.tips
+    milestone_card, run_record, resumed = pre.milestone_card, pre.run_record, pre.resumed
+    base_branch, branch_prefix = pre.base_branch, pre.branch_prefix
+
+    # Board-comments B7: any run's leftover comments on this milestone's
+    # cards go out under this lease, before anything is driven; a board
+    # failure is a warning and the run goes on (B8).
+    warnings = comments.flush(
+        store, root, card_ids=milestone_card_ids(milestone_card.id, plan.stories)
+    )
+    warnings.extend(reroll_stale_stories(plan.stories, root))
+    completed: list[str] = []
+    stop = StopSignal()
+
+    # `controlled` only ever parks the run through `stop` (C3); it
+    # closes the window and runs a final sweep before returning.
+    outcomes = await control.controlled(
+        supervise(
+            supervisor_plan(
+                plan.stories,
+                levels,
+                rows,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+                checkpoints=checkpoints,
+            ),
+            store=store,
+            run_id=run_id,
+            lease_token=lease.token,
+            root=root,
+            drive=pre.drive,
+            commands=list(commands),
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            max_concurrent=pre.max_concurrent,
+            stop=stop,
+            slots=slots,
+        ),
+        store=store,
+        stop=stop,
+        lease=lease,
+        interval=control_interval,
+    )
+    # Wave order, census order within a wave, never finish order.
+    for outcome in outcomes:
+        completed.extend(outcome.completed)
+        warnings.extend(outcome.warnings)
+    built_bases = bases_payload(outcomes)
+    total = sum(len(story.subtasks) for story in plan.stories)
+
+    def report(payload: dict[str, Any]) -> dict[str, Any]:
+        """Every payload shape on the same terms: `bases` when built, and on
+        a resume `resumed` plus `took_over` when a dead holder's lease
+        was taken over (X5), as `cli._resume_from_checkpoint` reports it."""
+        if resumed is not None:
+            payload["resumed"] = True
+            if lease.displaced is not None:
+                payload["took_over"] = {
+                    "pid": lease.displaced.pid,
+                    "host": lease.displaced.host,
+                    "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+                }
+        return with_bases(payload, built_bases)
+
+    def comment_run_end(payload: dict[str, Any]) -> dict[str, Any]:
+        """Comment `payload`'s outcome on the milestone card (board-comments B2).
+
+        Called after the run's final record, on every exit that records
+        one. `total` goes only into the dict `compose_run_end` reads, so
+        the report keeps its shape; the flush's warnings join the
+        report's own `warnings`.
+        """
+        comment = comments.compose_run_end(
+            run_id=run_id,
+            milestone_id=milestone_card.id,
+            token=lease.token,
+            payload={**payload, "total": total},
+        )
+        payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+        return payload
+
+    # Outcome precedence (live control C6): the first match wins. A
+    # control is never an escalation, and a paused or cancelled run
+    # never reaches Integrate in this invocation.
+    if stop.requested == "cancel":
+        store.record_run(run_record.model_copy(update={"status": "cancelled"}))
+        payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
+        # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
+        # each subtask it parked, in wave order, then the milestone. A lane
+        # stopped while its base built names no subtask and gets nothing;
+        # an escalated lane already commented its own escalation.
+        for outcome in outcomes:
+            if outcome.kind != "stopped" or outcome.subtask is None:
+                continue
+            assert outcome.story is not None
+            comment = comments.compose_cancelled(
+                run_id=run_id,
+                card_id=outcome.subtask,
+                before_phase=outcome.before_phase,
+                branch=rows[outcome.story][1][outcome.subtask].branch,
+                relaunch=f"am run --milestone {milestone_card.id}",
+            )
+            payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
+        return comment_run_end(payload)
+    if any(outcome.kind == "escalated" for outcome in outcomes):
+        store.record_run(run_record.model_copy(update={"status": "escalated"}))
+        primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
+        payload = escalated_payload(run_id, primary, outcomes, warnings)
+        if stop.requested == "pause":
+            payload["control"] = "pause"
+        return comment_run_end(report(payload))
+    if stop.requested == "pause":
+        store.record_run(run_record.model_copy(update={"status": "stopped"}))
+        # Board-comments B2 (card 5d9a875f): only the milestone's run-end;
+        # a parked subtask is resumed, not closed, so it gets no comment.
+        return comment_run_end(report(controlled_payload(run_id, "pause", outcomes, warnings)))
+
+    # Integrate (addendum I6) runs only once every lane finished clean,
+    # and also when there was nothing left to drive: that is how a relaunch
+    # retries an Integrate escalation, and why a finished milestone's
+    # relaunch is a no-op merge. Read as `integration.integrate_milestone`
+    # so a test can replace it, as `driver` is. It needs a factory for a
+    # conflicting tip; `None` is production's, read off `cli` now.
+    factory = cli.default_runner_factory if runner_factory is None else runner_factory
+    # `integrate_milestone` stays a synchronous call (I6); it is run on a
+    # worker thread, not the loop thread, only because its conflict
+    # resolver (`runtime_engine.run_subtask`) makes its own nested
+    # `asyncio.run(...)` call, which `asyncio.run` refuses once this
+    # coroutine is already running on the loop thread. `Store`'s
+    # connection is `check_same_thread=False` for exactly this kind of
+    # cross-thread, strictly sequential use (store.py).
+    # A cancel waits for that thread, so the store and lease
+    # outlive it (`_in_thread_to_completion`).
+    outcome = await _in_thread_to_completion(
+        integration.integrate_milestone,
+        stories=plan.stories,
+        repo_dir=root,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        commands=list(commands),
+        allow_no_verification=allow_no_verification,
+        store=store,
+        run_id=run_id,
+        runner_factory=factory,
+    )
+    if isinstance(outcome, integration.IntegrateEscalation):
+        # The branch and worktree stay exactly as Integrate left them (I5).
+        store.record_run(run_record.model_copy(update={"status": "escalated"}))
+        return comment_run_end(report(integrate_escalated_payload(run_id, outcome, warnings)))
+
+    store.record_run(run_record.model_copy(update={"status": "done"}))
+    return comment_run_end(
+        report(
+            {
+                "done": True,
+                "run_id": run_id,
+                "levels": [
+                    {"level": index, "stories": [planned.story.id for planned in level]}
+                    for index, level in enumerate(levels)
+                ],
+                "completed": completed,
+                "tips": tips,
+                "warnings": warnings,
+                "integrated": integrated_payload(outcome),
+            }
+        )
+    )
+
+
 def run_milestone(
     milestone: str | None,
     *,
@@ -1572,12 +1942,15 @@ def run_milestone(
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
-    `milestone` is a card id or a title needle (O1). Everything that can refuse,
-    `max_concurrent < 1` and another live run's claim included, runs before
-    the store is opened. Then the run takes a `control.Lease` with its
-    `milestone_claims` (`cli.run_lease`), one `milestone` run is recorded with its
-    whole plan `pending`, and `asyncio.run(control.controlled(supervise(...)))`
-    runs every story the moment its blockers succeeded, at most
+    `milestone` is a card id or a title needle (O1). This wrapper validates
+    its arguments (`max_concurrent < 1` included) and then runs the three
+    stages (card 5daa944e) under one `asyncio.run(_run_milestone_async(...))`:
+    `preflight_milestone` runs everything that can refuse, another live
+    run's claim included, before the store is opened; `recorded_milestone_run`
+    takes a `control.Lease` with the run's `milestone_claims`
+    (`cli.run_lease`) and records one `milestone` run with its whole plan
+    `pending`; and `run_milestone_engine` runs `control.controlled(supervise(...))`,
+    which starts every story the moment its blockers succeeded, at most
     `max_concurrent` at once. A subtask already `done` on
     the board is never driven, but its branch still anchors the next
     subtask's base. The card and its story are read fresh from the board
@@ -1715,6 +2088,14 @@ async def _run_milestone_async(
     """`run_milestone`'s body without its argument validation, awaitable in a
     caller's own event loop.
 
+    It composes the run's three stages (card 5daa944e): `preflight_milestone`
+    (every read and refusal, `cli.refuse_claimed` last, then a fresh run's
+    `refresh_git` and run record; no store), `recorded_milestone_run` (the
+    store opened, the lease and claims taken before `record_run`, the plan
+    recorded `pending`; the lease and claims released before `store.close()`
+    on every exit) and `run_milestone_engine` (the start flush,
+    `control.controlled(supervise(...))`, Integrate and the report).
+
     A caller that skips `run_milestone` must validate its own arguments first:
     a fresh run needs `max_concurrent >= 1` and a `milestone`, `base_branch`
     and `branch_prefix`. `slots`, when given, is forwarded to `supervise` and
@@ -1726,247 +2107,85 @@ async def _run_milestone_async(
     on a worker thread (see its call site), and a cancel arriving meanwhile
     waits for it to return before this coroutine unwinds.
     """
-    root = runs.resolve_repo_dir(repo_dir)
-    resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
-    if resumed is not None:
-        base_branch = resumed.base_branch
-        branch_prefix = resumed.branch_prefix
-        max_concurrent = resumed.config.max_concurrent_stories
-    roots = board.roots(repo_dir=root)
-    if resumed is None:
-        milestone_card = census.find_milestone(roots, milestone)
-    else:
-        milestone_card = find_run_milestone(roots, resumed)
-    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
-    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    drive = cli.drive_subtask_async if driver is None else driver
-    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
-    # The last refusal (X5, X6): read-only, before `refresh_git` and before
-    # `Store.open`, so a milestone, remaining subtask or integration branch
-    # another live run claims leaves no fetch, prune, run row or run
-    # directory. A resume's own rows are not a conflict; `take_lease` below
-    # re-checks atomically.
-    cli.refuse_claimed(root, keys, run_id=None if resumed is None else resumed.id)
-
-    if resumed is None:
-        # The first side effect. It runs after every refusal and before the store
-        # is opened, so a failed fetch leaves no run directory behind.
-        refresh_git(root)
-        started_at = clock()
-        run_id = runs.mint_run_id(milestone_card.id, started_at)
-        run_record = models.Run(
-            id=run_id,
-            workflow=MILESTONE_WORKFLOW,
-            repo_dir=root,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            status="started",
-            started_at=started_at,
-            config=models.RunConfig(max_concurrent_stories=max_concurrent),
-            milestone_id=milestone_card.id,
+    pre = preflight_milestone(
+        milestone,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        clock=clock,
+        resume_run_id=resume_run_id,
+        driver=driver,
+    )
+    with recorded_milestone_run(pre) as recorded:
+        return await run_milestone_engine(
+            pre,
+            recorded,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            control_interval=control_interval,
+            slots=slots,
         )
-    else:
-        run_id = resumed.id
-        # Stamps a run recorded before `milestone_id` existed, so the next
-        # resume no longer needs the short-id fallback.
-        run_record = resumed.model_copy(
-            update={"status": "started", "milestone_id": milestone_card.id}
+
+
+def detach_milestone(
+    milestone: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+
+    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
+    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
+    `pending` plan are the same. Inside the recorded stage `run.log` is
+    created and the lease handed off, so the stage exits releasing nothing
+    and closes its store. The child runs `run_milestone_engine` on this very
+    `pre`, with the plan rows and checkpoints the recorded stage wrote
+    (`cli.hand_off_to_child`).
+    """
+    pre = preflight_milestone(
+        milestone,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        clock=clock,
+        driver=driver,
+    )
+    with recorded_milestone_run(pre) as recorded:
+        log = detach.create_run_log(pre.run_id)
+        rows, checkpoints = recorded.rows, recorded.checkpoints
+        token = recorded.lease.hand_off()
+
+    def engine(store: Store, lease: control.Lease) -> dict[str, Any]:
+        handed = RecordedMilestoneRun(
+            run_id=pre.run_id, store=store, lease=lease, rows=rows, checkpoints=checkpoints
         )
-    store = Store.open(root, run_id)
-    try:
-        checkpoints: dict[str, Checkpoint] | None = None
-        cards: list[tuple[str, Workflow]] = []
-        if resumed is not None:
-            cards = open_cards(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-            # The store's own refusal, a checkpoint saved under another
-            # workflow, comes before the first write and before git is touched.
-            # Read-only, so it runs before the lease is taken.
-            checkpoints = resume_checkpoints(store, cards)
-        # After every refusal, and inside the `try` that closes the store, so
-        # the claims and the lease are released before `store.close()` on
-        # every exit (live control C2, X5). Taken before `record_run`, so
-        # every run write is fenced by this token; a lost race is
-        # `ClaimedError` or `RunIsLiveError` with nothing recorded.
-        with cli.run_lease(store, claims=keys) as lease:
-            if resumed is not None:
-                # A resume's first side effect, under this life's lease (X5):
-                # a run still live elsewhere was refused on entry, before git.
-                refresh_git(root)
-            store.record_run(run_record)
-            rows = record_plan(store, levels, root=root, branch_prefix=branch_prefix)
-            if resumed is not None:
-                # After `record_plan`, which records every planned row `pending`.
-                reopen_rows(store, resumed, {card_id for card_id, _workflow in cards})
-            # Board-comments B7: any run's leftover comments on this milestone's
-            # cards go out under this lease, before anything is driven; a board
-            # failure is a warning and the run goes on (B8).
-            warnings = comments.flush(
-                store, root, card_ids=milestone_card_ids(milestone_card.id, plan.stories)
-            )
-            warnings.extend(reroll_stale_stories(plan.stories, root))
-            completed: list[str] = []
-            stop = StopSignal()
-
-            # `controlled` only ever parks the run through `stop` (C3); it
-            # closes the window and runs a final sweep before returning.
-            outcomes = await control.controlled(
-                supervise(
-                    supervisor_plan(
-                        plan.stories,
-                        levels,
-                        rows,
-                        branch_prefix=branch_prefix,
-                        base_branch=base_branch,
-                        checkpoints=checkpoints,
-                    ),
-                    store=store,
-                    run_id=run_id,
-                    lease_token=lease.token,
-                    root=root,
-                    drive=drive,
-                    commands=list(commands),
-                    allow_no_verification=allow_no_verification,
-                    runner_factory=runner_factory,
-                    max_concurrent=max_concurrent,
-                    stop=stop,
-                    slots=slots,
-                ),
-                store=store,
-                stop=stop,
-                lease=lease,
-                interval=control_interval,
-            )
-            # Wave order, census order within a wave, never finish order.
-            for outcome in outcomes:
-                completed.extend(outcome.completed)
-                warnings.extend(outcome.warnings)
-            built_bases = bases_payload(outcomes)
-            total = sum(len(story.subtasks) for story in plan.stories)
-
-            def report(payload: dict[str, Any]) -> dict[str, Any]:
-                """Every payload shape on the same terms: `bases` when built, and on
-                a resume `resumed` plus `took_over` when a dead holder's lease
-                was taken over (X5), as `cli._resume_from_checkpoint` reports it."""
-                if resumed is not None:
-                    payload["resumed"] = True
-                    if lease.displaced is not None:
-                        payload["took_over"] = {
-                            "pid": lease.displaced.pid,
-                            "host": lease.displaced.host,
-                            "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
-                        }
-                return with_bases(payload, built_bases)
-
-            def comment_run_end(payload: dict[str, Any]) -> dict[str, Any]:
-                """Comment `payload`'s outcome on the milestone card (board-comments B2).
-
-                Called after the run's final record, on every exit that records
-                one. `total` goes only into the dict `compose_run_end` reads, so
-                the report keeps its shape; the flush's warnings join the
-                report's own `warnings`.
-                """
-                comment = comments.compose_run_end(
-                    run_id=run_id,
-                    milestone_id=milestone_card.id,
-                    token=lease.token,
-                    payload={**payload, "total": total},
-                )
-                payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
-                return payload
-
-            # Outcome precedence (live control C6): the first match wins. A
-            # control is never an escalation, and a paused or cancelled run
-            # never reaches Integrate in this invocation.
-            if stop.requested == "cancel":
-                store.record_run(run_record.model_copy(update={"status": "cancelled"}))
-                payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
-                # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
-                # each subtask it parked, in wave order, then the milestone. A lane
-                # stopped while its base built names no subtask and gets nothing;
-                # an escalated lane already commented its own escalation.
-                for outcome in outcomes:
-                    if outcome.kind != "stopped" or outcome.subtask is None:
-                        continue
-                    assert outcome.story is not None
-                    comment = comments.compose_cancelled(
-                        run_id=run_id,
-                        card_id=outcome.subtask,
-                        before_phase=outcome.before_phase,
-                        branch=rows[outcome.story][1][outcome.subtask].branch,
-                        relaunch=f"am run --milestone {milestone_card.id}",
-                    )
-                    payload["warnings"].extend(post_comment(store, root, comment, run_id=run_id))
-                return comment_run_end(payload)
-            if any(outcome.kind == "escalated" for outcome in outcomes):
-                store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                primary = next((outcome.story for outcome in outcomes if outcome.primary), None)
-                payload = escalated_payload(run_id, primary, outcomes, warnings)
-                if stop.requested == "pause":
-                    payload["control"] = "pause"
-                return comment_run_end(report(payload))
-            if stop.requested == "pause":
-                store.record_run(run_record.model_copy(update={"status": "stopped"}))
-                # Board-comments B2 (card 5d9a875f): only the milestone's run-end;
-                # a parked subtask is resumed, not closed, so it gets no comment.
-                return comment_run_end(
-                    report(controlled_payload(run_id, "pause", outcomes, warnings))
-                )
-
-            # Integrate (addendum I6) runs only once every lane finished clean,
-            # and also when there was nothing left to drive: that is how a relaunch
-            # retries an Integrate escalation, and why a finished milestone's
-            # relaunch is a no-op merge. Read as `integration.integrate_milestone`
-            # so a test can replace it, as `driver` is. It needs a factory for a
-            # conflicting tip; `None` is production's, read off `cli` now.
-            factory = cli.default_runner_factory if runner_factory is None else runner_factory
-            # `integrate_milestone` stays a synchronous call (I6); it is run on a
-            # worker thread, not the loop thread, only because its conflict
-            # resolver (`runtime_engine.run_subtask`) makes its own nested
-            # `asyncio.run(...)` call, which `asyncio.run` refuses once this
-            # coroutine is already running on the loop thread. `Store`'s
-            # connection is `check_same_thread=False` for exactly this kind of
-            # cross-thread, strictly sequential use (store.py).
-            # A cancel waits for that thread, so the store and lease below
-            # outlive it (`_in_thread_to_completion`).
-            outcome = await _in_thread_to_completion(
-                integration.integrate_milestone,
-                stories=plan.stories,
-                repo_dir=root,
-                base_branch=base_branch,
-                branch_prefix=branch_prefix,
-                commands=list(commands),
+        return asyncio.run(
+            run_milestone_engine(
+                pre,
+                handed,
+                commands=commands,
                 allow_no_verification=allow_no_verification,
-                store=store,
-                run_id=run_id,
-                runner_factory=factory,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
             )
-            if isinstance(outcome, integration.IntegrateEscalation):
-                # The branch and worktree stay exactly as Integrate left them (I5).
-                store.record_run(run_record.model_copy(update={"status": "escalated"}))
-                return comment_run_end(
-                    report(integrate_escalated_payload(run_id, outcome, warnings))
-                )
+        )
 
-            store.record_run(run_record.model_copy(update={"status": "done"}))
-            return comment_run_end(
-                report(
-                    {
-                        "done": True,
-                        "run_id": run_id,
-                        "levels": [
-                            {"level": index, "stories": [planned.story.id for planned in level]}
-                            for index, level in enumerate(levels)
-                        ],
-                        "completed": completed,
-                        "tips": tips,
-                        "warnings": warnings,
-                        "integrated": integrated_payload(outcome),
-                    }
-                )
-            )
-    finally:
-        store.close()
+    return cli.hand_off_to_child(
+        root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
 
 
 # ── the board run (card baef4f94) ───────────────────────────────────────────

@@ -20,6 +20,7 @@ Typer's own usage errors.
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -38,6 +39,7 @@ from agent_manager import (
     comments,
     control,
     dag,
+    detach,
     dispatch,
     locks,
     models,
@@ -839,37 +841,44 @@ def card_outcome_comment(
     return None
 
 
-def run_card(
+@dataclass(frozen=True)
+class CardPreflight:
+    """What `preflight_card` read and decided for one `run --card` (card 5daa944e).
+
+    Everything the recorded stage and the engine read afterwards, built with
+    no side effect: no store, no run directory, no lease. The three records
+    are the `started` rows `recorded_card_run` writes. Internal state, so a
+    dataclass.
+    """
+
+    root: Path
+    card: models.Card
+    parent: models.Card
+    branch: str
+    worktree: Path
+    base_branch: str
+    claims: list[str]
+    run_id: str
+    run_record: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+
+
+def preflight_card(
     card_id: str,
     *,
     repo_dir: Path,
     branch_prefix: str,
     base_branch: str = "master",
-    allow_no_verification: bool = False,
-    commands: Sequence[str] = (),
-    runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
-    control_interval: float = control.CONTROL_POLL_SECONDS,
-) -> dict[str, Any]:
-    """Drive one subtask card through `workflow.task.TASK` once, and report.
+) -> CardPreflight:
+    """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
 
-    The order is the spec's and it is load-bearing: the board reads happen before
-    a run id exists (so a bad card leaves no run directory), and the run, story
-    and subtask rows are written before the walk starts (so `status` and `resume`
-    can see a run that died on its first phase).
-
-    Live control (C11) and claims (X5): the card is refused before
-    `Store.open` if another live run claims it, and from before the
-    `started` rows through the final ones the run holds a `control.Lease`
-    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
-    which polls for `am pause`/`am cancel` every `control_interval` seconds
-    and turns one into `stop.request`. A pause parks the walk before its next
-    phase (`stopped`, resumable); a cancel parks it the same way and records
-    the run `cancelled` (`card_run_status`). No control cancels a running phase.
-
-    Board comments (card 5d9a875f): once the rows are recorded, still under
-    the lease, the card gets at most one comment (`card_outcome_comment`);
-    a flush's warnings join the payload's `warnings` and nothing else changes.
+    In today's order: the card, `ParentlessCardError`, its parent, the branch
+    and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
+    and before any store exists, so a refused card leaves no run directory
+    (X5). Only then is the clock read and the run id minted, and the
+    `started` run, story and subtask records built. Nothing is written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -884,14 +893,20 @@ def run_card(
     worktree = worktree_for(root, branch)
     claims = [control.card_claim(card.id)]
     # Read-only and before `Store.open`, so a refused card leaves no run
-    # directory (X5); `take_lease` below re-checks atomically.
+    # directory (X5); `take_lease` in the recorded stage re-checks atomically.
     refuse_claimed(root, claims)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-
-    store = Store.open(root, run_id)
-    try:
-        run_record = models.Run(
+    return CardPreflight(
+        root=root,
+        card=card,
+        parent=parent,
+        branch=branch,
+        worktree=worktree,
+        base_branch=base_branch,
+        claims=claims,
+        run_id=run_id,
+        run_record=models.Run(
             id=run_id,
             workflow=WORKFLOW_NAME,
             repo_dir=root,
@@ -900,97 +915,200 @@ def run_card(
             status="started",
             started_at=started_at,
             config=models.RunConfig(),
-        )
-        story = models.StoryRun(
+        ),
+        story=models.StoryRun(
             card_id=parent.id,
             title=parent.title,
             level=0,
             status="started",
             tip_branch=branch,
-        )
-        subtask = models.SubtaskRun(
+        ),
+        subtask=models.SubtaskRun(
             card_id=card.id,
             branch=branch,
             base_branch=base_branch,
             status="started",
             worktree_path=worktree,
-        )
-        # Inside the `try` that closes the store, so the claims and the lease
-        # are released before `store.close()` on every exit, a raising walk
-        # included (C2, X5). Taken before `record_run`, so every run write is
-        # fenced by this token; a lost race is `ClaimedError` with nothing
-        # written but the empty run directory.
-        with run_lease(store, claims=claims) as lease:
-            store.record_run(run_record)
-            store.record_story(story)
-            store.record_subtask(story.card_id, subtask)
+        ),
+    )
 
-            stop = StopSignal()
-            # `controlled` only ever parks the walk through `stop` (C3); it
-            # closes the window and runs a final sweep before returning.
-            drive = asyncio.run(
-                control.controlled(
-                    drive_subtask_async(
-                        store=store,
-                        run_id=run_id,
-                        card=card,
-                        parent=parent,
-                        subtask=subtask,
-                        repo_dir=root,
-                        commands=commands,
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        stop=stop,
-                    ),
-                    store=store,
-                    stop=stop,
-                    lease=lease,
-                    interval=control_interval,
-                )
-            )
-            summary = drive.summary
-            run_status = card_run_status(summary, stop)
 
-            store.record_run(run_record.model_copy(update={"status": run_status}))
-            store.record_story(story.model_copy(update={"status": summary.status}))
-            store.record_subtask(
-                story.card_id, subtask.model_copy(update={"status": summary.status})
-            )
+@dataclass(frozen=True)
+class RecordedRun:
+    """A run past its recorded stage: its id, its open store and the lease it holds.
 
-            # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
-            # still under the lease, so the outbox write is fenced. A board
-            # failure is a warning (B8); a lost lease propagates.
-            comment = card_outcome_comment(
-                run_id=run_id,
-                card=card,
-                summary=summary,
-                stop=stop,
-                branch=branch,
-                token=lease.token,
-            )
-            if comment is not None:
-                # `orchestrate` imports `cli`, so it is read here, at call time.
-                from agent_manager import orchestrate
+    What the engine of `run --card` needs that pre-flight could not give it
+    (card 5daa944e). Internal state, so a dataclass.
+    """
 
-                drive.warnings.extend(
-                    orchestrate.post_comment(store, root, comment, run_id=run_id)
-                )
+    run_id: str
+    store: Store
+    lease: control.Lease
 
-        return {
-            "run_id": run_id,
-            "card_id": card.id,
-            "story_id": parent.id,
-            "branch": branch,
-            "base_branch": base_branch,
-            "worktree": str(worktree),
-            "status": run_status,
-            "failed_phase": summary.failed_phase,
-            "detail": summary.detail,
-            "skipped": list(summary.skipped),
-            "warnings": drive.warnings,
-        }
+
+@contextmanager
+def recorded_card_run(pre: CardPreflight) -> Iterator[RecordedRun]:
+    """Stage 2 of `run --card`: open the store, take the lease, record `started` (card 5daa944e).
+
+    The lease and the `card:<id>` claim are taken inside the `try` that closes
+    the store, so they are released before `store.close()` on every exit, an
+    exception in the block included (C2, X5). They are taken before
+    `record_run`, so every run write is fenced by this token; a lost race is
+    `ClaimedError` (or `RunIsLiveError`) with nothing written but the empty
+    run directory. The run, story and subtask rows are written before the
+    block runs, so `status` and `resume` can see a run that dies on its first
+    phase.
+    """
+    store = Store.open(pre.root, pre.run_id)
+    try:
+        with run_lease(store, claims=pre.claims) as lease:
+            store.record_run(pre.run_record)
+            store.record_story(pre.story)
+            store.record_subtask(pre.story.card_id, pre.subtask)
+            yield RecordedRun(run_id=pre.run_id, store=store, lease=lease)
     finally:
         store.close()
+
+
+async def run_card_engine(
+    pre: CardPreflight,
+    recorded: RecordedRun,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Stage 3 of `run --card`: walk a recorded, leased run and report (card 5daa944e).
+
+    The walk runs under `control.controlled` with the recorded stage's lease,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request` (C11). Then the outcome rows are
+    recorded and, still under the lease, the card gets at most one comment
+    (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
+    the payload's `warnings`. The caller owns the store and the lease.
+    """
+    store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
+    stop = StopSignal()
+    # `controlled` only ever parks the walk through `stop` (C3); it
+    # closes the window and runs a final sweep before returning.
+    drive = await control.controlled(
+        drive_subtask_async(
+            store=store,
+            run_id=run_id,
+            card=pre.card,
+            parent=pre.parent,
+            subtask=pre.subtask,
+            repo_dir=pre.root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            stop=stop,
+        ),
+        store=store,
+        stop=stop,
+        lease=lease,
+        interval=control_interval,
+    )
+    summary = drive.summary
+    run_status = card_run_status(summary, stop)
+
+    store.record_run(pre.run_record.model_copy(update={"status": run_status}))
+    store.record_story(pre.story.model_copy(update={"status": summary.status}))
+    store.record_subtask(
+        pre.story.card_id, pre.subtask.model_copy(update={"status": summary.status})
+    )
+
+    # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
+    # still under the lease, so the outbox write is fenced. A board
+    # failure is a warning (B8); a lost lease propagates.
+    comment = card_outcome_comment(
+        run_id=run_id,
+        card=pre.card,
+        summary=summary,
+        stop=stop,
+        branch=pre.branch,
+        token=lease.token,
+    )
+    if comment is not None:
+        # `orchestrate` imports `cli`, so it is read here, at call time.
+        from agent_manager import orchestrate
+
+        drive.warnings.extend(orchestrate.post_comment(store, pre.root, comment, run_id=run_id))
+
+    return {
+        "run_id": run_id,
+        "card_id": pre.card.id,
+        "story_id": pre.parent.id,
+        "branch": pre.branch,
+        "base_branch": pre.base_branch,
+        "worktree": str(pre.worktree),
+        "status": run_status,
+        "failed_phase": summary.failed_phase,
+        "detail": summary.detail,
+        "skipped": list(summary.skipped),
+        "warnings": drive.warnings,
+    }
+
+
+def run_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str = "master",
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Drive one subtask card through `workflow.task.TASK` once, and report.
+
+    Three stages (card 5daa944e), composed here: `preflight_card` (the board
+    reads and every refusal, then the run id and the `started` records, with
+    no side effect), `recorded_card_run` (the store opened, the lease and
+    the `card:<id>` claim taken, the `started` rows written) and
+    `run_card_engine` (the walk, the outcome rows and the card comment),
+    which runs under one `asyncio.run`.
+
+    The order is the spec's and it is load-bearing: the board reads happen before
+    a run id exists (so a bad card leaves no run directory), and the run, story
+    and subtask rows are written before the walk starts (so `status` and `resume`
+    can see a run that died on its first phase).
+
+    Live control (C11) and claims (X5): the card is refused before
+    `Store.open` if another live run claims it, and from before the
+    `started` rows through the final ones the run holds a `control.Lease`
+    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request`. A pause parks the walk before its next
+    phase (`stopped`, resumable); a cancel parks it the same way and records
+    the run `cancelled` (`card_run_status`). No control cancels a running phase.
+    The lease and claim are released before `store.close()` on every exit.
+
+    Board comments (card 5d9a875f): once the rows are recorded, still under
+    the lease, the card gets at most one comment (`card_outcome_comment`);
+    a flush's warnings join the payload's `warnings` and nothing else changes.
+    """
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                recorded,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
 
 
 DEFAULT_MAX_CONCURRENT = 4
@@ -1175,6 +1293,146 @@ this tuple is a bug in this program and should crash loudly with its stack intac
 """
 
 
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+
+
+def release_handed_off(root: Path, run_id: str, token: str) -> None:
+    """Release a handed-off lease's claims, then the lease, over a fresh store.
+
+    For a detach that failed after `Lease.hand_off()`: the recorded stage's
+    store is already closed and its lease no longer releases anything.
+    """
+    store = Store.open(root, run_id)
+    try:
+        try:
+            store.release_claims(token)
+        finally:
+            store.release_lease(token)
+    finally:
+        store.close()
+
+
+def run_detached_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+) -> None:
+    """What the detached child of `am run --detach` runs: stage 3, then report.
+
+    It opens its own store and adopts `token` (no new lease: the claims the
+    parent took stay under it), so the heartbeat runs here. `engine` runs
+    stage 3 on that store and lease. Its payload is written to `report.json`
+    as `ok_envelope`, or a `HANDLED` error as `error_envelope`, both while
+    the lease is still held. Leaving the lease releases the claims, then the
+    lease, then the store closes, on every exit. Anything else propagates
+    with no report: its traceback goes to `run.log`.
+    """
+    store = Store.open(root, run_id)
+    try:
+        with control.Lease(store, adopt=token) as lease:
+            try:
+                payload = engine(store, lease)
+            except HANDLED as error:
+                detach.write_report(run_id, render(error_envelope(error)))
+                return
+            detach.write_report(run_id, render(ok_envelope(payload)))
+    finally:
+        store.close()
+
+
+def hand_off_to_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    log: Path,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+    detacher: detach.Detacher,
+) -> dict[str, Any]:
+    """Start the detached child, point the lease at it, let it go, and report.
+
+    Called with the lease already handed off and the recorded stage's store
+    closed, so no connection and no heartbeat thread crosses the fork. The
+    child blocks until `go`. The lease row is re-pointed at the child's pid
+    over a fresh store while this process is still alive, so the row never
+    names a dead pid, and only then is the child let go. A failed spawn or
+    pid update releases the claims and lease (after telling a spawned child
+    to abort) and propagates.
+    """
+
+    def body() -> None:
+        run_detached_child(root=root, run_id=run_id, token=token, engine=engine)
+
+    try:
+        spawned = detacher(body, log)
+    except BaseException:
+        release_handed_off(root, run_id, token)
+        raise
+    try:
+        store = Store.open(root, run_id)
+        try:
+            store.set_lease_holder(token, pid=spawned.pid, host=socket.gethostname())
+        finally:
+            store.close()
+    except BaseException:
+        spawned.abort()
+        release_handed_off(root, run_id, token)
+        raise
+    spawned.go()
+    return {"run_id": run_id, "pid": spawned.pid, "log": str(log), "detached": True}
+
+
+def detach_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    base_branch: str = "master",
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
+
+    `preflight_card` and `recorded_card_run` run exactly as for `run_card`, so
+    every refusal is the same. Inside the recorded stage `run.log` is created
+    (a failure there releases as any crash does) and the lease is handed
+    off, so the stage exits releasing nothing and closes its store. The child
+    runs `run_card_engine` on this very `pre` and run id (`hand_off_to_child`).
+    """
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        log = detach.create_run_log(pre.run_id)
+        token = recorded.lease.hand_off()
+
+    def engine(store: Store, lease: control.Lease) -> dict[str, Any]:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                RecordedRun(run_id=pre.run_id, store=store, lease=lease),
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
+
+    return hand_off_to_child(
+        root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -1183,6 +1441,7 @@ def _check_run_targets(
     max_concurrent: int | None = None,
     board: bool = False,
     branch_prefix: str | None = None,
+    detach: bool = False,
 ) -> None:
     """Refuse a bad `--card` / `--milestone` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
@@ -1201,6 +1460,9 @@ def _check_run_targets(
     refused whatever its value, the default included. The Option has no
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
+    `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
+    nothing to hand off, and with `--board`, whose run was not split into
+    pre-flight, recorded stage and engine.
     """
     if board and card is not None:
         raise typer.BadParameter(
@@ -1237,6 +1499,16 @@ def _check_run_targets(
             "--branch-prefix with --board needs a non-blank prefix, not a blank string",
             param_hint="'--branch-prefix'",
         )
+    if detach and dry_run:
+        raise typer.BadParameter(
+            "--dry-run writes nothing and cannot be detached",
+            param_hint="'--detach' / '--dry-run'",
+        )
+    if detach and board:
+        raise typer.BadParameter(
+            "--detach applies to --card and --milestone, not --board",
+            param_hint="'--detach' / '--board'",
+        )
     if dry_run and card is not None:
         raise typer.BadParameter(
             "--dry-run previews a milestone and does not apply to --card",
@@ -1258,6 +1530,7 @@ RUN_EXAMPLES = """\
 Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
+  am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
   am run --board --verify "uv run pytest"                             # run every open milestone
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
@@ -1295,6 +1568,16 @@ def run(
             "With --milestone: show the plan (story order, each subtask's branch "
             "and base, merged bases) and write nothing. With --board: show every "
             "open milestone by level, each with its own plan, and write nothing."
+        ),
+    ),
+    detach_run: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "With --card or --milestone: check, record and lease the run here, "
+            "then hand it to a background process in its own session and print "
+            "its run id, pid and log. Its output goes to "
+            "<data dir>/runs/<run-id>/run.log and its final envelope to report.json."
         ),
     ),
     max_concurrent: int | None = typer.Option(
@@ -1350,6 +1633,7 @@ def run(
         max_concurrent=max_concurrent,
         board=whole_board,
         branch_prefix=branch_prefix,
+        detach=detach_run,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1380,6 +1664,19 @@ def run(
                 base_branch=base_branch,
                 max_concurrent=lanes,
             )
+        elif milestone is not None and detach_run:
+            # Read as `orchestrate.detach_milestone` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
+                detacher=detach.fork_detacher,
+            )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
             # No runner_factory and no driver: production gets
@@ -1392,6 +1689,17 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+            )
+        elif detach_run:
+            # Read as `detach.fork_detacher` so a test can patch it there.
+            payload = detach_card(
+                card,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                allow_no_verification=allow_no_verification,
+                commands=list(verify),
+                detacher=detach.fork_detacher,
             )
         else:
             payload = run_card(
@@ -1406,6 +1714,9 @@ def run(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+    if detach_run:
+        # A handed-off run's outcome is in its report.json, not this exit code.
+        return
     # A board payload carries one entry per milestone under `milestones`, each
     # with a `status`; a board dry-run carries no `milestones` key at all, so
     # it is read with `.get` and an empty default. A card payload reports

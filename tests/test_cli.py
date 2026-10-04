@@ -17,12 +17,15 @@ import io
 import inspect
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +42,7 @@ from agent_manager import (
     cli,
     control,
     dag,
+    detach,
     dispatch,
     integration,
     locks,
@@ -9068,3 +9072,802 @@ def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeyp
         _watch_line("run-a", 3),
         _watch_line("run-d", 1),
     ]
+
+
+# ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is a plain directory, and no git, brd or claude process ever starts.
+
+SEAM_AT = datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc)
+SEAM_LATER = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+
+def _seam_root(tmp_path: Path, monkeypatch) -> Path:
+    """A plain repo directory (no git, no brd) with the data dir under tmp_path."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _seam_cards(fake_board) -> dict[str, str]:
+    """The milestone -> story -> subtask chain `run --card` needs, on the FakeBoard."""
+    milestone = fake_board.add_card("Milestone 1: walking skeleton")
+    story = fake_board.add_card("The CLI: run, status, logs, resume", parent_id=milestone)
+    subtask = fake_board.add_card("Add run --card end to end", parent_id=story)
+    return {"milestone": milestone, "story": story, "subtask": subtask}
+
+
+def _preflight(root: Path, card_id: str, at: datetime = SEAM_AT) -> Any:
+    return cli.preflight_card(
+        card_id, repo_dir=root, branch_prefix="m1", base_branch="main", clock=lambda: at
+    )
+
+
+def test_preflight_card_refuses_a_parentless_card_and_creates_no_run_directory(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    loose = fake_board.add_card("A card with no story")
+
+    with pytest.raises(cli.ParentlessCardError):
+        _preflight(root, loose)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_card_refuses_a_card_another_live_run_claims(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight(root, cards["subtask"])
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    card = board.show(cards["subtask"], repo_dir=root)
+    branch = dag.task_branch("m1", card)
+
+    pre = _preflight(root, cards["subtask"])
+
+    assert pre.root == root
+    assert (pre.card.id, pre.parent.id) == (cards["subtask"], cards["story"])
+    assert pre.run_id == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert pre.branch == branch
+    assert pre.worktree == cli.worktree_for(root, branch)
+    assert pre.base_branch == "main"
+    assert pre.claims == [control.card_claim(cards["subtask"])]
+    assert (pre.run_record.id, pre.run_record.status) == (pre.run_id, "started")
+    assert (pre.run_record.workflow, pre.run_record.started_at) == (cli.WORKFLOW_NAME, SEAM_AT)
+    assert (pre.run_record.base_branch, pre.run_record.branch_prefix) == ("main", "m1")
+    assert (pre.story.card_id, pre.story.status, pre.story.tip_branch) == (
+        cards["story"],
+        "started",
+        branch,
+    )
+    assert (pre.subtask.card_id, pre.subtask.status, pre.subtask.branch) == (
+        cards["subtask"],
+        "started",
+        branch,
+    )
+    assert pre.subtask.worktree_path == cli.worktree_for(root, branch)
+    assert _run_dirs() == []
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == []
+    assert fake_board.writes == []
+
+
+def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
+    """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
+
+    `(0, 0)` means the claims and the lease were released before the store
+    closed. Counted over the closing store's own connection, before the real
+    close runs.
+    """
+    seen: list[tuple[int, int]] = []
+    real_close = store_module.Store.close
+
+    def close(self) -> None:
+        conn = self.connection
+        claims = conn.execute(
+            "SELECT COUNT(*) FROM run_claims WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        leases = conn.execute(
+            "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        seen.append((claims, leases))
+        real_close(self)
+
+    monkeypatch.setattr(store_module.Store, "close", close)
+    return seen
+
+
+def _no_drive(**kwargs: Any) -> Any:
+    pytest.fail("drive_subtask_async ran in the recorded stage")
+
+
+def test_inside_recorded_card_run_the_run_is_recorded_and_leased_but_not_driven(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(cli, "drive_subtask_async", _no_drive)
+    pre = _preflight(root, cards["subtask"])
+
+    with cli.recorded_card_run(pre) as recorded:
+        assert recorded.run_id == pre.run_id
+        run = recorded.store.load_run(pre.run_id)
+        assert run is not None
+        (story,) = run.stories
+        (subtask,) = story.subtasks
+        assert (run.status, story.status, subtask.status) == ("started", "started", "started")
+        assert (story.card_id, subtask.card_id) == (cards["story"], cards["subtask"])
+        lease = _card_lease(root, pre.run_id)
+        assert lease is not None
+        assert lease.token == recorded.lease.token
+        assert _claim_rows(root) == [
+            (control.card_claim(cards["subtask"]), pre.run_id, recorded.lease.token)
+        ]
+
+
+def test_leaving_recorded_card_run_on_an_error_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+
+    with pytest.raises(RuntimeError, match="engine never started"):
+        with cli.recorded_card_run(pre):
+            raise RuntimeError("engine never started")
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    assert _card_lease(root, pre.run_id) is None
+    again = _preflight(root, cards["subtask"], SEAM_LATER)
+    assert again.run_id == cli.mint_run_id(cards["subtask"], SEAM_LATER)
+
+
+def test_a_claim_taken_after_card_preflight_is_refused_on_entry_with_nothing_recorded(
+    tmp_path, monkeypatch, fake_board
+):
+    """The lost race (spec, Error paths): another run claims the card between
+    pre-flight and the recorded stage. `take_lease` refuses it atomically,
+    nothing is recorded and the store is still closed."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        with cli.recorded_card_run(pre):
+            pytest.fail("the recorded stage yielded under another run's claim")
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert closes == [(0, 0)]
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def _done_drive(calls: list[dict[str, Any]]):
+    """A fake `drive_subtask_async` that records its keywords and finishes `done`."""
+
+    async def drive(**kwargs: Any) -> cli.SubtaskDrive:
+        calls.append(kwargs)
+        return cli.SubtaskDrive(summary=SubtaskSummary(status="done"), warnings=[])
+
+    return drive
+
+
+def test_run_card_hands_the_engine_the_lease_of_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    handed: dict[str, Any] = {}
+
+    real_recorded = cli.recorded_card_run
+
+    @contextmanager
+    def spying_recorded(pre):
+        with real_recorded(pre) as recorded:
+            handed["recorded"] = recorded
+            yield recorded
+
+    real_controlled = control.controlled
+
+    async def spying_controlled(work, **kwargs):
+        handed["controlled"] = kwargs["lease"]
+        return await real_controlled(work, **kwargs)
+
+    real_comment = cli.card_outcome_comment
+
+    def spying_comment(**kwargs):
+        handed["token"] = kwargs["token"]
+        return real_comment(**kwargs)
+
+    monkeypatch.setattr(cli, "recorded_card_run", spying_recorded)
+    monkeypatch.setattr(control, "controlled", spying_controlled)
+    monkeypatch.setattr(cli, "card_outcome_comment", spying_comment)
+
+    result = cli.run_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        control_interval=0.01,
+    )
+
+    recorded = handed["recorded"]
+    assert handed["controlled"] is recorded.lease
+    assert handed["token"] == recorded.lease.token
+    assert recorded.run_id == result["run_id"] == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert [call["run_id"] for call in calls] == [result["run_id"]]
+    assert calls[0]["store"] is recorded.store
+    assert result["status"] == "done"
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_card_engine_still_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    """Spec: a crash in the engine still propagates, still releases the lease
+    and claims, and still closes the store. A characterization pin: it passes
+    before the split and must keep passing after it."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    async def crashing_drive(**kwargs: Any) -> Any:
+        raise RuntimeError("drive bug")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", crashing_drive)
+    closes = _close_snapshots(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="drive bug"):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=root,
+            branch_prefix="m1",
+            base_branch="main",
+            clock=lambda: SEAM_AT,
+            control_interval=0.01,
+        )
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+
+
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+#
+# Unit tier: `detach.fork_detacher` is replaced by `_FakeDetacher`, which
+# forks nothing; its `body` is run inline by the tests that need the child.
+
+FAKE_CHILD_PID = 424242
+"""The pid `_FakeDetacher` reports; no such child exists."""
+
+
+class _FakeDetacher:
+    """Stands in for `detach.fork_detacher`: records the call, starts nothing.
+
+    `body` keeps what the real child would run. `at_go`, when set, runs as
+    the parent writes the go byte, so a test can see the store at that moment.
+    """
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[Path] = []
+        self.events: list[str] = []
+        self.body: Any = None
+        self.at_go: Any = None
+
+    def __call__(self, body: Any, log: Path) -> detach.Spawned:
+        self.calls.append(log)
+        if self.error is not None:
+            raise self.error
+        self.body = body
+        return detach.Spawned(pid=FAKE_CHILD_PID, go=self._go, abort=self._abort)
+
+    def _go(self) -> None:
+        if self.at_go is not None:
+            self.at_go()
+        self.events.append("go")
+
+    def _abort(self) -> None:
+        self.events.append("abort")
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _alive_heartbeats() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "am-lease-heartbeat" and thread.is_alive()
+    ]
+
+
+DRY_RUN_DETACH = "--dry-run writes nothing and cannot be detached"
+BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message", "hint"),
+    [
+        (
+            {"card": None, "milestone": "M9", "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": SOME_CARD, "milestone": None, "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": False},
+            BOARD_DETACH,
+            "'--detach' / '--board'",
+        ),
+    ],
+)
+def test_check_run_targets_refuses_detach_with_dry_run_or_board(kwargs, message, hint):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(detach=True, **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"card": SOME_CARD, "milestone": None},
+        {"card": None, "milestone": "M9", "max_concurrent": 2},
+    ],
+)
+def test_check_run_targets_accepts_detach_with_card_or_milestone(kwargs):
+    assert (
+        cli._check_run_targets(dry_run=False, branch_prefix="m9", detach=True, **kwargs) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("targets", "word"),
+    [
+        (["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"], "detached"),
+        (["--board"], "applies"),
+    ],
+)
+def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(
+        cli.app, ["run", *targets, "--detach", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert fake.calls == []
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def _handed_off_card_run(root: Path, card_id: str) -> tuple[Any, str]:
+    """Stage 1 and 2 of a card run, then the parent's hand-off: what the child inherits."""
+    pre = _preflight(root, card_id)
+    with cli.recorded_card_run(pre) as recorded:
+        token = recorded.lease.hand_off()
+    return pre, token
+
+
+def _no_take_lease(self, **kwargs: Any) -> Any:
+    pytest.fail("the detached child took a new lease instead of adopting its own")
+
+
+def _report_path(run_id: str) -> Path:
+    return paths.data_dir() / "runs" / run_id / detach.REPORT_NAME
+
+
+def test_the_detached_child_adopts_the_lease_reports_then_releases_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+    held_at_report: list[bool] = []
+    real_write = detach.write_report
+
+    def spying_write(run_id: str, text: str) -> Path:
+        held_at_report.append(_card_lease(root, run_id) is not None)
+        return real_write(run_id, text)
+
+    monkeypatch.setattr(detach, "write_report", spying_write)
+    seen: list[tuple[str, str, str, int]] = []
+
+    def engine(store, lease):
+        row = _card_lease(root, pre.run_id)
+        seen.append((store.run_id, lease.token, row.token, len(_alive_heartbeats())))
+        return {"run_id": pre.run_id, "status": "done"}
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert seen == [(pre.run_id, token, token, 1)]
+    report = _report_path(pre.run_id)
+    assert json.loads(report.read_text(encoding="utf-8")) == {
+        "ok": True,
+        "data": {"run_id": pre.run_id, "status": "done"},
+    }
+    assert _mode(report) == 0o600
+    assert held_at_report == [True]
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _alive_heartbeats() == []
+
+
+def test_the_detached_child_reports_a_handled_error_and_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise cli.UnknownCardError("the card is gone")
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert json.loads(_report_path(pre.run_id).read_text(encoding="utf-8")) == {
+        "ok": False,
+        "error": {"type": "UnknownCardError", "message": "the card is gone"},
+    }
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_detached_child_writes_no_report_and_still_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise RuntimeError("engine bug")
+
+    with pytest.raises(RuntimeError, match="engine bug"):
+        cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert not _report_path(pre.run_id).exists()
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _recorded_run_ids(root) == [pre.run_id]
+
+
+def test_release_handed_off_releases_the_claims_and_lease_and_closes(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    assert _card_lease(root, pre.run_id) is not None
+    closes = _close_snapshots(monkeypatch)
+
+    cli.release_handed_off(pre.root, pre.run_id, token)
+
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+
+
+def _card_run_args(root: Path, card_id: str, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--card",
+        card_id,
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        "m1",
+        "--allow-no-verification",
+        *extra,
+    ]
+
+
+def _lease_pids(root: Path) -> list[int]:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [row["pid"] for row in conn.execute("SELECT pid FROM run_leases ORDER BY run_id")]
+    finally:
+        conn.close()
+
+
+def test_a_detached_card_run_prints_one_envelope_and_leaves_the_lease_to_the_child(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(cli, "drive_subtask_async", _no_drive)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    closes = _close_snapshots(monkeypatch)
+    pids_at_go: list[list[int]] = []
+    fake.at_go = lambda: pids_at_go.append(_lease_pids(root))
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert result.exit_code == 0, result.output
+    assert len(result.stdout.splitlines()) == 1
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert (data["pid"], data["detached"]) == (FAKE_CHILD_PID, True)
+    run_id = data["run_id"]
+    assert [entry["id"] for entry in cli.runs_for(repo_dir=root)["runs"]] == [run_id]
+    log = Path(data["log"])
+    assert log == paths.data_dir() / "runs" / run_id / detach.RUN_LOG_NAME
+    assert log.is_file() and _mode(log) == 0o600
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert pids_at_go == [[FAKE_CHILD_PID]]
+    lease = _card_lease(root, run_id)
+    assert lease is not None
+    assert (lease.pid, lease.host) == (FAKE_CHILD_PID, socket.gethostname())
+    assert _claim_rows(root) == [(control.card_claim(cards["subtask"]), run_id, lease.token)]
+    assert _alive_heartbeats() == []
+    # The recorded stage's store, then the pid update's: both closed, both still holding.
+    assert closes == [(1, 1), (1, 1)]
+    assert not (log.parent / detach.REPORT_NAME).exists()
+
+
+def test_detach_honours_pretty(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(detach, "fork_detacher", _FakeDetacher())
+
+    result = runner.invoke(
+        cli.app, _card_run_args(root, cards["subtask"], "--detach", "--pretty")
+    )
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert result.stdout == cli.render(envelope, pretty=True) + "\n"
+    assert envelope["data"]["detached"] is True
+
+
+def test_the_detached_card_child_reports_the_foreground_payload_then_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+    assert result.exit_code == 0, result.output
+    run_id = json.loads(result.stdout)["data"]["run_id"]
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    captured: list[dict[str, Any]] = []
+    real_engine = cli.run_card_engine
+
+    async def spying_engine(pre, recorded, **kwargs):
+        payload = await real_engine(pre, recorded, **kwargs)
+        captured.append(payload)
+        return payload
+
+    monkeypatch.setattr(cli, "run_card_engine", spying_engine)
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+
+    fake.body()
+
+    (payload,) = captured
+    assert (payload["run_id"], payload["status"]) == (run_id, "done")
+    assert [call["run_id"] for call in calls] == [run_id]
+    report = _report_path(run_id)
+    assert json.loads(report.read_text(encoding="utf-8")) == json.loads(
+        cli.render(cli.ok_envelope(payload))
+    )
+    assert _mode(report) == 0o600
+    assert closes == [(0, 0)]
+    assert _card_lease(root, run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_a_parentless_card_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    loose = fake_board.add_card("A card with no story")
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = runner.invoke(cli.app, _card_run_args(root, loose))
+    detached = runner.invoke(cli.app, _card_run_args(root, loose, "--detach"))
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert json.loads(detached.stdout) == json.loads(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "ParentlessCardError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+
+
+def test_a_claimed_card_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = runner.invoke(cli.app, _card_run_args(root, cards["subtask"]))
+    detached = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    def steady(stdout: str) -> dict[str, Any]:
+        envelope = json.loads(stdout)
+        envelope["error"]["message"] = re.sub(r"\d+s ago", "Ns ago", envelope["error"]["message"])
+        return envelope
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert steady(detached.stdout) == steady(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "ClaimedError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_a_failed_detach_releases_the_claim_and_lease_and_prints_no_detached_envelope(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher(error=OSError("fork failed"))
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    closes = _close_snapshots(monkeypatch)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, OSError)
+    assert '"detached"' not in result.stdout
+    assert len(fake.calls) == 1
+    assert closes[-1] == (0, 0)
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_run_log_that_cannot_be_created_releases_through_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    """Spec, Error paths: the failure is raised inside the recorded stage,
+    before the hand-off, so 3.1's release-then-close covers it."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def unwritable(run_id: str) -> Path:
+        raise PermissionError("run.log: permission denied")
+
+    monkeypatch.setattr(detach, "create_run_log", unwritable)
+    closes = _close_snapshots(monkeypatch)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, PermissionError)
+    assert '"detached"' not in result.stdout
+    assert fake.calls == []
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_failed_lease_pid_update_aborts_the_child_and_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 1: the child is told to abort and never runs its body."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def locked(self, token: str, *, pid: int, host: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store_module.Store, "set_lease_holder", locked)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, sqlite3.OperationalError)
+    assert '"detached"' not in result.stdout
+    assert fake.events == ["abort"]
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_card_run_without_detach_still_prints_its_full_payload(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"]))
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["status"] == "done"
+    assert "detached" not in data
+    assert fake.calls == []
+    assert _claim_rows(root) == []
+    assert not (paths.data_dir() / "runs" / data["run_id"] / detach.RUN_LOG_NAME).exists()
+
+
+def test_run_help_and_examples_document_detach():
+    assert "--detach" in cli.RUN_EXAMPLES
+
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--detach" in result.output
