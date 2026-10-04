@@ -2198,19 +2198,34 @@ when a blocker did not finish `done` and it was never dispatched."""
 def board_prefixes(
     milestones: Sequence[models.CardNode],
     branch_prefix_of: Callable[[models.CardNode], str],
+    *,
+    roots: Sequence[models.CardNode] = (),
 ) -> dict[str, str]:
-    """Each open milestone's branch prefix, keyed by milestone id, in input order.
+    """Each given milestone's branch prefix, then each of its blocker roots', keyed by id.
+
+    The given milestones come first, in input order. Then each card in `roots`
+    (every milestone root the caller read, open or not) that one of them lists
+    in `blocked_by` and that has no key yet, in `roots` order, whatever its
+    status: a blocker that is no longer open keeps the prefix it ran under, so
+    `milestone_bases` can name the integrate branch it left behind. Whether that
+    blocker matters is `milestone_bases`' call, not this one's. Only direct
+    blockers are keyed; a `roots` card nobody here blocks on is never derived,
+    and a `blocked_by` id that is not in `roots` is ignored. With no `roots`
+    the result is the given milestones' alone.
 
     `branch_prefix_of` is the caller's: deriving a prefix is not this module's
-    job. This only checks it. A prefix that is not a non-blank string is
-    `ValueError`, as `run_milestone` refuses a missing one. So is a prefix two
-    milestones share: both would claim `branch:<prefix>-integrate`, and the
-    deduplicated board claim set would hide that until the second milestone's
-    own pre-flight refused it mid-run.
+    job. This only checks it, for every entry alike. A prefix that is not a
+    non-blank string is `ValueError`, as `run_milestone` refuses a missing one.
+    So is a prefix two entries share: two milestones would both claim
+    `branch:<prefix>-integrate`, and the deduplicated board claim set would hide
+    that until the second milestone's own pre-flight refused it mid-run; a
+    blocker root sharing one would have its blocked milestone stack on the
+    other's branch.
     """
     prefixes: dict[str, str] = {}
     owners: dict[str, str] = {}
-    for card in milestones:
+
+    def add(card: models.CardNode) -> None:
         prefix = branch_prefix_of(card)
         if not isinstance(prefix, str) or not prefix.strip():
             raise ValueError(f"milestone {card.id} has no branch prefix (got {prefix!r})")
@@ -2220,7 +2235,98 @@ def board_prefixes(
             )
         owners[prefix] = card.id
         prefixes[card.id] = prefix
+
+    for card in milestones:
+        add(card)
+    blocker_ids = {blocker_id for card in milestones for blocker_id in card.blocked_by}
+    for card in roots:
+        if card.id in blocker_ids and card.id not in prefixes:
+            add(card)
     return prefixes
+
+
+class MilestoneBlockersError(ValueError):
+    """A milestone would have to stack on two or more blockers at once.
+
+    A milestone's base is one branch, and a merged base is a non-goal, so the
+    human is told to chain the blockers instead. Subclasses `ValueError`, as
+    `dag.DependencyCycleError` does: `ValueError` is already in `cli.HANDLED`,
+    so a CLI caller gets the `ok: false` envelope and exit 3.
+    """
+
+
+def _blocker_branch(milestone_id: str, blocker_id: str, prefixes: Mapping[str, str]) -> str:
+    """The blocker's `<prefix>-integrate`, or `ValueError` when it has no prefix.
+
+    A missing or blank prefix is a caller bug, refused as `board_prefixes`
+    refuses one, and never a `MilestoneBlockersError`.
+    """
+    prefix = prefixes.get(blocker_id)
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise ValueError(
+            f"milestone {milestone_id}'s blocker {blocker_id} has no branch prefix "
+            f"(got {prefix!r})"
+        )
+    return integration.integration_branch(prefix)
+
+
+def milestone_bases(
+    milestones: Sequence[models.CardNode],
+    prefixes: Mapping[str, str],
+    branch_exists: Callable[[str], bool],
+    base_branch: str,
+) -> dict[str, str]:
+    """The branch each open milestone stacks on, keyed by id, in input order.
+
+    `milestones` is every milestone root the caller knows, open or not; only
+    the open ones (`dag.milestone_is_open`) get a key. A blocker id that is
+    not a root in `milestones` is ignored. Each blocker is then exactly one of:
+
+    - open: a stack candidate on its integrate branch, which its own run in
+      this board creates. `branch_exists` is not asked.
+    - landed (`census.is_landed`): ignored. `branch_exists` is not asked.
+    - unlanded (`done`, or in play with nothing open under it): a candidate
+      only if `branch_exists` says its integrate branch is there; otherwise
+      assumed landed, today's behaviour.
+
+    No candidate stacks on `base_branch`, one stacks on its branch, two or
+    more raise `MilestoneBlockersError` for the first such milestone in input
+    order. Pure apart from `branch_exists`, which is asked at most once per
+    (milestone, blocker) pair. Blocker cycles are `dag.board_levels`' to
+    refuse, not this function's.
+    """
+    by_id = {card.id: card for card in milestones}
+    bases: dict[str, str] = {}
+    for card in milestones:
+        if card.id in bases or not dag.milestone_is_open(card):
+            continue
+        candidates: list[tuple[str, str]] = []
+        unlanded: list[str] = []
+        for blocker_id in dict.fromkeys(card.blocked_by):
+            blocker = by_id.get(blocker_id)
+            if blocker is None:
+                continue
+            if dag.milestone_is_open(blocker):
+                candidates.append((blocker.id, _blocker_branch(card.id, blocker.id, prefixes)))
+            elif not census.is_landed(blocker.status):
+                branch = _blocker_branch(card.id, blocker.id, prefixes)
+                if branch_exists(branch):
+                    candidates.append((blocker.id, branch))
+                    unlanded.append(blocker.id)
+        if len(candidates) > 1:
+            listed = ", ".join(blocker_id for blocker_id, _ in candidates)
+            message = (
+                f"milestone {card.id} is blocked by {len(candidates)} milestones that are "
+                f"not landed ({listed}); a milestone stacks on at most one: "
+                "chain them (A <- B <- C)"
+            )
+            if unlanded:
+                message += (
+                    f", or mark {', '.join(unlanded)} merged if that work has already landed"
+                )
+            raise MilestoneBlockersError(message)
+        bases[card.id] = candidates[0][1] if candidates else base_branch
+    return bases
 
 
 def board_claims(
@@ -2258,6 +2364,33 @@ def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     return "escalated"
 
 
+def _local_branch_exists(root: Path) -> Callable[[str], bool]:
+    """`run_board`'s `branch_exists` for `milestone_bases`: is `<branch>` a local branch of `root`?
+
+    Each call runs `git -C <root> rev-parse --verify --quiet refs/heads/<branch>`
+    through `worktree.run_git`, read at call time. Only `refs/heads/` counts: a
+    tag or a remote-tracking ref with the same short name is not a local
+    branch. Exit 1 is the ref being absent, so `False`; any other `GitError`
+    (exit 128, "not a git repository") is not an answer and propagates, so a
+    broken repository never silently drops a stacked milestone onto the base
+    branch. No `git_lock`: a read-only ref lookup is not worth a
+    `LockTimeoutError` path in a refusal check.
+    """
+
+    def exists(branch: str) -> bool:
+        try:
+            worktree.run_git(
+                ["-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]
+            )
+        except worktree.GitError as error:
+            if error.exit_code == 1:
+                return False
+            raise
+        return True
+
+    return exists
+
+
 def run_board(
     *,
     repo_dir: Path,
@@ -2276,11 +2409,16 @@ def run_board(
     Refusals come first, in this order, and each leaves nothing behind. Bad
     arguments are `ValueError` before the board is read: `max_concurrent < 1`
     and a missing `base_branch`, as `run_milestone` refuses them. Then come the
-    open milestones: `board.roots()` leveled by `dag.board_levels`, so a done
-    milestone with nothing open under it drops out and a blocker cycle is
-    `DependencyCycleError`. Next, each milestone's prefix from
-    `branch_prefix_of` (`board_prefixes`: blank or shared is `ValueError`).
-    Last, one `cli.refuse_claimed` over every open milestone's
+    open milestones: `board.roots()`, read once, leveled by `dag.board_levels`,
+    so a done milestone with nothing open under it drops out and a blocker
+    cycle is `DependencyCycleError`. Next, each milestone's prefix from
+    `branch_prefix_of`, and each non-open blocker root's too (`board_prefixes`
+    with `roots=`: blank or shared is `ValueError`). Next, each open
+    milestone's base (`milestone_bases` over every root): its one open
+    blocker's `<prefix>-integrate`, or its one unlanded blocker's when that
+    branch exists locally (`_local_branch_exists`), else `base_branch`; two
+    such blockers is `MilestoneBlockersError`, before the claims check. Last,
+    one `cli.refuse_claimed` over every open milestone's
     `milestone_claims`, unioned in level order (`board_claims`): a key another
     live run holds is `ClaimedError` before any milestone starts, so there is
     no run row, run directory or lease for any of them. Each milestone's own
@@ -2289,9 +2427,9 @@ def run_board(
 
     Then one `asyncio.run` covers the whole board with one
     `asyncio.Semaphore(max_concurrent)` that every milestone's lanes share
-    (`_run_board_async`). A milestone runs once every open blocker finished
-    `done`. A milestone whose blocker did not finish `done` is never
-    dispatched and is reported `blocked`. A milestone that raises is reported
+    (`_run_board_async`), each milestone on its own base. A milestone runs
+    once every open blocker finished `done`. A milestone whose blocker did
+    not finish `done` is never dispatched and is reported `blocked`. A milestone that raises is reported
     `escalated` with `"<Type>: <msg>"` and never disturbs its siblings.
 
     Returns the plain payload, not the CLI envelope:
@@ -2312,9 +2450,11 @@ def run_board(
     if not base_branch:
         raise ValueError("a board run needs a base branch")
     root = runs.resolve_repo_dir(repo_dir)
-    levels = dag.board_levels(board.roots(repo_dir=root))
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
     milestones = [card for level in levels for card in level]
-    prefixes = board_prefixes(milestones, branch_prefix_of)
+    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
+    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
     levels_payload = [
         {"level": index, "milestones": [card.id for card in level]}
         for index, level in enumerate(levels)
@@ -2326,8 +2466,8 @@ def run_board(
         _run_board_async(
             milestones,
             prefixes=prefixes,
+            bases=bases,
             root=root,
-            base_branch=base_branch,
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
@@ -2349,8 +2489,8 @@ async def _run_board_async(
     milestones: Sequence[models.CardNode],
     *,
     prefixes: Mapping[str, str],
+    bases: Mapping[str, str],
     root: Path,
-    base_branch: str,
     commands: Sequence[str],
     allow_no_verification: bool,
     runner_factory: runs.RunnerFactory | None,
@@ -2361,8 +2501,11 @@ async def _run_board_async(
 ) -> list[dict[str, Any]]:
     """`run_board`'s one event loop: one entry per milestone, in `milestones` order.
 
-    The tree comes from `build_dag_tree`, with each milestone's blockers being
-    its `blocked_by` restricted to `milestones` (a done blocker is not here,
+    Each milestone is dispatched on its own entry in `bases` (`milestone_bases`'
+    answer), never on one shared base; `bases` keys every open milestone, so a
+    missing key is a caller bug and surfaces as that milestone's `escalated`
+    entry. The tree comes from `build_dag_tree`, with each milestone's
+    blockers being its `blocked_by` restricted to `milestones` (a done blocker is not here,
     so it is satisfied). grafo itself holds a node back until every one of its
     parents' edges has fired, so by the time a node body runs, every blocker's
     `milestone_ok` entry is already set -- no extra waiting needed here. A
@@ -2395,7 +2538,7 @@ async def _run_board_async(
                 payload = await _run_milestone_async(
                     card.id,
                     repo_dir=root,
-                    base_branch=base_branch,
+                    base_branch=bases[card.id],
                     branch_prefix=prefixes[card.id],
                     commands=commands,
                     allow_no_verification=allow_no_verification,

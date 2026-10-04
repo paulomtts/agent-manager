@@ -28,7 +28,18 @@ from typing import Any
 
 import pytest
 
-from agent_manager import bases, board, cli, dag, integration, models, orchestrate, paths, store
+from agent_manager import (
+    bases,
+    board,
+    census,
+    cli,
+    dag,
+    integration,
+    models,
+    orchestrate,
+    paths,
+    store,
+)
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -141,6 +152,21 @@ def _run_dirs() -> list[Path]:
 
 def _local_branches(root: Path) -> list[str]:
     return _git(root, "branch", "--format=%(refname:short)").split()
+
+
+def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """`git merge-base --is-ancestor`: exit 0 is True, exit 1 is False, anything else raises.
+
+    Anything else (exit 128: an unknown ref) is not an answer, so a typo in a
+    ref can never pass a "does not contain" assertion by accident.
+    """
+    argv = ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant]
+    completed = subprocess.run(argv, capture_output=True, text=True)
+    if completed.returncode in (0, 1):
+        return completed.returncode == 0
+    raise subprocess.CalledProcessError(
+        completed.returncode, argv, completed.stdout, completed.stderr
+    )
 
 
 def _story_span(run: models.Run, story_id: str):
@@ -349,6 +375,168 @@ def test_a_claim_on_a_later_milestone_refuses_the_whole_board_up_front(board_roo
     assert {
         card: board.show(card, repo_dir=root).status for card in statuses_before
     } == statuses_before
+
+
+@pytest.mark.e2e_fake
+def test_a_two_open_blocker_milestone_refuses_the_whole_board_up_front(board_root):
+    """Card 5b772688: `MilestoneBlockersError` comes before the claims check
+    and any dispatch, so nothing is left behind and no fake claude starts."""
+    root = board_root
+    a = _milestone(root, "A", "ba")
+    b = _milestone(root, "B", "bb")
+    c = _milestone(root, "C", "bc", blocked_by=(a["id"], b["id"]))
+    subtasks = (a["subtask"], b["subtask"], c["subtask"])
+    statuses_before = {card: board.show(card, repo_dir=root).status for card in subtasks}
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        _run_board(root, a, b, c)
+
+    assert c["id"] in str(caught.value)
+    assert "chain them" in str(caught.value)
+    assert _run_ids(root) == []
+    assert _run_dirs() == []
+    assert _local_branches(root) == ["main"]
+    assert {card: board.show(card, repo_dir=root).status for card in subtasks} == statuses_before
+
+
+@pytest.mark.e2e_fake
+def test_a_blocked_milestone_stacks_on_its_blockers_integrate_branch(board_root):
+    """Card d8b6ed12, T1: B is blocked by A, so B runs on A's integrate branch
+    and B's branches really contain A's commits; `main` is never touched."""
+    root = board_root
+    a = _milestone(root, "A", "ba")
+    b = _milestone(root, "B", "bb", blocked_by=(a["id"],))
+    a_integrate = integration.integration_branch(a["prefix"])
+    b_integrate = integration.integration_branch(b["prefix"])
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    result = _run_board(root, a, b)
+
+    assert result["ok"] is True, result
+    assert result["levels"] == [
+        {"level": 0, "milestones": [a["id"]]},
+        {"level": 1, "milestones": [b["id"]]},
+    ]
+    entries = _entries(result)
+    assert entries[a["id"]]["status"] == "done", entries[a["id"]]
+    assert entries[b["id"]]["status"] == "done", entries[b["id"]]
+    # B's own Integrate merges into B's own integrate branch, never A's.
+    assert entries[b["id"]]["integrated"]["branch"] == b_integrate
+    a_run = _load_run(root, entries[a["id"]]["run_id"])
+    b_run = _load_run(root, entries[b["id"]]["run_id"])
+    assert a_run.base_branch == "main"
+    assert b_run.base_branch == a_integrate
+    (b_story,) = [story for story in b_run.stories if story.card_id == b["story"]]
+    assert b_story.subtasks, b_story  # non-vacuity: B's story recorded its subtask
+    for subtask in b_story.subtasks:
+        assert subtask.base_branch == a_integrate, subtask
+    # Stacking is real in git.
+    assert _is_ancestor(root, a["branch"], b["branch"])
+    assert _is_ancestor(root, a_integrate, b["branch"])
+    assert _is_ancestor(root, a_integrate, b_integrate)
+    assert not _is_ancestor(root, b["branch"], a_integrate)
+    # Positive control: the stack still sits on main's history.
+    assert _is_ancestor(root, "main", b["branch"])
+    # Only when the worktree survived the run (cleanup policy is not pinned here).
+    b_worktree = cli.worktree_for(root, b["branch"])
+    if b_worktree.exists():
+        assert _is_ancestor(b_worktree, a["branch"], "HEAD")
+        a_commit = _git(root, "log", "-1", "--format=%H", a["branch"], "--", "IMPLEMENTATION.md")
+        assert a_commit.strip(), a["branch"]
+        assert a_commit.strip() in _git(b_worktree, "log", "--format=%H", "HEAD").split()
+    # Negative control: main gained nothing and did not move.
+    assert not _is_ancestor(root, a["branch"], "main")
+    assert not _is_ancestor(root, a_integrate, "main")
+    assert _git(root, "rev-parse", "main").strip() == main_before
+    # The helper refuses an unknown ref instead of answering False.
+    with pytest.raises(subprocess.CalledProcessError):
+        _is_ancestor(root, "no-such-branch", "main")
+
+
+@pytest.mark.e2e_fake
+def test_a_three_milestone_chain_stacks_each_link_on_the_one_before(board_root):
+    """Card d8b6ed12, T2: A <- B <- C with two free slots, so only the edges
+    order them; C stacks on B's integrate branch, never flattened onto A's or main."""
+    root = board_root
+    a = _milestone(root, "A", "ba")
+    b = _milestone(root, "B", "bb", blocked_by=(a["id"],))
+    c = _milestone(root, "C", "bc", blocked_by=(b["id"],))
+    a_integrate = integration.integration_branch(a["prefix"])
+    b_integrate = integration.integration_branch(b["prefix"])
+    c_integrate = integration.integration_branch(c["prefix"])
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    result = _run_board(root, a, b, c, max_concurrent=2)
+
+    assert result["ok"] is True, result
+    assert result["levels"] == [
+        {"level": 0, "milestones": [a["id"]]},
+        {"level": 1, "milestones": [b["id"]]},
+        {"level": 2, "milestones": [c["id"]]},
+    ]
+    entries = _entries(result)
+    for milestone in (a, b, c):
+        assert entries[milestone["id"]]["status"] == "done", entries[milestone["id"]]
+    assert _load_run(root, entries[a["id"]]["run_id"]).base_branch == "main"
+    assert _load_run(root, entries[b["id"]]["run_id"]).base_branch == a_integrate
+    # C is on its immediate blocker: not on A's integrate branch, not on main.
+    assert _load_run(root, entries[c["id"]]["run_id"]).base_branch == b_integrate
+    # Transitive containment.
+    for ancestor in (a["branch"], b["branch"], a_integrate, b_integrate):
+        assert _is_ancestor(root, ancestor, c["branch"]), ancestor
+    assert _is_ancestor(root, b_integrate, c_integrate)
+    assert _is_ancestor(root, a_integrate, b_integrate)
+    # Positive control: the chain still sits on main's history.
+    assert _is_ancestor(root, "main", c["branch"])
+    # The stack points one way only.
+    assert not _is_ancestor(root, c["branch"], b["branch"])
+    assert not _is_ancestor(root, b["branch"], a["branch"])
+    assert _git(root, "rev-parse", "main").strip() == main_before
+
+
+@pytest.mark.e2e_fake
+def test_a_relaunch_stacks_a_new_milestone_on_a_done_blockers_integrate_branch(board_root):
+    """Card d8b6ed12, T3: A finished `done` (not `merged`) in a first run and
+    left its integrate branch behind; B, added later and blocked by A, stacks
+    on that branch in a second run that never dispatches A again."""
+    root = board_root
+    a = _milestone(root, "A", "ba")
+    a_integrate = integration.integration_branch(a["prefix"])
+    main_before = _git(root, "rev-parse", "main").strip()
+
+    first = _run_board(root, a)
+
+    assert first["ok"] is True, first
+    assert a_integrate in _local_branches(root)
+    a_status = board.show(a["id"], repo_dir=root).status
+    assert not census.is_landed(a_status), a_status
+    if a_status != "done":
+        board.set_status(a["id"], "done", repo_dir=root)
+    assert board.show(a["id"], repo_dir=root).status == "done"
+    a_integrate_after_first = _git(root, "rev-parse", a_integrate).strip()
+    a_branch_after_first = _git(root, "rev-parse", a["branch"]).strip()
+
+    b = _milestone(root, "B", "bb", blocked_by=(a["id"],))
+    b_integrate = integration.integration_branch(b["prefix"])
+    # `a` is passed so `branch_prefix_of` can name A's prefix for its blocker root.
+    second = _run_board(root, a, b)
+
+    assert second["ok"] is True, second
+    assert second["levels"] == [{"level": 0, "milestones": [b["id"]]}]
+    entries = _entries(second)
+    assert set(entries) == {b["id"]}
+    assert entries[b["id"]]["status"] == "done", entries[b["id"]]
+    assert _load_run(root, entries[b["id"]]["run_id"]).base_branch == a_integrate
+    # A was not dispatched again: it still has exactly its first run.
+    a_short = dag.short_id(a["id"])
+    assert len([run_id for run_id in _run_ids(root) if run_id.endswith(a_short)]) == 1
+    assert _is_ancestor(root, a["branch"], b["branch"])
+    assert _is_ancestor(root, a_integrate, b["branch"])
+    assert _is_ancestor(root, a_integrate, b_integrate)
+    # A's branches were not rewritten.
+    assert _git(root, "rev-parse", a_integrate).strip() == a_integrate_after_first
+    assert _git(root, "rev-parse", a["branch"]).strip() == a_branch_after_first
+    assert _git(root, "rev-parse", "main").strip() == main_before
 
 
 @pytest.mark.e2e_fake
