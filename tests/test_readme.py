@@ -12,7 +12,7 @@ import re
 import typing
 from pathlib import Path
 
-from agent_manager import cli, detach, models, store
+from agent_manager import cli, detach, models, orchestrate, store
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
@@ -148,6 +148,61 @@ def test_detach_section_documents_the_board_form():
     text = README.read_text(encoding="utf-8")
     assert "`--detach` with `--board`" not in text
     assert "or with `--board`" not in text
+
+
+def test_board_section_documents_stacking():
+    """Card 072e1f6c: the `--board` section documents milestone stacking: the
+    table, the `MilestoneBlockersError` refusal, chaining, and which base a
+    rerun or a resume uses."""
+    section = _section("Running every open milestone with `--board`")
+    lines = section.splitlines()
+    name = orchestrate.MilestoneBlockersError.__name__
+
+    # B3: the refusal list is exactly 1.-5., item 4 is the new refusal, before
+    # the claim check, and the closing sentence still follows the list.
+    numbered = [index for index, line in enumerate(lines) if re.match(r"\d+\. ", line)]
+    assert [lines[index].split(".")[0] for index in numbered] == ["1", "2", "3", "4", "5"]
+    fourth, fifth = lines[numbered[3]], lines[numbered[4]]
+    assert name in fourth
+    assert "ClaimedError" in fifth
+    assert lines[numbered[4] + 2].startswith(
+        "A refused board run leaves no run row, no run directory and no lease"
+    )
+
+    # B1: the stacking table, a well-formed two-column pipe table.
+    table = [line for line in lines if line.startswith("|")]
+    for line in table:
+        assert line.count("|") == 3, line
+    rows = [line for line in table[1:] if not re.fullmatch(r"\|[\s:|-]+\|", line)]
+    assert len(rows) >= 5
+    assert any(all(word in row for word in ("`merged`", "`canceled`", "`archived`")) for row in rows)
+    assert any("`--base-branch`" in row for row in rows)
+    assert any("-integrate" in row for row in rows)
+    assert any("local" in row for row in rows)
+    assert any(name in row for row in rows)
+    assert "`am` never merges into `--base-branch`." in section
+    assert "Stacking changes where a milestone starts, not when." in section
+
+    # B2: a satisfied blocker can still be the base.
+    assert "it counts as satisfied for scheduling" in section
+
+    # B4: chaining, and marking a landed blocker merged.
+    assert "chain" in section
+    assert "A ← B ← C" in section or "A <- B <- C" in section
+    assert "`brd block B --by A`" in section
+    assert "`brd unblock C --by A`" in section
+    assert "`brd update <id> --status merged`" in section
+    assert any(all(word in line for word in ("mark", "`merged`", "chain")) for line in lines)
+
+    # B5: the Recovery passage says which base a rerun and a resume use.
+    recovery = section[section.index("Recovery. ") :]
+    assert "computes each milestone's base again" in recovery
+    assert any("am resume" in line and "`base_branch`" in line for line in recovery.splitlines())
+
+    # Every in-section link lands on a heading.
+    anchors = re.findall(r"\]\(#([^)]+)\)", section)
+    slugs = {_slug(title) for _, _, title in _headings()}
+    assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
 
 
 def test_watch_documents_from_now():

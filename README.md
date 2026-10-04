@@ -151,11 +151,23 @@ am run --board --dry-run --pretty
 
 `--board` drives every open milestone on the board in one command, as one dependency graph. Each milestone runs exactly as `am run --milestone` would run it: its stories, its [merged bases](#multiple-blockers) and its own [Integrate](#integrate) into its own `<prefix>-integrate`. Across milestones:
 
-- Milestones are leveled by the `blocked_by` edges between them. A milestone that is marked done, or that has nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied.
+- Milestones are leveled by the `blocked_by` edges between them. A milestone that is marked done, or that has nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied for scheduling. Such a blocker can still be the milestone's base, when it is `done` but not `merged` and its `<prefix>-integrate` branch is still local (see Stacking below).
 - A milestone starts once every open milestone blocking it has finished `done`.
 - If a blocker ends in any other status (`escalated`, `stopped`, `cancelled`, or `blocked` itself), the milestone is never started: no run, no branch, no worktree, no board change. It is reported `blocked`.
 - A milestone whose run raises an error is reported `escalated`, and the other milestones carry on.
 - A board with no open milestone is `ok`, runs nothing and exits 0.
+
+Stacking. Each milestone starts from one branch, its base. Only the ids in its `blocked_by` that are milestone roots on the board count here; any other blocker id is ignored. A blocker's prefix is derived the same way as the milestone's own, even when the blocker is no longer open. A blocker counts as landed when its status is `merged`, `canceled` or `archived`, in any case.
+
+| blockers of the milestone (its `blocked_by` milestone roots) | the milestone starts from |
+|---|---|
+| none, or every blocker is `merged`, `canceled` or `archived` | `--base-branch` |
+| exactly one open blocker B | `<prefix of B>-integrate`, which B's own run in this board creates |
+| exactly one blocker B that is not open and not landed (in practice `done` but not `merged`), whose `<prefix of B>-integrate` exists as a local branch | `<prefix of B>-integrate` |
+| a blocker that is not open and not landed, with no local `<prefix>-integrate` branch | nothing: it is treated as landed and does not count |
+| two or more blockers from the two `<prefix of B>-integrate` rows above | refused (`MilestoneBlockersError`, see Refusals below) |
+
+A stacked milestone runs exactly as before from its base: its stories root on the blocker's `<prefix>-integrate` instead of `--base-branch`, and its own Integrate still merges into its own `<prefix>-integrate`. `am` never merges into `--base-branch`. Stacking changes where a milestone starts, not when. It still waits for every open blocker to finish `done`, and is reported `blocked` if one ends any other way.
 
 Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
 
@@ -164,7 +176,8 @@ Refusals. These come in this order, before anything is written. Each prints `{"o
 1. A blank `--base-branch`.
 2. A blocker cycle between milestones (`DependencyCycleError`).
 3. A blank prefix, or a prefix two milestones share.
-4. A claim another live run holds, checked once over the claims of every open milestone together (`ClaimedError`, see [Several am processes](#several-am-processes)).
+4. A milestone with two or more blockers it could stack on: open, or not landed with a local `<prefix>-integrate` branch (`MilestoneBlockersError`). The message names the milestone and those blockers. A milestone stacks on at most one, so chain them (A ← B ← C): if C is blocked by both A and B, run `brd block B --by A`, then `brd unblock C --by A`, so that C is blocked by B only. One `am run --board` then runs the whole chain, each milestone starting from the previous one's `<prefix>-integrate`. When the message also says to mark blockers `merged`, their work may already have landed: instead of chaining, mark each such blocker `merged` with `brd update <id> --status merged`, a human's step `am` never takes. It then no longer counts.
+5. A claim another live run holds, checked once over the claims of every open milestone together (`ClaimedError`, see [Several am processes](#several-am-processes)).
 
 A refused board run leaves no run row, no run directory and no lease for any milestone. A board that cannot be read is refused the same way, as on a `--milestone` run.
 
@@ -196,6 +209,8 @@ Recovery. Because nothing records the board run as a whole, there is nothing to 
 - continue one `stopped` or `escalated` milestone on its own with `am resume <run-id>`, using that entry's `run_id`.
 
 A `blocked` milestone has no run to resume. It starts on a later `am run --board`, once its blockers are done.
+
+Which base a milestone resumes from. A rerun of `am run --board` computes each milestone's base again from the current board and the current local branches. A blocker that finished `done` still stacks its dependents on its `<prefix>-integrate` while that branch is local and the blocker is not marked `merged`. Once you land it and mark it `merged`, they start from `--base-branch`. `am resume <run-id>` keeps the `base_branch` that run recorded and does not compute it again, so a stacked milestone does not move to a new base (see [Relaunching resumes](#relaunching-resumes)).
 
 #### What a clean run leaves behind
 
