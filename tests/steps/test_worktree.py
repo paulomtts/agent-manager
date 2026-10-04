@@ -987,6 +987,7 @@ def _rm_rf_after_a_commit(repo: Path, wt: Path, branch: str) -> str:
     return head
 
 
+@pytest.mark.git
 def test_an_rm_rf_worktree_whose_branch_survives_is_re_added_with_its_commits(
     repo: Path, tmp_path: Path
 ):
@@ -1029,6 +1030,7 @@ def test_an_rm_rf_worktree_whose_branch_survives_is_re_added_with_its_commits(
     assert _adds(again_calls) == []
 
 
+@pytest.mark.git
 def test_an_rm_rf_worktree_whose_branch_is_also_gone_is_re_cut_from_base(
     repo: Path, tmp_path: Path
 ):
