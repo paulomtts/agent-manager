@@ -1299,8 +1299,10 @@ def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], st
 
     With `--branch-prefix` omitted the prefix is the milestone card's own
     `dag.task_stem`; given, it is `<branch_prefix>-<stem>`, never the given
-    value verbatim, so two milestones can never share it. Checking the result
-    (blank, shared) is `orchestrate.board_prefixes`'s job, not this one's.
+    value verbatim, so two milestones can never share it. It reads only the
+    card's title and id, never its status, so a milestone that is no longer
+    open gets the prefix it ran under. Checking the result (blank, shared) is
+    `orchestrate.board_prefixes`'s job, not this one's.
     """
 
     def prefix_of(card: models.CardNode) -> str:

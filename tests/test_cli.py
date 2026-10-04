@@ -3279,6 +3279,18 @@ def test_board_prefix_of_with_a_prefix_joins_it_to_the_stem_and_never_reuses_it_
     assert prefix_of(BOARD_CARD) != "sprint9"
 
 
+@pytest.mark.parametrize("status", ["done", "merged", "canceled"])
+@pytest.mark.parametrize("branch_prefix", [None, "sprint9"])
+def test_board_prefix_of_ignores_status_so_a_finished_milestone_keeps_its_prefix(
+    status, branch_prefix
+):
+    """Card 8198b0b4: a blocker that is no longer open gets the prefix it ran under."""
+    prefix_of = cli.board_prefix_of(branch_prefix)
+    finished = BOARD_CARD.model_copy(update={"status": status})
+
+    assert prefix_of(finished) == prefix_of(BOARD_CARD)
+
+
 BLANK_BOARD_PREFIX = "--branch-prefix with --board needs a non-blank prefix, not a blank string"
 PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
 
