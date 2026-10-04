@@ -4589,14 +4589,24 @@ def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, mo
 
 
 def _write_logs_attempt(
-    run_id: str, phase: str, n: int, *, stdout: bool = True
+    run_id: str,
+    phase: str,
+    n: int,
+    *,
+    stdout: bool = True,
+    status: str | None = None,
 ) -> models.Attempt:
     """One attempt's three files on disk, plus the row that points at them.
 
     The *test* calls `paths.attempt_dir` -- which creates the directory -- because
     in production `dispatch.AgentRunner` is what creates it. `logs` itself must
     never call it, and `test_logs_writes_nothing` is what pins that.
+
+    `status=None` keeps the long-standing default (`gate_failed` for attempt 1,
+    `ok` after it). A `started` attempt has no exit code yet.
     """
+    if status is None:
+        status = "ok" if n > 1 else "gate_failed"
     directory = paths.attempt_dir(run_id, "card-1", phase, n)
     (directory / "prompt.txt").write_text(f"prompt for {phase}.{n}\n", encoding="utf-8")
     (directory / "result.json").write_text(
@@ -4607,19 +4617,28 @@ def _write_logs_attempt(
     return models.Attempt(
         n=n,
         dispatch=_recorded_dispatch(run_id),
-        status="ok" if n > 1 else "gate_failed",
-        exit_code=0 if n > 1 else 1,
+        status=status,
+        exit_code=None if status == "started" else (0 if status == "ok" else 1),
         prompt_path=directory / "prompt.txt",
         result_path=directory / "result.json",
         stdout_path=directory / "stdout.log",
     )
 
 
-def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
+def _record_for_logs(
+    root: Path,
+    run_id: str,
+    *,
+    stdout: bool = True,
+    implement_status: str | None = None,
+) -> None:
     """A run with two agent phases (two attempts, then one) and a pending phase.
 
     The trailing `verify` phase has no attempts, so the no-flag default has to
-    skip it to reach `implement`.
+    skip it to reach `implement`. `implement_status` sets `implement.1`'s
+    status; `None` keeps the default `gate_failed`, which is terminal, so a
+    `logs --follow` test that needs the stream to keep polling passes
+    `"started"`.
     """
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4661,7 +4680,9 @@ def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
             "story-1",
             "card-1",
             "implement",
-            _write_logs_attempt(run_id, "implement", 1, stdout=stdout),
+            _write_logs_attempt(
+                run_id, "implement", 1, stdout=stdout, status=implement_status
+            ),
         )
         opened.record_phase(
             "story-1",
@@ -5182,7 +5203,7 @@ def _assert_contiguous(chunks: list[dict[str, Any]], start: int) -> int:
 
 
 def test_logs_follow_hello_shape(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
 
     result, sleeps = _logs_follow(monkeypatch, *_logs_args(projection))
 
@@ -5203,7 +5224,7 @@ def test_logs_follow_hello_shape(projection, monkeypatch):
 
 
 def test_logs_follow_streams_backlog_with_offsets(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     content = "first line\nsecond líne\n€uro\n"
     _implement_stdout().write_bytes(content.encode("utf-8"))
 
@@ -5219,7 +5240,7 @@ def test_logs_follow_streams_backlog_with_offsets(projection, monkeypatch):
 
 
 def test_logs_follow_multibyte_not_split(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     stdout = _implement_stdout()
     stdout.write_bytes(b"caf\xc3")  # the first byte of "é" only
 
@@ -5244,7 +5265,7 @@ def test_logs_follow_multibyte_not_split(projection, monkeypatch):
 
 
 def test_logs_follow_since_offset_resumes(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     content = _implement_stdout().read_bytes()
     assert content == b"stdout of implement.1\n"
 
@@ -5257,7 +5278,7 @@ def test_logs_follow_since_offset_resumes(projection, monkeypatch):
 
 
 def test_logs_follow_picks_up_appended_data(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     stdout = _implement_stdout()
     original = stdout.read_bytes()
 
@@ -5281,7 +5302,9 @@ def test_logs_follow_picks_up_appended_data(projection, monkeypatch):
 
 
 def test_logs_follow_waits_for_missing_file(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)
+    _record_for_logs(
+        projection, LOGS_RUN_ID, stdout=False, implement_status="started"
+    )
     stdout = _implement_stdout()
 
     def still_absent() -> None:
@@ -5345,7 +5368,7 @@ def test_logs_follow_writes_nothing(projection, monkeypatch):
 def test_logs_follow_since_offset_beyond_end_waits(projection, monkeypatch):
     """Review Focus 2: a cursor past EOF is not an error; bytes appear once
     the file grows past it, starting exactly at the cursor."""
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     stdout = _implement_stdout()
     size = stdout.stat().st_size
 
@@ -5373,7 +5396,7 @@ def test_logs_follow_since_offset_beyond_end_waits(projection, monkeypatch):
 def test_logs_follow_truncated_file_emits_nothing_new(projection, monkeypatch):
     """Review Focus 3: a file cut below the cursor is no crash and no rewind;
     bytes below the cursor are never re-emitted."""
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     stdout = _implement_stdout()
     original = stdout.read_bytes()
 
@@ -5398,7 +5421,7 @@ def test_logs_follow_truncated_file_emits_nothing_new(projection, monkeypatch):
 def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
     """Review Focus 1: invalid UTF-8 becomes U+FFFD, and the next offset
     still counts raw bytes, not decoded characters."""
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     stdout = _implement_stdout()
     stdout.write_bytes(b"ok\xff\xfe\n")
 
@@ -5504,7 +5527,7 @@ def test_logs_follow_refusals(projection, monkeypatch, argv, follow, kind, messa
 
 
 def test_logs_follow_ctrl_c_exits_zero(projection, monkeypatch):
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
 
     def press_ctrl_c() -> None:
         raise KeyboardInterrupt
@@ -5521,7 +5544,7 @@ def test_logs_follow_ctrl_c_exits_zero(projection, monkeypatch):
 
 def test_logs_follow_closed_pipe_exits_zero_quietly(projection, monkeypatch):
     """Review Focus 4: `am logs ... --follow | head -1`."""
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     real_emit = cli._emit_stream_line
     emitted: list[Any] = []
 
@@ -5543,7 +5566,7 @@ def test_logs_follow_closed_pipe_exits_zero_quietly(projection, monkeypatch):
 def test_logs_follow_mid_stream_error_goes_to_stderr(projection, monkeypatch):
     """Review Focus 5: after the hello no envelope can follow, so a handled
     error is one stderr line and exit 3, as `watch --follow` does."""
-    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
     real_read = cli._read_log_bytes
     reads: list[int] = []
 
