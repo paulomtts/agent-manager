@@ -360,9 +360,12 @@ async def test_build_dag_tree_four_node_shape_completes():
     """Spec §1.1: A and B are roots, D is blocked by A, C by B and D. Every
     coroutine sets its own event on exit, and a 2+-blocker one first awaits
     its blockers' events, as `lane` does today. B returns, then A after a
-    wall-clock gap, so D is ready only after grafo shrank its pool. With C an
-    unconnected root, C sits in a worker waiting on D while D is queued
-    behind exit sentinels, and the run never returns."""
+    wall-clock gap, so D is ready only after grafo shrank its pool. Under
+    grafo 0.3.5 with C an unconnected root, C sat in a worker waiting on D
+    while D was queued behind exit sentinels, and the run never returned.
+    grafo 0.3.6 fixed that pool bug, so this is now a regression pin for the
+    shape, not a red test for `build_dag_tree`'s edges (those are pinned by
+    the edge, roots and raised-blocker tests above)."""
     a, b = _DagItem("a"), _DagItem("b")
     d = _DagItem("d", ("a",))
     c = _DagItem("c", ("b", "d"))
