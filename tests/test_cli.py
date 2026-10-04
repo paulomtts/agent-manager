@@ -5031,6 +5031,50 @@ def test_logs_for_a_deterministic_phase_writes_nothing(projection):
     assert _attempt_rows(projection) == rows_before
 
 
+def _implement_stdout() -> Path:
+    """Where `_record_for_logs` puts `implement.1`'s stdout, read-only."""
+    return paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1) / "stdout.log"
+
+
+def test_logs_without_follow_unchanged(projection):
+    """Card 4.1: without `--follow`, `logs` is still exactly one envelope."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert set(envelope) == {"ok", "data"}
+    assert "event" not in envelope
+    assert "offset" not in envelope["data"]
+    assert envelope["data"]["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+
+
+def test_select_logs_names_the_file_a_follow_reads(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    step_dir = _write_step_logs(LOGS_RUN_ID, 1)
+
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert agent.phase.name == "implement"
+    assert agent.attempt is not None
+    assert agent.attempt.n == 1
+    assert agent.followed_path() == _implement_stdout()
+    assert agent.payload() == cli.logs_for(LOGS_RUN_ID, "card-1", repo_dir=projection)
+
+    step = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify")
+    assert step.phase.name == "verify"
+    assert step.attempt is None
+    assert step.step_attempt == 1
+    assert step.followed_path() == step_dir / "stdout.log"
+    assert step.payload() == cli.logs_for(
+        LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify"
+    )
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""

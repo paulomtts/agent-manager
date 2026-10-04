@@ -1855,27 +1855,72 @@ def runs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def logs_for(
+@dataclass(frozen=True)
+class LogsSelection:
+    """The attempt `am logs` reports on, as `select_logs` chose it.
+
+    An agent phase carries its `Attempt` row. A deterministic phase has no
+    row (spec e1b1e7d5 Decision 2), so it carries the `<phase>.N` number and
+    directory found on disk instead, and `attempt` is `None`.
+    """
+
+    run: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+    phase: models.PhaseRun
+    attempt: models.Attempt | None
+    step_attempt: int | None = None
+    step_directory: Path | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """`logs`' one-shot payload: `logs_payload` or `step_logs_payload`."""
+        if self.attempt is not None:
+            return logs_payload(
+                self.run, self.story, self.subtask, self.phase, self.attempt
+            )
+        if self.step_attempt is None or self.step_directory is None:
+            raise CliError(
+                f"phase {self.phase.name!r} of card {self.subtask.card_id!r}"
+                " was selected with neither an attempt row nor a step directory"
+            )
+        return step_logs_payload(
+            self.run,
+            self.story,
+            self.subtask,
+            self.phase,
+            self.step_attempt,
+            self.step_directory,
+        )
+
+    def followed_path(self) -> Path | None:
+        """The file `logs --follow` reads: the agent attempt's recorded
+        `stdout_path` (the launcher merges stderr into it), or a deterministic
+        phase's `<phase>.N/stdout.log`. `None` when an agent attempt recorded
+        no stdout path."""
+        if self.attempt is not None:
+            return self.attempt.stdout_path
+        if self.step_directory is None:
+            return None
+        return self.step_directory / verify_step.STDOUT_LOG
+
+
+def select_logs(
     run_id: str,
     card: str,
     *,
     repo_dir: Path,
     phase: str | None = None,
     attempt: int | None = None,
-) -> dict[str, Any]:
-    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+) -> LogsSelection:
+    """Which attempt §10's `logs` reports, shared by the one-shot and `--follow`.
 
     Read-only, like `status_for`: the projection is reached through the free
     `open_db` / `load_run` rather than `Store.open`, which would construct a
     `Journal` and therefore mint a run directory for a run that may not exist.
     The connection is closed on every path including the refusals.
 
-    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
-    "most recent run" reading of it to default to.
-
     A `--phase` naming a deterministic phase is answered from disk: its
-    attempts are the `<phase>.N` directories `run_one_step` created, and the
-    payload carries that attempt's `stdout.log` and `stderr.log` (spec
+    attempts are the `<phase>.N` directories `run_one_step` created (spec
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
@@ -1908,13 +1953,47 @@ def logs_for(
             recorded = paths.recorded_attempts(run_id, card, step.name)
             n = select_step_attempt(subtask, step, recorded, attempt)
             directory = paths.attempt_path(run_id, card, step.name, n)
-            return step_logs_payload(run, story, subtask, step, n, directory)
+            return LogsSelection(
+                run=run,
+                story=story,
+                subtask=subtask,
+                phase=step,
+                attempt=None,
+                step_attempt=n,
+                step_directory=directory,
+            )
         chosen_phase, chosen_attempt = select_attempt(
             subtask, phase=phase, attempt=attempt
         )
-        return logs_payload(run, story, subtask, chosen_phase, chosen_attempt)
+        return LogsSelection(
+            run=run,
+            story=story,
+            subtask=subtask,
+            phase=chosen_phase,
+            attempt=chosen_attempt,
+        )
     finally:
         conn.close()
+
+
+def logs_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+
+    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
+    "most recent run" reading of it to default to. The selection, and its
+    read-only rules, are `select_logs`'; the artifacts are read after the
+    projection connection is closed, from the paths the selection names.
+    """
+    return select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    ).payload()
 
 
 @app.command("logs")
