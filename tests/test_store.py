@@ -5158,15 +5158,20 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
 
 def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
     _hand_cancel_an_escalated_run(repo)
-    with store.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
-        handle.write("{not json at all\n")
-    before = _all_rows(repo)
 
-    # `Store.open` itself scans the journal (`Journal.__init__` -> `last_seq`),
-    # so the corrupt line surfaces there, before `rebuild_from_journal` would
-    # even run the foreign-value check: the journal error still wins.
-    with pytest.raises(store.CorruptJournalError):
-        store.Store.open(repo, RUN_ID)
+    # Open first: `Store.open` scans the journal (`Journal.__init__` ->
+    # `last_seq`), so the line is corrupted afterwards to reach the rebuild.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with store.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
+            handle.write("{not json at all\n")
+        before = _all_rows(repo)
+
+        with pytest.raises(store.CorruptJournalError):
+            st.rebuild_from_journal(RUN_ID)
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
 
     assert _all_rows(repo) == before
 
