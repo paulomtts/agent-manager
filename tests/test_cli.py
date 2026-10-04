@@ -3929,20 +3929,25 @@ def _record(
     started_at: datetime,
     status: str = "done",
     with_phases: bool = True,
+    workflow: str = "task",
+    milestone_id: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
-    in `root`'s projection, written the only way this program writes rows."""
+    in `root`'s projection, written the only way this program writes rows. The
+    defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
+    `milestone_id` for a milestone-shaped one."""
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
                 id=run_id,
-                workflow="task",
+                workflow=workflow,
                 repo_dir=root,
                 base_branch="main",
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
+                milestone_id=milestone_id,
             )
         )
         opened.record_story(
@@ -4172,6 +4177,382 @@ def test_runs_agrees_with_status_about_the_most_recent_run(projection):
     )
 
     assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
+
+
+RUNS_ENTRY_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "milestone_id",
+    "card_id",
+    "lease",
+    "progress",
+}
+"""Every `data.runs[]` entry: the seven names `am runs` always had, plus
+`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74) and
+`progress` (card 882b212b)."""
+
+RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
+"""A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
+`acquired_at`."""
+
+RUNS_MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
+
+
+def test_runs_shows_a_card_runs_card_id_and_a_null_milestone_id(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["card_id"] == "card-1"
+    assert entry["milestone_id"] is None
+
+
+def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection):
+    """`_record` writes a subtask row under the milestone run too, so this also
+    pins that a milestone run never reports one of its subtasks as `card_id`."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["workflow"] == "milestone"
+    assert entry["milestone_id"] == RUNS_MILESTONE_ID
+    assert entry["card_id"] is None
+
+
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_and_progress(projection):
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        assert set(envelope) == {"ok", "data"}
+        assert envelope["ok"] is True
+        assert set(envelope["data"]) == {"runs"}
+        assert len(envelope["data"]["runs"]) == 2
+        for entry in envelope["data"]["runs"]:
+            assert set(entry) == RUNS_ENTRY_KEYS
+
+
+RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"
+"""A second run, started after `CONTROL_RUN_ID`'s `RECORDED_AT`, so it lists first."""
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid, host, accepting",
+    [
+        (0, None, None, True),
+        (-30, None, None, True),
+        (-5, 0, "elsewhere.invalid", True),
+        (-5, None, None, False),
+    ],
+    ids=["fresh-here", "boundary-30s", "other-host-unprobed-pid", "not-accepting"],
+)
+def test_runs_shows_a_live_lease(
+    projection, monkeypatch, heartbeat_offset, pid, host, accepting
+):
+    """Spec test 1, plus Review Focus: the 30s boundary is inclusive, another
+    host's pid is never probed here, and a closed control window still reads
+    live. `pid`/`host` `None` mean `_plant_lease`'s default: this process,
+    this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(
+        projection,
+        pid=pid,
+        host=host,
+        heartbeat_at=_at(heartbeat_offset),
+        accepting=accepting,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": True,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE if host is None else host,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": accepting,
+    }
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid",
+    [
+        (-31, None),
+        (-5, 0),
+    ],
+    ids=["stale-heartbeat", "dead-pid-here"],
+)
+def test_runs_shows_a_dead_lease_with_its_fields_still_filled(
+    projection, monkeypatch, heartbeat_offset, pid
+):
+    """Spec test 2. Pid 0 is never alive (`control.pid_alive`), so no process
+    has to be spawned and reaped to get a dead pid on this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, pid=pid, heartbeat_at=_at(heartbeat_offset))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": False,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": True,
+    }
+
+
+def test_runs_shows_a_null_lease_for_a_run_with_no_lease_row(projection, monkeypatch):
+    """Spec test 3: no row is `null`, not an error and not a missing key."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert '"lease":null' in result.stdout
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert "lease" in entry
+    assert entry["lease"] is None
+
+
+@pytest.mark.parametrize("heartbeat_offset", [-5, -31], ids=["live", "stale"])
+def test_runs_lease_is_status_control_lease_without_acquired_at(
+    projection, monkeypatch, heartbeat_offset
+):
+    """Spec test 4: one computation, two commands, no drift."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(heartbeat_offset))
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+    reported = runner.invoke(
+        cli.app, ["status", CONTROL_RUN_ID, "--repo-dir", str(projection)]
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert reported.exit_code == 0, reported.output
+    [entry] = json.loads(listed.stdout)["data"]["runs"]
+    status_lease = json.loads(reported.stdout)["data"]["control"]["lease"]
+    assert "acquired_at" in status_lease
+    assert entry["lease"] == {
+        key: value for key, value in status_lease.items() if key != "acquired_at"
+    }
+
+
+def test_runs_lease_has_exactly_the_five_keys_plain_and_pretty(projection, monkeypatch):
+    """Spec test 5: the shape pin, beside `RUNS_ENTRY_KEYS`'s own."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection)
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        [entry] = envelope["data"]["runs"]
+        assert set(entry) == RUNS_ENTRY_KEYS
+        assert set(entry["lease"]) == RUNS_LEASE_KEYS
+        assert isinstance(entry["lease"]["live"], bool)
+        assert isinstance(entry["lease"]["pid"], int)
+        assert isinstance(entry["lease"]["host"], str)
+        assert isinstance(entry["lease"]["heartbeat_at"], str)
+        assert isinstance(entry["lease"]["accepting"], bool)
+
+
+def test_runs_attaches_each_runs_own_lease_and_reads_the_clock_once(
+    projection, monkeypatch
+):
+    """Review Focus: a run without a lease row never inherits its neighbour's,
+    and the whole listing is judged against one instant."""
+    calls: list[datetime] = []
+
+    def counting_now() -> datetime:
+        calls.append(CONTROL_NOW)
+        return CONTROL_NOW
+
+    monkeypatch.setattr(cli, "_utcnow", counting_now)
+    _plant_run(projection)
+    _record(
+        projection,
+        RUNS_NEWER_RUN_ID,
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+        with_phases=False,
+    )
+    _plant_lease(projection, run_id=CONTROL_RUN_ID, heartbeat_at=_at(-31))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)["data"]["runs"]
+    assert [entry["id"] for entry in entries] == [RUNS_NEWER_RUN_ID, CONTROL_RUN_ID]
+    assert entries[0]["lease"] is None
+    assert entries[1]["lease"] is not None
+    assert entries[1]["lease"]["live"] is False
+    assert entries[1]["lease"]["heartbeat_at"] == _at(-31).isoformat()
+    assert len(calls) == 1
+
+
+RUNS_PROGRESS_KEYS = {"stories", "subtasks", "current"}
+RUNS_PROGRESS_COUNT_KEYS = {"done", "total"}
+RUNS_PROGRESS_CURRENT_KEYS = {"card", "phase", "attempt"}
+"""`data.runs[].progress` (card 882b212b), its two counts, and a non-null `current`."""
+
+
+def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
+    """`_record`'s `card-1` given a third phase, `implement`, still `started`,
+    with `attempts` attempt rows numbered from 1."""
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(
+                name="implement", kind="agent", status="started", started_at=RECORDED_AT
+            ),
+        )
+        for n in range(1, attempts + 1):
+            opened.record_attempt(
+                "story-1",
+                "card-1",
+                "implement",
+                models.Attempt(n=n, dispatch=_recorded_dispatch(run_id)),
+            )
+    finally:
+        opened.close()
+
+
+def _record_bare_run(root: Path, run_id: str, *, started_at: datetime) -> None:
+    """A run row with nothing below it: a run that never got past starting."""
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow="task",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=started_at,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def test_runs_progress_has_exactly_its_keys_plain_and_pretty(projection):
+    """The shape pin for `progress`, beside `RUNS_ENTRY_KEYS`'s own: one run
+    with a `current`, one without."""
+    in_flight = "20260923T090000Z-cbe34d00"
+    _record(projection, in_flight, started_at=RECORDED_AT, status="started")
+    _record_started_phase(projection, in_flight, attempts=1)
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        entries = envelope["data"]["runs"]
+        assert [entry["progress"]["current"] is None for entry in entries] == [False, True]
+        for entry in entries:
+            assert set(entry) == RUNS_ENTRY_KEYS
+            progress = entry["progress"]
+            assert set(progress) == RUNS_PROGRESS_KEYS
+            for level in ("stories", "subtasks"):
+                assert set(progress[level]) == RUNS_PROGRESS_COUNT_KEYS
+                assert all(type(progress[level][key]) is int for key in RUNS_PROGRESS_COUNT_KEYS)
+            if progress["current"] is not None:
+                assert set(progress["current"]) == RUNS_PROGRESS_CURRENT_KEYS
+                assert isinstance(progress["current"]["card"], str)
+                assert isinstance(progress["current"]["phase"], str)
+                assert type(progress["current"]["attempt"]) is int
+
+
+def test_runs_shows_a_fixture_runs_progress(projection):
+    """Exact values through the CLI: a run in flight, a finished one, and one
+    with no tree rows at all, which is the zero shape and never `null`."""
+    in_flight = "20260923T090000Z-cbe34d00"
+    finished = "20260922T090000Z-cbe34d00"
+    bare = "20260921T090000Z-cbe34d00"
+    _record(projection, in_flight, started_at=RECORDED_AT, status="started")
+    _record_started_phase(projection, in_flight, attempts=2)
+    _record(
+        projection,
+        finished,
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+    )
+    _record_bare_run(
+        projection, bare, started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)["data"]["runs"]
+    assert [entry["id"] for entry in entries] == [in_flight, finished, bare]
+    assert {entry["id"]: entry["progress"] for entry in entries} == {
+        in_flight: {
+            "stories": {"done": 0, "total": 1},
+            "subtasks": {"done": 0, "total": 1},
+            "current": {"card": "card-1", "phase": "implement", "attempt": 2},
+        },
+        finished: {
+            "stories": {"done": 1, "total": 1},
+            "subtasks": {"done": 1, "total": 1},
+            "current": None,
+        },
+        bare: {
+            "stories": {"done": 0, "total": 0},
+            "subtasks": {"done": 0, "total": 0},
+            "current": None,
+        },
+    }
 
 
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
