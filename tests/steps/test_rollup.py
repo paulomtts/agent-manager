@@ -22,6 +22,7 @@ that only record whether `board.WRITE_LOCK` is held; the real functions still
 run against the real board.
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -34,7 +35,7 @@ from pathlib import Path
 import pytest
 from lockhelpers import _holder, _probe, _reap, _release
 
-from agent_manager import board, locks, paths
+from agent_manager import board, locks, models, paths
 from agent_manager.steps import rollup
 
 
@@ -767,3 +768,104 @@ def test_rollup_status_is_in_progress_by_progress_not_least_advanced():
 
 def test_rollup_status_accepts_a_generator():
     assert rollup.rollup_status(s for s in ["done", "done"]) == "done"
+
+
+# --- terminal statuses: merged counts as done, canceled/archived are out of play ---
+
+
+def test_rollup_status_counts_merged_children_as_done():
+    assert rollup.rollup_status(["merged", "merged"]) == "done"
+    assert rollup.rollup_status(["merged", "done"]) == "done"
+    assert rollup.rollup_status(["MERGED", "Done"]) == "done"
+    assert rollup.rollup_status(["merged", "todo"]) == "in_progress"
+
+
+@pytest.mark.parametrize("dead", ["canceled", "archived", "CANCELED"])
+def test_rollup_status_ignores_out_of_play_children(dead):
+    assert rollup.rollup_status([dead, "done"]) == "done"
+    assert rollup.rollup_status([dead, "merged"]) == "done"
+    assert rollup.rollup_status([dead, "todo"]) == "todo"
+    assert rollup.rollup_status([dead, "done", "todo"]) == "in_progress"
+    assert rollup.rollup_status([dead, "in_progress"]) == "in_progress"
+
+
+@pytest.mark.parametrize("dead", ["canceled", "archived"])
+def test_rollup_status_writes_nothing_when_every_child_is_out_of_play(dead):
+    assert rollup.rollup_status([dead, dead]) is None
+
+
+class _Board:
+    """A tiny in-memory board standing in for `brd` behind `rollup.board`."""
+
+    def __init__(self, statuses: dict[str, str], parents: dict[str, str]) -> None:
+        self.statuses = dict(statuses)
+        self.parents = parents
+        self.writes: list[tuple[str, str]] = []
+
+    def show(self, card_id, repo_dir=None):
+        return models.Card(
+            id=card_id,
+            title=card_id,
+            status=self.statuses[card_id],
+            parent_id=self.parents.get(card_id),
+        )
+
+    def tree(self, card_id, repo_dir=None):
+        return models.CardNode(
+            id=card_id,
+            title=card_id,
+            status=self.statuses[card_id],
+            children=[
+                models.CardNode(id=c, title=c, status=self.statuses[c])
+                for c, p in self.parents.items()
+                if p == card_id
+            ],
+        )
+
+    def set_status(self, card_id, status, repo_dir=None):
+        self.writes.append((card_id, status))
+        self.statuses[card_id] = status
+        return self.show(card_id)
+
+
+@pytest.fixture
+def mem_board(monkeypatch):
+    def make(statuses, parents):
+        fake = _Board(statuses, parents)
+        monkeypatch.setattr(rollup.board, "show", fake.show)
+        monkeypatch.setattr(rollup.board, "tree", fake.tree)
+        monkeypatch.setattr(rollup.board, "set_status", fake.set_status)
+        monkeypatch.setattr(rollup.board, "write_lock", lambda path: contextlib.nullcontext())
+        return fake
+
+    return make
+
+
+@pytest.mark.parametrize("terminal", ["merged", "canceled", "archived", "MERGED"])
+def test_set_status_never_overwrites_a_terminal_card(mem_board, terminal):
+    fake = mem_board({"m": "in_progress", "s": "in_progress", "t": terminal}, {"t": "s", "s": "m"})
+    result = rollup.set_status("t", "done")
+    assert ("t", "done") not in fake.writes
+    assert fake.statuses["t"] == terminal
+    assert result["status"] == terminal
+
+
+@pytest.mark.parametrize("terminal", ["merged", "canceled", "archived"])
+def test_rollup_never_overwrites_a_terminal_parent(mem_board, terminal):
+    fake = mem_board(
+        {"m": "in_progress", "s": terminal, "t": "todo"}, {"t": "s", "s": "m"}
+    )
+    rollup.set_status("t", "done")
+    assert fake.statuses["s"] == terminal
+    assert all(card != "s" for card, _ in fake.writes)
+
+
+def test_rollup_skips_canceled_siblings_and_treats_merged_as_done(mem_board):
+    fake = mem_board(
+        {"m": "todo", "s": "in_progress", "a": "merged", "b": "canceled", "c": "todo", "d": "archived"},
+        {"a": "s", "b": "s", "c": "s", "d": "s", "s": "m"},
+    )
+    result = rollup.set_status("c", "done")
+    assert fake.statuses["s"] == "done"
+    assert fake.statuses["m"] == "done"
+    assert [r["card"] for r in result["rolled_up"]] == ["s", "m"]
