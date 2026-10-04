@@ -3,8 +3,11 @@
 D5 keeps two independent stores: `paths.project_db_path(root)` holds a
 queryable projection of the state tree, and `paths.run_dir(run_id)/journal.jsonl`
 holds the append-only audit trail. The journal is appended *before* the row is
-written, so if the two ever disagree the journal wins and the projection can be
-thrown away and rebuilt (§9 lines 365-368).
+written, so if the two ever disagree the journal wins and the run's §9 tree
+(`runs`, `stories`, `subtasks`, `phases`, `attempts`) can be thrown away and
+rebuilt (§9 lines 365-368); the six row-only tables (`checkpoints`,
+`checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`,
+`board_comments`) have no journal and are the projection's alone.
 
 This module owns only those two stores. Path derivation belongs to `paths`, the
 state tree belongs to `models`, and the resume loop that acts on an in-flight
@@ -1312,9 +1315,11 @@ class Store:
 
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
-    The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
-    `run_leases` (live control C1/C2) and `board_comments` (board-comments
-    B6): row-only tables outside the journal.
+    The exceptions are `checkpoints` (pygents spec §6), `checkpoint_floors`
+    (exactly-once 1.1), `run_controls` and `run_leases` (live control C1/C2),
+    `run_claims` (multi-process X5) and `board_comments` (board-comments B6):
+    the six row-only tables, which have no journal and are the projection's
+    alone.
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
@@ -2059,9 +2064,19 @@ class Store:
     def rebuild_from_journal(self, run_id: str, *, force: bool = False) -> models.Run:
         """Replace this run's projection with what its journal says (D5).
 
-        The journal wins: every row for `run_id` is deleted and rewritten from
-        the replayed tree, so the result is the same whether the projection was
-        stale, truncated or already correct.
+        The journal wins: every row of the run's §9 tree (`runs`, `stories`,
+        `subtasks`, `phases`, `attempts`) for `run_id` is deleted and rewritten
+        from the replayed tree, so the result is the same whether the projection
+        was stale, truncated or already correct. The six row-only tables
+        (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`,
+        `run_claims`, `board_comments`) have no journal and are left alone.
+
+        The exception (journal/DB divergence §3.6): a projection holding a value
+        no journal line ever recorded for that node, a `foreign` mismatch in
+        `diverging`'s terms, is refused with `ProjectionDivergedError` before
+        any row is touched, unless `force=True`. The check compares the same
+        journal lines the rebuild replays. `stale` mismatches never refuse, and
+        a projection with no `runs` row for `run_id` has nothing foreign in it.
 
         The store lock is held from reading the journal through the delete and
         every rewrite, so no `record_*` lands between the delete and the

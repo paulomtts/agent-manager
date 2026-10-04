@@ -370,8 +370,11 @@ Run
 
 **Write ordering.** The journal is appended *before* the SQLite row is updated,
 and every journal line carries the run id, the card, the phase, the attempt and
-a monotonic sequence number. The DB is a projection and can be rebuilt from the
-journal; if the two disagree, the journal wins.
+a monotonic sequence number. The DB is a projection and the run's tree (`runs`,
+`stories`, `subtasks`, `phases`, `attempts`) can be rebuilt from the journal,
+while the six row-only tables (`checkpoints`, `checkpoint_floors`,
+`run_controls`, `run_leases`, `run_claims`, `board_comments`) have no journal
+and are the projection's alone; if the two disagree, the journal wins.
 
 **Resume semantics.** `resume <run-id>` reloads the run, discards any attempt
 that was in flight when the process died (recorded as `started` with no
