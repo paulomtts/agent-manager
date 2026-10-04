@@ -251,9 +251,10 @@ def test_the_import_guard_catches_every_spelling_of_launching(source):
     "source",
     ["import math", "import re", "from pydantic import ValidationError", ""],
 )
-def test_the_import_guard_clears_what_the_adapter_legitimately_needs(source):
+def test_the_import_guard_clears_imports_that_cannot_launch_anything(source):
     # And it must not be a guard that rejects everything, which would pass the
-    # test above for the wrong reason.
+    # test above for the wrong reason. These are harmless-to-launching imports
+    # (the old log scanner's), not ones the adapter uses today.
     assert not _imported_names(source) & FORBIDDEN_IMPORTS, source
 
 
@@ -265,11 +266,9 @@ def test_the_adapter_launches_nothing_itself():
     assert not _imported_names(source) & FORBIDDEN_IMPORTS
     # Imports are the source-level half; these are the runtime half, catching a
     # module pulled in under any alias by `importlib` or assigned after import.
+    # The adapter holds no module object at all since the log scanner left.
     for name, value in vars(claude_module).items():
-        assert not isinstance(value, ModuleType) or value.__name__ in {
-            "math",
-            "re",
-        }, name
+        assert not isinstance(value, ModuleType), name
     assert not hasattr(claude_module, "run_direct")
 
 
