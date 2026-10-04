@@ -5399,6 +5399,92 @@ def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
     ]
 
 
+def _record_review_without_stdout_path(root: Path) -> None:
+    """Add an agent `review` phase whose one attempt recorded no stdout path."""
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_phase(
+            "story-1", "card-1", models.PhaseRun(name="review", kind="agent", status="failed")
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "review",
+            models.Attempt(
+                n=1, dispatch=_recorded_dispatch(LOGS_RUN_ID), status="harness_error"
+            ),
+        )
+    finally:
+        opened.close()
+
+
+@pytest.mark.parametrize(
+    ("argv", "follow", "kind", "message"),
+    [
+        (["no-such-run", "card-1"], True, "UnknownRunError", None),
+        ([LOGS_RUN_ID, "card-9"], True, "UnknownCardError", None),
+        ([LOGS_RUN_ID, "card-1", "--phase", "reveiw"], True, "UnknownPhaseError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "explore", "--attempt", "9"],
+            True,
+            "UnknownAttemptError",
+            None,
+        ),
+        ([LOGS_RUN_ID, "card-1", "--phase", "verify"], True, "UnknownAttemptError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "review"],
+            True,
+            "CliError",
+            "attempt 1 of phase 'review' of card 'card-1' recorded no stdout path,"
+            " so there is no file to follow",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "-1"],
+            True,
+            "CliError",
+            "--since-offset must be 0 or more, got -1",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "0"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "5"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+    ],
+)
+def test_logs_follow_refusals(projection, monkeypatch, argv, follow, kind, message):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_review_without_stdout_path(projection)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *argv,
+        "--repo-dir",
+        str(projection),
+        actions=[lambda: None],
+        follow=follow,
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == []
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert "event" not in envelope
+    assert envelope["error"]["type"] == kind
+    if message is not None:
+        assert envelope["error"]["message"] == message
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""

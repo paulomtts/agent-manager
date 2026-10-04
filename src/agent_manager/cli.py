@@ -2004,18 +2004,34 @@ def logs_follow_for(
     phase: str | None = None,
     attempt: int | None = None,
     since_offset: int = 0,
-) -> Path | None:
+) -> Path:
     """Validate `am logs --follow` and name the file it streams.
 
     The same selection as `logs_for` (`select_logs`), so every refusal the
-    one-shot makes is made here too, before the hello line. The projection
-    connection is closed by `select_logs` before this returns, and streaming
-    reads only the returned file.
+    one-shot makes is made here too, before the hello line. On top of those:
+    a negative `--since-offset` (worded as `watch --since` is), and an agent
+    attempt that recorded no stdout path, since the hello must name a file.
+    The projection connection is closed by `select_logs` before this
+    returns, and streaming reads only the returned file.
     """
+    if since_offset < 0:
+        raise CliError(f"--since-offset must be 0 or more, got {since_offset}")
     selection = select_logs(
         run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
     )
-    return selection.followed_path()
+    followed = selection.followed_path()
+    if followed is None:
+        number = (
+            selection.attempt.n
+            if selection.attempt is not None
+            else selection.step_attempt
+        )
+        raise CliError(
+            f"attempt {number} of phase {selection.phase.name!r} of card"
+            f" {selection.subtask.card_id!r} recorded no stdout path,"
+            " so there is no file to follow"
+        )
+    return followed
 
 
 @app.command("logs")
@@ -2056,6 +2072,13 @@ def logs(
     """
     offset = since_offset if since_offset is not None else 0
     try:
+        # `None` means --since-offset was not given; any given value, 0
+        # included, needs --follow, as --from-now does for `watch`.
+        if since_offset is not None and not follow:
+            raise CliError(
+                "--since-offset needs --follow: it resumes a stream,"
+                " and without --follow there is no stream"
+            )
         if follow:
             followed = logs_follow_for(
                 run_id,
