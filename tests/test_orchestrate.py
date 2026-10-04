@@ -6872,6 +6872,357 @@ def test_milestone_status_reads_a_run_milestone_payload(payload, status):
     assert orchestrate.milestone_status(payload) == status
 
 
+# ── milestone_bases (card 40ac07f3) ─────────────────────────────────────────
+
+
+def _prefixes(*ns: int) -> dict[str, str]:
+    """`{_plan_id(n): f"p{n}"}`: milestone `n`'s integrate branch is `p<n>-integrate`."""
+    return {_plan_id(n): f"p{n}" for n in ns}
+
+
+def _recording_exists(*present: str) -> tuple[Callable[[str], bool], list[str]]:
+    """A `branch_exists` that answers from `present` and records every call."""
+    calls: list[str] = []
+
+    def exists(branch: str) -> bool:
+        calls.append(branch)
+        return branch in present
+
+    return exists, calls
+
+
+def test_milestone_bases_puts_unblocked_open_milestones_on_the_base_branch_in_input_order():
+    """Spec test 1: no blockers -> base_branch; keys are the open ones, input order."""
+    two, one, done = _board_milestone(2), _board_milestone(1), _board_milestone(3, status="done")
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([two, one, done], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [(two.id, "master"), (one.id, "master")]
+    assert calls == []
+
+
+def test_milestone_bases_of_no_open_milestones_is_empty():
+    exists, _ = _recording_exists()
+    assert orchestrate.milestone_bases([], {}, exists, "master") == {}
+    assert (
+        orchestrate.milestone_bases(
+            [_board_milestone(1, status="done")], _prefixes(1), exists, "master"
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "done_children"),
+    [("merged", True), ("canceled", False), ("archived", False)],
+)
+def test_milestone_bases_ignores_a_landed_blocker_without_checking_its_branch(
+    status, done_children
+):
+    """Spec tests 2-3, Review Focus 5: a canceled/archived blocker with open work
+    under it is still landed, never a stack candidate."""
+    blocker = _board_milestone(1, status=status, done_children=done_children)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == []
+
+
+def test_milestone_bases_stacks_on_one_open_blocker_without_checking_its_branch():
+    """Spec test 4: the open blocker's run creates its branch; existence is not asked."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocker.id: "master", blocked.id: "p1-integrate"}
+    assert calls == []
+
+
+def test_milestone_bases_stacks_on_a_done_blocker_whose_integrate_branch_exists():
+    """Spec test 5."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_treats_a_done_blocker_without_its_branch_as_landed():
+    """Spec test 6: "assume landed; today's behaviour"."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_refuses_a_milestone_with_two_open_blockers():
+    """Spec test 7."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    blocked = _board_milestone(3, blocked_by=(1, 2))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases([one, two, blocked], _prefixes(1, 2, 3), exists, "master")
+
+    assert isinstance(caught.value, ValueError)
+    message = str(caught.value)
+    assert blocked.id in message
+    assert one.id in message and two.id in message
+    assert "chain" in message
+
+
+def test_milestone_bases_refuses_an_open_blocker_plus_a_done_blocker_with_its_branch():
+    """Spec test 8: picking one would drop the other's unmerged work."""
+    one = _board_milestone(1)
+    two = _board_milestone(2, status="done", done_children=True)
+    blocked = _board_milestone(3, blocked_by=(1, 2))
+    exists, _ = _recording_exists("p2-integrate")
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases([one, two, blocked], _prefixes(1, 2, 3), exists, "master")
+
+    message = str(caught.value)
+    assert blocked.id in message
+    assert one.id in message and two.id in message
+    assert "chain" in message
+    assert "merged" in message
+
+
+def test_milestone_bases_stacks_on_the_one_open_blocker_when_the_others_are_satisfied():
+    """Spec test 9: open + done-without-branch + merged -> the open one."""
+    one = _board_milestone(1)
+    two = _board_milestone(2, status="done", done_children=True)
+    three = _board_milestone(3, status="merged", done_children=True)
+    blocked = _board_milestone(4, blocked_by=(1, 2, 3))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases(
+        [one, two, three, blocked], _prefixes(1, 2, 3, 4), exists, "master"
+    )
+
+    assert bases == {one.id: "master", blocked.id: "p1-integrate"}
+    assert calls == ["p2-integrate"]
+
+
+def test_milestone_bases_stacks_a_chain_of_open_milestones():
+    """Spec test 10 / §2.4: A <- B <- C, all open."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([a, b, c], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [
+        (a.id, "master"),
+        (b.id, "p1-integrate"),
+        (c.id, "p2-integrate"),
+    ]
+
+
+def test_milestone_bases_stacks_a_chain_whose_head_is_done_with_its_branch():
+    """Spec test 11 / §2.4: A done with its branch, B and C open."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases([a, b, c], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [(b.id, "p1-integrate"), (c.id, "p2-integrate")]
+
+
+def test_milestone_bases_ignores_a_blocker_that_is_not_a_milestone():
+    """Spec test 12: an unknown id needs no prefix and counts as satisfied."""
+    blocked = _board_milestone(1, blocked_by=(99,))
+    exists, calls = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocked], _prefixes(1), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+    assert calls == []
+
+
+def test_milestone_bases_counts_a_duplicated_blocker_once():
+    """Spec test 13: blocked_by=(1, 1) is S1, not a false S2 refusal."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1, 1))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases[blocked.id] == "p1-integrate"
+
+
+def test_milestone_bases_reads_blocker_statuses_in_any_case():
+    """Spec test 14: MERGED is landed; Done goes through branch_exists."""
+    merged = _board_milestone(1, status="MERGED", done_children=True)
+    on_merged = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+    assert orchestrate.milestone_bases(
+        [merged, on_merged], _prefixes(1, 2), exists, "master"
+    ) == {on_merged.id: "master"}
+    assert calls == []
+
+    done = _board_milestone(1, status="Done", done_children=True)
+    exists, calls = _recording_exists("p1-integrate")
+    assert orchestrate.milestone_bases(
+        [done, on_merged], _prefixes(1, 2), exists, "master"
+    ) == {on_merged.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_gives_non_open_milestones_no_key():
+    """Spec test 15: the keys are exactly what board_levels would dispatch."""
+    done = _board_milestone(1, status="done")
+    finished_tree = _board_milestone(2, done_children=True)
+    live = _board_milestone(3)
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases(
+        [done, finished_tree, live], _prefixes(1, 2, 3), exists, "master"
+    )
+
+    assert list(bases) == [live.id]
+    assert list(bases) == [
+        node.id for level in dag.board_levels([done, finished_tree, live]) for node in level
+    ]
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        pytest.param(_board_milestone(1), id="open"),
+        pytest.param(_board_milestone(1, status="done", done_children=True), id="done"),
+    ],
+)
+def test_milestone_bases_refuses_a_needed_blocker_with_no_prefix(blocker):
+    """Spec test 16: a caller bug, so ValueError, not MilestoneBlockersError."""
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(ValueError) as caught:
+        orchestrate.milestone_bases([blocker, blocked], _prefixes(2), exists, "master")
+
+    assert not isinstance(caught.value, orchestrate.MilestoneBlockersError)
+    message = str(caught.value)
+    assert blocked.id in message and blocker.id in message
+    assert "no branch prefix" in message
+
+
+@pytest.mark.parametrize("prefix", ["", "   ", None])
+def test_milestone_bases_refuses_a_blank_prefix_for_a_needed_blocker(prefix):
+    """Review Focus 4: a blank prefix would name the branch `-integrate`."""
+    blocker, blocked = _board_milestone(1), _board_milestone(2, blocked_by=(1,))
+    prefixes = {blocker.id: prefix, blocked.id: "p2"}
+    exists, _ = _recording_exists()
+
+    with pytest.raises(ValueError, match="no branch prefix") as caught:
+        orchestrate.milestone_bases([blocker, blocked], prefixes, exists, "master")
+
+    assert not isinstance(caught.value, orchestrate.MilestoneBlockersError)
+
+
+def test_milestone_bases_needs_no_prefix_for_a_landed_blocker():
+    """Spec test 16, second half."""
+    blocker = _board_milestone(1, status="merged", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(2), exists, "master")
+
+    assert bases == {blocked.id: "master"}
+
+
+@pytest.mark.parametrize(
+    ("present", "expected"),
+    [(("p1-integrate",), "p1-integrate"), ((), "master")],
+)
+def test_milestone_bases_treats_a_todo_blocker_with_nothing_open_like_done(present, expected):
+    """Spec test 17: the "unlanded" non-done case."""
+    blocker = _board_milestone(1, status="todo", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists(*present)
+
+    bases = orchestrate.milestone_bases([blocker, blocked], _prefixes(1, 2), exists, "master")
+
+    assert bases == {blocked.id: expected}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_a_repeated_milestone_checks_its_blocker_branch_once():
+    """Review Focus 1: at most one branch_exists call per (M, B) pair."""
+    blocker = _board_milestone(1, status="done", done_children=True)
+    blocked = _board_milestone(2, blocked_by=(1,))
+    exists, calls = _recording_exists("p1-integrate")
+
+    bases = orchestrate.milestone_bases(
+        [blocker, blocked, blocked], _prefixes(1, 2), exists, "master"
+    )
+
+    assert bases == {blocked.id: "p1-integrate"}
+    assert calls == ["p1-integrate"]
+
+
+def test_milestone_bases_does_not_depend_on_input_order_for_classification():
+    """Review Focus 2: a chain given C, B, A gets the same bases, keyed C, B, A."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    exists, _ = _recording_exists()
+
+    bases = orchestrate.milestone_bases([c, b, a], _prefixes(1, 2, 3), exists, "master")
+
+    assert list(bases.items()) == [
+        (c.id, "p2-integrate"),
+        (b.id, "p1-integrate"),
+        (a.id, "master"),
+    ]
+
+
+def test_milestone_bases_refuses_the_first_offending_milestone_naming_blockers_in_blocked_by_order():
+    """Review Focus 3: one problem at a time, deterministically worded."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    first = _board_milestone(3, blocked_by=(2, 1))
+    second = _board_milestone(4, blocked_by=(1, 2))
+    exists, _ = _recording_exists()
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        orchestrate.milestone_bases(
+            [one, two, first, second], _prefixes(1, 2, 3, 4), exists, "master"
+        )
+
+    message = str(caught.value)
+    assert first.id in message
+    assert second.id not in message
+    assert message.index(two.id) < message.index(one.id)
+
+
+def test_milestone_bases_leaves_its_inputs_alone():
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1, 1))
+    milestones = [a, b]
+    before = [card.model_copy(deep=True) for card in milestones]
+    prefixes = _prefixes(1, 2)
+    exists, _ = _recording_exists()
+
+    orchestrate.milestone_bases(milestones, prefixes, exists, "master")
+
+    assert milestones == before
+    assert prefixes == _prefixes(1, 2)
+
+
 # ── run_board at its seams (card baef4f94) ──────────────────────────────────
 #
 # `board.roots`, `cli.refuse_claimed` and `orchestrate._run_milestone_async`

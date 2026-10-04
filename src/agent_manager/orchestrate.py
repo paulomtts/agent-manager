@@ -2223,6 +2223,90 @@ def board_prefixes(
     return prefixes
 
 
+class MilestoneBlockersError(ValueError):
+    """A milestone would have to stack on two or more blockers at once.
+
+    A milestone's base is one branch, and a merged base is a non-goal, so the
+    human is told to chain the blockers instead. Subclasses `ValueError`, as
+    `dag.DependencyCycleError` does: `ValueError` is already in `cli.HANDLED`,
+    so a CLI caller gets the `ok: false` envelope and exit 3.
+    """
+
+
+def _blocker_branch(milestone_id: str, blocker_id: str, prefixes: Mapping[str, str]) -> str:
+    """The blocker's `<prefix>-integrate`, or `ValueError` when it has no prefix.
+
+    A missing or blank prefix is a caller bug, refused as `board_prefixes`
+    refuses one, and never a `MilestoneBlockersError`.
+    """
+    prefix = prefixes.get(blocker_id)
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise ValueError(
+            f"milestone {milestone_id}'s blocker {blocker_id} has no branch prefix "
+            f"(got {prefix!r})"
+        )
+    return integration.integration_branch(prefix)
+
+
+def milestone_bases(
+    milestones: Sequence[models.CardNode],
+    prefixes: Mapping[str, str],
+    branch_exists: Callable[[str], bool],
+    base_branch: str,
+) -> dict[str, str]:
+    """The branch each open milestone stacks on, keyed by id, in input order.
+
+    `milestones` is every milestone root the caller knows, open or not; only
+    the open ones (`dag.milestone_is_open`) get a key. A blocker id that is
+    not a root in `milestones` is ignored. Each blocker is then exactly one of:
+
+    - open: a stack candidate on its integrate branch, which its own run in
+      this board creates. `branch_exists` is not asked.
+    - landed (`census.is_landed`): ignored. `branch_exists` is not asked.
+    - unlanded (`done`, or in play with nothing open under it): a candidate
+      only if `branch_exists` says its integrate branch is there; otherwise
+      assumed landed, today's behaviour.
+
+    No candidate stacks on `base_branch`, one stacks on its branch, two or
+    more raise `MilestoneBlockersError` for the first such milestone in input
+    order. Pure apart from `branch_exists`, which is asked at most once per
+    (milestone, blocker) pair. Blocker cycles are `dag.board_levels`' to
+    refuse, not this function's.
+    """
+    by_id = {card.id: card for card in milestones}
+    bases: dict[str, str] = {}
+    for card in milestones:
+        if card.id in bases or not dag.milestone_is_open(card):
+            continue
+        candidates: list[tuple[str, str]] = []
+        unlanded: list[str] = []
+        for blocker_id in dict.fromkeys(card.blocked_by):
+            blocker = by_id.get(blocker_id)
+            if blocker is None:
+                continue
+            if dag.milestone_is_open(blocker):
+                candidates.append((blocker.id, _blocker_branch(card.id, blocker.id, prefixes)))
+            elif not census.is_landed(blocker.status):
+                branch = _blocker_branch(card.id, blocker.id, prefixes)
+                if branch_exists(branch):
+                    candidates.append((blocker.id, branch))
+                    unlanded.append(blocker.id)
+        if len(candidates) > 1:
+            listed = ", ".join(blocker_id for blocker_id, _ in candidates)
+            message = (
+                f"milestone {card.id} is blocked by {len(candidates)} milestones that are "
+                f"not landed ({listed}); a milestone stacks on at most one: "
+                "chain them (A <- B <- C)"
+            )
+            if unlanded:
+                message += (
+                    f", or mark {', '.join(unlanded)} merged if that work has already landed"
+                )
+            raise MilestoneBlockersError(message)
+        bases[card.id] = candidates[0][1] if candidates else base_branch
+    return bases
+
+
 def board_claims(
     milestones: Sequence[models.CardNode], prefixes: Mapping[str, str]
 ) -> list[str]:
