@@ -3844,6 +3844,50 @@ def test_a_board_run_prints_run_boards_payload_in_the_ok_envelope(tmp_path, monk
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
+def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypatch):
+    """Card a7fcc076: `am run --board` prints `{"ok": true, "data": payload}`
+    with `run_board`'s payload untouched: `data` is exactly `{ok, board,
+    levels, milestones}`, with no board-level `run_id`, and the done,
+    escalated and blocked entries keep their own key sets. The envelope's
+    `ok` stays true when `data.ok` is false: an escalation is a truthful
+    result, reported through the exit code."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    done_id, escalated_id, blocked_id = _plan_id(1), _plan_id(2), _plan_id(3)
+    payload = {
+        "ok": False,
+        "board": True,
+        "levels": [
+            {"level": 0, "milestones": [done_id, escalated_id]},
+            {"level": 1, "milestones": [blocked_id]},
+        ],
+        "milestones": [
+            {
+                "milestone_id": done_id,
+                "status": "done",
+                "done": True,
+                "run_id": "20261001T000000Z-00000001",
+            },
+            {"milestone_id": escalated_id, "status": "escalated", "error": "RuntimeError: boom"},
+            {"milestone_id": blocked_id, "status": "blocked", "blocked_by": [escalated_id]},
+        ],
+    }
+    _patch_run_board(monkeypatch, payload)
+
+    result = _board_run(tmp_path)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope == {"ok": True, "data": payload}
+    assert set(envelope["data"]) == {"ok", "board", "levels", "milestones"}
+    assert "run_id" not in envelope["data"]
+    assert envelope["data"]["ok"] is False
+    assert [set(entry) for entry in envelope["data"]["milestones"]] == [
+        {"milestone_id", "status", "done", "run_id"},
+        {"milestone_id", "status", "error"},
+        {"milestone_id", "status", "blocked_by"},
+    ]
+
+
 @pytest.mark.parametrize(
     "statuses, exit_code",
     [
