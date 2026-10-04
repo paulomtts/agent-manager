@@ -1207,7 +1207,7 @@ DEFAULT_MAX_CONCURRENT = 4
 def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, str]]:
     """Everything in the census that never enters a dispatch level, in census order.
 
-    A story that is closed, or that has no remaining subtasks, is one
+    An out-of-play (`canceled`/`archived`) story is not listed at all. A story that is closed, or that has no remaining subtasks, is one
     `kind: "story"` entry, and its subtasks are not listed on their own: the
     story is the unit that is skipped. A done subtask of a story that is still
     pending is a `kind: "subtask"` entry naming its story, because that story
@@ -1215,6 +1215,8 @@ def already_done_entries(stories: Sequence[census.StoryPlan]) -> list[dict[str, 
     """
     entries: list[dict[str, str]] = []
     for story in stories:
+        if census.is_out_of_play(story.status):
+            continue  # canceled/archived: not part of the plan, so not "done" either
         if dag.is_story_closed(story) or not dag.remaining_subtasks(story):
             entries.append({"kind": "story", "id": story.id, "title": story.title})
             continue
