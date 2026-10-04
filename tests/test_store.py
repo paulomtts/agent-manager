@@ -2576,6 +2576,38 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
         st.close()
 
 
+def test_checkpoint_cards_lists_this_runs_distinct_pairs_in_order(repo):
+    """af52db54: `am reset` reports every `(card_id, workflow)` the run
+    checkpointed, whatever the reason, and nothing another run saved."""
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-b", reason="turn", saved_at=_at(0))
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(1))
+        _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(2))
+        _save_checkpoint(st, "card-a", reason="done", saved_at=_at(3))
+        _save_checkpoint(st, "card-a", reason="turn", workflow="integrate", saved_at=_at(4))
+    finally:
+        st.close()
+
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(other, "card-c", reason="turn", saved_at=_at(5))
+        _save_checkpoint(other, "card-a", reason="parked", workflow="bases", saved_at=_at(6))
+        before = other.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+        # Asked from a store bound to another run: the argument decides.
+        mine = other.checkpoint_cards(RUN_ID)
+        theirs = other.checkpoint_cards(OTHER_RUN_ID)
+        unknown = other.checkpoint_cards("run-never-saved")
+        after = other.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+    finally:
+        other.close()
+
+    assert mine == [("card-a", "integrate"), ("card-a", "task"), ("card-b", "task")]
+    assert theirs == [("card-a", "bases"), ("card-c", "task")]
+    assert unknown == []
+    assert after == before == 7
+
+
 # -- run controls and leases -----------------------------------------------------
 #
 # Row-only tables outside the journal (live-control spec C1/C2), like
