@@ -1454,6 +1454,28 @@ def test_list_runs_picks_the_first_subtask_when_a_task_run_has_several(repo):
     assert summary.card_id == "zzzz9999"
 
 
+def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
+    """Positions count per story, so a `task` run holding subtasks under two
+    stories has two rows at position 0; the lower card id must win, whatever
+    order the stories sort in."""
+    opened = store.Store.open(repo, "run-t")
+    try:
+        opened.record_run(
+            _run(repo, "run-t").model_copy(update={"started_at": None, "workflow": "task"})
+        )
+        early_story = _story().model_copy(update={"card_id": "00000000"})
+        opened.record_story(early_story)
+        opened.record_subtask(early_story.card_id, _subtask("zzzz9999"))
+        opened.record_story(_story())
+        opened.record_subtask(_story().card_id, _subtask("aaaa1111"))
+    finally:
+        opened.close()
+
+    [summary] = _listed(repo)
+
+    assert summary.card_id == "aaaa1111"
+
+
 def test_run_summary_fields_are_the_old_seven_plus_milestone_id_and_card_id():
     assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
     assert store.RunSummary.model_config["extra"] == "forbid"
