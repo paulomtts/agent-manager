@@ -1890,9 +1890,11 @@ def _resume_from_checkpoint(
         # on every exit, a checkpoint refusal included (C2, X5).
         with run_lease(store, claims=claims) as lease:
             checkpoint = store.latest_checkpoint(subtask.card_id)
-            phase = checkpoint_resume_phase(
-                checkpoint, card_id=subtask.card_id, run_id=run.id
-            )
+            # Refuses a done, phase-escalated or digest-mismatched checkpoint
+            # before any write. The phase it names is not reported: the walk
+            # may decline the checkpoint (its worktree could not be kept), so
+            # `resumed_from` is read from the summary after the walk.
+            checkpoint_resume_phase(checkpoint, card_id=subtask.card_id, run_id=run.id)
             # Card 5b19aa93: the walk keeps the checkpoint's suite, not
             # `commands`. Say so when a passed `--verify` differs from it; an
             # omitted flag or an unknown kept suite says nothing.
@@ -1962,7 +1964,7 @@ def _resume_from_checkpoint(
             "detail": summary.detail,
             "skipped": list(summary.skipped),
             "warnings": [*flushed, *kept_warning, *drive.warnings],
-            "resumed_from": phase,
+            "resumed_from": summary.resumed_at,
             "discarded_attempts": [
                 {"phase": orphan.name, "n": attempt.n} for orphan, attempt in orphans
             ],
