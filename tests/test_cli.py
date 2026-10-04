@@ -11886,3 +11886,31 @@ def test_run_help_and_examples_document_detach():
 
     assert result.exit_code == 0, result.output
     assert "--detach" in result.output
+
+
+@pytest.mark.parametrize("status", ["done", "merged", "MERGED"])
+def test_already_done_lists_finished_stories_and_subtasks(status):
+    closed = _plan_story(1, [_plan_subtask(11)], status=status)
+    open_story = _plan_story(2, [_plan_subtask(21, status), _plan_subtask(22)])
+    assert cli.already_done_entries([closed, open_story]) == [
+        {"kind": "story", "id": closed.id, "title": "story 1"},
+        {"kind": "subtask", "id": _plan_id(21), "title": "subtask 21", "story": open_story.id},
+    ]
+
+
+@pytest.mark.parametrize("status", ["canceled", "archived", "CANCELED"])
+def test_already_done_omits_out_of_play_cards_and_they_never_run(status):
+    dead = _plan_story(1, [_plan_subtask(11)], status=status)
+    live = _plan_story(2, [_plan_subtask(21, status), _plan_subtask(22)], blocked_by=[dead.id])
+    assert cli.already_done_entries([dead, live]) == []
+    payload = cli.dry_run_payload(
+        [dead, live], repo_dir=DRY_RUN_REPO, branch_prefix="m3", base_branch="main"
+    )
+    assert payload["already_done"] == []
+    ran = [s["id"] for lvl in payload["levels"] for st in lvl["stories"] for s in st["subtasks"]]
+    assert ran == [_plan_id(22)]
+
+
+def test_already_done_omits_an_out_of_play_story_even_with_finished_subtasks():
+    dead = _plan_story(1, [_plan_subtask(11, "done")], status="archived")
+    assert cli.already_done_entries([dead]) == []
