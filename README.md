@@ -140,7 +140,7 @@ am run --board --dry-run --pretty
 
 `--board` drives every open milestone on the board in one command, as one dependency graph. Each milestone runs exactly as `am run --milestone` would run it: its stories, its [merged bases](#multiple-blockers) and its own [Integrate](#integrate) into its own `<prefix>-integrate`. Across milestones:
 
-- Milestones are leveled by the `blocked_by` edges between them. A milestone that is done, with nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied.
+- Milestones are leveled by the `blocked_by` edges between them. A milestone that is marked done, or that has nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied.
 - A milestone starts once every open milestone blocking it has finished `done`.
 - If a blocker ends in any other status (`escalated`, `stopped`, `cancelled`, or `blocked` itself), the milestone is never started: no run, no branch, no worktree, no board change. It is reported `blocked`.
 - A milestone whose run raises an error is reported `escalated`, and the other milestones carry on.
