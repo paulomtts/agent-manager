@@ -667,6 +667,7 @@ def test_a_rollup_waits_for_another_process_holding_the_board_lock(
 
 
 def test_a_nested_rollup_walk_runs_every_brd_call_under_one_flock(fake_brd):
+    # The card is read first (a human-set terminal status is never overwritten).
     # Three writes (sub1, st1, m1) re-enter the lock the walk already holds; a
     # second flock on a new descriptor would block its own process forever,
     # so the worker thread's join timeout is the deadlock detector.
@@ -685,7 +686,7 @@ def test_a_nested_rollup_walk_runs_every_brd_call_under_one_flock(fake_brd):
     }
     calls = fake_brd.calls()
     assert [call["argv"][0] for call in calls] == [
-        "update", "show", "tree", "update", "show", "tree", "update", "show",
+        "show", "update", "show", "tree", "update", "show", "tree", "update", "show",
     ]
     assert all(call["flock"] == "busy" for call in calls), calls
     assert _probe(fake_brd.root, "board") == "free"

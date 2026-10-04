@@ -114,6 +114,16 @@ subtasks still to run are listed. `data.already_done` lists what will not run:
 `{"kind": "subtask", "id", "title", "story"}` for a done subtask of a story that
 still has work.
 
+Card statuses decide what counts as finished and what is in the plan at all.
+`done` and `merged` (a human's step after integrating) both mean finished,
+everywhere `am` asks whether a subtask, story or milestone is done, including
+`already_done`. `canceled` and `archived` mean out of play: the card is left out
+of the plan, is never run and is not counted as remaining work, and a `blocked_by`
+edge pointing at such a card is ignored, as in leave-me-alone. Statuses are
+read in any case. The status rollup never overwrites a `merged`, `canceled` or
+`archived` card, ignores `canceled`/`archived` children and counts `merged`
+children as `done`. `am` never writes `merged`, `canceled` or `archived` itself.
+
 `data.integrate` is the plan for [Integrate](#integrate), the step that runs after every story has finished: `{"branch", "worktree", "order"}`. `branch` is `<prefix>-integrate`, `worktree` is its worktree, `<repo>/.claude/worktrees/<prefix>-integrate`, and `order` lists `{"story", "tip"}` in the order the tips will be merged. It names every story that has subtasks, done or not, because Integrate merges them all. The preview creates neither the branch nor the worktree.
 
 Read the `base` column before a real run:
