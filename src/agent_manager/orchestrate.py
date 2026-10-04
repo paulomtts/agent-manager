@@ -14,11 +14,12 @@ releases the dependents of a lane that did not finish clean, and
 `collect_outcomes` reads every story's outcome after the tree ran (T6).
 
 A story with two or more in-milestone blockers roots on a merged base
-(supervisor-tree §5): its lane waits for every blocker to finish clean, then
-awaits `bases.build` with their tips (`blocker_tips`), after it took its slot
-and before its first subtask, so that
-subtask stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the
-fast path: no base branch and no extra verify.
+(supervisor-tree §5): it is reached through one grafo edge per blocker, so its
+lane runs only after every blocker succeeded. The lane reads the blockers' tips
+from `plan.tips` in `root_plan.blockers` order and awaits `bases.build` with
+them, after it took its slot and before its first subtask, so that subtask
+stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the fast path:
+no base branch and no extra verify.
 
 Every derivation belongs to a collaborator: the milestone and its census to
 `census`, waves, stack bases, roots and tips to `dag`, board reads to `board`,
@@ -841,9 +842,9 @@ async def build_merged_base(
 ) -> None:
     """Await `bases.build` for one merged-root story (supervisor-tree §5).
 
-    `tips` are the blockers' tips, already resolved by the caller in
-    `root_plan.blockers` order (`blocker_tips`). `bases.build` is read off its
-    module at call time so a test can replace it. A `None` factory is
+    `tips` are the blockers' tips, read by the caller from `plan.tips` in
+    `root_plan.blockers` order. `bases.build` is read off its module at call
+    time so a test can replace it. A `None` factory is
     production's, `cli.default_runner_factory`, read at call time as
     Integrate reads it, so a conflicting tip reaches the resolver instead of
     failing for a human. `resume_from` is the resolver's checkpoint on a
@@ -1121,7 +1122,7 @@ async def lane(
 
     A story with nothing left to run returns its tip without taking a slot,
     unless `builds_a_base_alone` says it must first build its merged base
-    (`base_only_lane`); a `merged` one still waits for its blockers first. Otherwise the lane takes a slot -- grafo started it, so
+    (`base_only_lane`). Otherwise the lane takes a slot -- grafo started it, so
     every blocker already succeeded -- and drives the remaining subtasks in
     census order, each on the base `record_plan` recorded for it. Before each
     subtask it checks the stop: if it fired, the story is recorded `stopped`
@@ -1132,14 +1133,11 @@ async def lane(
     at that subtask. `LaneEscalated`/`LaneStopped` pass through the catch-all
     unchanged. A `BaseException` is never caught.
 
-    A story whose root is `merged` is one of `supervise`'s grafo roots (not
-    reached through a blocker's edge; `blocker_tips` explains why), so it
-    waits for its own blockers here, before taking a slot: `blocker_tips`
-    returns None when a blocker did not finish clean, and this lane then
-    returns its tip without ever taking a slot, exactly as a story whose
-    blocker's edge grafo never fired would (T1's existing contract). Once
-    every blocker is clean, the lane takes its slot, checks the stop (fired:
-    `stopped` at its first subtask, nothing built), then awaits
+    A story whose root is `merged` is reached through one grafo edge per
+    blocker, so its lane runs only after every blocker succeeded; it reads the
+    blockers' tips from `plan.tips` in `root_plan.blockers` order. The lane
+    takes its slot, checks the stop (fired: `stopped` at its first subtask,
+    nothing built), then awaits
     `build_merged_base` before its first subtask, whose recorded base is the
     merged base branch. `BaseFailed(stopped=False)` triggers the stop, records
     the story `escalated` and raises `LaneEscalated` with `failed_phase="base"`,
@@ -1446,12 +1444,10 @@ async def supervise(
     blockers being its `plan.roots` in-milestone blockers: one node per story
     and one edge per blocker, each forwarding the blocker's tip as
     `tip_<short id>`, so a story rooted on a `merged` base (two or more
-    in-milestone blockers) is a grafo join, not an executor root. Such a
-    story's lane waits on each blocker's own completion, signalled by
-    `story_done`/`story_ok` below, and reads the blocker's tip off
-    `plan.tips` (`blocker_tips`); every lane sets its own signal on exit,
-    success or not, so this never hangs. A milestone with no story has no
-    tree to run.
+    in-milestone blockers) is a grafo join, not an executor root: its lane
+    runs only after every blocker succeeded, and reads the blockers' tips from
+    `plan.tips` in `root_plan.blockers` order. A milestone with no story has
+    no tree to run.
 
     `slots` is the semaphore every lane takes its slot from: when given it is
     used as is, so concurrent `supervise` calls handed the same one share one
