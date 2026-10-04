@@ -1555,6 +1555,121 @@ def milestone_card_ids(
     return list(dict.fromkeys(ids))
 
 
+# ── the three stages of a milestone run (card 5daa944e) ─────────────────────
+
+
+@dataclass(frozen=True)
+class MilestonePreflight:
+    """What `preflight_milestone` read and decided for one milestone run.
+
+    Everything the recorded stage and the engine read afterwards. On a resume,
+    `base_branch`, `branch_prefix` and `max_concurrent` are the recorded
+    run's, and `resumed` is that run as it was left. `drive` is the chosen
+    driver. Internal state, so a dataclass.
+    """
+
+    root: Path
+    resumed: models.Run | None
+    milestone_card: models.CardNode
+    plan: census.Census
+    levels: list[list[PlannedStory]]
+    tips: list[dict[str, str]]
+    keys: list[str]
+    base_branch: str
+    branch_prefix: str
+    max_concurrent: int
+    run_id: str
+    run_record: models.Run
+    drive: Driver
+
+
+def preflight_milestone(
+    milestone: str | None,
+    *,
+    repo_dir: Path,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
+    max_concurrent: int = 1,
+    clock: Callable[[], datetime] = _utcnow,
+    resume_run_id: str | None = None,
+    driver: Driver | None = None,
+) -> MilestonePreflight:
+    """Stage 1 of a milestone run: every read and refusal, then the run record (card 5daa944e).
+
+    In today's order: the resumable run (resume only), the board roots, the
+    milestone (`census.find_milestone`'s unknown/ambiguous refusal, or
+    `find_run_milestone`), its census, `plan_levels` (the cycle refusal), the
+    tips, the claims, and `cli.refuse_claimed` as the last refusal --
+    read-only, before `refresh_git` and before any store, so a key another
+    live run holds leaves no fetch, prune, run row or run directory. A fresh
+    run then refreshes git (its first side effect, still before the store),
+    reads the clock and mints the run id; a resume keeps its own id and
+    refreshes git later, under the lease. The store is never opened here.
+    """
+    root = runs.resolve_repo_dir(repo_dir)
+    resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
+    if resumed is not None:
+        base_branch = resumed.base_branch
+        branch_prefix = resumed.branch_prefix
+        max_concurrent = resumed.config.max_concurrent_stories
+    roots = board.roots(repo_dir=root)
+    if resumed is None:
+        milestone_card = census.find_milestone(roots, milestone)
+    else:
+        milestone_card = find_run_milestone(roots, resumed)
+    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    drive = cli.drive_subtask_async if driver is None else driver
+    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
+    # The last refusal (X5, X6): read-only, before `refresh_git` and before
+    # `Store.open`, so a milestone, remaining subtask or integration branch
+    # another live run claims leaves no fetch, prune, run row or run
+    # directory. A resume's own rows are not a conflict; `take_lease` in the
+    # recorded stage re-checks atomically.
+    cli.refuse_claimed(root, keys, run_id=None if resumed is None else resumed.id)
+
+    if resumed is None:
+        # The first side effect. It runs after every refusal and before the store
+        # is opened, so a failed fetch leaves no run directory behind.
+        refresh_git(root)
+        started_at = clock()
+        run_id = runs.mint_run_id(milestone_card.id, started_at)
+        run_record = models.Run(
+            id=run_id,
+            workflow=MILESTONE_WORKFLOW,
+            repo_dir=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            status="started",
+            started_at=started_at,
+            config=models.RunConfig(max_concurrent_stories=max_concurrent),
+            milestone_id=milestone_card.id,
+        )
+    else:
+        run_id = resumed.id
+        # Stamps a run recorded before `milestone_id` existed, so the next
+        # resume no longer needs the short-id fallback.
+        run_record = resumed.model_copy(
+            update={"status": "started", "milestone_id": milestone_card.id}
+        )
+    return MilestonePreflight(
+        root=root,
+        resumed=resumed,
+        milestone_card=milestone_card,
+        plan=plan,
+        levels=levels,
+        tips=tips,
+        keys=keys,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        run_id=run_id,
+        run_record=run_record,
+        drive=drive,
+    )
+
+
 def run_milestone(
     milestone: str | None,
     *,

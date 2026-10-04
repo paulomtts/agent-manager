@@ -43,6 +43,7 @@ import pytest
 from lockhelpers import _holder, _probe, _reap
 
 from agent_manager import bases, board, census, cli, control, dag, integration, locks, models, orchestrate, paths, runs
+from agent_manager import comments
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -7163,3 +7164,123 @@ def test_run_board_ends_on_a_base_exception_instead_of_hanging(board_seams):
 
     with pytest.raises(Fatal):
         _board(board_seams)
+
+
+# ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is `_resume_root`'s plain directory, `orchestrate.refresh_git` is
+# patched, and `integrate_recorder` (autouse) stands in for Integrate. No git,
+# brd or claude process ever starts.
+
+
+def _preflight_milestone(root: Path, milestone: str | None, **overrides: Any) -> Any:
+    kwargs: dict[str, Any] = {
+        "repo_dir": root,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "max_concurrent": 1,
+        "clock": lambda: STARTED_AT,
+    }
+    kwargs.update(overrides)
+    return orchestrate.preflight_milestone(milestone, **kwargs)
+
+
+def _no_refresh(root: Path) -> None:
+    pytest.fail("refresh_git ran before a pre-flight refusal")
+
+
+def test_preflight_milestone_refuses_a_blocker_cycle_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board
+):
+    """Through the board a sibling cycle is refused even earlier, by the
+    census (`CensusOrderError`), so the census is patched to hand
+    `plan_levels` the cyclic stories of test_plan_levels_refuses_a_blocker_cycle_before_any_geometry."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = _add_card(root, "Milestone 3: orchestration")
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b]),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(dag.DependencyCycleError):
+        _preflight_milestone(root, milestone)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_milestone_refuses_an_ambiguous_needle_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    _add_card(root, "Milestone 3: orchestration")
+    _add_card(root, "Milestone 3: integration")
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(census.MilestoneNotFoundError, match="ambiguous milestone"):
+        _preflight_milestone(root, "Milestone 3")
+
+    assert _run_dirs() == []
+
+
+def test_preflight_milestone_refuses_a_claimed_key_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    key = f"card:{shape['milestone']}"
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight_milestone(root, shape["milestone"])
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_a_fresh_milestone_preflight_refreshes_git_once_after_every_refusal(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 2})
+    events: list[str] = []
+    real_refuse = cli.refuse_claimed
+
+    def refuse(at: Path, keys: Any, *, run_id: str | None = None) -> None:
+        events.append("refuse_claimed")
+        real_refuse(at, keys, run_id=run_id)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: events.append(f"refresh_git:{at}"))
+    driver = FakeDriver()
+
+    pre = _preflight_milestone(root, shape["milestone"], driver=driver)
+
+    assert events == ["refuse_claimed", f"refresh_git:{root}"]
+    assert pre.root == root
+    assert pre.resumed is None
+    assert pre.milestone_card.id == shape["milestone"]
+    assert pre.run_id == runs.mint_run_id(shape["milestone"], STARTED_AT)
+    assert (pre.run_record.id, pre.run_record.status) == (pre.run_id, "started")
+    assert pre.run_record.workflow == orchestrate.MILESTONE_WORKFLOW
+    assert pre.run_record.milestone_id == shape["milestone"]
+    assert pre.run_record.config.max_concurrent_stories == 1
+    assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
+    assert pre.keys == orchestrate.milestone_claims(shape["milestone"], pre.plan.stories, PREFIX)
+    assert pre.drive is driver
+    assert driver.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
