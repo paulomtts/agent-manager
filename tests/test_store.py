@@ -1361,8 +1361,10 @@ SUMMARY_KEYS = {
     "started_at",
     "milestone_id",
     "card_id",
+    "lease",
 }
-"""The seven names `am runs` always had, plus the two this card adds."""
+"""The seven names `am runs` always had, plus `milestone_id` and `card_id`
+(card 0b5a15d7) and `lease` (card 6bf47e74)."""
 
 
 def _listed(root: Path) -> list[store.RunSummary]:
@@ -1476,11 +1478,12 @@ def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
     assert summary.card_id == "aaaa1111"
 
 
-def test_run_summary_fields_are_the_old_seven_plus_milestone_id_and_card_id():
+def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_and_lease():
     assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
     assert store.RunSummary.model_config["extra"] == "forbid"
     assert store.RunSummary.model_fields["milestone_id"].default is None
     assert store.RunSummary.model_fields["card_id"].default is None
+    assert store.RunSummary.model_fields["lease"].default is None
 
 
 def test_a_listed_run_dumps_exactly_the_summary_keys(repo):
@@ -1489,6 +1492,115 @@ def test_a_listed_run_dumps_exactly_the_summary_keys(repo):
     [summary] = _listed(repo)
 
     assert set(summary.model_dump()) == SUMMARY_KEYS
+
+
+RUN_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
+"""The `runs[]` lease object: `am status`'s `control.lease` minus `acquired_at`."""
+
+
+def _summary_fields(**overrides) -> dict:
+    """The fields of one valid `RunSummary`, without the database."""
+    return {
+        "id": "run-x",
+        "workflow": "task",
+        "repo_dir": Path("/repo"),
+        "base_branch": "main",
+        "branch_prefix": "m1",
+        "status": "started",
+        **overrides,
+    }
+
+
+def _run_lease_fields(**overrides) -> dict:
+    """One valid `RunLease` as a plain dict."""
+    return {
+        "live": True,
+        "pid": 4242,
+        "host": "box",
+        "heartbeat_at": "2026-09-29T09:00:00+00:00",
+        "accepting": True,
+        **overrides,
+    }
+
+
+def test_run_lease_has_exactly_the_five_keys_and_forbids_others():
+    assert set(store.RunLease.model_fields) == RUN_LEASE_KEYS
+    assert store.RunLease.model_config["extra"] == "forbid"
+
+
+def test_run_summary_lease_defaults_to_none():
+    summary = store.RunSummary.model_validate(_summary_fields())
+
+    assert summary.lease is None
+    assert summary.model_dump()["lease"] is None
+
+
+def test_run_summary_accepts_a_lease_object_and_dumps_it_as_a_plain_dict():
+    summary = store.RunSummary.model_validate(_summary_fields(lease=_run_lease_fields()))
+
+    assert isinstance(summary.lease, store.RunLease)
+    assert summary.model_dump()["lease"] == _run_lease_fields()
+
+
+def test_run_summary_accepts_null_pid_host_and_heartbeat_in_a_lease():
+    """The source design types these three as nullable; the model must agree."""
+    summary = store.RunSummary.model_validate(
+        _summary_fields(lease=_run_lease_fields(pid=None, host=None, heartbeat_at=None))
+    )
+
+    assert summary.lease is not None
+    assert (summary.lease.pid, summary.lease.host, summary.lease.heartbeat_at) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_run_summary_rejects_an_unknown_key_inside_the_lease():
+    """The error must sit at `lease.acquired_at`: a `RunSummary` with no
+    `lease` field at all would also raise, but at `lease`, the wrong reason."""
+    with pytest.raises(ValidationError) as caught:
+        store.RunSummary.model_validate(
+            _summary_fields(
+                lease=_run_lease_fields(acquired_at="2026-09-29T08:59:00+00:00")
+            )
+        )
+
+    [error] = caught.value.errors()
+    assert error["loc"] == ("lease", "acquired_at")
+    assert error["type"] == "extra_forbidden"
+
+
+def test_run_summary_rejects_a_lease_missing_a_key():
+    fields = _run_lease_fields()
+    del fields["accepting"]
+
+    with pytest.raises(ValidationError) as caught:
+        store.RunSummary.model_validate(_summary_fields(lease=fields))
+
+    [error] = caught.value.errors()
+    assert error["loc"] == ("lease", "accepting")
+    assert error["type"] == "missing"
+
+
+def test_list_runs_leaves_the_lease_to_the_caller_even_with_a_lease_row(repo):
+    """`live` needs `control`, which `store` must not import, so `list_runs`
+    never fills `lease`: `am runs` does, in `cli`."""
+    _record_summary(repo, "run-l", None, workflow="task")
+    _plant_lease(repo, "run-l", token="life-1")
+
+    [summary] = _listed(repo)
+
+    assert summary.lease is None
+
+
+def test_store_does_not_import_control():
+    """`control` imports `store`; the reverse would be a circular import."""
+    source = Path(store.__file__).read_text()
+
+    assert "from agent_manager import control" not in source
+    assert "from agent_manager.control" not in source
+    assert "import agent_manager.control" not in source
 
 
 def test_latest_run_id_is_the_newest_recorded_run(repo):

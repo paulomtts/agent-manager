@@ -585,6 +585,26 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
     return run
 
 
+class RunLease(BaseModel):
+    """The `lease` of one `am runs` entry: `am status`'s `control.lease`
+    without `acquired_at`.
+
+    Filled by `cli.runs_for`, never by `list_runs`: `live` is
+    `control.lease_is_live` at read time, and `control` imports this module,
+    so the reverse import would be circular. `pid`, `host` and `heartbeat_at`
+    are nullable to match the published type, though a real `run_leases` row
+    always fills them. `heartbeat_at` is an ISO string, as in `control_view`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    live: bool
+    pid: int | None
+    host: str | None
+    heartbeat_at: str | None
+    accepting: bool
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
@@ -599,6 +619,10 @@ class RunSummary(BaseModel):
     run row: it is the single subtask a `task` (`--card`) run records, and null
     for any other workflow or before that subtask row is written. Both default
     to `None`, so they are additive: no older key changed.
+
+    `lease` is the run's `run_leases` row as a `RunLease`, or `None` when the
+    run has no lease row. `list_runs` always leaves it `None`; `am runs`
+    fills it in `cli`. It too defaults to `None`, so it is additive.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -612,6 +636,7 @@ class RunSummary(BaseModel):
     started_at: datetime | None = None
     milestone_id: str | None = None
     card_id: str | None = None
+    lease: RunLease | None = None
 
 
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
