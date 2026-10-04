@@ -130,3 +130,16 @@ def test_detach_section_documents_envelope():
     assert "exit code 3" in section
     assert "exits 0" in section
     assert "usage error (exit 2)" in section
+
+
+def test_watch_documents_from_now():
+    section = _section("Watching a run")
+    assert (
+        "The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:"
+        in section
+    )
+    assert "am watch --all --follow --from-now" in section
+    assert "- `--from-now` together with `--since`, any value, 0 included;" in section
+    assert "- `--from-now` without `--follow`;" in section
+    assert "only lines appended after the command started" in section
+    assert '"schema":1' in section

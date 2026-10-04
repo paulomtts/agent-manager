@@ -524,13 +524,15 @@ New keys are additive: a newer `am` may add keys to these objects, but never rem
 am watch 20260923T140506Z-19efcddc
 am watch --all --since 40
 am watch 20260923T140506Z-19efcddc --follow
+am watch --all --follow --from-now
 ```
 
-The shape is `am watch RUN_ID | --all [--since SEQ] [--follow]`:
+The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:
 
 - Give exactly one of `RUN_ID` and `--all`.
 - `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
 - `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+- `--from-now` needs `--follow` and skips the backlog: the stream prints only lines appended after the command started. It cannot be combined with `--since`, whatever its value.
 
 Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
 
@@ -538,6 +540,8 @@ These are refused with `{"ok": false, "error": {"type", "message"}}` and exit co
 
 - both `RUN_ID` and `--all`, or neither;
 - a `--since` below 0;
+- `--from-now` together with `--since`, any value, 0 included;
+- `--from-now` without `--follow`;
 - a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
 - a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
 
@@ -552,6 +556,8 @@ Watching a run id that does not exist creates no run directory.
 ```
 
 `am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":1`.
 
 Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
 
