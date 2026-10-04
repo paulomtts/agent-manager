@@ -1636,7 +1636,13 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
 
 
 def watch_for(
-    run_id: str | None, *, all_runs: bool = False, since: int = 0
+    run_id: str | None,
+    *,
+    all_runs: bool = False,
+    since: int = 0,
+    follow: bool = False,
+    from_now: bool = False,
+    since_given: bool = False,
 ) -> dict[str, Any]:
     """The payload of `am watch`: `{"events": [...]}`.
 
@@ -1646,6 +1652,11 @@ def watch_for(
     missing `runs/` is no events: a watcher pointed at the wrong data
     directory sees nothing, not an error (am-watch design 3.7). Events are
     ordered by `(run_id, seq)`; `since` filters each run's own `seq`.
+
+    `from_now` (`--from-now`) is refused with `since_given` (any `--since`
+    on the command line, 0 included) and without `follow`. Both refusals
+    come before any journal is read, so `watch` prints them as the usual
+    exit-3 envelope with no stream line.
     """
     if all_runs == (run_id is not None):
         raise CliError(
@@ -1654,6 +1665,16 @@ def watch_for(
         )
     if since < 0:
         raise CliError(f"--since must be 0 or more, got {since}")
+    if from_now and since_given:
+        raise CliError(
+            "--from-now and --since are exclusive: --from-now skips the whole"
+            " backlog, --since picks where in it to start; give one of them"
+        )
+    if from_now and not follow:
+        raise CliError(
+            "--from-now needs --follow: it skips the backlog of a stream,"
+            " and without --follow there is only the backlog"
+        )
     if run_id is not None:
         _check_watch_run_id(run_id)
         try:
@@ -1741,6 +1762,7 @@ def _follow_watch(
     since: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
+    from_now: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """The backlog above `since`, then every line appended after it.
 
@@ -1748,9 +1770,20 @@ def _follow_watch(
     another pass, `max_polls` times or forever when it is `None`. One cursor
     dict spans every pass, so no `seq` of a run is emitted twice and none is
     skipped, however its lines are spread across polls.
+
+    With `from_now` the backlog pass still runs, so it seeds each existing
+    run's cursor to its highest complete `seq`, but nothing it reads is
+    yielded. A torn last line is not read, so it is emitted once complete;
+    a run with no complete line, or none at all yet, has no cursor and is
+    emitted in full from `since` when its lines appear.
     """
     cursors: dict[str, int] = {}
-    yield from _poll_watch(run_id, since=since, cursors=cursors)
+    backlog = _poll_watch(run_id, since=since, cursors=cursors)
+    if from_now:
+        for _ in backlog:
+            pass
+    else:
+        yield from backlog
     polls = 0
     while max_polls is None or polls < max_polls:
         sleep(WATCH_POLL_SECONDS)
@@ -1774,7 +1807,7 @@ def _silence_stdout() -> None:
     os.close(devnull)
 
 
-def _stream_watch(run_id: str | None, *, since: int) -> None:
+def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
@@ -1787,7 +1820,11 @@ def _stream_watch(run_id: str | None, *, since: int) -> None:
     try:
         _emit_stream_line(_watch_hello())
         for event in _follow_watch(
-            run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+            run_id,
+            since=since,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            from_now=from_now,
         ):
             _emit_stream_line(event)
     except KeyboardInterrupt:
@@ -1810,13 +1847,24 @@ def watch(
     all_runs: bool = typer.Option(
         False, "--all", help="Read every run's journal under the data directory."
     ),
-    since: int = typer.Option(
-        0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
+    since: int | None = typer.Option(
+        None,
+        "--since",
+        metavar="SEQ",
+        help="Only events whose seq is greater than SEQ (default 0).",
     ),
     follow: bool = typer.Option(
         False,
         "--follow",
         help="Keep printing events, one JSON object per line, until interrupted.",
+    ),
+    from_now: bool = typer.Option(
+        False,
+        "--from-now",
+        help=(
+            "With --follow, skip the backlog: print only events appended after"
+            " the command starts. Exclusive with --since."
+        ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
@@ -1824,16 +1872,28 @@ def watch(
 
     With --follow, print a hello line and then each event as its own line of
     JSON, the backlog first and then new ones as they are appended, until
-    interrupted. A refusal is still one envelope at exit 3, printed before
-    any stream line.
+    interrupted. With --follow --from-now, the backlog is skipped and only
+    events appended after the start are printed. A refusal is still one
+    envelope at exit 3, printed before any stream line.
     """
+    # `None` means --since was not given, which --from-now must tell apart
+    # from an explicit `--since 0`; every other use wants the number.
+    since_given = since is not None
+    since_value = since if since is not None else 0
     try:
-        payload = watch_for(run_id, all_runs=all_runs, since=since)
+        payload = watch_for(
+            run_id,
+            all_runs=all_runs,
+            since=since_value,
+            follow=follow,
+            from_now=from_now,
+            since_given=since_given,
+        )
     except WATCH_HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_watch(run_id, since=since)
+        _stream_watch(run_id, since=since_value, from_now=from_now)
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
