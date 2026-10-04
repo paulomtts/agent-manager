@@ -297,12 +297,27 @@ def _field(mapping: object, name: str) -> object:
     return mapping.get(name) if isinstance(mapping, Mapping) else None
 
 
+_NONE_LIKE = re.compile(r"^\s*(?:none|n/a|null|nil)\b", re.IGNORECASE)
+
+
+def _is_none_like(command: object) -> bool:
+    """True when Explore wrote "there is none" instead of an empty string.
+
+    Explore is an LLM and `typecheck`/`lint` are free text, so a repo with no
+    typecheck can come back as `none (CLAUDE.md: there is no separate ...)`.
+    Running its first word as a program failed the verify phase and escalated a
+    whole run. Only Explore's fields get this leniency: a `--verify` command the
+    user typed is always run exactly as given.
+    """
+    return isinstance(command, str) and _NONE_LIKE.match(command) is not None
+
+
 def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
     """Explore's `verification.typecheck` then each `verification.lint` entry.
 
     Pygents design G9 item 4: these run after the `--verify` commands, in that
     order. `fullSuite`/`full_suite` is deliberately not read -- `commands` is
-    the suite's only source. A blank typecheck or blank lint entry is skipped;
+    the suite's only source. A blank or none-like (`none`, `n/a`, ...) typecheck or lint entry is skipped;
     a wrong-typed one raises `ValueError` here, before any process starts,
     exactly like a malformed `--verify` command. `typecheck` and `lint` carry
     no alias in `results.Verification`, so the engine's snake_case dump and a
@@ -312,13 +327,15 @@ def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
     planned: list[tuple[object, list[str]]] = []
 
     typecheck = _field(verification, "typecheck")
-    if typecheck is not None:
+    if typecheck is not None and not _is_none_like(typecheck):
         argv = _argv_for(typecheck)
         if argv is not None:
             planned.append((typecheck, argv))
 
     lint = _field(verification, "lint")
     if lint is not None:
+        if isinstance(lint, (list, tuple)):
+            lint = [entry for entry in lint if not _is_none_like(entry)]
         planned.extend(_plan_commands(lint))
 
     return planned

@@ -39,8 +39,18 @@ class Verification(_Result):
     """What Explore reports about how this repo is verified (addendum R1)."""
 
     full_suite: list[str] = Field(serialization_alias="fullSuite")
-    typecheck: str
-    lint: list[str]
+    typecheck: str = Field(
+        description=(
+            "The repo's typecheck command, exactly as you would type it, or an empty "
+            "string when it has none. Never prose such as 'none' or 'n/a'."
+        )
+    )
+    lint: list[str] = Field(
+        description=(
+            "The repo's lint commands, each exactly as you would type it, or an empty "
+            "list when it has none."
+        )
+    )
 
 
 class ExploreResult(_Result):

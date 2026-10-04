@@ -705,3 +705,11 @@ def test_the_embedded_json_schema_names_snake_case_only():
         "plan_hash",
         "report",
     }
+
+
+def test_the_verification_schema_tells_explore_to_use_an_empty_string_when_there_is_none():
+    schema = results.Verification.model_json_schema()
+    typecheck = schema["properties"]["typecheck"]["description"]
+    lint = schema["properties"]["lint"]["description"]
+    assert "empty string" in typecheck and "never" in typecheck.lower()
+    assert "empty list" in lint
