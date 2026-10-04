@@ -1723,6 +1723,432 @@ def test_store_does_not_import_control():
     }
 
 
+# -- progress (card 882b212b) -------------------------------------------------
+#
+# Unit tier: a SQLite fixture store in tmp_path, nothing spawned.
+
+
+def _progress_run(
+    root: Path,
+    run_id: str,
+    *,
+    workflow: str = "milestone",
+    status: str = "started",
+    started_at: datetime | None = None,
+) -> store.Store:
+    """An open store for `run_id` holding its run row and nothing below it.
+    The caller records the tree and closes the store."""
+    opened = store.Store.open(root, run_id)
+    opened.record_run(
+        _run(root, run_id).model_copy(
+            update={"workflow": workflow, "status": status, "started_at": started_at}
+        )
+    )
+    return opened
+
+
+def _tree_story(card_id: str, status: str = "started", title: str = "A story") -> models.StoryRun:
+    return models.StoryRun(card_id=card_id, title=title, level=0, status=status)
+
+
+def _tree_subtask(card_id: str, status: str = "started") -> models.SubtaskRun:
+    return models.SubtaskRun(
+        card_id=card_id, branch=f"m1/task-{card_id}", base_branch="main", status=status
+    )
+
+
+def _tree_phase(
+    name: str, status: str, started_at: datetime | None = None
+) -> models.PhaseRun:
+    return models.PhaseRun(name=name, kind="agent", status=status, started_at=started_at)
+
+
+def _tree_attempt(card: str, phase: str, n: int) -> models.Attempt:
+    return models.Attempt(n=n, dispatch=_dispatch(card, phase, n))
+
+
+def _progress_at(minute: int) -> datetime:
+    return datetime(2026, 10, 4, 9, minute, tzinfo=timezone.utc)
+
+
+def _progress_of(root: Path) -> dict[str, dict | None]:
+    """Each listed run's `progress`, dumped, keyed by run id."""
+    return {
+        summary.id: None if summary.progress is None else summary.progress.model_dump()
+        for summary in _listed(root)
+    }
+
+
+def _expected(
+    stories: tuple[int, int] = (0, 0),
+    subtasks: tuple[int, int] = (0, 0),
+    current: dict | None = None,
+) -> dict:
+    """A dumped `RunProgress` from `(done, total)` pairs."""
+    return {
+        "stories": {"done": stories[0], "total": stories[1]},
+        "subtasks": {"done": subtasks[0], "total": subtasks[1]},
+        "current": current,
+    }
+
+
+def test_list_runs_gives_a_run_with_no_tree_rows_zero_progress_and_no_current(repo):
+    """`progress` is never null from `list_runs`: a run row with nothing below
+    it is 0 of 0 at both levels with no current step."""
+    _progress_run(repo, "run-bare").close()
+
+    [summary] = _listed(repo)
+
+    assert summary.progress is not None
+    assert summary.progress.current is None
+    assert summary.progress.model_dump() == _expected()
+
+
+def test_list_runs_counts_stories_and_subtasks_done_against_total(repo):
+    """Only `done` is done: every other status counts toward `total` alone."""
+    layout = {
+        ("s-done", "done"): [("a", "done"), ("b", "done")],
+        ("s-started", "started"): [("c", "started"), ("d", "stopped")],
+        ("s-failed", "failed"): [("e", "failed")],
+        ("s-escalated", "escalated"): [("f", "cancelled")],
+        ("s-pending", "pending"): [("g", "pending")],
+    }
+    opened = _progress_run(repo, "run-m")
+    try:
+        for (story_id, story_status), subtasks in layout.items():
+            opened.record_story(_tree_story(story_id, story_status))
+            for card, status in subtasks:
+                opened.record_subtask(story_id, _tree_subtask(card, status))
+    finally:
+        opened.close()
+
+    assert _progress_of(repo) == {"run-m": _expected(stories=(1, 5), subtasks=(2, 7))}
+
+
+def test_list_runs_counts_a_task_run_as_one_story_and_one_subtask(repo):
+    """Re-recording a node upserts its row, so finishing the card moves `done`
+    without growing `total`."""
+    opened = _progress_run(repo, "run-t", workflow="task")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("ef248597"))
+        assert _progress_of(repo) == {
+            "run-t": _expected(stories=(0, 1), subtasks=(0, 1))
+        }
+
+        opened.record_subtask("story-1", _tree_subtask("ef248597", "done"))
+        opened.record_story(_tree_story("story-1", "done"))
+    finally:
+        opened.close()
+
+    assert _progress_of(repo) == {"run-t": _expected(stories=(1, 1), subtasks=(1, 1))}
+
+
+def test_list_runs_counts_the_integrate_story_and_its_resolver_subtasks(repo):
+    """`store` cannot import `integration` (which imports `store`), so the
+    synthetic Integrate story is a story like any other: a run that resolved
+    a conflict shows one story more than its milestone has. Its resolver
+    subtask is named after the conflicting story, as `integration` records it."""
+    opened = _progress_run(repo, "run-m")
+    try:
+        opened.record_story(_tree_story("s1", "done"))
+        opened.record_subtask("s1", _tree_subtask("a", "done"))
+        opened.record_story(_tree_story("integrate", "started", title="Integrate"))
+        opened.record_subtask("integrate", _tree_subtask("s1"))
+        opened.record_phase(
+            "integrate", "s1", _tree_phase("resolve", "started", _progress_at(5))
+        )
+    finally:
+        opened.close()
+
+    assert _progress_of(repo) == {
+        "run-m": _expected(
+            stories=(1, 2),
+            subtasks=(1, 2),
+            current={"card": "s1", "phase": "resolve", "attempt": None},
+        )
+    }
+
+
+def test_list_runs_keeps_each_runs_progress_to_its_own_rows(repo):
+    """Both runs use the same story, card and phase names, and the later run's
+    phase started later with more attempts: none of it may leak across."""
+    early = _progress_run(repo, "run-a", started_at=_progress_at(0))
+    try:
+        early.record_story(_tree_story("story-1", "done"))
+        early.record_subtask("story-1", _tree_subtask("card-1", "done"))
+        early.record_subtask("story-1", _tree_subtask("card-2"))
+        early.record_phase(
+            "story-1", "card-2", _tree_phase("implement", "started", _progress_at(1))
+        )
+        early.record_attempt(
+            "story-1", "card-2", "implement", _tree_attempt("card-2", "implement", 1)
+        )
+    finally:
+        early.close()
+    late = _progress_run(repo, "run-b", started_at=_progress_at(10))
+    try:
+        late.record_story(_tree_story("story-1"))
+        late.record_story(_tree_story("story-2"))
+        late.record_subtask("story-1", _tree_subtask("card-2"))
+        late.record_phase(
+            "story-1", "card-2", _tree_phase("implement", "started", _progress_at(30))
+        )
+        for n in (1, 2, 3):
+            late.record_attempt(
+                "story-1", "card-2", "implement", _tree_attempt("card-2", "implement", n)
+            )
+    finally:
+        late.close()
+
+    assert _progress_of(repo) == {
+        "run-a": _expected(
+            stories=(1, 1),
+            subtasks=(1, 2),
+            current={"card": "card-2", "phase": "implement", "attempt": 1},
+        ),
+        "run-b": _expected(
+            stories=(0, 2),
+            subtasks=(0, 1),
+            current={"card": "card-2", "phase": "implement", "attempt": 3},
+        ),
+    }
+
+
+def test_an_empty_history_still_lists_no_runs_with_progress(repo):
+    """No new error path: an empty projection is still an empty list."""
+    assert _listed(repo) == []
+
+
+def test_list_runs_current_is_the_started_phase_with_its_latest_attempt(repo):
+    """`attempt` is the highest `n` of that phase of that card: not of a done
+    phase before it, and not of the same phase name on another card."""
+    opened = _progress_run(repo, "run-m")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-2", "done"))
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("explore", "done", _progress_at(1))
+        )
+        for n in (1, 2, 3, 4):
+            opened.record_attempt(
+                "story-1", "card-1", "explore", _tree_attempt("card-1", "explore", n)
+            )
+        opened.record_phase(
+            "story-1", "card-2", _tree_phase("implement", "done", _progress_at(2))
+        )
+        for n in range(1, 8):
+            opened.record_attempt(
+                "story-1", "card-2", "implement", _tree_attempt("card-2", "implement", n)
+            )
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("implement", "started", _progress_at(3))
+        )
+        for n in (1, 2):
+            opened.record_attempt(
+                "story-1", "card-1", "implement", _tree_attempt("card-1", "implement", n)
+            )
+    finally:
+        opened.close()
+
+    [summary] = _listed(repo)
+
+    assert summary.progress is not None
+    assert summary.progress.current == store.ProgressCurrent(
+        card="card-1", phase="implement", attempt=2
+    )
+
+
+def test_list_runs_current_attempt_is_null_before_any_attempt_row(repo):
+    opened = _progress_run(repo, "run-t", workflow="task")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-1"))
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("explore", "started", _progress_at(1))
+        )
+    finally:
+        opened.close()
+
+    assert _progress_of(repo)["run-t"]["current"] == {
+        "card": "card-1",
+        "phase": "explore",
+        "attempt": None,
+    }
+
+
+def test_list_runs_current_is_null_when_no_phase_is_started(repo):
+    """A phase that finished is re-recorded `done` in place, so it drops out;
+    a `pending` phase is not in flight."""
+    opened = _progress_run(repo, "run-t", workflow="task")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-1"))
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("explore", "started", _progress_at(1))
+        )
+        opened.record_attempt(
+            "story-1", "card-1", "explore", _tree_attempt("card-1", "explore", 1)
+        )
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("explore", "done", _progress_at(1))
+        )
+        opened.record_phase("story-1", "card-1", _tree_phase("verify", "pending"))
+    finally:
+        opened.close()
+
+    assert _progress_of(repo) == {"run-t": _expected(stories=(0, 1), subtasks=(0, 1))}
+
+
+def test_list_runs_current_picks_the_latest_started_phase_among_parallel_ones(repo):
+    """A milestone run has subtasks of several stories in flight at once; the
+    one whose phase started last is `current`, whatever order they were
+    recorded in."""
+    opened = _progress_run(repo, "run-m")
+    try:
+        for story_id, card, minute in (("s1", "c1", 5), ("s2", "c2", 9), ("s3", "c3", 7)):
+            opened.record_story(_tree_story(story_id))
+            opened.record_subtask(story_id, _tree_subtask(card))
+            opened.record_phase(
+                story_id, card, _tree_phase("implement", "started", _progress_at(minute))
+            )
+    finally:
+        opened.close()
+
+    assert _progress_of(repo)["run-m"]["current"] == {
+        "card": "c2",
+        "phase": "implement",
+        "attempt": None,
+    }
+
+
+def test_list_runs_current_breaks_a_started_at_tie_by_story_then_card_then_position(repo):
+    """Each run records the loser first, so insertion order cannot pass for
+    the tie-break."""
+    same = _progress_at(5)
+    by_story = _progress_run(repo, "run-story")
+    try:
+        for story_id, card in (("bbbb", "c-of-b"), ("aaaa", "c-of-a")):
+            by_story.record_story(_tree_story(story_id))
+            by_story.record_subtask(story_id, _tree_subtask(card))
+            by_story.record_phase(story_id, card, _tree_phase("implement", "started", same))
+    finally:
+        by_story.close()
+    by_card = _progress_run(repo, "run-card")
+    try:
+        by_card.record_story(_tree_story("story-1"))
+        for card in ("c2", "c1"):
+            by_card.record_subtask("story-1", _tree_subtask(card))
+            by_card.record_phase("story-1", card, _tree_phase("implement", "started", same))
+    finally:
+        by_card.close()
+    by_position = _progress_run(repo, "run-position")
+    try:
+        by_position.record_story(_tree_story("story-1"))
+        by_position.record_subtask("story-1", _tree_subtask("card-1"))
+        for name in ("zeta", "alpha"):
+            by_position.record_phase("story-1", "card-1", _tree_phase(name, "started", same))
+    finally:
+        by_position.close()
+
+    currents = {run_id: progress["current"] for run_id, progress in _progress_of(repo).items()}
+
+    assert currents == {
+        "run-story": {"card": "c-of-a", "phase": "implement", "attempt": None},
+        "run-card": {"card": "c1", "phase": "implement", "attempt": None},
+        "run-position": {"card": "card-1", "phase": "zeta", "attempt": None},
+    }
+
+
+def test_list_runs_current_takes_a_started_phase_with_no_start_time_only_when_alone(repo):
+    """`started_at DESC` sends NULL last: an undated started phase loses to any
+    dated one, even one whose story sorts after it, and wins when alone."""
+    mixed = _progress_run(repo, "run-mixed")
+    try:
+        mixed.record_story(_tree_story("a"))
+        mixed.record_subtask("a", _tree_subtask("card-a"))
+        mixed.record_phase("a", "card-a", _tree_phase("undated", "started", None))
+        mixed.record_story(_tree_story("b"))
+        mixed.record_subtask("b", _tree_subtask("card-b"))
+        mixed.record_phase("b", "card-b", _tree_phase("dated", "started", _progress_at(1)))
+    finally:
+        mixed.close()
+    alone = _progress_run(repo, "run-alone")
+    try:
+        alone.record_story(_tree_story("a"))
+        alone.record_subtask("a", _tree_subtask("card-a"))
+        alone.record_phase("a", "card-a", _tree_phase("undated", "started", None))
+    finally:
+        alone.close()
+
+    currents = {run_id: progress["current"] for run_id, progress in _progress_of(repo).items()}
+
+    assert currents == {
+        "run-mixed": {"card": "card-b", "phase": "dated", "attempt": None},
+        "run-alone": {"card": "card-a", "phase": "undated", "attempt": None},
+    }
+
+
+def test_list_runs_current_comes_from_rows_not_from_the_run_status(repo):
+    """A run whose process died mid-phase keeps the `started` phase row it
+    stopped in, and `current` shows it whatever the run row says; `lease.live`
+    is what tells a consumer nobody is working on it."""
+    opened = _progress_run(repo, "run-dead", status="failed")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-1"))
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("implement", "started", _progress_at(1))
+        )
+        opened.record_attempt(
+            "story-1", "card-1", "implement", _tree_attempt("card-1", "implement", 1)
+        )
+    finally:
+        opened.close()
+
+    [summary] = _listed(repo)
+
+    assert summary.status == "failed"
+    assert summary.progress is not None
+    assert summary.progress.model_dump()["current"] == {
+        "card": "card-1",
+        "phase": "implement",
+        "attempt": 1,
+    }
+
+
+def test_list_runs_progress_reads_without_writing(repo):
+    """`am runs` takes no lock and writes nothing: the progress queries are
+    plain `SELECT`s, and leave no transaction open behind them."""
+    opened = _progress_run(repo, "run-t", workflow="task")
+    try:
+        opened.record_story(_tree_story("story-1"))
+        opened.record_subtask("story-1", _tree_subtask("card-1"))
+        opened.record_phase(
+            "story-1", "card-1", _tree_phase("implement", "started", _progress_at(1))
+        )
+        opened.record_attempt(
+            "story-1", "card-1", "implement", _tree_attempt("card-1", "implement", 1)
+        )
+    finally:
+        opened.close()
+
+    conn = store.open_db(repo)
+    try:
+        before = conn.total_changes
+        [summary] = store.list_runs(conn)
+        after = conn.total_changes
+        in_transaction = conn.in_transaction
+    finally:
+        conn.close()
+
+    assert summary.progress is not None
+    assert summary.progress.current is not None
+    assert after == before
+    assert in_transaction is False
+
+
 def test_latest_run_id_is_the_newest_recorded_run(repo):
     _record_summary(repo, "run-a", datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     _record_summary(repo, "run-c", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
@@ -2628,6 +3054,15 @@ def test_an_old_task_run_lists_its_card_id_after_the_milestone_id_migration(repo
     assert summary.workflow == "task"
     assert summary.milestone_id is None
     assert summary.card_id == "ef248597"
+
+
+def test_an_old_runs_row_lists_with_zero_progress(repo):
+    """A database from before `milestone_id` has a bare `runs` row and empty
+    tree tables; it lists with the zero `progress`, not `null` or an error."""
+    [summary] = _migrated_legacy(repo)
+
+    assert summary.progress is not None
+    assert summary.progress.model_dump() == _expected()
 
 
 def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):

@@ -682,6 +682,49 @@ class RunSummary(BaseModel):
     progress: RunProgress | None = None
 
 
+def _progress_count(
+    conn: sqlite3.Connection, table: Literal["stories", "subtasks"], run_id: str
+) -> ProgressCount:
+    """`done` of `total` rows of `table` for one run. `table` is one of two
+    literals from this module, never user input, so formatting it in is safe.
+    `SUM` over no rows is NULL, hence the `COALESCE`."""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS total, COALESCE(SUM(status = 'done'), 0) AS done"
+        f" FROM {table} WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return ProgressCount(done=row["done"], total=row["total"])
+
+
+_CURRENT_PHASE_SQL = """
+SELECT phases.card_id AS card,
+       phases.name    AS phase,
+       (SELECT MAX(attempts.n) FROM attempts
+         WHERE attempts.run_id   = phases.run_id
+           AND attempts.story_id = phases.story_id
+           AND attempts.card_id  = phases.card_id
+           AND attempts.phase    = phases.name) AS attempt
+  FROM phases
+ WHERE phases.run_id = ? AND phases.status = 'started'
+ ORDER BY phases.started_at DESC, phases.story_id, phases.card_id, phases.position
+ LIMIT 1
+"""
+"""The run's in-flight phase: the `started` one that started last (a NULL
+`started_at` sorts last under `DESC`), ties broken by story, card, then
+position, with the highest attempt number of that phase, or NULL before its
+first attempt row."""
+
+
+def _run_progress(conn: sqlite3.Connection, run_id: str) -> RunProgress:
+    """One run's `RunProgress`, from read-only `SELECT`s on `conn`."""
+    row = conn.execute(_CURRENT_PHASE_SQL, (run_id,)).fetchone()
+    return RunProgress(
+        stories=_progress_count(conn, "stories", run_id),
+        subtasks=_progress_count(conn, "subtasks", run_id),
+        current=None if row is None else ProgressCurrent(**dict(row)),
+    )
+
+
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     """Every run recorded in this project's projection, newest first.
 
@@ -698,6 +741,20 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     workflow -- a milestone run records many subtasks -- gets NULL. Should a
     `task` run ever hold several subtask rows, the lowest `position`, then the
     lowest card id, wins, so the answer is stable rather than an error.
+
+    `progress` is counted here for every run, never left `None`, from plain
+    `SELECT`s over that run's `stories`, `subtasks`, `phases` and `attempts`
+    rows; nothing in it needs `control`. At each level `done` counts only
+    status `done` and `total` counts every row, so `failed`, `escalated`,
+    `stopped` and `cancelled` rows are in `total` alone. The synthetic
+    Integrate story and its resolver subtasks are rows like any other (`store`
+    cannot import `integration`, which imports it), so a milestone run that
+    resolved a conflict shows one story more than its milestone has.
+    `current` is the `started` phase that started last (see
+    `_CURRENT_PHASE_SQL`), or `None` when no phase is started. It is read
+    from rows, not from liveness: a run whose process died mid-phase still
+    shows the phase it stopped in, and `lease.live` tells whether anyone is
+    still working on it. A run with no tree rows is 0 of 0 with no `current`.
     """
     rows = conn.execute(
         "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
@@ -709,7 +766,10 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
         " ) END AS card_id"
         " FROM runs ORDER BY runs.started_at DESC, runs.id DESC"
     ).fetchall()
-    return [RunSummary.model_validate(dict(row)) for row in rows]
+    return [
+        RunSummary.model_validate({**dict(row), "progress": _run_progress(conn, row["id"])})
+        for row in rows
+    ]
 
 
 def latest_run_id(conn: sqlite3.Connection) -> str | None:

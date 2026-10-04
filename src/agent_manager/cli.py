@@ -201,8 +201,8 @@ RUN_IDENTITY = (
 )
 """The run's own fields, without `config` and without the tree below it. §10's
 `status` header is these seven names. Each `runs` entry carries the same seven,
-plus `milestone_id`, `card_id` and `lease` (a superset), so the two commands
-still describe a run's identity the same way."""
+plus `milestone_id`, `card_id`, `lease` and `progress` (a superset), so the two
+commands still describe a run's identity the same way."""
 
 
 def status_rows(run: models.Run) -> list[dict[str, Any]]:
@@ -1494,7 +1494,7 @@ def status(
 
 
 def runs_for(*, repo_dir: Path) -> dict[str, Any]:
-    """This project's run history, newest first, each run with its lease.
+    """This project's run history, newest first, each run with its lease and progress.
 
     An empty history is an empty list, not a refusal: a project that has never
     been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
@@ -1506,6 +1506,9 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     same connection and shaped by `_lease_fields`, the helper `control_view`
     uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
     `None` when the run has no lease row. One `now` judges the whole listing.
+
+    `progress` arrives already counted by `store.list_runs`; `model_copy`
+    keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
