@@ -3996,6 +3996,93 @@ def test_a_board_dry_run_refusal_is_an_envelope_and_writes_nothing(
     assert list(paths.data_dir().iterdir()) == []
 
 
+def _bare_main_repo(path: Path) -> Path:
+    """A real git repo at `path` on `main` with one empty commit, no brd board."""
+    path.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)], check=True, capture_output=True, text=True
+    )
+    _git(path, "config", "user.email", "tests@example.com")
+    _git(path, "config", "user.name", "agent-manager tests")
+    _git(path, "config", "commit.gpgsign", "false")
+    _git(path, "commit", "--allow-empty", "-m", "base")
+    return path
+
+
+@pytest.mark.git
+@pytest.mark.parametrize(
+    "ref_kind, stacks", [("branch", True), ("tag", False)], ids=["local-branch", "tag-only"]
+)
+def test_the_board_dry_run_asks_real_git_for_a_done_blockers_local_integrate_branch(
+    tmp_path, monkeypatch, ref_kind, stacks
+):
+    """Card 5bfe746d, spec T9: the unreplaced `_local_branch_exists` against a real
+    repo. M1 is `done` and blocks M2. A local branch `<stem(M1)>-integrate`
+    stacks M2 on it; a tag of the same name, with no branch, does not, and M2
+    stays on `main`. The repo's branches, tags and work tree are untouched."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    repo = _bare_main_repo(tmp_path / "repo")
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    integrate = integration.integration_branch(dag.task_stem(done))
+    _git(repo, ref_kind, integrate)
+    _serve_roots(monkeypatch, [done, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+    refs_before = _git(repo, "show-ref")
+    porcelain_before = _git(repo, "status", "--porcelain")
+
+    result = _board_dry_run(repo)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["levels"] == _as_json(
+        [
+            {
+                "level": 0,
+                "milestones": [
+                    _expected_board_milestone(
+                        second,
+                        dag.task_stem(second),
+                        root=cli.resolve_repo_dir(repo),
+                        max_concurrent=cli.DEFAULT_MAX_CONCURRENT,
+                        base_branch=integrate if stacks else "main",
+                    )
+                ],
+            }
+        ]
+    )
+    assert _git(repo, "show-ref") == refs_before
+    assert _git(repo, "status", "--porcelain") == porcelain_before
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.git
+def test_the_board_dry_run_lets_a_git_error_from_a_non_repository_propagate(
+    tmp_path, monkeypatch
+):
+    """Card 5bfe746d, spec 2.3 / review focus: `--repo-dir` is no git repository and
+    M2's blocker is `done`, so its integrate branch must be looked up. git exits
+    128, which is not an answer: the `GitError` propagates (no envelope), as it
+    does from `run_board`, rather than silently previewing M2 on `main`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    # Stop git's repository discovery at tmp_path, so an enclosing repo can't answer.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    done = _board_milestone(1, status="done")
+    second = _board_milestone(2, blocked_by=(done.id,))
+    _serve_roots(monkeypatch, [done, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(not_a_repo)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, orchestrate.worktree.GitError)
+    assert result.exception.exit_code == 128
+    assert '"ok"' not in result.stdout
+    assert list(paths.data_dir().iterdir()) == []
+
+
 def _board_payload(*statuses: str) -> dict[str, Any]:
     """`run_board`'s payload shape with one milestone entry per status."""
     entries = [
