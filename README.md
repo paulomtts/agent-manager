@@ -77,7 +77,7 @@ Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
 The base-branch and final integration checks run their commands with neither set.
 
-Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, none of the three, a blank `--milestone`, a missing `--branch-prefix` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run` or with `--board`.
+Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, none of the three, a blank `--milestone`, a missing `--branch-prefix` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run`.
 These are usage errors: Typer prints the message on stderr, nothing is printed on stdout, and the exit code is 2.
 
 #### Running detached with `--detach`
@@ -86,7 +86,7 @@ These are usage errors: Typer prints the message on stderr, nothing is printed o
 am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run pytest" --detach
 ```
 
-`--detach` works with `--card` and `--milestone`. The command first does everything a foreground run does before its first subtask: it reads the board, makes every check, records the run and takes its lease. A refusal at that point comes back as the usual `{"ok": false, ...}` envelope with exit code 3, and nothing starts. Then the run moves to a background process in its own session, and the command prints one envelope and exits 0:
+`--detach` works with `--card`, `--milestone` and `--board`. The command first does everything a foreground run does before its first subtask: it reads the board, makes every check, records the run and takes its lease. A refusal at that point comes back as the usual `{"ok": false, ...}` envelope with exit code 3, and nothing starts. Then the run moves to a background process in its own session, and the command prints one envelope and exits 0:
 
 ```json
 {"ok":true,"data":{"detached":true,"log":"/home/me/.local/share/agent-manager/runs/20261004T090000Z-1a2b3c4d/run.log","pid":48213,"run_id":"20261004T090000Z-1a2b3c4d"}}
@@ -97,7 +97,8 @@ am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run
 - A crash writes no `report.json`. Its traceback is in `run.log`, the lease and claims are released, and the run can be resumed like any crashed run.
 - The exit code is 0 whenever the run was handed off, even if it later escalates. Read the outcome from `report.json` or `am status`.
 - A missing verification command is not caught before the run starts. The verification gate runs during the explore phase, so with `--detach` it shows up in `report.json` and `am status`, not on your terminal. Pass `--verify` or `--allow-no-verification`.
-- `--detach` with `--dry-run` or with `--board` is refused as a usage error (exit 2).
+- `--detach` with `--dry-run` is refused as a usage error (exit 2).
+- With `--board`, the command runs the board's whole pre-flight here: the argument checks, the board read, the cycle check, each milestone's prefix and base, and the up-front claim check. A refusal is the usual envelope with exit code 3, and nothing starts. Then the board run moves to the background process. The envelope's `data` has the keys `board`, `detached`, `pid`, `log`, `report` and `levels`, and no `run_id`: each milestone's run is created when that milestone starts, and `am runs` or `am watch --all` finds it. `log` is `<data dir>/boards/<stamp>-<digest>.log` and `report` is `<data dir>/boards/<stamp>-<digest>.report.json`, where `<digest>` is the repository's digest. Both are mode 0600. The report holds the envelope `am run --board` would have printed. A claim another run takes after the up-front check shows up there as an `escalated` milestone.
 - Later versions may add keys to these envelopes. Ignore keys you do not know.
 
 #### Preview with `--dry-run`
@@ -156,7 +157,7 @@ am run --board --dry-run --pretty
 - A milestone whose run raises an error is reported `escalated`, and the other milestones carry on.
 - A board with no open milestone is `ok`, runs nothing and exits 0.
 
-Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, and `--detach` with `--board` are usage errors (exit 2).
+Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
 
 Refusals. These come in this order, before anything is written. Each prints `{"ok": false, "error": {"type", "message"}}` and exits 3:
 

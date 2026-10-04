@@ -69,6 +69,7 @@ from agent_manager import (
     detach,
     integration,
     models,
+    paths,
     runs,
 )
 from agent_manager.runtime import engine as runtime_engine
@@ -2391,6 +2392,124 @@ def _local_branch_exists(root: Path) -> Callable[[str], bool]:
     return exists
 
 
+# ── the two stages of a board run (card 203a9a5e) ───────────────────────────
+
+
+@dataclass(frozen=True)
+class BoardPreflight:
+    """What `preflight_board` read and decided for one board run.
+
+    Everything `run_board_engine` reads afterwards, so the engine never reads
+    the board again. `milestones` is `levels` flattened, in level order.
+    `levels_payload` is the payload's `levels` value, so a foreground envelope
+    and the run's report name the same levels. No run id: a board run has no
+    Run record. Internal state, so a dataclass.
+    """
+
+    root: Path
+    base_branch: str
+    max_concurrent: int
+    levels: list[list[models.CardNode]]
+    milestones: list[models.CardNode]
+    prefixes: dict[str, str]
+    bases: dict[str, str]
+    levels_payload: list[dict[str, Any]]
+
+
+def preflight_board(
+    *,
+    repo_dir: Path,
+    base_branch: str | None,
+    branch_prefix_of: Callable[[models.CardNode], str],
+    max_concurrent: int = 1,
+) -> BoardPreflight:
+    """Stage 1 of a board run: every argument check, read and refusal (card 203a9a5e).
+
+    `run_board`'s refusals, in its order, each propagating unchanged and
+    leaving nothing behind: `max_concurrent < 1` and a missing `base_branch`
+    (`ValueError`, before the board is read); `board.roots()`, read once, then
+    `dag.board_levels` (`DependencyCycleError`); `board_prefixes` with
+    `roots=` (`ValueError`); `milestone_bases` over `_local_branch_exists`
+    (`MilestoneBlockersError`, or a `GitError` that is not exit 1); last,
+    only when something is open, one `cli.refuse_claimed` over `board_claims`
+    (`ClaimedError`). `board.roots`, `cli.refuse_claimed` and
+    `_local_branch_exists` are read at call time. Starts no event loop, opens
+    no store and writes nothing.
+    """
+    if max_concurrent < 1:
+        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+    if not base_branch:
+        raise ValueError("a board run needs a base branch")
+    root = runs.resolve_repo_dir(repo_dir)
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
+    milestones = [card for level in levels for card in level]
+    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
+    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
+    levels_payload = [
+        {"level": index, "milestones": [card.id for card in level]}
+        for index, level in enumerate(levels)
+    ]
+    if milestones:
+        cli.refuse_claimed(root, board_claims(milestones, prefixes))
+    return BoardPreflight(
+        root=root,
+        base_branch=base_branch,
+        max_concurrent=max_concurrent,
+        levels=levels,
+        milestones=milestones,
+        prefixes=prefixes,
+        bases=bases,
+        levels_payload=levels_payload,
+    )
+
+
+def run_board_engine(
+    pre: BoardPreflight,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Stage 2 of a board run: run the board `pre` approved, and report (card 203a9a5e).
+
+    `pre` is the only input. The board is not read again, prefixes and bases
+    are not derived again, and the up-front claim check is not repeated: that
+    pre-flight is the caller's. Each milestone's own pre-flight inside
+    `_run_milestone_async` still runs, so a claim taken since `pre` is an
+    `escalated` entry. With nothing open it returns `ok` with no milestones and
+    starts no event loop. Otherwise one `asyncio.run(_run_board_async(...))`
+    on `pre.max_concurrent`, and `run_board`'s payload with `pre.levels_payload`
+    as its `levels`. Synchronous; does not mutate `pre`.
+    """
+    if not pre.milestones:
+        return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
+    entries = asyncio.run(
+        _run_board_async(
+            pre.milestones,
+            prefixes=pre.prefixes,
+            bases=pre.bases,
+            root=pre.root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            max_concurrent=pre.max_concurrent,
+            control_interval=control_interval,
+        )
+    )
+    return {
+        "ok": all(entry["status"] == "done" for entry in entries),
+        "board": True,
+        "levels": pre.levels_payload,
+        "milestones": entries,
+    }
+
+
 def run_board(
     *,
     repo_dir: Path,
@@ -2405,6 +2524,8 @@ def run_board(
     control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Drive every open milestone on the board as one grafo tree, and report.
+
+    It composes `preflight_board` and `run_board_engine` (card 203a9a5e).
 
     Refusals come first, in this order, and each leaves nothing behind. Bad
     arguments are `ValueError` before the board is read: `max_concurrent < 1`
@@ -2445,43 +2566,109 @@ def run_board(
     through `board_levels` and the claims. Or resume a stopped or escalated
     milestone on its own with `am resume <run-id>`.
     """
-    if max_concurrent < 1:
-        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
-    if not base_branch:
-        raise ValueError("a board run needs a base branch")
-    root = runs.resolve_repo_dir(repo_dir)
-    all_roots = board.roots(repo_dir=root)
-    levels = dag.board_levels(all_roots)
-    milestones = [card for level in levels for card in level]
-    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
-    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
-    levels_payload = [
-        {"level": index, "milestones": [card.id for card in level]}
-        for index, level in enumerate(levels)
-    ]
-    if not milestones:
-        return {"ok": True, "board": True, "levels": levels_payload, "milestones": []}
-    cli.refuse_claimed(root, board_claims(milestones, prefixes))
-    entries = asyncio.run(
-        _run_board_async(
-            milestones,
-            prefixes=prefixes,
-            bases=bases,
-            root=root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-            driver=driver,
-            clock=clock,
-            max_concurrent=max_concurrent,
-            control_interval=control_interval,
-        )
+    pre = preflight_board(
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix_of=branch_prefix_of,
+        max_concurrent=max_concurrent,
     )
+    return run_board_engine(
+        pre,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        driver=driver,
+        clock=clock,
+        control_interval=control_interval,
+    )
+
+
+class BoardLogExistsError(ValueError):
+    """A board detach found its log already there (card 03f027ea).
+
+    Another board run on this repository was detached in the same second, so
+    the two would share a log and a report. Subclasses `ValueError`, so it is
+    in `cli.HANDLED`: an `ok: false` envelope and exit 3, nothing forked, and
+    the existing log untouched.
+    """
+
+
+def detach_board(
+    *,
+    repo_dir: Path,
+    base_branch: str | None,
+    branch_prefix_of: Callable[[models.CardNode], str],
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --board --detach` (card 03f027ea): pre-flight here, the board run in a child.
+
+    `preflight_board` runs exactly as for `run_board`, so every refusal is
+    the same and leaves nothing behind, `<data dir>/boards/` included. Then
+    the log `<data dir>/boards/<stamp>-<digest>.log` is created exclusively
+    at 0600 (`<stamp>` from `clock`, `<digest>` the repository's
+    `paths.project_digest`); an existing one is `BoardLogExistsError`.
+    `detacher` gets the body and the log, and the child is let go at once:
+    a board run has no run id, store or lease to point at it, so this does
+    not go through `cli.hand_off_to_child`. Nothing holds a store across the
+    fork: `preflight_board` opens none.
+
+    The child runs `run_board_engine` on this very `pre` (no second board
+    read or claim check; each milestone's own run is created when it is
+    dispatched) and writes `<stem>.report.json`: the envelope a foreground
+    `am run --board` would have printed, or a `HANDLED` error's envelope.
+    Anything else propagates with no report; its traceback goes to the log.
+
+    Returns `{"board", "detached", "pid", "log", "report", "levels"}`, with
+    `levels` the foreground payload's.
+    """
+    pre = preflight_board(
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix_of=branch_prefix_of,
+        max_concurrent=max_concurrent,
+    )
+    stem = f"{clock().strftime(runs.RUN_ID_TIME_FORMAT)}-{paths.project_digest(pre.root)}"
+    try:
+        log = detach.create_board_log(stem)
+    except FileExistsError as error:
+        raise BoardLogExistsError(
+            f"board log {error.filename} already exists: another board run on this "
+            "repository was detached in the same second; run the command again"
+        ) from None
+    report = detach.board_report_path(stem)
+
+    def body() -> None:
+        try:
+            payload = run_board_engine(
+                pre,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                driver=driver,
+                clock=clock,
+                control_interval=control_interval,
+            )
+        except cli.HANDLED as error:
+            detach.write_board_report(report, cli.render(cli.error_envelope(error)))
+            return
+        detach.write_board_report(report, cli.render(cli.ok_envelope(payload)))
+
+    spawned = detacher(body, log)
+    spawned.go()
     return {
-        "ok": all(entry["status"] == "done" for entry in entries),
         "board": True,
-        "levels": levels_payload,
-        "milestones": entries,
+        "detached": True,
+        "pid": spawned.pid,
+        "log": str(log),
+        "report": str(report),
+        "levels": pre.levels_payload,
     }
 
 

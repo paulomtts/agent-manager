@@ -73,6 +73,84 @@ def test_write_report_replaces_an_earlier_report_whole():
     assert sorted(entry.name for entry in path.parent.iterdir()) == [detach.REPORT_NAME]
 
 
+BOARD_STEM = "20261004T090000Z-" + "ab" * 32
+
+
+def test_create_board_log_makes_an_empty_0600_file_under_boards():
+    log = detach.create_board_log(BOARD_STEM)
+
+    assert log == paths.data_dir() / "boards" / f"{BOARD_STEM}{detach.BOARD_LOG_SUFFIX}"
+    assert log.is_file()
+    assert log.read_bytes() == b""
+    assert _mode(log) == 0o600
+
+
+@pytest.mark.parametrize("umask", [0o000, 0o277])
+def test_create_board_log_is_0600_whatever_the_umask(umask):
+    paths.boards_dir()  # made first: a 0o277 umask would make it untraversable
+    old = os.umask(umask)
+    try:
+        log = detach.create_board_log(BOARD_STEM)
+    finally:
+        os.umask(old)
+
+    assert _mode(log) == 0o600
+
+
+def test_create_board_log_refuses_an_existing_log_and_leaves_it_alone():
+    log = detach.create_board_log(BOARD_STEM)
+    log.write_text("the first board run\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError) as caught:
+        detach.create_board_log(BOARD_STEM)
+
+    assert str(caught.value.filename) == str(log)
+    assert log.read_text(encoding="utf-8") == "the first board run\n"
+
+
+def test_board_report_path_names_the_report_and_creates_only_the_directory():
+    path = detach.board_report_path(BOARD_STEM)
+
+    assert path == paths.data_dir() / "boards" / f"{BOARD_STEM}{detach.BOARD_REPORT_SUFFIX}"
+    assert path.parent.is_dir()
+    assert not path.exists()
+    assert list(path.parent.iterdir()) == []
+
+
+def test_write_board_report_writes_one_line_at_0600_and_leaves_no_temp_file():
+    target = detach.board_report_path(BOARD_STEM)
+
+    path = detach.write_board_report(target, json.dumps({"ok": True, "data": {"board": True}}))
+
+    assert path == target
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": True, "data": {"board": True}}
+    assert path.read_text(encoding="utf-8").endswith("\n")
+    assert _mode(path) == 0o600
+    assert sorted(entry.name for entry in path.parent.iterdir()) == [target.name]
+
+
+def test_write_board_report_replaces_an_earlier_report_whole():
+    target = detach.board_report_path(BOARD_STEM)
+    detach.write_board_report(target, '{"ok":false}')
+
+    path = detach.write_board_report(target, '{"ok":true}')
+
+    assert path.read_text(encoding="utf-8") == '{"ok":true}\n'
+    assert sorted(entry.name for entry in path.parent.iterdir()) == [target.name]
+
+
+@pytest.mark.parametrize("umask", [0o000, 0o277])
+def test_write_board_report_is_0600_whatever_the_umask(umask):
+    target = detach.board_report_path(BOARD_STEM)
+    old = os.umask(umask)
+    try:
+        detach.write_board_report(target, '{"ok":true}')
+    finally:
+        os.umask(old)
+
+    assert _mode(target) == 0o600
+
+
 # -- fork_detacher itself: these fork, so they are e2e_fake, not unit -----------
 #
 # The tier follows what a test spawns, not its directory (CLAUDE.md "Test
