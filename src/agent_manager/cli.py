@@ -138,7 +138,8 @@ class DeadRunError(CliError):
     """The run is recorded `started`, but no live process holds its lease (C2, C8).
 
     Nobody is left to honour a request, so none is recorded. The message
-    names the lease's pid, host and heartbeat age, or says there is no lease.
+    names the lease's pid, host and heartbeat age, or says there is no lease,
+    and points at `am resume` and `am reset`.
     """
 
 
@@ -2162,13 +2163,14 @@ def _controllable_lease(
     if lease is None:
         raise DeadRunError(
             f"run {run_id} is recorded started but no process holds its lease;"
-            f" it is not running, so `am resume {run_id}` picks it up"
+            f" it is not running, so `am resume {run_id}` picks it up,"
+            f" or `am reset {run_id}` closes it"
         )
     if not control.lease_is_live(lease, now=now):
         raise DeadRunError(
             f"run {run_id} is not running: its lease is held by pid {lease.pid}"
             f" on {lease.host}, last heartbeat {_heartbeat_age(lease, now)}s ago;"
-            f" `am resume {run_id}` picks it up"
+            f" `am resume {run_id}` picks it up, or `am reset {run_id}` closes it"
         )
     if not lease.accepting:
         raise NotAcceptingError(

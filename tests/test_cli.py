@@ -9003,3 +9003,29 @@ def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
     assert isinstance(store_module.CorruptJournalError("torn"), cli.HANDLED)
     assert not isinstance(store_module.MissingJournalError("gone"), cli.HANDLED)
     assert not isinstance(store_module.JournalError("other"), cli.HANDLED)
+
+
+@pytest.mark.parametrize(
+    "lease",
+    [None, {"heartbeat_at": CONTROL_NOW - timedelta(seconds=31)}],
+    ids=["no-lease", "dead-lease"],
+)
+def test_a_cancel_of_a_dead_run_points_at_am_resume_and_am_reset(
+    projection, monkeypatch, lease
+):
+    """Spec test 10: both `DeadRunError` wordings name `am reset <run-id>`."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    if lease is not None:
+        _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, "cancel")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    assert error["message"].endswith(
+        f"`am resume {CONTROL_RUN_ID}` picks it up,"
+        f" or `am reset {CONTROL_RUN_ID}` closes it"
+    )
+    assert _controls(projection) == []
