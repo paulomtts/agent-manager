@@ -533,6 +533,82 @@ def test_lease_exit_leaves_a_new_holders_lease_and_claims_alone(root, opened_sto
     assert _all_claims(root) == [("card:a", RUN_ID, "thief")]
 
 
+# -- hand-off and adoption (am run --detach, card aff9fdbf) ---------------------
+
+
+def test_a_handed_off_lease_stops_beating_unbinds_and_releases_nothing(root, opened_store):
+    run = models.Run(
+        id=RUN_ID,
+        workflow="task",
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix="m10/",
+        status="started",
+        config=models.RunConfig(),
+    )
+    with control.Lease(opened_store, claims=["card:a"], clock=lambda: _at(0)) as lease:
+        token = lease.hand_off()
+        assert token == lease.token
+        assert _heartbeat_threads() == []
+
+    row = _read_lease(root)
+    assert row is not None and row.token == token
+    assert _held(root, token) == ["card:a"]
+    thief = store.Store.open(root, RUN_ID)
+    try:
+        thief.take_lease(
+            token="thief", pid=1, host="elsewhere", now=_at(0), is_live=lambda row: False
+        )
+    finally:
+        thief.close()
+    # Bound to the handed-off token, this write would raise LeaseLostError.
+    assert opened_store.record_run(run).event == "run_upsert"
+
+
+def test_an_adopting_lease_keeps_the_token_and_claims_and_releases_both_on_exit(
+    root, opened_store
+):
+    with control.Lease(
+        opened_store, claims=["card:a"], pid=4242, host="build-box", clock=lambda: _at(0)
+    ) as first:
+        token = first.hand_off()
+
+    class NoTake(Wrapped):
+        def take_lease(self, **kwargs: Any) -> Any:
+            pytest.fail("an adopting lease took a new lease")
+
+    child = store.Store.open(root, RUN_ID)
+    try:
+        with control.Lease(NoTake(child), adopt=token, clock=lambda: _at(100)) as adopted:
+            assert adopted.token == token
+            assert adopted.displaced is None
+            assert len(_heartbeat_threads()) == 1
+            row = _read_lease(root)
+            assert row is not None
+            assert (row.token, row.pid, row.host) == (token, 4242, "build-box")
+            assert row.heartbeat_at == _at(100)
+            assert _held(root, token) == ["card:a"]
+        assert _read_lease(root) is None
+        assert _all_claims(root) == []
+        assert _heartbeat_threads() == []
+    finally:
+        child.close()
+
+
+def test_an_adopting_lease_refuses_a_token_that_no_longer_holds_the_run(root, opened_store):
+    _plant(root, token="someone-else", heartbeat_at=_at(0), claims=("card:a",))
+
+    with pytest.raises(store.LeaseLostError) as caught:
+        with control.Lease(opened_store, adopt="handed-off"):
+            pytest.fail("adopted a lease another process holds")
+
+    assert caught.value.holder is not None and caught.value.holder.token == "someone-else"
+    row = _read_lease(root)
+    assert row is not None and row.token == "someone-else"
+    assert _all_claims(root) == [("card:a", RUN_ID, "someone-else")]
+    assert _heartbeat_threads() == []
+
+
 # -- apply_pending (C4) --------------------------------------------------------
 
 
