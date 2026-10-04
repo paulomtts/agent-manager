@@ -1,14 +1,17 @@
-"""Unit tier: the files `am run --detach` leaves (card aff9fdbf).
+"""The files `am run --detach` leaves, and the fork that leaves them (card aff9fdbf).
 
-`fork_detacher` really forks, so it is exercised only by the e2e_fake test
-`tests/e2e/test_detached_run.py`; nothing here starts a process.
+Unmarked tests are unit tier and start no process. `fork_detacher` really
+forks, so its own tests below are marked `e2e_fake`; the whole detached run
+is `tests/e2e/test_detached_run.py`.
 """
 
 import ast
 import json
 import os
+import signal
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -70,15 +73,96 @@ def test_write_report_replaces_an_earlier_report_whole():
     assert sorted(entry.name for entry in path.parent.iterdir()) == [detach.REPORT_NAME]
 
 
-def test_spawned_carries_the_pid_and_the_two_signals():
-    events: list[str] = []
-    spawned = detach.Spawned(pid=4242, go=lambda: events.append("go"), abort=lambda: events.append("abort"))
+# -- fork_detacher itself: these fork, so they are e2e_fake, not unit -----------
+#
+# The tier follows what a test spawns, not its directory (CLAUDE.md "Test
+# tiers"): each test below forks a real child, so each is marked `e2e_fake`
+# explicitly and stays out of the default run. Order comes from the go-pipe
+# and `waitpid`, never from sleeps. `sys.stdout`/`sys.stderr` are pointed back
+# at fds 1 and 2, as they are in a real `am` process, because pytest's capture
+# replaces them with objects that do not write to fd 1 or 2.
 
-    spawned.go()
+CHILD_DEADLINE = 30.0
+"""Only bounds a broken child; a healthy one exits at once."""
+
+
+def _real_std_streams(monkeypatch) -> None:
+    """Called in the test body: pytest re-installs its capture between setup and call."""
+    monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+    monkeypatch.setattr(sys, "stderr", sys.__stderr__)
+
+
+def _reap(pid: int) -> int:
+    """Wait for `pid` to exit and return its exit code; kill it past the deadline."""
+    deadline = time.monotonic() + CHILD_DEADLINE
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return os.waitstatus_to_exitcode(status)
+        if time.monotonic() >= deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail(f"the detached child {pid} did not exit within {CHILD_DEADLINE}s")
+        time.sleep(0.01)
+
+
+@pytest.mark.e2e_fake
+def test_fork_detacher_runs_the_body_in_its_own_session_only_once_told_to_go(
+    tmp_path, monkeypatch
+):
+    _real_std_streams(monkeypatch)
+    log = tmp_path / "run.log"
+    log.touch()
+    marker = tmp_path / "ran"
+
+    def body() -> None:
+        print("from the detached child", flush=True)
+        marker.write_text(f"{os.getpid()} {os.getsid(0)}", encoding="utf-8")
+
+    spawned = detach.fork_detacher(body, log)
+    try:
+        # The child is blocked on the go-pipe, so its body cannot have run yet.
+        assert not marker.exists()
+    finally:
+        spawned.go()
+
+    assert _reap(spawned.pid) == 0
+    assert marker.read_text(encoding="utf-8") == f"{spawned.pid} {spawned.pid}"
+    assert "from the detached child" in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.e2e_fake
+def test_an_aborted_detached_child_exits_without_running_its_body(tmp_path, monkeypatch):
+    _real_std_streams(monkeypatch)
+    log = tmp_path / "run.log"
+    log.touch()
+    marker = tmp_path / "ran"
+
+    spawned = detach.fork_detacher(lambda: marker.touch(), log)
     spawned.abort()
 
-    assert spawned.pid == 4242
-    assert events == ["go", "abort"]
+    _reap(spawned.pid)
+    assert not marker.exists()
+
+
+@pytest.mark.e2e_fake
+def test_a_detached_child_whose_body_raises_leaves_its_traceback_in_run_log(
+    tmp_path, monkeypatch
+):
+    _real_std_streams(monkeypatch)
+    log = tmp_path / "run.log"
+    log.touch()
+
+    def body() -> None:
+        raise RuntimeError("engine bug in the child")
+
+    spawned = detach.fork_detacher(body, log)
+    spawned.go()
+
+    assert _reap(spawned.pid) != 0
+    text = log.read_text(encoding="utf-8")
+    assert "Traceback" in text
+    assert "RuntimeError: engine bug in the child" in text
 
 
 def test_detach_module_imports_only_paths_and_the_stdlib():
