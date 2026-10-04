@@ -69,6 +69,7 @@ from agent_manager import (
     detach,
     integration,
     models,
+    paths,
     runs,
 )
 from agent_manager.runtime import engine as runtime_engine
@@ -2580,6 +2581,95 @@ def run_board(
         clock=clock,
         control_interval=control_interval,
     )
+
+
+class BoardLogExistsError(ValueError):
+    """A board detach found its log already there (card 03f027ea).
+
+    Another board run on this repository was detached in the same second, so
+    the two would share a log and a report. Subclasses `ValueError`, so it is
+    in `cli.HANDLED`: an `ok: false` envelope and exit 3, nothing forked, and
+    the existing log untouched.
+    """
+
+
+def detach_board(
+    *,
+    repo_dir: Path,
+    base_branch: str | None,
+    branch_prefix_of: Callable[[models.CardNode], str],
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --board --detach` (card 03f027ea): pre-flight here, the board run in a child.
+
+    `preflight_board` runs exactly as for `run_board`, so every refusal is
+    the same and leaves nothing behind, `<data dir>/boards/` included. Then
+    the log `<data dir>/boards/<stamp>-<digest>.log` is created exclusively
+    at 0600 (`<stamp>` from `clock`, `<digest>` the repository's
+    `paths.project_digest`); an existing one is `BoardLogExistsError`.
+    `detacher` gets the body and the log, and the child is let go at once:
+    a board run has no run id, store or lease to point at it, so this does
+    not go through `cli.hand_off_to_child`. Nothing holds a store across the
+    fork: `preflight_board` opens none.
+
+    The child runs `run_board_engine` on this very `pre` (no second board
+    read or claim check; each milestone's own run is created when it is
+    dispatched) and writes `<stem>.report.json`: the envelope a foreground
+    `am run --board` would have printed, or a `HANDLED` error's envelope.
+    Anything else propagates with no report; its traceback goes to the log.
+
+    Returns `{"board", "detached", "pid", "log", "report", "levels"}`, with
+    `levels` the foreground payload's.
+    """
+    pre = preflight_board(
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix_of=branch_prefix_of,
+        max_concurrent=max_concurrent,
+    )
+    stem = f"{clock().strftime(runs.RUN_ID_TIME_FORMAT)}-{paths.project_digest(pre.root)}"
+    try:
+        log = detach.create_board_log(stem)
+    except FileExistsError as error:
+        raise BoardLogExistsError(
+            f"board log {error.filename} already exists: another board run on this "
+            "repository was detached in the same second; run the command again"
+        ) from None
+    report = detach.board_report_path(stem)
+
+    def body() -> None:
+        try:
+            payload = run_board_engine(
+                pre,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                driver=driver,
+                clock=clock,
+                control_interval=control_interval,
+            )
+        except cli.HANDLED as error:
+            detach.write_board_report(report, cli.render(cli.error_envelope(error)))
+            return
+        detach.write_board_report(report, cli.render(cli.ok_envelope(payload)))
+
+    spawned = detacher(body, log)
+    spawned.go()
+    return {
+        "board": True,
+        "detached": True,
+        "pid": spawned.pid,
+        "log": str(log),
+        "report": str(report),
+        "levels": pre.levels_payload,
+    }
 
 
 async def _run_board_async(
