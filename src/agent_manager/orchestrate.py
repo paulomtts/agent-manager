@@ -2145,15 +2145,15 @@ async def _run_board_async(
 
     The tree comes from `build_dag_tree`, with each milestone's blockers being
     its `blocked_by` restricted to `milestones` (a done blocker is not here,
-    so it is satisfied). Every node waits on each of its own blockers'
-    `milestone_done` and reads `milestone_ok`, whatever the blocker count.
-    An edge only schedules, and a node never raises an `Exception`, so the
-    edge fires whether or not the blocker finished `done`. A node dispatches
-    only when every blocker is clean. Otherwise it records `blocked` with the
-    unclean blockers. A non-`Exception` `BaseException` (not a cancel) ends the
-    whole run through `run_until_killed`, as in `supervise`, because grafo
-    would drop it and hang. The `grafo` logger is at CRITICAL for exactly this
-    call.
+    so it is satisfied). grafo itself holds a node back until every one of its
+    parents' edges has fired, so by the time a node body runs, every blocker's
+    `milestone_ok` entry is already set -- no extra waiting needed here. A
+    node never raises an `Exception`, so an edge fires whether or not the
+    blocker finished `done`; a node dispatches only when every blocker is
+    clean, and otherwise records `blocked` with the unclean blockers. A
+    non-`Exception` `BaseException` (not a cancel) ends the whole run through
+    `run_until_killed`, as in `supervise`, because grafo would drop it and
+    hang. The `grafo` logger is at CRITICAL for exactly this call.
     """
     grafo_logger = logging.getLogger(GRAFO_LOGGER)
     level_before = grafo_logger.level
@@ -2167,7 +2167,6 @@ async def _run_board_async(
             ]
             for card in milestones
         }
-        milestone_done = {card.id: asyncio.Event() for card in milestones}
         milestone_ok: dict[str, bool] = {}
         entries: dict[str, dict[str, Any]] = {}
         fatal: list[BaseException] = []
@@ -2200,8 +2199,6 @@ async def _run_board_async(
         def node_coroutine(card: models.CardNode) -> Callable[..., Awaitable[str]]:
             async def run(**_forwarded: Any) -> str:
                 try:
-                    for blocker in blockers[card.id]:
-                        await milestone_done[blocker].wait()
                     unclean = [
                         blocker
                         for blocker in blockers[card.id]
@@ -2222,7 +2219,6 @@ async def _run_board_async(
                     raise
                 finally:
                     milestone_ok[card.id] = entries.get(card.id, {}).get("status") == "done"
-                    milestone_done[card.id].set()
                 return card.id
 
             return run
