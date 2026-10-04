@@ -51,5 +51,7 @@ The full table is in design spec §14
   files); plain dataclasses are fine for internal-only state.
 - CLI output is JSON by default, `--pretty` for humans — the same envelope shape
   as `brd` (`{"ok": true, "data": ...}`).
-- The design spec is the source of truth:
-  `docs/superpowers/specs/2026-09-23-agent-manager-design.md`.
+- Module layering, import rules and where new code goes:
+  `docs/standards/architecture.md` is the source of truth.
+- `docs/superpowers/` is gitignored local working history (specs, plans), not
+  a source of truth.
