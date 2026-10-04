@@ -579,6 +579,10 @@ def test_no_forbidden_git_operation_runs_on_any_path(repo: Path, tmp_path: Path)
     assert again["created"] is False
     _assert_no_forbidden_git(calls)
     assert (tmp_path / "wt-8" / "prior.txt").is_file()
+    # Every add above is a clean add (no stale registration anywhere), so none
+    # may carry `-f`: it would mask git's refusal of a branch live elsewhere.
+    assert len(_adds(calls)) == 2
+    assert not any("-f" in argv or "--force" in argv for argv in calls), calls
 
 
 def test_every_spelling_of_one_repository_shares_one_lock(repo: Path, tmp_path: Path):
@@ -929,3 +933,40 @@ def test_a_git_lock_timeout_propagates_and_no_worktree_is_added(
     assert not any(_is_add(argv) for argv in calls)
     assert not (tmp_path / "wt").exists()
     assert _repo_lock_is_free(repo)
+
+
+# --- Stale-registered-but-missing worktrees (card cf03b236) -----------------
+
+
+def _adds(calls: list[list[str]]) -> list[list[str]]:
+    """The recorded `worktree add` argvs, in call order."""
+    return [argv for argv in calls if _is_add(argv)]
+
+
+def test_a_cleanly_removed_worktree_and_branch_take_the_plain_add(
+    repo: Path, tmp_path: Path
+):
+    # `git worktree remove` + `git branch -D` leave no registration behind, so
+    # this is an ordinary clean add: today's argv exactly, and never `-f`.
+    wt = tmp_path / "wt"
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+    worktree.ensure(**args)
+    _git(repo, "worktree", "remove", str(wt))
+    _git(repo, "branch", "-D", "m1/task-9")
+
+    calls: list[list[str]] = []
+    result = worktree.ensure(**args, git_runner=_recorder(calls, worktree.run_git))
+
+    assert result["branch_existed"] is False
+    assert result["worktree_existed"] is False
+    assert result["created"] is True
+    assert _adds(calls) == [
+        ["-C", str(repo), "worktree", "add", str(wt), "-b", "m1/task-9", "main"]
+    ]
+    assert not any("-f" in argv or "--force" in argv for argv in calls), calls
+    assert wt.is_dir()
