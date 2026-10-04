@@ -585,6 +585,151 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
     return run
 
 
+MismatchKind = Literal["stale", "foreign"]
+"""§3.2: `stale` is a value the journal recorded for that node at some seq (or a
+node the projection lacks), which a rebuild repairs; `foreign` is a value no
+journal line ever recorded for that node (or a node no line created), written
+outside the store."""
+
+
+@dataclass(frozen=True)
+class Mismatch:
+    """One place the projection disagrees with the replayed journal (§3.3).
+
+    `node` is keyed by the journal's own coordinates (`story`, `card`, `phase`,
+    `attempt`, as `JournalLine` and am-watch spell them), all `None` for the
+    run. `field` is `"status"` for a status mismatch and `None` for a shape
+    mismatch; then `journal`/`projection` is the status on the side that has
+    the node and `None` on the side that lacks it.
+    """
+
+    node: dict[str, str | int | None]
+    field: Literal["status"] | None
+    journal: str | None
+    projection: str | None
+    kind: MismatchKind
+
+
+_NodeKey = tuple[str | None, str | None, str | None, int | None]
+"""(story, card, phase, attempt): one node of the §9 tree in `JournalLine`'s
+coordinates. The run is all `None`."""
+
+_RUN_KEY: _NodeKey = (None, None, None, None)
+
+_NODE_MODELS: dict[str, type[BaseModel]] = {
+    "run_upsert": models.Run,
+    "story_upsert": models.StoryRun,
+    "subtask_upsert": models.SubtaskRun,
+    "phase_upsert": models.PhaseRun,
+    "attempt_upsert": models.Attempt,
+}
+"""The model each event's payload validates as, exactly as `replay` reads it."""
+
+_LEVELS: tuple[tuple[str, str], ...] = (
+    ("stories", "card_id"),
+    ("subtasks", "card_id"),
+    ("phases", "name"),
+    ("attempts", "n"),
+)
+"""Below the run, each level's child list and the field `_upsert` matches
+siblings by. The identity value of a node at level `i` fills slot `i` of its
+`_NodeKey`."""
+
+
+def _coords(key: _NodeKey) -> dict[str, str | int | None]:
+    story, card, phase, attempt = key
+    return {"story": story, "card": card, "phase": phase, "attempt": attempt}
+
+
+def _child_key(key: _NodeKey, depth: int, value: Any) -> _NodeKey:
+    """`key` with the child's identity `value` in the slot for level `depth`."""
+    slots = list(key)
+    slots[depth] = value
+    return (slots[0], slots[1], slots[2], slots[3])
+
+
+def _line_node(line: JournalLine, node: Any) -> _NodeKey:
+    """The node a line describes, located the way `replay` places it: the
+    envelope names its ancestors, the payload's identity field names it."""
+    if line.event == "run_upsert":
+        return _RUN_KEY
+    if line.event == "story_upsert":
+        return (node.card_id, None, None, None)
+    if line.event == "subtask_upsert":
+        return (line.story, node.card_id, None, None)
+    if line.event == "phase_upsert":
+        return (line.story, line.card, node.name, None)
+    return (line.story, line.card, line.phase, node.n)
+
+
+def _journaled_statuses(lines: list[JournalLine]) -> dict[_NodeKey, set[str]]:
+    """Every status each node was ever journaled at, at any seq (§3.2)."""
+    seen: dict[_NodeKey, set[str]] = {}
+    for line in sorted(lines, key=lambda item: item.seq):
+        node: Any = _NODE_MODELS[line.event].model_validate(line.payload)
+        seen.setdefault(_line_node(line, node), set()).add(node.status)
+    return seen
+
+
+def _walk(
+    key: _NodeKey,
+    depth: int,
+    journal_node: Any,
+    projection_node: Any,
+    seen: dict[_NodeKey, set[str]],
+    found: list[Mismatch],
+) -> None:
+    """Compare one node both sides have, then its children, in tree order."""
+    if journal_node.status != projection_node.status:
+        found.append(
+            Mismatch(
+                node=_coords(key),
+                field="status",
+                journal=journal_node.status,
+                projection=projection_node.status,
+                kind=(
+                    "stale"
+                    if projection_node.status in seen.get(key, set())
+                    else "foreign"
+                ),
+            )
+        )
+    if depth == len(_LEVELS):
+        return
+    children, identity = _LEVELS[depth]
+    theirs = {
+        getattr(child, identity): child for child in getattr(projection_node, children)
+    }
+    for child in getattr(journal_node, children):
+        value = getattr(child, identity)
+        other = theirs.get(value)
+        if other is not None:
+            _walk(_child_key(key, depth, value), depth + 1, child, other, seen, found)
+
+
+def diverging(lines: list[JournalLine], projection: models.Run) -> list[Mismatch]:
+    """Every place `projection` disagrees with the journal `lines` replay to.
+
+    Pure: the caller loads both sides; nothing here reads a file or the
+    database, and neither argument is mutated. `replay`'s own errors
+    (`JournalError`, pydantic `ValidationError`) propagate unchanged.
+
+    Only `status` is compared, at every level of the §9 tree, plus shape.
+    Nodes are matched as `replay` matches them: the run by itself, a story by
+    `card_id`, a subtask by its story and `card_id`, a phase by `name`, an
+    attempt by `n`. A differing status is `stale` if the journal ever recorded
+    the projection's value for that node, else `foreign` (§3.2; a node set
+    back to an earlier journaled status is therefore `stale`, by decision).
+    Mismatches come out in tree walk order. An empty list means they agree.
+    """
+    lines = list(lines)
+    journal = replay(lines)
+    seen = _journaled_statuses(lines)
+    found: list[Mismatch] = []
+    _walk(_RUN_KEY, 0, journal, projection, seen, found)
+    return found
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 

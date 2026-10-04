@@ -4642,3 +4642,191 @@ def test_a_taken_over_store_neither_marks_nor_fails_a_comment(stores):
     row = _comment_row(a.connection, "k1")
     assert row is not None
     assert (row["state"], row["comment_id"]) == ("posted", "c-202")
+
+
+# -- store.diverging (journal/DB divergence §3.2-§3.3) ------------------------
+#
+# Unit tier: real sqlite and journal files under tmp_path, no subprocess.
+
+
+def _node(
+    story: str | None = None,
+    card: str | None = None,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, str | int | None]:
+    return {"story": story, "card": card, "phase": phase, "attempt": attempt}
+
+
+def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
+    """Write the projection behind the store's back, as a hand-edit would."""
+    conn = sqlite3.connect(paths.project_db_path(repo))
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _diverging_now(repo: Path) -> list[store.Mismatch]:
+    """Load the journal and the projection the way a caller would, and compare."""
+    lines = store.Journal(RUN_ID).read()
+    conn = store.open_db(repo)
+    try:
+        projection = store.load_run(conn, RUN_ID)
+    finally:
+        conn.close()
+    assert projection is not None
+    return store.diverging(lines, projection)
+
+
+def test_diverging_finds_nothing_in_a_run_recorded_only_through_the_store(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        resumed = _subtask("ef248597", base="m1/task-fdebc746")
+        st.record_subtask("8831189b", resumed.model_copy(update={"status": "stopped"}))
+        st.record_subtask("8831189b", resumed)  # resumed: re-stamped `started`
+        st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_dispatch(card="ef248597", phase="implement"),
+                status="harness_error",
+                exit_code=1,
+            ),
+        )
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    finally:
+        st.close()
+
+    assert _diverging_now(repo) == []
+
+
+def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="escalated",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_stale(repo):
+    # Pinned decision (§3.2 known limit): indistinguishable from a crash.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b"),
+            field="status",
+            journal="done",
+            projection="started",
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_classifies_against_the_nodes_own_history_at_attempt_level(repo):
+    # `ok` was journaled for the explore attempt, never for the implement one.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE attempts SET status = 'ok' WHERE phase = 'implement' AND n = 1")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597", phase="implement", attempt=1),
+            field="status",
+            journal="started",
+            projection="ok",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_ignores_every_field_but_status(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET workflow = 'task', base_branch = 'develop'")
+    _raw_sql(repo, "UPDATE stories SET title = 'hand-edited', tip_branch = NULL, level = 3")
+    _raw_sql(repo, "UPDATE subtasks SET branch = 'elsewhere', worktree_path = NULL")
+    _raw_sql(repo, "UPDATE phases SET detail = 'hand-edited', ended_at = NULL")
+    _raw_sql(repo, "UPDATE attempts SET cost = 9.5, exit_code = 42, tokens_in = 7")
+
+    assert _diverging_now(repo) == []
+
+
+def test_diverging_lets_replays_errors_through_unchanged(repo):
+    projection = _run(repo)
+    with pytest.raises(store.JournalError, match="no run_upsert"):
+        store.diverging([], projection)
+
+    headless = store.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="story_upsert",
+        story="8831189b",
+        payload=_story().model_dump(mode="json", exclude={"subtasks"}),
+    )
+    with pytest.raises(store.JournalError, match="no run_upsert preceded it"):
+        store.diverging([headless], projection)
+
+    malformed = store.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="run_upsert",
+        payload={"id": RUN_ID},
+    )
+    with pytest.raises(ValidationError):
+        store.diverging([malformed], projection)
+
+
+def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    lines = store.Journal(RUN_ID).read()
+    conn = store.open_db(repo)
+    try:
+        projection = store.load_run(conn, RUN_ID)
+    finally:
+        conn.close()
+    assert projection is not None
+    lines_before = [line.model_copy(deep=True) for line in lines]
+    projection_before = projection.model_copy(deep=True)
+
+    assert store.diverging(lines, projection) != []
+    assert lines == lines_before
+    assert projection == projection_before
