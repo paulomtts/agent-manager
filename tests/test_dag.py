@@ -6,7 +6,6 @@ from agent_manager.census import StoryPlan, SubtaskPlan
 from agent_manager.dag import (
     DependencyCycleError,
     RootPlan,
-    StackRootError,
     assert_no_blocker_cycles,
     base_branch_name,
     board_levels,
@@ -14,7 +13,6 @@ from agent_manager.dag import (
     compute_levels,
     is_story_closed,
     is_subtask_done,
-    ref_matches_card,
     remaining_subtasks,
     short_id,
     slugify,
@@ -111,16 +109,6 @@ def test_task_branch_prefixes_the_stem():
     assert task_branch("m12", CARD) == "m12/task-40-1-feat-write-rows-a32af745"
 
 
-def test_ref_matches_card_keys_on_the_short_id_so_a_rename_still_matches():
-    branch = task_branch("m12", CARD)
-    renamed = {**CARD, "title": "completely different title"}
-    assert ref_matches_card(branch, renamed["id"]) is True
-
-
-def test_ref_matches_card_does_not_confuse_two_different_cards():
-    assert ref_matches_card("m12/task-quoting-03a6dc10", CARD["id"]) is False
-
-
 class _CardObject:
     """Stand-in for the future models.Card, which another subtask owns."""
 
@@ -145,15 +133,6 @@ def test_task_stem_propagates_the_short_id_error_for_a_missing_or_bad_id():
         task_stem({"title": "no id here"})
     with pytest.raises(ValueError, match="not a card id"):
         task_branch("m12", {"id": "nope", "title": "bad id"})
-
-
-def test_ref_matches_card_treats_a_none_ref_as_the_empty_string():
-    assert ref_matches_card(None, CARD["id"]) is False
-
-
-def test_ref_matches_card_still_validates_the_card_id_for_an_empty_ref():
-    with pytest.raises(ValueError, match="not a card id"):
-        ref_matches_card("", "nope")
 
 
 # ── doneness, levels and cycles ─────────────────────────────────────────────
@@ -535,10 +514,6 @@ def test_three_blockers_one_done_all_count_toward_the_merged_root():
     assert story_root(c, _by_id(a, b, d, c), PREFIX, BASE) == RootPlan(
         "merged", "m3/base-0000000c", ("a", "b", "d")
     )
-
-
-def test_a_stack_root_error_is_a_value_error():
-    assert issubclass(StackRootError, ValueError)
 
 
 def test_a_blocker_listed_twice_counts_once():

@@ -62,9 +62,8 @@ Named as a constant because phase results land in the same mapping under the
 phase's name: a phase called `worktree` -- the shipped `task` workflow has
 exactly one -- would otherwise overwrite the real worktree path every later
 step binds from, and a phase called `spec_path` would overwrite the document
-path `implement` and `review` both declare. `_bind_result` uses this to skip
-writing such a result back into the table rather than refuse the phase
-outright.
+path `implement` and `review` both declare. A result for such a name is kept
+out of the table rather than the phase being refused outright.
 """
 
 
@@ -311,9 +310,9 @@ def gate_values(
     name `plan_check.has_validated_plan(result)` and the shipped gates use.
 
     A phase named after a reserved key is the one exception, for the same
-    reason `_bind_result` is: a gate on the `worktree` phase that binds
-    `worktree` wants the path the phase was pointed at, not that phase's
-    return value. `result` still reaches it either way.
+    reason the context table excludes it there too: a gate on the `worktree`
+    phase that binds `worktree` wants the path the phase was pointed at, not
+    that phase's return value. `result` still reaches it either way.
     """
     values = {**context, "result": result}
     if phase_name not in RESERVED_CONTEXT_KEYS:
@@ -408,21 +407,6 @@ def _skip_target(phase: phase_model.Step, values: Mapping[str, Any]) -> str | No
         phase.when, values, phase=phase.name, function=_label(phase.when)
     )
     return phase.skip_to if phase.when(**kwargs) else None
-
-
-def _bind_result(context: dict[str, Any], phase_name: str, result: Any) -> None:
-    """Fold one phase's result into the binding table under its own name.
-
-    `TASK` names its worktree-setup phase `worktree`, exactly the key
-    `subtask_context` binds the real worktree path under. The result is still
-    recorded and returned in the summary either way; it is just never written
-    back here, so the reserved value survives for every later phase that binds
-    `worktree` (or any other reserved key) by name, instead of being silently
-    replaced by a same-named phase's own result. `runtime/context.py`'s
-    `binding_table` applies the same rule to the pygents pool.
-    """
-    if phase_name not in RESERVED_CONTEXT_KEYS:
-        context[phase_name] = result
 
 
 LOG_DIR_PARAMETER = "log_dir"

@@ -86,15 +86,6 @@ def task_branch(prefix: str, card: object) -> str:
     return f"{prefix}/task-{task_stem(card)}"
 
 
-def ref_matches_card(ref: object, card_id: object) -> bool:
-    """True when a branch or ref carries this card's short id anywhere in it.
-
-    Keys on the id and never on the slug, so editing a card's title cannot
-    orphan the branch that was named from the old title.
-    """
-    return short_id(card_id) in str("" if ref is None else ref)
-
-
 # ── doneness ────────────────────────────────────────────────────────────────
 # Port of orchestrator.js:84-101. brd `status` is the only source of truth for
 # doneness; there is no other field to consult.
@@ -283,19 +274,6 @@ def assert_no_blocker_cycles(stories: list[StoryPlan]) -> None:
 # Port of orchestrator.js:211-268. Where each subtask's branch stacks is
 # DERIVED from the census, never discovered. ``assert_no_blocker_cycles`` must
 # run before any of these functions.
-
-
-class StackRootError(ValueError):
-    """A story has no single parent branch for its stack to root on.
-
-    ``story_root`` no longer raises it: a multi-blocker story gets a
-    ``"merged"`` ``RootPlan``. ``orchestrate.plan_levels`` raises it for such
-    a story on a real run until merged bases are built.
-
-    Subclasses ``ValueError`` because ``ValueError`` is already in
-    ``cli.HANDLED``: a CLI caller turns it into an ``ok: false`` envelope
-    without this module importing ``cli``.
-    """
 
 
 @dataclass(frozen=True)

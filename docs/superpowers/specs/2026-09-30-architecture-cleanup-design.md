@@ -122,10 +122,23 @@ implementing (per this project's standing rule — line numbers drift).
 `orphan_attempts`, `continuable_checkpoint`, `select_resumable`, and the
 `UnknownRunError`/`NotResumableError`/`CheckpointMismatchError` types. `default_runner_factory`
 **stays in `cli.py`** — see the exemption below. `bases.py`, `integration.py`,
-and `orchestrate.py` import `runs`, never `cli`. `cli.py` imports `runs` like everyone else and
-keeps only Typer command bodies plus the CLI-specific envelope/exit-code glue (§4 there). The three
-deferred imports at `cli.py:895,1137,1460` are deleted — nothing downstream of `runs` imports `cli`,
-so the cycle they existed to break no longer exists. Business logic that survives in `cli.py`
+and `orchestrate.py` import `runs`, never `cli`, for every name this decision actually moves. `cli.py`
+imports `runs` like everyone else and keeps only Typer command bodies plus the CLI-specific
+envelope/exit-code glue (§4 there). The three deferred imports at `cli.py:895,1137,1460` are deleted
+— nothing downstream of `runs` imports `cli` for the names this decision moves.
+
+**Status (as actually landed): partial, by design, not a gap.** `orchestrate.py` still imports
+`cli` as a module today, for `default_runner_factory` and `drive_subtask_async` (the
+exemption below), and for four names this decision never scoped to move in the first place --
+`refuse_claimed`, `run_lease`, `SubtaskDrive`, `HANDLED` -- which stayed exactly where S1 left
+them. `cli.py` keeps one deferred `from agent_manager import orchestrate` for the same reason the
+exemption gives: binding either name at import time, across a real circular import, breaks. Both
+ends document this inline (`orchestrate.py`'s own module docstring, `cli.py`'s call site) and the
+module loads cleanly in either import order
+(`tests/test_cli.py::test_cli_and_orchestrate_import_cleanly_in_either_order`).
+This is a deliberate, stable exception, not unfinished work -- the "after" diagram below describes
+the target shape for the names S1 actually names, not a claim that every `cli` reference from
+`orchestrate.py` is gone. Business logic that survives in `cli.py`
 today (`dry_run_payload`'s level/base/root computation) moves to `runs.py` too, since it is a pure
 function of the census and belongs next to `dag`'s other pure derivations, not the Typer app.
 

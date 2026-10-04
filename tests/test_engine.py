@@ -115,15 +115,6 @@ def test_the_base_branch_alias_is_the_same_string_the_steps_bind_as_base():
     assert context["base_branch"] == context["base"] == "m1/story-base"
 
 
-def test_a_phase_named_base_branch_cannot_overwrite_the_alias():
-    """Same rule as the `worktree` phase: a result must never replace a key a
-    later gate binds from. `_bind_result` is called directly here because the
-    rule is a property of that function, not of any particular document."""
-    context = walk.subtask_context(_subtask(), REPO)
-    walk._bind_result(context, "base_branch", {"branch": "somewhere/else"})
-    assert context["base_branch"] == "m1/story-base"
-
-
 def test_bind_arguments_passes_only_the_parameters_the_callable_declares():
     def step(branch: str, repo_dir: Path) -> dict[str, Any]:
         return {"branch": branch, "repo_dir": repo_dir}
@@ -1349,12 +1340,14 @@ def test_a_phase_that_succeeds_journals_no_failure_detail(store, run_subtask):
 
 
 def test_a_gate_on_a_phase_named_like_a_context_key_still_sees_the_real_value(store, run_subtask):
-    """The mirror of the `_bind_result` guard, for the phase's own gate and
-    `when`. The shipped `worktree` phase carries neither today, but a gate
-    added to it that asks for `worktree` wants the path `worktree.ensure` was
-    pointed at, not that call's return value -- exactly what the reserved-key
-    guard protects for every *later* phase. The result stays reachable under
-    `result`, which is the name the shipped gates bind by anyway.
+    """A phase named after a reserved context key (e.g. `worktree`) still
+    gets the real engine-set value when its own gate or `when` binds by
+    that name, not that phase's own return value. The shipped `worktree`
+    phase carries neither a gate nor a `when` today, but a gate added to it
+    that asks for `worktree` wants the path `worktree.ensure` was pointed
+    at -- exactly what the reserved-key guard protects for every *later*
+    phase too. The result stays reachable under `result`, which is the
+    name the shipped gates bind by anyway.
     """
     seen: dict[str, Any] = {}
 

@@ -104,31 +104,10 @@ def test_the_attempt_directory_is_outside_the_worktree(data_home):
     assert attempt.parent.parent.parent.name == "runs"
 
 
-def test_feedback_is_appended_below_the_original_prompt_text():
-    rendered = _rendered()
-
-    second = dispatch.with_feedback(rendered, "summary: Field required")
-
-    assert second.text.startswith(rendered.text)
-    assert dispatch.FEEDBACK_HEADING in second.text
-    assert "summary: Field required" in second.text
-    assert second.phase == "explore"
-    assert rendered.text == "# phase: explore\n# role: explorer\n"
-
-
-def test_feedback_accumulates_across_attempts():
-    once = dispatch.with_feedback(_rendered(), "first complaint")
-
-    twice = dispatch.with_feedback(once, "second complaint")
-
-    assert "first complaint" in twice.text
-    assert twice.text.index("first complaint") < twice.text.index("second complaint")
-
-
 def test_a_written_prompt_lands_in_the_attempt_directory(data_home):
     attempt = paths.attempt_dir(RUN_ID, CARD, "explore", 1)
 
-    written = dispatch.with_feedback(_rendered(), "try again").write(attempt)
+    written = _rendered("try again").write(attempt)
 
     assert written == attempt / "prompt.txt"
     assert "try again" in written.read_text(encoding="utf-8")

@@ -11641,6 +11641,8 @@ def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == {"checked": False, "reason": "lease is live", "mismatches": []}
+
+
 def test_a_detached_card_run_prints_one_envelope_and_leaves_the_lease_to_the_child(
     tmp_path, monkeypatch, fake_board
 ):

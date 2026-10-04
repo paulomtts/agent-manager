@@ -71,8 +71,8 @@ def binding_table(pool: ContextPool, memory: ContextQueue, phase: str) -> dict[s
 
     A result pooled under a reserved key -- the shipped `task` workflow's
     `worktree` phase is one -- stays in the pool, so the summary still reports
-    it, but never replaces the engine's own value in the table: the rule
-    `walk._bind_result` applies, over the pool.
+    it, but never replaces the engine's own value in the table: the same rule
+    `runtime/walk.py`'s dict-based context applies, over the pool.
     """
     table: dict[str, Any] = dict(decode(pool.get(SUBTASK).content))
     for item in pool.items:

@@ -66,23 +66,6 @@ def next_attempt(run_id: str, card: str, phase: str) -> int:
     return paths.highest_attempt(run_id, card, phase) + 1
 
 
-def with_feedback(
-    rendered: prompt.RenderedPrompt, feedback: str
-) -> prompt.RenderedPrompt:
-    """The same prompt with one feedback block appended (§6 step 7).
-
-    Appended to whatever it is handed, so a third attempt carries both earlier
-    complaints: the spec's "the prior prompt plus the feedback block". Dispatch
-    is stateless (D1), so the whole input of every attempt has to be the file on
-    disk -- nothing is carried in the harness's head between attempts.
-    """
-    return replace(
-        rendered,
-        text=f"{rendered.text}\n{FEEDBACK_HEADING}\n{feedback}\n",
-        sections=rendered.sections + (("feedback", feedback),),
-    )
-
-
 def _append_feedback(brief: str, feedback: Sequence[str]) -> str:
     """One `FEEDBACK_HEADING` section per accumulated complaint, after the brief.
 

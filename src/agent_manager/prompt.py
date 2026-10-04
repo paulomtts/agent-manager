@@ -166,8 +166,8 @@ def _verbatim(key: str) -> Resolver:
 def _phase_field(phase_key: str, field: str) -> Resolver:
     """One field of an earlier phase's result, inlined as its own string.
 
-    `walk._bind_result` stores a phase's result in the context under the
-    phase's own name, so `docs_commit`'s `{"plan_hash": digest}` lands at
+    The engine stores a phase's result in the context under the phase's own
+    name, so `docs_commit`'s `{"plan_hash": digest}` lands at
     `context["docs_commit"]["plan_hash"]`. Input names are the document's
     vocabulary and context keys are the callees' names, so the declared input
     stays `plan_hash` while the lookup is nested -- the same split

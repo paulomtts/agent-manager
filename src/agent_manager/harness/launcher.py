@@ -193,9 +193,13 @@ place in the code where D7's deferred work is visible.
 def get_launcher(kind: Launcher) -> LauncherFn:
     """Resolve a launcher mode to the function the engine will inject.
 
-    Called once, at run start, with `RunConfig.launcher`. Failing here means
-    failing before a single worktree is created, which is the whole reason the
-    unimplemented modes are named rather than omitted.
+    Not wired to any caller yet: production always injects `run_direct`
+    directly (`cli.py` imports it by name), since v1 implements only `direct`
+    and `RunConfig.launcher` has no reader. This is the seam a future
+    multi-mode wiring would call, at run start, with `RunConfig.launcher` --
+    failing here would mean failing before a single worktree is created,
+    which is the whole reason the unimplemented modes are named rather than
+    omitted.
     """
     if kind not in LAUNCHERS:
         raise UnsupportedLauncherError(

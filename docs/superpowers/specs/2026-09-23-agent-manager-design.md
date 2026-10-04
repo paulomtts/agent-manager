@@ -73,6 +73,20 @@ because the reasons constrain later work.
 
 ## 4. Architecture
 
+> **Superseded by the pygents engine.** This section's diagram and package
+> layout describe the original yaml-engine architecture (a standalone
+> `engine.py`, `workflow/loader.py` and `registry.py`, `codex`/`pi` harness
+> adapters, a `workflow/builtin/` of YAML documents). None of those exist.
+> The pygents engine (`runtime/`) replaced the state machine, `workflow/`
+> now holds declared Python data (`phases.py`) rather than YAML, and v1
+> implements only the `claude` adapter and the `direct` launcher. For the
+> actual module layout, read `src/agent_manager/` itself rather than this
+> tree -- the real set (`orchestrate.py`, `runs.py`, `control.py`,
+> `dispatch.py`, `bases.py`, `integration.py`, `comments.py`, `detach.py`,
+> `runtime/*`, among others) has grown well past what this diagram shows,
+> and keeping a second, hand-maintained copy of it here would only rot
+> again.
+
 ```
                     ┌──────────────────────────────────────────┐
    you ──► CLI ────►│  engine (state machine)                  │
