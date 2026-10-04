@@ -282,7 +282,7 @@ def test_the_returned_hash_is_the_hash_of_the_plan_file_on_disk(repo: Path) -> N
     result = _run(repo)
 
     expected = hashlib.sha256((repo / PLAN_RELATIVE).read_bytes()).hexdigest()[:8]
-    assert result == {"plan_hash": expected, "backfilled": []}
+    assert result == {"plan_hash": expected, "backfilled": [], "documents_committed": True}
     assert reducers.is_plan_hash(result["plan_hash"])
 
 
@@ -522,7 +522,11 @@ def test_unstamped_drafts_gain_the_current_hash_and_the_stamped_one_is_untouched
 
     result = _run(repo)
 
-    assert result == {"plan_hash": digest, "backfilled": [original["A"], original["C"]]}
+    assert result == {
+        "plan_hash": digest,
+        "backfilled": [original["A"], original["C"]],
+        "documents_committed": True,
+    }
     a_new, b_new, c_new, docs = _range(repo)
     rewritten = {"A": a_new, "B": b_new, "C": c_new}
     for key in ("A", "C"):
@@ -596,7 +600,11 @@ def test_drafts_that_already_hold_the_documents_are_stamped_instead_of_raising(
 
     result = _run(repo)
 
-    assert result == {"plan_hash": _digest(repo), "backfilled": [draft]}
+    assert result == {
+        "plan_hash": _digest(repo),
+        "backfilled": [draft],
+        "documents_committed": True,
+    }
     assert _commit_count(repo) == before
     assert _message(repo).splitlines()[-1] == f"Plan-Hash: {_digest(repo)}"
 
@@ -634,7 +642,11 @@ def test_a_second_call_after_a_backfill_is_a_no_op(repo: Path) -> None:
     second = _run(repo)
 
     assert first["backfilled"] != []  # non-vacuity: the first call rewrote
-    assert second == {"plan_hash": first["plan_hash"], "backfilled": []}
+    assert second == {
+        "plan_hash": first["plan_hash"],
+        "backfilled": [],
+        "documents_committed": True,
+    }
     assert _rev(repo, "HEAD") == head
 
 

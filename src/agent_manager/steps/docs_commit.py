@@ -396,7 +396,11 @@ def commit_documents(
         # The resume path (design §9): "these two paths hold no change", so a
         # plan edited between runs still earns its own commit and hash.
         if _branch_carries(git_runner, worktree_path, digest):
-            return {"plan_hash": digest, "backfilled": backfilled}
+            return {
+                "plan_hash": digest,
+                "backfilled": backfilled,
+                "documents_committed": True,
+            }
         raise UntaggedDocumentsError(
             plan_hash=digest, spec_path=spec_path, plan_path=plan_path
         )
@@ -417,4 +421,4 @@ def commit_documents(
             plan_path,
         ]
     )
-    return {"plan_hash": digest, "backfilled": backfilled}
+    return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": True}
