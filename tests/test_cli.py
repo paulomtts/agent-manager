@@ -3636,6 +3636,43 @@ def test_an_empty_board_dry_runs_to_no_levels_and_exits_zero(tmp_path, monkeypat
     }
 
 
+def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_path, monkeypatch):
+    """Card a7fcc076: the `--board --dry-run` shape, pinned for the README.
+
+    `data` is exactly `{board, max_concurrent, levels}`; each level is
+    `{level, milestones}`; each milestone is exactly `{milestone_id, title,
+    branch_prefix, plan}`, and `plan` is that milestone's `dry_run_payload`
+    (`{max_concurrent, levels, already_done, integrate}`). `ok` is only on
+    the envelope, never inside `data`, and nothing carries a `run_id`: a
+    preview mints no run and opens no Store."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(first.id,))
+    _serve_roots(monkeypatch, [first, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"board", "max_concurrent", "levels"}
+    assert "ok" not in data
+    assert "run_id" not in data
+    assert data["board"] is True
+    assert [set(level) for level in data["levels"]] == [{"level", "milestones"}] * 2
+    entries = [entry for level in data["levels"] for entry in level["milestones"]]
+    assert [entry["milestone_id"] for entry in entries] == [first.id, second.id]
+    for entry in entries:
+        assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+        assert set(entry["plan"]) == {"max_concurrent", "levels", "already_done", "integrate"}
+        assert "ok" not in entry["plan"]
+        assert "run_id" not in entry["plan"]
+    assert list(paths.data_dir().iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "roots, error_type",
     [
