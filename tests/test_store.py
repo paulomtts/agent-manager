@@ -657,7 +657,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
             "8831189b",
             "ef248597",
             "implement",
-            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, cost=0.42),
+            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, duration=4.5),
         )
 
         assert attempt_line.story == "8831189b"
@@ -673,7 +673,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
         attempt_row = st.connection.execute("SELECT * FROM attempts").fetchone()
         assert attempt_row["status"] == "ok"
         assert attempt_row["exit_code"] == 0
-        assert attempt_row["cost"] == pytest.approx(0.42)
+        assert attempt_row["duration"] == pytest.approx(4.5)
         assert json.loads(attempt_row["dispatch"])["role"] == "coder"
     finally:
         st.close()
@@ -810,9 +810,6 @@ def _record_full_run(st: store.Store, repo: Path) -> None:
             status="ok",
             exit_code=0,
             duration=31.25,
-            tokens_in=8000,
-            tokens_out=1500,
-            cost=0.31,
             prompt_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/prompt.txt"),
             result_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/result.json"),
             stdout_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log"),
@@ -858,14 +855,14 @@ def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
 
     finished = subtask.phases[0].attempts[0]
     assert finished.status == "ok"
-    assert finished.cost == pytest.approx(0.31)
+    assert finished.duration == pytest.approx(31.25)
     assert finished.stdout_path == Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log")
     assert finished.dispatch.role == "coder"
 
     in_flight = subtask.phases[1].attempts[0]
     assert in_flight.status == "started"
     assert in_flight.exit_code is None
-    assert in_flight.cost is None
+    assert in_flight.duration is None
 
 
 def test_load_run_returns_none_for_an_unknown_run(repo):
@@ -951,9 +948,6 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     assert attempt.status == "started"
     assert attempt.exit_code is None
     assert attempt.duration is None
-    assert attempt.tokens_in is None
-    assert attempt.tokens_out is None
-    assert attempt.cost is None
     assert row["status"] == "started"
     assert row["exit_code"] is None
 
@@ -1016,6 +1010,137 @@ def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
     finally:
         st.close()
     assert "tokens" in str(excinfo.value)
+
+
+# -- retired attempt usage keys (remove-cost-tracking §4.3) -------------------
+#
+# Every journal written before 2026-10-03 carries `tokens_in`, `tokens_out`
+# and `cost` on each attempt line. `Attempt` no longer declares them, so
+# `replay` sheds exactly those three names from an attempt payload and stays
+# strict about everything else. Unit tier: real temp DB and journal.
+
+_RETIRED_NULL = {"tokens_in": None, "tokens_out": None, "cost": None}
+_RETIRED_SET = {"tokens_in": 8000, "tokens_out": 1500, "cost": 0.31}
+
+
+def _append_old_attempt(journal: store.Journal, extra: dict) -> None:
+    """Re-record implement attempt 1 as `ok`, the way an `am` from before
+    2026-10-03 wrote it: today's payload plus `extra`."""
+    payload = models.Attempt(
+        n=1,
+        dispatch=_dispatch(card="ef248597", phase="implement"),
+        status="ok",
+        exit_code=0,
+        duration=12.5,
+    ).model_dump(mode="json")
+    _append_raw(
+        journal,
+        {
+            "seq": journal.last_seq() + 1,
+            "ts": "2026-09-23T10:20:00+00:00",
+            "run_id": RUN_ID,
+            "event": "attempt_upsert",
+            "story": "8831189b",
+            "card": "ef248597",
+            "phase": "implement",
+            "attempt": 1,
+            "payload": {**payload, **extra},
+        },
+    )
+
+
+@pytest.mark.parametrize("retired", [_RETIRED_NULL, _RETIRED_SET], ids=["null", "non_null"])
+def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, retired):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, retired)
+        replayed = st.replay_journal(RUN_ID)
+        # The projection already holds this run, so the rebuild runs its
+        # `diverging` pre-check over the same old lines first.
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+        assert loaded is not None
+        mismatches = store.diverging(st.journal.read(), loaded)
+    finally:
+        st.close()
+
+    assert replayed == rebuilt == loaded
+    attempt = rebuilt.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (attempt.n, attempt.status, attempt.exit_code, attempt.duration) == (
+        1,
+        "ok",
+        0,
+        12.5,
+    )
+    for key in retired:
+        assert not hasattr(attempt, key)
+    assert set(retired).isdisjoint(attempt.model_dump())
+    assert mismatches == []
+
+
+@pytest.mark.parametrize("read", ["replay_journal", "rebuild_from_journal"])
+def test_an_attempt_line_with_any_other_unknown_key_still_raises_naming_only_it(
+    repo, read
+):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_old_attempt(st.journal, {**_RETIRED_NULL, "operator": "x"})
+        with pytest.raises(ValidationError) as excinfo:
+            getattr(st, read)(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("operator",)]
+    assert "operator" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "event", ["run_upsert", "story_upsert", "subtask_upsert", "phase_upsert"]
+)
+def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
+    # No other node ever carried these keys, so on any other line they are
+    # still an unknown key and still fail loudly.
+    coordinates, payload = {
+        "run_upsert": ({}, _run(repo).model_dump(mode="json", exclude={"stories"})),
+        "story_upsert": (
+            {"story": "8831189b"},
+            _story().model_dump(mode="json", exclude={"subtasks"}),
+        ),
+        "subtask_upsert": (
+            {"story": "8831189b"},
+            _subtask("ef248597", base="m1/task-fdebc746").model_dump(
+                mode="json", exclude={"phases"}
+            ),
+        ),
+        "phase_upsert": (
+            {"story": "8831189b", "card": "ef248597"},
+            models.PhaseRun(name="implement", kind="agent", status="started").model_dump(
+                mode="json", exclude={"attempts"}
+            ),
+        ),
+    }[event]
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        _append_raw(
+            st.journal,
+            {
+                "seq": st.journal.last_seq() + 1,
+                "ts": "2026-09-23T10:20:00+00:00",
+                "run_id": RUN_ID,
+                "event": event,
+                **coordinates,
+                "payload": {**payload, "cost": None},
+            },
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            st.replay_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("cost",)]
 
 
 def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
@@ -1539,8 +1664,11 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
         st.close()
 
     assert rebuilt == loaded
+    # The first `load_run` is the foreign-value check (divergence §3.6): it
+    # reads the projection under the same lock, before anything is deleted.
     assert seen == [
         ("read", True),
+        ("load_run", True),
         ("_delete_run", True),
         ("_write_attempt_row", True),
         ("_write_attempt_row", True),
@@ -2078,6 +2206,121 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
     assert _phase_details(after) == _EXPECTED_DETAILS
 
 
+# -- attempts without usage columns ------------------------------------------
+#
+# Remove-cost-tracking §5.3 items 4-5: a fresh `attempts` table has no
+# tokens/cost columns, and a table created before that keeps them, unwritten
+# and unread, because migration is additive-only. Unit tier: real temp DB and
+# journal, no subprocess.
+
+ATTEMPT_COLUMNS = [
+    "run_id",
+    "story_id",
+    "card_id",
+    "phase",
+    "n",
+    "status",
+    "exit_code",
+    "duration",
+    "prompt_path",
+    "result_path",
+    "stdout_path",
+    "dispatch",
+]
+
+LEGACY_ATTEMPT_COLUMNS = [
+    *ATTEMPT_COLUMNS[:8],
+    "tokens_in",
+    "tokens_out",
+    "cost",
+    *ATTEMPT_COLUMNS[8:],
+]
+"""The `attempts` columns as they shipped before 2026-10-03, in table order."""
+
+
+def _attempt_columns(conn: sqlite3.Connection) -> list[str]:
+    return [row["name"] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()]
+
+
+def test_a_fresh_attempts_table_has_no_usage_columns(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = _attempt_columns(conn)
+    finally:
+        conn.close()
+
+    assert columns == ATTEMPT_COLUMNS
+    assert len(columns) == 12
+
+
+_LEGACY_ATTEMPTS = """
+DROP TABLE attempts;
+CREATE TABLE attempts (
+    run_id       TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    card_id      TEXT NOT NULL,
+    phase        TEXT NOT NULL,
+    n            INTEGER NOT NULL,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    duration     REAL,
+    tokens_in    INTEGER,
+    tokens_out   INTEGER,
+    cost         REAL,
+    prompt_path  TEXT,
+    result_path  TEXT,
+    stdout_path  TEXT,
+    dispatch     TEXT NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id, phase, n)
+);
+"""
+"""The `attempts` table exactly as it shipped before 2026-10-03, empty."""
+
+
+def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
+    legacy = store.open_db(repo)
+    legacy.executescript(_LEGACY_ATTEMPTS)
+    legacy.commit()
+    legacy.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        columns = _attempt_columns(st.connection)
+        _record_full_run(st, repo)
+        # Re-recording implement attempt 1 takes the ON CONFLICT path.
+        st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_dispatch(card="ef248597", phase="implement"),
+                status="ok",
+                exit_code=0,
+                duration=7.5,
+            ),
+        )
+        usage = [
+            tuple(row)
+            for row in st.connection.execute(
+                "SELECT tokens_in, tokens_out, cost FROM attempts ORDER BY phase, n"
+            ).fetchall()
+        ]
+        loaded = st.load_run(RUN_ID)
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        after = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert columns == LEGACY_ATTEMPT_COLUMNS
+    assert usage == [(None, None, None), (None, None, None)]
+    assert loaded is not None
+    implement = loaded.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (implement.status, implement.exit_code, implement.duration) == ("ok", 0, 7.5)
+    assert rebuilt == loaded
+    assert after == loaded
+
+
 # -- run milestone id ----------------------------------------------------------
 #
 # `Run.milestone_id` is the full id of the milestone card a run drives
@@ -2574,6 +2817,38 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
         assert st.latest_open_checkpoint("card-a", "task") == opened
     finally:
         st.close()
+
+
+def test_checkpoint_cards_lists_this_runs_distinct_pairs_in_order(repo):
+    """af52db54: `am reset` reports every `(card_id, workflow)` the run
+    checkpointed, whatever the reason, and nothing another run saved."""
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _save_checkpoint(st, "card-b", reason="turn", saved_at=_at(0))
+        _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(1))
+        _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(2))
+        _save_checkpoint(st, "card-a", reason="done", saved_at=_at(3))
+        _save_checkpoint(st, "card-a", reason="turn", workflow="integrate", saved_at=_at(4))
+    finally:
+        st.close()
+
+    other = store.Store.open(repo, OTHER_RUN_ID)
+    try:
+        _save_checkpoint(other, "card-c", reason="turn", saved_at=_at(5))
+        _save_checkpoint(other, "card-a", reason="parked", workflow="bases", saved_at=_at(6))
+        before = other.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+        # Asked from a store bound to another run: the argument decides.
+        mine = other.checkpoint_cards(RUN_ID)
+        theirs = other.checkpoint_cards(OTHER_RUN_ID)
+        unknown = other.checkpoint_cards("run-never-saved")
+        after = other.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+    finally:
+        other.close()
+
+    assert mine == [("card-a", "integrate"), ("card-a", "task"), ("card-b", "task")]
+    assert theirs == [("card-a", "bases"), ("card-c", "task")]
+    assert unknown == []
+    assert after == before == 7
 
 
 # -- run controls and leases -----------------------------------------------------
@@ -4610,3 +4885,558 @@ def test_a_taken_over_store_neither_marks_nor_fails_a_comment(stores):
     row = _comment_row(a.connection, "k1")
     assert row is not None
     assert (row["state"], row["comment_id"]) == ("posted", "c-202")
+
+
+# -- store.diverging (journal/DB divergence §3.2-§3.3) ------------------------
+#
+# Unit tier: real sqlite and journal files under tmp_path, no subprocess.
+
+
+def _node(
+    story: str | None = None,
+    card: str | None = None,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, str | int | None]:
+    return {"story": story, "card": card, "phase": phase, "attempt": attempt}
+
+
+def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
+    """Write the projection behind the store's back, as a hand-edit would."""
+    conn = sqlite3.connect(paths.project_db_path(repo))
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _diverging_now(repo: Path) -> list[store.Mismatch]:
+    """Load the journal and the projection the way a caller would, and compare."""
+    lines = store.Journal(RUN_ID).read()
+    conn = store.open_db(repo)
+    try:
+        projection = store.load_run(conn, RUN_ID)
+    finally:
+        conn.close()
+    assert projection is not None
+    return store.diverging(lines, projection)
+
+
+def test_diverging_finds_nothing_in_a_run_recorded_only_through_the_store(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        resumed = _subtask("ef248597", base="m1/task-fdebc746")
+        st.record_subtask("8831189b", resumed.model_copy(update={"status": "stopped"}))
+        st.record_subtask("8831189b", resumed)  # resumed: re-stamped `started`
+        st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_dispatch(card="ef248597", phase="implement"),
+                status="harness_error",
+                exit_code=1,
+            ),
+        )
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    finally:
+        st.close()
+
+    assert _diverging_now(repo) == []
+
+
+def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="escalated",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_stale(repo):
+    # Pinned decision (§3.2 known limit): indistinguishable from a crash.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b"),
+            field="status",
+            journal="done",
+            projection="started",
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_classifies_against_the_nodes_own_history_at_attempt_level(repo):
+    # `ok` was journaled for the explore attempt, never for the implement one.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE attempts SET status = 'ok' WHERE phase = 'implement' AND n = 1")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597", phase="implement", attempt=1),
+            field="status",
+            journal="started",
+            projection="ok",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_ignores_every_field_but_status(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET workflow = 'task', base_branch = 'develop'")
+    _raw_sql(repo, "UPDATE stories SET title = 'hand-edited', tip_branch = NULL, level = 3")
+    _raw_sql(repo, "UPDATE subtasks SET branch = 'elsewhere', worktree_path = NULL")
+    _raw_sql(repo, "UPDATE phases SET detail = 'hand-edited', ended_at = NULL")
+    _raw_sql(
+        repo, "UPDATE attempts SET duration = 9.5, exit_code = 42, stdout_path = '/elsewhere'"
+    )
+
+    assert _diverging_now(repo) == []
+
+
+def test_diverging_lets_replays_errors_through_unchanged(repo):
+    projection = _run(repo)
+    with pytest.raises(store.JournalError, match="no run_upsert"):
+        store.diverging([], projection)
+
+    headless = store.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="story_upsert",
+        story="8831189b",
+        payload=_story().model_dump(mode="json", exclude={"subtasks"}),
+    )
+    with pytest.raises(store.JournalError, match="no run_upsert preceded it"):
+        store.diverging([headless], projection)
+
+    malformed = store.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="run_upsert",
+        payload={"id": RUN_ID},
+    )
+    with pytest.raises(ValidationError):
+        store.diverging([malformed], projection)
+
+
+def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    lines = store.Journal(RUN_ID).read()
+    conn = store.open_db(repo)
+    try:
+        projection = store.load_run(conn, RUN_ID)
+    finally:
+        conn.close()
+    assert projection is not None
+    lines_before = [line.model_copy(deep=True) for line in lines]
+    projection_before = projection.model_copy(deep=True)
+
+    assert store.diverging(lines, projection) != []
+    assert lines == lines_before
+    assert projection == projection_before
+
+
+def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
+    # The setup of test_rebuild_picks_up_a_journal_line_whose_row_never_landed:
+    # the journal line is appended, the row write fails on the closed connection.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+    with pytest.raises(sqlite3.Error):
+        st.record_story(_story())
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b"),
+            field=None,
+            journal="started",
+            projection=None,
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+    finally:
+        st.close()
+    _raw_sql(
+        repo,
+        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
+        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+    )
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="deadbeef"),
+            field=None,
+            journal=None,
+            projection="done",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_reports_a_missing_subtree_once_at_its_root(repo):
+    # The subtask row goes; its phase and attempt rows are left orphaned, so
+    # load_run never reaches them. One mismatch, not one per descendant.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "DELETE FROM subtasks WHERE card_id = 'ef248597'")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597"),
+            field=None,
+            journal="started",
+            projection=None,
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_reports_mismatches_in_tree_walk_order(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_subtask("8831189b", _subtask())
+        st.record_story(
+            _story().model_copy(update={"card_id": "c0ffee12", "title": "Second story"})
+        )
+    finally:
+        st.close()
+    # Written deepest-last-first and out of tree order on purpose.
+    _raw_sql(repo, "UPDATE stories SET status = 'cancelled' WHERE card_id = 'c0ffee12'")
+    _raw_sql(repo, "UPDATE subtasks SET status = 'failed' WHERE card_id = 'ef248597'")
+    _raw_sql(repo, "UPDATE runs SET status = 'done' WHERE id = ?", (RUN_ID,))
+    # Position -1 sorts it first in the projection; only-in-projection
+    # siblings still come after every journal sibling.
+    _raw_sql(
+        repo,
+        "INSERT INTO stories (run_id, card_id, title, level, status, tip_branch,"
+        " position) VALUES (?, 'feedface', 'Hand-made', 0, 'pending', NULL, -1)",
+        (RUN_ID,),
+    )
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(), field="status", journal="started", projection="done",
+            kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597"), field="status",
+            journal="started", projection="failed", kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="c0ffee12"), field="status", journal="started",
+            projection="cancelled", kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="feedface"), field=None, journal=None,
+            projection="pending", kind="foreign",
+        ),
+    ]
+
+
+# -- rebuild_from_journal's foreign-value rail (journal/DB divergence §3.6) ---
+#
+# Unit tier: real sqlite and journal files under tmp_path, no subprocess.
+
+
+def _all_rows(repo: Path) -> dict[str, list[tuple]]:
+    """Every row of every table, in rowid order, read behind the store's back."""
+    conn = sqlite3.connect(paths.project_db_path(repo))
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def _projected_run_status(repo: Path) -> str | None:
+    conn = store.open_db(repo)
+    try:
+        return store.run_status(conn, RUN_ID)
+    finally:
+        conn.close()
+
+
+def _hand_cancel_an_escalated_run(repo: Path) -> None:
+    """The 2026-10-03 incident: the journal says `escalated`, a hand-edit `cancelled`.
+
+    A full tree and a checkpoint ride along so the no-row-touched snapshot
+    covers tree rows and row-only rows alike.
+    """
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+        _save_checkpoint(st, "ef248597")
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+
+def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
+    _hand_cancel_an_escalated_run(repo)
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+    error = caught.value
+    assert isinstance(error, RuntimeError)
+    assert not isinstance(error, store.JournalError)
+    assert error.run_id == RUN_ID
+    assert error.mismatches == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="escalated",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+    message = str(error)
+    assert RUN_ID in message
+    assert "run status: journal 'escalated', projection 'cancelled'" in message
+    assert "force=True" in message
+    assert _projected_run_status(repo) == "cancelled"
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_with_force_overwrites_a_hand_edited_run_status(repo):
+    _hand_cancel_an_escalated_run(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+        loaded = st.load_run(RUN_ID)
+        kept = st.latest_checkpoint("ef248597")
+    finally:
+        st.close()
+
+    assert rebuilt.status == "escalated"
+    assert loaded == rebuilt
+    assert _projected_run_status(repo) == "escalated"
+    assert kept is not None  # row-only: the forced rebuild still leaves it alone
+
+
+def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+    finally:
+        st.close()
+    _raw_sql(
+        repo,
+        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
+        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+    )
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert caught.value.mismatches == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="deadbeef"),
+            field=None,
+            journal=None,
+            projection="done",
+            kind="foreign",
+        )
+    ]
+    assert (
+        "story=8831189b card=deadbeef shape: journal None, projection 'done'"
+        in str(caught.value)
+    )
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(repo):
+    # `stale` (§3.2): the journal recorded `started` for this story, so the
+    # projection is merely behind and the rebuild goes ahead without `force`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert rebuilt.stories[0].status == "done"
+    assert loaded == rebuilt
+
+
+def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert caught.value.mismatches == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="started",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+    assert "story=8831189b" not in str(caught.value)
+    assert _all_rows(repo) == before
+
+
+def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_its_lease(
+    repo, stores
+):
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    st.record_run(_run(repo))
+    st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    with pytest.raises(store.ProjectionDivergedError):
+        st.rebuild_from_journal(RUN_ID)
+
+    assert st.connection.in_transaction is False
+    assert _held_elsewhere(st._lock) is False
+    kept = store.read_lease(st.connection, RUN_ID)
+    assert kept is not None and kept.token == "t1"
+    assert store.run_status(st.connection, RUN_ID) == "cancelled"
+
+
+def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
+    _hand_cancel_an_escalated_run(repo)
+
+    # Open first: `Store.open` scans the journal (`Journal.__init__` ->
+    # `last_seq`), so the line is corrupted afterwards to reach the rebuild.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with store.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
+            handle.write("{not json at all\n")
+        before = _all_rows(repo)
+
+        with pytest.raises(store.CorruptJournalError):
+            st.rebuild_from_journal(RUN_ID)
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
+    # A value the models cannot validate is certainly not one `am` wrote: the
+    # projection read raises before anything is deleted. `force` skips the read.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'bogus' WHERE id = ?", (RUN_ID,))
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(ValidationError):
+            st.rebuild_from_journal(RUN_ID)
+        assert _all_rows(repo) == before
+        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+    finally:
+        st.close()
+
+    assert rebuilt.status == "started"
+    assert _projected_run_status(repo) == "started"

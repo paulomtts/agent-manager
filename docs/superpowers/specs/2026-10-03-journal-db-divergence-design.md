@@ -81,10 +81,12 @@ Read precisely, `rebuild_from_journal` (`store.py:1837-1878`) replays the
 journal into a `models.Run`, calls `_delete_run` (`store.py:1897-1903`),
 which deletes this run's rows from exactly five tables — `attempts`,
 `phases`, `subtasks`, `stories`, `runs` — and rewrites those five from the
-replayed tree. The other six tables are not touched, and `Store`'s own
-docstring says so (`store.py:1104-1113`): `checkpoints`, `checkpoint_floors`,
-`run_controls`, `run_leases`, `run_claims` and `board_comments` are row-only,
-"outside the journal," and "`rebuild_from_journal` leaves those rows alone."
+replayed tree. The other six tables are not touched, but `Store`'s own
+docstring (`store.py:1104-1113`) only names four of them as the exception --
+`checkpoints`, `run_controls`, `run_leases` and `board_comments` -- and
+misses `checkpoint_floors` and `run_claims` entirely. All six are row-only,
+"outside the journal," and `rebuild_from_journal` leaves every one of their
+rows alone; the docstring just doesn't say so yet.
 
 So the D5 sentence is true of the §9 *tree* (run, stories, subtasks, phases,
 attempts) and false of everything that drives recovery: a projection that is

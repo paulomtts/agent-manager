@@ -7,9 +7,8 @@ is that seam. The seam, not the confinement, is the deliverable here.
 
 Everything this module does is deliberately blind to what it is running. It
 never reads the result file (§6 step 5 is the engine's), never parses the log
-it wrote (that is `parse_usage`'s job, on the adapter), and never builds a
-shell string (§5 line 252). That blindness is what lets one launcher serve
-every adapter.
+it wrote (nothing does: D4), and never builds a shell string (§5 line 252).
+That blindness is what lets one launcher serve every adapter.
 
 The line between raising and returning is drawn on retryability. A non-zero
 exit and a timeout are `Outcome`s, because §6 wants them journalled as attempts

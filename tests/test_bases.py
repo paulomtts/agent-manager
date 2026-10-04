@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import inspect
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -285,6 +286,32 @@ async def test_a_removed_base_worktree_is_re_added_and_nothing_is_re_merged(
 
 
 @pytest.mark.git
+async def test_an_rm_rf_base_worktree_is_re_added_and_nothing_is_re_merged(
+    two_story_repo: Path, MASTER_BEFORE: str
+):
+    # The merged-base worktree deleted outside am's bookkeeping: git still has
+    # it registered. `build` reaches the same `worktree.ensure` seam, which
+    # re-adds it on the intact base branch; bases.py itself is unchanged.
+    repo = two_story_repo
+    await _build(repo, ["m7/a", "m7/b"])
+    built = rev(repo, BASE)
+    shutil.rmtree(base_worktree(repo))
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
+
+    result = await _build(repo, ["m7/a", "m7/b"])
+
+    assert result == bases.BaseResult(
+        branch=BASE, merged=[], already_merged=["m7/b"], resolved=[]
+    )
+    wt = base_worktree(repo)
+    assert wt.is_dir()
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == BASE
+    assert rev(repo, BASE) == built
+    assert rev(repo, "master") == MASTER_BEFORE
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+
+
+@pytest.mark.git
 async def test_a_tip_given_as_a_sha_is_merged_and_reported_as_given(
     two_story_repo: Path, MASTER_BEFORE: str
 ):
@@ -347,9 +374,6 @@ class _FakeAdapter:
 
     def build_command(self, d: models.Dispatch) -> list[str]:
         return ["fake-resolver", "--prompt", str(d.prompt_path)]
-
-    def parse_usage(self, stdout: str) -> None:
-        return None
 
 
 _CONFLICT_HEADING = "\n## conflict_files\n"

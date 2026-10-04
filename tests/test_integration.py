@@ -256,9 +256,6 @@ class _FakeAdapter:
     def build_command(self, d: models.Dispatch) -> list[str]:
         return ["fake-resolver", "--prompt", str(d.prompt_path)]
 
-    def parse_usage(self, stdout: str) -> None:
-        return None
-
 
 _CONFLICT_HEADING = "\n## conflict_files\n"
 _RESULT_LEAD = "write your result as valid JSON to exactly this path:\n\n"

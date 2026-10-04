@@ -12,7 +12,7 @@ Three rules shape everything here, and none of them is negotiable:
   `LauncherFn`, which is what keeps `bwrap` a later swap and every test above
   the launcher process-free. `subprocess` is deliberately not imported.
 - D4 / §6 step 5: the contract is `result.json`. `stdout.log` is captured as a
-  log and is only ever handed to `parse_usage`, never parsed for a result.
+  log and never read by the engine.
 - §6 step 3: the attempt directory comes from `paths.attempt_dir`, which is
   rooted under `paths.data_dir()` and therefore outside every worktree -- a
   result file written inside the worktree would fail the verify step's
@@ -33,7 +33,7 @@ from agent_manager import models, paths, prompt, results
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import walk
-from agent_manager.harness.base import HarnessAdapter, Outcome, Usage
+from agent_manager.harness.base import HarnessAdapter, Outcome
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
@@ -567,7 +567,6 @@ class AgentRunner:
                     fatal=True,
                     result=verdict.result,
                 )
-        usage = _usage(target.adapter, outcome)
         self._record_attempt(
             phase,
             models.Attempt(
@@ -576,9 +575,6 @@ class AgentRunner:
                 status=verdict.status,
                 exit_code=outcome.exit_code,
                 duration=outcome.duration,
-                tokens_in=None if usage is None else usage.tokens_in,
-                tokens_out=None if usage is None else usage.tokens_out,
-                cost=None if usage is None else usage.cost,
                 prompt_path=prompt_path,
                 result_path=dispatch_record.result_path,
                 stdout_path=stdout_path,
@@ -715,17 +711,3 @@ class AgentRunner:
             f"reused ({why}); dispatching again"
         )
         return None
-
-
-def _usage(adapter: HarnessAdapter, outcome: Outcome) -> Usage | None:
-    """What the attempt cost, as far as `stdout.log` says. Never raises.
-
-    The only thing the log is ever read for (D4). `errors="replace"` and the
-    swallowed `OSError` are deliberate: a truncated or unreadable log must not
-    turn an attempt that produced a perfectly good result file into a failure.
-    """
-    try:
-        text = outcome.stdout_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    return adapter.parse_usage(text)

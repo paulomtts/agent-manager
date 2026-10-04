@@ -1,10 +1,10 @@
-"""Behaviour of the harness adapter protocol and its data types (design §8
+"""Behaviour of the harness adapter protocol and its data type (design §8
 lines 306-318, card 55e503e0).
 
 Unit tier per design §14 line 484 ("Adapters -- `build_command` is pure and
 asserted per harness; the launcher is injected, so no harness is executed in
 unit tests"). Nothing here spawns a process or touches disk: the module is a
-Protocol and two value types. The stub adapter below is the interface's only
+Protocol and one value type. The stub adapter below is the interface's only
 consumer in this card -- the real adapters are sibling cards, and the fake
 adapter that returns canned result files belongs to the engine card (§14
 line 486).
@@ -15,7 +15,6 @@ import inspect
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from agent_manager.harness import base
 from agent_manager.models import Dispatch
@@ -31,9 +30,6 @@ class StubAdapter:
     def build_command(self, d: Dispatch) -> list[str]:
         return [self.name, "--model", d.model, "--result", str(d.result_path)]
 
-    def parse_usage(self, stdout: str) -> base.Usage | None:
-        return None
-
 
 def _dispatch() -> Dispatch:
     return Dispatch(
@@ -47,15 +43,15 @@ def _dispatch() -> Dispatch:
     )
 
 
-def test_the_protocol_declares_exactly_the_four_members_the_spec_prints():
+def test_the_protocol_declares_exactly_the_three_members_the_spec_prints():
     # §8 lines 306-313 are the contract every adapter card codes against. A
-    # fifth member added here, or a rename, would silently break a sibling
-    # adapter written against the printed version.
+    # fourth member added here, or a rename, would silently break a sibling
+    # adapter written against the printed version. `parse_usage` left with
+    # the 2026-10-03 remove-cost-tracking spec (§4.4): nothing reads the log.
     assert set(base.HarnessAdapter.__protocol_attrs__) == {
         "name",
         "capabilities",
         "build_command",
-        "parse_usage",
     }
 
 
@@ -67,11 +63,6 @@ def test_the_protocol_methods_have_the_signatures_the_spec_prints():
     assert list(build.parameters) == ["self", "d"]
     assert build.parameters["d"].annotation is Dispatch
     assert build.return_annotation == list[str]
-
-    parse = inspect.signature(base.HarnessAdapter.parse_usage)
-    assert list(parse.parameters) == ["self", "stdout"]
-    assert parse.parameters["stdout"].annotation is str
-    assert parse.return_annotation == base.Usage | None
 
 
 def test_a_structural_stub_satisfies_the_adapter_interface():
@@ -93,7 +84,6 @@ def test_a_structural_stub_satisfies_the_adapter_interface():
     ]
     # §5 line 252: an argv list, never a shell string.
     assert all(isinstance(word, str) for word in argv)
-    assert adapter.parse_usage("no usage in this log") is None
 
 
 def test_the_protocol_is_not_runtime_checkable():
@@ -104,56 +94,11 @@ def test_the_protocol_is_not_runtime_checkable():
         isinstance(StubAdapter(), base.HarnessAdapter)
 
 
-def test_usage_round_trips_a_full_payload():
-    usage = base.Usage(tokens_in=8000, tokens_out=1500, cost=0.31)
-    assert usage.tokens_in == 8000
-    assert usage.tokens_out == 1500
-    assert usage.cost == 0.31
-    assert base.Usage.model_validate(usage.model_dump(mode="json")) == usage
-
-
-def test_usage_is_empty_when_a_harness_reports_nothing():
-    # D4: stdout is a log, not a channel. A harness that prints no usage line
-    # still ran fine, so every field is optional.
-    usage = base.Usage()
-    assert usage.tokens_in is None
-    assert usage.tokens_out is None
-    assert usage.cost is None
-
-
-def test_usage_fields_match_the_attempt_fields_they_are_copied_into():
-    # The engine's journalling is a straight copy; a rename here would make it
-    # a translation nobody wrote.
-    assert set(base.Usage.model_fields) == {"tokens_in", "tokens_out", "cost"}
-
-
-def test_usage_is_frozen():
-    usage = base.Usage(tokens_in=10)
-    with pytest.raises(ValidationError):
-        usage.tokens_in = 20
-
-
-def test_usage_rejects_negative_counts_and_cost():
-    for field, value in (("tokens_in", -1), ("tokens_out", -1), ("cost", -0.01)):
-        with pytest.raises(ValidationError) as excinfo:
-            base.Usage(**{field: value})
-        assert [error["loc"] for error in excinfo.value.errors()] == [(field,)]
-
-
-def test_usage_rejects_an_infinite_or_nan_cost():
-    # A garbled stdout line can parse to inf or nan. `inf >= 0` is true and
-    # every nan comparison is false, so a plain lower bound would let both
-    # through into the journal.
-    for bad in (float("inf"), float("nan")):
-        with pytest.raises(ValidationError):
-            base.Usage(cost=bad)
-
-
-def test_usage_rejects_an_unknown_key():
-    # A harness that renames its usage field must fail loudly, not report zero.
-    with pytest.raises(ValidationError) as excinfo:
-        base.Usage(total_tokens=9500)
-    assert "total_tokens" in str(excinfo.value)
+def test_usage_is_gone_from_the_adapter_layer():
+    # 2026-10-03 remove-cost-tracking §4.4: `am` keeps no per-phase cost, so
+    # the adapter layer has no usage type to trade in. A leftover reference
+    # to the old usage model anywhere must fail loudly at import, not linger.
+    assert not hasattr(base, "Usage")
 
 
 def test_outcome_carries_what_the_engine_classifies_on():
@@ -198,8 +143,9 @@ def test_outcome_is_frozen():
         outcome.exit_code = 0
 
 
-def test_outcome_carries_no_result_payload_and_no_usage():
-    # The launcher never opens the result file and never parses usage; keeping
-    # both off this type is what lets one launcher serve every adapter.
+def test_outcome_carries_no_result_payload_and_no_log_contents():
+    # The launcher never opens the result file and never reads the log it
+    # wrote (nothing does: D4); keeping both off this type is what lets one
+    # launcher serve every adapter.
     fields = {field.name for field in dataclasses.fields(base.Outcome)}
     assert fields == {"argv", "exit_code", "timed_out", "duration", "stdout_path"}

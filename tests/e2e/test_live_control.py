@@ -20,6 +20,7 @@ Unmarked on purpose: fake-claude e2e tests run on every `uv run pytest`; only
 """
 
 import json
+import shutil
 import subprocess
 import threading
 from collections import Counter
@@ -27,6 +28,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 from typer.testing import CliRunner
 
 from agent_manager import cli, control, store
@@ -390,4 +392,124 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
     # The cancelled run stays cancelled.
+    assert _status(root, run_id) == "cancelled"
+
+
+def _subtask_of(root: Path, run_id: str, card_id: str):
+    """`card_id`'s recorded `SubtaskRun` in `run_id`, phases in the order the walk recorded them."""
+    conn = store.open_db(cli.resolve_repo_dir(root))
+    try:
+        run = store.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None, run_id
+    for story in run.stories:
+        for subtask in story.subtasks:
+            if subtask.card_id == card_id:
+                return subtask
+    raise AssertionError(f"{card_id} is not recorded in run {run_id}")
+
+
+@pytest.mark.e2e_fake
+def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_from_worktree(
+    two_story_board, run_milestone_cli, read_fake_log, monkeypatch, request
+):
+    """am-reset spec test 12, the 2026-10-03 incident replayed: a milestone
+    paused in a1's plan, a1's worktree removed by hand, `am reset` closes the
+    run, `am resume` refuses it, and a fresh `am run --milestone` drives a1
+    from `worktree` to `done` with every agent phase run once, `explore`
+    included: nothing is continued from the reset run's checkpoint."""
+    assert request.node.get_closest_marker("e2e") is None
+    root = two_story_board["root"]
+    milestone = two_story_board["milestone"]
+    stories = two_story_board["stories"]
+    (a1,) = two_story_board["subtasks"]["A"]
+    branch = two_story_board["branches"][a1]
+    worktree = cli.worktree_for(root, branch)
+    entered, release, applied = threading.Event(), threading.Event(), threading.Event()
+    _hold(monkeypatch, a1, HELD_PHASE, entered, release)
+    _signal_when_applied(monkeypatch, applied)
+
+    run_id, _requested, first = _control_while_held(
+        root,
+        milestone,
+        "pause",
+        run_milestone_cli=run_milestone_cli,
+        entered=entered,
+        release=release,
+        applied=applied,
+    )
+
+    # Paused: a1 parked after its held plan, the run recorded `stopped`.
+    assert first.exit_code == 0, (first.output, first.exception)
+    assert _envelope(first)["paused"] is True
+    assert _status(root, run_id) == "stopped"
+    paused_counts = _card_phase_counts(read_fake_log(run_id))
+    assert _only(paused_counts, a1) == _counts(partial={a1: HELD_PHASE}), paused_counts
+
+    # The incident: a1's worktree removed by hand; its branch survives.
+    assert worktree.is_dir()
+    shutil.rmtree(worktree)
+    assert not worktree.exists()
+    assert branch in _local_branches(root)
+
+    reset = CliRunner().invoke(cli.app, ["reset", run_id, "--repo-dir", str(root)])
+
+    assert reset.exit_code == 0, (reset.output, reset.exception)
+    closed = _envelope(reset)
+    assert set(closed) == {
+        "run_id",
+        "previous_status",
+        "status",
+        "already_cancelled",
+        "cards",
+        "message",
+    }, closed
+    assert closed["run_id"] == run_id
+    assert closed["previous_status"] == "stopped"
+    assert closed["status"] == "cancelled"
+    assert closed["already_cancelled"] is False
+    assert {"card_id": a1, "workflow": "task", "open_in": None} in closed["cards"], closed
+    assert all(card["open_in"] is None for card in closed["cards"]), closed["cards"]
+    assert closed["message"] == (
+        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        " and a relaunch starts its cards from their first phase"
+    )
+    assert _status(root, run_id) == "cancelled"
+
+    # `am resume` of the reset run is refused at exit 3, launching nothing.
+    launches = len(read_fake_log(run_id))
+    refused = _resume(root, run_id)
+
+    assert refused.exit_code == cli.EXIT_ERROR == 3, (refused.output, refused.exception)
+    assert _error(refused) == {
+        "type": "NotResumableError",
+        "message": f"run {run_id} was cancelled; start new work with `am run --milestone`",
+    }
+    assert len(read_fake_log(run_id)) == launches
+
+    relaunch = run_milestone_cli(root, milestone)
+
+    assert relaunch.exit_code == 0, (relaunch.output, relaunch.exception)
+    finished = _envelope(relaunch)
+    assert finished["done"] is True, finished
+    assert "escalated" not in finished
+    new_run = finished["run_id"]
+    assert new_run != run_id
+    assert a1 in finished["completed"]
+    assert set(finished["integrated"]["merged"]) == set(stories.values())
+    # Driven from `worktree` to `done`: the walk's first recorded phase is the
+    # worktree step, and it recreated the removed directory on a1's branch.
+    subtask = _subtask_of(root, new_run, a1)
+    assert subtask.status == "done", subtask
+    assert subtask.phases[0].name == "worktree", [p.name for p in subtask.phases]
+    assert subtask.phases[0].status == "done"
+    assert worktree.is_dir()
+    assert _git(worktree, "rev-parse", "--abbrev-ref", "HEAD").strip() == branch
+    # Nothing continued from the reset run's parked checkpoint: every agent
+    # phase of a1 exactly once in the relaunch, `explore` included.
+    relaunched = _card_phase_counts(read_fake_log(new_run))
+    assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
+    assert relaunched[(a1, "explore")] == 1
+    # The reset run stays cancelled.
     assert _status(root, run_id) == "cancelled"

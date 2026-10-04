@@ -3,8 +3,11 @@
 D5 keeps two independent stores: `paths.project_db_path(root)` holds a
 queryable projection of the state tree, and `paths.run_dir(run_id)/journal.jsonl`
 holds the append-only audit trail. The journal is appended *before* the row is
-written, so if the two ever disagree the journal wins and the projection can be
-thrown away and rebuilt (§9 lines 365-368).
+written, so if the two ever disagree the journal wins and the run's §9 tree
+(`runs`, `stories`, `subtasks`, `phases`, `attempts`) can be thrown away and
+rebuilt (§9 lines 365-368); the six row-only tables (`checkpoints`,
+`checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`,
+`board_comments`) have no journal and are the projection's alone.
 
 This module owns only those two stores. Path derivation belongs to `paths`, the
 state tree belongs to `models`, and the resume loop that acts on an in-flight
@@ -86,9 +89,6 @@ CREATE TABLE IF NOT EXISTS attempts (
     status       TEXT NOT NULL,
     exit_code    INTEGER,
     duration     REAL,
-    tokens_in    INTEGER,
-    tokens_out   INTEGER,
-    cost         REAL,
     prompt_path  TEXT,
     result_path  TEXT,
     stdout_path  TEXT,
@@ -243,7 +243,10 @@ def open_db(root: Path) -> sqlite3.Connection:
     `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
     table lacks, as a nullable column. Existing rows keep their data and read
     the new column as NULL. It is a no-op on a database that already has the
-    column, so opening the same database any number of times is safe.
+    column, so opening the same database any number of times is safe. Nothing
+    is ever dropped: an `attempts` table created before 2026-10-03 keeps its
+    `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
+    any more, so they stay NULL.
 
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
@@ -285,6 +288,36 @@ class CorruptJournalError(JournalError):
     """A journal line is not JSON. Names the file and the 1-based line number."""
 
 
+def _describe_node(node: dict[str, str | int | None]) -> str:
+    """`"run"` for the run, else its non-`None` coordinates as `key=value`."""
+    parts = [f"{key}={value}" for key, value in node.items() if value is not None]
+    return " ".join(parts) if parts else "run"
+
+
+class ProjectionDivergedError(RuntimeError):
+    """The projection holds values no journal line recorded (divergence §3.6).
+
+    Raised by `Store.rebuild_from_journal` before it deletes anything, when
+    `diverging` finds a `foreign` mismatch: rebuilding would overwrite what
+    something other than the store wrote. Not a `JournalError`: the journal is
+    fine. `mismatches` holds only the foreign ones, in tree-walk order.
+    """
+
+    def __init__(self, run_id: str, mismatches: "list[Mismatch]") -> None:
+        details = "; ".join(
+            f"{_describe_node(mismatch.node)} {mismatch.field or 'shape'}:"
+            f" journal {mismatch.journal!r}, projection {mismatch.projection!r}"
+            for mismatch in mismatches
+        )
+        super().__init__(
+            f"projection of run {run_id!r} holds values its journal never"
+            f" recorded: {details}. Nothing was changed;"
+            " rebuild_from_journal(..., force=True) overwrites them."
+        )
+        self.run_id = run_id
+        self.mismatches = mismatches
+
+
 class JournalLine(BaseModel):
     """The envelope around one journalled event.
 
@@ -306,6 +339,26 @@ class JournalLine(BaseModel):
 
 
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
+
+
+_RETIRED_ATTEMPT_KEYS: frozenset[str] = frozenset({"tokens_in", "tokens_out", "cost"})
+"""Attempt payload keys dropped before validation (remove-cost-tracking design,
+docs/superpowers/specs/2026-10-03-remove-cost-tracking-design.md §4.3).
+
+Every journal written before 2026-10-03 carries them on each `attempt_upsert`
+line, as null. `models.Attempt` no longer declares them and forbids unknown
+keys, so without this every old journal would stop replaying: the projection
+could not be rebuilt, and resume adoption would silently decline every old run.
+A named allow-list rather than `extra="ignore"`: any other unknown key still
+fails, and only attempt payloads are touched."""
+
+
+def _current_attempt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """`payload` without `_RETIRED_ATTEMPT_KEYS`, whatever their values, as a
+    new dict. The journal line's own payload is never mutated."""
+    return {
+        key: value for key, value in payload.items() if key not in _RETIRED_ATTEMPT_KEYS
+    }
 
 
 class _UnknownEventLine(BaseModel):
@@ -528,7 +581,10 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
 
     Nothing here is defensive: a line that fails `models` validation raises the
     `pydantic.ValidationError` straight out, because an old-schema line has to
-    fail loudly rather than quietly drop a field from the projection.
+    fail loudly rather than quietly drop a field from the projection. The one
+    exception is `_RETIRED_ATTEMPT_KEYS`: an `attempt_upsert` payload sheds
+    those three named keys, which every pre-2026-10-03 journal carries, before
+    it is validated, and any other unknown key still raises.
     """
     run: models.Run | None = None
 
@@ -578,11 +634,194 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
             continue
 
         phase = _find(subtask.phases, "name", line.phase, "phase", line.seq)
-        _upsert(phase.attempts, "n", models.Attempt.model_validate(line.payload), None)
+        attempt = models.Attempt.model_validate(_current_attempt_payload(line.payload))
+        _upsert(phase.attempts, "n", attempt, None)
 
     if run is None:
         raise JournalError("journal contains no run_upsert line")
     return run
+
+
+MismatchKind = Literal["stale", "foreign"]
+"""§3.2: `stale` is a value the journal recorded for that node at some seq (or a
+node the projection lacks), which a rebuild repairs; `foreign` is a value no
+journal line ever recorded for that node (or a node no line created), written
+outside the store."""
+
+
+@dataclass(frozen=True)
+class Mismatch:
+    """One place the projection disagrees with the replayed journal (§3.3).
+
+    `node` is keyed by the journal's own coordinates (`story`, `card`, `phase`,
+    `attempt`, as `JournalLine` and am-watch spell them), all `None` for the
+    run. `field` is `"status"` for a status mismatch and `None` for a shape
+    mismatch; then `journal`/`projection` is the status on the side that has
+    the node and `None` on the side that lacks it.
+    """
+
+    node: dict[str, str | int | None]
+    field: Literal["status"] | None
+    journal: str | None
+    projection: str | None
+    kind: MismatchKind
+
+
+_NodeKey = tuple[str | None, str | None, str | None, int | None]
+"""(story, card, phase, attempt): one node of the §9 tree in `JournalLine`'s
+coordinates. The run is all `None`."""
+
+_RUN_KEY: _NodeKey = (None, None, None, None)
+
+_NODE_MODELS: dict[str, type[BaseModel]] = {
+    "run_upsert": models.Run,
+    "story_upsert": models.StoryRun,
+    "subtask_upsert": models.SubtaskRun,
+    "phase_upsert": models.PhaseRun,
+    "attempt_upsert": models.Attempt,
+}
+"""The model each event's payload validates as, exactly as `replay` reads it
+(an `attempt_upsert` payload first sheds `_RETIRED_ATTEMPT_KEYS`)."""
+
+_LEVELS: tuple[tuple[str, str], ...] = (
+    ("stories", "card_id"),
+    ("subtasks", "card_id"),
+    ("phases", "name"),
+    ("attempts", "n"),
+)
+"""Below the run, each level's child list and the field `_upsert` matches
+siblings by. The identity value of a node at level `i` fills slot `i` of its
+`_NodeKey`."""
+
+
+def _coords(key: _NodeKey) -> dict[str, str | int | None]:
+    story, card, phase, attempt = key
+    return {"story": story, "card": card, "phase": phase, "attempt": attempt}
+
+
+def _child_key(key: _NodeKey, depth: int, value: Any) -> _NodeKey:
+    """`key` with the child's identity `value` in the slot for level `depth`."""
+    slots = list(key)
+    slots[depth] = value
+    return (slots[0], slots[1], slots[2], slots[3])
+
+
+def _line_node(line: JournalLine, node: Any) -> _NodeKey:
+    """The node a line describes, located the way `replay` places it: the
+    envelope names its ancestors, the payload's identity field names it."""
+    if line.event == "run_upsert":
+        return _RUN_KEY
+    if line.event == "story_upsert":
+        return (node.card_id, None, None, None)
+    if line.event == "subtask_upsert":
+        return (line.story, node.card_id, None, None)
+    if line.event == "phase_upsert":
+        return (line.story, line.card, node.name, None)
+    return (line.story, line.card, line.phase, node.n)
+
+
+def _journaled_statuses(lines: list[JournalLine]) -> dict[_NodeKey, set[str]]:
+    """Every status each node was ever journaled at, at any seq (§3.2)."""
+    seen: dict[_NodeKey, set[str]] = {}
+    for line in sorted(lines, key=lambda item: item.seq):
+        payload = (
+            _current_attempt_payload(line.payload)
+            if line.event == "attempt_upsert"
+            else line.payload
+        )
+        node: Any = _NODE_MODELS[line.event].model_validate(payload)
+        seen.setdefault(_line_node(line, node), set()).add(node.status)
+    return seen
+
+
+def _walk(
+    key: _NodeKey,
+    depth: int,
+    journal_node: Any,
+    projection_node: Any,
+    seen: dict[_NodeKey, set[str]],
+    found: list[Mismatch],
+) -> None:
+    """Compare one node both sides have, then its children, in tree order.
+
+    A child only the journal has is one `stale` shape mismatch; a child only
+    the projection has is one `foreign` shape mismatch, listed after the
+    journal's children. Neither's descendants are reported.
+    """
+    if journal_node.status != projection_node.status:
+        found.append(
+            Mismatch(
+                node=_coords(key),
+                field="status",
+                journal=journal_node.status,
+                projection=projection_node.status,
+                kind=(
+                    "stale"
+                    if projection_node.status in seen.get(key, set())
+                    else "foreign"
+                ),
+            )
+        )
+    if depth == len(_LEVELS):
+        return
+    children, identity = _LEVELS[depth]
+    theirs = {
+        getattr(child, identity): child for child in getattr(projection_node, children)
+    }
+    # One mismatch per missing subtree root: its descendants are not walked.
+    journal_ids: set[Any] = set()
+    for child in getattr(journal_node, children):
+        value = getattr(child, identity)
+        journal_ids.add(value)
+        other = theirs.get(value)
+        if other is None:
+            found.append(
+                Mismatch(
+                    node=_coords(_child_key(key, depth, value)),
+                    field=None,
+                    journal=child.status,
+                    projection=None,
+                    kind="stale",
+                )
+            )
+        else:
+            _walk(_child_key(key, depth, value), depth + 1, child, other, seen, found)
+    # Nodes only the projection has follow the journal's, in projection order.
+    for child in getattr(projection_node, children):
+        value = getattr(child, identity)
+        if value not in journal_ids:
+            found.append(
+                Mismatch(
+                    node=_coords(_child_key(key, depth, value)),
+                    field=None,
+                    journal=None,
+                    projection=child.status,
+                    kind="foreign",
+                )
+            )
+
+
+def diverging(lines: list[JournalLine], projection: models.Run) -> list[Mismatch]:
+    """Every place `projection` disagrees with the journal `lines` replay to.
+
+    Pure: the caller loads both sides; nothing here reads a file or the
+    database, and neither argument is mutated. `replay`'s own errors
+    (`JournalError`, pydantic `ValidationError`) propagate unchanged.
+
+    Only `status` is compared, at every level of the §9 tree, plus shape.
+    Nodes are matched as `replay` matches them: the run by itself, a story by
+    `card_id`, a subtask by its story and `card_id`, a phase by `name`, an
+    attempt by `n`. A differing status is `stale` if the journal ever recorded
+    the projection's value for that node, else `foreign` (§3.2; a node set
+    back to an earlier journaled status is therefore `stale`, by decision).
+    Mismatches come out in tree walk order. An empty list means they agree.
+    """
+    lines = list(lines)
+    journal = replay(lines)
+    seen = _journaled_statuses(lines)
+    found: list[Mismatch] = []
+    _walk(_RUN_KEY, 0, journal, projection, seen, found)
+    return found
 
 
 class RunSummary(BaseModel):
@@ -714,9 +953,6 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
                             status=attempt_row["status"],
                             exit_code=attempt_row["exit_code"],
                             duration=attempt_row["duration"],
-                            tokens_in=attempt_row["tokens_in"],
-                            tokens_out=attempt_row["tokens_out"],
-                            cost=attempt_row["cost"],
                             prompt_path=attempt_row["prompt_path"],
                             result_path=attempt_row["result_path"],
                             stdout_path=attempt_row["stdout_path"],
@@ -1106,9 +1342,11 @@ class Store:
 
     Every `record_*` appends the journal line first and writes the row second.
     There is deliberately no public method that writes a tree row on its own.
-    The exceptions are `checkpoints` (pygents spec §6), `run_controls` and
-    `run_leases` (live control C1/C2) and `board_comments` (board-comments
-    B6): row-only tables outside the journal.
+    The exceptions are `checkpoints` (pygents spec §6), `checkpoint_floors`
+    (exactly-once 1.1), `run_controls` and `run_leases` (live control C1/C2),
+    `run_claims` (multi-process X5) and `board_comments` (board-comments B6):
+    the six row-only tables, which have no journal and are the projection's
+    alone.
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
@@ -1393,18 +1631,15 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO attempts (run_id, story_id, card_id, phase, n, status,
-                                  exit_code, duration, tokens_in, tokens_out, cost,
+                                  exit_code, duration,
                                   prompt_path, result_path, stdout_path, dispatch)
             VALUES (:run_id, :story_id, :card_id, :phase, :n, :status,
-                    :exit_code, :duration, :tokens_in, :tokens_out, :cost,
+                    :exit_code, :duration,
                     :prompt_path, :result_path, :stdout_path, :dispatch)
             ON CONFLICT(run_id, story_id, card_id, phase, n) DO UPDATE SET
                 status=excluded.status,
                 exit_code=excluded.exit_code,
                 duration=excluded.duration,
-                tokens_in=excluded.tokens_in,
-                tokens_out=excluded.tokens_out,
-                cost=excluded.cost,
                 prompt_path=excluded.prompt_path,
                 result_path=excluded.result_path,
                 stdout_path=excluded.stdout_path,
@@ -1419,9 +1654,6 @@ class Store:
                 "status": attempt.status,
                 "exit_code": attempt.exit_code,
                 "duration": attempt.duration,
-                "tokens_in": attempt.tokens_in,
-                "tokens_out": attempt.tokens_out,
-                "cost": attempt.cost,
                 "prompt_path": _text(attempt.prompt_path),
                 "result_path": _text(attempt.result_path),
                 "stdout_path": _text(attempt.stdout_path),
@@ -1586,6 +1818,22 @@ class Store:
                 (card_id, workflow),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
+
+    def checkpoint_cards(self, run_id: str) -> list[tuple[str, str]]:
+        """Every distinct `(card_id, workflow)` with a checkpoint row under `run_id`.
+
+        Any `reason` counts, `done` included. Ordered by `card_id`, then
+        `workflow`. Read-only, and `run_id` is the argument, never
+        `self.run_id`: `am reset` asks it about the run it closes
+        (am-reset §3.5, card af52db54).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT card_id, workflow FROM checkpoints"
+                " WHERE run_id = ? ORDER BY card_id, workflow",
+                (run_id,),
+            ).fetchall()
+            return [(row["card_id"], row["workflow"]) for row in rows]
 
     # -- board comment outbox ------------------------------------------------
     #
@@ -1834,12 +2082,22 @@ class Store:
 
     # -- rebuild -------------------------------------------------------------
 
-    def rebuild_from_journal(self, run_id: str) -> models.Run:
+    def rebuild_from_journal(self, run_id: str, *, force: bool = False) -> models.Run:
         """Replace this run's projection with what its journal says (D5).
 
-        The journal wins: every row for `run_id` is deleted and rewritten from
-        the replayed tree, so the result is the same whether the projection was
-        stale, truncated or already correct.
+        The journal wins: every row of the run's §9 tree (`runs`, `stories`,
+        `subtasks`, `phases`, `attempts`) for `run_id` is deleted and rewritten
+        from the replayed tree, so the result is the same whether the projection
+        was stale, truncated or already correct. The six row-only tables
+        (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`,
+        `run_claims`, `board_comments`) have no journal and are left alone.
+
+        The exception (journal/DB divergence §3.6): a projection holding a value
+        no journal line ever recorded for that node, a `foreign` mismatch in
+        `diverging`'s terms, is refused with `ProjectionDivergedError` before
+        any row is touched, unless `force=True`. The check compares the same
+        journal lines the rebuild replays. `stale` mismatches never refuse, and
+        a projection with no `runs` row for `run_id` has nothing foreign in it.
 
         The store lock is held from reading the journal through the delete and
         every rewrite, so no `record_*` lands between the delete and the
@@ -1851,12 +2109,23 @@ class Store:
             journal = (
                 self._journal if self._journal.run_id == run_id else Journal(run_id)
             )
-            run = replay(journal.read())
+            lines = journal.read()
+            run = replay(lines)
             if run.id != run_id:
                 raise JournalError(
                     f"journal of run {run_id!r} has a run_upsert naming run"
                     f" {run.id!r}: refusing to key its projection under two ids"
                 )
+            if not force:
+                projection = self.load_run(run_id)
+                if projection is not None:
+                    foreign = [
+                        mismatch
+                        for mismatch in diverging(lines, projection)
+                        if mismatch.kind == "foreign"
+                    ]
+                    if foreign:
+                        raise ProjectionDivergedError(run_id, foreign)
             self._delete_run(run_id)
             self._write_run_row(run_id, run)
             for story in run.stories:

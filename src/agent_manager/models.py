@@ -12,8 +12,8 @@ validation message is the signal, so the constraints here are chosen to make the
 message legible.
 
 Everything terminal is optional: an attempt in flight when the manager died is
-recorded as `started` with no exit code, duration, tokens or cost, and resume has
-to load that row back before discarding it and re-running the phase.
+recorded as `started` with no exit code or duration, and resume has to load that
+row back before discarding it and re-running the phase.
 """
 
 from datetime import datetime
@@ -83,9 +83,6 @@ class Attempt(_Model):
     status: AttemptStatus = "started"
     exit_code: int | None = None
     duration: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    tokens_in: int | None = Field(default=None, ge=0)
-    tokens_out: int | None = Field(default=None, ge=0)
-    cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     prompt_path: Path | None = None
     result_path: Path | None = None
     stdout_path: Path | None = None
