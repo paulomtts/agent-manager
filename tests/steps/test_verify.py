@@ -669,6 +669,52 @@ def test_a_blank_typecheck_and_blank_lint_entries_are_skipped(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    "none_like",
+    [
+        "none",
+        "None",
+        "NONE (CLAUDE.md: there is no separate lint or typecheck command)",
+        "none - this repo has no typecheck",
+        "n/a",
+        "N/A: nothing to run",
+        "null",
+        "nil",
+    ],
+)
+def test_a_none_like_typecheck_or_lint_entry_is_skipped_not_run(tmp_path: Path, none_like: str):
+    # Explore is an LLM: for a repo with no typecheck it may write prose such as
+    # "none (CLAUDE.md: ...)" instead of "". Running its first word as a program
+    # escalated a whole run (VerifyError: could not run none).
+    calls, runner = _recorder()
+    explore = {"verification": {"typecheck": none_like, "lint": [none_like, "uv run ruff check"]}}
+    result = verify.run_suite(["uv run pytest"], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [
+        ["uv", "run", "pytest"],
+        ["uv", "run", "ruff", "check"],
+    ]
+    assert result["passed"] is True
+    assert [entry["command"] for entry in result["verified"]] == [
+        "uv run pytest",
+        "uv run ruff check",
+    ]
+
+
+def test_a_real_command_that_merely_starts_with_none_letters_still_runs(tmp_path: Path):
+    calls, runner = _recorder()
+    explore = {"verification": {"typecheck": "nonexistent-checker --strict", "lint": []}}
+    verify.run_suite([], str(tmp_path), explore, runner=runner)
+    assert [argv for argv, _ in calls] == [["nonexistent-checker", "--strict"]]
+
+
+def test_a_none_like_verify_command_from_the_cli_is_still_run(tmp_path: Path):
+    # Only Explore's untrusted fields get the none-like leniency: a --verify
+    # command the user typed is run exactly as given.
+    calls, runner = _recorder()
+    verify.run_suite(["none"], str(tmp_path), None, runner=runner)
+    assert [argv for argv, _ in calls] == [["none"]]
+
+
+@pytest.mark.parametrize(
     "explore",
     [
         None,
