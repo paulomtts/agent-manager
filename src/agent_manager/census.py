@@ -47,6 +47,11 @@ OUT_OF_PLAY_STATUSES = frozenset({"canceled", "archived"})
 treated exactly like `canceled`. Together with `FINISHED_STATUSES` these are
 brd's releasing statuses; `am` never writes either set."""
 
+LANDED_STATUSES = frozenset({"merged"}) | OUT_OF_PLAY_STATUSES
+"""brd statuses whose work a human has landed (`merged`) or dropped
+(`canceled`/`archived`), so nothing stacks on them. Plain `done` is not
+landed: its work may still sit on an unmerged integrate branch."""
+
 
 def is_finished(status: str | None) -> bool:
     """True for `done` or `merged`, in any case."""
@@ -56,6 +61,11 @@ def is_finished(status: str | None) -> bool:
 def is_out_of_play(status: str | None) -> bool:
     """True for `canceled` or `archived`, in any case."""
     return (status or "").lower() in OUT_OF_PLAY_STATUSES
+
+
+def is_landed(status: str | None) -> bool:
+    """True for `merged`, `canceled` or `archived`, in any case."""
+    return (status or "").lower() in LANDED_STATUSES
 
 
 def _is_digit(ch: str) -> bool:
