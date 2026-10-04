@@ -41,9 +41,6 @@ not by the directory it lives in. `tests/conftest.py` auto-marks unmarked items
 under `tests/steps/` as `git` and under `tests/e2e/` as `e2e_fake`, but only as a
 default — mark the test explicitly when what it spawns says otherwise.
 
-The full table is in design spec §14
-(`docs/superpowers/specs/2026-09-23-agent-manager-design.md`).
-
 ## Conventions
 
 - Source lives under `src/agent_manager/`, tests mirror it under `tests/`.
