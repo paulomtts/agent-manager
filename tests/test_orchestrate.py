@@ -7000,7 +7000,6 @@ def test_a_blocker_keeps_its_prefix_once_done_and_milestone_bases_stacks_on_it()
     ) == {blocked.id: f"{prefix_of(done_blocker)}-integrate"}
 
 
-
 def test_board_claims_unions_each_milestones_claims_first_occurrence_first():
     one, two = _board_milestone(1), _board_milestone(2)
     prefixes = {one.id: "pa", two.id: "pb"}
