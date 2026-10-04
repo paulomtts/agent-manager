@@ -25,12 +25,13 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import typer
+from pydantic import ValidationError
 
 from agent_manager import (
     board,
@@ -286,6 +287,54 @@ def control_view(
             for row in requests
         ],
         "claims": list(claims),
+    }
+
+
+def integrity_view(
+    run_id: str,
+    run: models.Run,
+    lease: store_module.LeaseRow | None,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """The `integrity` key of `status`: does the journal agree with `run`?
+
+    Journal/DB divergence spec §3.3, §3.7. Always the three keys `checked`,
+    `reason` and `mismatches`, and never an error: a journal that cannot be
+    compared is `checked: false` with the reason why, so `status` keeps its
+    exit code. Report-only (§3.4): nothing is written and no control request
+    is filed.
+
+    The journal is opened through `Journal._for_reading`, never
+    `Journal(run_id)`, whose `paths.run_dir` would create a directory for a
+    run that has none, and a torn last line is an append in flight and is
+    skipped, as in `_journal_events`. The one `try` covers `diverging` as well
+    as `read`, because `replay` inside it raises `JournalError` or a pydantic
+    `ValidationError` of its own. Mismatches are `store.diverging`'s, in its
+    tree-walk order: there is one definition of divergence.
+
+    A live lease (§3.5) is `checked: false, reason: "lease is live"` before the
+    journal is opened: a running process's writes in flight are noise, not
+    divergence, even against a hand-edited projection. A dead lease, or none,
+    is checked.
+    """
+    if lease is not None and control.lease_is_live(lease, now=now):
+        return {"checked": False, "reason": "lease is live", "mismatches": []}
+    try:
+        lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+        found = store_module.diverging(lines, run)
+    except store_module.MissingJournalError:
+        return {"checked": False, "reason": "no journal", "mismatches": []}
+    except (store_module.JournalError, ValidationError) as error:
+        return {
+            "checked": False,
+            "reason": f"journal unreadable: {error}",
+            "mismatches": [],
+        }
+    return {
+        "checked": True,
+        "reason": None,
+        "mismatches": [asdict(mismatch) for mismatch in found],
     }
 
 
@@ -1436,6 +1485,8 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     listing `runs` prints, so the two commands cannot disagree about which run is
     the most recent one. The lease and every control request are read on the
     same connection and rendered by `control_view`, still without a write.
+    The `integrity` key compares the run's journal with the loaded tree through
+    `integrity_view`, which reads the journal and writes nothing either.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -1469,7 +1520,9 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
             now=now,
             claims=claims,
         )
-        return status_payload(run, state)
+        payload = status_payload(run, state)
+        payload["integrity"] = integrity_view(wanted, run, lease, now=now)
+        return payload
     finally:
         conn.close()
 
