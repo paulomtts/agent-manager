@@ -2364,6 +2364,33 @@ def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     return "escalated"
 
 
+def _local_branch_exists(root: Path) -> Callable[[str], bool]:
+    """`run_board`'s `branch_exists` for `milestone_bases`: is `<branch>` a local branch of `root`?
+
+    Each call runs `git -C <root> rev-parse --verify --quiet refs/heads/<branch>`
+    through `worktree.run_git`, read at call time. Only `refs/heads/` counts: a
+    tag or a remote-tracking ref with the same short name is not a local
+    branch. Exit 1 is the ref being absent, so `False`; any other `GitError`
+    (exit 128, "not a git repository") is not an answer and propagates, so a
+    broken repository never silently drops a stacked milestone onto the base
+    branch. No `git_lock`: a read-only ref lookup is not worth a
+    `LockTimeoutError` path in a refusal check.
+    """
+
+    def exists(branch: str) -> bool:
+        try:
+            worktree.run_git(
+                ["-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]
+            )
+        except worktree.GitError as error:
+            if error.exit_code == 1:
+                return False
+            raise
+        return True
+
+    return exists
+
+
 def run_board(
     *,
     repo_dir: Path,

@@ -7757,6 +7757,56 @@ def test_run_board_ends_on_a_base_exception_instead_of_hanging(board_seams):
         _board(board_seams)
 
 
+# ── _local_branch_exists (card 5b772688) ────────────────────────────────────
+
+
+def _branch_repo(tmp_path: Path) -> Path:
+    """A repo with one commit on `main`, branch `m-integrate`, tag
+    `t-integrate` and remote-tracking ref `origin/r-integrate`."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True
+    )
+    _git(root, "config", "user.email", "tests@example.com")
+    _git(root, "config", "user.name", "agent-manager tests")
+    _git(root, "config", "commit.gpgsign", "false")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-m", "base")
+    _git(root, "branch", "m-integrate")
+    _git(root, "tag", "t-integrate")
+    _git(root, "update-ref", "refs/remotes/origin/r-integrate", "HEAD")
+    return root
+
+
+@pytest.mark.git
+def test_local_branch_exists_answers_only_for_local_branches(tmp_path):
+    exists = orchestrate._local_branch_exists(_branch_repo(tmp_path))
+
+    assert exists("m-integrate") is True
+    assert exists("main") is True
+    assert exists("absent-integrate") is False
+    assert exists("t-integrate") is False
+    assert exists("r-integrate") is False
+
+
+@pytest.mark.git
+def test_local_branch_exists_propagates_a_git_error_that_is_not_an_answer(
+    tmp_path, monkeypatch
+):
+    """A broken repository is not "the branch is missing": exit 128 propagates."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    exists = orchestrate._local_branch_exists(not_a_repo)
+
+    with pytest.raises(worktree.GitError) as caught:
+        exists("m-integrate")
+
+    assert caught.value.exit_code != 1
+
+
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
 #
 # Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
