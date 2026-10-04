@@ -14,11 +14,12 @@ releases the dependents of a lane that did not finish clean, and
 `collect_outcomes` reads every story's outcome after the tree ran (T6).
 
 A story with two or more in-milestone blockers roots on a merged base
-(supervisor-tree §5): its lane waits for every blocker to finish clean, then
-awaits `bases.build` with their tips (`blocker_tips`), after it took its slot
-and before its first subtask, so that
-subtask stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the
-fast path: no base branch and no extra verify.
+(supervisor-tree §5): it is reached through one grafo edge per blocker, so its
+lane runs only after every blocker succeeded. The lane reads the blockers' tips
+from `plan.tips` in `root_plan.blockers` order and awaits `bases.build` with
+them, after it took its slot and before its first subtask, so that subtask
+stacks on `<prefix>/base-<short id>`. A lone-blocker story stays the fast path:
+no base branch and no extra verify.
 
 Every derivation belongs to a collaborator: the milestone and its census to
 `census`, waves, stack bases, roots and tips to `dag`, board reads to `board`,
@@ -841,9 +842,9 @@ async def build_merged_base(
 ) -> None:
     """Await `bases.build` for one merged-root story (supervisor-tree §5).
 
-    `tips` are the blockers' tips, already resolved by the caller in
-    `root_plan.blockers` order (`blocker_tips`). `bases.build` is read off its
-    module at call time so a test can replace it. A `None` factory is
+    `tips` are the blockers' tips, read by the caller from `plan.tips` in
+    `root_plan.blockers` order. `bases.build` is read off its module at call
+    time so a test can replace it. A `None` factory is
     production's, `cli.default_runner_factory`, read at call time as
     Integrate reads it, so a conflicting tip reaches the resolver instead of
     failing for a human. `resume_from` is the resolver's checkpoint on a
@@ -866,32 +867,6 @@ async def build_merged_base(
         stop=stop,
         **extra,
     )
-
-
-async def blocker_tips(
-    root_plan: dag.RootPlan,
-    plan: SupervisorPlan,
-    story_done: Mapping[str, asyncio.Event],
-    story_ok: Mapping[str, bool],
-) -> list[str] | None:
-    """Every blocker's tip, in `root_plan.blockers` order, once each is done.
-
-    A merged-root story is itself one of `supervise`'s grafo roots (T1's own
-    dependency edges are not used for a 2+-blocker join: grafo's dynamic
-    worker pool can starve a join node forever when an unrelated sibling lane
-    is still in flight, a defect in grafo itself, confirmed outside this
-    module and out of scope to fix there). This lane instead waits on each
-    blocker's own completion signal, then reads its tip off `plan.tips` --
-    the same value the blocker's own lane would have returned, computed at
-    plan time (`dag.story_tip`), so no data is lost by not using grafo's
-    runtime forwarding for this edge. None means a blocker did not finish
-    clean (escalated or stopped): the caller must not build the base.
-    """
-    for blocker in root_plan.blockers:
-        await story_done[blocker].wait()
-    if not all(story_ok.get(blocker, False) for blocker in root_plan.blockers):
-        return None
-    return [plan.tips[blocker] for blocker in root_plan.blockers]
 
 
 def builds_a_base_alone(story: census.StoryPlan, root_plan: dag.RootPlan) -> bool:
@@ -1142,14 +1117,12 @@ async def lane(
     slots: asyncio.Semaphore,
     stop: StopSignal,
     finished: dict[str, LaneOutcome],
-    story_done: Mapping[str, asyncio.Event],
-    story_ok: Mapping[str, bool],
 ) -> str:
     """One story's node coroutine (T1, T4, T6): drive its remaining subtasks, return its tip.
 
     A story with nothing left to run returns its tip without taking a slot,
     unless `builds_a_base_alone` says it must first build its merged base
-    (`base_only_lane`); a `merged` one still waits for its blockers first. Otherwise the lane takes a slot -- grafo started it, so
+    (`base_only_lane`). Otherwise the lane takes a slot -- grafo started it, so
     every blocker already succeeded -- and drives the remaining subtasks in
     census order, each on the base `record_plan` recorded for it. Before each
     subtask it checks the stop: if it fired, the story is recorded `stopped`
@@ -1160,14 +1133,11 @@ async def lane(
     at that subtask. `LaneEscalated`/`LaneStopped` pass through the catch-all
     unchanged. A `BaseException` is never caught.
 
-    A story whose root is `merged` is one of `supervise`'s grafo roots (not
-    reached through a blocker's edge; `blocker_tips` explains why), so it
-    waits for its own blockers here, before taking a slot: `blocker_tips`
-    returns None when a blocker did not finish clean, and this lane then
-    returns its tip without ever taking a slot, exactly as a story whose
-    blocker's edge grafo never fired would (T1's existing contract). Once
-    every blocker is clean, the lane takes its slot, checks the stop (fired:
-    `stopped` at its first subtask, nothing built), then awaits
+    A story whose root is `merged` is reached through one grafo edge per
+    blocker, so its lane runs only after every blocker succeeded; it reads the
+    blockers' tips from `plan.tips` in `root_plan.blockers` order. The lane
+    takes its slot, checks the stop (fired: `stopped` at its first subtask,
+    nothing built), then awaits
     `build_merged_base` before its first subtask, whose recorded base is the
     merged base branch. `BaseFailed(stopped=False)` triggers the stop, records
     the story `escalated` and raises `LaneEscalated` with `failed_phase="base"`,
@@ -1196,11 +1166,7 @@ async def lane(
     planned = plan.planned.get(story.id)
     tips: list[str] | None = None
     if root_plan.kind == "merged":
-        # Waited for even with nothing left to run: grafo would have held a
-        # blocked story, done or not, behind its blockers' edges.
-        tips = await blocker_tips(root_plan, plan, story_done, story_ok)
-        if tips is None:
-            return plan.tips[story.id]
+        tips = [plan.tips[blocker] for blocker in root_plan.blockers]
     if planned is None and not builds_a_base_alone(story, root_plan):
         return plan.tips[story.id]
     if planned is None:
@@ -1426,21 +1392,18 @@ async def build_dag_tree(
     (grafo's 60 s default would cancel a long-running node). `nodes_by_id` is
     keyed by `id_of(item)`, in `items` order.
 
-    An item with exactly one blocker gets one edge from that blocker. Its
-    output is forwarded as `forward(blocker_item)` -- `forward` is handed the
-    blocker item, not its id -- or not at all when `forward` is `None` or
-    returns `None`.
+    Every blocker of an item gets one edge to it, in `blockers_of` order,
+    whatever the blocker count: grafo enqueues a node only once every parent
+    returned, and never once a parent raised, so an item with two or more
+    blockers is a real join. Each edge forwards its blocker's output as
+    `forward(blocker_item)` -- `forward` is handed the blocker item, not its
+    id, once per edge -- or nothing on that edge when `forward` is `None` or
+    returns `None`. This helper creates no events and does no waiting.
 
-    An item with two or more blockers gets no incoming edge and is one of the
-    executor's roots itself: grafo's dynamic worker pool can starve a
-    2+-parent join forever when an unrelated sibling node is still in flight
-    (confirmed in the pinned grafo release; not fixed here). This helper
-    creates no events and does no waiting: the coroutine `node_factory`
-    builds for such an item must wait on its blockers itself.
-
-    `roots` is, in `items` order, every item with no blocker plus every item
-    with two or more. A blocker id not among `items` is the caller's to
-    avoid; nothing is filtered or validated. Empty `items` gives `({}, [])`.
+    `roots` is, in `items` order, every item with no blocker; an item with
+    one or more blockers is never a root. A blocker id not among `items` is
+    the caller's to avoid; nothing is filtered, validated or de-duplicated.
+    Empty `items` gives `({}, [])`.
     """
     nodes = {
         id_of(item): grafo.Node(coroutine=node_factory(item), uuid=id_of(item), timeout=None)
@@ -1450,13 +1413,13 @@ async def build_dag_tree(
     roots: list[grafo.Node] = []
     for item in items:
         blockers = blockers_of(item)
-        if len(blockers) == 1:
-            (blocker,) = blockers
+        if not blockers:
+            roots.append(nodes[id_of(item)])
+            continue
+        for blocker in blockers:
             parent = nodes[blocker]
             name = None if forward is None else forward(items_by_id[blocker])
             await parent.connect(nodes[id_of(item)], forward=name)
-        else:
-            roots.append(nodes[id_of(item)])
     return nodes, roots
 
 
@@ -1478,16 +1441,13 @@ async def supervise(
     """Run every census story as a grafo node and collect the outcomes (T1, T6).
 
     The tree comes from `build_dag_tree` over `plan.stories`, each story's
-    blockers being its `plan.roots` in-milestone blockers: one node per story,
-    one edge per single-blocker story forwarding the blocker's tip as
-    `tip_<short id>`, and every story rooted on a `merged` base (two or more
-    in-milestone blockers) as an extra executor root, for the grafo
-    join-starvation reason `build_dag_tree` documents (a grafo limitation,
-    not a `dag`/`bases` defect). Such a story's lane waits on each blocker's
-    own completion, signalled by `story_done`/`story_ok` below, and reads the
-    blocker's tip off `plan.tips` (`blocker_tips`); every lane sets its own
-    signal on exit, success or not, so this never hangs. A milestone with no
-    story has no tree to run.
+    blockers being its `plan.roots` in-milestone blockers: one node per story
+    and one edge per blocker, each forwarding the blocker's tip as
+    `tip_<short id>`, so a story rooted on a `merged` base (two or more
+    in-milestone blockers) is a grafo join, not an executor root: its lane
+    runs only after every blocker succeeded, and reads the blockers' tips from
+    `plan.tips` in `root_plan.blockers` order. A milestone with no story has
+    no tree to run.
 
     `slots` is the semaphore every lane takes its slot from: when given it is
     used as is, so concurrent `supervise` calls handed the same one share one
@@ -1509,8 +1469,6 @@ async def supervise(
         if slots is None:
             slots = asyncio.Semaphore(max_concurrent)
         finished: dict[str, LaneOutcome] = {}
-        story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
-        story_ok: dict[str, bool] = {}
         # A lane's `BaseException` that is neither an `Exception` nor a
         # cancellation: grafo would drop it (`run_until_killed`).
         fatal: list[BaseException] = []
@@ -1533,20 +1491,14 @@ async def supervise(
                         slots=slots,
                         stop=stop,
                         finished=finished,
-                        story_done=story_done,
-                        story_ok=story_ok,
                     )
                 except BaseException as error:
-                    story_ok[story.id] = False
                     if not isinstance(error, (Exception, asyncio.CancelledError)):
                         fatal.append(error)
                         killed.set()
                     raise
                 else:
-                    story_ok[story.id] = True
                     return result
-                finally:
-                    story_done[story.id].set()
 
             return run
 

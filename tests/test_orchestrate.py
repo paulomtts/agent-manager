@@ -224,23 +224,26 @@ async def test_build_dag_tree_single_blocker_wires_edge():
     assert calls == {"a": {}, "b": {"from_a": "out-a"}}
 
 
-async def test_build_dag_tree_multi_blocker_is_root_not_edge():
-    """A and B both block C: C gets no incoming edge and is a root itself, so
-    `roots` is every item, in items order. The helper does no waiting: C runs
-    with no forwarded kwargs."""
+async def test_build_dag_tree_multi_blocker_gets_an_edge_from_every_parent():
+    """A and B both block C: C gets one edge from each, waits on both parents'
+    events, is no root, and receives both blockers' forwarded outputs."""
     a, b = _DagItem("a"), _DagItem("b")
     c = _DagItem("c", ("a", "b"))
     calls: dict[str, dict[str, Any]] = {}
 
     nodes, roots = await _build([a, b, c], calls)
 
-    assert nodes["a"].children == []
-    assert nodes["b"].children == []
-    assert roots == [nodes["a"], nodes["b"], nodes["c"]]
+    assert nodes["a"].children == [nodes["c"]]
+    assert nodes["b"].children == [nodes["c"]]
+    assert roots == [nodes["a"], nodes["b"]]
+    assert nodes["c"] not in roots
+    assert len(nodes["c"]._parent_events) == 2
+    assert nodes["c"]._parent_events[0] is nodes["a"]._event
+    assert nodes["c"]._parent_events[1] is nodes["b"]._event
 
     await grafo.TreeExecutor(uuid="merged", roots=roots).run()
 
-    assert calls == {"a": {}, "b": {}, "c": {}}
+    assert calls["c"] == {"from_a": "out-a", "from_b": "out-b"}
 
 
 async def test_build_dag_tree_no_forward_connects_without_kwarg():
@@ -282,21 +285,23 @@ async def test_build_dag_tree_forward_returning_none_connects_without_kwarg():
 
 
 async def test_build_dag_tree_roots_follow_items_order():
-    """A merged item listed before a plain root keeps its place: roots are in
-    items order, not plain roots first."""
-    a, b = _DagItem("a"), _DagItem("b")
+    """Roots are exactly the zero-blocker items, in items order: `e` after `b`
+    proves the order is the items', not alphabetical, and the merged `c`
+    listed between them is no root."""
+    a, b, e = _DagItem("a"), _DagItem("b"), _DagItem("e")
     c = _DagItem("c", ("a", "b"))
     calls: dict[str, dict[str, Any]] = {}
 
-    nodes, roots = await _build([a, c, b], calls)
+    nodes, roots = await _build([a, c, b, e], calls)
 
-    assert list(nodes) == ["a", "c", "b"]
-    assert roots == [nodes["a"], nodes["c"], nodes["b"]]
+    assert list(nodes) == ["a", "c", "b", "e"]
+    assert roots == [nodes["a"], nodes["b"], nodes["e"]]
+    assert nodes["c"] not in roots
 
 
 async def test_build_dag_tree_merged_item_still_forwards_to_its_dependent():
-    """A merged item is a root, and a single-blocker item behind it is still
-    reached by an edge forwarding the merged item's output."""
+    """A single-blocker item behind a merged item is reached by an edge
+    forwarding the merged item's output."""
     a, b = _DagItem("a"), _DagItem("b")
     joined = _DagItem("joined", ("a", "b"))
     d = _DagItem("d", ("joined",))
@@ -305,7 +310,7 @@ async def test_build_dag_tree_merged_item_still_forwards_to_its_dependent():
     nodes, roots = await _build([a, b, joined, d], calls)
 
     assert nodes["joined"].children == [nodes["d"]]
-    assert roots == [nodes["a"], nodes["b"], nodes["joined"]]
+    assert roots == [nodes["a"], nodes["b"]]
 
     await grafo.TreeExecutor(uuid="joined", roots=roots).run()
 
@@ -314,6 +319,95 @@ async def test_build_dag_tree_merged_item_still_forwards_to_its_dependent():
 
 async def test_build_dag_tree_empty_items():
     assert await _build([], {}) == ({}, [])
+
+
+async def test_build_dag_tree_never_runs_an_item_whose_blocker_raised():
+    """A raises, so grafo never enqueues C (blocked by A and B): C's coroutine
+    is never called and C has no output. grafo's own gate, no waiting here."""
+    a, b = _DagItem("a"), _DagItem("b")
+    c = _DagItem("c", ("a", "b"))
+    calls: dict[str, dict[str, Any]] = {}
+
+    def factory(item: _DagItem) -> Callable[..., Awaitable[str]]:
+        async def run(**forwarded: Any) -> str:
+            calls[item.id] = forwarded
+            # One scheduling tick before A raises, so every root has been
+            # picked up by a worker first: were C a root, it would be called.
+            await asyncio.sleep(0)
+            if item.id == "a":
+                raise RuntimeError("a failed")
+            return f"out-{item.id}"
+
+        return run
+
+    nodes, roots = await orchestrate.build_dag_tree(
+        [a, b, c],
+        id_of=lambda item: item.id,
+        blockers_of=lambda item: item.blockers,
+        node_factory=factory,
+        forward=_dag_forward,
+    )
+    executor = grafo.TreeExecutor(uuid="raised", roots=roots)
+
+    await executor.run()
+
+    assert "c" not in calls
+    assert nodes["c"].output is None
+    assert [type(error) for error in executor.errors] == [RuntimeError]
+
+
+async def test_build_dag_tree_four_node_shape_completes():
+    """Spec §1.1: A and B are roots, D is blocked by A, C by B and D. Every
+    coroutine sets its own event on exit, and a 2+-blocker one first awaits
+    its blockers' events, as `lane` does today. B returns, then A after a
+    wall-clock gap, so D is ready only after grafo shrank its pool. Under
+    grafo 0.3.5 with C an unconnected root, C sat in a worker waiting on D
+    while D was queued behind exit sentinels, and the run never returned.
+    grafo 0.3.6 fixed that pool bug, so this is now a regression pin for the
+    shape, not a red test for `build_dag_tree`'s edges (those are pinned by
+    the edge, roots and raised-blocker tests above)."""
+    a, b = _DagItem("a"), _DagItem("b")
+    d = _DagItem("d", ("a",))
+    c = _DagItem("c", ("b", "d"))
+    done = {item.id: asyncio.Event() for item in (a, b, c, d)}
+
+    def factory(item: _DagItem) -> Callable[..., Awaitable[str]]:
+        async def run(**forwarded: Any) -> str:
+            try:
+                # One scheduling tick first, so a worker takes C before B
+                # returns and shrinks the pool (spec §1.1).
+                await asyncio.sleep(0)
+                if len(item.blockers) >= 2:
+                    for blocker in item.blockers:
+                        await done[blocker].wait()
+                if item.id == "a":
+                    # The pool-shrink window is wall-clock, not ordering
+                    # (spec §1.1): A must return after B's worker shrank it.
+                    await asyncio.sleep(0.05)
+                return f"out-{item.id}"
+            finally:
+                done[item.id].set()
+
+        return run
+
+    nodes, roots = await orchestrate.build_dag_tree(
+        [a, b, d, c],
+        id_of=lambda item: item.id,
+        blockers_of=lambda item: item.blockers,
+        node_factory=factory,
+    )
+
+    try:
+        await asyncio.wait_for(grafo.TreeExecutor(uuid="four", roots=roots).run(), 2.0)
+    except TimeoutError:
+        pytest.fail("the four-node shape hung: D is queued behind grafo's exit sentinels")
+
+    assert {uuid: node.output for uuid, node in nodes.items()} == {
+        "a": "out-a",
+        "b": "out-b",
+        "d": "out-d",
+        "c": "out-c",
+    }
 
 
 def test_story_tips_name_every_story_with_subtasks_in_census_order():
@@ -3746,6 +3840,79 @@ def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
     assert result["bases"] == [_bases_entry(story_c, root_plan)]
     statuses = _statuses(_load(project, result["run_id"]))
     assert (statuses[story_c], statuses[c1], statuses[c2]) == ("done", "done", "done")
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_merged_root_story_with_one_escalated_blocker_is_never_driven(project, fake_bases):
+    """C is blocked by A and B. B finishes clean, then A escalates: C is never
+    driven, no base is built, and C and c1 stay `pending`, as a
+    single-blocker dependent of an escalated story does. A regression pin
+    (spec §5 I1): today's early return in `lane` and grafo's own gate after
+    the fix give the same outcome."""
+    shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
+    story_a, story_b, story_c = (shape["stories"][key] for key in "ABC")
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    b_returned = asyncio.Event()
+
+    async def after_b_returned(stop: StopSignal | None) -> None:
+        await _within(b_returned.wait(), "b1 to return")
+
+    driver = GatedDriver(
+        outcomes={a1: ("review", "reviewer found a blocker")},
+        gates={a1: after_b_returned},
+        returned={b1: b_returned},
+    )
+
+    result = _run(project, shape["milestone"], driver, max_concurrent=2)
+
+    assert c1 not in [call["card"] for call in driver.calls]
+    assert fake_bases.calls == []
+    assert (result["escalated"], result["story"], result["subtask"]) == (True, story_a, a1)
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
+    assert (statuses[story_b], statuses[b1]) == ("done", "done")
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_merged_root_story_behind_an_edge_child_completes_instead_of_hanging(
+    project, fake_bases
+):
+    """Spec §1.1 through `supervise`: D is blocked by A, C by B and D. B
+    returns, then A after a wall-clock gap, so D is ready only after grafo
+    shrank its pool. The run completes and C is built and driven."""
+    shape = _milestone(
+        project,
+        {"A": 1, "B": 1, "D": 1, "C": 1},
+        blocked_by={"D": ["A"], "C": ["B", "D"]},
+    )
+    story_c, story_d = shape["stories"]["C"], shape["stories"]["D"]
+    (a1,) = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    (c1,) = shape["subtasks"]["C"]
+    (d1,) = shape["subtasks"]["D"]
+    b_returned = asyncio.Event()
+
+    async def after_b_returned_and_a_gap(stop: StopSignal | None) -> None:
+        await _within(b_returned.wait(), "b1 to return")
+        # The pool-shrink window is wall-clock, not ordering (spec §1.1): A
+        # must return after B's worker shrank grafo's pool.
+        await asyncio.sleep(0.05)
+
+    driver = GatedDriver(gates={a1: after_b_returned_and_a_gap}, returned={b1: b_returned})
+
+    result = _run_or_fail_if_it_hangs(
+        lambda: _run(project, shape["milestone"], driver, max_concurrent=2)
+    )
+
+    assert result["done"] is True, result
+    assert [call["story_id"] for call in fake_bases.calls] == [story_c]
+    statuses = _statuses(_load(project, result["run_id"]))
+    assert (statuses[story_c], statuses[c1]) == ("done", "done")
+    assert (statuses[story_d], statuses[d1]) == ("done", "done")
 
 
 @pytest.mark.brd

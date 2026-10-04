@@ -110,6 +110,15 @@ opposite: git base-stacking, branch-tip forwarding, brd row recording — all
 story-specific, with no milestone equivalent (there is no "merged base" at
 the milestone level), and it is not touched or generalized.
 
+**Superseded (2026-10-03).** The 2+-blocker "separate path" described here,
+in "The extraction" below and in §4's first risk (an executor root waiting on
+`story_done`/`story_ok` completion events, justified by grafo
+"join-starvation") no longer exists and its rationale does not hold: as
+`2026-10-03-merged-root-real-edges-design.md` §3.4 records, `build_dag_tree`
+now gives a 2+-blocker item one real grafo edge per blocker, the same as a
+single-blocker item gets one, and grafo's own all-parents-done gate is what
+makes it wait.
+
 **The extraction.** Pull the generic half out of `supervise` into a new
 helper, e.g. `orchestrate.build_dag_tree`:
 
