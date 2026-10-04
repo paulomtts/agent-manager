@@ -755,6 +755,8 @@ def test_the_coder_brief_states_the_resume_rule_and_who_commits_the_documents():
     assert "`blocked_reason`" in brief
     assert "Never rewrite, amend, squash or delete them." in brief
     assert "committed by the engine" in brief
+    assert "unless this repository git-ignores them" in brief
+    assert "do not add, force-add, commit or amend" in brief
 
 
 class StandInResult(BaseModel):

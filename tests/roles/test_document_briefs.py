@@ -14,20 +14,25 @@ from agent_manager.roles.loader import load_role
 
 DOCUMENT_ROLES = ("spec_author", "planner", "spec_critic", "plan_critic")
 
-DO_NOT_COMMIT = ("Never run `git commit`", "docs_commit", "Plan-Hash")
+DO_NOT_COMMIT = (
+    "Never run `git commit`",
+    "docs_commit",
+    "Plan-Hash",
+    "unless the repository git-ignores them",
+)
 
 CRITIC_PARAGRAPH = {
     "spec_critic": (
         "Never run `git commit`. Folding fixes into the spec file is the whole"
         " job: the workflow's `docs_commit` step commits the spec and the plan"
         " together, with the `Plan-Hash` trailer that ties them to the finished"
-        " plan."
+        " plan, unless the repository git-ignores them."
     ),
     "plan_critic": (
         "Never run `git commit`. Folding fixes into the plan file is the whole"
         " job: the workflow's `docs_commit` step commits the spec and the plan"
         " together, with the `Plan-Hash` trailer that ties them to the finished"
-        " plan."
+        " plan, unless the repository git-ignores them."
     ),
 }
 

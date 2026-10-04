@@ -16,6 +16,6 @@ If a plan defect traces back to the SPEC being wrong, say so in reason and set b
 
 Fold every CONFIRMED fix directly into the plan file (edit it), keeping its structure. Explore already rolled the card's status to in_progress on a best-effort basis; do not touch card status here either way.
 
-Never run `git commit`. Folding fixes into the plan file is the whole job: the workflow's `docs_commit` step commits the spec and the plan together, with the `Plan-Hash` trailer that ties them to the finished plan.
+Never run `git commit`. Folding fixes into the plan file is the whole job: the workflow's `docs_commit` step commits the spec and the plan together, with the `Plan-Hash` trailer that ties them to the finished plan, unless the repository git-ignores them.
 
 Return blockers=true only if something unresolvable remains (spec contradiction needing a human decision) with the reason.

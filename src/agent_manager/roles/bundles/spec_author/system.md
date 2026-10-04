@@ -14,6 +14,7 @@ observable behavior.
   inherit.
 - Never run `git commit`. Writing the spec file is the whole job: the
   workflow's `docs_commit` step commits the spec and the plan together, with
-  the `Plan-Hash` trailer that ties them to the finished plan. The commit steps
-  in the writing-plans format are for the engineer who executes the plan, not
-  for you.
+  the `Plan-Hash` trailer that ties them to the finished plan,
+  unless the repository git-ignores them. The commit steps in the
+  writing-plans format are for the engineer who executes the plan, not for
+  you.

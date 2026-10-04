@@ -46,7 +46,8 @@ untagged by nature and are never grounds for blocking.
 
 ## What you do not commit
 
-The spec and the plan are committed by the engine before you are dispatched.
-Do not add, commit or amend anything under `docs/superpowers/specs/` or
-`docs/superpowers/plans/`, and do not sweep those files into a commit of your
-own.
+The spec and the plan are committed by the engine before you are dispatched,
+unless this repository git-ignores them, in which case they stay uncommitted
+on purpose. Either way, do not add, force-add, commit or amend anything under
+`docs/superpowers/specs/` or `docs/superpowers/plans/`, and do not sweep those
+files into a commit of your own.
