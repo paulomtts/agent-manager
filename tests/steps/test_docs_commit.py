@@ -942,3 +942,33 @@ def test_only_one_ignored_document_raises_before_any_add(repo: Path, ignored: st
     assert not any("update-ref" in argv for argv in calls), calls
     assert _rev(repo, "HEAD") == head
     assert _git(repo, "diff", "--cached", "--name-only") == ""
+
+
+@pytest.mark.git
+@pytest.mark.parametrize("ignore", [True, False], ids=["ignored", "tracked"])
+def test_a_task_worktree_commits_the_documents_only_when_git_tracks_them(
+    repo: Path, tmp_path: Path, ignore: bool
+) -> None:
+    """Production shape: the documents live in a linked worktree on a task
+    branch cut from `main`, and the rule (if any) is on `main`."""
+    if ignore:
+        _ignore_documents(repo)
+    worktree = tmp_path / "worktrees" / "task"
+    _git(repo, "worktree", "add", "-q", "-b", "task", str(worktree), "main")
+    _write_documents(worktree)
+    before = _git(worktree, "rev-list", "main..HEAD").split()
+
+    result = _run(worktree)
+
+    after = _git(worktree, "rev-list", "main..HEAD").split()
+    assert result["plan_hash"] == _digest(worktree)
+    assert result["backfilled"] == []
+    assert result["documents_committed"] is (not ignore)
+    if ignore:
+        assert after == before == []
+        assert _git(worktree, "status", "--porcelain", "--untracked-files=all") == ""
+    else:
+        assert len(after) == 1
+        assert _message(worktree).splitlines()[-1] == f"Plan-Hash: {result['plan_hash']}"
+        committed = _git(worktree, "show", "--name-only", "--format=", "HEAD").split()
+        assert sorted(committed) == sorted([SPEC_RELATIVE, PLAN_RELATIVE])
