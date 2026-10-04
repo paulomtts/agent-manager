@@ -44,7 +44,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
-The one exception is `am watch --follow`, which prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)).
+The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)).
 
 ### Milestone runs
 
@@ -524,13 +524,15 @@ New keys are additive: a newer `am` may add keys to these objects, but never rem
 am watch 20260923T140506Z-19efcddc
 am watch --all --since 40
 am watch 20260923T140506Z-19efcddc --follow
+am watch --all --follow --from-now
 ```
 
-The shape is `am watch RUN_ID | --all [--since SEQ] [--follow]`:
+The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:
 
 - Give exactly one of `RUN_ID` and `--all`.
 - `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
 - `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+- `--from-now` needs `--follow` and skips the backlog: the stream prints only lines appended after the command started. It cannot be combined with `--since`, whatever its value.
 
 Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
 
@@ -538,6 +540,8 @@ These are refused with `{"ok": false, "error": {"type", "message"}}` and exit co
 
 - both `RUN_ID` and `--all`, or neither;
 - a `--since` below 0;
+- `--from-now` together with `--since`, any value, 0 included;
+- `--from-now` without `--follow`;
 - a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
 - a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
 
@@ -552,6 +556,8 @@ Watching a run id that does not exist creates no run directory.
 ```
 
 `am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":1`.
 
 Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
 
@@ -600,6 +606,56 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
 - Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run) are in the `payload` of its first line, a `run_upsert`. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
+
+### Reading an attempt's output
+
+`am logs` prints what one attempt of one phase of one subtask was given and wrote. Like `am status` and `am runs`, it reads the projection and takes no lease, no claim and no lock, so it works beside any number of live runs.
+
+```bash
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement --follow
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement --follow --since-offset 20
+```
+
+The shape is `am logs RUN_ID CARD [--phase P] [--attempt N] [--follow] [--since-offset BYTES] [--repo-dir DIR]`:
+
+- `--phase` defaults to the last phase with attempts, and `--attempt` to that phase's highest recorded attempt.
+- Without `--follow`, `am logs` prints one envelope with the attempt's prompt, result and captured output, and exits 0.
+
+#### Following an attempt with `--follow`
+
+`--follow` turns the output into a stream of the attempt's stdout file, one JSON object per line:
+
+```
+{"event":"logs","offset":0,"path":"/home/you/.local/share/agent-manager/runs/20261002T140000Z-19efcddc/<subtask-id>/implement.1/stdout.log","schema":1}
+{"offset":0,"text":"Reading the plan...\n"}
+{"offset":20,"text":"Running uv run pytest\n"}
+{"event":"end","status":"ok"}
+```
+
+- The first line is the hello line. `path` is the file being followed: the stdout file an agent attempt recorded (its stderr is merged into it), or `<phase>.N/stdout.log` for a deterministic phase such as `verify`. `offset` is the byte the stream starts at: 0, or the `--since-offset` you passed.
+- Then come the file's bytes as `{"offset", "text"}` lines: what is already in the file first, then each append, flushed as soon as it is written. Chunks are contiguous, and each chunk's `offset` is the byte position of its first byte in the file. `text` is decoded as UTF-8. A character split across two reads is held back and arrives whole in the next chunk. A byte that is not valid UTF-8 comes out as U+FFFD.
+- A file that is not written yet gives no chunk. The stream waits until it appears.
+- Once the attempt has a terminal status and the file has stopped growing, the stream ends. A partial character still held back at the very end of the file comes out first, as one last chunk decoded with U+FFFD. Then the last line is `{"event":"end","status":S}`, and the exit code is 0. `S` is the attempt's status: `ok`, `schema_invalid`, `gate_failed` or `harness_error`, the vocabulary of `attempt_upsert` in the [journal](#the-journal-line). A deterministic phase has no attempt status of its own, so `S` is `ok` when the attempt is the phase's latest and the phase is `done`, and `gate_failed` when a later attempt superseded it or the phase failed, escalated, stopped or was cancelled.
+
+To pick up where you left off, pass `--since-offset B`, the way `--since` resumes `am watch`. `B` is the last chunk's `offset` plus the UTF-8 byte length of its `text`. That sum is exact for valid UTF-8. A U+FFFD stands for invalid bytes of the file but is 3 bytes in `text`, so after invalid bytes the sum can overcount. The next chunk's `offset` is always exact, so prefer it when you have one.
+
+Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. An error after the hello line cannot get an envelope, for example the run, card, phase or attempt no longer being in the projection. `am logs` then prints `am logs: <message>` on stderr and exits 3, as `am watch` does.
+
+These are refused with the usual `{"ok": false, "error": {"type", "message"}}` envelope and exit code 3, before any stream line is written:
+
+- an unknown run, card, phase or attempt, as for the one-shot;
+- a `--since-offset` below 0;
+- `--since-offset` without `--follow`, whatever its value, 0 included;
+- an agent attempt that recorded no stdout path, since there is no file to follow.
+
+So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event":"logs"`. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+`am logs --follow` checks the file about every 250 ms. That interval is internal and is not part of the contract.
+
+The hello line's `schema` is the stream's own version, `1` today. It is independent of the journal line's version and of the `am watch` hello line's `schema`, and a change to the chunk or end lines is signaled there.
+
+New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
 ## Resuming: what runs again
 
