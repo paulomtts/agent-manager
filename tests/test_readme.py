@@ -132,6 +132,24 @@ def test_detach_section_documents_envelope():
     assert "usage error (exit 2)" in section
 
 
+def test_detach_section_documents_the_board_form():
+    """Card 03f027ea: `--board --detach` is documented in prose, with no second
+    JSON example (`test_detach_section_documents_envelope` pins exactly one)."""
+    section = _section("Running detached with `--detach`")
+    assert "`--card`, `--milestone` and `--board`" in section
+    assert "<data dir>/boards/" in section
+    assert detach.BOARD_LOG_SUFFIX in section
+    assert detach.BOARD_REPORT_SUFFIX in section
+    for key in ("board", "detached", "pid", "log", "report", "levels"):
+        assert f"`{key}`" in section
+    assert "no `run_id`" in section
+    assert "am watch --all" in section
+    assert len(_fenced_json_lines(section)) == 1
+    text = README.read_text(encoding="utf-8")
+    assert "`--detach` with `--board`" not in text
+    assert "or with `--board`" not in text
+
+
 def test_watch_documents_from_now():
     section = _section("Watching a run")
     assert (
