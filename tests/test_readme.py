@@ -89,3 +89,44 @@ def test_usage_names_both_streaming_commands():
     assert _slug(LOGS_TITLE) in anchors
     slugs = {_slug(title) for _, _, title in _headings()}
     assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
+
+
+def test_runs_section_documents_new_keys():
+    section = _section("Listing runs")
+    new_keys = ("milestone_id", "card_id", "lease", "progress")
+    assert set(new_keys) <= set(store.RunSummary.model_fields)
+    for key in new_keys:
+        assert f"`{key}`" in section, key
+    for model in (
+        store.RunLease,
+        store.RunProgress,
+        store.ProgressCount,
+        store.ProgressCurrent,
+    ):
+        for field in model.model_fields:
+            assert re.search(rf"\b{field}\b", section), f"{model.__name__}.{field}"
+    assert "It is `null` on a `--card` run" in section
+    assert "It is `null` on a milestone run" in section
+    assert "`null` if no process has a lease row for it" in section
+    assert "`am status <run-id>` shows in `control.lease`" in section
+    assert ADDITIVE in section
+    assert IGNORE_UNKNOWN in section
+
+
+def test_detach_section_documents_envelope():
+    section = _section("Running detached with `--detach`")
+    examples = _fenced_json_lines(section)
+    assert len(examples) == 1
+    _, envelope = examples[0]
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert data["detached"] is True
+    assert isinstance(data["pid"], int)
+    assert data["log"].endswith(f"/runs/{data['run_id']}/{detach.RUN_LOG_NAME}")
+    assert detach.RUN_LOG_NAME in section
+    assert detach.REPORT_NAME in section
+    assert f"mode {detach.FILE_MODE:04o}" in section
+    assert "exit code 3" in section
+    assert "exits 0" in section
+    assert "usage error (exit 2)" in section
