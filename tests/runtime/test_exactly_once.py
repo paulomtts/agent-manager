@@ -267,13 +267,26 @@ def _runner(opened, launcher: FakeLauncher, roles: Path) -> dispatch.AgentRunner
     )
 
 
+WORKTREE: Path | None = None
+"""The subtask's worktree path. The autouse `worktree_dir` fixture sets it to a
+real `tmp_path` directory, so a resume takes the engine's no-git fast path."""
+
+
+@pytest.fixture(autouse=True)
+def worktree_dir(tmp_path, monkeypatch) -> Path:
+    path = tmp_path / "worktree"
+    path.mkdir()
+    monkeypatch.setitem(globals(), "WORKTREE", path)
+    return path
+
+
 def _subtask() -> models.SubtaskRun:
     return models.SubtaskRun(
         card_id=CARD_ID,
         branch=f"m11/task-adopt-the-resumed-head-{CARD_ID}",
         base_branch="m11/story-base",
         status="started",
-        worktree_path=Path("/w"),
+        worktree_path=WORKTREE,
     )
 
 

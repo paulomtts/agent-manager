@@ -44,13 +44,26 @@ def store(monkeypatch, tmp_path):
     opened.close()
 
 
+WORKTREE: Path | None = None
+"""The subtask's worktree path. The autouse `worktree_dir` fixture sets it to a
+real `tmp_path` directory, so a resume takes the engine's no-git fast path."""
+
+
+@pytest.fixture(autouse=True)
+def worktree_dir(tmp_path, monkeypatch) -> Path:
+    path = tmp_path / "worktree"
+    path.mkdir()
+    monkeypatch.setitem(globals(), "WORKTREE", path)
+    return path
+
+
 def _subtask(card_id: str = CARD_ID) -> models.SubtaskRun:
     return models.SubtaskRun(
         card_id=card_id,
         branch=f"m6/task-checkpoint-every-turn-{card_id}",
         base_branch="m6/story-base",
         status="started",
-        worktree_path=Path("/w"),
+        worktree_path=WORKTREE,
     )
 
 
@@ -75,6 +88,7 @@ WALK_PARAMETERS = [
     "extra_context",
     "agent_runner",
     "clock",
+    "ensure_worktree",
     "stop",
     "resume_from",
 ]

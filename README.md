@@ -36,7 +36,7 @@ am run --card 19efcddc-0000-0000-0000-000000000000 \
   --verify "uv run ruff check"
 ```
 
-Pick a run back up where it was interrupted: a `--card` run's one stopped or killed subtask, at the phase it was interrupted in, or a `--milestone` run's whole milestone, under the same run id. There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here: they were decided when the run started and are recorded on the run. The verification suite is not recorded. A walk continued from a checkpoint keeps the suite and the opt-out the run started with, so on a `--card` run `--verify` and `--allow-no-verification` have no effect. When `--verify` on a `--card` run differs from the kept suite, `data.warnings` names the kept suite as `verification: kept from checkpoint: [...]`. On a milestone run, pass the same `--verify` commands (or `--allow-no-verification`) again: they are what every subtask with no checkpoint, every merged base and Integrate run. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
+Pick a run back up where it was interrupted: a `--card` run's one stopped or killed subtask, at the phase it was interrupted in, or a `--milestone` run's whole milestone, under the same run id. There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here: they were decided when the run started and are recorded on the run. The verification suite is not recorded. A walk continued from a checkpoint keeps the suite and the opt-out the run started with, so on a `--card` run `--verify` and `--allow-no-verification` have no effect. The exception is a checkpoint declined because its worktree could not be kept (see [Resuming: what runs again](#resuming-what-runs-again)): that subtask is walked again from its first phase with the `--verify` commands and `--allow-no-verification` passed now, not the kept suite, and a `verification: kept from checkpoint: [...]` warning shown beside the decline warning is then stale. When `--verify` on a `--card` run differs from the kept suite, `data.warnings` names the kept suite as `verification: kept from checkpoint: [...]`. On a milestone run, pass the same `--verify` commands (or `--allow-no-verification`) again: they are what every subtask with no checkpoint, every merged base and Integrate run. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
 
 ```bash
 am resume 20260923T140506Z-19efcddc
@@ -331,7 +331,7 @@ A milestone resume refuses before anything is written and before git is fetched,
 - any open subtask, or any open `base-<story id>` resolver, has a checkpoint saved under a workflow that has changed since (its digest no longer matches). One stale checkpoint refuses the whole resume, and nothing is written. Relaunch with `am run --milestone` instead: a relaunch starts such a card again from its first phase rather than refusing.
 - the run id's milestone is not on the board, or more than one root card has its short id, or the stories now have a blocker cycle.
 
-On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. A phase that finished just before the process was killed, before the next checkpoint was saved, depends on its kind: an agent phase is adopted and not dispatched again, and a step runs again (see [Resuming: what runs again](#resuming-what-runs-again)). Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `cancelled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
+On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. A phase that finished just before the process was killed, before the next checkpoint was saved, depends on its kind: an agent phase is adopted and not dispatched again, and a step runs again (see [Resuming: what runs again](#resuming-what-runs-again)). Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` (`null` when the checkpoint was declined and the walk started over, see [Resuming: what runs again](#resuming-what-runs-again)) and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `cancelled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
 
 A `task` run's resume refuses before anything runs, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
@@ -530,6 +530,24 @@ phase 'implement' was not dispatched again: attempt 1 of run <run-id> had alread
 A recorded result that no longer holds up is dispatched again, with one warning line `phase '<name>': attempt <n> of run <run-id> was not reused (<why>); dispatching again`. The envelope shape and the exit codes are the same as for any other resume.
 
 Exactly-once covers am's dispatch of an agent phase, not what the harness did. The harness's own effects are never transactional: commits, files written in the worktree, or anything else an agent did before the kill stay as they are, whether the phase is then adopted or dispatched again. A phase that is dispatched again finds that work already in its worktree; `implement`, for example, resumes from git and the `Plan-Hash` trailers.
+
+Before a checkpoint is continued, the subtask's worktree is checked. A worktree deleted outside `am` (an `rm -rf`, a `git worktree remove`) is a recovery, never a refusal:
+
+| The subtask's worktree on resume | What happens | Warning | Where the walk goes on |
+|---|---|---|---|
+| Present (or the subtask has none) | Nothing runs: no git, no warning. | none | At the checkpoint's pending phase. |
+| Missing, its branch still exists | The worktree is added again for the branch, which keeps its commits. | one, "added again" | At the checkpoint's pending phase. |
+| Missing, and its branch is gone too, or adding it again fails | The checkpoint is not resumed. | one, "was not resumed" | From the subtask's first phase, `worktree`, as a fresh walk. When the branch was gone it is cut again from its base; a real git failure is reported by the `worktree` step as an ordinary escalation at `worktree`. |
+
+The three warning lines, in `data.warnings` on a `--card` run and in the run's warnings on a milestone run:
+
+```
+checkpoint #<seq> of run <run-id>: worktree <path> was missing and was added again for branch '<branch>'; resuming at '<phase>'
+checkpoint #<seq> of run <run-id> was not resumed (worktree <path> is missing and branch '<branch>' no longer exists); starting from the first phase
+checkpoint #<seq> of run <run-id> was not resumed (worktree <path> is missing and could not be added again: GitError: <message>); starting from the first phase
+```
+
+After a decline, `data.resumed_from` is `null` and a milestone run's `done` comment for that subtask carries no `(resumed at <phase>)` line: both report where the walk actually went on, not the checkpoint it was handed. The declined checkpoint row is not deleted or rewritten; the fresh walk's first checkpoint, saved at a higher seq, supersedes it.
 
 ## What the board records
 

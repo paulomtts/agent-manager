@@ -5324,6 +5324,80 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
     assert board.show(cards["subtask"], repo_dir=project).status == "done"
 
 
+def _resumable_subtask(project: Path, run_id: str, card_id: str) -> models.SubtaskRun:
+    """The subtask row `run_id` recorded for `card_id`: its branch and worktree."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    found = cli.find_subtask(run, card_id)
+    assert found is not None
+    return found[1]
+
+
+def _newest_seq(project: Path, run_id: str, card_id: str) -> int:
+    """The seq of `card_id`'s newest checkpoint in `run_id`: the one a resume reads."""
+    return max(
+        row[2]
+        for row in _checkpoint_rows(cli.resolve_repo_dir(project))
+        if row[0] == run_id and row[1] == card_id
+    )
+
+
+@pytest.mark.git
+def test_a_pygents_resume_with_its_worktree_deleted_re_adds_it_and_resumes_at_implement(
+    project, cards
+):
+    """Resume worktree re-ensure §3.2 case 2: the branch survives, so the
+    worktree is added again, the checkpoint is kept and `resumed_from` still
+    names its pending phase, with the re-added line in `data.warnings`."""
+    run_id = _crash_pygents(project, cards, "implement")
+    subtask = _resumable_subtask(project, run_id, cards["subtask"])
+    seq = _newest_seq(project, run_id, cards["subtask"])
+    shutil.rmtree(subtask.worktree_path)
+    seen: list[str] = []
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory(seen))
+
+    assert seen[0] == "implement"
+    assert payload["status"] == "done"
+    assert payload["resumed_from"] == "implement"
+    assert (
+        f"checkpoint #{seq} of run {run_id}: worktree {subtask.worktree_path} was missing"
+        f" and was added again for branch '{subtask.branch}'; resuming at 'implement'"
+    ) in payload["warnings"]
+
+
+@pytest.mark.git
+def test_a_pygents_resume_with_worktree_and_branch_gone_declines_the_checkpoint(
+    project, cards
+):
+    """Resume worktree re-ensure §3.2 case 3 and §3.6: the branch is gone too,
+    so the checkpoint is declined and the subtask is walked from its first
+    phase. `resumed_from` is then `null`, not the checkpoint's `plan`."""
+    run_id = _crash_pygents(project, cards, "plan")
+    subtask = _resumable_subtask(project, run_id, cards["subtask"])
+    seq = _newest_seq(project, run_id, cards["subtask"])
+    root = cli.resolve_repo_dir(project)
+    shutil.rmtree(subtask.worktree_path)
+    # git refuses `branch -D` while the stale registration still claims the
+    # branch, which is why the branch is deleted through `update-ref` here.
+    _git(root, "update-ref", "-d", f"refs/heads/{subtask.branch}")
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert payload["resumed_from"] is None
+    assert payload["status"] == "done"
+    assert (
+        f"checkpoint #{seq} of run {run_id} was not resumed (worktree"
+        f" {subtask.worktree_path} is missing and branch '{subtask.branch}' no longer"
+        " exists); starting from the first phase"
+    ) in payload["warnings"]
+    assert set(payload) == RESUME_KEYS
+
+
 @pytest.mark.brd
 @pytest.mark.git
 def test_a_pygents_resume_marks_the_orphan_attempt_harness_error(project, cards):

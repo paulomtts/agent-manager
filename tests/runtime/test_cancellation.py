@@ -73,13 +73,26 @@ def completions():
     HookRegistry.unregister("record_turn_completion")
 
 
+WORKTREE: Path | None = None
+"""The subtask's worktree path. The autouse `worktree_dir` fixture sets it to a
+real `tmp_path` directory, so a resume takes the engine's no-git fast path."""
+
+
+@pytest.fixture(autouse=True)
+def worktree_dir(tmp_path, monkeypatch) -> Path:
+    path = tmp_path / "worktree"
+    path.mkdir()
+    monkeypatch.setitem(globals(), "WORKTREE", path)
+    return path
+
+
 def _subtask(card_id: str = CARD_ID) -> models.SubtaskRun:
     return models.SubtaskRun(
         card_id=card_id,
         branch=f"m8/task-pin-pygents-{card_id}",
         base_branch="m8/story-base",
         status="started",
-        worktree_path=Path("/w"),
+        worktree_path=WORKTREE,
     )
 
 
