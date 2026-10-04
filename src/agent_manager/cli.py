@@ -2356,8 +2356,11 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     does up to its first write and no further: `Store.open`, the run's own
     lease with no claims (a reset drives no card and no branch), and one
     fenced `record_run` of `cancelled`. No checkpoint row is written or
-    deleted, and no other row is touched. The lease is released and the store
-    closed on every exit.
+    deleted, and no other row is touched. `cards` then reports each
+    `(card_id, workflow)` the run checkpointed and, by
+    `Store.latest_open_checkpoint`, which other run (if any) a relaunch
+    would still continue it from (`open_in`). The lease is released and the
+    store closed on every exit.
 
     A run already `cancelled` is not refused: the lease is taken and released
     around the check, and nothing is journalled (`already_cancelled: true`).
@@ -2398,6 +2401,23 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
             already = current.status == "cancelled"
             if not already:
                 store.record_run(current.model_copy(update={"status": "cancelled"}))
+        # After the status write (or the no-op): each `(card_id, workflow)` the
+        # run checkpointed, with the run a relaunch would continue it from by
+        # the newest-row rule -- `null` unless that is another run (§3.5).
+        cards: list[dict[str, Any]] = []
+        for card_id, workflow in store.checkpoint_cards(run.id):
+            found = store.latest_open_checkpoint(card_id, workflow)
+            cards.append(
+                {
+                    "card_id": card_id,
+                    "workflow": workflow,
+                    "open_in": (
+                        found.run_id
+                        if found is not None and found.run_id != run.id
+                        else None
+                    ),
+                }
+            )
     finally:
         store.close()
     payload: dict[str, Any] = {
@@ -2405,8 +2425,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
         "previous_status": current.status,
         "status": "cancelled",
         "already_cancelled": already,
-        # af52db54 fills this in from the run's checkpoints.
-        "cards": [],
+        "cards": cards,
         "message": _reset_message(run.id, already=already),
     }
     if lease.displaced is not None:

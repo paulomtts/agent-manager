@@ -46,6 +46,7 @@ from agent_manager import (
     orchestrate,
     paths,
     prompt,
+    runs,
     store as store_module,
 )
 from agent_manager.errors import AgentPhaseFailed
@@ -8581,7 +8582,9 @@ def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkey
 # `am reset RUN_ID` closes a run nobody is driving: read-only refusals, then
 # the run's own lease with no claims, one fenced `run_upsert` of `cancelled`,
 # and the lease released. Unit tier: the projection fixture and the store
-# only, no subprocess. `cards` stays `[]` here; af52db54 fills it in.
+# only, no subprocess. `cards` (card af52db54) lists each `(card_id,
+# workflow)` the run checkpointed with the run a relaunch would continue it
+# from (`open_in`), or `null`.
 
 RESET_KEYS = {
     "run_id",
@@ -8614,20 +8617,30 @@ def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
         conn.close()
 
 
-def _plant_parked_checkpoint(root: Path) -> None:
-    """One open `parked` checkpoint of card-1 under the run, as a paused walk leaves it."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+def _plant_parked_checkpoint(
+    root: Path,
+    *,
+    run_id: str = CONTROL_RUN_ID,
+    card_id: str = "card-1",
+    workflow: str = task_workflow.TASK.name,
+    reason: str = "parked",
+    saved_at: datetime = CONTROL_NOW,
+) -> None:
+    """One checkpoint row, by default the open `parked` row of card-1 a paused
+    walk leaves under the run. The keywords plant the other rows the `cards`
+    tests need: another run's, another workflow's, an older or newer one."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         opened.save_checkpoint(
-            "card-1",
-            workflow=task_workflow.TASK.name,
+            card_id,
+            workflow=workflow,
             digest=task_workflow.TASK.digest(),
-            reason="parked",
+            reason=reason,
             agent={
                 "current_turn": None,
                 "queue": [{"kwargs": {"phase": "plan", "loop": 0}}],
             },
-            saved_at=CONTROL_NOW,
+            saved_at=saved_at,
         )
     finally:
         opened.close()
@@ -8647,7 +8660,8 @@ def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
 def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
     projection, worktree_present
 ):
-    """Spec test 1 (store half; `cards`/`open_in` are af52db54's)."""
+    """Spec test 1, `cards` half from af52db54: the run's own row was the
+    newest, so the card is closed and `open_in` is null."""
     _plant_run(projection, status="stopped")
     _plant_parked_checkpoint(projection)
     worktree = projection / ".claude" / "worktrees" / "m1" / "task-x"
@@ -8670,7 +8684,7 @@ def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
         "previous_status": "stopped",
         "status": "cancelled",
         "already_cancelled": False,
-        "cards": [],
+        "cards": [{"card_id": "card-1", "workflow": "task", "open_in": None}],
         "message": RESET_MESSAGE,
     }
     assert _recorded_status(projection) == "cancelled"
@@ -8904,6 +8918,132 @@ def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
     upserts_after = [line for line in _journal_lines() if line.event == "run_upsert"]
     assert len(upserts_after) == len(upserts_before) + 1
     assert _lease(projection) is None
+
+
+def _plant_other_run(root: Path, status: str = "stopped") -> None:
+    """Run Y (`OTHER_RUN_ID`): a second run in the projection, as a crashed
+    earlier life of the same card leaves it."""
+    _record(root, OTHER_RUN_ID, started_at=RECORDED_AT, status=status, with_phases=False)
+
+
+def test_a_repeated_reset_reports_the_same_cards_and_writes_nothing(projection):
+    """af52db54 spec test 5: an already-cancelled reset still reports `cards`."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection)
+
+    first = _invoke_reset(projection)
+    lines_after_first = _journal_lines()
+    checkpoints_after_first = _checkpoint_rows(projection)
+    second = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    first_data = json.loads(first.stdout)["data"]
+    second_data = json.loads(second.stdout)["data"]
+    assert first_data["already_cancelled"] is False
+    assert second_data["already_cancelled"] is True
+    assert second_data["cards"] == first_data["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": None}
+    ]
+    assert _journal_lines() == lines_after_first
+    assert _checkpoint_rows(projection) == checkpoints_after_first
+    assert _lease(projection) is None
+
+
+def test_reset_lists_every_pair_it_checkpointed_in_order_a_done_card_included(
+    projection,
+):
+    """Review Focus 1: every `(card_id, workflow)` with a row under the run,
+    any reason, ordered by card then workflow."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection, card_id="card-2", reason="done", saved_at=_at(0))
+    _plant_parked_checkpoint(projection, card_id="card-1", saved_at=_at(1))
+    _plant_parked_checkpoint(
+        projection, card_id="card-1", workflow="integrate", reason="turn", saved_at=_at(2)
+    )
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["cards"] == [
+        {"card_id": "card-1", "workflow": "integrate", "open_in": None},
+        {"card_id": "card-1", "workflow": "task", "open_in": None},
+        {"card_id": "card-2", "workflow": "task", "open_in": None},
+    ]
+
+
+def test_reset_reports_open_in_null_when_its_own_row_is_the_newest(projection):
+    """af52db54 spec test 10, chain case: Y's open row is older than X's, so
+    once X is cancelled the newest-row rule closes the card, and a relaunch
+    continues nothing even though Y's row is still open. Two stores on one
+    database: a reader bound to Y stays open across X's reset."""
+    _plant_run(projection, status="stopped")
+    _plant_other_run(projection)
+    _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
+    _plant_parked_checkpoint(projection, saved_at=_at(1))
+    reader = store_module.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
+    try:
+        before = runs.continuable_checkpoint(reader, "card-1")
+        assert before is not None and before.run_id == CONTROL_RUN_ID
+        checkpoints_before = _checkpoint_rows(projection)
+
+        result = _invoke_reset(projection)
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["cards"] == [
+            {"card_id": "card-1", "workflow": "task", "open_in": None}
+        ]
+        assert runs.continuable_checkpoint(reader, "card-1") is None
+        assert reader.latest_open_checkpoint("card-1", task_workflow.TASK.name) is None
+    finally:
+        reader.close()
+    # Y's row is still there and Y is untouched: only the newest row decided.
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert any(row[0] == OTHER_RUN_ID for row in checkpoints_before)
+    assert _recorded_status(projection, OTHER_RUN_ID) == "stopped"
+
+
+def test_reset_names_the_run_a_newer_bases_row_keeps_the_card_open_in(projection):
+    """af52db54 spec test 10, variant: Y's newest row for the card is under
+    `bases`, so resetting X leaves Y's older `task` row continuable
+    (`open_in: Y`). Once Y is reset too, every report is null."""
+    _plant_run(projection, status="stopped")
+    _plant_other_run(projection)
+    _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
+    _plant_parked_checkpoint(projection, reason="turn", saved_at=_at(1))
+    _plant_parked_checkpoint(
+        projection, run_id=OTHER_RUN_ID, workflow="bases", saved_at=_at(2)
+    )
+    checkpoints_before = _checkpoint_rows(projection)
+
+    first = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    # Exactly X's own pair: Y's `bases` pair is not X's to report.
+    assert json.loads(first.stdout)["data"]["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": OTHER_RUN_ID}
+    ]
+
+    other = _invoke_reset(projection, OTHER_RUN_ID)
+
+    assert other.exit_code == 0, other.output
+    other_data = json.loads(other.stdout)["data"]
+    assert other_data["previous_status"] == "stopped"
+    assert other_data["cards"] == [
+        {"card_id": "card-1", "workflow": "bases", "open_in": None},
+        {"card_id": "card-1", "workflow": "task", "open_in": None},
+    ]
+
+    again = _invoke_reset(projection)
+
+    assert again.exit_code == 0, again.output
+    again_data = json.loads(again.stdout)["data"]
+    assert again_data["already_cancelled"] is True
+    assert again_data["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": None}
+    ]
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _recorded_status(projection, OTHER_RUN_ID) == "cancelled"
 
 
 def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
