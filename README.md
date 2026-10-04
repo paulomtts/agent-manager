@@ -135,6 +135,61 @@ Read the `base` column before a real run:
   `brd block <story> --by <blocker>` and preview again.
 - A cycle between stories is refused with exit code 3 before anything is written. A story with two or more blockers is not refused.
 
+#### Running every open milestone with `--board`
+
+```bash
+am run --board --verify "uv run pytest" [--branch-prefix P] [--max-concurrent N]
+am run --board --dry-run --pretty
+```
+
+`--board` drives every open milestone on the board in one command, as one dependency graph. Each milestone runs exactly as `am run --milestone` would run it: its stories, its [merged bases](#multiple-blockers) and its own [Integrate](#integrate) into its own `<prefix>-integrate`. Across milestones:
+
+- Milestones are leveled by the `blocked_by` edges between them. A milestone that is done, with nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied.
+- A milestone starts once every open milestone blocking it has finished `done`.
+- If a blocker ends in any other status (`escalated`, `stopped`, `cancelled`, or `blocked` itself), the milestone is never started: no run, no branch, no worktree, no board change. It is reported `blocked`.
+- A milestone whose run raises an error is reported `escalated`, and the other milestones carry on.
+- A board with no open milestone is `ok`, runs nothing and exits 0.
+
+Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, and `--detach` with `--board` are usage errors (exit 2).
+
+Refusals. These come in this order, before anything is written. Each prints `{"ok": false, "error": {"type", "message"}}` and exits 3:
+
+1. A blank `--base-branch`.
+2. A blocker cycle between milestones (`DependencyCycleError`).
+3. A blank prefix, or a prefix two milestones share.
+4. A claim another live run holds, checked once over the claims of every open milestone together (`ClaimedError`, see [Several am processes](#several-am-processes)).
+
+A refused board run leaves no run row, no run directory and no lease for any milestone. A board that cannot be read is refused the same way, as on a `--milestone` run.
+
+The run's `data` is `{"ok", "board": true, "levels", "milestones"}`. It has no `run_id` of its own.
+
+- `levels` is a list of `{"level", "milestones"}`, where `milestones` lists milestone ids. As with `--milestone`, levels are a way to read the plan: a milestone waits only for its own blockers.
+- `milestones` has one entry per open milestone, in level order. Each entry has one of three shapes:
+  - A milestone that ran: `{"milestone_id", "status", ...}`, followed by every key of that milestone's own `--milestone` report (see [What a clean run leaves behind](#what-a-clean-run-leaves-behind) and [What an escalation report contains](#what-an-escalation-report-contains)), its `run_id` included. `status` is `done`, `escalated`, `stopped` (a pause) or `cancelled`.
+  - A milestone that never started: `{"milestone_id", "status": "blocked", "blocked_by"}`. `blocked_by` lists the ids of its blockers that did not finish `done`.
+  - A milestone whose run raised an error: `{"milestone_id", "status": "escalated", "error"}`, with `error` reading `"<Type>: <message>"`. It has no `run_id` key. One example is a claim that another run took after the board's up-front check.
+- `ok` is `true` only when every entry is `done`.
+
+The outer envelope's `ok` is `true` whatever the outcome, because the report itself is a true result. The exit code is 1 only when some entry is `escalated`. A board whose milestones are only `done`, `blocked`, `stopped` or `cancelled` exits 0, even when `data.ok` is `false`. Read `data.ok`, not the exit code, to know whether everything finished.
+
+`--dry-run` with `--board` is read-only. It opens no store, checks no claim, writes nothing, and exits 0. It still refuses a blocker cycle, a bad prefix and a board that cannot be read, the same way as above. Its `data` is `{"board": true, "max_concurrent", "levels"}`, with no `ok` and no `run_id`. `levels` is a list of `{"level", "milestones"}`, and each milestone is `{"milestone_id", "title", "branch_prefix", "plan"}`. `branch_prefix` is the prefix that milestone will run under. `plan` is exactly that milestone's own `--milestone --dry-run` data (`max_concurrent`, `levels`, `already_done`, `integrate`). Read each plan as described in [Preview with `--dry-run`](#preview-with---dry-run), `base` column included.
+
+`--max-concurrent N` is one slot pool for the whole board, not N per milestone. Every story of every milestone takes a slot from the same N, so N caps the stories running at once across the board. It defaults to 4, as with `--milestone`, and `--max-concurrent 1` runs one story at a time on the whole board. Integrate merges do not take a slot (see [Integrate](#integrate)). Everything else in [Parallel runs](#parallel-runs) holds inside each milestone.
+
+One run and one journal per milestone. A board run is not a run itself: nothing records it as a whole. Each milestone it starts is a run of its own, with its own run id, `<data dir>/runs/<run-id>/journal.jsonl` and lease, exactly as a `--milestone` run would be. To follow a board run, take each entry's `run_id` (or find the runs in `am runs`) and read each journal separately with `am watch <run-id>`, or read them all with `am watch --all`. In each journal:
+
+- The first line is a `run_upsert` whose `payload.milestone_id` is that milestone's full card id. It is never `null` on a board run.
+- Every line has that run's `run_id`.
+- A `story_upsert` line has the story card id in `story`, and its `payload` has no milestone key. A story belongs to the milestone named on the first line of its journal.
+- A real story id appears in only one milestone's journal. The synthetic ids `"integrate"`, `"bases"` and `"base-<story id>"` (see [Reading the stream safely](#reading-the-stream-safely)) are fixed names that may appear in several milestones' journals, so identify a story by `(run_id, story)`, never by `story` alone.
+
+Recovery. Because nothing records the board run as a whole, there is nothing to resume at the board level. After a fix, either:
+
+- run the same `am run --board` command again. Done milestones drop out, and each other open milestone starts again as a relaunch would (see [Relaunching resumes](#relaunching-resumes)), or
+- continue one `stopped` or `escalated` milestone on its own with `am resume <run-id>`, using that entry's `run_id`.
+
+A `blocked` milestone has no run to resume. It starts on a later `am run --board`, once its blockers are done.
+
 #### What a clean run leaves behind
 
 Each story starts as soon as its blockers have finished clean, up to `--max-concurrent` stories run at once, and each story's subtasks run in order. Before the first subtask the run
