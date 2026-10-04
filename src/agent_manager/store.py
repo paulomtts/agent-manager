@@ -679,7 +679,12 @@ def _walk(
     seen: dict[_NodeKey, set[str]],
     found: list[Mismatch],
 ) -> None:
-    """Compare one node both sides have, then its children, in tree order."""
+    """Compare one node both sides have, then its children, in tree order.
+
+    A child only the journal has is one `stale` shape mismatch; a child only
+    the projection has is one `foreign` shape mismatch, listed after the
+    journal's children. Neither's descendants are reported.
+    """
     if journal_node.status != projection_node.status:
         found.append(
             Mismatch(
@@ -700,11 +705,37 @@ def _walk(
     theirs = {
         getattr(child, identity): child for child in getattr(projection_node, children)
     }
+    # One mismatch per missing subtree root: its descendants are not walked.
+    journal_ids: set[Any] = set()
     for child in getattr(journal_node, children):
         value = getattr(child, identity)
+        journal_ids.add(value)
         other = theirs.get(value)
-        if other is not None:
+        if other is None:
+            found.append(
+                Mismatch(
+                    node=_coords(_child_key(key, depth, value)),
+                    field=None,
+                    journal=child.status,
+                    projection=None,
+                    kind="stale",
+                )
+            )
+        else:
             _walk(_child_key(key, depth, value), depth + 1, child, other, seen, found)
+    # Nodes only the projection has follow the journal's, in projection order.
+    for child in getattr(projection_node, children):
+        value = getattr(child, identity)
+        if value not in journal_ids:
+            found.append(
+                Mismatch(
+                    node=_coords(_child_key(key, depth, value)),
+                    field=None,
+                    journal=None,
+                    projection=child.status,
+                    kind="foreign",
+                )
+            )
 
 
 def diverging(lines: list[JournalLine], projection: models.Run) -> list[Mismatch]:

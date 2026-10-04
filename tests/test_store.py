@@ -4830,3 +4830,113 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
     assert store.diverging(lines, projection) != []
     assert lines == lines_before
     assert projection == projection_before
+
+
+def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
+    # The setup of test_rebuild_picks_up_a_journal_line_whose_row_never_landed:
+    # the journal line is appended, the row write fails on the closed connection.
+    st = store.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    st.close()
+    with pytest.raises(sqlite3.Error):
+        st.record_story(_story())
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b"),
+            field=None,
+            journal="started",
+            projection=None,
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+    finally:
+        st.close()
+    _raw_sql(
+        repo,
+        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
+        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+    )
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="deadbeef"),
+            field=None,
+            journal=None,
+            projection="done",
+            kind="foreign",
+        )
+    ]
+
+
+def test_diverging_reports_a_missing_subtree_once_at_its_root(repo):
+    # The subtask row goes; its phase and attempt rows are left orphaned, so
+    # load_run never reaches them. One mismatch, not one per descendant.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+    finally:
+        st.close()
+    _raw_sql(repo, "DELETE FROM subtasks WHERE card_id = 'ef248597'")
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597"),
+            field=None,
+            journal="started",
+            projection=None,
+            kind="stale",
+        )
+    ]
+
+
+def test_diverging_reports_mismatches_in_tree_walk_order(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_subtask("8831189b", _subtask())
+        st.record_story(
+            _story().model_copy(update={"card_id": "c0ffee12", "title": "Second story"})
+        )
+    finally:
+        st.close()
+    # Written deepest-last-first and out of tree order on purpose.
+    _raw_sql(repo, "UPDATE stories SET status = 'cancelled' WHERE card_id = 'c0ffee12'")
+    _raw_sql(repo, "UPDATE subtasks SET status = 'failed' WHERE card_id = 'ef248597'")
+    _raw_sql(repo, "UPDATE runs SET status = 'done' WHERE id = ?", (RUN_ID,))
+    # Position -1 sorts it first in the projection; only-in-projection
+    # siblings still come after every journal sibling.
+    _raw_sql(
+        repo,
+        "INSERT INTO stories (run_id, card_id, title, level, status, tip_branch,"
+        " position) VALUES (?, 'feedface', 'Hand-made', 0, 'pending', NULL, -1)",
+        (RUN_ID,),
+    )
+
+    assert _diverging_now(repo) == [
+        store.Mismatch(
+            node=_node(), field="status", journal="started", projection="done",
+            kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="8831189b", card="ef248597"), field="status",
+            journal="started", projection="failed", kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="c0ffee12"), field="status", journal="started",
+            projection="cancelled", kind="foreign",
+        ),
+        store.Mismatch(
+            node=_node(story="feedface"), field=None, journal=None,
+            projection="pending", kind="foreign",
+        ),
+    ]
