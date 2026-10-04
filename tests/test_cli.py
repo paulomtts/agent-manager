@@ -3903,8 +3903,12 @@ def test_a_board_run_exits_escalated_only_when_some_milestone_escalated(
         dag.DependencyCycleError("dag: dependency cycle among milestones #a, #b"),
         board.BoardError("brd refused", argv=["brd", "tree"]),
         cli.CliError("run 20261001T000000Z-00000001 already claims branch:m-integrate"),
+        orchestrate.MilestoneBlockersError(
+            "milestone X is blocked by 2 milestones that are not landed (A, B); "
+            "a milestone stacks on at most one: chain them (A <- B <- C)"
+        ),
     ],
-    ids=["ValueError", "DependencyCycleError", "BoardError", "CliError"],
+    ids=["ValueError", "DependencyCycleError", "BoardError", "CliError", "MilestoneBlockersError"],
 )
 def test_a_handled_error_from_a_board_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 12: every `HANDLED` refusal is `ok: false` at exit 3."""

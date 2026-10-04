@@ -352,6 +352,28 @@ def test_a_claim_on_a_later_milestone_refuses_the_whole_board_up_front(board_roo
 
 
 @pytest.mark.e2e_fake
+def test_a_two_open_blocker_milestone_refuses_the_whole_board_up_front(board_root):
+    """Card 5b772688: `MilestoneBlockersError` comes before the claims check
+    and any dispatch, so nothing is left behind and no fake claude starts."""
+    root = board_root
+    a = _milestone(root, "A", "ba")
+    b = _milestone(root, "B", "bb")
+    c = _milestone(root, "C", "bc", blocked_by=(a["id"], b["id"]))
+    subtasks = (a["subtask"], b["subtask"], c["subtask"])
+    statuses_before = {card: board.show(card, repo_dir=root).status for card in subtasks}
+
+    with pytest.raises(orchestrate.MilestoneBlockersError) as caught:
+        _run_board(root, a, b, c)
+
+    assert c["id"] in str(caught.value)
+    assert "chain them" in str(caught.value)
+    assert _run_ids(root) == []
+    assert _run_dirs() == []
+    assert _local_branches(root) == ["main"]
+    assert {card: board.show(card, repo_dir=root).status for card in subtasks} == statuses_before
+
+
+@pytest.mark.e2e_fake
 def test_no_rendezvous_is_left_armed_for_later_tests():
     """Kept last in the module: the rendezvous is armed through the
     function-scoped `monkeypatch`, so it must be gone once a test ends."""

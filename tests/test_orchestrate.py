@@ -4453,7 +4453,12 @@ def _resume_root(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _record_resume_run(
-    root: Path, run_id: str = RESUME_RUN_ID, *, workflow: str = "milestone", status: str = "escalated"
+    root: Path,
+    run_id: str = RESUME_RUN_ID,
+    *,
+    workflow: str = "milestone",
+    status: str = "escalated",
+    base_branch: str = "main",
 ) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4462,7 +4467,7 @@ def _record_resume_run(
                 id=run_id,
                 workflow=workflow,
                 repo_dir=root,
-                base_branch="main",
+                base_branch=base_branch,
                 branch_prefix=PREFIX,
                 status=status,
                 config=models.RunConfig(max_concurrent_stories=3),
@@ -8250,6 +8255,21 @@ def test_a_resumed_milestone_preflight_leaves_refresh_git_to_the_recorded_stage(
         assert recorded.checkpoints == {}
         assert refreshed == [_expected_claims(milestone, [subtask])]
     assert len(refreshed) == 1
+
+
+def test_a_resumed_milestone_keeps_its_recorded_stacked_base(tmp_path, monkeypatch, fake_board):
+    """Card 5b772688 (parent L69-70): `am resume` keeps the base the run was
+    stacked on, whatever base the caller passes; `milestone_bases` is not consulted."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _seam_resume_board(fake_board)
+    _record_resume_run(root, base_branch="pstack-integrate")
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    pre = orchestrate.preflight_milestone(
+        None, repo_dir=root, base_branch="main", resume_run_id=RESUME_RUN_ID
+    )
+
+    assert pre.base_branch == "pstack-integrate"
 
 
 def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
