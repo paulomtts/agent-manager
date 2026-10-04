@@ -2391,6 +2391,78 @@ def _local_branch_exists(root: Path) -> Callable[[str], bool]:
     return exists
 
 
+# ── the two stages of a board run (card 203a9a5e) ───────────────────────────
+
+
+@dataclass(frozen=True)
+class BoardPreflight:
+    """What `preflight_board` read and decided for one board run.
+
+    Everything `run_board_engine` reads afterwards, so the engine never reads
+    the board again. `milestones` is `levels` flattened, in level order.
+    `levels_payload` is the payload's `levels` value, so a foreground envelope
+    and the run's report name the same levels. No run id: a board run has no
+    Run record. Internal state, so a dataclass.
+    """
+
+    root: Path
+    base_branch: str
+    max_concurrent: int
+    levels: list[list[models.CardNode]]
+    milestones: list[models.CardNode]
+    prefixes: dict[str, str]
+    bases: dict[str, str]
+    levels_payload: list[dict[str, Any]]
+
+
+def preflight_board(
+    *,
+    repo_dir: Path,
+    base_branch: str | None,
+    branch_prefix_of: Callable[[models.CardNode], str],
+    max_concurrent: int = 1,
+) -> BoardPreflight:
+    """Stage 1 of a board run: every argument check, read and refusal (card 203a9a5e).
+
+    `run_board`'s refusals, in its order, each propagating unchanged and
+    leaving nothing behind: `max_concurrent < 1` and a missing `base_branch`
+    (`ValueError`, before the board is read); `board.roots()`, read once, then
+    `dag.board_levels` (`DependencyCycleError`); `board_prefixes` with
+    `roots=` (`ValueError`); `milestone_bases` over `_local_branch_exists`
+    (`MilestoneBlockersError`, or a `GitError` that is not exit 1); last,
+    only when something is open, one `cli.refuse_claimed` over `board_claims`
+    (`ClaimedError`). `board.roots`, `cli.refuse_claimed` and
+    `_local_branch_exists` are read at call time. Starts no event loop, opens
+    no store and writes nothing.
+    """
+    if max_concurrent < 1:
+        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
+    if not base_branch:
+        raise ValueError("a board run needs a base branch")
+    root = runs.resolve_repo_dir(repo_dir)
+    all_roots = board.roots(repo_dir=root)
+    levels = dag.board_levels(all_roots)
+    milestones = [card for level in levels for card in level]
+    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
+    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
+    levels_payload = [
+        {"level": index, "milestones": [card.id for card in level]}
+        for index, level in enumerate(levels)
+    ]
+    if milestones:
+        cli.refuse_claimed(root, board_claims(milestones, prefixes))
+    return BoardPreflight(
+        root=root,
+        base_branch=base_branch,
+        max_concurrent=max_concurrent,
+        levels=levels,
+        milestones=milestones,
+        prefixes=prefixes,
+        bases=bases,
+        levels_payload=levels_payload,
+    )
+
+
 def run_board(
     *,
     repo_dir: Path,
@@ -2445,42 +2517,33 @@ def run_board(
     through `board_levels` and the claims. Or resume a stopped or escalated
     milestone on its own with `am resume <run-id>`.
     """
-    if max_concurrent < 1:
-        raise ValueError(f"max_concurrent must be at least 1, got {max_concurrent}")
-    if not base_branch:
-        raise ValueError("a board run needs a base branch")
-    root = runs.resolve_repo_dir(repo_dir)
-    all_roots = board.roots(repo_dir=root)
-    levels = dag.board_levels(all_roots)
-    milestones = [card for level in levels for card in level]
-    prefixes = board_prefixes(milestones, branch_prefix_of, roots=all_roots)
-    bases = milestone_bases(all_roots, prefixes, _local_branch_exists(root), base_branch)
-    levels_payload = [
-        {"level": index, "milestones": [card.id for card in level]}
-        for index, level in enumerate(levels)
-    ]
-    if not milestones:
-        return {"ok": True, "board": True, "levels": levels_payload, "milestones": []}
-    cli.refuse_claimed(root, board_claims(milestones, prefixes))
+    pre = preflight_board(
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix_of=branch_prefix_of,
+        max_concurrent=max_concurrent,
+    )
+    if not pre.milestones:
+        return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
     entries = asyncio.run(
         _run_board_async(
-            milestones,
-            prefixes=prefixes,
-            bases=bases,
-            root=root,
+            pre.milestones,
+            prefixes=pre.prefixes,
+            bases=pre.bases,
+            root=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
-            max_concurrent=max_concurrent,
+            max_concurrent=pre.max_concurrent,
             control_interval=control_interval,
         )
     )
     return {
         "ok": all(entry["status"] == "done" for entry in entries),
         "board": True,
-        "levels": levels_payload,
+        "levels": pre.levels_payload,
         "milestones": entries,
     }
 

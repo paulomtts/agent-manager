@@ -7977,6 +7977,188 @@ def test_run_board_checks_a_non_open_blocker_roots_prefix_before_any_claim_check
     assert board_seams.runs.calls == []
 
 
+# ── board pre-flight / engine seam (card 203a9a5e) ──────────────────────────
+#
+# `preflight_board` and `run_board_engine`, the two stages `run_board` now
+# composes, driven through the same `board_seams` fakes: no git, brd or harness.
+
+
+def _preflight(seams: BoardSeams, **overrides: Any) -> "orchestrate.BoardPreflight":
+    """`orchestrate.preflight_board` with `_board`'s defaults.
+
+    The return annotation is a string: this file has no `from __future__ import
+    annotations`, and a bare one would fail at import before the class exists."""
+    kwargs: dict[str, Any] = {
+        "repo_dir": seams.root,
+        "base_branch": "main",
+        "branch_prefix_of": _prefix_of,
+        "max_concurrent": 2,
+    }
+    kwargs.update(overrides)
+    return orchestrate.preflight_board(**kwargs)
+
+
+def test_preflight_board_returns_the_state_the_engine_runs_on(board_seams):
+    """A done, unlanded blocker `a` (its branch exists), then `b` <- `c`, given out of order."""
+    a = _board_milestone(1, status="done", done_children=True)
+    b = _board_milestone(2, blocked_by=(1,))
+    c = _board_milestone(3, blocked_by=(2,))
+    board_seams.cards = [c, b, a]
+    board_seams.branches.add("p00000001-integrate")
+
+    pre = _preflight(board_seams)
+
+    root = runs.resolve_repo_dir(board_seams.root)
+    assert pre.root == root
+    assert pre.base_branch == "main"
+    assert pre.max_concurrent == 2
+    assert [card.id for card in pre.milestones] == [b.id, c.id]
+    assert [[card.id for card in level] for level in pre.levels] == [[b.id], [c.id]]
+    assert list(pre.prefixes) == [b.id, c.id, a.id]
+    assert pre.prefixes[a.id] == "p00000001"
+    assert pre.bases == {b.id: "p00000001-integrate", c.id: "p00000002-integrate"}
+    assert pre.levels_payload == [
+        {"level": 0, "milestones": [b.id]},
+        {"level": 1, "milestones": [c.id]},
+    ]
+    assert board_seams.asked == [(root, "p00000001-integrate")]
+    assert board_seams.claims == [orchestrate.board_claims(pre.milestones, pre.prefixes)]
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"max_concurrent": 0}, {"base_branch": None}, {"base_branch": ""}]
+)
+def test_preflight_board_refuses_bad_arguments_before_it_reads_the_board(
+    board_seams, monkeypatch, overrides
+):
+    def no_read(*, repo_dir=None):
+        pytest.fail("preflight_board read the board before refusing its arguments")
+
+    monkeypatch.setattr(board, "roots", no_read)
+
+    with pytest.raises(ValueError):
+        _preflight(board_seams, **overrides)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+@pytest.mark.parametrize(
+    ("cards", "overrides", "error", "match"),
+    [
+        pytest.param(
+            lambda: [_board_milestone(1, blocked_by=(2,)), _board_milestone(2, blocked_by=(1,))],
+            {},
+            dag.DependencyCycleError,
+            None,
+            id="cycle",
+        ),
+        pytest.param(
+            lambda: [_board_milestone(1), _board_milestone(2)],
+            {"branch_prefix_of": lambda card: "same"},
+            ValueError,
+            "branch prefix",
+            id="shared-prefix",
+        ),
+        pytest.param(
+            lambda: [
+                _board_milestone(1),
+                _board_milestone(2),
+                _board_milestone(3, blocked_by=(1, 2)),
+            ],
+            {},
+            orchestrate.MilestoneBlockersError,
+            "chain them",
+            id="two-open-blockers",
+        ),
+    ],
+)
+def test_preflight_board_refuses_each_board_problem_before_the_claim_check(
+    board_seams, cards, overrides, error, match
+):
+    board_seams.cards = cards()
+
+    with pytest.raises(error, match=match):
+        _preflight(board_seams, **overrides)
+
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_lets_a_claim_conflict_propagate_with_nothing_started(
+    board_seams, monkeypatch
+):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2, blocked_by=(1,))]
+
+    def refuse(root: Path, keys, *, run_id: str | None = None) -> None:
+        raise cli.ClaimedError("held elsewhere", key=keys[-1], run_id=OTHER_RUN_ID)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight(board_seams)
+
+    assert caught.value.run_id == OTHER_RUN_ID
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_lets_a_git_failure_from_the_branch_check_propagate(
+    board_seams, monkeypatch
+):
+    """Review Focus 4: a broken repository never passes the pre-flight silently."""
+    done = _board_milestone(1, status="done", done_children=True)
+    later = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [done, later]
+    asked: list[str] = []
+
+    def broken_branch_exists(root: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            asked.append(branch)
+            raise worktree.GitError("not a git repository", argv=["git"], exit_code=128)
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", broken_branch_exists)
+
+    with pytest.raises(worktree.GitError) as caught:
+        _preflight(board_seams)
+
+    assert caught.value.exit_code == 128
+    assert asked == ["p00000001-integrate"]
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_on_a_board_with_nothing_open_skips_the_claim_check(board_seams):
+    """Review Focus 1: today's empty-board return comes before the claim check."""
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+
+    pre = _preflight(board_seams)
+
+    assert pre.milestones == []
+    assert pre.levels == []
+    assert pre.levels_payload == []
+    assert pre.bases == {}
+    assert board_seams.claims == []
+    assert board_seams.runs.calls == []
+
+
+def test_preflight_board_never_starts_an_event_loop(board_seams, monkeypatch):
+    board_seams.cards = [_board_milestone(1), _board_milestone(2, blocked_by=(1,))]
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("preflight_board started the board run")
+
+    monkeypatch.setattr(orchestrate.asyncio, "run", fail)
+    monkeypatch.setattr(orchestrate, "_run_board_async", fail)
+
+    pre = _preflight(board_seams)
+
+    assert [card.id for card in pre.milestones] == [_board_milestone(1).id, _board_milestone(2).id]
+    assert board_seams.runs.calls == []
+
+
 # ── _local_branch_exists (card 5b772688) ────────────────────────────────────
 
 
