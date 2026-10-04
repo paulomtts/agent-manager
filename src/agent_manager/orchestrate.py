@@ -868,32 +868,6 @@ async def build_merged_base(
     )
 
 
-async def blocker_tips(
-    root_plan: dag.RootPlan,
-    plan: SupervisorPlan,
-    story_done: Mapping[str, asyncio.Event],
-    story_ok: Mapping[str, bool],
-) -> list[str] | None:
-    """Every blocker's tip, in `root_plan.blockers` order, once each is done.
-
-    A merged-root story is itself one of `supervise`'s grafo roots (T1's own
-    dependency edges are not used for a 2+-blocker join: grafo's dynamic
-    worker pool can starve a join node forever when an unrelated sibling lane
-    is still in flight, a defect in grafo itself, confirmed outside this
-    module and out of scope to fix there). This lane instead waits on each
-    blocker's own completion signal, then reads its tip off `plan.tips` --
-    the same value the blocker's own lane would have returned, computed at
-    plan time (`dag.story_tip`), so no data is lost by not using grafo's
-    runtime forwarding for this edge. None means a blocker did not finish
-    clean (escalated or stopped): the caller must not build the base.
-    """
-    for blocker in root_plan.blockers:
-        await story_done[blocker].wait()
-    if not all(story_ok.get(blocker, False) for blocker in root_plan.blockers):
-        return None
-    return [plan.tips[blocker] for blocker in root_plan.blockers]
-
-
 def builds_a_base_alone(story: census.StoryPlan, root_plan: dag.RootPlan) -> bool:
     """Whether a story with no subtasks must still build its merged base.
 
@@ -1142,8 +1116,6 @@ async def lane(
     slots: asyncio.Semaphore,
     stop: StopSignal,
     finished: dict[str, LaneOutcome],
-    story_done: Mapping[str, asyncio.Event],
-    story_ok: Mapping[str, bool],
 ) -> str:
     """One story's node coroutine (T1, T4, T6): drive its remaining subtasks, return its tip.
 
@@ -1196,11 +1168,7 @@ async def lane(
     planned = plan.planned.get(story.id)
     tips: list[str] | None = None
     if root_plan.kind == "merged":
-        # Waited for even with nothing left to run: grafo would have held a
-        # blocked story, done or not, behind its blockers' edges.
-        tips = await blocker_tips(root_plan, plan, story_done, story_ok)
-        if tips is None:
-            return plan.tips[story.id]
+        tips = [plan.tips[blocker] for blocker in root_plan.blockers]
     if planned is None and not builds_a_base_alone(story, root_plan):
         return plan.tips[story.id]
     if planned is None:
@@ -1505,8 +1473,6 @@ async def supervise(
         if slots is None:
             slots = asyncio.Semaphore(max_concurrent)
         finished: dict[str, LaneOutcome] = {}
-        story_done: dict[str, asyncio.Event] = {story.id: asyncio.Event() for story in plan.stories}
-        story_ok: dict[str, bool] = {}
         # A lane's `BaseException` that is neither an `Exception` nor a
         # cancellation: grafo would drop it (`run_until_killed`).
         fatal: list[BaseException] = []
@@ -1529,20 +1495,14 @@ async def supervise(
                         slots=slots,
                         stop=stop,
                         finished=finished,
-                        story_done=story_done,
-                        story_ok=story_ok,
                     )
                 except BaseException as error:
-                    story_ok[story.id] = False
                     if not isinstance(error, (Exception, asyncio.CancelledError)):
                         fatal.append(error)
                         killed.set()
                     raise
                 else:
-                    story_ok[story.id] = True
                     return result
-                finally:
-                    story_done[story.id].set()
 
             return run
 
