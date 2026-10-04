@@ -282,7 +282,7 @@ def test_the_returned_hash_is_the_hash_of_the_plan_file_on_disk(repo: Path) -> N
     result = _run(repo)
 
     expected = hashlib.sha256((repo / PLAN_RELATIVE).read_bytes()).hexdigest()[:8]
-    assert result == {"plan_hash": expected, "backfilled": []}
+    assert result == {"plan_hash": expected, "backfilled": [], "documents_committed": True}
     assert reducers.is_plan_hash(result["plan_hash"])
 
 
@@ -522,7 +522,11 @@ def test_unstamped_drafts_gain_the_current_hash_and_the_stamped_one_is_untouched
 
     result = _run(repo)
 
-    assert result == {"plan_hash": digest, "backfilled": [original["A"], original["C"]]}
+    assert result == {
+        "plan_hash": digest,
+        "backfilled": [original["A"], original["C"]],
+        "documents_committed": True,
+    }
     a_new, b_new, c_new, docs = _range(repo)
     rewritten = {"A": a_new, "B": b_new, "C": c_new}
     for key in ("A", "C"):
@@ -596,7 +600,11 @@ def test_drafts_that_already_hold_the_documents_are_stamped_instead_of_raising(
 
     result = _run(repo)
 
-    assert result == {"plan_hash": _digest(repo), "backfilled": [draft]}
+    assert result == {
+        "plan_hash": _digest(repo),
+        "backfilled": [draft],
+        "documents_committed": True,
+    }
     assert _commit_count(repo) == before
     assert _message(repo).splitlines()[-1] == f"Plan-Hash: {_digest(repo)}"
 
@@ -634,7 +642,11 @@ def test_a_second_call_after_a_backfill_is_a_no_op(repo: Path) -> None:
     second = _run(repo)
 
     assert first["backfilled"] != []  # non-vacuity: the first call rewrote
-    assert second == {"plan_hash": first["plan_hash"], "backfilled": []}
+    assert second == {
+        "plan_hash": first["plan_hash"],
+        "backfilled": [],
+        "documents_committed": True,
+    }
     assert _rev(repo, "HEAD") == head
 
 
@@ -807,3 +819,156 @@ def test_a_signed_commit_is_rewritten_unsigned(repo: Path, tmp_path: Path) -> No
     assert "not-a-real-signature" not in rewritten
     assert "author Signer <signer@example.com> 1000000000 +0200\n" in rewritten
     assert _message(repo, signed_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+
+
+def _ignore_documents(root: Path, source: str = "gitignore") -> None:
+    """Make git ignore the documents' folder, the way a repo that keeps its
+    specs and plans as local history does. `gitignore` commits the rule on the
+    current branch; `exclude` writes it to `.git/info/exclude`, uncommitted."""
+    if source == "gitignore":
+        (root / ".gitignore").write_text("docs/superpowers/\n", encoding="utf-8")
+        _git(root, "add", ".gitignore")
+        _git(root, "commit", "-q", "-m", "ignore docs/superpowers")
+    else:
+        exclude = Path(_git(root, "rev-parse", "--git-path", "info/exclude").strip())
+        exclude = exclude if exclude.is_absolute() else root / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("docs/superpowers/\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("source", ["gitignore", "exclude"])
+def test_ignored_documents_are_hashed_but_not_committed(repo: Path, source: str) -> None:
+    _ignore_documents(repo, source)
+    _write_documents(repo)
+    head = _rev(repo, "HEAD")
+    porcelain = _git(repo, "status", "--porcelain", "--untracked-files=all")
+
+    result = _run(repo)
+
+    assert result == {
+        "plan_hash": _digest(repo),
+        "backfilled": [],
+        "documents_committed": False,
+    }
+    assert _rev(repo, "HEAD") == head
+    assert _git(repo, "status", "--porcelain", "--untracked-files=all") == porcelain
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+    assert (repo / SPEC_RELATIVE).is_file()
+    assert (repo / PLAN_RELATIVE).is_file()
+
+
+def test_ignored_documents_run_no_add_and_no_commit(repo: Path) -> None:
+    _ignore_documents(repo)
+    _write_documents(repo)
+    calls: list[list[str]] = []
+
+    _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
+
+    assert any("check-ignore" in argv for argv in calls), calls
+    for argv in calls:
+        assert "add" not in argv, argv
+        assert "commit" not in argv, argv
+
+
+def test_ignored_documents_still_get_their_drafts_backfilled(repo: Path) -> None:
+    _ignore_documents(repo)
+    original = _drafts_scenario(repo)
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result == {
+        "plan_hash": digest,
+        "backfilled": [original["A"], original["C"]],
+        "documents_committed": False,
+    }
+    a_new, b_new, c_new = _range(repo)
+    assert _message(repo, a_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+    assert _message(repo, b_new).splitlines()[-1] == f"Plan-Hash: {OTHER_HASH}"
+    assert _message(repo, c_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+
+
+def test_ignored_documents_with_no_tagged_commit_do_not_raise(repo: Path) -> None:
+    """With nothing committable, an empty branch carries no trailer at all:
+    that is the expected state, not untagged debris."""
+    _ignore_documents(repo)
+    _task_branch(repo)
+    _write_documents(repo)
+
+    result = _run(repo)
+
+    assert result["documents_committed"] is False
+    assert _git(repo, "rev-list", "main..HEAD") == ""
+
+
+def test_ignored_documents_track_a_plan_edited_between_runs(repo: Path) -> None:
+    _ignore_documents(repo)
+    _write_documents(repo)
+    first = _run(repo)
+    head = _rev(repo, "HEAD")
+    (repo / PLAN_RELATIVE).write_text("# plan\n\nrewritten.\n", encoding="utf-8")
+
+    second = _run(repo)
+
+    assert second["plan_hash"] == _digest(repo)
+    assert second["plan_hash"] != first["plan_hash"]
+    assert second["documents_committed"] is False
+    assert _rev(repo, "HEAD") == head
+
+
+
+@pytest.mark.parametrize("ignored", ["spec", "plan"])
+def test_only_one_ignored_document_raises_before_any_add(repo: Path, ignored: str) -> None:
+    folder = "docs/superpowers/specs/" if ignored == "spec" else "docs/superpowers/plans/"
+    (repo / ".gitignore").write_text(f"{folder}\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", f"ignore {folder}")
+    _task_branch(repo)
+    _commit_file(repo, "draft.txt", "unstamped draft")
+    _write_documents(repo)
+    head = _rev(repo, "HEAD")
+    calls: list[list[str]] = []
+
+    with pytest.raises(docs_commit.PartlyIgnoredDocumentsError) as caught:
+        _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
+
+    expected = SPEC_RELATIVE if ignored == "spec" else PLAN_RELATIVE
+    other = PLAN_RELATIVE if ignored == "spec" else SPEC_RELATIVE
+    assert caught.value.ignored == expected
+    assert caught.value.tracked == other
+    assert expected in str(caught.value)
+    assert other in str(caught.value)
+    assert not any("add" in argv for argv in calls), calls
+    assert not any("update-ref" in argv for argv in calls), calls
+    assert _rev(repo, "HEAD") == head
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+
+
+@pytest.mark.git
+@pytest.mark.parametrize("ignore", [True, False], ids=["ignored", "tracked"])
+def test_a_task_worktree_commits_the_documents_only_when_git_tracks_them(
+    repo: Path, tmp_path: Path, ignore: bool
+) -> None:
+    """Production shape: the documents live in a linked worktree on a task
+    branch cut from `main`, and the rule (if any) is on `main`."""
+    if ignore:
+        _ignore_documents(repo)
+    worktree = tmp_path / "worktrees" / "task"
+    _git(repo, "worktree", "add", "-q", "-b", "task", str(worktree), "main")
+    _write_documents(worktree)
+    before = _git(worktree, "rev-list", "main..HEAD").split()
+
+    result = _run(worktree)
+
+    after = _git(worktree, "rev-list", "main..HEAD").split()
+    assert result["plan_hash"] == _digest(worktree)
+    assert result["backfilled"] == []
+    assert result["documents_committed"] is (not ignore)
+    if ignore:
+        assert after == before == []
+        assert _git(worktree, "status", "--porcelain", "--untracked-files=all") == ""
+    else:
+        assert len(after) == 1
+        assert _message(worktree).splitlines()[-1] == f"Plan-Hash: {result['plan_hash']}"
+        committed = _git(worktree, "show", "--name-only", "--format=", "HEAD").split()
+        assert sorted(committed) == sorted([SPEC_RELATIVE, PLAN_RELATIVE])

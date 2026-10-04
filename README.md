@@ -707,6 +707,8 @@ A recorded result that no longer holds up is dispatched again, with one warning 
 
 Exactly-once covers am's dispatch of an agent phase, not what the harness did. The harness's own effects are never transactional: commits, files written in the worktree, or anything else an agent did before the kill stay as they are, whether the phase is then adopted or dispatched again. A phase that is dispatched again finds that work already in its worktree; `implement`, for example, resumes from git and the `Plan-Hash` trailers. The coder role is explicitly told never to rewrite, amend, squash or delete a commit; the `docs_commit` step does exactly that (rebuilding and moving the branch ref) to backfill a missing or stale `Plan-Hash` trailer, which is a deliberate asymmetry -- that rewrite is the engine's own, narrow and idempotent, done before an agent is ever dispatched into the worktree, not a license the coder shares.
 
+`docs_commit` commits the spec and the plan in one commit with the `Plan-Hash` trailer when the repository tracks them. When the repository git-ignores both (for example `docs/superpowers/` in its `.gitignore`), it neither adds nor commits them: they stay in the worktree as ignored files, the plan is still hashed, and the backfill still stamps the trailer on every commit the branch already has. When git ignores only one of the two, the subtask escalates at `docs_commit`.
+
 Before a checkpoint is continued, the subtask's worktree is checked. A worktree deleted outside `am` (an `rm -rf`, a `git worktree remove`) is a recovery, never a refusal:
 
 | The subtask's worktree on resume | What happens | Warning | Where the walk goes on |
@@ -714,6 +716,8 @@ Before a checkpoint is continued, the subtask's worktree is checked. A worktree 
 | Present (or the subtask has none) | Nothing runs: no git, no warning. | none | At the checkpoint's pending phase. |
 | Missing, its branch still exists | The worktree is added again for the branch, which keeps its commits. | one, "added again" | At the checkpoint's pending phase. |
 | Missing, and its branch is gone too, or adding it again fails | The checkpoint is not resumed. | one, "was not resumed" | From the subtask's first phase, `worktree`, as a fresh walk. When the branch was gone it is cut again from its base; a real git failure is reported by the `worktree` step as an ordinary escalation at `worktree`. |
+
+The spec and the plan come back with a worktree added again only when they were committed. When the repository git-ignores them, they lived only in the deleted directory, so a walk resumed after the `spec` or `plan` phase finds neither file.
 
 The three warning lines, in `data.warnings` on a `--card` run and in the run's warnings on a milestone run:
 

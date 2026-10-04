@@ -1,5 +1,7 @@
 """Commit the spec and the plan, tagged with the plan's Plan-Hash trailer.
 
+Documents git ignores in the worktree are hashed but never added or committed.
+
 A deterministic step (design §4 `steps/`, §6): git and the filesystem only --
 no model call, no board access, no `brd`. It runs after `mark_validated` and
 before `implement`, because the hash it stamps is the hash of the plan file
@@ -106,6 +108,18 @@ class UntaggedDocumentsError(RuntimeError):
         )
 
 
+class PartlyIgnoredDocumentsError(RuntimeError):
+    """Git ignores one of the two documents and not the other."""
+
+    def __init__(self, *, ignored: str, tracked: str) -> None:
+        self.ignored = ignored
+        self.tracked = tracked
+        super().__init__(
+            f"git ignores {ignored} but not {tracked}. The spec and the plan are "
+            "committed together or not at all: ignore both paths, or neither."
+        )
+
+
 def _branch_carries(git_runner: GitRunner, worktree_path: str, digest: str) -> bool:
     """Whether any commit reachable from HEAD carries exactly this trailer.
 
@@ -118,6 +132,21 @@ def _branch_carries(git_runner: GitRunner, worktree_path: str, digest: str) -> b
         return False
     wanted = f"{TRAILER_PREFIX}{digest}"
     return any(line.strip() == wanted for line in log.splitlines())
+
+
+def _is_ignored(git_runner: GitRunner, worktree_path: str, path: str) -> bool:
+    """Whether git ignores `path` in this worktree (`git check-ignore`).
+
+    Exit 1 answers `False`; any other failure propagates as `GitError`.
+    A tracked path is never ignored.
+    """
+    try:
+        git_runner(["-C", worktree_path, "check-ignore", "-q", "--", path])
+    except GitError as error:
+        if error.exit_code == 1:
+            return False
+        raise
+    return True
 
 
 def _required_relative_path(value: object, field: str) -> str:
@@ -362,7 +391,17 @@ def commit_documents(
 
     Parameter names are the engine's binding table's names, so the document's
     phase needs no `args:` at all. Returns a plain dict (design §6), stored in
-    the context under the phase name.
+    the context under the phase name: `plan_hash`, the hash of the plan file
+    on disk; `backfilled`, the pre-rewrite shas the backfill stamped; and
+    `documents_committed`.
+
+    When git ignores both documents in the worktree, nothing is added or
+    committed and `documents_committed` is `False`; the hash and the backfill
+    are unchanged. Otherwise the documents are committed (or found already
+    committed under this hash) and it is `True`. Raises
+    `PartlyIgnoredDocumentsError`, before any write, when git ignores exactly
+    one of them, and `UntaggedDocumentsError` when tracked documents have
+    nothing to commit and no branch commit carries the hash.
     """
     worktree_path = _required_worktree(worktree)
     spec_path = _required_relative_path(spec_path, "spec_path")
@@ -382,10 +421,18 @@ def commit_documents(
             )
 
     digest = plan_hash(plan_file.read_bytes())
+    spec_ignored = _is_ignored(git_runner, worktree_path, spec_path)
+    plan_ignored = _is_ignored(git_runner, worktree_path, plan_path)
+    if spec_ignored != plan_ignored:
+        ignored, tracked = (spec_path, plan_path) if spec_ignored else (plan_path, spec_path)
+        raise PartlyIgnoredDocumentsError(ignored=ignored, tracked=tracked)
     # Before the add/commit below: when a role already committed the documents
     # themselves, nothing is staged and `_branch_carries` decides -- which it
     # can only answer yes to once those drafts carry the trailer.
     backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
+
+    if spec_ignored:
+        return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": False}
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
@@ -396,7 +443,11 @@ def commit_documents(
         # The resume path (design §9): "these two paths hold no change", so a
         # plan edited between runs still earns its own commit and hash.
         if _branch_carries(git_runner, worktree_path, digest):
-            return {"plan_hash": digest, "backfilled": backfilled}
+            return {
+                "plan_hash": digest,
+                "backfilled": backfilled,
+                "documents_committed": True,
+            }
         raise UntaggedDocumentsError(
             plan_hash=digest, spec_path=spec_path, plan_path=plan_path
         )
@@ -417,4 +468,4 @@ def commit_documents(
             plan_path,
         ]
     )
-    return {"plan_hash": digest, "backfilled": backfilled}
+    return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": True}

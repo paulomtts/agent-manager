@@ -397,3 +397,48 @@ def test_with_no_critic_block_no_brief_carries_a_feedback_section(
     for name in AGENT_PHASES:
         text = Path(agent_attempts[name].prompt_path).read_text(encoding="utf-8")
         assert FEEDBACK_SECTION not in text, name
+
+
+def test_a_repo_that_ignores_the_documents_finishes_done_without_committing_them(
+    milestone_board, fake_claude_bin
+):
+    """Every phase after `docs_commit` reads the spec and the plan from the
+    worktree, so a repo that git-ignores them still ends done: the documents
+    stay on disk and out of history, and every branch commit is tagged."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    ignore = root / ".gitignore"
+    existing = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
+    ignore.write_text(existing + "docs/superpowers/\n", encoding="utf-8")
+    _git(root, "add", ".gitignore")
+    _git(root, "commit", "-q", "-m", "ignore docs/superpowers")
+
+    result = _run_one_card(root, card)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert board.show(card, repo_dir=root).status == "done"
+
+    worktree = cli.worktree_for(root, data["branch"])
+    details = board.show(card, repo_dir=root)
+    workflow = task_workflow.TASK
+    documents = [
+        prompt.expand_writes(
+            workflow.phase(name).writes, details, phase=name, input_name=f"{name}_path"
+        )
+        for name in ("spec", "plan")
+    ]
+    for relative in documents:
+        assert (worktree / relative).is_file(), relative
+    tracked = _git(worktree, "ls-files").split("\n")
+    assert not any(path.startswith("docs/superpowers/") for path in tracked)
+    assert _git(worktree, "status", "--porcelain") == ""
+
+    revisions = _git(worktree, "rev-list", "main..HEAD").split()
+    assert revisions  # non-vacuity: the implement commit is there
+    subject = docs_commit.SUBJECT_TEMPLATE.format(title=details.title)
+    for revision in revisions:
+        message = _git(worktree, "show", "-s", "--format=%B", revision)
+        assert "Plan-Hash:" in message
+        assert not message.startswith(subject)
