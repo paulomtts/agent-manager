@@ -5485,6 +5485,71 @@ def test_logs_follow_refusals(projection, monkeypatch, argv, follow, kind, messa
         assert envelope["error"]["message"] == message
 
 
+def test_logs_follow_ctrl_c_exits_zero(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    def press_ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[press_ctrl_c])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_closed_pipe_exits_zero_quietly(projection, monkeypatch):
+    """Review Focus 4: `am logs ... --follow | head -1`."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    real_emit = cli._emit_stream_line
+    emitted: list[Any] = []
+
+    def emit_into_a_closed_pipe(obj) -> None:
+        emitted.append(obj)
+        if len(emitted) == 2:  # the reader went away after the hello line
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_into_a_closed_pipe)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [_logs_hello_line(_implement_stdout())]
+
+
+def test_logs_follow_mid_stream_error_goes_to_stderr(projection, monkeypatch):
+    """Review Focus 5: after the hello no envelope can follow, so a handled
+    error is one stderr line and exit 3, as `watch --follow` does."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_fail(path, offset):
+        reads.append(offset)
+        if len(reads) == 2:
+            raise cli.CliError("the log went away")
+        return real_read(path, offset)
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_fail)
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None, lambda: None]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert len(sleeps) == 1  # the stream ended on the failing poll
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+    assert result.stderr == "am logs: the log went away\n"
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""

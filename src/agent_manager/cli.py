@@ -2434,13 +2434,25 @@ def _stream_logs(path: Path, *, offset: int) -> None:
     """The body of `am logs --follow`, once `logs_follow_for` has accepted it.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
-    test that replaces them controls every poll.
+    test that replaces them controls every poll. Ctrl-C and a closed pipe are
+    how a stream normally ends: exit 0, nothing on stderr. After the hello
+    line no envelope can be printed, so a handled error goes to stderr and
+    the exit is `EXIT_ERROR`, mirroring `_stream_watch`.
     """
-    _emit_stream_line(_logs_hello(path, offset))
-    for chunk in _follow_logs(
-        path, offset=offset, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
-    ):
-        _emit_stream_line(chunk)
+    try:
+        _emit_stream_line(_logs_hello(path, offset))
+        for chunk in _follow_logs(
+            path, offset=offset, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+        ):
+            _emit_stream_line(chunk)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        _silence_stdout()
+        return
+    except HANDLED as error:
+        typer.echo(f"am logs: {error}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("watch")
