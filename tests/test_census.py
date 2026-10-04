@@ -496,3 +496,48 @@ def test_story_cycle_propagates_from_flatten_milestone():
     )
     with pytest.raises(CensusOrderError, match="could not be ordered"):
         flatten_milestone(tree)
+
+
+# --- terminal card statuses -------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["canceled", "archived", "CANCELED", "Archived"])
+def test_flatten_drops_out_of_play_stories_subtasks_and_edges_to_them(status):
+    tree = node(
+        1,
+        "M",
+        children=[
+            node(2, "dead story", status=status, children=[node(6, "x")]),
+            node(
+                3,
+                "live",
+                blocked_by=[ID(2)],
+                children=[
+                    node(4, "dead sub", status=status),
+                    node(5, "live sub", blocked_by=[ID(4)]),
+                ],
+            ),
+        ],
+    )
+    stories = census.flatten_milestone(tree).stories
+    assert [s.id for s in stories] == [ID(3)]
+    assert stories[0].blocked_by == []
+    assert [t.id for t in stories[0].subtasks] == [ID(5)]
+
+
+def test_flatten_keeps_a_merged_card_with_its_status():
+    tree = node(1, "M", children=[node(2, "s", status="merged", children=[node(3, "t", status="merged")])])
+    story = census.flatten_milestone(tree).stories[0]
+    assert story.status == "merged"
+    assert story.subtasks[0].status == "merged"
+
+
+def test_status_sets_live_in_one_place():
+    assert census.FINISHED_STATUSES == frozenset({"done", "merged"})
+    assert census.OUT_OF_PLAY_STATUSES == frozenset({"canceled", "archived"})
+    for status in ("done", "MERGED"):
+        assert census.is_finished(status) and not census.is_out_of_play(status)
+    for status in ("canceled", "ARCHIVED"):
+        assert census.is_out_of_play(status) and not census.is_finished(status)
+    for status in ("todo", "in_progress", "blocked", None, ""):
+        assert not census.is_finished(status) and not census.is_out_of_play(status)
