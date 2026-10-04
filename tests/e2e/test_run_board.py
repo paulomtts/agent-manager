@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, cli, dag, models, orchestrate, paths, store
+from agent_manager import bases, board, cli, dag, integration, models, orchestrate, paths, store
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -207,6 +207,29 @@ def test_two_independent_milestones_both_finish(board_root):
         assert _load_run(root, entry["run_id"]).milestone_id == milestone["id"]
         assert board.show(milestone["subtask"], repo_dir=root).status == "done"
     assert entries[x["id"]]["run_id"] != entries[y["id"]]["run_id"]
+    # Card a7fcc076: each milestone's own journal names its milestone at the
+    # head and every line carries that milestone's own run id, so no line
+    # needs a milestone key. Synthetic story ids (`integrate`, `bases`) are
+    # fixed names that any milestone's journal may record, so only the real
+    # story card ids are checked for disjointness across journals.
+    synthetic = {integration.INTEGRATE_STORY_ID, bases.BASES_STORY_ID}
+    real_stories: dict[str, set[str]] = {}
+    for milestone in (x, y):
+        run_id = entries[milestone["id"]]["run_id"]
+        lines = store.Journal(run_id).read()
+        assert lines, run_id
+        assert lines[0].event == "run_upsert", lines[0]
+        assert lines[0].payload["milestone_id"] == milestone["id"]
+        assert {line.run_id for line in lines} == {run_id}
+        for line in lines:
+            if line.event == "run_upsert":
+                assert line.payload["milestone_id"] == milestone["id"], line
+            if line.event == "story_upsert":
+                assert "milestone_id" not in line.payload, line
+        stories = {line.story for line in lines if line.story is not None}
+        real_stories[milestone["id"]] = stories - synthetic
+        assert milestone["story"] in real_stories[milestone["id"]], stories
+    assert real_stories[x["id"]].isdisjoint(real_stories[y["id"]])
     assert _git(root, "rev-parse", "main").strip() == main_before
 
 

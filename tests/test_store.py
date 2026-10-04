@@ -3092,6 +3092,99 @@ def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):
     assert after == returned
 
 
+RUN_UPSERT_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "config",
+    "milestone_id",
+}
+"""A `run_upsert` payload: the `Run` dump without `stories`."""
+
+STORY_UPSERT_KEYS = {"card_id", "title", "level", "status", "tip_branch"}
+"""A `story_upsert` payload: the `StoryRun` dump without `subtasks`. No milestone key."""
+
+
+def test_a_milestone_runs_journal_names_its_milestone_once_at_the_head(repo):
+    """Card a7fcc076, the "no new journal key" decision, pinned.
+
+    A `--board` run gives each milestone its own Run, so one journal covers
+    exactly one milestone. Its first line (lowest `seq`) is the `run_upsert`
+    carrying `milestone_id`, and every later line shares that line's
+    `run_id`. A `story_upsert` therefore needs no milestone key of its own:
+    a consumer reading one run's journal learns the milestone from the head.
+    The synthetic ids (`integrate`, `bases`, `base-<story id>`) are recorded
+    the same way, under the same `run_id`. Should this ever fail because the
+    head is not a `run_upsert` with `milestone_id`, or because lines mix run
+    ids, the spec's fallback (an additive `milestone_id` on `story_upsert`)
+    applies.
+    """
+    from agent_manager import bases, integration
+
+    story = _story()
+    merged = models.StoryRun(
+        card_id=bases.BASES_STORY_ID,
+        title=bases.BASES_STORY_TITLE,
+        level=0,
+        status="started",
+    )
+    resolver = _subtask(bases.resolver_card_id(story.card_id))
+    integrate = models.StoryRun(
+        card_id=integration.INTEGRATE_STORY_ID, title="Integrate", level=1, status="started"
+    )
+    run = _run(repo).model_copy(update={"milestone_id": MILESTONE_ID})
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(run)
+        st.record_story(story)
+        st.record_story(merged)
+        st.record_subtask(bases.BASES_STORY_ID, resolver)
+        st.record_story(integrate)
+        st.record_run(run.model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+
+    lines = store.Journal(RUN_ID).read()
+
+    assert [line.event for line in lines] == [
+        "run_upsert",
+        "story_upsert",
+        "story_upsert",
+        "subtask_upsert",
+        "story_upsert",
+        "run_upsert",
+    ]
+    head = min(lines, key=lambda line: line.seq)
+    assert head is lines[0]
+    assert head.event == "run_upsert"
+    assert set(head.payload) == RUN_UPSERT_KEYS
+    assert head.payload["milestone_id"] == MILESTONE_ID
+    assert {line.run_id for line in lines} == {RUN_ID}
+    for line in lines:
+        if line.event == "run_upsert":
+            assert line.payload["milestone_id"] == MILESTONE_ID
+    story_lines = [line for line in lines if line.event == "story_upsert"]
+    assert [line.story for line in story_lines] == [
+        story.card_id,
+        bases.BASES_STORY_ID,
+        integration.INTEGRATE_STORY_ID,
+    ]
+    for line in story_lines:
+        assert set(line.payload) == STORY_UPSERT_KEYS
+        assert line.payload["card_id"] == line.story
+        assert line.card is None
+    (subtask_line,) = [line for line in lines if line.event == "subtask_upsert"]
+    assert (subtask_line.story, subtask_line.card) == (
+        bases.BASES_STORY_ID,
+        f"base-{story.card_id}",
+    )
+    assert "milestone_id" not in subtask_line.payload
+
+
 def test_a_run_upsert_line_from_before_milestone_id_rebuilds_to_none(repo):
     # A journal written before the field existed has no `milestone_id` key at
     # all (not `null`): it must still validate, and project a NULL column.

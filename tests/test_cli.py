@@ -3636,6 +3636,43 @@ def test_an_empty_board_dry_runs_to_no_levels_and_exits_zero(tmp_path, monkeypat
     }
 
 
+def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_path, monkeypatch):
+    """Card a7fcc076: the `--board --dry-run` shape, pinned for the README.
+
+    `data` is exactly `{board, max_concurrent, levels}`; each level is
+    `{level, milestones}`; each milestone is exactly `{milestone_id, title,
+    branch_prefix, plan}`, and `plan` is that milestone's `dry_run_payload`
+    (`{max_concurrent, levels, already_done, integrate}`). `ok` is only on
+    the envelope, never inside `data`, and nothing carries a `run_id`: a
+    preview mints no run and opens no Store."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(first.id,))
+    _serve_roots(monkeypatch, [first, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"board", "max_concurrent", "levels"}
+    assert "ok" not in data
+    assert "run_id" not in data
+    assert data["board"] is True
+    assert [set(level) for level in data["levels"]] == [{"level", "milestones"}] * 2
+    entries = [entry for level in data["levels"] for entry in level["milestones"]]
+    assert [entry["milestone_id"] for entry in entries] == [first.id, second.id]
+    for entry in entries:
+        assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+        assert set(entry["plan"]) == {"max_concurrent", "levels", "already_done", "integrate"}
+        assert "ok" not in entry["plan"]
+        assert "run_id" not in entry["plan"]
+    assert list(paths.data_dir().iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "roots, error_type",
     [
@@ -3805,6 +3842,45 @@ def test_a_board_run_prints_run_boards_payload_in_the_ok_envelope(tmp_path, monk
     assert pretty.exit_code == 0, pretty.output
     assert "\n" in pretty.stdout.strip()
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
+
+
+def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypatch):
+    """Card a7fcc076: `am run --board` prints `{"ok": true, "data": payload}`
+    with `run_board`'s payload untouched: `data` is exactly `{ok, board,
+    levels, milestones}`, with no board-level `run_id`, and the done,
+    escalated and blocked entries keep their own key sets. The envelope's
+    `ok` stays true when `data.ok` is false: an escalation is a truthful
+    result, reported through the exit code."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    done_id, escalated_id, blocked_id = _plan_id(1), _plan_id(2), _plan_id(3)
+    payload = {
+        "ok": False,
+        "board": True,
+        "levels": [
+            {"level": 0, "milestones": [done_id, escalated_id]},
+            {"level": 1, "milestones": [blocked_id]},
+        ],
+        "milestones": [
+            {
+                "milestone_id": done_id,
+                "status": "done",
+                "done": True,
+                "run_id": "20261001T000000Z-00000001",
+            },
+            {"milestone_id": escalated_id, "status": "escalated", "error": "RuntimeError: boom"},
+            {"milestone_id": blocked_id, "status": "blocked", "blocked_by": [escalated_id]},
+        ],
+    }
+    _patch_run_board(monkeypatch, payload)
+
+    result = _board_run(tmp_path)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    envelope = json.loads(result.stdout)
+    # Exact equality is the whole pin: any key the CLI adds, drops or renames
+    # (a board-level `run_id`, say) breaks it. The payload's own key sets are
+    # pinned against the real `run_board` in test_orchestrate.py.
+    assert envelope == {"ok": True, "data": payload}
 
 
 @pytest.mark.parametrize(
