@@ -2033,23 +2033,25 @@ def logs_follow_for(
     phase: str | None = None,
     attempt: int | None = None,
     since_offset: int = 0,
-) -> Path:
-    """Validate `am logs --follow` and name the file it streams.
+) -> LogsSelection:
+    """Validate `am logs --follow` and return the attempt it streams.
 
     The same selection as `logs_for` (`select_logs`), so every refusal the
     one-shot makes is made here too, before the hello line. On top of those:
     a negative `--since-offset` (worded as `watch --since` is), and an agent
     attempt that recorded no stdout path, since the hello must name a file.
     The projection connection is closed by `select_logs` before this
-    returns, and streaming reads only the returned file.
+    returns. The selection, not only its file, is returned because the
+    stream looks the attempt's status up again before every read
+    (`logs_end_status`, card 4.2), and that needs the run, card, phase and
+    attempt number.
     """
     if since_offset < 0:
         raise CliError(f"--since-offset must be 0 or more, got {since_offset}")
     selection = select_logs(
         run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
     )
-    followed = selection.followed_path()
-    if followed is None:
+    if selection.followed_path() is None:
         number = (
             selection.attempt.n
             if selection.attempt is not None
@@ -2060,7 +2062,61 @@ def logs_follow_for(
             f" {selection.subtask.card_id!r} recorded no stdout path,"
             " so there is no file to follow"
         )
-    return followed
+    return selection
+
+
+def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
+    """The followed attempt's status if it is over, `None` while it runs.
+
+    Looked up afresh on every call, because `selection` is a snapshot from
+    before the stream began. Read-only, like `select_logs`: the free
+    `open_db` / `load_run`, the connection closed before anything else, and
+    for a deterministic phase only `paths.recorded_attempts`; never
+    `Store.open`, `paths.attempt_dir` or `paths.run_dir`, which create
+    directories. An agent attempt is over once its status is anything but
+    `started`; a deterministic one maps through `step_end_status`. A run,
+    card, phase or attempt that can no longer be found is a refusal, which
+    `_stream_logs` reports on stderr at exit 3.
+    """
+    run_id = selection.run.id
+    card = selection.subtask.card_id
+    name = selection.phase.name
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection for {root} any more"
+        )
+    found = find_subtask(run, card)
+    if found is None:
+        raise UnknownCardError(f"card {card!r} is not in run {run_id!r} any more")
+    _, subtask = found
+    phase = next((item for item in subtask.phases if item.name == name), None)
+    if phase is None:
+        raise UnknownPhaseError(f"card {card!r} has no phase {name!r} any more")
+    if selection.attempt is None:
+        if selection.step_attempt is None:
+            raise CliError(
+                f"phase {name!r} of card {card!r} was selected with neither"
+                " an attempt row nor a step attempt"
+            )
+        return step_end_status(
+            subtask,
+            phase,
+            selection.step_attempt,
+            paths.recorded_attempts(run_id, card, name),
+        )
+    n = selection.attempt.n
+    row = next((item for item in phase.attempts if item.n == n), None)
+    if row is None:
+        raise UnknownAttemptError(
+            f"phase {name!r} of card {card!r} has no attempt {n} any more"
+        )
+    return None if row.status == "started" else row.status
 
 
 @app.command("logs")
@@ -2078,7 +2134,8 @@ def logs(
         "--follow",
         help=(
             "Keep printing the attempt's stdout as it grows, one JSON object"
-            " per line, until interrupted."
+            " per line; once the attempt is over and the file stops growing,"
+            ' print {"event":"end","status":...} and exit 0.'
         ),
     ),
     since_offset: int | None = typer.Option(
@@ -2096,8 +2153,10 @@ def logs(
 
     With --follow, print a hello line naming the attempt's stdout file and
     then its bytes as `{"offset", "text"}` lines, the existing content first
-    and then each append, until interrupted. A refusal is still one envelope
-    at exit 3, printed before any stream line.
+    and then each append. Once the attempt has a terminal status and the
+    file has stopped growing, a last `{"event": "end", "status": ...}` line
+    follows and the exit is 0. A refusal is still one envelope at exit 3,
+    printed before any stream line.
     """
     offset = since_offset if since_offset is not None else 0
     try:
@@ -2109,7 +2168,7 @@ def logs(
                 " and without --follow there is no stream"
             )
         if follow:
-            followed = logs_follow_for(
+            selection = logs_follow_for(
                 run_id,
                 card,
                 repo_dir=repo_dir,
@@ -2125,7 +2184,7 @@ def logs(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_logs(followed, offset=offset)
+        _stream_logs(selection, repo_dir=repo_dir, offset=offset)
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
@@ -2425,26 +2484,31 @@ def _logs_hello(path: Path, offset: int) -> dict[str, Any]:
 
 
 def _follow_logs(
-    path: Path,
+    path: Path | None,
     *,
     offset: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
+    end_status: Callable[[], str | None],
 ) -> Iterator[dict[str, Any]]:
-    """`path`'s bytes from `offset` as `{"offset", "text"}` chunks, then each append.
+    """`path`'s bytes from `offset` as `{"offset", "text"}` chunks, then each
+    append, then `{"event": "end", "status": ...}` once the attempt is over.
 
-    One read at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
-    another read, `max_polls` times or forever when it is `None`. One byte
-    cursor spans every read, so chunks are contiguous: each starts where the
-    last ended. A trailing partial UTF-8 character stays below the cursor
-    and is read again, completed, on a later poll. A read that finds nothing
-    past the cursor (no file yet, a file shorter than the cursor) yields
-    nothing. Attempt status is not consulted: ending the stream on a
-    terminal attempt is card 4.2's.
+    `end_status()` is asked before every read, so bytes written just before
+    the status flips are still read. While it returns `None` the attempt is
+    running: one read, then `sleep(WATCH_POLL_SECONDS)` and another,
+    `max_polls` sleeps or forever when it is `None`. Once it returns a
+    status, reads repeat with no sleep and no poll bound until one finds
+    nothing new; then a trailing partial UTF-8 character still held back is
+    yielded as one replacement-decoded chunk (the file will not grow to
+    complete it) and the `end` line closes the stream. One byte cursor spans
+    every read, so chunks are contiguous. A read that finds nothing past the
+    cursor (no file yet, a file shorter than the cursor) yields nothing.
     """
     cursor = offset
     polls = 0
     while True:
+        ended = end_status()
         data = _read_log_bytes(path, cursor)
         complete = _utf8_complete_length(data)
         if complete:
@@ -2453,27 +2517,41 @@ def _follow_logs(
                 "text": data[:complete].decode("utf-8", errors="replace"),
             }
             cursor += complete
+            if ended is not None:
+                continue
+        if ended is not None:
+            if data:
+                yield {"offset": cursor, "text": data.decode("utf-8", errors="replace")}
+            yield {"event": "end", "status": ended}
+            return
         if max_polls is not None and polls >= max_polls:
             return
         sleep(WATCH_POLL_SECONDS)
         polls += 1
 
 
-def _stream_logs(path: Path, *, offset: int) -> None:
+def _stream_logs(selection: LogsSelection, *, repo_dir: Path, offset: int) -> None:
     """The body of `am logs --follow`, once `logs_follow_for` has accepted it.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
-    test that replaces them controls every poll. Ctrl-C and a closed pipe are
-    how a stream normally ends: exit 0, nothing on stderr. After the hello
-    line no envelope can be printed, so a handled error goes to stderr and
-    the exit is `EXIT_ERROR`, mirroring `_stream_watch`.
+    test that replaces them controls every poll. The stream ends by itself
+    with the `end` line once `logs_end_status` finds the attempt over and the
+    file drained: exit 0. Ctrl-C and a closed pipe also end it at exit 0,
+    nothing on stderr. After the hello line no envelope can be printed, so a
+    handled error, a failed status re-lookup included, goes to stderr and the
+    exit is `EXIT_ERROR`, mirroring `_stream_watch`.
     """
+    path = selection.followed_path()
     try:
         _emit_stream_line(_logs_hello(path, offset))
-        for chunk in _follow_logs(
-            path, offset=offset, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+        for line in _follow_logs(
+            path,
+            offset=offset,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            end_status=lambda: logs_end_status(selection, repo_dir=repo_dir),
         ):
-            _emit_stream_line(chunk)
+            _emit_stream_line(line)
     except KeyboardInterrupt:
         return
     except BrokenPipeError:
