@@ -2463,6 +2463,52 @@ def preflight_board(
     )
 
 
+def run_board_engine(
+    pre: BoardPreflight,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Stage 2 of a board run: run the board `pre` approved, and report (card 203a9a5e).
+
+    `pre` is the only input. The board is not read again, prefixes and bases
+    are not derived again, and the up-front claim check is not repeated: that
+    pre-flight is the caller's. Each milestone's own pre-flight inside
+    `_run_milestone_async` still runs, so a claim taken since `pre` is an
+    `escalated` entry. With nothing open it returns `ok` with no milestones and
+    starts no event loop. Otherwise one `asyncio.run(_run_board_async(...))`
+    on `pre.max_concurrent`, and `run_board`'s payload with `pre.levels_payload`
+    as its `levels`. Synchronous; does not mutate `pre`.
+    """
+    if not pre.milestones:
+        return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
+    entries = asyncio.run(
+        _run_board_async(
+            pre.milestones,
+            prefixes=pre.prefixes,
+            bases=pre.bases,
+            root=pre.root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            max_concurrent=pre.max_concurrent,
+            control_interval=control_interval,
+        )
+    )
+    return {
+        "ok": all(entry["status"] == "done" for entry in entries),
+        "board": True,
+        "levels": pre.levels_payload,
+        "milestones": entries,
+    }
+
+
 def run_board(
     *,
     repo_dir: Path,
@@ -2477,6 +2523,8 @@ def run_board(
     control_interval: float = control.CONTROL_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Drive every open milestone on the board as one grafo tree, and report.
+
+    It composes `preflight_board` and `run_board_engine` (card 203a9a5e).
 
     Refusals come first, in this order, and each leaves nothing behind. Bad
     arguments are `ValueError` before the board is read: `max_concurrent < 1`
@@ -2523,29 +2571,15 @@ def run_board(
         branch_prefix_of=branch_prefix_of,
         max_concurrent=max_concurrent,
     )
-    if not pre.milestones:
-        return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
-    entries = asyncio.run(
-        _run_board_async(
-            pre.milestones,
-            prefixes=pre.prefixes,
-            bases=pre.bases,
-            root=pre.root,
-            commands=commands,
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-            driver=driver,
-            clock=clock,
-            max_concurrent=pre.max_concurrent,
-            control_interval=control_interval,
-        )
+    return run_board_engine(
+        pre,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        driver=driver,
+        clock=clock,
+        control_interval=control_interval,
     )
-    return {
-        "ok": all(entry["status"] == "done" for entry in entries),
-        "board": True,
-        "levels": pre.levels_payload,
-        "milestones": entries,
-    }
 
 
 async def _run_board_async(

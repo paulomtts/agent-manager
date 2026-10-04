@@ -8159,6 +8159,113 @@ def test_preflight_board_never_starts_an_event_loop(board_seams, monkeypatch):
     assert board_seams.runs.calls == []
 
 
+def test_run_board_engine_runs_a_preflight_without_reading_the_board_again(
+    board_seams, monkeypatch
+):
+    """Review Focus 3: the engine runs the approved pre-flight, never a fresh read."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    pre = _preflight(board_seams)
+
+    def no_read(*, repo_dir=None):
+        pytest.fail("run_board_engine read the board again")
+
+    monkeypatch.setattr(board, "roots", no_read)
+    board_seams.claims = []
+
+    result = orchestrate.run_board_engine(pre)
+
+    assert result["ok"] is True
+    assert result["board"] is True
+    assert result["levels"] == pre.levels_payload
+    assert [entry["milestone_id"] for entry in result["milestones"]] == [a.id, b.id]
+    assert _bases(board_seams) == {a.id: "main", b.id: "p00000001-integrate"}
+    assert board_seams.claims == []
+    assert pre.levels_payload == [
+        {"level": 0, "milestones": [a.id]},
+        {"level": 1, "milestones": [b.id]},
+    ]
+    assert pre.bases == {a.id: "main", b.id: "p00000001-integrate"}
+
+
+def test_run_board_engine_gives_the_same_payload_run_board_gives(board_seams):
+    """Review Focus 5: one board, both entry points, one payload."""
+    a = _board_milestone(1)
+    b = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [a, b]
+    board_seams.runs.outcomes[a.id] = {"escalated": True, "run_id": "r"}
+
+    engine_result = orchestrate.run_board_engine(_preflight(board_seams))
+    board_seams.runs.calls.clear()
+    board_result = _board(board_seams)
+
+    assert engine_result == board_result
+    assert engine_result["ok"] is False
+    assert _by_id(engine_result)[b.id] == {
+        "milestone_id": b.id,
+        "status": "blocked",
+        "blocked_by": [a.id],
+    }
+    assert board_seams.runs.called() == [a.id]
+
+
+def test_run_board_engine_uses_the_preflights_lane_bound_and_forwards_run_arguments(
+    board_seams,
+):
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+    pre = _preflight(board_seams, max_concurrent=3)
+    runner_factory = object()
+    driver = object()
+
+    def clock() -> datetime:
+        return datetime(2026, 10, 4, tzinfo=timezone.utc)
+
+    orchestrate.run_board_engine(
+        pre,
+        commands=("git status",),
+        allow_no_verification=True,
+        runner_factory=runner_factory,
+        driver=driver,
+        clock=clock,
+        control_interval=0.25,
+    )
+
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    slots = [kwargs["slots"] for _milestone, kwargs in board_seams.runs.calls]
+    assert isinstance(slots[0], asyncio.Semaphore)
+    assert all(semaphore is slots[0] for semaphore in slots)
+    for milestone, kwargs in board_seams.runs.calls:
+        assert kwargs["max_concurrent"] == 3
+        assert kwargs["repo_dir"] == pre.root
+        assert kwargs["branch_prefix"] == pre.prefixes[milestone]
+        assert kwargs["base_branch"] == pre.bases[milestone]
+        assert list(kwargs["commands"]) == ["git status"]
+        assert kwargs["allow_no_verification"] is True
+        assert kwargs["runner_factory"] is runner_factory
+        assert kwargs["driver"] is driver
+        assert kwargs["clock"] is clock
+        assert kwargs["control_interval"] == 0.25
+
+
+def test_run_board_engine_on_an_empty_preflight_starts_no_event_loop(board_seams, monkeypatch):
+    """Review Focus 1: nothing open, so nothing to run and no loop to start."""
+    board_seams.cards = [_board_milestone(1, status="done", done_children=True)]
+    pre = _preflight(board_seams)
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("run_board_engine started a run on an empty board")
+
+    monkeypatch.setattr(orchestrate, "_run_board_async", fail)
+    monkeypatch.setattr(orchestrate.asyncio, "run", fail)
+
+    result = orchestrate.run_board_engine(pre)
+
+    assert result == {"ok": True, "board": True, "levels": [], "milestones": []}
+    assert board_seams.runs.calls == []
+
+
 # ── _local_branch_exists (card 5b772688) ────────────────────────────────────
 
 
