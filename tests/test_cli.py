@@ -8500,3 +8500,88 @@ def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkey
     monkeypatch.setattr(sys, "stdout", buffer)
     cli._silence_stdout()
     assert sys.stdout is buffer
+
+
+# ── am watch --from-now (card db129e6a) ────────────────────────────────────
+#
+# Default (unit) tier per design §14, like the follow tests above: journals in
+# tmp_path, polling driven by the fake `cli._watch_sleep`, no subprocess.
+
+
+def _assert_one_cli_error(result, *needles: str) -> dict[str, Any]:
+    """The refusal shape: exit 3, exactly one envelope line, ok false, CliError."""
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert "event" not in envelope
+    assert envelope["error"]["type"] == "CliError"
+    for needle in needles:
+        assert needle in envelope["error"]["message"], envelope
+    return envelope
+
+
+def test_watch_from_now_refused_with_since(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    for argv in (
+        ["run-a", "--from-now", "--since", "0"],
+        ["run-a", "--from-now", "--since", "2"],
+        ["--all", "--from-now", "--since", "0"],
+    ):
+        result, sleeps = _watch_follow(monkeypatch, *argv)
+        assert sleeps == [], argv
+        _assert_one_cli_error(result, "--from-now", "--since", "exclusive")
+
+    # `--pretty` still indents the refusal, and it is still the only output.
+    pretty, sleeps = _watch_follow(
+        monkeypatch, "run-a", "--from-now", "--since", "0", "--pretty"
+    )
+    assert pretty.exit_code == cli.EXIT_ERROR, pretty.output
+    assert sleeps == []
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout)["error"]["type"] == "CliError"
+
+    # Breaking both new rules at once reports the --since conflict.
+    both = _watch("run-a", "--from-now", "--since", "2")
+    _assert_one_cli_error(both, "--from-now", "--since", "exclusive")
+
+
+def test_watch_from_now_refused_without_follow(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    for argv in (["run-a", "--from-now"], ["--all", "--from-now"]):
+        result = runner.invoke(cli.app, ["watch", *argv])
+        _assert_one_cli_error(result, "--from-now", "--follow")
+
+
+def test_watch_from_now_keeps_existing_refusals_and_since_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    # RUN_ID handling is unchanged under --from-now: no hello line, no polls.
+    for argv, kind in (
+        (["no-such-run", "--from-now"], "UnknownRunError"),
+        (["../escape", "--from-now"], "UnknownRunError"),
+        (["run-a", "--all", "--from-now"], "CliError"),
+    ):
+        refused, sleeps = _watch_follow(monkeypatch, *argv)
+        assert refused.exit_code == cli.EXIT_ERROR, (argv, refused.output)
+        assert sleeps == [], argv
+        refusal_lines = refused.stdout.splitlines()
+        assert len(refusal_lines) == 1, (argv, refused.stdout)
+        refusal = json.loads(refusal_lines[0])
+        assert refusal["ok"] is False, argv
+        assert refusal["error"]["type"] == kind, argv
+    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
+
+    # Without --from-now, `--since 0` is still the default and `--since -1`
+    # is still refused by the old check.
+    zero = _watch("run-a", "--since", "0")
+    assert zero.exit_code == 0, zero.output
+    assert json.loads(zero.stdout) == {"ok": True, "data": {"events": written}}
+    negative = _watch("run-a", "--since", "-1")
+    _assert_one_cli_error(negative, "--since must be 0 or more")
