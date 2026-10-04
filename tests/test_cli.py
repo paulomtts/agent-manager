@@ -5744,6 +5744,48 @@ def test_logs_follow_ends_on_terminal_status(projection, monkeypatch, status):
     assert result.stdout.splitlines()[-1] == f'{{"event":"end","status":"{status}"}}'
 
 
+def test_logs_follow_checks_status_before_the_read_it_applies_to(
+    projection, monkeypatch
+):
+    """The writer appends and flips the status right after a read that found
+    nothing. Because the status was looked up *before* that read, it was
+    still `started`: the stream polls once more, reads the last bytes, and
+    only then ends. Looking the status up after the read would end here and
+    lose them."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_writer_finishes(path, offset):
+        data = real_read(path, offset)
+        reads.append(offset)
+        if len(reads) == 1:
+            assert data == b""
+            with stdout.open("ab") as handle:
+                handle.write(b"last words\n")
+            _set_implement_status(projection, "ok")
+        return data
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_writer_finishes)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", str(size)),
+        actions=[lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(stdout, size),
+        {"offset": size, "text": "last words\n"},
+        _end_line("ok"),
+    ]
+
+
 def test_logs_follow_already_complete_file_ends_without_waiting(projection, monkeypatch):
     _record_for_logs(projection, LOGS_RUN_ID)  # implement.1 is gate_failed
     content = "first line\nsecond líne\n€uro\n"
