@@ -142,7 +142,13 @@ def test_watch_documents_from_now():
     assert "- `--from-now` together with `--since`, any value, 0 included;" in section
     assert "- `--from-now` without `--follow`;" in section
     assert "only lines appended after the command started" in section
-    assert '"schema":1' in section
+    assert (
+        "A line that was still being written when the command started"
+        " is printed once it is complete." in section
+    )
+    # The section's pre-existing hello example already holds `"schema":1`,
+    # so pin the --from-now paragraph's own sentence, not the bare token.
+    assert 'The hello line is the same, `"schema":1`.' in section
 
 
 def test_logs_section_shape_line():
