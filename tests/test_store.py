@@ -1363,9 +1363,10 @@ SUMMARY_KEYS = {
     "milestone_id",
     "card_id",
     "lease",
+    "progress",
 }
 """The seven names `am runs` always had, plus `milestone_id` and `card_id`
-(card 0b5a15d7) and `lease` (card 6bf47e74)."""
+(card 0b5a15d7), `lease` (card 6bf47e74) and `progress` (card 882b212b)."""
 
 
 def _listed(root: Path) -> list[store.RunSummary]:
@@ -1479,12 +1480,13 @@ def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
     assert summary.card_id == "aaaa1111"
 
 
-def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_and_lease():
+def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_lease_and_progress():
     assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
     assert store.RunSummary.model_config["extra"] == "forbid"
     assert store.RunSummary.model_fields["milestone_id"].default is None
     assert store.RunSummary.model_fields["card_id"].default is None
     assert store.RunSummary.model_fields["lease"].default is None
+    assert store.RunSummary.model_fields["progress"].default is None
 
 
 def test_a_listed_run_dumps_exactly_the_summary_keys(repo):
@@ -1581,6 +1583,106 @@ def test_run_summary_rejects_a_lease_missing_a_key():
 
     [error] = caught.value.errors()
     assert error["loc"] == ("lease", "accepting")
+    assert error["type"] == "missing"
+
+
+PROGRESS_KEYS = {"stories", "subtasks", "current"}
+PROGRESS_COUNT_KEYS = {"done", "total"}
+PROGRESS_CURRENT_KEYS = {"card", "phase", "attempt"}
+"""The `runs[]` progress object (card 882b212b): two counts and the step in flight."""
+
+
+def _progress_fields(**overrides) -> dict:
+    """One valid `RunProgress` as a plain dict."""
+    return {
+        "stories": {"done": 1, "total": 2},
+        "subtasks": {"done": 3, "total": 5},
+        "current": {"card": "card-1", "phase": "implement", "attempt": 2},
+        **overrides,
+    }
+
+
+def test_run_progress_models_have_exactly_their_keys_and_forbid_others():
+    assert set(store.RunProgress.model_fields) == PROGRESS_KEYS
+    assert set(store.ProgressCount.model_fields) == PROGRESS_COUNT_KEYS
+    assert set(store.ProgressCurrent.model_fields) == PROGRESS_CURRENT_KEYS
+    for model in (store.RunProgress, store.ProgressCount, store.ProgressCurrent):
+        assert model.model_config["extra"] == "forbid"
+
+
+def test_run_summary_progress_defaults_to_none():
+    """Additive for anyone who builds a `RunSummary` by hand; `list_runs`
+    itself always fills it."""
+    summary = store.RunSummary.model_validate(_summary_fields())
+
+    assert summary.progress is None
+    assert summary.model_dump()["progress"] is None
+
+
+def test_run_summary_accepts_a_progress_object_and_dumps_it_as_a_plain_dict():
+    summary = store.RunSummary.model_validate(_summary_fields(progress=_progress_fields()))
+
+    assert isinstance(summary.progress, store.RunProgress)
+    assert isinstance(summary.progress.current, store.ProgressCurrent)
+    assert summary.model_dump()["progress"] == _progress_fields()
+
+
+def test_run_summary_accepts_a_null_current_and_a_null_attempt():
+    no_current = store.RunSummary.model_validate(
+        _summary_fields(progress=_progress_fields(current=None))
+    )
+    no_attempt = store.RunSummary.model_validate(
+        _summary_fields(
+            progress=_progress_fields(
+                current={"card": "card-1", "phase": "explore", "attempt": None}
+            )
+        )
+    )
+
+    assert no_current.progress is not None
+    assert no_current.progress.current is None
+    assert no_attempt.progress is not None
+    assert no_attempt.progress.current is not None
+    assert no_attempt.progress.current.attempt is None
+
+
+@pytest.mark.parametrize(
+    "progress, loc",
+    [
+        (_progress_fields(extra=1), ("progress", "extra")),
+        (
+            _progress_fields(stories={"done": 0, "total": 0, "failed": 0}),
+            ("progress", "stories", "failed"),
+        ),
+        (
+            _progress_fields(
+                current={"card": "c", "phase": "p", "attempt": 1, "story": "s"}
+            ),
+            ("progress", "current", "story"),
+        ),
+    ],
+    ids=["progress", "count", "current"],
+)
+def test_run_summary_rejects_an_unknown_key_anywhere_in_progress(progress, loc):
+    with pytest.raises(ValidationError) as caught:
+        store.RunSummary.model_validate(_summary_fields(progress=progress))
+
+    [error] = caught.value.errors()
+    assert error["loc"] == loc
+    assert error["type"] == "extra_forbidden"
+
+
+def test_run_summary_rejects_a_progress_missing_current():
+    """`current` is required, never silently absent: `null` is the only way
+    to say nothing is in flight."""
+    fields = _progress_fields()
+    del fields["current"]
+
+    with pytest.raises(ValidationError) as caught:
+        store.RunSummary.model_validate(_summary_fields(progress=fields))
+
+    [error] = caught.value.errors()
+    assert error["loc"] == ("progress", "current")
     assert error["type"] == "missing"
 
 

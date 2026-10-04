@@ -4190,9 +4190,11 @@ RUNS_ENTRY_KEYS = {
     "milestone_id",
     "card_id",
     "lease",
+    "progress",
 }
 """Every `data.runs[]` entry: the seven names `am runs` always had, plus
-`milestone_id` and `card_id` (card 0b5a15d7) and `lease` (card 6bf47e74)."""
+`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74) and
+`progress` (card 882b212b)."""
 
 RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
 """A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
@@ -4232,7 +4234,7 @@ def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection)
     assert entry["card_id"] is None
 
 
-def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_and_card_id(projection):
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_and_progress(projection):
     _record(
         projection,
         "20260921T090000Z-cbe34d00",

@@ -605,6 +605,43 @@ class RunLease(BaseModel):
     accepting: bool
 
 
+class ProgressCount(BaseModel):
+    """`done` of `total` rows at one level of a run's tree (`stories` or
+    `subtasks`). Only status `done` counts toward `done`; every other status,
+    `failed`, `escalated`, `stopped` and `cancelled` included, counts toward
+    `total` alone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    done: int
+    total: int
+
+
+class ProgressCurrent(BaseModel):
+    """The step a run is in, read from rows only: the `started` phase's
+    subtask `card`, its `phase` name, and the highest `attempt` number
+    recorded for that phase, or `None` before its first attempt row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    phase: str
+    attempt: int | None
+
+
+class RunProgress(BaseModel):
+    """The `progress` of one `am runs` entry, counted by `list_runs` from the
+    run's `stories`, `subtasks`, `phases` and `attempts` rows.
+
+    `current` is required: `None` is how it says no phase is `started`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stories: ProgressCount
+    subtasks: ProgressCount
+    current: ProgressCurrent | None
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
@@ -623,6 +660,11 @@ class RunSummary(BaseModel):
     `lease` is the run's `run_leases` row as a `RunLease`, or `None` when the
     run has no lease row. `list_runs` always leaves it `None`; `am runs`
     fills it in `cli`. It too defaults to `None`, so it is additive.
+
+    `progress` is how far the run has got, counted from its tree rows as a
+    `RunProgress`. `list_runs` always fills it (a run with no tree rows is 0
+    of 0 with no `current`); it defaults to `None` only so that a
+    `RunSummary` built by hand stays valid, which keeps it additive.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -637,6 +679,7 @@ class RunSummary(BaseModel):
     milestone_id: str | None = None
     card_id: str | None = None
     lease: RunLease | None = None
+    progress: RunProgress | None = None
 
 
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
