@@ -5346,7 +5346,6 @@ def _newest_seq(project: Path, run_id: str, card_id: str) -> int:
     )
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pygents_resume_with_its_worktree_deleted_re_adds_it_and_resumes_at_implement(
     project, cards
@@ -5371,7 +5370,6 @@ def test_a_pygents_resume_with_its_worktree_deleted_re_adds_it_and_resumes_at_im
     ) in payload["warnings"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pygents_resume_with_worktree_and_branch_gone_declines_the_checkpoint(
     project, cards

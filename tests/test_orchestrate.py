@@ -6283,7 +6283,6 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
     assert run_end_rows == [(key, "posted") for key in milestone_keys]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_whose_walk_declined_its_checkpoint_posts_done_without_resumed_at(project):
     """Resume worktree re-ensure §3.6: the lane hands a1 a checkpoint, but the
