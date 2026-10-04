@@ -313,7 +313,6 @@ class HarnessAdapter(Protocol):
     capabilities: frozenset[str]
 
     def build_command(self, d: Dispatch) -> list[str]: ...
-    def parse_usage(self, stdout: str) -> Usage | None: ...
 ```
 
 `Dispatch` carries the prompt text, the role bundle, the cwd, the result path,
@@ -363,10 +362,12 @@ Run
         └── phases: list[PhaseRun]
             ├── name, kind, status, started_at, ended_at
             └── attempts: list[Attempt]
-                ├── n, exit_code, duration, tokens_in, tokens_out, cost
+                ├── n, exit_code, duration
                 ├── dispatch: harness, model, role, cwd, prompt_path, result_path
                 └── artifacts: prompt.txt, result.json, stdout.log
 ```
+
+`tokens_in`, `tokens_out` and `cost` were removed from `Attempt` by [2026-10-03-remove-cost-tracking-design.md](2026-10-03-remove-cost-tracking-design.md).
 
 **Write ordering.** The journal is appended *before* the SQLite row is updated,
 and every journal line carries the run id, the card, the phase, the attempt and
@@ -560,9 +561,10 @@ runs and a diff. Any expression language in the workflow document.
 
 ## 17. Open questions
 
-- **Cost accounting on non-Claude harnesses.** `parse_usage` may return nothing
-  where a harness does not report tokens. Per-phase cost then has gaps. Live
-  with the gaps in v1, or require a usage source per adapter?
+- ~~**Cost accounting on non-Claude harnesses.**~~ Resolved by
+  [2026-10-03-remove-cost-tracking-design.md](2026-10-03-remove-cost-tracking-design.md):
+  closed, because `am` keeps no per-phase cost, so no adapter needs a usage
+  source.
 - **Timeouts.** A per-phase default is needed, and a long `implement` on a
   large subtask is legitimately slow. Start with a generous per-role timeout in
   `policy.toml` and tune from recorded durations.
