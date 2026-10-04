@@ -44,7 +44,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
-The one exception is `am watch --follow`, which prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)).
+The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)).
 
 ### Milestone runs
 
@@ -600,6 +600,8 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
 - Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run) are in the `payload` of its first line, a `run_upsert`. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
+
+### Reading an attempt's output
 
 ## Resuming: what runs again
 
