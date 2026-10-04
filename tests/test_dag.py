@@ -733,3 +733,70 @@ def test_board_levels_of_only_finished_milestones_is_empty():
 def test_a_cycle_through_a_done_milestone_does_not_stop_board_levels():
     roots = [_root("a", ["b"], status="done"), _root("b", ["a"])]
     assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+# ── terminal card statuses: merged = finished, canceled/archived = out of play ──
+
+FINISHED = ["done", "merged", "MERGED", "Done"]
+OUT_OF_PLAY = ["canceled", "archived", "CANCELED", "Archived"]
+
+
+@pytest.mark.parametrize("status", FINISHED)
+def test_finished_statuses_are_done_for_subtasks_and_stories(status):
+    assert is_subtask_done(_sub("s", status)) is True
+    assert is_story_closed(_story("a", status=status)) is True
+    assert remaining_subtasks(_story("a", status=status)) == []
+
+
+@pytest.mark.parametrize("status", OUT_OF_PLAY)
+def test_out_of_play_subtasks_are_not_remaining_work(status):
+    story = _story("a", subtasks=[_sub("a1", status), _sub("a2")])
+    assert [s.id for s in remaining_subtasks(story)] == ["a2"]
+    only = _story("b", subtasks=[_sub("b1", status)])
+    assert remaining_subtasks(only) == []
+    assert compute_levels([only]) == []
+
+
+@pytest.mark.parametrize("status", OUT_OF_PLAY)
+def test_an_out_of_play_story_is_never_dispatched(status):
+    stories = [_story("a", status=status), _story("b")]
+    assert [[s.id for s in lvl] for lvl in compute_levels(stories)] == [["b"]]
+
+
+@pytest.mark.parametrize("status", FINISHED)
+def test_a_story_blocked_by_a_finished_story_lands_in_level_zero(status):
+    stories = [_story("a", status=status), _story("b", ["a"])]
+    assert [[s.id for s in lvl] for lvl in compute_levels(stories)] == [["b"]]
+
+
+@pytest.mark.parametrize("status", OUT_OF_PLAY)
+def test_a_blocker_on_an_out_of_play_story_is_ignored(status):
+    stories = [_story("a", status=status), _story("b", ["a"]), _story("c")]
+    assert [[s.id for s in lvl] for lvl in compute_levels(stories)] == [["b", "c"]]
+
+
+@pytest.mark.parametrize("status", FINISHED)
+def test_board_levels_drops_a_finished_root_and_a_finished_tree(status):
+    done_child = CardNode(id="k", title="s", status=status)
+    assert board_levels([_root("a", status=status)]) == []
+    assert board_levels([_root("a", children=[done_child])]) == []
+    nested = CardNode(id="s", title="s", status="done", children=[done_child])
+    assert board_levels([_root("a", children=[nested])]) == []
+
+
+@pytest.mark.parametrize("status", OUT_OF_PLAY)
+def test_board_levels_ignores_out_of_play_cards(status):
+    dead = CardNode(id="k", title="s", status=status)
+    dead_subtree = CardNode(
+        id="d", title="s", status=status, children=[CardNode(id="t", title="t", status="todo")]
+    )
+    assert board_levels([_root("a", status=status)]) == []
+    assert board_levels([_root("a", children=[dead, dead_subtree])]) == []
+    roots = [_root("a", status=status), _root("b", ["a"])]
+    assert _node_ids(board_levels(roots)) == [["b"]]
+
+
+@pytest.mark.parametrize("status", FINISHED)
+def test_board_levels_blocker_released_by_a_finished_milestone(status):
+    roots = [_root("a", status=status), _root("b", ["a"])]
+    assert _node_ids(board_levels(roots)) == [["b"]]

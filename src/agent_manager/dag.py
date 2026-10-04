@@ -35,7 +35,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from agent_manager.census import StoryPlan, SubtaskPlan
+from agent_manager.census import StoryPlan, SubtaskPlan, is_finished, is_out_of_play
 from agent_manager.models import CardNode
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -92,12 +92,12 @@ def task_branch(prefix: str, card: object) -> str:
 
 
 def is_subtask_done(subtask: SubtaskPlan) -> bool:
-    """True when the subtask's brd status is ``done``, in any case."""
-    return (subtask.status or "").lower() == "done"
+    """True when the subtask's brd status is finished (``done``/``merged``)."""
+    return is_finished(subtask.status)
 
 
 def is_story_closed(story: StoryPlan) -> bool:
-    """True when the story's own brd status is ``done``, in any case.
+    """True when the story's own brd status is finished (``done``/``merged``).
 
     A story marked done is finished, full stop: its subtasks are never
     re-dispatched. During the 2026-08-17 outage per-subtask lookups returned
@@ -105,18 +105,24 @@ def is_story_closed(story: StoryPlan) -> bool:
     field cannot be corrupted piecemeal, so it is the safer gate; a story
     closed by mistake is reopened by hand.
     """
-    return (story.status or "").lower() == "done"
+    return is_finished(story.status)
 
 
 def remaining_subtasks(story: StoryPlan) -> list[SubtaskPlan]:
-    """The story's not-done subtasks in census order; none if the story is closed.
+    """The story's not-finished, in-play subtasks in census order; none if closed.
+
+    ``canceled``/``archived`` subtasks are out of play and never remaining work.
 
     The census already ordered the subtasks by their ``blocked_by`` chain, so
     nothing is re-sorted here.
     """
     if is_story_closed(story):
         return []
-    return [subtask for subtask in story.subtasks if not is_subtask_done(subtask)]
+    return [
+        subtask
+        for subtask in story.subtasks
+        if not is_subtask_done(subtask) and not is_out_of_play(subtask.status)
+    ]
 
 
 # ── dependency levels ───────────────────────────────────────────────────────
@@ -172,7 +178,9 @@ def compute_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
     pending = [
         story
         for story in stories
-        if not is_story_closed(story) and remaining_subtasks(story)
+        if not is_story_closed(story)
+        and not is_out_of_play(story.status)
+        and remaining_subtasks(story)
     ]
     return topological_levels(pending)
 
@@ -188,10 +196,15 @@ def compute_integrate_levels(stories: list[StoryPlan]) -> list[list[StoryPlan]]:
 
 
 def _has_open_descendant(node: CardNode) -> bool:
-    """True when any card nested under ``node``, at any depth, is not ``done``."""
+    """True when any in-play card under ``node``, at any depth, is not finished.
+
+    An out-of-play card (``canceled``/``archived``) and its whole subtree are
+    skipped: they are neither open work nor finished work.
+    """
     return any(
-        (child.status or "").lower() != "done" or _has_open_descendant(child)
+        not is_finished(child.status) or _has_open_descendant(child)
         for child in node.children
+        if not is_out_of_play(child.status)
     )
 
 
@@ -210,7 +223,9 @@ def board_levels(roots: list[CardNode]) -> list[list[CardNode]]:
     pending = [
         root
         for root in roots
-        if (root.status or "").lower() != "done" and _has_open_descendant(root)
+        if not is_finished(root.status)
+        and not is_out_of_play(root.status)
+        and _has_open_descendant(root)
     ]
     ids = {root.id for root in pending}
     placed: set[str] = set()

@@ -36,9 +36,24 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from agent_manager import board
+from agent_manager.census import (
+    FINISHED_STATUSES,
+    OUT_OF_PLAY_STATUSES,
+    is_finished,
+    is_out_of_play,
+)
 
 MAX_ANCESTRY_DEPTH = 16
 """Most ancestors the walk will visit; a guard against a corrupted parent chain."""
+
+
+_HUMAN_TERMINAL = (FINISHED_STATUSES | OUT_OF_PLAY_STATUSES) - {"done"}
+"""Terminal statuses only a human sets (`merged`, `canceled`, `archived`).
+`done` is excluded: am itself writes it, and a later write may replace it."""
+
+
+def _is_human_terminal(status: str | None) -> bool:
+    return (status or "").lower() in _HUMAN_TERMINAL
 
 
 def stored_status(status: str) -> str:
@@ -53,17 +68,26 @@ def stored_status(status: str) -> str:
 def rollup_status(children_statuses: Iterable[str]) -> str | None:
     """A parent's status computed from its direct children, by progress.
 
-    `None` when there are no children (the parent is not written); `todo` when
-    every child is unstarted; `done` when every child is done; otherwise
-    `in_progress` -- one finished child among unstarted ones means the parent
-    is under way, not unstarted. A port of leave-me-alone's `rollupStatus`.
+    Out-of-play children (`canceled`, `archived`) are ignored: they neither
+    hold the parent back nor push it forward. `None` (the parent is not
+    written) when no in-play child is left; `todo` when every in-play child is
+    unstarted; `done` when every one is finished (`merged` counts as `done`);
+    otherwise `in_progress` -- one finished child among unstarted ones means
+    the parent is under way, not unstarted. Never returns `merged`, `canceled`
+    or `archived`: those are a human's calls, so am never writes them. Differs
+    from leave-me-alone's `rollupStatus`, which can roll a parent up to
+    `merged` or `canceled`.
     """
-    statuses = [stored_status(status) for status in children_statuses]
+    statuses = [
+        stored_status(status)
+        for status in children_statuses
+        if not is_out_of_play(status)
+    ]
     if not statuses:
         return None
     if all(status == "todo" for status in statuses):
         return "todo"
-    if all(status == "done" for status in statuses):
+    if all(is_finished(status) for status in statuses):
         return "done"
     return "in_progress"
 
@@ -116,7 +140,13 @@ def set_status(
     """
     path = Path(repo_dir) if repo_dir is not None else None
     with board.write_lock(path):
-        written = board.set_status(card, status, repo_dir=path)
+        # A card a human already marked merged/canceled/archived is theirs:
+        # never overwrite it, but still walk up so ancestors stay right.
+        current_card = board.show(card, repo_dir=path)
+        if _is_human_terminal(current_card.status):
+            written = current_card
+        else:
+            written = board.set_status(card, status, repo_dir=path)
 
         rolled_up: list[dict[str, str]] = []
         current = written.id
@@ -133,7 +163,11 @@ def set_status(
                 )
             node = board.tree(parent_id, repo_dir=path)
             target = rollup_status(child.status for child in node.children)
-            if target is not None and stored_status(node.status) != target:
+            if (
+                target is not None
+                and not _is_human_terminal(node.status)
+                and stored_status(node.status) != target
+            ):
                 parent = board.set_status(parent_id, target, repo_dir=path)
                 rolled_up.append({"card": parent.id, "status": parent.status})
             current = parent_id

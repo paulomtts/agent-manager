@@ -38,6 +38,25 @@ from agent_manager.models import CardNode
 
 _NUMERIC = re.compile(r"[0-9]+")
 
+FINISHED_STATUSES = frozenset({"done", "merged"})
+"""brd statuses meaning the card's work is finished (`merged` is a human's
+follow-up to `done`). The one definition of "finished" in `am`."""
+
+OUT_OF_PLAY_STATUSES = frozenset({"canceled", "archived"})
+"""brd statuses meaning the card is not part of the plan at all. `archived` is
+treated exactly like `canceled`. Together with `FINISHED_STATUSES` these are
+brd's releasing statuses; `am` never writes either set."""
+
+
+def is_finished(status: str | None) -> bool:
+    """True for `done` or `merged`, in any case."""
+    return (status or "").lower() in FINISHED_STATUSES
+
+
+def is_out_of_play(status: str | None) -> bool:
+    """True for `canceled` or `archived`, in any case."""
+    return (status or "").lower() in OUT_OF_PLAY_STATUSES
+
 
 def _is_digit(ch: str) -> bool:
     """ASCII 0-9 only, as the JS `/[0-9]/`; `str.isdigit` also takes e.g. '٢'."""
@@ -198,24 +217,39 @@ def flatten_milestone(root: CardNode) -> Census:
     """`root`'s stories and each story's subtasks, ordered by `order_siblings`.
 
     Port of `census.mjs:100-113`. A story's `blocked_by` is copied through
-    unchanged, ids outside the milestone included. A cycle among the stories
-    or among one story's subtasks raises `CensusOrderError`.
+    unchanged, ids outside the milestone included, except that out-of-play
+    cards (`canceled`, `archived`) are dropped at any depth together with every
+    `blocked_by` edge pointing at them: they are not part of the plan. A cycle
+    among the stories or among one story's subtasks raises `CensusOrderError`.
     """
+    out_of_play_ids: set[str] = set()
+
+    def collect(card: CardNode) -> None:
+        if is_out_of_play(card.status):
+            out_of_play_ids.add(card.id)
+        for child in card.children:
+            collect(child)
+
+    collect(root)
+
+    def live(cards: list[CardNode]) -> list[CardNode]:
+        return [card for card in cards if not is_out_of_play(card.status)]
+
     stories = [
         StoryPlan(
             id=story.id,
             title=story.title,
             status=_stored_status(story.status),
-            blocked_by=list(story.blocked_by),
+            blocked_by=[dep for dep in story.blocked_by if dep not in out_of_play_ids],
             subtasks=[
                 SubtaskPlan(
                     id=subtask.id,
                     title=subtask.title,
                     status=_stored_status(subtask.status),
                 )
-                for subtask in order_siblings(story.children)
+                for subtask in order_siblings(live(story.children))
             ],
         )
-        for story in order_siblings(root.children)
+        for story in order_siblings(live(root.children))
     ]
     return Census(milestone_title=root.title, stories=stories)
