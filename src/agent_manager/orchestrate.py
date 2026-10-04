@@ -2428,8 +2428,8 @@ def run_board(
     Then one `asyncio.run` covers the whole board with one
     `asyncio.Semaphore(max_concurrent)` that every milestone's lanes share
     (`_run_board_async`), each milestone on its own base. A milestone runs
-    once every open blocker finished `done`. A milestone whose blocker did not finish `done` is never
-    dispatched and is reported `blocked`. A milestone that raises is reported
+    once every open blocker finished `done`. A milestone whose blocker did
+    not finish `done` is never dispatched and is reported `blocked`. A milestone that raises is reported
     `escalated` with `"<Type>: <msg>"` and never disturbs its siblings.
 
     Returns the plain payload, not the CLI envelope:
@@ -2504,8 +2504,8 @@ async def _run_board_async(
     Each milestone is dispatched on its own entry in `bases` (`milestone_bases`'
     answer), never on one shared base; `bases` keys every open milestone, so a
     missing key is a caller bug and surfaces as that milestone's `escalated`
-    entry. The tree comes from `build_dag_tree`, with each milestone's blockers being
-    its `blocked_by` restricted to `milestones` (a done blocker is not here,
+    entry. The tree comes from `build_dag_tree`, with each milestone's
+    blockers being its `blocked_by` restricted to `milestones` (a done blocker is not here,
     so it is satisfied). grafo itself holds a node back until every one of its
     parents' edges has fired, so by the time a node body runs, every blocker's
     `milestone_ok` entry is already set -- no extra waiting needed here. A
