@@ -1342,6 +1342,97 @@ def run_detached_child(
         store.close()
 
 
+def hand_off_to_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    log: Path,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+    detacher: detach.Detacher,
+) -> dict[str, Any]:
+    """Start the detached child, point the lease at it, let it go, and report.
+
+    Called with the lease already handed off and the recorded stage's store
+    closed, so no connection and no heartbeat thread crosses the fork. The
+    child blocks until `go`. The lease row is re-pointed at the child's pid
+    over a fresh store while this process is still alive, so the row never
+    names a dead pid, and only then is the child let go. A failed spawn or
+    pid update releases the claims and lease (after telling a spawned child
+    to abort) and propagates.
+    """
+
+    def body() -> None:
+        run_detached_child(root=root, run_id=run_id, token=token, engine=engine)
+
+    try:
+        spawned = detacher(body, log)
+    except BaseException:
+        release_handed_off(root, run_id, token)
+        raise
+    try:
+        store = Store.open(root, run_id)
+        try:
+            store.set_lease_holder(token, pid=spawned.pid, host=socket.gethostname())
+        finally:
+            store.close()
+    except BaseException:
+        spawned.abort()
+        release_handed_off(root, run_id, token)
+        raise
+    spawned.go()
+    return {"run_id": run_id, "pid": spawned.pid, "log": str(log), "detached": True}
+
+
+def detach_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    base_branch: str = "master",
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
+
+    `preflight_card` and `recorded_card_run` run exactly as for `run_card`, so
+    every refusal is the same. Inside the recorded stage `run.log` is created
+    (a failure there releases as any crash does) and the lease is handed
+    off, so the stage exits releasing nothing and closes its store. The child
+    runs `run_card_engine` on this very `pre` and run id (`hand_off_to_child`).
+    """
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        log = detach.create_run_log(pre.run_id)
+        token = recorded.lease.hand_off()
+
+    def engine(store: Store, lease: control.Lease) -> dict[str, Any]:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                RecordedRun(run_id=pre.run_id, store=store, lease=lease),
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
+
+    return hand_off_to_child(
+        root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -1585,6 +1676,17 @@ def run(
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
+        elif detach_run:
+            # Read as `detach.fork_detacher` so a test can patch it there.
+            payload = detach_card(
+                card,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                allow_no_verification=allow_no_verification,
+                commands=list(verify),
+                detacher=detach.fork_detacher,
+            )
         else:
             payload = run_card(
                 card,
@@ -1598,6 +1700,9 @@ def run(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+    if detach_run:
+        # A handed-off run's outcome is in its report.json, not this exit code.
+        return
     # A board payload carries one entry per milestone under `milestones`, each
     # with a `status`; a board dry-run carries no `milestones` key at all, so
     # it is read with `.get` and an empty default. A card payload reports
