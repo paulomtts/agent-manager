@@ -66,6 +66,7 @@ from agent_manager import (
     comments,
     control,
     dag,
+    detach,
     integration,
     models,
     runs,
@@ -2126,6 +2127,65 @@ async def _run_milestone_async(
             control_interval=control_interval,
             slots=slots,
         )
+
+
+def detach_milestone(
+    milestone: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+
+    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
+    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
+    `pending` plan are the same. Inside the recorded stage `run.log` is
+    created and the lease handed off, so the stage exits releasing nothing
+    and closes its store. The child runs `run_milestone_engine` on this very
+    `pre`, with the plan rows and checkpoints the recorded stage wrote
+    (`cli.hand_off_to_child`).
+    """
+    pre = preflight_milestone(
+        milestone,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        clock=clock,
+        driver=driver,
+    )
+    with recorded_milestone_run(pre) as recorded:
+        log = detach.create_run_log(pre.run_id)
+        rows, checkpoints = recorded.rows, recorded.checkpoints
+        token = recorded.lease.hand_off()
+
+    def engine(store: Store, lease: control.Lease) -> dict[str, Any]:
+        handed = RecordedMilestoneRun(
+            run_id=pre.run_id, store=store, lease=lease, rows=rows, checkpoints=checkpoints
+        )
+        return asyncio.run(
+            run_milestone_engine(
+                pre,
+                handed,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
+
+    return cli.hand_off_to_child(
+        root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
 
 
 # ── the board run (card baef4f94) ───────────────────────────────────────────

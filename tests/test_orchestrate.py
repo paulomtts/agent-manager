@@ -27,6 +27,7 @@ import logging
 import os
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -40,10 +41,11 @@ from typing import Any
 
 import grafo
 import pytest
+from typer.testing import CliRunner
 
 from lockhelpers import _holder, _probe, _reap
 
-from agent_manager import bases, board, census, cli, comments, control, dag, integration, locks, models, orchestrate, paths, runs
+from agent_manager import bases, board, census, cli, comments, control, dag, detach, integration, locks, models, orchestrate, paths, runs
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -7528,4 +7530,195 @@ def test_run_milestone_hands_the_engine_the_lease_of_the_recorded_stage(
     assert [call["card"] for call in driver.calls] == [a1]
     assert [call["store"] for call in integrate_recorder.calls] == [recorded.store]
     assert result["done"] is True
+    assert _claim_rows(root) == []
+
+
+# ── am run --milestone --detach (card aff9fdbf) ─────────────────────────────
+#
+# Unit tier, like the seam tests above: FakeBoard, a plain repo dir,
+# `refresh_git` patched, `integrate_recorder` autouse, and `_FakeDetacher`
+# instead of `detach.fork_detacher`. Nothing forks.
+
+FAKE_CHILD_PID = 424242
+"""The pid `_FakeDetacher` reports; no such child exists."""
+
+detach_runner = CliRunner()
+
+
+class _FakeDetacher:
+    """Stands in for `detach.fork_detacher`: records the call, starts nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[Path] = []
+        self.events: list[str] = []
+        self.body: Any = None
+
+    def __call__(self, body: Any, log: Path) -> detach.Spawned:
+        self.calls.append(log)
+        self.body = body
+        return detach.Spawned(
+            pid=FAKE_CHILD_PID,
+            go=lambda: self.events.append("go"),
+            abort=lambda: self.events.append("abort"),
+        )
+
+
+def _milestone_run_args(root: Path, needle: str, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--milestone",
+        needle,
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        PREFIX,
+        "--allow-no-verification",
+        *extra,
+    ]
+
+
+def _no_take_lease(self, **kwargs: Any) -> Any:
+    pytest.fail("the detached child took a new lease instead of adopting its own")
+
+
+def test_an_ambiguous_milestone_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    _add_card(root, "Milestone 3: orchestration")
+    _add_card(root, "Milestone 3: integration")
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = detach_runner.invoke(cli.app, _milestone_run_args(root, "Milestone 3"))
+    detached = detach_runner.invoke(
+        cli.app, _milestone_run_args(root, "Milestone 3", "--detach")
+    )
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert json.loads(detached.stdout) == json.loads(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "MilestoneNotFoundError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+
+
+def test_a_blocker_cycle_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = _add_card(root, "Milestone 3: orchestration")
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b]),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = detach_runner.invoke(cli.app, _milestone_run_args(root, milestone))
+    detached = detach_runner.invoke(cli.app, _milestone_run_args(root, milestone, "--detach"))
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert json.loads(detached.stdout) == json.loads(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "DependencyCycleError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+
+
+def test_a_detached_milestone_run_records_and_leases_the_plan_and_drives_nothing_here(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 2})
+    a1, a2 = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    refreshed: list[Path] = []
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: refreshed.append(at))
+    monkeypatch.setattr(cli, "drive_subtask_async", _forbidden("drive_subtask_async"))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = detach_runner.invoke(
+        cli.app, _milestone_run_args(root, shape["milestone"], "--detach")
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert (data["pid"], data["detached"]) == (FAKE_CHILD_PID, True)
+    run_id = data["run_id"]
+    assert _run_ids(root) == [run_id]
+    assert _statuses(_load(root, run_id)) == {
+        "run": "started",
+        story: "pending",
+        a1: "pending",
+        a2: "pending",
+    }
+    lease = _lease(root, run_id)
+    assert lease is not None and lease.pid == FAKE_CHILD_PID
+    assert _held_keys(root, run_id) == _expected_claims(shape["milestone"], [a1, a2])
+    log = Path(data["log"])
+    assert log == paths.run_dir(run_id) / detach.RUN_LOG_NAME
+    assert stat.S_IMODE(os.stat(log).st_mode) == 0o600
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert refreshed == [root]
+
+
+def test_the_detached_milestone_child_drives_the_recorded_plan_and_reports_it(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    (a1,) = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    fake = _FakeDetacher()
+    driver = FakeDriver()
+
+    data = orchestrate.detach_milestone(
+        shape["milestone"],
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix=PREFIX,
+        detacher=fake,
+        allow_no_verification=True,
+        driver=driver,
+        clock=lambda: STARTED_AT,
+        control_interval=0.01,
+    )
+
+    run_id = data["run_id"]
+    assert run_id == runs.mint_run_id(shape["milestone"], STARTED_AT)
+    assert driver.calls == []
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+
+    fake.body()
+
+    report = paths.run_dir(run_id) / detach.REPORT_NAME
+    assert stat.S_IMODE(os.stat(report).st_mode) == 0o600
+    expected = {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": [story]}],
+        "completed": [a1],
+        "tips": [{"story": story, "tip": _branch(root, a1)}],
+        "warnings": [],
+        "integrated": _integrated(root, [story]),
+    }
+    assert json.loads(report.read_text(encoding="utf-8")) == json.loads(
+        cli.render(cli.ok_envelope(expected))
+    )
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert [call["run_id"] for call in integrate_recorder.calls] == [run_id]
+    assert _load(root, run_id).status == "done"
+    assert closes == [(0, 0)]
+    assert _lease(root, run_id) is None
     assert _claim_rows(root) == []

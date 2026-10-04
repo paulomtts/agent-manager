@@ -1663,6 +1663,19 @@ def run(
                 base_branch=base_branch,
                 max_concurrent=lanes,
             )
+        elif milestone is not None and detach_run:
+            # Read as `orchestrate.detach_milestone` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
+                detacher=detach.fork_detacher,
+            )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
             # No runner_factory and no driver: production gets
