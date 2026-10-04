@@ -49,7 +49,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1668,6 +1669,67 @@ def preflight_milestone(
         run_record=run_record,
         drive=drive,
     )
+
+
+@dataclass(frozen=True)
+class RecordedMilestoneRun:
+    """A milestone run past its recorded stage (card 5daa944e).
+
+    Its id, its open store, the lease it holds, the plan rows `record_plan`
+    wrote, and on a resume each open card's checkpoint (`None` on a fresh
+    run). Internal state, so a dataclass.
+    """
+
+    run_id: str
+    store: Store
+    lease: control.Lease
+    rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
+    checkpoints: dict[str, Checkpoint] | None
+
+
+@contextmanager
+def recorded_milestone_run(pre: MilestonePreflight) -> Iterator[RecordedMilestoneRun]:
+    """Stage 2 of a milestone run: open the store, take the lease, record the plan (card 5daa944e).
+
+    On a resume the checkpoints are read first: the store's own refusal, a
+    checkpoint saved under another workflow, is read-only and comes before
+    the lease, before git and before any write. Then `cli.run_lease` takes
+    the lease with `pre.keys`, inside the `try` that closes the store, so the
+    claims and the lease are released before `store.close()` on every exit
+    (live control C2, X5), an exception in the block included. It is taken
+    before `record_run`, so every run write is fenced by this token; a lost
+    race is `ClaimedError` or `RunIsLiveError` with nothing recorded. A
+    resume refreshes git first under the lease. Then the run is recorded
+    `started` and the whole plan `pending`; a resume then reopens its rows.
+    """
+    store = Store.open(pre.root, pre.run_id)
+    try:
+        checkpoints: dict[str, Checkpoint] | None = None
+        cards: list[tuple[str, Workflow]] = []
+        if pre.resumed is not None:
+            cards = open_cards(
+                pre.plan.stories, branch_prefix=pre.branch_prefix, base_branch=pre.base_branch
+            )
+            checkpoints = resume_checkpoints(store, cards)
+        with cli.run_lease(store, claims=pre.keys) as lease:
+            if pre.resumed is not None:
+                # A resume's first side effect, under this life's lease (X5):
+                # a run still live elsewhere was refused on entry, before git.
+                refresh_git(pre.root)
+            store.record_run(pre.run_record)
+            rows = record_plan(store, pre.levels, root=pre.root, branch_prefix=pre.branch_prefix)
+            if pre.resumed is not None:
+                # After `record_plan`, which records every planned row `pending`.
+                reopen_rows(store, pre.resumed, {card_id for card_id, _workflow in cards})
+            yield RecordedMilestoneRun(
+                run_id=pre.run_id,
+                store=store,
+                lease=lease,
+                rows=rows,
+                checkpoints=checkpoints,
+            )
+    finally:
+        store.close()
 
 
 def run_milestone(

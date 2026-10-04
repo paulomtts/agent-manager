@@ -7284,3 +7284,140 @@ def test_a_fresh_milestone_preflight_refreshes_git_once_after_every_refusal(
     assert driver.calls == []
     assert _run_dirs() == []
     assert _run_ids(root) == []
+
+
+def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
+    """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
+
+    `(0, 0)` means the claims and the lease were released before the store
+    closed. Counted over the closing store's own connection, before the real
+    close runs.
+    """
+    seen: list[tuple[int, int]] = []
+    real_close = store_module.Store.close
+
+    def close(self) -> None:
+        conn = self.connection
+        claims = conn.execute(
+            "SELECT COUNT(*) FROM run_claims WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        leases = conn.execute(
+            "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        seen.append((claims, leases))
+        real_close(self)
+
+    monkeypatch.setattr(store_module.Store, "close", close)
+    return seen
+
+
+def _seam_resume_board(fake_board) -> tuple[str, str, str]:
+    """A milestone whose short id is RESUME_RUN_ID's (`00000009`), one story, one subtask."""
+    milestone = fake_board.add_card("Milestone 9: resume", card_id=_plan_id(9))
+    story = fake_board.add_card("Story R", parent_id=milestone)
+    subtask = fake_board.add_card("r1: the one subtask", parent_id=story)
+    return milestone, story, subtask
+
+
+def test_inside_recorded_milestone_run_the_plan_is_recorded_and_leased_but_nothing_driven(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 2})
+    a1, a2 = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    monkeypatch.setattr(
+        comments,
+        "flush",
+        lambda *args, **kwargs: pytest.fail("comments.flush ran in the recorded stage"),
+    )
+    driver = FakeDriver()
+    pre = _preflight_milestone(root, shape["milestone"], driver=driver)
+
+    with orchestrate.recorded_milestone_run(pre) as recorded:
+        assert recorded.run_id == pre.run_id
+        run = recorded.store.load_run(recorded.run_id)
+        assert run is not None
+        assert _statuses(run) == {"run": "started", story: "pending", a1: "pending", a2: "pending"}
+        assert run.milestone_id == shape["milestone"]
+        assert _held_keys(root, recorded.run_id) == _expected_claims(shape["milestone"], [a1, a2])
+        assert list(recorded.rows) == [story]
+        assert recorded.checkpoints is None
+        assert driver.calls == []
+
+
+def test_leaving_recorded_milestone_run_on_an_error_releases_claims_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight_milestone(root, shape["milestone"], driver=FakeDriver())
+
+    with pytest.raises(RuntimeError, match="engine never started"):
+        with orchestrate.recorded_milestone_run(pre):
+            raise RuntimeError("engine never started")
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    assert _held_keys(root, pre.run_id) == []
+    assert _load(root, pre.run_id).status == "started"
+
+
+def test_a_resumed_milestone_preflight_leaves_refresh_git_to_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    """A resume refreshes git under its own lease (X5), not in pre-flight,
+    and takes its prefix, base and bound from the recorded run."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone, _story, subtask = _seam_resume_board(fake_board)
+    _record_resume_run(root)
+    refreshed: list[list[str]] = []
+    monkeypatch.setattr(
+        orchestrate, "refresh_git", lambda at: refreshed.append(_held_keys(root, RESUME_RUN_ID))
+    )
+
+    pre = orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+
+    assert refreshed == []
+    assert (pre.run_id, pre.base_branch, pre.branch_prefix, pre.max_concurrent) == (
+        RESUME_RUN_ID,
+        "main",
+        PREFIX,
+        3,
+    )
+    assert pre.resumed is not None
+    assert (pre.run_record.status, pre.run_record.milestone_id) == ("started", milestone)
+    with orchestrate.recorded_milestone_run(pre) as recorded:
+        assert recorded.checkpoints == {}
+        assert refreshed == [_expected_claims(milestone, [subtask])]
+    assert len(refreshed) == 1
+
+
+def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    _milestone_id, _story, subtask = _seam_resume_board(fake_board)
+    _record_resume_run(root)
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        _save(opened, subtask, "parked", phase="plan", digest="saved-under-another-task")
+    finally:
+        opened.close()
+    monkeypatch.setattr(
+        orchestrate,
+        "refresh_git",
+        lambda at: pytest.fail("refresh_git ran before the checkpoint refusal"),
+    )
+    pre = orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+
+    with pytest.raises(runs.CheckpointMismatchError):
+        with orchestrate.recorded_milestone_run(pre):
+            pytest.fail("the recorded stage yielded past a stale checkpoint")
+
+    assert _claim_rows(root) == []
+    assert _held_keys(root, RESUME_RUN_ID) == []
+    assert _load(root, RESUME_RUN_ID).status == "escalated"
