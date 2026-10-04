@@ -819,3 +819,99 @@ def test_a_signed_commit_is_rewritten_unsigned(repo: Path, tmp_path: Path) -> No
     assert "not-a-real-signature" not in rewritten
     assert "author Signer <signer@example.com> 1000000000 +0200\n" in rewritten
     assert _message(repo, signed_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+
+
+def _ignore_documents(root: Path, source: str = "gitignore") -> None:
+    """Make git ignore the documents' folder, the way a repo that keeps its
+    specs and plans as local history does. `gitignore` commits the rule on the
+    current branch; `exclude` writes it to `.git/info/exclude`, uncommitted."""
+    if source == "gitignore":
+        (root / ".gitignore").write_text("docs/superpowers/\n", encoding="utf-8")
+        _git(root, "add", ".gitignore")
+        _git(root, "commit", "-q", "-m", "ignore docs/superpowers")
+    else:
+        exclude = Path(_git(root, "rev-parse", "--git-path", "info/exclude").strip())
+        exclude = exclude if exclude.is_absolute() else root / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("docs/superpowers/\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("source", ["gitignore", "exclude"])
+def test_ignored_documents_are_hashed_but_not_committed(repo: Path, source: str) -> None:
+    _ignore_documents(repo, source)
+    _write_documents(repo)
+    head = _rev(repo, "HEAD")
+    porcelain = _git(repo, "status", "--porcelain", "--untracked-files=all")
+
+    result = _run(repo)
+
+    assert result == {
+        "plan_hash": _digest(repo),
+        "backfilled": [],
+        "documents_committed": False,
+    }
+    assert _rev(repo, "HEAD") == head
+    assert _git(repo, "status", "--porcelain", "--untracked-files=all") == porcelain
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+    assert (repo / SPEC_RELATIVE).is_file()
+    assert (repo / PLAN_RELATIVE).is_file()
+
+
+def test_ignored_documents_run_no_add_and_no_commit(repo: Path) -> None:
+    _ignore_documents(repo)
+    _write_documents(repo)
+    calls: list[list[str]] = []
+
+    _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
+
+    assert any("check-ignore" in argv for argv in calls), calls
+    for argv in calls:
+        assert "add" not in argv, argv
+        assert "commit" not in argv, argv
+
+
+def test_ignored_documents_still_get_their_drafts_backfilled(repo: Path) -> None:
+    _ignore_documents(repo)
+    original = _drafts_scenario(repo)
+    digest = _digest(repo)
+
+    result = _run(repo)
+
+    assert result == {
+        "plan_hash": digest,
+        "backfilled": [original["A"], original["C"]],
+        "documents_committed": False,
+    }
+    a_new, b_new, c_new = _range(repo)
+    assert _message(repo, a_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+    assert _message(repo, b_new).splitlines()[-1] == f"Plan-Hash: {OTHER_HASH}"
+    assert _message(repo, c_new).splitlines()[-1] == f"Plan-Hash: {digest}"
+
+
+def test_ignored_documents_with_no_tagged_commit_do_not_raise(repo: Path) -> None:
+    """With nothing committable, an empty branch carries no trailer at all:
+    that is the expected state, not untagged debris."""
+    _ignore_documents(repo)
+    _task_branch(repo)
+    _write_documents(repo)
+
+    result = _run(repo)
+
+    assert result["documents_committed"] is False
+    assert _git(repo, "rev-list", "main..HEAD") == ""
+
+
+def test_ignored_documents_track_a_plan_edited_between_runs(repo: Path) -> None:
+    _ignore_documents(repo)
+    _write_documents(repo)
+    first = _run(repo)
+    head = _rev(repo, "HEAD")
+    (repo / PLAN_RELATIVE).write_text("# plan\n\nrewritten.\n", encoding="utf-8")
+
+    second = _run(repo)
+
+    assert second["plan_hash"] == _digest(repo)
+    assert second["plan_hash"] != first["plan_hash"]
+    assert second["documents_committed"] is False
+    assert _rev(repo, "HEAD") == head
+

@@ -120,6 +120,21 @@ def _branch_carries(git_runner: GitRunner, worktree_path: str, digest: str) -> b
     return any(line.strip() == wanted for line in log.splitlines())
 
 
+def _is_ignored(git_runner: GitRunner, worktree_path: str, path: str) -> bool:
+    """Whether git ignores `path` in this worktree (`git check-ignore`).
+
+    Exit 1 answers `False`; any other failure propagates as `GitError`.
+    A tracked path is never ignored.
+    """
+    try:
+        git_runner(["-C", worktree_path, "check-ignore", "-q", "--", path])
+    except GitError as error:
+        if error.exit_code == 1:
+            return False
+        raise
+    return True
+
+
 def _required_relative_path(value: object, field: str) -> str:
     """A non-blank relative document path, or `ValueError` before any git call."""
     if not isinstance(value, (str, Path)):
@@ -386,6 +401,11 @@ def commit_documents(
     # themselves, nothing is staged and `_branch_carries` decides -- which it
     # can only answer yes to once those drafts carry the trailer.
     backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
+
+    if _is_ignored(git_runner, worktree_path, spec_path) and _is_ignored(
+        git_runner, worktree_path, plan_path
+    ):
+        return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": False}
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
