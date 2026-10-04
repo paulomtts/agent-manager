@@ -426,6 +426,22 @@ and section 10 of the
 [supervisor-tree addendum](docs/superpowers/specs/2026-09-25-supervisor-tree-design.md#10-deferred)
 for everything deferred.
 
+### Listing runs
+
+`am runs` lists this repository's runs from its projection, newest first. Like `am status`, it takes no lease, no claim and no lock.
+
+```bash
+am runs --repo-dir . --pretty
+```
+
+`data.runs` is a list with one object per run. Each object has these keys:
+
+- `id`, `workflow` (`milestone` or `task`), `repo_dir`, `base_branch`, `branch_prefix`, `status`, `started_at` (`null` if never recorded).
+- `milestone_id`: the full id of the milestone card a milestone run drives. It is `null` on a `--card` run, and on a run recorded by an `am` too old to store it.
+- `card_id`: the subtask card an `am run --card` run drives. It is `null` on a milestone run, and on a `--card` run whose subtask has not been recorded yet.
+
+New keys are additive: a newer `am` may add keys to these objects, but never removes or renames one. Consumers should ignore any key they do not recognize.
+
 ### Watching a run
 
 `am watch` prints a run's journal: the append-only log, one JSON object per line, that every run writes to `<data dir>/runs/<run-id>/journal.jsonl` (`<data dir>` is defined under [Several am processes](#several-am-processes)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine writes under the same `<data dir>/runs/`, one `am watch --all` sees the runs of every repository at once.
