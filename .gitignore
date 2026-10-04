@@ -4,7 +4,13 @@ __pycache__/
 .pytest_cache/
 
 .brd
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/audit/
+!.claude/workflows/
+.claude/workflows/*
+!.claude/workflows/audit.js
 
 docs/superpowers/
 .superpowers/
