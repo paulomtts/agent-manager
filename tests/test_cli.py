@@ -4189,9 +4189,14 @@ RUNS_ENTRY_KEYS = {
     "started_at",
     "milestone_id",
     "card_id",
+    "lease",
 }
-"""Every `data.runs[]` entry: the seven names `am runs` always had, plus the
-two that card 0b5a15d7 added."""
+"""Every `data.runs[]` entry: the seven names `am runs` always had, plus
+`milestone_id` and `card_id` (card 0b5a15d7) and `lease` (card 6bf47e74)."""
+
+RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
+"""A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
+`acquired_at`."""
 
 RUNS_MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
 
@@ -4254,6 +4259,174 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_and_card_id(pr
         assert len(envelope["data"]["runs"]) == 2
         for entry in envelope["data"]["runs"]:
             assert set(entry) == RUNS_ENTRY_KEYS
+
+
+RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"
+"""A second run, started after `CONTROL_RUN_ID`'s `RECORDED_AT`, so it lists first."""
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid, host, accepting",
+    [
+        (0, None, None, True),
+        (-30, None, None, True),
+        (-5, 0, "elsewhere.invalid", True),
+        (-5, None, None, False),
+    ],
+    ids=["fresh-here", "boundary-30s", "other-host-unprobed-pid", "not-accepting"],
+)
+def test_runs_shows_a_live_lease(
+    projection, monkeypatch, heartbeat_offset, pid, host, accepting
+):
+    """Spec test 1, plus Review Focus: the 30s boundary is inclusive, another
+    host's pid is never probed here, and a closed control window still reads
+    live. `pid`/`host` `None` mean `_plant_lease`'s default: this process,
+    this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(
+        projection,
+        pid=pid,
+        host=host,
+        heartbeat_at=_at(heartbeat_offset),
+        accepting=accepting,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": True,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE if host is None else host,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": accepting,
+    }
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid",
+    [
+        (-31, None),
+        (-5, 0),
+    ],
+    ids=["stale-heartbeat", "dead-pid-here"],
+)
+def test_runs_shows_a_dead_lease_with_its_fields_still_filled(
+    projection, monkeypatch, heartbeat_offset, pid
+):
+    """Spec test 2. Pid 0 is never alive (`control.pid_alive`), so no process
+    has to be spawned and reaped to get a dead pid on this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, pid=pid, heartbeat_at=_at(heartbeat_offset))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": False,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": True,
+    }
+
+
+def test_runs_shows_a_null_lease_for_a_run_with_no_lease_row(projection, monkeypatch):
+    """Spec test 3: no row is `null`, not an error and not a missing key."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert '"lease":null' in result.stdout
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert "lease" in entry
+    assert entry["lease"] is None
+
+
+@pytest.mark.parametrize("heartbeat_offset", [-5, -31], ids=["live", "stale"])
+def test_runs_lease_is_status_control_lease_without_acquired_at(
+    projection, monkeypatch, heartbeat_offset
+):
+    """Spec test 4: one computation, two commands, no drift."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(heartbeat_offset))
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+    reported = runner.invoke(
+        cli.app, ["status", CONTROL_RUN_ID, "--repo-dir", str(projection)]
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert reported.exit_code == 0, reported.output
+    [entry] = json.loads(listed.stdout)["data"]["runs"]
+    status_lease = json.loads(reported.stdout)["data"]["control"]["lease"]
+    assert "acquired_at" in status_lease
+    assert entry["lease"] == {
+        key: value for key, value in status_lease.items() if key != "acquired_at"
+    }
+
+
+def test_runs_lease_has_exactly_the_five_keys_plain_and_pretty(projection, monkeypatch):
+    """Spec test 5: the shape pin, beside `RUNS_ENTRY_KEYS`'s own."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection)
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        [entry] = envelope["data"]["runs"]
+        assert set(entry) == RUNS_ENTRY_KEYS
+        assert set(entry["lease"]) == RUNS_LEASE_KEYS
+        assert isinstance(entry["lease"]["live"], bool)
+        assert isinstance(entry["lease"]["pid"], int)
+        assert isinstance(entry["lease"]["host"], str)
+        assert isinstance(entry["lease"]["heartbeat_at"], str)
+        assert isinstance(entry["lease"]["accepting"], bool)
+
+
+def test_runs_attaches_each_runs_own_lease_and_reads_the_clock_once(
+    projection, monkeypatch
+):
+    """Review Focus: a run without a lease row never inherits its neighbour's,
+    and the whole listing is judged against one instant."""
+    calls: list[datetime] = []
+
+    def counting_now() -> datetime:
+        calls.append(CONTROL_NOW)
+        return CONTROL_NOW
+
+    monkeypatch.setattr(cli, "_utcnow", counting_now)
+    _plant_run(projection)
+    _record(
+        projection,
+        RUNS_NEWER_RUN_ID,
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+        with_phases=False,
+    )
+    _plant_lease(projection, run_id=CONTROL_RUN_ID, heartbeat_at=_at(-31))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)["data"]["runs"]
+    assert [entry["id"] for entry in entries] == [RUNS_NEWER_RUN_ID, CONTROL_RUN_ID]
+    assert entries[0]["lease"] is None
+    assert entries[1]["lease"] is not None
+    assert entries[1]["lease"]["live"] is False
+    assert entries[1]["lease"]["heartbeat_at"] == _at(-31).isoformat()
+    assert len(calls) == 1
 
 
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):

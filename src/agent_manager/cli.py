@@ -201,8 +201,8 @@ RUN_IDENTITY = (
 )
 """The run's own fields, without `config` and without the tree below it. §10's
 `status` header is these seven names. Each `runs` entry carries the same seven,
-plus `milestone_id` and `card_id` (a superset), so the two commands still
-describe a run's identity the same way."""
+plus `milestone_id`, `card_id` and `lease` (a superset), so the two commands
+still describe a run's identity the same way."""
 
 
 def status_rows(run: models.Run) -> list[dict[str, Any]]:
@@ -245,6 +245,23 @@ def status_rows(run: models.Run) -> list[dict[str, Any]]:
     return rows
 
 
+def _lease_fields(lease: store_module.LeaseRow, *, now: datetime) -> dict[str, Any]:
+    """The lease fields `am status` and `am runs` both show.
+
+    One function so the two commands cannot drift: `control_view` adds
+    `acquired_at` on top, `runs_for` shows these five as they are. `live` is
+    `control.lease_is_live` at `now`, worked out at read time and never
+    stored; `heartbeat_at` is an ISO string.
+    """
+    return {
+        "pid": lease.pid,
+        "host": lease.host,
+        "heartbeat_at": lease.heartbeat_at.isoformat(),
+        "accepting": lease.accepting,
+        "live": control.lease_is_live(lease, now=now),
+    }
+
+
 def control_view(
     lease: store_module.LeaseRow | None,
     requests: Sequence[store_module.ControlRow],
@@ -262,12 +279,8 @@ def control_view(
         "lease": None
         if lease is None
         else {
-            "pid": lease.pid,
-            "host": lease.host,
+            **_lease_fields(lease, now=now),
             "acquired_at": lease.acquired_at.isoformat(),
-            "heartbeat_at": lease.heartbeat_at.isoformat(),
-            "accepting": lease.accepting,
-            "live": control.lease_is_live(lease, now=now),
         },
         "requests": [
             {
@@ -1481,17 +1494,33 @@ def status(
 
 
 def runs_for(*, repo_dir: Path) -> dict[str, Any]:
-    """This project's run history, newest first.
+    """This project's run history, newest first, each run with its lease.
 
     An empty history is an empty list, not a refusal: a project that has never
     been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
+
+    `lease` is filled here, not in `store.list_runs`: `live` needs `control`,
+    which `store` must not import. Each run's `run_leases` row is read on the
+    same connection and shaped by `_lease_fields`, the helper `control_view`
+    uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
+    `None` when the run has no lease row. One `now` judges the whole listing.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
     try:
-        return {"runs": [summary.model_dump() for summary in store_module.list_runs(conn)]}
+        now = _utcnow()
+        entries = []
+        for summary in store_module.list_runs(conn):
+            lease = store_module.read_lease(conn, summary.id)
+            shown = (
+                None
+                if lease is None
+                else store_module.RunLease(**_lease_fields(lease, now=now))
+            )
+            entries.append(summary.model_copy(update={"lease": shown}).model_dump())
+        return {"runs": entries}
     finally:
         conn.close()
 
