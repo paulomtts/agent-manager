@@ -9215,3 +9215,228 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
     assert _resume_guard_state(projection) == before
     assert _checkpoint_rows(projection) == checkpoints_before
     assert _recorded_status(projection) == "cancelled"
+
+
+# ── am status integrity (card f63036db) ─────────────────────────────────────
+#
+# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the journal
+# with the projection through `store.diverging` and reports it under an
+# always-present `integrity` key, at exit 0, writing nothing. Unit tier: the
+# projection fixture writes SQLite rows and journal files in `tmp_path`; no
+# subprocess.
+
+CLEAN_INTEGRITY = {"checked": True, "reason": None, "mismatches": []}
+
+RUN_CANCELLED_BY_HAND = {
+    "node": {"story": None, "card": None, "phase": None, "attempt": None},
+    "field": "status",
+    "journal": "started",
+    "projection": "cancelled",
+    "kind": "foreign",
+}
+"""What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`."""
+
+
+def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
+    """The run's journal file, located without `Journal(run_id)`, which would
+    create the run directory."""
+    return paths.data_dir() / "runs" / run_id / store_module.JOURNAL_NAME
+
+
+def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
+    """Change the run's projected status behind the store's back, as a human
+    with `sqlite3` would: no journal line records it."""
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        with store_module.immediate(conn):
+            conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+    finally:
+        conn.close()
+
+
+def _status_data(root: Path, *args: str) -> dict[str, Any]:
+    result = runner.invoke(cli.app, ["status", *args, "--repo-dir", str(root)])
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    return envelope["data"]
+
+
+def _projection_snapshot(root: Path) -> dict[str, list[str]]:
+    """Every table's rows, order-insensitively, over a plain read connection."""
+    db = paths.project_db_path(cli.resolve_repo_dir(root))
+    conn = sqlite3.connect(db)
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            ).fetchall()
+        ]
+        return {
+            name: sorted(repr(row) for row in conn.execute(f'SELECT * FROM "{name}"').fetchall())
+            for name in tables
+        }
+    finally:
+        conn.close()
+
+
+def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, monkeypatch):
+    """Spec test 1; Review Focus: the no-RUN_ID default carries `integrity` too.
+    Every key but `integrity` renders byte-for-byte as `status_payload` did
+    before this card."""
+    _freeze_clock(monkeypatch)
+    _record(projection, CONTROL_RUN_ID, started_at=RECORDED_AT, status="started")
+    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    try:
+        run = store_module.load_run(conn, CONTROL_RUN_ID)
+    finally:
+        conn.close()
+    before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))
+    expected = cli.render(cli.ok_envelope({**before, "integrity": CLEAN_INTEGRITY}))
+
+    for args in (["status", CONTROL_RUN_ID], ["status"]):
+        result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout.strip() == expected
+
+
+def test_status_reports_a_run_hand_edited_to_cancelled_as_one_foreign_mismatch(
+    projection, monkeypatch
+):
+    """Spec test 2: report-only -- exit 0, and no control request is filed."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _hand_edit_run_status(projection, "cancelled")
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == {
+        "checked": True,
+        "reason": None,
+        "mismatches": [RUN_CANCELLED_BY_HAND],
+    }
+    assert data["control"]["requests"] == []
+    assert _controls(projection) == []
+
+
+def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monkeypatch):
+    """Spec test 3: every table and the journal's bytes are identical after a
+    `status` that found and reported a mismatch."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _hand_edit_run_status(projection, "cancelled")
+    tables_before = _projection_snapshot(projection)
+    journal_before = _journal_path().read_bytes()
+    runs_before = sorted(p.name for p in (paths.data_dir() / "runs").iterdir())
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"]["checked"] is True
+    assert data["integrity"]["mismatches"] == [RUN_CANCELLED_BY_HAND]
+    assert _projection_snapshot(projection) == tables_before
+    assert _journal_path().read_bytes() == journal_before
+    assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
+
+
+def test_status_of_a_run_with_no_journal_says_so_and_creates_no_run_directory(
+    projection, monkeypatch
+):
+    """Spec test 5: `Journal._for_reading`, never the constructor that calls
+    `paths.run_dir` and would create the directory."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
+    shutil.rmtree(run_dir)
+
+    def forbidden(self, run_id):
+        raise AssertionError("status must not construct Journal(run_id)")
+
+    monkeypatch.setattr(store_module.Journal, "__init__", forbidden)
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == {"checked": False, "reason": "no journal", "mismatches": []}
+    assert not run_dir.exists()
+
+
+def test_a_torn_final_journal_line_is_ignored_and_the_run_still_checked(
+    projection, monkeypatch
+):
+    """Spec test 6, first half: an append in flight, no trailing newline."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    with _journal_path().open("a", encoding="utf-8") as handle:
+        handle.write('{"seq": 9999, "ts": "2026-')
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == CLEAN_INTEGRITY
+
+
+def test_a_newline_terminated_non_json_line_makes_the_journal_unreadable(
+    projection, monkeypatch
+):
+    """Spec test 6, second half: still `CorruptJournalError`, reported at exit 0."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    with _journal_path().open("a", encoding="utf-8") as handle:
+        handle.write("not json\n")
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    integrity = data["integrity"]
+    assert integrity["checked"] is False
+    assert integrity["reason"].startswith("journal unreadable: ")
+    assert "line is not JSON" in integrity["reason"]
+    assert integrity["mismatches"] == []
+
+
+def test_an_empty_journal_is_unreadable_not_a_traceback(projection, monkeypatch):
+    """Review Focus: `read()` returns `[]`, and `replay` inside `diverging`
+    raises `JournalError` -- the try must cover `diverging` too."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _journal_path().write_text("", encoding="utf-8")
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == {
+        "checked": False,
+        "reason": "journal unreadable: journal contains no run_upsert line",
+        "mismatches": [],
+    }
+
+
+def test_a_journal_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
+    """Review Focus: the envelope is valid, the run payload is not, so
+    `diverging` raises a pydantic `ValidationError`."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    path = _journal_path()
+    first, *rest = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    line = json.loads(first)
+    assert line["event"] == "run_upsert"
+    line["payload"]["status"] = "not-a-status"
+    path.write_text(json.dumps(line) + "\n" + "".join(rest), encoding="utf-8")
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    integrity = data["integrity"]
+    assert integrity["checked"] is False
+    assert integrity["reason"].startswith("journal unreadable: ")
+    assert "validation error" in integrity["reason"]
+    assert integrity["mismatches"] == []
+
+
+def test_an_unknown_journal_event_kind_is_skipped_by_the_check(projection, monkeypatch):
+    """Review Focus: a line a newer `am` wrote is not divergence and does not raise."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    with _journal_path().open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"seq": 9999, "event": "from_the_future"}) + "\n")
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == CLEAN_INTEGRITY
