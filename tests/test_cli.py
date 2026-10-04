@@ -9862,3 +9862,12 @@ def test_a_card_run_without_detach_still_prints_its_full_payload(
     assert fake.calls == []
     assert _claim_rows(root) == []
     assert not (paths.data_dir() / "runs" / data["run_id"] / detach.RUN_LOG_NAME).exists()
+
+
+def test_run_help_and_examples_document_detach():
+    assert "--detach" in cli.RUN_EXAMPLES
+
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--detach" in result.output

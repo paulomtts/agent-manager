@@ -1530,6 +1530,7 @@ RUN_EXAMPLES = """\
 Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
+  am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
   am run --board --verify "uv run pytest"                             # run every open milestone
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash

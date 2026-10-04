@@ -79,9 +79,30 @@ The base-branch and final integration checks run their commands with neither set
 
 Some combinations are refused before anything is read: `--card` together with
 `--milestone`, neither of them, a blank `--milestone`, `--dry-run` with
-`--card`, `--max-concurrent` with `--card`, and a `--max-concurrent` below 1.
+`--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1, and
+`--detach` with `--dry-run` or with `--board`.
 These are usage errors, like a missing `--branch-prefix`: Typer prints the
 message on stderr, nothing is printed on stdout, and the exit code is 2.
+
+#### Running detached with `--detach`
+
+```bash
+am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run pytest" --detach
+```
+
+`--detach` works with `--card` and `--milestone`. The command first does everything a foreground run does before its first subtask: it reads the board, makes every check, records the run and takes its lease. A refusal at that point comes back as the usual `{"ok": false, ...}` envelope with exit code 3, and nothing starts. Then the run moves to a background process in its own session, and the command prints one envelope and exits 0:
+
+```json
+{"ok":true,"data":{"detached":true,"log":"/home/me/.local/share/agent-manager/runs/20261004T090000Z-1a2b3c4d/run.log","pid":48213,"run_id":"20261004T090000Z-1a2b3c4d"}}
+```
+
+- `run_id` is the id `am runs`, `am status`, `am watch`, `am pause` and `am resume` take. `pid` is the background process. It holds the run's lease, and `am runs` and `am status` show it as the lease's `pid`.
+- The background process writes its output to `run.log`. When the run ends it writes `report.json`. Both files are in `<data dir>/runs/<run-id>/` (`$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`) and both are mode 0600. `report.json` holds the envelope the same run would have printed in the foreground: `{"ok": true, "data": ...}` for a run that finished, escalated, stopped or was cancelled, or `{"ok": false, "error": ...}` for a run the tool could not carry on. It is written in one step, so it is either absent or complete.
+- A crash writes no `report.json`. Its traceback is in `run.log`, the lease and claims are released, and the run can be resumed like any crashed run.
+- The exit code is 0 whenever the run was handed off, even if it later escalates. Read the outcome from `report.json` or `am status`.
+- A missing verification command is not caught before the run starts. The verification gate runs during the explore phase, so with `--detach` it shows up in `report.json` and `am status`, not on your terminal. Pass `--verify` or `--allow-no-verification`.
+- `--detach` with `--dry-run` or with `--board` is refused as a usage error (exit 2).
+- Later versions may add keys to these envelopes. Ignore keys you do not know.
 
 #### Preview with `--dry-run`
 
