@@ -1,5 +1,7 @@
 """Commit the spec and the plan, tagged with the plan's Plan-Hash trailer.
 
+Documents git ignores in the worktree are hashed but never added or committed.
+
 A deterministic step (design §4 `steps/`, §6): git and the filesystem only --
 no model call, no board access, no `brd`. It runs after `mark_validated` and
 before `implement`, because the hash it stamps is the hash of the plan file
@@ -103,6 +105,18 @@ class UntaggedDocumentsError(RuntimeError):
             f"this branch carries the trailer {TRAILER_PREFIX}{plan_hash}. The "
             "documents are tracked and untagged, so a resumed run would read them "
             "as debris. Commit them with the trailer, or remove them, by hand."
+        )
+
+
+class PartlyIgnoredDocumentsError(RuntimeError):
+    """Git ignores one of the two documents and not the other."""
+
+    def __init__(self, *, ignored: str, tracked: str) -> None:
+        self.ignored = ignored
+        self.tracked = tracked
+        super().__init__(
+            f"git ignores {ignored} but not {tracked}. The spec and the plan are "
+            "committed together or not at all: ignore both paths, or neither."
         )
 
 
@@ -377,7 +391,17 @@ def commit_documents(
 
     Parameter names are the engine's binding table's names, so the document's
     phase needs no `args:` at all. Returns a plain dict (design §6), stored in
-    the context under the phase name.
+    the context under the phase name: `plan_hash`, the hash of the plan file
+    on disk; `backfilled`, the pre-rewrite shas the backfill stamped; and
+    `documents_committed`.
+
+    When git ignores both documents in the worktree, nothing is added or
+    committed and `documents_committed` is `False`; the hash and the backfill
+    are unchanged. Otherwise the documents are committed (or found already
+    committed under this hash) and it is `True`. Raises
+    `PartlyIgnoredDocumentsError`, before any write, when git ignores exactly
+    one of them, and `UntaggedDocumentsError` when tracked documents have
+    nothing to commit and no branch commit carries the hash.
     """
     worktree_path = _required_worktree(worktree)
     spec_path = _required_relative_path(spec_path, "spec_path")
@@ -397,14 +421,17 @@ def commit_documents(
             )
 
     digest = plan_hash(plan_file.read_bytes())
+    spec_ignored = _is_ignored(git_runner, worktree_path, spec_path)
+    plan_ignored = _is_ignored(git_runner, worktree_path, plan_path)
+    if spec_ignored != plan_ignored:
+        ignored, tracked = (spec_path, plan_path) if spec_ignored else (plan_path, spec_path)
+        raise PartlyIgnoredDocumentsError(ignored=ignored, tracked=tracked)
     # Before the add/commit below: when a role already committed the documents
     # themselves, nothing is staged and `_branch_carries` decides -- which it
     # can only answer yes to once those drafts carry the trailer.
     backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
 
-    if _is_ignored(git_runner, worktree_path, spec_path) and _is_ignored(
-        git_runner, worktree_path, plan_path
-    ):
+    if spec_ignored:
         return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": False}
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.

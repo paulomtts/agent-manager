@@ -915,3 +915,30 @@ def test_ignored_documents_track_a_plan_edited_between_runs(repo: Path) -> None:
     assert second["documents_committed"] is False
     assert _rev(repo, "HEAD") == head
 
+
+
+@pytest.mark.parametrize("ignored", ["spec", "plan"])
+def test_only_one_ignored_document_raises_before_any_add(repo: Path, ignored: str) -> None:
+    folder = "docs/superpowers/specs/" if ignored == "spec" else "docs/superpowers/plans/"
+    (repo / ".gitignore").write_text(f"{folder}\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", f"ignore {folder}")
+    _task_branch(repo)
+    _commit_file(repo, "draft.txt", "unstamped draft")
+    _write_documents(repo)
+    head = _rev(repo, "HEAD")
+    calls: list[list[str]] = []
+
+    with pytest.raises(docs_commit.PartlyIgnoredDocumentsError) as caught:
+        _run(repo, git_runner=_recorder(calls, docs_commit.run_git))
+
+    expected = SPEC_RELATIVE if ignored == "spec" else PLAN_RELATIVE
+    other = PLAN_RELATIVE if ignored == "spec" else SPEC_RELATIVE
+    assert caught.value.ignored == expected
+    assert caught.value.tracked == other
+    assert expected in str(caught.value)
+    assert other in str(caught.value)
+    assert not any("add" in argv for argv in calls), calls
+    assert not any("update-ref" in argv for argv in calls), calls
+    assert _rev(repo, "HEAD") == head
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
