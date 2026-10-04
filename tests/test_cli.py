@@ -5075,6 +5075,51 @@ def test_select_logs_names_the_file_a_follow_reads(projection):
     )
 
 
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (b"", 0),
+        (b"abc", 3),
+        ("é".encode(), 2),
+        ("é".encode()[:1], 0),
+        (b"caf\xc3", 3),
+        (b"x" + "€".encode()[:2], 1),
+        (b"x" + "€".encode(), 4),
+        (b"ab" + "😀".encode()[:3], 2),
+        (b"ab" + "😀".encode(), 6),
+    ],
+)
+def test_utf8_complete_length_holds_back_only_a_truncated_tail(data, expected):
+    assert cli._utf8_complete_length(data) == expected
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"ok\xff", b"ok\xc0", b"\x80\x80\x80\x80", b"ok\x80"],
+)
+def test_utf8_complete_length_never_holds_back_invalid_bytes(data):
+    """A byte that cannot start a sequence is emitted (as U+FFFD), so an
+    invalid tail can never stall the stream."""
+    assert cli._utf8_complete_length(data) == len(data)
+
+
+def test_read_log_bytes_reads_from_the_offset(tmp_path):
+    log = tmp_path / "stdout.log"
+    log.write_bytes(b"0123456789")
+
+    assert cli._read_log_bytes(log, 0) == b"0123456789"
+    assert cli._read_log_bytes(log, 4) == b"456789"
+    assert cli._read_log_bytes(log, 10) == b""
+    assert cli._read_log_bytes(log, 50) == b""
+
+
+def test_read_log_bytes_is_empty_for_anything_unreadable(tmp_path):
+    assert cli._read_log_bytes(None, 0) == b""
+    assert cli._read_log_bytes(tmp_path / "missing.log", 0) == b""
+    assert cli._read_log_bytes(tmp_path, 0) == b""
+    assert not (tmp_path / "missing.log").exists()
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""

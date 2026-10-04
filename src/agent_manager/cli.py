@@ -2260,6 +2260,53 @@ def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> 
         raise typer.Exit(EXIT_ERROR) from None
 
 
+def _read_log_bytes(path: Path | None, offset: int) -> bytes:
+    """`path`'s bytes from `offset` to its current end, for `logs --follow`.
+
+    Never raises for the file's state: a path not recorded, a file not
+    written yet, a directory, an unreadable mode, or a file shorter than
+    `offset` all read as `b""`, so a poll that finds nothing waits for the
+    next one (spec card 4.1, "File not there yet"). Opens for reading only,
+    so nothing is created.
+    """
+    if path is None:
+        return b""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _utf8_complete_length(data: bytes) -> int:
+    """How many leading bytes of `data` end on a UTF-8 character boundary.
+
+    Only a trailing sequence whose lead byte is valid but whose continuation
+    bytes have not all arrived yet is held back: at most 3 bytes. Any other
+    byte, including a stray continuation or an invalid lead, counts as
+    complete, so `errors="replace"` turns it into U+FFFD and an invalid
+    tail can never stall the stream.
+    """
+    end = len(data)
+    for index in range(end - 1, max(end - 4, 0) - 1, -1):
+        byte = data[index]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte < 0x80:
+            return end
+        if 0xC2 <= byte <= 0xDF:
+            needed = 2
+        elif 0xE0 <= byte <= 0xEF:
+            needed = 3
+        elif 0xF0 <= byte <= 0xF4:
+            needed = 4
+        else:
+            return end
+        return index if end - index < needed else end
+    return end
+
+
 @app.command("watch")
 def watch(
     run_id: str | None = typer.Argument(
