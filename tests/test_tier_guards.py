@@ -1,5 +1,6 @@
 """Tier guards in `tests/conftest.py`: the unit-tier PATH shim, the per-test budget,
-the e2e cap and justification check, and the git/brd binary skip.
+the e2e cap and justification check, the brd/fake_board mismatch guard, and the
+git/brd binary skip.
 
 The helpers, the stub text and the source scans are pure, so their tests carry
 no tier marker and run in the unit tier. The hook-level tests start a nested
@@ -25,8 +26,10 @@ from conftest import (
     STUB_EXIT_CODE,
     STUB_NAMES,
     UNIT_BUDGET_S,
+    BrdFakeBoardGuard,
     E2ETierCap,
     binary_skip_reason,
+    brd_fake_board_violations,
     e2e_tier_violations,
     has_justification,
     item_docstring,
@@ -477,6 +480,104 @@ def test_five_justified_e2e_tests_collect_and_are_deselected_by_default(pytester
     result = run_nested(pytester, source, "-m", DEFAULT_SELECTION)
     assert result.ret == pytest.ExitCode.OK
     result.assert_outcomes(passed=1, deselected=5)
+
+
+# ── the brd/fake_board mismatch guard ───────────────────────────────────────
+
+
+def test_an_item_marked_brd_without_fake_board_is_clean():
+    assert brd_fake_board_violations([("t.py::test_real", ["brd", "git"], ["project"])]) == []
+
+
+def test_fake_board_without_brd_is_clean():
+    assert brd_fake_board_violations([("t.py::test_fake", ["git"], ["fake_board", "project"])]) == []
+
+
+def test_brd_plus_fake_board_is_a_violation():
+    assert brd_fake_board_violations(
+        [("t.py::test_mislabeled", ["brd", "git"], ["fake_board", "project"])]
+    ) == ["t.py::test_mislabeled: marked brd but depends on fake_board -- use git instead"]
+
+
+def test_pins_fake_board_exempts_the_combination():
+    assert brd_fake_board_violations(
+        [("t.py::test_pin", ["brd", "pins_fake_board"], ["fake_board", "temp_board"])]
+    ) == []
+
+
+def test_several_items_report_each_violation_in_order():
+    items = [
+        ("t.py::test_a", ["brd"], ["fake_board"]),
+        ("t.py::test_b", ["brd"], ["project"]),
+        ("t.py::test_c", ["brd"], ["fake_board"]),
+    ]
+    assert brd_fake_board_violations(items) == [
+        "t.py::test_a: marked brd but depends on fake_board -- use git instead",
+        "t.py::test_c: marked brd but depends on fake_board -- use git instead",
+    ]
+
+
+def test_guard_plugin_passes_items_without_the_mismatch():
+    items = [_FakeItem("t.py::test_ok", chain=["brd", "git"])]
+    BrdFakeBoardGuard().pytest_collection_modifyitems(items)
+
+
+def test_guard_plugin_raises_one_usage_error_per_mismatch(monkeypatch):
+    item = _FakeItem("t.py::test_bad", chain=["brd", "git"])
+    monkeypatch.setattr(item, "fixturenames", ["project", "fake_board"], raising=False)
+    with pytest.raises(pytest.UsageError) as excinfo:
+        BrdFakeBoardGuard().pytest_collection_modifyitems([item])
+    lines = str(excinfo.value).splitlines()
+    assert lines[0] == "brd tier check failed:"
+    assert lines[1] == "t.py::test_bad: marked brd but depends on fake_board -- use git instead"
+    assert len(lines) == 2
+
+
+@pytest.mark.git
+def test_a_brd_test_depending_on_fake_board_fails_collection_under_the_default_selection(
+    pytester,
+):
+    result = run_nested(
+        pytester,
+        """
+        import pytest
+
+        @pytest.fixture
+        def fake_board():
+            return object()
+
+        @pytest.mark.brd
+        @pytest.mark.git
+        def test_mislabeled(fake_board):
+            pass
+        """,
+        "-m",
+        DEFAULT_SELECTION,
+    )
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(
+        ["*test_nested.py::test_mislabeled: marked brd but depends on fake_board*"]
+    )
+
+
+@pytest.mark.git
+def test_a_brd_test_without_fake_board_collects_and_runs_normally(pytester):
+    result = run_nested(
+        pytester,
+        """
+        import pytest
+
+        @pytest.mark.brd
+        @pytest.mark.git
+        def test_real_brd():
+            pass
+        """,
+        "-m",
+        DEFAULT_SELECTION,
+        "--co",
+    )
+    assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
+    result.stdout.fnmatch_lines(["*1 deselected*"])
 
 
 # ── the git/brd binary skip ─────────────────────────────────────────────────

@@ -357,36 +357,30 @@ async def test_build_dag_tree_never_runs_an_item_whose_blocker_raised():
 
 
 async def test_build_dag_tree_four_node_shape_completes():
-    """Spec §1.1: A and B are roots, D is blocked by A, C by B and D. Every
-    coroutine sets its own event on exit, and a 2+-blocker one first awaits
-    its blockers' events, as `lane` does today. B returns, then A after a
-    wall-clock gap, so D is ready only after grafo shrank its pool. Under
-    grafo 0.3.5 with C an unconnected root, C sat in a worker waiting on D
-    while D was queued behind exit sentinels, and the run never returned.
-    grafo 0.3.6 fixed that pool bug, so this is now a regression pin for the
-    shape, not a red test for `build_dag_tree`'s edges (those are pinned by
-    the edge, roots and raised-blocker tests above)."""
+    """Spec §1.1: A and B are roots, D is blocked by A, C by B and D. Nothing
+    here hand-rolls the join -- grafo's own edges hold C back until both B
+    and D's parent events are set, exactly as `lane` relies on today (no
+    manual Event-waiting of its own). B returns, then A after a wall-clock
+    gap, so D is ready only after grafo shrank its pool. Under grafo 0.3.5
+    with C an unconnected root, C sat in a worker waiting on D while D was
+    queued behind exit sentinels, and the run never returned. grafo 0.3.6
+    fixed that pool bug, so this is now a regression pin for the shape, not a
+    red test for `build_dag_tree`'s edges (those are pinned by the edge,
+    roots and raised-blocker tests above)."""
     a, b = _DagItem("a"), _DagItem("b")
     d = _DagItem("d", ("a",))
     c = _DagItem("c", ("b", "d"))
-    done = {item.id: asyncio.Event() for item in (a, b, c, d)}
 
     def factory(item: _DagItem) -> Callable[..., Awaitable[str]]:
         async def run(**forwarded: Any) -> str:
-            try:
-                # One scheduling tick first, so a worker takes C before B
-                # returns and shrinks the pool (spec §1.1).
-                await asyncio.sleep(0)
-                if len(item.blockers) >= 2:
-                    for blocker in item.blockers:
-                        await done[blocker].wait()
-                if item.id == "a":
-                    # The pool-shrink window is wall-clock, not ordering
-                    # (spec §1.1): A must return after B's worker shrank it.
-                    await asyncio.sleep(0.05)
-                return f"out-{item.id}"
-            finally:
-                done[item.id].set()
+            # One scheduling tick first, so a worker takes C before B
+            # returns and shrinks the pool (spec §1.1).
+            await asyncio.sleep(0)
+            if item.id == "a":
+                # The pool-shrink window is wall-clock, not ordering
+                # (spec §1.1): A must return after B's worker shrank it.
+                await asyncio.sleep(0.05)
+            return f"out-{item.id}"
 
         return run
 
@@ -1428,7 +1422,6 @@ class GatedDriver:
                 self.returned[card.id].set()
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate_recorder):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
@@ -1509,7 +1502,6 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
     ]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_the_whole_plan_is_recorded_pending_before_the_first_subtask_is_driven(project):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
@@ -1537,7 +1529,6 @@ def test_the_whole_plan_is_recorded_pending_before_the_first_subtask_is_driven(p
     } == {a1: "main", a2: _branch(project, a1), b1: _branch(project, a2)}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_done_subtask_is_skipped_but_still_anchors_the_next_base(project):
     shape = _milestone(project, {"A": 2})
@@ -1556,7 +1547,6 @@ def test_a_done_subtask_is_skipped_but_still_anchors_the_next_base(project):
     assert _statuses(run) == {"run": "done", story_a: "done", a2: "done"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_story_blocked_by_a_done_story_roots_on_that_storys_tip(project):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
@@ -1578,7 +1568,6 @@ def test_a_story_blocked_by_a_done_story_roots_on_that_storys_tip(project):
     ]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_every_drivers_warnings_reach_the_result_in_order(project):
     shape = _milestone(project, {"A": 2})
@@ -1590,7 +1579,6 @@ def test_every_drivers_warnings_reach_the_result_in_order(project):
     assert result["warnings"] == ["a1 warned", "a2 warned", "a2 again"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_no_driver_resolves_to_cli_drive_subtask_async_at_call_time(project, monkeypatch):
     """The default driver is the awaitable one (T3), read off `cli` when the run
@@ -1618,7 +1606,6 @@ def test_the_driver_protocol_mirrors_drive_subtask_async():
     assert protocol[1:] == list(inspect.signature(cli.drive_subtask_async).parameters)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_no_runner_factory_gives_integrate_cli_default_runner_factory_at_call_time(
     project, monkeypatch, integrate_recorder
@@ -1663,7 +1650,6 @@ def test_the_engine_selecting_modules_never_import_pygents():
         )
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_escalation_is_recorded_and_reported_with_its_story_and_files(
     project, integrate_recorder
@@ -1699,7 +1685,6 @@ def test_an_integrate_escalation_is_recorded_and_reported_with_its_story_and_fil
     assert [call["run_status"] for call in integrate_recorder.calls] == ["started"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_that_raises_propagates_and_the_run_is_never_recorded_done(
     project, integrate_recorder
@@ -1717,7 +1702,6 @@ def test_an_integrate_that_raises_propagates_and_the_run_is_never_recorded_done(
     assert run.status == "started"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_clean_milestone_is_integrated_before_the_run_is_recorded_done(
     project, real_integrate
@@ -1756,7 +1740,6 @@ def test_a_clean_milestone_is_integrated_before_the_run_is_recorded_done(
     assert _sha(project, "main") == main_before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_escalation_records_the_run_escalated_and_leaves_the_branch(
     project, real_integrate
@@ -1807,7 +1790,6 @@ def test_an_integrate_escalation_records_the_run_escalated_and_leaves_the_branch
     assert _sha(project, "main") == main_before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_all_done_milestone_runs_no_lane_and_still_integrates(project, real_integrate):
     """Spec test 4."""
@@ -1846,7 +1828,6 @@ def test_an_all_done_milestone_runs_no_lane_and_still_integrates(project, real_i
     assert _sha(project, "main") == main_before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_relaunch_after_an_integrate_escalation_retries_integrate(project, real_integrate):
     """Spec test 5: the cause is fixed (the suite made green) and the same
@@ -1895,7 +1876,6 @@ def test_a_relaunch_after_an_integrate_escalation_retries_integrate(project, rea
     assert _sha(project, "main") == main_before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_relaunching_a_finished_integrated_milestone_leaves_the_integration_tip(
     project, real_integrate
@@ -1930,7 +1910,6 @@ def test_relaunching_a_finished_integrated_milestone_leaves_the_integration_tip(
     assert _sha(project, "main") == main_before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
@@ -1959,7 +1938,6 @@ def test_a_milestone_with_nothing_pending_still_records_a_done_run(project, inte
     assert _statuses(run) == {"run": "done"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_stops_the_run_before_the_next_story(project, integrate_recorder):
     shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
@@ -1998,7 +1976,6 @@ def test_an_escalation_stops_the_run_before_the_next_story(project, integrate_re
     assert INTEGRATION_BRANCH not in _local_branches(project)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_in_a_later_level_reports_that_level(project):
     shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
@@ -2019,7 +1996,6 @@ def test_an_escalation_in_a_later_level_reports_that_level(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_driver_that_raises_is_recorded_as_an_escalation(project):
     shape = _milestone(project, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
@@ -2044,7 +2020,6 @@ def test_a_driver_that_raises_is_recorded_as_an_escalation(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_keyboard_interrupt_from_the_driver_is_not_swallowed(project):
     """The catch is `Exception`, not `BaseException`: Ctrl-C stops the process,
@@ -2057,7 +2032,6 @@ def test_a_keyboard_interrupt_from_the_driver_is_not_swallowed(project):
         _run(project, shape["milestone"], driver)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_repo_with_no_origin_prunes_worktrees_and_never_fetches(project, monkeypatch):
     shape = _milestone(project, {"A": 1})
@@ -2071,7 +2045,6 @@ def test_a_repo_with_no_origin_prunes_worktrees_and_never_fetches(project, monke
     assert all(argv[:2] == ["-C", str(root)] for argv in calls)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_origin_remote_is_fetched_exactly_once_before_the_prune(
     project, tmp_path, monkeypatch
@@ -2094,7 +2067,6 @@ def test_an_origin_remote_is_fetched_exactly_once_before_the_prune(
     ]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_remote_that_is_not_literally_origin_is_not_fetched(project, tmp_path, monkeypatch):
     other = tmp_path / "other.git"
@@ -2111,7 +2083,6 @@ def test_a_remote_that_is_not_literally_origin_is_not_fetched(project, tmp_path,
     assert [argv[2:] for argv in calls] == [["remote"], ["worktree", "prune"]]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, monkeypatch):
     origin = tmp_path / "origin.git"
@@ -2202,7 +2173,6 @@ def test_only_a_stale_story_is_anchored_and_on_its_last_done_subtask():
     assert [(story.id, anchor.id) for story, anchor in anchors] == [(stale.id, _plan_id(12))]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_stale_story_is_rolled_up_to_done_and_so_is_the_milestone(project):
     shape = _milestone(project, {"A": 2})
@@ -2223,7 +2193,6 @@ def test_a_stale_story_is_rolled_up_to_done_and_so_is_the_milestone(project):
     assert board.show(shape["milestone"], repo_dir=project).status == "done"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_stale_rollup_is_a_warning_and_the_run_goes_on(project, monkeypatch):
     shape = _milestone(project, {"A": 2, "B": 1})
@@ -2250,7 +2219,6 @@ def test_a_failed_stale_rollup_is_a_warning_and_the_run_goes_on(project, monkeyp
     assert "brd is down" in warning
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_board_read_that_fails_inside_a_lane_is_an_escalation_of_that_subtask(
     project, monkeypatch
@@ -2294,7 +2262,6 @@ def test_a_board_read_that_fails_inside_a_lane_is_an_escalation_of_that_subtask(
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 @pytest.mark.parametrize("bound", [0, -1])
 def test_a_bound_below_one_is_refused_before_anything_is_written(project, monkeypatch, bound):
@@ -2310,7 +2277,6 @@ def test_a_bound_below_one_is_refused_before_anything_is_written(project, monkey
     assert list(paths.data_dir().iterdir()) == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_the_bound_is_recorded_in_the_run_config(project):
     shape = _milestone(project, {"A": 1})
@@ -2321,7 +2287,6 @@ def test_the_bound_is_recorded_in_the_run_config(project):
     assert _load(project, result["run_id"]).config == models.RunConfig(max_concurrent_stories=2)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_fresh_run_records_its_milestones_full_id(project):
     shape = _milestone(project, {"A": 1})
@@ -2332,7 +2297,6 @@ def test_a_fresh_run_records_its_milestones_full_id(project):
     assert _load(project, result["run_id"]).milestone_id == shape["milestone"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(project):
     shape = _milestone(project, {"A": 2, "B": 1, "C": 1})
@@ -2373,7 +2337,6 @@ def test_every_story_of_a_level_runs_at_once_and_each_keeps_its_subtask_order(pr
     assert set(_statuses(run).values()) == {"done"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_at_most_max_concurrent_lanes_run(project):
     """Five ready stories, two slots. Every lane stays in flight until a third
@@ -2474,7 +2437,6 @@ async def _refill(slots: asyncio.Semaphore, capacity: int) -> None:
         slots.release()
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_two_supervise_calls_sharing_one_semaphore_never_exceed_it_combined(project):
     """Two milestones of three ready stories each, one shared two-slot
@@ -2539,7 +2501,6 @@ def test_two_supervise_calls_sharing_one_semaphore_never_exceed_it_combined(proj
         assert set(statuses.values()) == {"done"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_in_one_sharing_call_leaves_the_other_its_slots(project):
     """Milestone X's only lane escalates; milestone Y's three lanes share the
@@ -2643,7 +2604,6 @@ def test_run_milestone_refuses_bad_arguments_before_starting_an_event_loop(
         )
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_the_async_core_awaited_in_a_running_loop_is_bounded_by_the_callers_semaphore(
     project, integrate_recorder
@@ -2722,7 +2682,6 @@ def test_the_async_core_awaited_in_a_running_loop_is_bounded_by_the_callers_sema
     assert set(_statuses(run).values()) == {"done"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_cancelling_the_async_core_mid_integrate_waits_for_integrate_before_closing_the_store(
     project, integrate_recorder, monkeypatch
@@ -2781,7 +2740,6 @@ def test_cancelling_the_async_core_mid_integrate_waits_for_integrate_before_clos
     assert len(integrate_recorder.calls) == 1
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
     project, integrate_recorder
@@ -2827,7 +2785,6 @@ def test_an_escalation_parks_the_other_lane_and_its_dependent_stays_pending(
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_between_subtasks_sees_the_stop_and_never_drives_the_next(project):
     """The lane checks the stop before every subtask (spec, Observable
@@ -2859,7 +2816,6 @@ def test_a_lane_between_subtasks_sees_the_stop_and_never_drives_the_next(project
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_two_escalations_in_one_tick_give_one_primary(project):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A"]})
@@ -2914,7 +2870,6 @@ def test_two_escalations_in_one_tick_give_one_primary(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
     shape = _milestone(project, {"A": 1, "B": 1})
@@ -2950,7 +2905,6 @@ def test_a_lane_that_raises_escalates_and_parks_its_sibling(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_stop_while_waiting_for_a_slot_ends_stopped(project):
     """Three ready stories, two slots. `queued` has been started by the tree and
@@ -2986,7 +2940,6 @@ def test_stop_while_waiting_for_a_slot_ends_stopped(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_keyboard_interrupt_in_one_lane_cancels_the_other_and_propagates(project):
     """A BaseException is not an escalation (§7): it leaves the loop, and
@@ -3073,7 +3026,6 @@ def _run_or_fail_if_it_hangs(call: Callable[[], Any]) -> Any:
     return outcome["value"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_plain_base_exception_in_one_lane_cancels_the_other_and_propagates(
     project, integrate_recorder
@@ -3146,7 +3098,6 @@ def test_cancelling_run_until_killed_cancels_the_work_it_awaits():
     assert asyncio.run(scenario()) == (True, True)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_warnings_and_completed_follow_census_order_not_finish_order(project):
     shape = _milestone(project, {"A": 1, "B": 1})
@@ -3175,7 +3126,6 @@ def test_warnings_and_completed_follow_census_order_not_finish_order(project):
 # ── the supervisor tree (supervisor-tree T1-T6) ─────────────────────────────
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_story_starts_when_its_blocker_finishes_not_its_level(project):
     """T1: C (blocked by A) starts the moment A is done, while B -- in A's wave
@@ -3208,7 +3158,6 @@ def test_a_story_starts_when_its_blocker_finishes_not_its_level(project):
     )
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_chain_finishes_with_one_slot(project):
     """T4: a lane takes its slot only after its blockers finished, so a chain
@@ -3233,7 +3182,6 @@ def test_a_chain_finishes_with_one_slot(project):
     assert result["completed"] == [a1, b1, c1]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_story_behind_a_subtask_less_story_waits_for_the_blocker_beneath(project):
     """Review Focus 2: J has no subtasks, so C's stack roots on A's tip through
@@ -3256,7 +3204,6 @@ def test_a_story_behind_a_subtask_less_story_waits_for_the_blocker_beneath(proje
     assert driver.calls[1]["base"] == _branch(project, a1)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_with_no_stories_finishes_without_a_tree(project, integrate_recorder):
     """Review Focus 1: no story means no root node, and grafo's executor cannot
@@ -3273,7 +3220,6 @@ def test_a_milestone_with_no_stories_finishes_without_a_tree(project, integrate_
     assert [call["stories"] for call in integrate_recorder.calls] == [[]]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_bug_becomes_escalated_with_type_and_message(project):
     """A driver that raises is a lane bug: `escalated` at the subtask it was
@@ -3301,7 +3247,6 @@ def test_a_lane_bug_becomes_escalated_with_type_and_message(project):
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_every_node_has_no_timeout(project, monkeypatch):
     """Review Focus 1: grafo's default node timeout (60 s) would cancel a lane
@@ -3329,7 +3274,6 @@ def test_every_node_has_no_timeout(project, monkeypatch):
     assert [node._timeout for node in built] == [None] * len(built)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_each_blocker_forwards_its_tip_to_its_dependent(project, monkeypatch):
     """T1: one edge per in-milestone blocker, forwarding the blocker's tip as
@@ -3379,7 +3323,6 @@ async def _noop() -> None:
     return None
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_outlives_the_default_node_timeout(project, monkeypatch):
     """Review Focus 1: with grafo's default patched to 0.05 s, a lane still in
@@ -3402,7 +3345,6 @@ def test_a_lane_outlives_the_default_node_timeout(project, monkeypatch):
     assert result["completed"] == [a1]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_report_keeps_levels_as_waves(project):
     """Levels stop being barriers but stay in the report: `dag.compute_levels`."""
@@ -3440,7 +3382,6 @@ def test_only_orchestrate_imports_grafo():
     assert importers == {"orchestrate.py"}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_bug_keeps_stdout_one_json_line(project, monkeypatch, capsys):
     """Review Focus 2, through the CLI: grafo logs a failing node with a
@@ -3521,7 +3462,6 @@ class _ThreadWatch:
         self.paused.set()
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_parks_running_lanes_and_blocks_new_ones(project, fresh_pygents):
     """Spec test 4, on real M6 pygents subtask agents over step-only workflows
@@ -3659,7 +3599,6 @@ def _plant(
         opened.close()
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pygents_relaunch_continues_a_matching_open_checkpoint_and_starts_the_rest_fresh(
     project,
@@ -3690,7 +3629,6 @@ def test_a_pygents_relaunch_continues_a_matching_open_checkpoint_and_starts_the_
     assert driver.resumed[b2] is _ABSENT
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_checkpoint_lookup_that_fails_escalates_that_subtask(project, monkeypatch):
     """Review Focus 4: the lookup runs inside the lane's `try`, so a broken
@@ -3791,7 +3729,6 @@ def _bases_entry(story_id: str, root_plan: dag.RootPlan) -> dict[str, Any]:
     return {"story": story_id, "branch": root_plan.branch, "blockers": list(root_plan.blockers)}
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
     project, fake_bases
@@ -3842,7 +3779,6 @@ def test_a_merged_root_story_builds_its_base_after_both_blockers_and_runs_on_it(
     assert (statuses[story_c], statuses[c1], statuses[c2]) == ("done", "done", "done")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_root_story_with_one_escalated_blocker_is_never_driven(project, fake_bases):
     """C is blocked by A and B. B finishes clean, then A escalates: C is never
@@ -3876,7 +3812,6 @@ def test_a_merged_root_story_with_one_escalated_blocker_is_never_driven(project,
     assert (statuses[story_b], statuses[b1]) == ("done", "done")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_root_story_behind_an_edge_child_completes_instead_of_hanging(
     project, fake_bases
@@ -3915,7 +3850,6 @@ def test_a_merged_root_story_behind_an_edge_child_completes_instead_of_hanging(
     assert (statuses[story_d], statuses[d1]) == ("done", "done")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
     shape = _milestone(project, {"A": 1, "B": 1, "C": 1}, blocked_by={"C": ["A", "B"]})
@@ -3927,7 +3861,6 @@ def test_a_given_runner_factory_reaches_the_base_builder(project, fake_bases):
     assert call["runner_factory"] is _no_resolver
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_done_blockers_existing_tip_goes_into_the_base(project, fake_bases):
     """Review Focus 3: on a relaunch A is already done. Its lane finishes at once
@@ -3952,7 +3885,6 @@ def test_a_done_blockers_existing_tip_goes_into_the_base(project, fake_bases):
     assert result["bases"] == [_bases_entry(story_c, root_plan)]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_run_with_no_merged_root_builds_no_base_and_reports_no_bases(project, fake_bases):
     """Spec: a lone-blocker story stays the fast path, and the key is absent
@@ -3966,7 +3898,6 @@ def test_a_run_with_no_merged_root_builds_no_base_and_reports_no_bases(project, 
     assert "bases" not in result
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_that_escalates_after_building_its_base_still_lists_it(project, fake_bases):
     """Review Focus 5: the base exists once built, so a lane-escalated payload
@@ -3984,7 +3915,6 @@ def test_a_lane_that_escalates_after_building_its_base_still_lists_it(project, f
     assert result["bases"] == [_bases_entry(story_c, root_plan)]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_escalation_still_lists_the_bases_built(
     project, fake_bases, integrate_recorder
@@ -4003,7 +3933,6 @@ def test_an_integrate_escalation_still_lists_the_bases_built(
     assert result["bases"] == [_bases_entry(story_c, root_plan)]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_base_escalates_the_story_at_base_and_parks_a_running_sibling(
     project, fake_bases
@@ -4062,7 +3991,6 @@ def test_a_failed_base_escalates_the_story_at_base_and_parks_a_running_sibling(
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_base_whose_resolver_was_stopped_ends_stopped_not_escalated(project, fake_bases):
     """Spec: `BaseFailed(stopped=True)` -- D escalates while C's base is being
@@ -4118,7 +4046,6 @@ def test_a_base_whose_resolver_was_stopped_ends_stopped_not_escalated(project, f
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_lane_that_finds_the_stop_fired_never_builds_its_base(project, fake_bases):
     """Review Focus 1: one slot. The three roots queue on it in census order;
@@ -4147,7 +4074,6 @@ def test_a_merged_lane_that_finds_the_stop_fired_never_builds_its_base(project, 
     assert (statuses[joined], statuses[j1]) == ("stopped", "pending")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_any_other_error_from_the_base_is_a_lane_escalation_with_no_subtask(
     project, fake_bases
@@ -4173,7 +4099,6 @@ def test_any_other_error_from_the_base_is_a_lane_escalation_with_no_subtask(
     assert (statuses[story_c], statuses[c1]) == ("escalated", "pending")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
     project, fake_bases
@@ -4196,7 +4121,6 @@ def test_a_failed_blocker_leaves_the_merged_story_pending_and_builds_no_base(
     assert (statuses[story_c], statuses[c1]) == ("pending", "pending")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_subtask_less_story_on_two_blockers_builds_its_base_and_its_dependent_stacks_on_it(
     project, fake_bases
@@ -4234,7 +4158,6 @@ def test_a_subtask_less_story_on_two_blockers_builds_its_base_and_its_dependent_
     assert result["bases"] == [_bases_entry(story_j, root_plan)]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_subtask_less_storys_failed_base_escalates_the_run_and_its_dependent_stays_pending(
     project, fake_bases, integrate_recorder
@@ -4279,7 +4202,6 @@ def test_a_subtask_less_storys_failed_base_escalates_the_run_and_its_dependent_s
     }
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_closed_subtask_less_story_builds_no_base(project, fake_bases):
     """Spec, Out of scope: a done story's missing base is milestone-wide
@@ -4298,7 +4220,6 @@ def test_a_closed_subtask_less_story_builds_no_base(project, fake_bases):
     assert "bases" not in result
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_storys_dependent_stays_pending_when_a_blocker_failed(project, fake_bases):
     """T1: grafo starts no dependent of a lane that did not finish clean. C
@@ -4324,7 +4245,6 @@ def test_a_merged_storys_dependent_stays_pending_when_a_blocker_failed(project, 
     assert (statuses[story_e], statuses[e1]) == ("pending", "pending")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_subtask_less_merged_storys_dependent_stays_pending_when_a_blocker_failed(
     project, fake_bases
@@ -4351,7 +4271,6 @@ def test_a_subtask_less_merged_storys_dependent_stays_pending_when_a_blocker_fai
     assert (statuses[story_d], statuses[d1]) == ("pending", "pending")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_done_merged_storys_dependent_waits_for_its_blockers(project, fake_bases):
     """A done story rooted on a merged base still sits behind its blockers,
@@ -4797,7 +4716,6 @@ def _never_consulted(store, card_id):
     pytest.fail("a resume consulted the lenient relaunch lookup runs.continuable_checkpoint")
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on(
     project, fake_bases, monkeypatch
@@ -4847,7 +4765,6 @@ def test_a_resume_reuses_the_recorded_settings_and_hands_each_open_checkpoint_on
     assert run.config.max_concurrent_stories == 3
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_resume_hands_a_subtask_less_storys_resolver_checkpoint_to_its_base(
     project, fake_bases
@@ -4878,7 +4795,6 @@ def test_a_resume_hands_a_subtask_less_storys_resolver_checkpoint_to_its_base(
     )
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_stale_resolver_checkpoint_refuses_the_whole_resume_and_writes_nothing(
     project, fake_bases, monkeypatch
@@ -4919,7 +4835,6 @@ def test_a_stale_resolver_checkpoint_refuses_the_whole_resume_and_writes_nothing
     ) == before
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_merged_base_from_the_interrupted_run_is_reused_and_not_merged_again(project):
     """Spec test 7, on the real `bases.build`: A and B finished and C's base
@@ -4953,7 +4868,6 @@ def test_a_merged_base_from_the_interrupted_run_is_reused_and_not_merged_again(p
     assert _sha(project, "main") == main_sha
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_card_finished_by_hand_since_the_interrupt_is_neither_checked_nor_driven(project):
     """Review Focus 1: a1's checkpoint is stale, but a human finished a1 on the
@@ -4974,7 +4888,6 @@ def test_a_card_finished_by_hand_since_the_interrupt_is_neither_checked_nor_driv
     assert result["completed"] == [a2]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_resume_after_an_integrate_escalation_retries_integrate(project, integrate_recorder):
     """Review Focus 4: nothing is left to drive, so the resume runs no lane
@@ -4998,7 +4911,6 @@ def test_a_resume_after_an_integrate_escalation_retries_integrate(project, integ
     assert _load(project, first["run_id"]).status == "done"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalated_resume_still_says_it_resumed(project):
     shape = _milestone(project, {"A": 1})
@@ -5071,7 +4983,6 @@ def _send_then_await_stop(project: Path, run_id: str, command: str) -> Gate:
     return gate
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_run_with_no_control_integrates_as_before(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
@@ -5088,7 +4999,6 @@ def test_a_run_with_no_control_integrates_as_before(project, integrate_recorder)
     assert _controls(project, run_id) == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
     project, integrate_recorder, monkeypatch
@@ -5116,7 +5026,6 @@ def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
     assert _lease(project, run_id) is None
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_crash_after_a_pause_propagates_releases_the_lease_and_records_neither(
     project, integrate_recorder
@@ -5142,7 +5051,6 @@ def test_a_crash_after_a_pause_propagates_releases_the_lease_and_records_neither
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_refused_resume_never_takes_a_lease(project, monkeypatch):
     """Error paths: `resume_checkpoints`' refusal comes before `record_run`,
@@ -5164,7 +5072,6 @@ def test_a_refused_resume_never_takes_a_lease(project, monkeypatch):
     assert _lease(project, run_id) is None
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_resuming_a_run_recorded_before_milestone_id_stamps_it(project):
     """A pre-migration run resolves through the short-id fallback once, and
@@ -5188,7 +5095,6 @@ def test_resuming_a_run_recorded_before_milestone_id_stamps_it(project):
     assert _load(project, run_id).milestone_id == shape["milestone"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_request_left_under_an_earlier_lease_never_reaches_the_resumed_run(project):
     """C4: a pause addressed to the interrupted process's token stays unhandled
@@ -5207,7 +5113,6 @@ def test_a_request_left_under_an_earlier_lease_never_reaches_the_resumed_run(pro
     assert _load(project, run_id).status == "done"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_that_raises_still_releases_the_lease(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
@@ -5221,7 +5126,6 @@ def test_an_integrate_that_raises_still_releases_the_lease(project, integrate_re
     assert _load(project, run_id).status == "started"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_paused_milestone_parks_records_stopped_and_skips_integrate(
     project, integrate_recorder
@@ -5259,7 +5163,6 @@ def test_a_paused_milestone_parks_records_stopped_and_skips_integrate(
     ]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pause_applied_after_the_last_lane_already_finished_still_skips_integrate(
     project, integrate_recorder, monkeypatch
@@ -5297,7 +5200,6 @@ def test_a_pause_applied_after_the_last_lane_already_finished_still_skips_integr
     assert [row.handled_at is not None for row in _controls(project, run_id)] == [True]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_waiting_for_a_slot_ends_stopped_on_a_pause(project, integrate_recorder):
     """Three ready stories, two slots: `queued` waits for a slot when the
@@ -5337,7 +5239,6 @@ def test_a_lane_waiting_for_a_slot_ends_stopped_on_a_pause(project, integrate_re
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
     project, integrate_recorder
@@ -5368,7 +5269,6 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
@@ -5394,7 +5294,6 @@ def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_record
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_under_pause_stays_escalated_and_carries_control_pause(
     project, integrate_recorder
@@ -5440,7 +5339,6 @@ def test_an_escalation_under_pause_stays_escalated_and_carries_control_pause(
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations(
     project, integrate_recorder
@@ -5491,7 +5389,6 @@ def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations
     assert integrate_recorder.calls == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_resumed_paused_run_reports_resumed_and_bases_through_report(project, fake_bases):
     """Every branch goes through `report`: a pause on a resume carries
@@ -5518,7 +5415,6 @@ def test_a_resumed_paused_run_reports_resumed_and_bases_through_report(project, 
     assert _load(project, run_id).status == "stopped"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
     project, fresh_pygents, integrate_recorder
@@ -5702,7 +5598,6 @@ def _recording(
     return gate
 
 
-@pytest.mark.brd
 @pytest.mark.parametrize("claimed", ["milestone", "subtask"])
 @pytest.mark.git
 def test_a_milestone_run_is_refused_while_a_live_run_claims_one_of_its_cards(
@@ -5739,7 +5634,6 @@ def test_a_milestone_run_is_refused_while_a_live_run_claims_one_of_its_cards(
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_run_is_refused_while_a_live_run_claims_its_integration_branch(
     project, monkeypatch
@@ -5772,7 +5666,6 @@ def test_a_milestone_run_is_refused_while_a_live_run_claims_its_integration_bran
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_dead_claim_does_not_refuse_a_milestone_run(project):
     """A dead holder's claims are taken over by `take_lease`, then released
@@ -5796,7 +5689,6 @@ def test_a_dead_claim_does_not_refuse_a_milestone_run(project):
     assert other is not None and other.token == "dead-life"
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_run_holds_its_claims_while_driving(project):
     """Mid-run the lease holds exactly `milestone_claims`: the milestone, the
@@ -5827,7 +5719,6 @@ def test_a_milestone_run_holds_its_claims_while_driving(project):
 @pytest.mark.parametrize(
     "exit_by", ["done", "escalated", "paused", "cancelled", "killed", "integrate_raises"]
 )
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_run_releases_its_claims_on_every_exit(project, integrate_recorder, exit_by):
     """X5: the claims are held mid-run and gone, with the lease, however the
@@ -5867,7 +5758,6 @@ def test_a_milestone_run_releases_its_claims_on_every_exit(project, integrate_re
     assert _lease(project, run_id) is None
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_claims_its_card(
     project, monkeypatch
@@ -5900,7 +5790,6 @@ def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_c
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, monkeypatch):
     """X5: on a resume the fetch/prune and the first journal line both happen
@@ -5948,7 +5837,6 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
     assert (git_saw.token, git_saw.pid) == (token, os.getpid())
 
 
-@pytest.mark.brd
 @pytest.mark.parametrize("outcome", ["done", "escalated"])
 @pytest.mark.git
 def test_a_milestone_resume_excludes_its_own_claims_and_reports_took_over(project, outcome):
@@ -5984,7 +5872,6 @@ def test_a_milestone_resume_excludes_its_own_claims_and_reports_took_over(projec
     assert _lease(project, run_id) is None
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_still_live_milestone_run_refuses_its_resume_before_touching_git(project, monkeypatch):
     """Review Focus 2 (C10): the run's own lease is live and holds its own
@@ -6045,7 +5932,6 @@ def _comment_states(project: Path) -> list[tuple[str, str]]:
         conn.close()
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story(project):
     """Spec test 1, subtask half; Review Focus 2: two lanes finish at once,
@@ -6075,7 +5961,6 @@ def test_a_clean_run_leaves_one_done_comment_on_each_subtask_and_none_on_a_story
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
     """Spec test 1, milestone half; Review Focus 5: `total` reaches the comment only."""
@@ -6098,7 +5983,6 @@ def test_a_clean_run_leaves_one_done_run_end_comment_on_the_milestone(project):
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
     project, integrate_recorder
@@ -6126,7 +6010,6 @@ def test_an_integrate_escalation_leaves_an_integrate_failed_run_end_comment(
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_lane_escalation_leaves_an_escalated_run_end_comment_naming_the_parked(project):
     """Spec test 2, milestone half: the run-end names the escalated subtask and
@@ -6171,7 +6054,6 @@ class WithResults:
         return replace(drive, summary=summary)
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(project):
     """Spec test 2: the escalated subtask gets phase, detail and the agent's
@@ -6212,7 +6094,6 @@ def test_an_escalation_comments_only_the_escalated_subtask_and_the_milestone(pro
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_second_life_escalating_at_the_same_phase_adds_a_second_escalation_comment(project):
     """Spec test 4 (Review Focus 3 of the card); Review Focus 4 here: no
@@ -6237,7 +6118,6 @@ def test_a_second_life_escalating_at_the_same_phase_adds_a_second_escalation_com
     assert len(milestone_keys) == 2 and len(set(milestone_keys)) == 2, milestone_keys
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_review(project):
     """Spec test 3: the first life's escalation stays; the second life adds
@@ -6269,7 +6149,6 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
     assert run_end_rows == [(key, "posted") for key in milestone_keys]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
     """Spec test 5, `lane` case: one `base-failed` comment on C, none on c1."""
@@ -6294,7 +6173,6 @@ def test_a_failed_merged_base_comments_on_its_story(project, fake_bases):
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_bases):
     """Spec test 5, `base_only_lane` case: J has no store row, yet its story
@@ -6320,7 +6198,6 @@ def test_a_subtask_less_storys_failed_base_comments_on_that_story(project, fake_
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_base_whose_resolver_was_stopped_gets_no_base_failed_comment(project, fake_bases):
     """Spec test 5, stopped case: `BaseFailed(stopped=True)` is a park, not a failure."""
@@ -6367,7 +6244,6 @@ def _board_down(monkeypatch) -> dict[str, bool]:
     return state
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_board_that_is_down_changes_only_warnings_and_a_relaunch_posts_the_rows(
     project, monkeypatch
@@ -6406,7 +6282,6 @@ def test_a_board_that_is_down_changes_only_warnings_and_a_relaunch_posts_the_row
     assert all(row_state == "posted" for _key, row_state in _comment_states(project))
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_start_flush_that_fails_reports_its_warnings_and_the_run_goes_on(
     project, monkeypatch
@@ -6431,7 +6306,6 @@ def test_a_start_flush_that_fails_reports_its_warnings_and_the_run_goes_on(
     assert "not posted" in on_a1[0] and "brd is down" in on_a1[0]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_an_escalation_comment_the_board_refuses_is_a_warning_on_the_run(
     project, monkeypatch
@@ -6451,7 +6325,6 @@ def test_an_escalation_comment_the_board_refuses_is_a_warning_on_the_run(
     ) == 1, result["warnings"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_failed_base_comment_the_board_refuses_is_a_warning_on_the_run(
     project, fake_bases, monkeypatch
@@ -6472,7 +6345,6 @@ def test_a_failed_base_comment_the_board_refuses_is_a_warning_on_the_run(
     ) == 1, result["warnings"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_subtask_less_storys_refused_base_comment_is_a_warning_on_the_run(
     project, fake_bases, monkeypatch
@@ -6500,7 +6372,6 @@ def test_a_subtask_less_storys_refused_base_comment_is_a_warning_on_the_run(
 # ── board comments on cancel and pause (card 5d9a875f) ─────────────────────
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
     """Spec test 1: a2 and b1 park under the cancel and each get one
@@ -6550,7 +6421,6 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_cancelled(project):
     """Review Focus 3: a1's lane already posted its escalation; the cancel
@@ -6589,7 +6459,6 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
     assert f"parked: [[{b1}]]" in found[0].body
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_phase(project):
     """Review Focus 1: `queued` never reached the driver, so its stopped
@@ -6625,7 +6494,6 @@ def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_ph
         assert "stopped before: implement" in _comments(project, subtask)[0].body
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
     project, fake_bases
@@ -6657,7 +6525,6 @@ def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warnings(
     project, monkeypatch
@@ -6686,7 +6553,6 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
     assert [state for _key, state in _comment_states(project)] == ["pending", "pending"]
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
     """Spec test 2: one comment in total, on the milestone, posted (its
@@ -6717,7 +6583,6 @@ def test_a_pause_leaves_exactly_one_paused_run_end_on_the_milestone(project):
     assert result["warnings"] == []
 
 
-@pytest.mark.brd
 @pytest.mark.git
 def test_a_paused_then_resumed_run_leaves_a_paused_then_a_done_run_end(project):
     """Review Focus 4: the resumed life has its own lease token, so its done

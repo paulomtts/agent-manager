@@ -254,10 +254,55 @@ class E2ETierCap:
 E2E_CAP_PLUGIN_NAME = "agent-manager-e2e-tier-cap"
 
 
+def brd_fake_board_violations(items: Iterable[tuple[str, Iterable[str], Iterable[str]]]) -> list[str]:
+    """Nodeids that carry `brd` but depend on `fake_board`, as violation messages.
+
+    `items` is (nodeid, marker names on its chain, its fixture closure) triples.
+    `brd` means "spawns the real binary"; `fake_board` monkeypatches it away, so
+    the two together is almost always a mislabel -- the item should be
+    `git`-tier instead (see the M20-era mislabeling this guard was added to
+    catch). The one deliberate exception is a test that pins `fake_board`
+    against the real binary (tests/test_board.py's "conftest twin" test): it
+    carries `pins_fake_board` to say so, and is skipped here.
+    """
+    violations = []
+    for nodeid, markers, fixturenames in items:
+        names = set(markers)
+        if "brd" in names and "fake_board" in set(fixturenames) and "pins_fake_board" not in names:
+            violations.append(
+                f"{nodeid}: marked brd but depends on fake_board -- use git instead"
+            )
+    return violations
+
+
+class BrdFakeBoardGuard:
+    """Collection-time check that no `brd`-marked item also depends on `fake_board`.
+
+    Mirrors `E2ETierCap`'s shape: its own plugin object since this module
+    already defines `pytest_collection_modifyitems`, `tryfirst` so it runs
+    before `-m` deselection hides a violating `brd`-tier item from the default
+    run's view.
+    """
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
+        violations = brd_fake_board_violations(
+            (item.nodeid, [mark.name for mark in item.iter_markers()], getattr(item, "fixturenames", ()))
+            for item in items
+        )
+        if violations:
+            raise pytest.UsageError("brd tier check failed:\n" + "\n".join(violations))
+
+
+BRD_GUARD_PLUGIN_NAME = "agent-manager-brd-fake-board-guard"
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the e2e cap check once per session."""
+    """Register the e2e cap check and the brd/fake_board guard once per session."""
     if not config.pluginmanager.has_plugin(E2E_CAP_PLUGIN_NAME):
         config.pluginmanager.register(E2ETierCap(), E2E_CAP_PLUGIN_NAME)
+    if not config.pluginmanager.has_plugin(BRD_GUARD_PLUGIN_NAME):
+        config.pluginmanager.register(BrdFakeBoardGuard(), BRD_GUARD_PLUGIN_NAME)
 
 
 UNIT_BUDGET_S = 0.5

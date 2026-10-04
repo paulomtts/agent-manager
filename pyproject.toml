@@ -49,6 +49,7 @@ markers = [
     "brd: executes the real brd binary; opt-in (-m brd)",
     "e2e_fake: production wiring under the fake claude; opt-in (-m e2e_fake)",
     "soak: concurrency stress; opt-in, no budget",
+    "pins_fake_board: a brd test that deliberately also depends on fake_board to pin it against the real binary; exempt from the brd/fake_board mismatch guard",
 ]
 # importlib mode, not the default prepend mode: tests/steps/test_integrate.py and
 # tests/e2e/test_integrate.py share a basename, and prepend mode names test modules
