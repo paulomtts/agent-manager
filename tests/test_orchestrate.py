@@ -3622,13 +3622,27 @@ EARLIER = datetime(2026, 9, 24, 11, 0, 0, tzinfo=timezone.utc)
 
 @dataclass
 class CheckpointDriver(FakeDriver):
-    """`FakeDriver` that also takes `resume_from` and records it per card."""
+    """`FakeDriver` that also takes `resume_from` and records it per card.
+
+    Like the engine's kept path, a card handed a checkpoint comes back with
+    `summary.resumed_at` set to that checkpoint's pending phase. A card in
+    `declined` stands for a walk whose checkpoint was declined (its worktree
+    could not be kept) and started over: `resumed_at` stays `None`.
+    """
 
     resumed: dict[str, Any] = field(default_factory=dict)
+    declined: set[str] = field(default_factory=set)
 
     async def __call__(self, *, resume_from: Any = _ABSENT, **kwargs: Any) -> cli.SubtaskDrive:
-        self.resumed[kwargs["card"].id] = resume_from
-        return await super().__call__(**kwargs)
+        card_id = kwargs["card"].id
+        self.resumed[card_id] = resume_from
+        drive = await super().__call__(**kwargs)
+        if resume_from is _ABSENT or resume_from is None or card_id in self.declined:
+            return drive
+        summary = replace(
+            drive.summary, resumed_at=runtime_engine.pending_phase(resume_from)
+        )
+        return replace(drive, summary=summary)
 
 
 def _plant(
@@ -6267,6 +6281,31 @@ def test_a_resume_after_the_fix_keeps_the_escalation_and_adds_done_resumed_at_re
     assert all(key.startswith(f"{run_id}/{milestone}/run-end:") for key in milestone_keys)
     run_end_rows = [row for row in _comment_states(project) if "/run-end:" in row[0]]
     assert run_end_rows == [(key, "posted") for key in milestone_keys]
+
+
+@pytest.mark.brd
+@pytest.mark.git
+def test_a_lane_whose_walk_declined_its_checkpoint_posts_done_without_resumed_at(project):
+    """Resume worktree re-ensure §3.6: the lane hands a1 a checkpoint, but the
+    walk declined it and started over (`summary.resumed_at` is None), so the
+    `done` comment names no resume point. The lane reads the summary, not the
+    checkpoint it handed in."""
+    shape = _milestone(project, {"A": 1})
+    milestone = shape["milestone"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run(project, milestone, FakeDriver(outcomes={a1: ("review", "boom")}))
+    run_id = first["run_id"]
+    _plant(project, run_id, a1, "turn", queue=("review",))
+    driver = CheckpointDriver(declined={a1})
+
+    result = _resume(project, run_id, driver)
+
+    assert result["done"] is True, result
+    assert driver.resumed[a1] is not _ABSENT
+    found = _comments(project, a1)
+    keys = _keys(found)
+    assert keys[-1] == f"{run_id}/{a1}/done", keys
+    assert "(resumed at" not in found[-1].body
 
 
 @pytest.mark.brd

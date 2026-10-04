@@ -1318,11 +1318,10 @@ async def lane(
                             card_id=subtask.id,
                             summary=summary,
                             branch=row.branch,
-                            # Where the walk picked up, only when the lane
-                            # handed the driver a checkpoint as `resume_from`.
-                            resumed_at=None
-                            if checkpoint is None
-                            else runtime_engine.pending_phase(checkpoint),
+                            # Where the walk actually continued, as the engine
+                            # reports it: `None` on a fresh walk, and on one
+                            # whose checkpoint was declined and started over.
+                            resumed_at=summary.resumed_at,
                         ),
                         run_id=run_id,
                     )
