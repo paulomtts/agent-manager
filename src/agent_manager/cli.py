@@ -487,6 +487,35 @@ def select_step_attempt(
     )
 
 
+def step_end_status(
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    n: int,
+    recorded: Sequence[int],
+) -> str | None:
+    """The `logs --follow` end status of deterministic attempt `n`, or `None`.
+
+    A deterministic phase has no `Attempt` row, so card 4.2 maps it onto the
+    `AttemptStatus` vocabulary: attempt `n` is over once a later `<phase>.M`
+    directory exists, or once the phase is neither `pending` nor `started`.
+    It ended `ok` only when it is the latest attempt and the phase is `done`;
+    a superseded attempt, or a phase `failed`, `escalated`, `stopped` or
+    `cancelled`, ended `gate_failed`. Pure: the caller scans `recorded` with
+    the read-only `paths.recorded_attempts`.
+    """
+    if n not in recorded:
+        numbers = ", ".join(str(item) for item in recorded) or "none"
+        raise UnknownAttemptError(
+            f"phase {phase.name!r} of card {subtask.card_id!r} has no attempt {n}"
+            f" any more; recorded attempts: {numbers}"
+        )
+    if max(recorded) > n:
+        return "gate_failed"
+    if phase.status in ("pending", "started"):
+        return None
+    return "ok" if phase.status == "done" else "gate_failed"
+
+
 def step_logs_payload(
     run: models.Run,
     story: models.StoryRun,
@@ -1855,27 +1884,72 @@ def runs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def logs_for(
+@dataclass(frozen=True)
+class LogsSelection:
+    """The attempt `am logs` reports on, as `select_logs` chose it.
+
+    An agent phase carries its `Attempt` row. A deterministic phase has no
+    row (spec e1b1e7d5 Decision 2), so it carries the `<phase>.N` number and
+    directory found on disk instead, and `attempt` is `None`.
+    """
+
+    run: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+    phase: models.PhaseRun
+    attempt: models.Attempt | None
+    step_attempt: int | None = None
+    step_directory: Path | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """`logs`' one-shot payload: `logs_payload` or `step_logs_payload`."""
+        if self.attempt is not None:
+            return logs_payload(
+                self.run, self.story, self.subtask, self.phase, self.attempt
+            )
+        if self.step_attempt is None or self.step_directory is None:
+            raise CliError(
+                f"phase {self.phase.name!r} of card {self.subtask.card_id!r}"
+                " was selected with neither an attempt row nor a step directory"
+            )
+        return step_logs_payload(
+            self.run,
+            self.story,
+            self.subtask,
+            self.phase,
+            self.step_attempt,
+            self.step_directory,
+        )
+
+    def followed_path(self) -> Path | None:
+        """The file `logs --follow` reads: the agent attempt's recorded
+        `stdout_path` (the launcher merges stderr into it), or a deterministic
+        phase's `<phase>.N/stdout.log`. `None` when an agent attempt recorded
+        no stdout path."""
+        if self.attempt is not None:
+            return self.attempt.stdout_path
+        if self.step_directory is None:
+            return None
+        return self.step_directory / verify_step.STDOUT_LOG
+
+
+def select_logs(
     run_id: str,
     card: str,
     *,
     repo_dir: Path,
     phase: str | None = None,
     attempt: int | None = None,
-) -> dict[str, Any]:
-    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+) -> LogsSelection:
+    """Which attempt §10's `logs` reports, shared by the one-shot and `--follow`.
 
     Read-only, like `status_for`: the projection is reached through the free
     `open_db` / `load_run` rather than `Store.open`, which would construct a
     `Journal` and therefore mint a run directory for a run that may not exist.
     The connection is closed on every path including the refusals.
 
-    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
-    "most recent run" reading of it to default to.
-
     A `--phase` naming a deterministic phase is answered from disk: its
-    attempts are the `<phase>.N` directories `run_one_step` created, and the
-    payload carries that attempt's `stdout.log` and `stderr.log` (spec
+    attempts are the `<phase>.N` directories `run_one_step` created (spec
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
@@ -1908,13 +1982,141 @@ def logs_for(
             recorded = paths.recorded_attempts(run_id, card, step.name)
             n = select_step_attempt(subtask, step, recorded, attempt)
             directory = paths.attempt_path(run_id, card, step.name, n)
-            return step_logs_payload(run, story, subtask, step, n, directory)
+            return LogsSelection(
+                run=run,
+                story=story,
+                subtask=subtask,
+                phase=step,
+                attempt=None,
+                step_attempt=n,
+                step_directory=directory,
+            )
         chosen_phase, chosen_attempt = select_attempt(
             subtask, phase=phase, attempt=attempt
         )
-        return logs_payload(run, story, subtask, chosen_phase, chosen_attempt)
+        return LogsSelection(
+            run=run,
+            story=story,
+            subtask=subtask,
+            phase=chosen_phase,
+            attempt=chosen_attempt,
+        )
     finally:
         conn.close()
+
+
+def logs_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+
+    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
+    "most recent run" reading of it to default to. The selection, and its
+    read-only rules, are `select_logs`'; the artifacts are read after the
+    projection connection is closed, from the paths the selection names.
+    """
+    return select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    ).payload()
+
+
+def logs_follow_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+    since_offset: int = 0,
+) -> LogsSelection:
+    """Validate `am logs --follow` and return the attempt it streams.
+
+    The same selection as `logs_for` (`select_logs`), so every refusal the
+    one-shot makes is made here too, before the hello line. On top of those:
+    a negative `--since-offset` (worded as `watch --since` is), and an agent
+    attempt that recorded no stdout path, since the hello must name a file.
+    The projection connection is closed by `select_logs` before this
+    returns. The selection, not only its file, is returned because the
+    stream looks the attempt's status up again before every read
+    (`logs_end_status`, card 4.2), and that needs the run, card, phase and
+    attempt number.
+    """
+    if since_offset < 0:
+        raise CliError(f"--since-offset must be 0 or more, got {since_offset}")
+    selection = select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    )
+    if selection.followed_path() is None:
+        number = (
+            selection.attempt.n
+            if selection.attempt is not None
+            else selection.step_attempt
+        )
+        raise CliError(
+            f"attempt {number} of phase {selection.phase.name!r} of card"
+            f" {selection.subtask.card_id!r} recorded no stdout path,"
+            " so there is no file to follow"
+        )
+    return selection
+
+
+def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
+    """The followed attempt's status if it is over, `None` while it runs.
+
+    Looked up afresh on every call, because `selection` is a snapshot from
+    before the stream began. Read-only, like `select_logs`: the free
+    `open_db` / `load_run`, the connection closed before anything else, and
+    for a deterministic phase only `paths.recorded_attempts`; never
+    `Store.open`, `paths.attempt_dir` or `paths.run_dir`, which create
+    directories. An agent attempt is over once its status is anything but
+    `started`; a deterministic one maps through `step_end_status`. A run,
+    card, phase or attempt that can no longer be found is a refusal, which
+    `_stream_logs` reports on stderr at exit 3.
+    """
+    run_id = selection.run.id
+    card = selection.subtask.card_id
+    name = selection.phase.name
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection for {root} any more"
+        )
+    found = find_subtask(run, card)
+    if found is None:
+        raise UnknownCardError(f"card {card!r} is not in run {run_id!r} any more")
+    _, subtask = found
+    phase = next((item for item in subtask.phases if item.name == name), None)
+    if phase is None:
+        raise UnknownPhaseError(f"card {card!r} has no phase {name!r} any more")
+    if selection.attempt is None:
+        if selection.step_attempt is None:
+            raise CliError(
+                f"phase {name!r} of card {card!r} was selected with neither"
+                " an attempt row nor a step attempt"
+            )
+        return step_end_status(
+            subtask,
+            phase,
+            selection.step_attempt,
+            paths.recorded_attempts(run_id, card, name),
+        )
+    n = selection.attempt.n
+    row = next((item for item in phase.attempts if item.n == n), None)
+    if row is None:
+        raise UnknownAttemptError(
+            f"phase {name!r} of card {card!r} has no attempt {n} any more"
+        )
+    return None if row.status == "started" else row.status
 
 
 @app.command("logs")
@@ -1927,19 +2129,63 @@ def logs(
     attempt: int | None = typer.Option(
         None, "--attempt", help="Which attempt. Defaults to the highest recorded."
     ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help=(
+            "Keep printing the attempt's stdout as it grows, one JSON object"
+            " per line; once the attempt is over and the file stops growing,"
+            ' print {"event":"end","status":...} and exit 0.'
+        ),
+    ),
+    since_offset: int | None = typer.Option(
+        None,
+        "--since-offset",
+        metavar="BYTES",
+        help="With --follow, start at this byte offset of the stdout file (default 0).",
+    ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository whose projection is read."
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print one attempt's prompt, result and captured stdout/stderr."""
+    """Print one attempt's prompt, result and captured stdout/stderr.
+
+    With --follow, print a hello line naming the attempt's stdout file and
+    then its bytes as `{"offset", "text"}` lines, the existing content first
+    and then each append. Once the attempt has a terminal status and the
+    file has stopped growing, a last `{"event": "end", "status": ...}` line
+    follows and the exit is 0. A refusal is still one envelope at exit 3,
+    printed before any stream line.
+    """
+    offset = since_offset if since_offset is not None else 0
     try:
-        payload = logs_for(
-            run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
-        )
+        # `None` means --since-offset was not given; any given value, 0
+        # included, needs --follow, as --from-now does for `watch`.
+        if since_offset is not None and not follow:
+            raise CliError(
+                "--since-offset needs --follow: it resumes a stream,"
+                " and without --follow there is no stream"
+            )
+        if follow:
+            selection = logs_follow_for(
+                run_id,
+                card,
+                repo_dir=repo_dir,
+                phase=phase,
+                attempt=attempt,
+                since_offset=offset,
+            )
+        else:
+            payload = logs_for(
+                run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if follow:
+        _stream_logs(selection, repo_dir=repo_dir, offset=offset)
+        return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
@@ -2178,6 +2424,141 @@ def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> 
         return
     except WATCH_HANDLED as error:
         typer.echo(f"am watch: {error}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+def _read_log_bytes(path: Path | None, offset: int) -> bytes:
+    """`path`'s bytes from `offset` to its current end, for `logs --follow`.
+
+    Never raises for the file's state: a path not recorded, a file not
+    written yet, a directory, an unreadable mode, or a file shorter than
+    `offset` all read as `b""`, so a poll that finds nothing waits for the
+    next one (spec card 4.1, "File not there yet"). Opens for reading only,
+    so nothing is created.
+    """
+    if path is None:
+        return b""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _utf8_complete_length(data: bytes) -> int:
+    """How many leading bytes of `data` end on a UTF-8 character boundary.
+
+    Only a trailing sequence whose lead byte is valid but whose continuation
+    bytes have not all arrived yet is held back: at most 3 bytes. Any other
+    byte, including a stray continuation or an invalid lead, counts as
+    complete, so `errors="replace"` turns it into U+FFFD and an invalid
+    tail can never stall the stream.
+    """
+    end = len(data)
+    for index in range(end - 1, max(end - 4, 0) - 1, -1):
+        byte = data[index]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte < 0x80:
+            return end
+        if 0xC2 <= byte <= 0xDF:
+            needed = 2
+        elif 0xE0 <= byte <= 0xEF:
+            needed = 3
+        elif 0xF0 <= byte <= 0xF4:
+            needed = 4
+        else:
+            return end
+        return index if end - index < needed else end
+    return end
+
+
+def _logs_hello(path: Path, offset: int) -> dict[str, Any]:
+    """The first line of `am logs --follow`: which file, from which byte.
+
+    Its own `schema`, independent of the journal's and of `watch`'s hello,
+    so the chunk shape can evolve without touching either.
+    """
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _follow_logs(
+    path: Path | None,
+    *,
+    offset: int,
+    sleep: Callable[[float], None],
+    max_polls: int | None,
+    end_status: Callable[[], str | None],
+) -> Iterator[dict[str, Any]]:
+    """`path`'s bytes from `offset` as `{"offset", "text"}` chunks, then each
+    append, then `{"event": "end", "status": ...}` once the attempt is over.
+
+    `end_status()` is asked before every read, so bytes written just before
+    the status flips are still read. While it returns `None` the attempt is
+    running: one read, then `sleep(WATCH_POLL_SECONDS)` and another,
+    `max_polls` sleeps or forever when it is `None`. Once it returns a
+    status, reads repeat with no sleep and no poll bound until one finds
+    nothing new; then a trailing partial UTF-8 character still held back is
+    yielded as one replacement-decoded chunk (the file will not grow to
+    complete it) and the `end` line closes the stream. One byte cursor spans
+    every read, so chunks are contiguous. A read that finds nothing past the
+    cursor (no file yet, a file shorter than the cursor) yields nothing.
+    """
+    cursor = offset
+    polls = 0
+    while True:
+        ended = end_status()
+        data = _read_log_bytes(path, cursor)
+        complete = _utf8_complete_length(data)
+        if complete:
+            yield {
+                "offset": cursor,
+                "text": data[:complete].decode("utf-8", errors="replace"),
+            }
+            cursor += complete
+            if ended is not None:
+                continue
+        if ended is not None:
+            if data:
+                yield {"offset": cursor, "text": data.decode("utf-8", errors="replace")}
+            yield {"event": "end", "status": ended}
+            return
+        if max_polls is not None and polls >= max_polls:
+            return
+        sleep(WATCH_POLL_SECONDS)
+        polls += 1
+
+
+def _stream_logs(selection: LogsSelection, *, repo_dir: Path, offset: int) -> None:
+    """The body of `am logs --follow`, once `logs_follow_for` has accepted it.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll. The stream ends by itself
+    with the `end` line once `logs_end_status` finds the attempt over and the
+    file drained: exit 0. Ctrl-C and a closed pipe also end it at exit 0,
+    nothing on stderr. After the hello line no envelope can be printed, so a
+    handled error, a failed status re-lookup included, goes to stderr and the
+    exit is `EXIT_ERROR`, mirroring `_stream_watch`.
+    """
+    path = selection.followed_path()
+    try:
+        _emit_stream_line(_logs_hello(path, offset))
+        for line in _follow_logs(
+            path,
+            offset=offset,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            end_status=lambda: logs_end_status(selection, repo_dir=repo_dir),
+        ):
+            _emit_stream_line(line)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        _silence_stdout()
+        return
+    except HANDLED as error:
+        typer.echo(f"am logs: {error}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
 
 

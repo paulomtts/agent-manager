@@ -13,6 +13,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import asyncio
+import dataclasses
 import io
 import inspect
 import json
@@ -4589,14 +4590,24 @@ def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, mo
 
 
 def _write_logs_attempt(
-    run_id: str, phase: str, n: int, *, stdout: bool = True
+    run_id: str,
+    phase: str,
+    n: int,
+    *,
+    stdout: bool = True,
+    status: str | None = None,
 ) -> models.Attempt:
     """One attempt's three files on disk, plus the row that points at them.
 
     The *test* calls `paths.attempt_dir` -- which creates the directory -- because
     in production `dispatch.AgentRunner` is what creates it. `logs` itself must
     never call it, and `test_logs_writes_nothing` is what pins that.
+
+    `status=None` keeps the long-standing default (`gate_failed` for attempt 1,
+    `ok` after it). A `started` attempt has no exit code yet.
     """
+    if status is None:
+        status = "ok" if n > 1 else "gate_failed"
     directory = paths.attempt_dir(run_id, "card-1", phase, n)
     (directory / "prompt.txt").write_text(f"prompt for {phase}.{n}\n", encoding="utf-8")
     (directory / "result.json").write_text(
@@ -4607,19 +4618,28 @@ def _write_logs_attempt(
     return models.Attempt(
         n=n,
         dispatch=_recorded_dispatch(run_id),
-        status="ok" if n > 1 else "gate_failed",
-        exit_code=0 if n > 1 else 1,
+        status=status,
+        exit_code=None if status == "started" else (0 if status == "ok" else 1),
         prompt_path=directory / "prompt.txt",
         result_path=directory / "result.json",
         stdout_path=directory / "stdout.log",
     )
 
 
-def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
+def _record_for_logs(
+    root: Path,
+    run_id: str,
+    *,
+    stdout: bool = True,
+    implement_status: str | None = None,
+) -> None:
     """A run with two agent phases (two attempts, then one) and a pending phase.
 
     The trailing `verify` phase has no attempts, so the no-flag default has to
-    skip it to reach `implement`.
+    skip it to reach `implement`. `implement_status` sets `implement.1`'s
+    status; `None` keeps the default `gate_failed`, which is terminal, so a
+    `logs --follow` test that needs the stream to keep polling passes
+    `"started"`.
     """
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4661,7 +4681,9 @@ def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
             "story-1",
             "card-1",
             "implement",
-            _write_logs_attempt(run_id, "implement", 1, stdout=stdout),
+            _write_logs_attempt(
+                run_id, "implement", 1, stdout=stdout, status=implement_status
+            ),
         )
         opened.record_phase(
             "story-1",
@@ -5029,6 +5051,1013 @@ def test_logs_for_a_deterministic_phase_writes_nothing(projection):
     assert result.exit_code == 0
     assert _runs_snapshot() == tree_before
     assert _attempt_rows(projection) == rows_before
+
+
+def _implement_stdout() -> Path:
+    """Where `_record_for_logs` puts `implement.1`'s stdout, read-only."""
+    return paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1) / "stdout.log"
+
+
+def test_logs_without_follow_unchanged(projection):
+    """Card 4.1: without `--follow`, `logs` is still exactly one envelope."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert set(envelope) == {"ok", "data"}
+    assert "event" not in envelope
+    assert "offset" not in envelope["data"]
+    assert envelope["data"]["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+
+
+def test_select_logs_names_the_file_a_follow_reads(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    step_dir = _write_step_logs(LOGS_RUN_ID, 1)
+
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert agent.phase.name == "implement"
+    assert agent.attempt is not None
+    assert agent.attempt.n == 1
+    assert agent.followed_path() == _implement_stdout()
+    assert agent.payload() == cli.logs_for(LOGS_RUN_ID, "card-1", repo_dir=projection)
+
+    step = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify")
+    assert step.phase.name == "verify"
+    assert step.attempt is None
+    assert step.step_attempt == 1
+    assert step.followed_path() == step_dir / "stdout.log"
+    assert step.payload() == cli.logs_for(
+        LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify"
+    )
+
+
+def test_logs_selection_without_attempt_or_step_names_nothing(projection):
+    """A selection carrying neither an `Attempt` row nor a step directory
+    names no file to follow and refuses to build a payload."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    empty = cli.LogsSelection(
+        run=agent.run,
+        story=agent.story,
+        subtask=agent.subtask,
+        phase=agent.phase,
+        attempt=None,
+    )
+
+    assert empty.followed_path() is None
+    with pytest.raises(cli.CliError, match="neither an attempt row nor a step"):
+        empty.payload()
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (b"", 0),
+        (b"abc", 3),
+        ("é".encode(), 2),
+        ("é".encode()[:1], 0),
+        (b"caf\xc3", 3),
+        (b"x" + "€".encode()[:2], 1),
+        (b"x" + "€".encode(), 4),
+        (b"ab" + "😀".encode()[:3], 2),
+        (b"ab" + "😀".encode(), 6),
+    ],
+)
+def test_utf8_complete_length_holds_back_only_a_truncated_tail(data, expected):
+    assert cli._utf8_complete_length(data) == expected
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"ok\xff", b"ok\xc0", b"\x80\x80\x80\x80", b"ok\x80"],
+)
+def test_utf8_complete_length_never_holds_back_invalid_bytes(data):
+    """A byte that cannot start a sequence is emitted (as U+FFFD), so an
+    invalid tail can never stall the stream."""
+    assert cli._utf8_complete_length(data) == len(data)
+
+
+def test_read_log_bytes_reads_from_the_offset(tmp_path):
+    log = tmp_path / "stdout.log"
+    log.write_bytes(b"0123456789")
+
+    assert cli._read_log_bytes(log, 0) == b"0123456789"
+    assert cli._read_log_bytes(log, 4) == b"456789"
+    assert cli._read_log_bytes(log, 10) == b""
+    assert cli._read_log_bytes(log, 50) == b""
+
+
+def test_read_log_bytes_is_empty_for_anything_unreadable(tmp_path):
+    assert cli._read_log_bytes(None, 0) == b""
+    assert cli._read_log_bytes(tmp_path / "missing.log", 0) == b""
+    assert cli._read_log_bytes(tmp_path, 0) == b""
+    assert not (tmp_path / "missing.log").exists()
+
+
+def _logs_follow(monkeypatch, *args: str, actions=(), follow: bool = True):
+    """Run `am logs ARGS --follow` for exactly `len(actions)` polls after the backlog.
+
+    Modelled on `_watch_follow`: sleep `i` runs `actions[i]` (an append, a
+    truncate, a Ctrl-C) before poll `i` reads. `follow=False` drops the flag
+    so the refusal of `--since-offset` alone can be driven through the same
+    helper. Returns the result and the seconds each sleep was asked for.
+    """
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        actions[len(sleeps) - 1]()
+
+    monkeypatch.setattr(cli, "_watch_sleep", fake_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", len(actions))
+    argv = ["logs", *args, *(["--follow"] if follow else [])]
+    return runner.invoke(cli.app, argv), sleeps
+
+
+def _logs_args(projection: Path, *extra: str) -> list[str]:
+    return [LOGS_RUN_ID, "card-1", *extra, "--repo-dir", str(projection)]
+
+
+def _logs_hello_line(path: Path, offset: int = 0) -> dict[str, Any]:
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _assert_contiguous(chunks: list[dict[str, Any]], start: int) -> int:
+    """Each chunk starts where the last ended, in bytes; none is empty.
+
+    Only for valid UTF-8 content: a U+FFFD from replacement re-encodes to a
+    different byte length than the bytes it replaced.
+    """
+    cursor = start
+    for chunk in chunks:
+        assert set(chunk) == {"offset", "text"}, chunk
+        assert chunk["offset"] == cursor, chunks
+        assert chunk["text"], chunks
+        cursor += len(chunk["text"].encode("utf-8"))
+    return cursor
+
+
+def test_logs_follow_hello_shape(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    result, sleeps = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == []
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    assert all("ok" not in line for line in lines)
+    assert all("event" not in line for line in lines[1:])
+    assert result.stdout.endswith("\n")
+    assert all(": " not in text for text in result.stdout.splitlines())
+    assert result.stderr == ""
+
+    # `--pretty` only shapes a refusal: the stream is byte-for-byte the same.
+    pretty, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--pretty"))
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_logs_follow_streams_backlog_with_offsets(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    content = "first line\nsecond líne\n€uro\n"
+    _implement_stdout().write_bytes(content.encode("utf-8"))
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    chunks = lines[1:]
+    assert chunks[0]["offset"] == 0
+    assert "".join(chunk["text"] for chunk in chunks) == content
+    assert _assert_contiguous(chunks, 0) == len(content.encode("utf-8"))
+
+
+def test_logs_follow_multibyte_not_split(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"caf\xc3")  # the first byte of "é" only
+
+    def finish_the_character() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"\xa9 ok\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[finish_the_character, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    chunks = _stream(result)[1:]
+    assert chunks == [
+        {"offset": 0, "text": "caf"},
+        {"offset": 3, "text": "é ok\n"},
+    ]
+    assert all("�" not in chunk["text"] for chunk in chunks)
+    assert _assert_contiguous(chunks, 0) == stdout.stat().st_size
+
+
+def test_logs_follow_since_offset_resumes(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    content = _implement_stdout().read_bytes()
+    assert content == b"stdout of implement.1\n"
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--since-offset", "10"))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout(), 10)
+    assert lines[1:] == [{"offset": 10, "text": content[10:].decode("utf-8")}]
+
+
+def test_logs_follow_picks_up_appended_data(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"more\n")
+
+    # Poll 1 sees the append; poll 2 sees nothing new, so it must not repeat.
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    lines = _stream(result)
+    assert lines[1:] == [
+        {"offset": 0, "text": original.decode("utf-8")},
+        {"offset": len(original), "text": "more\n"},
+    ]
+    assert all(line.get("event") != "end" for line in lines)
+
+
+def test_logs_follow_waits_for_missing_file(projection, monkeypatch):
+    _record_for_logs(
+        projection, LOGS_RUN_ID, stdout=False, implement_status="started"
+    )
+    stdout = _implement_stdout()
+
+    def still_absent() -> None:
+        assert not stdout.exists()
+
+    def create_it() -> None:
+        stdout.write_bytes(b"late\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[still_absent, create_it, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": "late\n"},
+    ]
+
+
+def test_logs_follow_deterministic_phase_follows_stdout_log(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    second = _write_step_logs(LOGS_RUN_ID, 2)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--phase", "verify"))
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(second / "stdout.log"),
+        {"offset": 0, "text": "==> uv run pytest (exit 1)\nstdout of verify.2\n"},
+    ]
+
+
+def test_logs_follow_writes_nothing(projection, monkeypatch):
+    """`logs --follow` is read-only like `logs`: a missing stdout file is
+    waited on, never created; the per-read status re-lookup creates nothing,
+    whether it finds the attempt running or over; a refusal mints no run
+    directory."""
+    _record_for_logs(
+        projection, LOGS_RUN_ID, stdout=False, implement_status="started"
+    )
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    polling, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None]
+    )
+    assert polling.exit_code == 0, polling.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert all(line.get("event") != "end" for line in _stream(polling))
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not _implement_stdout().exists()
+
+    # The test, not `logs`, records the terminal status; snapshot after it.
+    _set_implement_status(projection, "harness_error")
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    ended = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+    assert ended.exit_code == 0, ended.output
+    assert _stream(ended)[-1] == _end_line("harness_error")
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not _implement_stdout().exists()
+
+    refusal, _ = _logs_follow(
+        monkeypatch, "no-such-run", "card-1", "--repo-dir", str(projection)
+    )
+    assert refusal.exit_code == cli.EXIT_ERROR
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def test_logs_follow_since_offset_beyond_end_waits(projection, monkeypatch):
+    """Review Focus 2: a cursor past EOF is not an error; bytes appear once
+    the file grows past it, starting exactly at the cursor."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+
+    def grow_short_of_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"a" * (500 - size))
+
+    def grow_past_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"b" * 505)
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", "1000"),
+        actions=[grow_short_of_the_cursor, grow_past_the_cursor],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(stdout, 1000),
+        {"offset": 1000, "text": "bbbbb"},
+    ]
+
+
+def test_logs_follow_truncated_file_emits_nothing_new(projection, monkeypatch):
+    """Review Focus 3: a file cut below the cursor is no crash and no rewind;
+    bytes below the cursor are never re-emitted."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def truncate() -> None:
+        stdout.write_bytes(b"")
+
+    def rewrite_shorter() -> None:
+        stdout.write_bytes(b"new\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[truncate, rewrite_shorter]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": original.decode("utf-8")},
+    ]
+
+
+def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
+    """Review Focus 1: invalid UTF-8 becomes U+FFFD, and the next offset
+    still counts raw bytes, not decoded characters."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"ok\xff\xfe\n")
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"next\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result)[1:] == [
+        {"offset": 0, "text": "ok��\n"},
+        {"offset": 5, "text": "next\n"},
+    ]
+
+
+def _record_review_without_stdout_path(root: Path) -> None:
+    """Add an agent `review` phase whose one attempt recorded no stdout path."""
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_phase(
+            "story-1", "card-1", models.PhaseRun(name="review", kind="agent", status="failed")
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "review",
+            models.Attempt(
+                n=1, dispatch=_recorded_dispatch(LOGS_RUN_ID), status="harness_error"
+            ),
+        )
+    finally:
+        opened.close()
+
+
+@pytest.mark.parametrize(
+    ("argv", "follow", "kind", "message"),
+    [
+        (["no-such-run", "card-1"], True, "UnknownRunError", None),
+        ([LOGS_RUN_ID, "card-9"], True, "UnknownCardError", None),
+        ([LOGS_RUN_ID, "card-1", "--phase", "reveiw"], True, "UnknownPhaseError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "explore", "--attempt", "9"],
+            True,
+            "UnknownAttemptError",
+            None,
+        ),
+        ([LOGS_RUN_ID, "card-1", "--phase", "verify"], True, "UnknownAttemptError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "review"],
+            True,
+            "CliError",
+            "attempt 1 of phase 'review' of card 'card-1' recorded no stdout path,"
+            " so there is no file to follow",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "-1"],
+            True,
+            "CliError",
+            "--since-offset must be 0 or more, got -1",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "0"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "5"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+    ],
+)
+def test_logs_follow_refusals(projection, monkeypatch, argv, follow, kind, message):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_review_without_stdout_path(projection)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *argv,
+        "--repo-dir",
+        str(projection),
+        actions=[lambda: None],
+        follow=follow,
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == []
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert "event" not in envelope
+    assert envelope["error"]["type"] == kind
+    if message is not None:
+        assert envelope["error"]["message"] == message
+
+
+def test_logs_follow_ctrl_c_exits_zero(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    def press_ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[press_ctrl_c])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_closed_pipe_exits_zero_quietly(projection, monkeypatch):
+    """Review Focus 4: `am logs ... --follow | head -1`."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    real_emit = cli._emit_stream_line
+    emitted: list[Any] = []
+
+    def emit_into_a_closed_pipe(obj) -> None:
+        emitted.append(obj)
+        if len(emitted) == 2:  # the reader went away after the hello line
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_into_a_closed_pipe)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [_logs_hello_line(_implement_stdout())]
+
+
+def test_logs_follow_mid_stream_error_goes_to_stderr(projection, monkeypatch):
+    """Review Focus 5: after the hello no envelope can follow, so a handled
+    error is one stderr line and exit 3, as `watch --follow` does."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_fail(path, offset):
+        reads.append(offset)
+        if len(reads) == 2:
+            raise cli.CliError("the log went away")
+        return real_read(path, offset)
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_fail)
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None, lambda: None]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert len(sleeps) == 1  # the stream ended on the failing poll
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+    assert result.stderr == "am logs: the log went away\n"
+
+
+def _verify_phase(status: str) -> tuple[models.SubtaskRun, models.PhaseRun]:
+    subtask = models.SubtaskRun(card_id="card-1", branch="m1/task-x", base_branch="main")
+    return subtask, models.PhaseRun(name="verify", kind="deterministic", status=status)
+
+
+@pytest.mark.parametrize(
+    ("status", "recorded", "n", "expected"),
+    [
+        ("done", [1, 2], 2, "ok"),
+        ("failed", [1, 2], 2, "gate_failed"),
+        ("escalated", [1], 1, "gate_failed"),
+        ("stopped", [1], 1, "gate_failed"),
+        ("cancelled", [1], 1, "gate_failed"),
+        ("started", [1, 2], 1, "gate_failed"),
+        ("done", [1, 2], 1, "gate_failed"),
+        ("pending", [1], 1, None),
+        ("started", [1], 1, None),
+    ],
+    ids=[
+        "latest-done",
+        "latest-failed",
+        "latest-escalated",
+        "latest-stopped",
+        "latest-cancelled",
+        "superseded-while-started",
+        "superseded-while-done",
+        "latest-pending",
+        "latest-started",
+    ],
+)
+def test_step_end_status(status, recorded, n, expected):
+    """Card 4.2's mapping for a deterministic phase: superseded or failed is
+    `gate_failed`, latest and `done` is `ok`, latest and running is `None`."""
+    subtask, phase = _verify_phase(status)
+
+    assert cli.step_end_status(subtask, phase, n, recorded) == expected
+
+
+@pytest.mark.parametrize(("n", "recorded"), [(3, [1, 2]), (1, [])])
+def test_step_end_status_refuses_an_attempt_no_longer_on_disk(n, recorded):
+    """Review Focus 5: the followed `<phase>.N` directory is gone, so the
+    re-lookup refuses instead of reporting an end it cannot know."""
+    subtask, phase = _verify_phase("done")
+
+    with pytest.raises(cli.UnknownAttemptError, match=f"has no attempt {n} any more"):
+        cli.step_end_status(subtask, phase, n, recorded)
+
+
+def _logs_follow_no_wait(monkeypatch, *args: str):
+    """Run `am logs ARGS --follow` with no poll bound and a sleep that fails.
+
+    For an attempt that is already over: the stream must drain and end on
+    its own, so any sleep is a bug, and an unbounded loop would hang rather
+    than pass. `pytest.fail` raises a `BaseException`, which `CliRunner`
+    does not swallow.
+    """
+
+    def no_sleep(seconds: float) -> None:
+        pytest.fail(f"the stream slept {seconds}s on an attempt that is already over")
+
+    monkeypatch.setattr(cli, "_watch_sleep", no_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", None)
+    return runner.invoke(cli.app, ["logs", *args, "--follow"])
+
+
+def _set_implement_status(root: Path, status: str) -> None:
+    """Re-record `implement.1` with `status`, as the runner's terminal write
+    does. Test-side only: it opens a `Store`, which `logs` must never do."""
+    directory = paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1)
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_recorded_dispatch(LOGS_RUN_ID),
+                status=status,
+                exit_code=None if status == "started" else (0 if status == "ok" else 1),
+                prompt_path=directory / "prompt.txt",
+                result_path=directory / "result.json",
+                stdout_path=directory / "stdout.log",
+            ),
+        )
+    finally:
+        opened.close()
+
+
+def _set_verify_status(root: Path, status: str) -> None:
+    """Re-record the deterministic `verify` phase with `status`."""
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="verify", kind="deterministic", status=status),
+        )
+    finally:
+        opened.close()
+
+
+def _end_line(status: str) -> dict[str, Any]:
+    return {"event": "end", "status": status}
+
+
+@pytest.mark.parametrize("status", ["ok", "schema_invalid", "gate_failed", "harness_error"])
+def test_logs_follow_ends_on_terminal_status(projection, monkeypatch, status):
+    """Card 4.2: bytes appended just before the status flips are still
+    streamed, then `end` carries the attempt's status and the exit is 0."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def finish_the_attempt() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"last words\n")
+        _set_implement_status(projection, status)
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[finish_the_attempt]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": original.decode("utf-8")},
+        {"offset": len(original), "text": "last words\n"},
+        _end_line(status),
+    ]
+    assert result.stdout.splitlines()[-1] == f'{{"event":"end","status":"{status}"}}'
+
+
+def test_logs_follow_checks_status_before_the_read_it_applies_to(
+    projection, monkeypatch
+):
+    """The writer appends and flips the status right after a read that found
+    nothing. Because the status was looked up *before* that read, it was
+    still `started`: the stream polls once more, reads the last bytes, and
+    only then ends. Looking the status up after the read would end here and
+    lose them."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_writer_finishes(path, offset):
+        data = real_read(path, offset)
+        reads.append(offset)
+        if len(reads) == 1:
+            assert data == b""
+            with stdout.open("ab") as handle:
+                handle.write(b"last words\n")
+            _set_implement_status(projection, "ok")
+        return data
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_writer_finishes)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", str(size)),
+        actions=[lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(stdout, size),
+        {"offset": size, "text": "last words\n"},
+        _end_line("ok"),
+    ]
+
+
+def test_logs_follow_already_complete_file_ends_without_waiting(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)  # implement.1 is gate_failed
+    content = "first line\nsecond líne\n€uro\n"
+    _implement_stdout().write_bytes(content.encode("utf-8"))
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": content},
+        _end_line("gate_failed"),
+    ]
+    assert result.stdout.splitlines()[-1] == '{"event":"end","status":"gate_failed"}'
+
+    # Review Focus 4: `--pretty` changes no byte of a stream that ends.
+    pretty = _logs_follow_no_wait(monkeypatch, *_logs_args(projection, "--pretty"))
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_logs_follow_started_attempt_never_ends_on_poll_bound(projection, monkeypatch):
+    """The bound stops a test stream; it is not an end. Passes before the
+    change too: it pins that `end` is never emitted for a `started` attempt."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_terminal_missing_file_ends(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)  # gate_failed
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        _end_line("gate_failed"),
+    ]
+    assert not _implement_stdout().exists()
+
+
+def test_logs_follow_terminal_flushes_partial_utf8_tail(projection, monkeypatch):
+    """The held-back half character can never be completed once the attempt
+    is over, so it goes out as U+FFFD at its own byte offset before `end`."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    _implement_stdout().write_bytes(b"caf\xc3")  # the first byte of "é" only
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "caf"},
+        {"offset": 3, "text": "�"},
+        _end_line("gate_failed"),
+    ]
+
+
+@pytest.mark.parametrize("past_end", [0, 978], ids=["at-eof", "past-eof"])
+def test_logs_follow_since_offset_at_eof_on_terminal_attempt(
+    projection, monkeypatch, past_end
+):
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    offset = _implement_stdout().stat().st_size + past_end
+
+    result = _logs_follow_no_wait(
+        monkeypatch, *_logs_args(projection, "--since-offset", str(offset))
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout(), offset),
+        _end_line("gate_failed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("phase_status", "attempts", "extra", "expected"),
+    [
+        ("done", 2, [], "ok"),
+        ("failed", 2, [], "gate_failed"),
+        ("started", 2, ["--attempt", "1"], "gate_failed"),
+        ("pending", 1, [], None),
+        ("started", 1, [], None),
+    ],
+    ids=["latest-done", "latest-failed", "superseded", "latest-pending", "latest-started"],
+)
+def test_logs_follow_deterministic_phase_end_status(
+    projection, monkeypatch, phase_status, attempts, extra, expected
+):
+    """Card 4.2's flagged mapping, end to end through the CLI."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    for n in range(1, attempts + 1):
+        _write_step_logs(LOGS_RUN_ID, n)
+    _set_verify_status(projection, phase_status)
+    followed = 1 if extra else attempts
+    stdout = paths.attempt_path(LOGS_RUN_ID, "card-1", "verify", followed) / "stdout.log"
+    body = {
+        "offset": 0,
+        "text": f"==> uv run pytest (exit 1)\nstdout of verify.{followed}\n",
+    }
+    args = _logs_args(projection, "--phase", "verify", *extra)
+
+    if expected is None:
+        result, sleeps = _logs_follow(monkeypatch, *args, actions=[lambda: None])
+        assert result.exit_code == 0, result.output
+        assert sleeps == [cli.WATCH_POLL_SECONDS]
+        assert _stream(result) == [_logs_hello_line(stdout), body]
+    else:
+        result = _logs_follow_no_wait(monkeypatch, *args)
+        assert result.exit_code == 0, result.output
+        assert _stream(result) == [_logs_hello_line(stdout), body, _end_line(expected)]
+    assert result.stderr == ""
+
+
+def test_logs_follow_relookup_lost_attempt_errors(projection, monkeypatch):
+    """The run vanishes from the projection after the hello: the re-lookup
+    refuses on stderr at exit 3, as any post-hello error does."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    def forget_the_run() -> None:
+        conn = sqlite3.connect(paths.project_db_path(projection))
+        try:
+            conn.execute("DELETE FROM runs WHERE id = ?", (LOGS_RUN_ID,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[forget_the_run]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+    assert result.stderr.startswith(
+        f"am logs: run {LOGS_RUN_ID!r} is not in the projection for "
+    )
+    assert result.stderr.endswith("\n")
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        (
+            lambda s: {"subtask": s.subtask.model_copy(update={"card_id": "card-9"})},
+            cli.UnknownCardError,
+            "card 'card-9' is not in run",
+        ),
+        (
+            lambda s: {"phase": s.phase.model_copy(update={"name": "gone"})},
+            cli.UnknownPhaseError,
+            "card 'card-1' has no phase 'gone' any more",
+        ),
+        (
+            lambda s: {"attempt": s.attempt.model_copy(update={"n": 9})},
+            cli.UnknownAttemptError,
+            "phase 'implement' of card 'card-1' has no attempt 9 any more",
+        ),
+        (
+            lambda s: {"attempt": None, "step_attempt": None},
+            cli.CliError,
+            "neither an attempt row nor a step attempt",
+        ),
+    ],
+    ids=["card", "phase", "attempt", "no-attempt-key"],
+)
+def test_logs_end_status_refuses_what_it_can_no_longer_find(
+    projection, change, error, message
+):
+    """Each lookup step of the re-lookup refuses rather than guessing, so the
+    stream reports it on stderr at exit 3 instead of crashing."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    selection = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert cli.logs_end_status(selection, repo_dir=projection) is None
+
+    stale = dataclasses.replace(selection, **change(selection))
+
+    with pytest.raises(error, match=re.escape(message)):
+        cli.logs_end_status(stale, repo_dir=projection)
+
+
+@pytest.mark.parametrize(
+    ("extra", "n", "status"),
+    [
+        (["--phase", "explore", "--attempt", "1"], 1, "gate_failed"),
+        (["--phase", "explore"], 2, "ok"),
+    ],
+    ids=["older-attempt", "latest-attempt"],
+)
+def test_logs_follow_ends_with_the_followed_attempts_own_status(
+    projection, monkeypatch, extra, n, status
+):
+    """Review Focus 1: the re-lookup is keyed by the followed attempt's
+    number, never by "the latest attempt of the phase"."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = paths.attempt_path(LOGS_RUN_ID, "card-1", "explore", n) / "stdout.log"
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection, *extra))
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": f"stdout of explore.{n}\n"},
+        _end_line(status),
+    ]
+
+
+def test_logs_follow_closed_pipe_on_end_exits_zero_quietly(projection, monkeypatch):
+    """Review Focus 2: the reader goes away exactly as `end` is written."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    real_emit = cli._emit_stream_line
+
+    def emit_until_end(obj) -> None:
+        if obj.get("event") == "end":
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_until_end)
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_ctrl_c_during_drain_exits_zero(projection, monkeypatch):
+    """Review Focus 3: a terminal attempt drains without sleeping, so Ctrl-C
+    lands in a read, not a sleep; it is still exit 0 and silent."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_interrupt(path, offset):
+        reads.append(offset)
+        if len(reads) == 2:
+            raise KeyboardInterrupt
+        return real_read(path, offset)
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_interrupt)
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
 
 
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
