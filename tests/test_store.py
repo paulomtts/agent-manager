@@ -1539,8 +1539,11 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
         st.close()
 
     assert rebuilt == loaded
+    # The first `load_run` is the foreign-value check (divergence §3.6): it
+    # reads the projection under the same lock, before anything is deleted.
     assert seen == [
         ("read", True),
+        ("load_run", True),
         ("_delete_run", True),
         ("_write_attempt_row", True),
         ("_write_attempt_row", True),
@@ -4940,3 +4943,253 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
             projection="pending", kind="foreign",
         ),
     ]
+
+
+# -- rebuild_from_journal's foreign-value rail (journal/DB divergence §3.6) ---
+#
+# Unit tier: real sqlite and journal files under tmp_path, no subprocess.
+
+
+def _all_rows(repo: Path) -> dict[str, list[tuple]]:
+    """Every row of every table, in rowid order, read behind the store's back."""
+    conn = sqlite3.connect(paths.project_db_path(repo))
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def _projected_run_status(repo: Path) -> str | None:
+    conn = store.open_db(repo)
+    try:
+        return store.run_status(conn, RUN_ID)
+    finally:
+        conn.close()
+
+
+def _hand_cancel_an_escalated_run(repo: Path) -> None:
+    """The 2026-10-03 incident: the journal says `escalated`, a hand-edit `cancelled`.
+
+    A full tree and a checkpoint ride along so the no-row-touched snapshot
+    covers tree rows and row-only rows alike.
+    """
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+        _save_checkpoint(st, "ef248597")
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+
+def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
+    _hand_cancel_an_escalated_run(repo)
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+        assert _held_elsewhere(st._lock) is False
+        assert st.connection.in_transaction is False
+    finally:
+        st.close()
+
+    error = caught.value
+    assert isinstance(error, RuntimeError)
+    assert not isinstance(error, store.JournalError)
+    assert error.run_id == RUN_ID
+    assert error.mismatches == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="escalated",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+    message = str(error)
+    assert RUN_ID in message
+    assert "run status: journal 'escalated', projection 'cancelled'" in message
+    assert "force=True" in message
+    assert _projected_run_status(repo) == "cancelled"
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_with_force_overwrites_a_hand_edited_run_status(repo):
+    _hand_cancel_an_escalated_run(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+        loaded = st.load_run(RUN_ID)
+        kept = st.latest_checkpoint("ef248597")
+    finally:
+        st.close()
+
+    assert rebuilt.status == "escalated"
+    assert loaded == rebuilt
+    assert _projected_run_status(repo) == "escalated"
+    assert kept is not None  # row-only: the forced rebuild still leaves it alone
+
+
+def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+    finally:
+        st.close()
+    _raw_sql(
+        repo,
+        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
+        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+    )
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert caught.value.mismatches == [
+        store.Mismatch(
+            node=_node(story="8831189b", card="deadbeef"),
+            field=None,
+            journal=None,
+            projection="done",
+            kind="foreign",
+        )
+    ]
+    assert (
+        "story=8831189b card=deadbeef shape: journal None, projection 'done'"
+        in str(caught.value)
+    )
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(repo):
+    # `stale` (§3.2): the journal recorded `started` for this story, so the
+    # projection is merely behind and the rebuild goes ahead without `force`.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert rebuilt.stories[0].status == "done"
+    assert loaded == rebuilt
+
+
+def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(store.ProjectionDivergedError) as caught:
+            st.rebuild_from_journal(RUN_ID)
+    finally:
+        st.close()
+
+    assert caught.value.mismatches == [
+        store.Mismatch(
+            node=_node(),
+            field="status",
+            journal="started",
+            projection="cancelled",
+            kind="foreign",
+        )
+    ]
+    assert "story=8831189b" not in str(caught.value)
+    assert _all_rows(repo) == before
+
+
+def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_its_lease(
+    repo, stores
+):
+    st = stores()
+    st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    st.record_run(_run(repo))
+    st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
+    _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
+
+    with pytest.raises(store.ProjectionDivergedError):
+        st.rebuild_from_journal(RUN_ID)
+
+    assert st.connection.in_transaction is False
+    assert _held_elsewhere(st._lock) is False
+    kept = store.read_lease(st.connection, RUN_ID)
+    assert kept is not None and kept.token == "t1"
+    assert store.run_status(st.connection, RUN_ID) == "cancelled"
+
+
+def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
+    _hand_cancel_an_escalated_run(repo)
+    with store.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
+        handle.write("{not json at all\n")
+    before = _all_rows(repo)
+
+    # `Store.open` itself scans the journal (`Journal.__init__` -> `last_seq`),
+    # so the corrupt line surfaces there, before `rebuild_from_journal` would
+    # even run the foreign-value check: the journal error still wins.
+    with pytest.raises(store.CorruptJournalError):
+        store.Store.open(repo, RUN_ID)
+
+    assert _all_rows(repo) == before
+
+
+def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
+    # A value the models cannot validate is certainly not one `am` wrote: the
+    # projection read raises before anything is deleted. `force` skips the read.
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'bogus' WHERE id = ?", (RUN_ID,))
+    before = _all_rows(repo)
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        with pytest.raises(ValidationError):
+            st.rebuild_from_journal(RUN_ID)
+        assert _all_rows(repo) == before
+        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+    finally:
+        st.close()
+
+    assert rebuilt.status == "started"
+    assert _projected_run_status(repo) == "started"

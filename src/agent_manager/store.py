@@ -285,6 +285,36 @@ class CorruptJournalError(JournalError):
     """A journal line is not JSON. Names the file and the 1-based line number."""
 
 
+def _describe_node(node: dict[str, str | int | None]) -> str:
+    """`"run"` for the run, else its non-`None` coordinates as `key=value`."""
+    parts = [f"{key}={value}" for key, value in node.items() if value is not None]
+    return " ".join(parts) if parts else "run"
+
+
+class ProjectionDivergedError(RuntimeError):
+    """The projection holds values no journal line recorded (divergence §3.6).
+
+    Raised by `Store.rebuild_from_journal` before it deletes anything, when
+    `diverging` finds a `foreign` mismatch: rebuilding would overwrite what
+    something other than the store wrote. Not a `JournalError`: the journal is
+    fine. `mismatches` holds only the foreign ones, in tree-walk order.
+    """
+
+    def __init__(self, run_id: str, mismatches: "list[Mismatch]") -> None:
+        details = "; ".join(
+            f"{_describe_node(mismatch.node)} {mismatch.field or 'shape'}:"
+            f" journal {mismatch.journal!r}, projection {mismatch.projection!r}"
+            for mismatch in mismatches
+        )
+        super().__init__(
+            f"projection of run {run_id!r} holds values its journal never"
+            f" recorded: {details}. Nothing was changed;"
+            " rebuild_from_journal(..., force=True) overwrites them."
+        )
+        self.run_id = run_id
+        self.mismatches = mismatches
+
+
 class JournalLine(BaseModel):
     """The envelope around one journalled event.
 
@@ -2026,7 +2056,7 @@ class Store:
 
     # -- rebuild -------------------------------------------------------------
 
-    def rebuild_from_journal(self, run_id: str) -> models.Run:
+    def rebuild_from_journal(self, run_id: str, *, force: bool = False) -> models.Run:
         """Replace this run's projection with what its journal says (D5).
 
         The journal wins: every row for `run_id` is deleted and rewritten from
@@ -2043,12 +2073,23 @@ class Store:
             journal = (
                 self._journal if self._journal.run_id == run_id else Journal(run_id)
             )
-            run = replay(journal.read())
+            lines = journal.read()
+            run = replay(lines)
             if run.id != run_id:
                 raise JournalError(
                     f"journal of run {run_id!r} has a run_upsert naming run"
                     f" {run.id!r}: refusing to key its projection under two ids"
                 )
+            if not force:
+                projection = self.load_run(run_id)
+                if projection is not None:
+                    foreign = [
+                        mismatch
+                        for mismatch in diverging(lines, projection)
+                        if mismatch.kind == "foreign"
+                    ]
+                    if foreign:
+                        raise ProjectionDivergedError(run_id, foreign)
             self._delete_run(run_id)
             self._write_run_row(run_id, run)
             for story in run.stories:
