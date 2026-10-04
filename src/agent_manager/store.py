@@ -1961,6 +1961,38 @@ class Store:
             )
             self._conn.commit()
 
+    def adopt_lease(self, token: str) -> LeaseRow:
+        """Bind this store to `token`, which already holds this run's lease (card aff9fdbf).
+
+        For the detached child of `am run --detach`: the parent took the lease
+        and handed it off, so nothing is taken here. If the row is gone or
+        carries another token, `LeaseLostError` names the holder now in place
+        and the store stays unbound. Otherwise every run write is fenced by
+        `token` from here on, and the journal re-reads its highest `seq`, as
+        `take_lease` does, since the parent appended after this store opened.
+        """
+        with self._lock:
+            current = read_lease(self._conn, self.run_id)
+            if current is None or current.token != token:
+                raise LeaseLostError(self.run_id, current)
+            self.bind_lease(token)
+            self._journal.reseek()
+            return current
+
+    def set_lease_holder(self, token: str, *, pid: int, host: str) -> None:
+        """Name `pid` on `host` as this run's lease holder, if `token` still holds it.
+
+        The parent of `am run --detach` points the row at its child before it
+        prints, so `am runs` and `am status` judge the child's liveness. Any
+        other token is a silent no-op, like `beat` and `close_window`.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET pid = ?, host = ? WHERE run_id = ? AND token = ?",
+                (pid, host, self.run_id, token),
+            )
+            self._conn.commit()
+
     def pending_controls(self, token: str) -> list[ControlRow]:
         """This run's unhandled requests addressed to `token`, in `seq` order."""
         with self._lock:
