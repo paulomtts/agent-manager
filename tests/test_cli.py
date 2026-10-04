@@ -9169,3 +9169,49 @@ def test_a_cancel_of_a_dead_run_points_at_am_resume_and_am_reset(
         f" or `am reset {CONTROL_RUN_ID}` closes it"
     )
     assert _controls(projection) == []
+
+
+# ── am resume of a reset run (card 522adfb5) ────────────────────────────────
+#
+# am-reset spec §3.6 / test 9: a run closed by `am reset` is refused by
+# `am resume` exactly as an `am cancel`led one is, before `Store.open`. Unit
+# tier: the projection fixture and the store only, no subprocess.
+
+
+@pytest.mark.parametrize("resets", [1, 2], ids=["reset-once", "reset-twice"])
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
+    projection, monkeypatch, workflow, resets
+):
+    """am-reset spec test 9, both workflows, with the assertion shape of
+    `test_resume_refuses_a_cancelled_run_and_writes_nothing`. Review Focus 4:
+    a second reset (`already_cancelled: true`) changes nothing about the
+    refusal. Review Focus 5: the refusal leaves every checkpoint row as the
+    reset left it."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="stopped", workflow=workflow)
+    _plant_parked_checkpoint(projection)
+    for n in range(resets):
+        reset = _invoke_reset(projection)
+        assert reset.exit_code == 0, reset.output
+        assert json.loads(reset.stdout)["data"]["already_cancelled"] is (n > 0)
+    assert _recorded_status(projection) == "cancelled"
+    before = _resume_guard_state(projection)
+    checkpoints_before = _checkpoint_rows(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR == 3, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResumableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} was cancelled;"
+            " start new work with `am run --milestone`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _recorded_status(projection) == "cancelled"
