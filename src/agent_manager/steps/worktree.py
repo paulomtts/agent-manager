@@ -137,6 +137,16 @@ def _is_registered(candidate: str, registered: list[str]) -> bool:
     return any(os.path.realpath(path) == real for path in registered)
 
 
+def _is_live_worktree(candidate: str, registered: list[str]) -> bool:
+    """Whether `candidate` is registered with git AND still a directory on disk.
+
+    A worktree deleted by hand (`rm -rf`) stays registered until something
+    prunes it; that stale registration must count as not existing, or
+    `ensure` would report a worktree that is not there.
+    """
+    return _is_registered(candidate, registered) and Path(candidate).is_dir()
+
+
 def _commit_count(git_runner: GitRunner, worktree_path: str, resolved_base: str) -> int:
     """Commits on HEAD that are not on `resolved_base`, or 0 if unreadable.
 
@@ -222,6 +232,10 @@ def ensure(
     (design §7); this module never derives a branch name. The return value is
     the deterministic phase's result (design §6) -- a plain dict, since it
     crosses no process boundary and so needs no Pydantic model (`CLAUDE.md`).
+
+    A path git still has registered but whose directory is gone counts as not
+    existing: it is re-added with `worktree add -f`, checking a surviving
+    branch out rather than re-cutting it (card cf03b236).
     """
     branch = _required_name(branch, "branch")
     base = _required_name(base, "base")
@@ -243,7 +257,7 @@ def ensure(
     registered = worktree_paths(
         git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
     )
-    worktree_existed = _is_registered(worktree_path, registered)
+    worktree_existed = _is_live_worktree(worktree_path, registered)
 
     resolved_base = _resolve_base(git_runner, repo_path, base)
 
@@ -259,20 +273,35 @@ def ensure(
             registered = worktree_paths(
                 git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
             )
-            if _is_registered(worktree_path, registered):
+            if _is_live_worktree(worktree_path, registered):
                 worktree_existed = True
             else:
+                # Still registered but not a directory: deleted by hand. `-f`
+                # is git's override for exactly that "missing but already
+                # registered" refusal; it touches bookkeeping, never branch
+                # content. A clean add never gets it, so git still refuses a
+                # branch that is checked out live at another path.
+                force = ["-f"] if _is_registered(worktree_path, registered) else []
                 if branch_existed:
                     # Check the existing branch out. Never re-cut it from
                     # base: a killed run's commits live on that branch and
                     # re-cutting would silently discard them.
-                    argv = ["-C", repo_path, "worktree", "add", worktree_path, branch]
+                    argv = [
+                        "-C",
+                        repo_path,
+                        "worktree",
+                        "add",
+                        *force,
+                        worktree_path,
+                        branch,
+                    ]
                 else:
                     argv = [
                         "-C",
                         repo_path,
                         "worktree",
                         "add",
+                        *force,
                         worktree_path,
                         "-b",
                         branch,

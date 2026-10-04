@@ -7,6 +7,7 @@ except where a test must force an output git itself would never print.
 """
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -970,3 +971,211 @@ def test_a_cleanly_removed_worktree_and_branch_take_the_plain_add(
     ]
     assert not any("-f" in argv or "--force" in argv for argv in calls), calls
     assert wt.is_dir()
+
+
+def _rm_rf_after_a_commit(repo: Path, wt: Path, branch: str) -> str:
+    """Ensure `branch` at `wt`, commit on it, then `rm -rf` the directory.
+
+    git keeps the registration (it shows up `prunable`), which is exactly what
+    a worktree deleted outside am's bookkeeping looks like. Returns the
+    commit's sha.
+    """
+    worktree.ensure(branch=branch, base="main", worktree=str(wt), repo_dir=str(repo))
+    head = _commit(wt, "prior.txt", "work from before the rm -rf\n")
+    shutil.rmtree(wt)
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
+    return head
+
+
+def test_an_rm_rf_worktree_whose_branch_survives_is_re_added_with_its_commits(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+    prior_head = _rm_rf_after_a_commit(repo, wt, "m1/task-9")
+    args = {
+        "branch": "m1/task-9",
+        "base": "main",
+        "worktree": str(wt),
+        "repo_dir": str(repo),
+    }
+
+    calls: list[list[str]] = []
+    result = worktree.ensure(**args, git_runner=_recorder(calls, worktree.run_git))
+
+    assert result == {
+        "branch": "m1/task-9",
+        "worktree": str(wt),
+        "branch_existed": True,
+        "worktree_existed": False,
+        "created": True,
+        "commit_count": 1,
+    }
+    assert wt.is_dir()
+    # Checked out, never re-cut from base: the commit is still there.
+    assert _head(wt) == prior_head
+    assert "add prior.txt" in _git(wt, "log", "--format=%s")
+    assert (wt / "prior.txt").read_text() == "work from before the rm -rf\n"
+    assert _adds(calls) == [
+        ["-C", str(repo), "worktree", "add", "-f", str(wt), "m1/task-9"]
+    ]
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+    _assert_no_forbidden_git(calls)
+
+    # Once recovered, the next call is the ordinary no-op.
+    again_calls: list[list[str]] = []
+    again = worktree.ensure(**args, git_runner=_recorder(again_calls, worktree.run_git))
+    assert again["worktree_existed"] is True
+    assert again["created"] is False
+    assert _adds(again_calls) == []
+
+
+def test_an_rm_rf_worktree_whose_branch_is_also_gone_is_re_cut_from_base(
+    repo: Path, tmp_path: Path
+):
+    wt = tmp_path / "wt"
+    _rm_rf_after_a_commit(repo, wt, "m1/task-9")
+    # git refuses `branch -D` while the stale registration still claims the
+    # branch, which is why the branch is deleted through `update-ref` here.
+    refused = subprocess.run(
+        ["git", "-C", str(repo), "branch", "-D", "m1/task-9"],
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode != 0
+    _git(repo, "update-ref", "-d", "refs/heads/m1/task-9")
+
+    calls: list[list[str]] = []
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+        git_runner=_recorder(calls, worktree.run_git),
+    )
+
+    assert result == {
+        "branch": "m1/task-9",
+        "worktree": str(wt),
+        "branch_existed": False,
+        "worktree_existed": False,
+        "created": True,
+        "commit_count": 0,
+    }
+    assert _adds(calls) == [
+        ["-C", str(repo), "worktree", "add", "-f", str(wt), "-b", "m1/task-9", "main"]
+    ]
+    assert _head(wt) == _head(repo)
+    assert not (wt / "prior.txt").exists()
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "m1/task-9"
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+    _assert_no_forbidden_git(calls)
+
+
+def test_two_threads_recovering_the_same_rm_rf_worktree_both_succeed(
+    repo: Path, tmp_path: Path
+):
+    # Both lanes see the stale registration unlocked; the re-check under the
+    # git lock must make the second one see the first one's live worktree.
+    wt = tmp_path / "wt"
+    prior_head = _rm_rf_after_a_commit(repo, wt, "m4/same")
+    start = threading.Barrier(2)
+    after_reads = threading.Barrier(2)
+    adds: list[list[str]] = []
+    adds_lock = threading.Lock()
+
+    def runner(argv: list[str]) -> str:
+        if _is_add(argv):
+            with adds_lock:
+                adds.append(list(argv))
+        if "--verify" in argv:
+            try:
+                return worktree.run_git(argv)
+            finally:
+                after_reads.wait(timeout=30)
+        return worktree.run_git(argv)
+
+    def lane(_: int) -> dict[str, object]:
+        start.wait(timeout=30)
+        return worktree.ensure(
+            branch="m4/same",
+            base="main",
+            worktree=str(wt),
+            repo_dir=str(repo),
+            git_runner=runner,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(lane, index) for index in range(2)]
+        errors = [future.exception(timeout=120) for future in futures]
+
+    assert errors == [None, None]
+    results = [future.result() for future in futures]
+    assert sorted(result["created"] for result in results) == [False, True]
+    loser = next(result for result in results if result["created"] is False)
+    assert loser["worktree_existed"] is True
+    assert adds == [["-C", str(repo), "worktree", "add", "-f", str(wt), "m4/same"]]
+    assert _head(wt) == prior_head
+    registered = worktree.worktree_paths(
+        _git(repo, "worktree", "list", "--porcelain")
+    )
+    real_wt = os.path.realpath(wt)
+    assert sum(os.path.realpath(p) == real_wt for p in registered) == 1
+
+
+def test_a_stale_path_now_occupied_by_a_file_surfaces_gits_error_and_frees_the_lock(
+    repo: Path, tmp_path: Path
+):
+    # `-f` overrides git's bookkeeping, never something on disk: a file now
+    # sitting at the stale path must be refused by git and left untouched.
+    wt = tmp_path / "wt"
+    _rm_rf_after_a_commit(repo, wt, "m4/occupied")
+    wt.write_text("someone else's file\n")
+
+    with pytest.raises(GitError) as excinfo:
+        worktree.ensure(
+            branch="m4/occupied",
+            base="main",
+            worktree=str(wt),
+            repo_dir=str(repo),
+        )
+
+    assert "add" in excinfo.value.argv
+    assert "-f" in excinfo.value.argv
+    assert wt.read_text() == "someone else's file\n"
+    assert _repo_lock_is_free(repo)
+    assert _probe(repo, "git") == "free"
+
+
+def test_recovering_a_stale_worktree_leaves_every_other_worktree_registered(
+    repo: Path, tmp_path: Path
+):
+    # `-f` replaces only this path's dead registration. A live sibling and an
+    # unrelated stale worktree must both survive: no prune-style sweep.
+    sibling = tmp_path / "sibling-wt"
+    _git(repo, "worktree", "add", str(sibling), "-b", "m1/task-8")
+    other_stale = tmp_path / "other-stale-wt"
+    _git(repo, "worktree", "add", str(other_stale), "-b", "m1/task-7")
+    shutil.rmtree(other_stale)
+    wt = tmp_path / "wt"
+    _rm_rf_after_a_commit(repo, wt, "m1/task-9")
+
+    calls: list[list[str]] = []
+    result = worktree.ensure(
+        branch="m1/task-9",
+        base="main",
+        worktree=str(wt),
+        repo_dir=str(repo),
+        git_runner=_recorder(calls, worktree.run_git),
+    )
+
+    assert result["created"] is True
+    registered = [
+        os.path.realpath(p)
+        for p in worktree.worktree_paths(_git(repo, "worktree", "list", "--porcelain"))
+    ]
+    assert os.path.realpath(sibling) in registered
+    assert os.path.realpath(other_stale) in registered
+    assert os.path.realpath(wt) in registered
+    assert sibling.is_dir()
+    assert not other_stale.exists()
+    _assert_no_forbidden_git(calls)
