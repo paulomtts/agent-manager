@@ -6981,6 +6981,7 @@ def test_milestone_bases_refuses_a_milestone_with_two_open_blockers():
     assert blocked.id in message
     assert one.id in message and two.id in message
     assert "chain" in message
+    assert "merged" not in message, "the mark-merged hint is only for unlanded blockers"
 
 
 def test_milestone_bases_refuses_an_open_blocker_plus_a_done_blocker_with_its_branch():
@@ -6998,6 +6999,8 @@ def test_milestone_bases_refuses_an_open_blocker_plus_a_done_blocker_with_its_br
     assert one.id in message and two.id in message
     assert "chain" in message
     assert "merged" in message
+    assert message.count(two.id) == 2, "the done blocker is named again in the hint"
+    assert message.count(one.id) == 1, "the open blocker cannot be marked merged"
 
 
 def test_milestone_bases_stacks_on_the_one_open_blocker_when_the_others_are_satisfied():
