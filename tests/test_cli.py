@@ -5075,6 +5075,24 @@ def test_select_logs_names_the_file_a_follow_reads(projection):
     )
 
 
+def test_logs_selection_without_attempt_or_step_names_nothing(projection):
+    """A selection carrying neither an `Attempt` row nor a step directory
+    names no file to follow and refuses to build a payload."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    empty = cli.LogsSelection(
+        run=agent.run,
+        story=agent.story,
+        subtask=agent.subtask,
+        phase=agent.phase,
+        attempt=None,
+    )
+
+    assert empty.followed_path() is None
+    with pytest.raises(cli.CliError, match="neither an attempt row nor a step"):
+        empty.payload()
+
+
 @pytest.mark.parametrize(
     ("data", "expected"),
     [
