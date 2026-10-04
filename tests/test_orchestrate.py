@@ -8265,6 +8265,11 @@ def test_a_resumed_milestone_keeps_its_recorded_stacked_base(tmp_path, monkeypat
     _record_resume_run(root, base_branch="pstack-integrate")
     monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
 
+    def no_bases(*args, **kwargs):
+        raise AssertionError("resume must not re-derive the base")
+
+    monkeypatch.setattr(orchestrate, "milestone_bases", no_bases)
+
     pre = orchestrate.preflight_milestone(
         None, repo_dir=root, base_branch="main", resume_run_id=RESUME_RUN_ID
     )
