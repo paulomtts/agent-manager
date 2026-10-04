@@ -43,8 +43,7 @@ import pytest
 
 from lockhelpers import _holder, _probe, _reap
 
-from agent_manager import bases, board, census, cli, control, dag, integration, locks, models, orchestrate, paths, runs
-from agent_manager import comments
+from agent_manager import bases, board, census, cli, comments, control, dag, integration, locks, models, orchestrate, paths, runs
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary

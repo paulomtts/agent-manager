@@ -9070,6 +9070,7 @@ def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeyp
         _watch_line("run-d", 1),
     ]
 
+
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
 #
 # Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
