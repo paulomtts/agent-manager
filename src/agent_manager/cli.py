@@ -138,7 +138,8 @@ class DeadRunError(CliError):
     """The run is recorded `started`, but no live process holds its lease (C2, C8).
 
     Nobody is left to honour a request, so none is recorded. The message
-    names the lease's pid, host and heartbeat age, or says there is no lease.
+    names the lease's pid, host and heartbeat age, or says there is no lease,
+    and points at `am resume` and `am reset`.
     """
 
 
@@ -148,6 +149,14 @@ class NotAcceptingError(CliError):
 
 class RunIsLiveError(CliError):
     """`am resume` was asked for a run another live process still holds (C10)."""
+
+
+class NotResettableError(CliError):
+    """`am reset` was asked to close a run that finished `done` (am-reset §3.4).
+
+    Only the CLI raises it, so it lives beside `RunIsLiveError` and
+    `DeadRunError` rather than in `runs` with `NotResumableError`.
+    """
 
 
 class ClaimedError(CliError):
@@ -1146,6 +1155,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     ValueError,
     locks.LockTimeoutError,
     store_module.LeaseLostError,
+    store_module.CorruptJournalError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1156,8 +1166,12 @@ while another `am` process held a project lock past its timeout (spec X7) is a
 refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostError`
 is in it because another process took this run's lease over mid-walk (spec X4):
 the fence stopped every write, and the operator gets the envelope naming the new
-holder. It is a `BaseException`, so it has to be listed by name. Anything outside
-this tuple is a bug in this program and should crash loudly with its stack intact.
+holder. It is a `BaseException`, so it has to be listed by name.
+`store_module.CorruptJournalError` is in it because a crashed run can leave a
+torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
+is a refusal naming the file and line, not a bug; only that subclass, not
+`JournalError` as a whole. Anything outside this tuple is a bug in this program
+and should crash loudly with its stack intact.
 """
 
 
@@ -2149,13 +2163,14 @@ def _controllable_lease(
     if lease is None:
         raise DeadRunError(
             f"run {run_id} is recorded started but no process holds its lease;"
-            f" it is not running, so `am resume {run_id}` picks it up"
+            f" it is not running, so `am resume {run_id}` picks it up,"
+            f" or `am reset {run_id}` closes it"
         )
     if not control.lease_is_live(lease, now=now):
         raise DeadRunError(
             f"run {run_id} is not running: its lease is held by pid {lease.pid}"
             f" on {lease.host}, last heartbeat {_heartbeat_age(lease, now)}s ago;"
-            f" `am resume {run_id}` picks it up"
+            f" `am resume {run_id}` picks it up, or `am reset {run_id}` closes it"
         )
     if not lease.accepting:
         raise NotAcceptingError(
@@ -2298,3 +2313,148 @@ def cancel(
 ) -> None:
     """Ask a running run to stop at its next phase boundary and close it for good."""
     _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
+
+
+def _reset_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+    """`am reset`'s read-only refusal of a run a live process holds (am-reset §3.4).
+
+    `_run_is_live_error`'s pid, host and heartbeat age, but pointing at
+    `am cancel`: the run is being driven, and a reset is for one that is not.
+    """
+    return RunIsLiveError(
+        f"run {lease.run_id} is still running in pid {lease.pid} on {lease.host}"
+        f" (heartbeat {_heartbeat_age(lease, now)}s ago); `am cancel {lease.run_id}`"
+        " stops it, and `am reset` is for a run nobody is driving"
+    )
+
+
+def _not_resettable_error(run_id: str) -> NotResettableError:
+    """`am reset`'s refusal of a finished run, worded once for both places it is checked."""
+    return NotResettableError(
+        f"run {run_id} finished (done), so there is nothing to close;"
+        " start new work with `am run`"
+    )
+
+
+def _reset_message(run_id: str, *, already: bool) -> str:
+    """What `am reset` tells the operator about `run_id` (am-reset §3.5)."""
+    if already:
+        return f"run {run_id} was already cancelled; nothing was written"
+    return (
+        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        " and a relaunch starts its cards from their first phase"
+    )
+
+
+def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
+    """Close a run nobody is driving by recording it `cancelled` (am-reset §3.2-3.3).
+
+    The run is loaded read-only, exactly as `resume_run` loads it. Refused, in
+    order and before `Store.open`: an unknown run (`UnknownRunError`), a run a
+    live process holds (`RunIsLiveError`, pointing at `am cancel`), and a
+    finished one (`NotResettableError`). Then, as `_resume_from_checkpoint`
+    does up to its first write and no further: `Store.open`, the run's own
+    lease with no claims (a reset drives no card and no branch), and one
+    fenced `record_run` of `cancelled`. No checkpoint row is written or
+    deleted, and no other row is touched. `cards` then reports each
+    `(card_id, workflow)` the run checkpointed and, by
+    `Store.latest_open_checkpoint`, which other run (if any) a relaunch
+    would still continue it from (`open_in`). The lease is released and the
+    store closed on every exit.
+
+    A run already `cancelled` is not refused: the lease is taken and released
+    around the check, and nothing is journalled (`already_cancelled: true`).
+    A displaced dead holder is reported under `took_over`.
+    """
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+        if run is None:
+            raise UnknownRunError(
+                f"run {run_id!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+        # Unknown, live, done: read-only and before `Store.open`, which would
+        # mint a run directory, so a refusal leaves nothing behind (§3.4).
+        lease = store_module.read_lease(conn, run.id)
+        now = _utcnow()
+        if lease is not None and control.lease_is_live(lease, now=now):
+            raise _reset_live_error(lease, now)
+        if run.status == "done":
+            raise _not_resettable_error(run.id)
+    finally:
+        conn.close()
+
+    store = Store.open(root, run.id)
+    try:
+        # `take_lease` re-checks liveness atomically: a live holder that
+        # appeared since the check above refuses here as `RunIsLiveError`,
+        # and a dead one is taken over. The status is read again under the
+        # lease, so two resets serialise (the second sees `cancelled` and
+        # writes nothing) and a run that finished meanwhile is never
+        # overwritten. No claims: a reset drives no card and no branch.
+        with run_lease(store) as lease:
+            current = store.load_run(run.id) or run
+            if current.status == "done":
+                raise _not_resettable_error(run.id)
+            already = current.status == "cancelled"
+            if not already:
+                store.record_run(current.model_copy(update={"status": "cancelled"}))
+        # After the status write (or the no-op): each `(card_id, workflow)` the
+        # run checkpointed, with the run a relaunch would continue it from by
+        # the newest-row rule -- `null` unless that is another run (§3.5).
+        cards: list[dict[str, Any]] = []
+        for card_id, workflow in store.checkpoint_cards(run.id):
+            found = store.latest_open_checkpoint(card_id, workflow)
+            cards.append(
+                {
+                    "card_id": card_id,
+                    "workflow": workflow,
+                    "open_in": (
+                        found.run_id
+                        if found is not None and found.run_id != run.id
+                        else None
+                    ),
+                }
+            )
+    finally:
+        store.close()
+    payload: dict[str, Any] = {
+        "run_id": run.id,
+        "previous_status": current.status,
+        "status": "cancelled",
+        "already_cancelled": already,
+        "cards": cards,
+        "message": _reset_message(run.id, already=already),
+    }
+    if lease.displaced is not None:
+        # A dead holder's lease was taken over (X5): say whose, as resume does.
+        payload["took_over"] = {
+            "pid": lease.displaced.pid,
+            "host": lease.displaced.host,
+            "heartbeat_at": lease.displaced.heartbeat_at.isoformat(),
+        }
+    return payload
+
+
+@app.command("reset")
+def reset(
+    run_id: str = typer.Argument(
+        ..., metavar="RUN_ID", help="The run nobody is driving to close."
+    ),
+    repo_dir: Path = typer.Option(
+        Path("."), "--repo-dir", help="The repository whose projection is written."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Close a run nobody is driving: record it cancelled under its own lease.
+
+    A running run wants `am cancel` instead; a finished one needs nothing.
+    """
+    try:
+        payload = reset_run(run_id, repo_dir=repo_dir)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))

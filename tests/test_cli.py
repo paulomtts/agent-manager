@@ -46,6 +46,7 @@ from agent_manager import (
     orchestrate,
     paths,
     prompt,
+    runs,
     store as store_module,
 )
 from agent_manager.errors import AgentPhaseFailed
@@ -8574,3 +8575,643 @@ def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkey
     monkeypatch.setattr(sys, "stdout", buffer)
     cli._silence_stdout()
     assert sys.stdout is buffer
+
+
+# ── am reset (card 736d6728) ─────────────────────────────────────────────────
+#
+# `am reset RUN_ID` closes a run nobody is driving: read-only refusals, then
+# the run's own lease with no claims, one fenced `run_upsert` of `cancelled`,
+# and the lease released. Unit tier: the projection fixture and the store
+# only, no subprocess. `cards` (card af52db54) lists each `(card_id,
+# workflow)` the run checkpointed with the run a relaunch would continue it
+# from (`open_in`), or `null`.
+
+RESET_KEYS = {
+    "run_id",
+    "previous_status",
+    "status",
+    "already_cancelled",
+    "cards",
+    "message",
+}
+
+RESET_MESSAGE = (
+    f"run {CONTROL_RUN_ID} is cancelled; `am resume {CONTROL_RUN_ID}` refuses it,"
+    " and a relaunch starts its cards from their first phase"
+)
+
+
+def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
+    return runner.invoke(cli.app, ["reset", run_id, "--repo-dir", str(root), *extra])
+
+
+def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_module.JournalLine]:
+    return store_module.Journal(run_id).read()
+
+
+def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return store_module.run_status(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _plant_parked_checkpoint(
+    root: Path,
+    *,
+    run_id: str = CONTROL_RUN_ID,
+    card_id: str = "card-1",
+    workflow: str = task_workflow.TASK.name,
+    reason: str = "parked",
+    saved_at: datetime = CONTROL_NOW,
+) -> None:
+    """One checkpoint row, by default the open `parked` row of card-1 a paused
+    walk leaves under the run. The keywords plant the other rows the `cards`
+    tests need: another run's, another workflow's, an older or newer one."""
+    opened = store_module.Store.open(cli.resolve_repo_dir(root), run_id)
+    try:
+        opened.save_checkpoint(
+            card_id,
+            workflow=workflow,
+            digest=task_workflow.TASK.digest(),
+            reason=reason,
+            agent={
+                "current_turn": None,
+                "queue": [{"kwargs": {"phase": "plan", "loop": 0}}],
+            },
+            saved_at=saved_at,
+        )
+    finally:
+        opened.close()
+
+
+def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
+    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+    try:
+        return opened.latest_open_checkpoint("card-1", task_workflow.TASK.name)
+    finally:
+        opened.close()
+
+
+@pytest.mark.parametrize(
+    "worktree_present", [True, False], ids=["worktree-present", "worktree-removed"]
+)
+def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
+    projection, worktree_present
+):
+    """Spec test 1, `cards` half from af52db54: the run's own row was the
+    newest, so the card is closed and `open_in` is null."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection)
+    worktree = projection / ".claude" / "worktrees" / "m1" / "task-x"
+    if worktree_present:
+        worktree.mkdir(parents=True)
+    assert _open_checkpoint(projection) is not None
+    lines_before = _journal_lines()
+    checkpoints_before = _checkpoint_rows(projection)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    assert "\n" not in result.stdout.strip()
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == RESET_KEYS
+    assert data == {
+        "run_id": CONTROL_RUN_ID,
+        "previous_status": "stopped",
+        "status": "cancelled",
+        "already_cancelled": False,
+        "cards": [{"card_id": "card-1", "workflow": "task", "open_in": None}],
+        "message": RESET_MESSAGE,
+    }
+    assert _recorded_status(projection) == "cancelled"
+    lines_after = _journal_lines()
+    assert lines_after[: len(lines_before)] == lines_before
+    (added,) = lines_after[len(lines_before) :]
+    assert added.event == "run_upsert"
+    assert added.seq == lines_before[-1].seq + 1
+    first = next(line for line in lines_before if line.event == "run_upsert")
+    # The same write whether or not the worktree exists: only `status` moved.
+    assert added.payload == {**first.payload, "status": "cancelled"}
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _open_checkpoint(projection) is None
+    assert worktree.exists() is worktree_present
+    assert _lease(projection) is None
+    rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "cancelled"
+    finally:
+        rebuilt.close()
+
+
+def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
+    """Spec test 7: no "nothing to reset" refusal."""
+    _plant_run(projection, status="stopped")
+    assert _checkpoint_rows(projection) == []
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["cards"] == []
+    assert data["status"] == "cancelled"
+    assert _recorded_status(projection) == "cancelled"
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+@pytest.mark.parametrize("status", ["stopped", "escalated", "started"])
+def test_reset_closes_every_resettable_status_of_either_workflow(
+    projection, status, workflow
+):
+    """Review Focus 2: every status but `done`/`cancelled` resets, a
+    `started` run with no lease included, whatever the workflow."""
+    _plant_run(projection, status=status, workflow=workflow)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["previous_status"] == status
+    assert data["already_cancelled"] is False
+    assert _recorded_status(projection) == "cancelled"
+    assert _lease(projection) is None
+
+
+def test_reset_pretty_prints_an_indented_envelope(projection):
+    """Review Focus 1."""
+    _plant_run(projection, status="stopped")
+
+    result = _invoke_reset(projection, CONTROL_RUN_ID, "--pretty")
+
+    assert result.exit_code == 0, result.output
+    assert "\n" in result.stdout.strip()
+    assert json.loads(result.stdout)["data"]["status"] == "cancelled"
+
+
+def _forbid_reset_writes(monkeypatch) -> None:
+    """A refusal must come before `Store.open`, so reaching it fails the test."""
+    monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
+
+
+def test_reset_refuses_an_unknown_run_and_creates_no_run_directory(
+    projection, monkeypatch
+):
+    """Spec test 6."""
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection, "no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "UnknownRunError",
+        "message": (
+            f"run 'no-such-run' is not in the projection for"
+            f" {cli.resolve_repo_dir(projection)}"
+            " (`agent-manager runs` lists the ones that are)"
+        ),
+    }
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+@pytest.mark.parametrize(
+    "lease, pid, host",
+    [
+        ({}, None, None),
+        ({"pid": 0, "host": "am-test-other-host.invalid"}, 0, "am-test-other-host.invalid"),
+    ],
+    ids=["this-host", "another-host"],
+)
+def test_reset_refuses_a_run_whose_lease_is_live_and_points_at_am_cancel(
+    projection, monkeypatch, lease, pid, host
+):
+    """Spec test 2, plus Review Focus 3: a fresh heartbeat from another host
+    is live whatever its pid."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started")
+    _plant_lease(projection, heartbeat_at=_at(-5), **lease)
+    before = (_resume_guard_state(projection), _recorded_status(projection))
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error == {
+        "type": "RunIsLiveError",
+        "message": (
+            f"run {CONTROL_RUN_ID} is still running in pid"
+            f" {os.getpid() if pid is None else pid} on {HERE if host is None else host}"
+            f" (heartbeat 5s ago); `am cancel {CONTROL_RUN_ID}` stops it,"
+            " and `am reset` is for a run nobody is driving"
+        ),
+    }
+    assert "am resume" not in error["message"]
+    assert (_resume_guard_state(projection), _recorded_status(projection)) == before
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_reset_refuses_a_finished_run_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """Spec test 5."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="done", workflow=workflow)
+    before = (_resume_guard_state(projection), _recorded_status(projection))
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResettableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} finished (done), so there is nothing to close;"
+            " start new work with `am run`"
+        ),
+    }
+    assert (_resume_guard_state(projection), _recorded_status(projection)) == before
+
+
+def test_not_resettable_error_is_a_handled_cli_error():
+    assert isinstance(cli.NotResettableError("finished"), cli.CliError)
+    assert isinstance(cli.NotResettableError("finished"), cli.HANDLED)
+
+
+@pytest.mark.parametrize(
+    "stale, pid",
+    [(True, None), (False, 0)],
+    ids=["stale-heartbeat", "dead-pid-on-this-host"],
+)
+def test_reset_takes_over_a_dead_lease_and_names_its_holder(
+    projection, monkeypatch, stale, pid
+):
+    """Spec test 3, the crash case. `control.Lease` judges liveness on the
+    real clock, so the planted heartbeat is relative to the real now."""
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_run(projection, status="started")
+    heartbeat = now - timedelta(seconds=31) if stale else now
+    _plant_lease(projection, token="crashed", pid=pid, heartbeat_at=heartbeat)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == RESET_KEYS | {"took_over"}
+    assert data["took_over"] == {
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE,
+        "heartbeat_at": heartbeat.isoformat(),
+    }
+    assert data["previous_status"] == "started"
+    assert data["already_cancelled"] is False
+    assert _recorded_status(projection) == "cancelled"
+    assert len(_journal_lines()) == len(lines_before) + 1
+    assert _lease(projection) is None
+
+
+def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
+    """Spec test 4."""
+    _plant_run(projection, status="cancelled")
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data == {
+        "run_id": CONTROL_RUN_ID,
+        "previous_status": "cancelled",
+        "status": "cancelled",
+        "already_cancelled": True,
+        "cards": [],
+        "message": f"run {CONTROL_RUN_ID} was already cancelled; nothing was written",
+    }
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "cancelled"
+    assert _lease(projection) is None
+
+
+def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
+    """Spec test 8, second case: the second reset sees `cancelled` under the
+    lease and is a no-op."""
+    _plant_run(projection, status="stopped")
+    upserts_before = [line for line in _journal_lines() if line.event == "run_upsert"]
+
+    first = _invoke_reset(projection)
+    second = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert json.loads(first.stdout)["data"]["already_cancelled"] is False
+    second_data = json.loads(second.stdout)["data"]
+    assert second_data["already_cancelled"] is True
+    assert second_data["previous_status"] == "cancelled"
+    upserts_after = [line for line in _journal_lines() if line.event == "run_upsert"]
+    assert len(upserts_after) == len(upserts_before) + 1
+    assert _lease(projection) is None
+
+
+def _plant_other_run(root: Path, status: str = "stopped") -> None:
+    """Run Y (`OTHER_RUN_ID`): a second run in the projection, as a crashed
+    earlier life of the same card leaves it."""
+    _record(root, OTHER_RUN_ID, started_at=RECORDED_AT, status=status, with_phases=False)
+
+
+def test_a_repeated_reset_reports_the_same_cards_and_writes_nothing(projection):
+    """af52db54 spec test 5: an already-cancelled reset still reports `cards`."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection)
+
+    first = _invoke_reset(projection)
+    lines_after_first = _journal_lines()
+    checkpoints_after_first = _checkpoint_rows(projection)
+    second = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    first_data = json.loads(first.stdout)["data"]
+    second_data = json.loads(second.stdout)["data"]
+    assert first_data["already_cancelled"] is False
+    assert second_data["already_cancelled"] is True
+    assert second_data["cards"] == first_data["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": None}
+    ]
+    assert _journal_lines() == lines_after_first
+    assert _checkpoint_rows(projection) == checkpoints_after_first
+    assert _lease(projection) is None
+
+
+def test_reset_lists_every_pair_it_checkpointed_in_order_a_done_card_included(
+    projection,
+):
+    """Review Focus 1: every `(card_id, workflow)` with a row under the run,
+    any reason, ordered by card then workflow."""
+    _plant_run(projection, status="stopped")
+    _plant_parked_checkpoint(projection, card_id="card-2", reason="done", saved_at=_at(0))
+    _plant_parked_checkpoint(projection, card_id="card-1", saved_at=_at(1))
+    _plant_parked_checkpoint(
+        projection, card_id="card-1", workflow="integrate", reason="turn", saved_at=_at(2)
+    )
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["cards"] == [
+        {"card_id": "card-1", "workflow": "integrate", "open_in": None},
+        {"card_id": "card-1", "workflow": "task", "open_in": None},
+        {"card_id": "card-2", "workflow": "task", "open_in": None},
+    ]
+
+
+def test_reset_reports_open_in_null_when_its_own_row_is_the_newest(projection):
+    """af52db54 spec test 10, chain case: Y's open row is older than X's, so
+    once X is cancelled the newest-row rule closes the card, and a relaunch
+    continues nothing even though Y's row is still open. Two stores on one
+    database: a reader bound to Y stays open across X's reset."""
+    _plant_run(projection, status="stopped")
+    _plant_other_run(projection)
+    _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
+    _plant_parked_checkpoint(projection, saved_at=_at(1))
+    reader = store_module.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
+    try:
+        before = runs.continuable_checkpoint(reader, "card-1")
+        assert before is not None and before.run_id == CONTROL_RUN_ID
+        checkpoints_before = _checkpoint_rows(projection)
+
+        result = _invoke_reset(projection)
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["data"]["cards"] == [
+            {"card_id": "card-1", "workflow": "task", "open_in": None}
+        ]
+        assert runs.continuable_checkpoint(reader, "card-1") is None
+        assert reader.latest_open_checkpoint("card-1", task_workflow.TASK.name) is None
+    finally:
+        reader.close()
+    # Y's row is still there and Y is untouched: only the newest row decided.
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert any(row[0] == OTHER_RUN_ID for row in checkpoints_before)
+    assert _recorded_status(projection, OTHER_RUN_ID) == "stopped"
+
+
+def test_reset_names_the_run_a_newer_bases_row_keeps_the_card_open_in(projection):
+    """af52db54 spec test 10, variant: Y's newest row for the card is under
+    `bases`, so resetting X leaves Y's older `task` row continuable
+    (`open_in: Y`). Once Y is reset too, every report is null."""
+    _plant_run(projection, status="stopped")
+    _plant_other_run(projection)
+    _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
+    _plant_parked_checkpoint(projection, reason="turn", saved_at=_at(1))
+    _plant_parked_checkpoint(
+        projection, run_id=OTHER_RUN_ID, workflow="bases", saved_at=_at(2)
+    )
+    checkpoints_before = _checkpoint_rows(projection)
+
+    first = _invoke_reset(projection)
+
+    assert first.exit_code == 0, first.output
+    # Exactly X's own pair: Y's `bases` pair is not X's to report.
+    assert json.loads(first.stdout)["data"]["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": OTHER_RUN_ID}
+    ]
+
+    other = _invoke_reset(projection, OTHER_RUN_ID)
+
+    assert other.exit_code == 0, other.output
+    other_data = json.loads(other.stdout)["data"]
+    assert other_data["previous_status"] == "stopped"
+    assert other_data["cards"] == [
+        {"card_id": "card-1", "workflow": "bases", "open_in": None},
+        {"card_id": "card-1", "workflow": "task", "open_in": None},
+    ]
+
+    again = _invoke_reset(projection)
+
+    assert again.exit_code == 0, again.output
+    again_data = json.loads(again.stdout)["data"]
+    assert again_data["already_cancelled"] is True
+    assert again_data["cards"] == [
+        {"card_id": "card-1", "workflow": "task", "open_in": None}
+    ]
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _recorded_status(projection, OTHER_RUN_ID) == "cancelled"
+
+
+def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
+    projection, monkeypatch
+):
+    """Spec test 8, first case: two stores on one database. The holder's
+    lease is live; `lease_is_live` is blinded for the read-only check only,
+    so `take_lease`'s atomic re-check is what refuses."""
+    now = datetime.now(timezone.utc)
+    _freeze_clock(monkeypatch, now)
+    _plant_run(projection, status="started")
+    holder = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    try:
+        holder.take_lease(
+            token="holder", pid=os.getpid(), host=HERE, now=now, is_live=lambda row: True
+        )
+    finally:
+        holder.close()
+    real = control.lease_is_live
+    seen: list[str] = []
+
+    def blind_first(lease, **kwargs):
+        seen.append(lease.token)
+        if len(seen) == 1:
+            return False
+        return real(lease, **kwargs)
+
+    monkeypatch.setattr(control, "lease_is_live", blind_first)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "RunIsLiveError"
+    assert seen[:2] == ["holder", "holder"]
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "started"
+    lease = _lease(projection)
+    assert lease is not None and lease.token == "holder"
+
+
+def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
+    projection, monkeypatch
+):
+    """Review Focus 4: the run finished between the read-only check and
+    `take_lease`. The read-only load is made to see `stopped`; the load
+    under the lease sees the real `done` and refuses before writing."""
+    _plant_run(projection, status="done")
+    real = store_module.load_run
+    calls: list[str] = []
+
+    def stale_first(conn, run_id):
+        loaded = real(conn, run_id)
+        calls.append(run_id)
+        if len(calls) == 1 and loaded is not None:
+            return loaded.model_copy(update={"status": "stopped"})
+        return loaded
+
+    monkeypatch.setattr(store_module, "load_run", stale_first)
+    lines_before = _journal_lines()
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "NotResettableError"
+    assert len(calls) == 2
+    assert _journal_lines() == lines_before
+    assert _recorded_status(projection) == "done"
+    assert _lease(projection) is None
+
+
+def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection):
+    """Spec test 9: `Store.open` reads the journal's highest `seq`, and a
+    non-JSON line in its middle is `CorruptJournalError` -- a refusal at
+    exit 3, not a traceback."""
+    _plant_run(projection, status="stopped")
+    path = store_module.Journal(CONTROL_RUN_ID).path
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CorruptJournalError"
+    assert f"{path}:2:" in envelope["error"]["message"]
+    assert _recorded_status(projection) == "stopped"
+    assert _lease(projection) is None
+
+
+def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
+    """Only the torn-journal subclass is a refusal; a missing journal or
+    any other `JournalError` stays a bug with its stack."""
+    assert isinstance(store_module.CorruptJournalError("torn"), cli.HANDLED)
+    assert not isinstance(store_module.MissingJournalError("gone"), cli.HANDLED)
+    assert not isinstance(store_module.JournalError("other"), cli.HANDLED)
+
+
+@pytest.mark.parametrize(
+    "lease",
+    [None, {"heartbeat_at": CONTROL_NOW - timedelta(seconds=31)}],
+    ids=["no-lease", "dead-lease"],
+)
+def test_a_cancel_of_a_dead_run_points_at_am_resume_and_am_reset(
+    projection, monkeypatch, lease
+):
+    """Spec test 10: both `DeadRunError` wordings name `am reset <run-id>`."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    if lease is not None:
+        _plant_lease(projection, **lease)
+
+    result = _invoke_control(projection, "cancel")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["type"] == "DeadRunError"
+    assert error["message"].endswith(
+        f"`am resume {CONTROL_RUN_ID}` picks it up,"
+        f" or `am reset {CONTROL_RUN_ID}` closes it"
+    )
+    assert _controls(projection) == []
+
+
+# ── am resume of a reset run (card 522adfb5) ────────────────────────────────
+#
+# am-reset spec §3.6 / test 9: a run closed by `am reset` is refused by
+# `am resume` exactly as an `am cancel`led one is, before `Store.open`. Unit
+# tier: the projection fixture and the store only, no subprocess.
+
+
+@pytest.mark.parametrize("resets", [1, 2], ids=["reset-once", "reset-twice"])
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
+    projection, monkeypatch, workflow, resets
+):
+    """am-reset spec test 9, both workflows, with the assertion shape of
+    `test_resume_refuses_a_cancelled_run_and_writes_nothing`. Review Focus 4:
+    a second reset (`already_cancelled: true`) changes nothing about the
+    refusal. Review Focus 5: the refusal leaves every checkpoint row as the
+    reset left it."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="stopped", workflow=workflow)
+    _plant_parked_checkpoint(projection)
+    for n in range(resets):
+        reset = _invoke_reset(projection)
+        assert reset.exit_code == 0, reset.output
+        assert json.loads(reset.stdout)["data"]["already_cancelled"] is (n > 0)
+    assert _recorded_status(projection) == "cancelled"
+    before = _resume_guard_state(projection)
+    checkpoints_before = _checkpoint_rows(projection)
+    _forbid_resume(monkeypatch)
+
+    result = runner.invoke(cli.app, ["resume", CONTROL_RUN_ID, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR == 3, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResumableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} was cancelled;"
+            " start new work with `am run --milestone`"
+        ),
+    }
+    assert _resume_guard_state(projection) == before
+    assert _checkpoint_rows(projection) == checkpoints_before
+    assert _recorded_status(projection) == "cancelled"

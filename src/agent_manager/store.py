@@ -1587,6 +1587,22 @@ class Store:
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 
+    def checkpoint_cards(self, run_id: str) -> list[tuple[str, str]]:
+        """Every distinct `(card_id, workflow)` with a checkpoint row under `run_id`.
+
+        Any `reason` counts, `done` included. Ordered by `card_id`, then
+        `workflow`. Read-only, and `run_id` is the argument, never
+        `self.run_id`: `am reset` asks it about the run it closes
+        (am-reset §3.5, card af52db54).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT card_id, workflow FROM checkpoints"
+                " WHERE run_id = ? ORDER BY card_id, workflow",
+                (run_id,),
+            ).fetchall()
+            return [(row["card_id"], row["workflow"]) for row in rows]
+
     # -- board comment outbox ------------------------------------------------
     #
     # A row-only table outside the journal (board-comments B6, B9): nothing
