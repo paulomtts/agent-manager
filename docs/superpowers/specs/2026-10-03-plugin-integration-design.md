@@ -112,6 +112,18 @@ journal cannot tell the plugin which milestone a story belongs to, add that
 field to the `run_upsert`/`story_upsert` payload (a new key, which consumers are
 already told to tolerate). Add the same shape tests as for `--milestone`.
 
+### 6. Terminal card statuses (implemented in PR #3)
+
+Not one of the plugin's workarounds but a correctness gap found while planning
+it: brd added `merged`, `canceled` and `archived`, and `am` only treated `done`
+as finished. Now `merged` is finished (like `done`), and `canceled`/`archived`
+(treated identically) are out of play: dropped from the census and the plan,
+their `blocked_by` edges ignored, never dispatched, and never overwritten by
+`am`'s status roll-up. `am` never writes `merged`, `canceled` or `archived`
+itself; a parent whose children are all `merged` rolls up to `done`. One set
+of status constants lives in `census.py`. This matters to S3: dispatch must not
+be offered for cards in those statuses.
+
 ## Compatibility and versioning
 
 - Every change adds a field, a flag or documentation. No key is removed or
