@@ -931,6 +931,43 @@ def preflight_card(
     )
 
 
+@dataclass(frozen=True)
+class RecordedRun:
+    """A run past its recorded stage: its id, its open store and the lease it holds.
+
+    What the engine of `run --card` needs that pre-flight could not give it
+    (card 5daa944e). Internal state, so a dataclass.
+    """
+
+    run_id: str
+    store: Store
+    lease: control.Lease
+
+
+@contextmanager
+def recorded_card_run(pre: CardPreflight) -> Iterator[RecordedRun]:
+    """Stage 2 of `run --card`: open the store, take the lease, record `started` (card 5daa944e).
+
+    The lease and the `card:<id>` claim are taken inside the `try` that closes
+    the store, so they are released before `store.close()` on every exit, an
+    exception in the block included (C2, X5). They are taken before
+    `record_run`, so every run write is fenced by this token; a lost race is
+    `ClaimedError` (or `RunIsLiveError`) with nothing written but the empty
+    run directory. The run, story and subtask rows are written before the
+    block runs, so `status` and `resume` can see a run that dies on its first
+    phase.
+    """
+    store = Store.open(pre.root, pre.run_id)
+    try:
+        with run_lease(store, claims=pre.claims) as lease:
+            store.record_run(pre.run_record)
+            store.record_story(pre.story)
+            store.record_subtask(pre.story.card_id, pre.subtask)
+            yield RecordedRun(run_id=pre.run_id, store=store, lease=lease)
+    finally:
+        store.close()
+
+
 def run_card(
     card_id: str,
     *,

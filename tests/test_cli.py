@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9169,3 +9170,104 @@ def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
     assert _recorded_run_ids(root) == []
     assert _claim_rows(root) == []
     assert fake_board.writes == []
+
+
+def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
+    """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
+
+    `(0, 0)` means the claims and the lease were released before the store
+    closed. Counted over the closing store's own connection, before the real
+    close runs.
+    """
+    seen: list[tuple[int, int]] = []
+    real_close = store_module.Store.close
+
+    def close(self) -> None:
+        conn = self.connection
+        claims = conn.execute(
+            "SELECT COUNT(*) FROM run_claims WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        leases = conn.execute(
+            "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        seen.append((claims, leases))
+        real_close(self)
+
+    monkeypatch.setattr(store_module.Store, "close", close)
+    return seen
+
+
+def _no_drive(**kwargs: Any) -> Any:
+    pytest.fail("drive_subtask_async ran in the recorded stage")
+
+
+def test_inside_recorded_card_run_the_run_is_recorded_and_leased_but_not_driven(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(cli, "drive_subtask_async", _no_drive)
+    pre = _preflight(root, cards["subtask"])
+
+    with cli.recorded_card_run(pre) as recorded:
+        assert recorded.run_id == pre.run_id
+        run = recorded.store.load_run(pre.run_id)
+        assert run is not None
+        (story,) = run.stories
+        (subtask,) = story.subtasks
+        assert (run.status, story.status, subtask.status) == ("started", "started", "started")
+        assert (story.card_id, subtask.card_id) == (cards["story"], cards["subtask"])
+        lease = _card_lease(root, pre.run_id)
+        assert lease is not None
+        assert lease.token == recorded.lease.token
+        assert _claim_rows(root) == [
+            (control.card_claim(cards["subtask"]), pre.run_id, recorded.lease.token)
+        ]
+
+
+def test_leaving_recorded_card_run_on_an_error_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+
+    with pytest.raises(RuntimeError, match="engine never started"):
+        with cli.recorded_card_run(pre):
+            raise RuntimeError("engine never started")
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    assert _card_lease(root, pre.run_id) is None
+    again = _preflight(root, cards["subtask"], SEAM_LATER)
+    assert again.run_id == cli.mint_run_id(cards["subtask"], SEAM_LATER)
+
+
+def test_a_claim_taken_after_card_preflight_is_refused_on_entry_with_nothing_recorded(
+    tmp_path, monkeypatch, fake_board
+):
+    """The lost race (spec, Error paths): another run claims the card between
+    pre-flight and the recorded stage. `take_lease` refuses it atomically,
+    nothing is recorded and the store is still closed."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        with cli.recorded_card_run(pre):
+            pytest.fail("the recorded stage yielded under another run's claim")
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert closes == [(0, 0)]
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
