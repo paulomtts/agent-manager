@@ -589,10 +589,16 @@ class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
     A `models.Run` would be a lie here: its `stories` list would always be empty
-    because `runs` is the only table read. The fields are the run's identity and
-    nothing else, and they go through pydantic for the same reason `load_run`
-    does -- a projection that drifted from `models` must fail loudly rather than
-    print half a history.
+    because `runs` is the only table read for it. The fields are the run's
+    identity and nothing else, and they go through pydantic for the same reason
+    `load_run` does -- a projection that drifted from `models` must fail loudly
+    rather than print half a history.
+
+    `milestone_id` is the `runs` column: null on a `--card` run and on a row
+    written before the column existed. `card_id` is not stored anywhere on the
+    run row: it is the single subtask a `task` (`--card`) run records, and null
+    for any other workflow or before that subtask row is written. Both default
+    to `None`, so they are additive: no older key changed.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -604,6 +610,8 @@ class RunSummary(BaseModel):
     branch_prefix: str
     status: models.Status
     started_at: datetime | None = None
+    milestone_id: str | None = None
+    card_id: str | None = None
 
 
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
@@ -616,10 +624,22 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     `started_at DESC` puts a NULL start time last (SQLite orders NULL below every
     value, so descending sends it to the end) and the id breaks a tie, which run
     ids minted at second resolution really do produce.
+
+    `card_id` is derived, not stored: a `task` run (`am run --card`) records one
+    story and one subtask, and that subtask's card is the run's card. Any other
+    workflow -- a milestone run records many subtasks -- gets NULL. Should a
+    `task` run ever hold several subtask rows, the lowest `position`, then the
+    lowest card id, wins, so the answer is stable rather than an error.
     """
     rows = conn.execute(
-        "SELECT id, workflow, repo_dir, base_branch, branch_prefix, status, started_at"
-        " FROM runs ORDER BY started_at DESC, id DESC"
+        "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
+        " runs.branch_prefix, runs.status, runs.started_at, runs.milestone_id,"
+        " CASE WHEN runs.workflow = 'task' THEN ("
+        "   SELECT subtasks.card_id FROM subtasks"
+        "    WHERE subtasks.run_id = runs.id"
+        "    ORDER BY subtasks.position, subtasks.card_id LIMIT 1"
+        " ) END AS card_id"
+        " FROM runs ORDER BY runs.started_at DESC, runs.id DESC"
     ).fetchall()
     return [RunSummary.model_validate(dict(row)) for row in rows]
 

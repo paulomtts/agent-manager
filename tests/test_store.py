@@ -1261,11 +1261,33 @@ def test_a_journal_whose_run_upsert_names_another_run_raises(repo):
     assert "run-somewhere-else" in message
 
 
-def _record_summary(root: Path, run_id: str, started_at: datetime | None) -> None:
-    """One run row in `root`'s projection, with nothing below it."""
+def _record_summary(
+    root: Path,
+    run_id: str,
+    started_at: datetime | None,
+    *,
+    workflow: str = "milestone",
+    milestone_id: str | None = None,
+    subtask_cards: tuple[str, ...] = (),
+) -> None:
+    """One run row in `root`'s projection, plus, when `subtask_cards` is given,
+    one story holding those subtasks in that order. The defaults write the run
+    row alone, as every older caller expects."""
     opened = store.Store.open(root, run_id)
     try:
-        opened.record_run(_run(root, run_id).model_copy(update={"started_at": started_at}))
+        opened.record_run(
+            _run(root, run_id).model_copy(
+                update={
+                    "started_at": started_at,
+                    "workflow": workflow,
+                    "milestone_id": milestone_id,
+                }
+            )
+        )
+        if subtask_cards:
+            opened.record_story(_story())
+            for card in subtask_cards:
+                opened.record_subtask(_story().card_id, _subtask(card))
     finally:
         opened.close()
 
@@ -1327,6 +1349,124 @@ def test_list_runs_breaks_a_started_at_tie_with_the_run_id(repo):
         assert [summary.id for summary in store.list_runs(conn)] == ["run-b", "run-a"]
     finally:
         conn.close()
+
+
+SUMMARY_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "milestone_id",
+    "card_id",
+}
+"""The seven names `am runs` always had, plus the two this card adds."""
+
+
+def _listed(root: Path) -> list[store.RunSummary]:
+    conn = store.open_db(root)
+    try:
+        return store.list_runs(conn)
+    finally:
+        conn.close()
+
+
+def test_list_runs_gives_a_milestone_run_its_milestone_id_and_no_card_id(repo):
+    _record_summary(repo, "run-m", None, milestone_id=MILESTONE_ID)
+
+    [summary] = _listed(repo)
+
+    assert summary.milestone_id == MILESTONE_ID
+    assert summary.card_id is None
+
+
+def test_list_runs_gives_a_card_run_its_card_id_and_no_milestone_id(repo):
+    _record_summary(repo, "run-t", None, workflow="task", subtask_cards=("ef248597",))
+
+    [summary] = _listed(repo)
+
+    assert summary.workflow == "task"
+    assert summary.milestone_id is None
+    assert summary.card_id == "ef248597"
+
+
+def test_list_runs_gives_a_task_run_with_no_subtask_row_no_card_id(repo):
+    """A `--card` run's row is written before its subtask row, so a reader can
+    see it in between; that is not an error."""
+    _record_summary(repo, "run-t", None, workflow="task")
+
+    [summary] = _listed(repo)
+
+    assert summary.card_id is None
+    assert summary.milestone_id is None
+
+
+def test_list_runs_never_gives_a_milestone_run_a_card_id_even_with_subtask_rows(repo):
+    _record_summary(
+        repo,
+        "run-m",
+        None,
+        milestone_id=MILESTONE_ID,
+        subtask_cards=("ef248597", "1535b285"),
+    )
+
+    [summary] = _listed(repo)
+
+    assert summary.milestone_id == MILESTONE_ID
+    assert summary.card_id is None
+
+
+def test_list_runs_gives_each_task_run_its_own_card_id(repo):
+    _record_summary(
+        repo,
+        "run-a",
+        datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+        workflow="task",
+        subtask_cards=("aaaa1111",),
+    )
+    _record_summary(
+        repo,
+        "run-b",
+        datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc),
+        workflow="task",
+        subtask_cards=("bbbb2222",),
+    )
+
+    summaries = _listed(repo)
+
+    assert [(s.id, s.card_id) for s in summaries] == [
+        ("run-b", "bbbb2222"),
+        ("run-a", "aaaa1111"),
+    ]
+
+
+def test_list_runs_picks_the_first_subtask_when_a_task_run_has_several(repo):
+    """A `--card` run records one subtask, but a projection holding two must
+    still list the run, with a stable answer: the lowest position wins."""
+    _record_summary(
+        repo, "run-t", None, workflow="task", subtask_cards=("zzzz9999", "aaaa1111")
+    )
+
+    [summary] = _listed(repo)
+
+    assert summary.card_id == "zzzz9999"
+
+
+def test_run_summary_fields_are_the_old_seven_plus_milestone_id_and_card_id():
+    assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
+    assert store.RunSummary.model_config["extra"] == "forbid"
+    assert store.RunSummary.model_fields["milestone_id"].default is None
+    assert store.RunSummary.model_fields["card_id"].default is None
+
+
+def test_a_listed_run_dumps_exactly_the_summary_keys(repo):
+    _record_summary(repo, "run-t", None, workflow="task", subtask_cards=("ef248597",))
+
+    [summary] = _listed(repo)
+
+    assert set(summary.model_dump()) == SUMMARY_KEYS
 
 
 def test_latest_run_id_is_the_newest_recorded_run(repo):
@@ -2188,6 +2328,52 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
     finally:
         again.close()
     assert reopened_columns == RUN_COLUMNS
+
+
+def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store.RunSummary]:
+    """`_LEGACY_RUNS` (plus `extra_sql`) written into a fresh database, which a
+    second `open_db` then migrates; the migrated projection's listing."""
+    fresh = store.open_db(repo)
+    try:
+        fresh.executescript(_LEGACY_RUNS + extra_sql)
+        fresh.commit()
+    finally:
+        fresh.close()
+
+    migrated = store.open_db(repo)
+    try:
+        return store.list_runs(migrated)
+    finally:
+        migrated.close()
+
+
+def test_an_old_runs_row_lists_with_no_milestone_id_and_no_card_id(repo):
+    [summary] = _migrated_legacy(repo)
+
+    assert (summary.id, summary.workflow, summary.status) == (
+        RUN_ID,
+        "milestone",
+        "escalated",
+    )
+    assert summary.milestone_id is None
+    assert summary.card_id is None
+
+
+def test_an_old_task_run_lists_its_card_id_after_the_milestone_id_migration(repo):
+    [summary] = _migrated_legacy(
+        repo,
+        """
+        UPDATE runs SET workflow = 'task' WHERE id = 'run-2026-09-23-01';
+        INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,
+                              status, worktree_path, position)
+        VALUES ('run-2026-09-23-01', '8831189b', 'ef248597', 'm1/task-ef248597',
+                'main', 'escalated', NULL, 0);
+        """,
+    )
+
+    assert summary.workflow == "task"
+    assert summary.milestone_id is None
+    assert summary.card_id == "ef248597"
 
 
 def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):

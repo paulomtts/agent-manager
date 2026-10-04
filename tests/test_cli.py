@@ -3929,20 +3929,25 @@ def _record(
     started_at: datetime,
     status: str = "done",
     with_phases: bool = True,
+    workflow: str = "task",
+    milestone_id: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
-    in `root`'s projection, written the only way this program writes rows."""
+    in `root`'s projection, written the only way this program writes rows. The
+    defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
+    `milestone_id` for a milestone-shaped one."""
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
                 id=run_id,
-                workflow="task",
+                workflow=workflow,
                 repo_dir=root,
                 base_branch="main",
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
+                milestone_id=milestone_id,
             )
         )
         opened.record_story(
@@ -4172,6 +4177,83 @@ def test_runs_agrees_with_status_about_the_most_recent_run(projection):
     )
 
     assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
+
+
+RUNS_ENTRY_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "milestone_id",
+    "card_id",
+}
+"""Every `data.runs[]` entry: the seven names `am runs` always had, plus the
+two that card 0b5a15d7 added."""
+
+RUNS_MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
+
+
+def test_runs_shows_a_card_runs_card_id_and_a_null_milestone_id(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["card_id"] == "card-1"
+    assert entry["milestone_id"] is None
+
+
+def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection):
+    """`_record` writes a subtask row under the milestone run too, so this also
+    pins that a milestone run never reports one of its subtasks as `card_id`."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["workflow"] == "milestone"
+    assert entry["milestone_id"] == RUNS_MILESTONE_ID
+    assert entry["card_id"] is None
+
+
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_and_card_id(projection):
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        assert set(envelope) == {"ok", "data"}
+        assert envelope["ok"] is True
+        assert set(envelope["data"]) == {"runs"}
+        assert len(envelope["data"]["runs"]) == 2
+        for entry in envelope["data"]["runs"]:
+            assert set(entry) == RUNS_ENTRY_KEYS
 
 
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
