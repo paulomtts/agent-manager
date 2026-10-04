@@ -312,7 +312,14 @@ def integrity_view(
     as `read`, because `replay` inside it raises `JournalError` or a pydantic
     `ValidationError` of its own. Mismatches are `store.diverging`'s, in its
     tree-walk order: there is one definition of divergence.
+
+    A live lease (§3.5) is `checked: false, reason: "lease is live"` before the
+    journal is opened: a running process's writes in flight are noise, not
+    divergence, even against a hand-edited projection. A dead lease, or none,
+    is checked.
     """
+    if lease is not None and control.lease_is_live(lease, now=now):
+        return {"checked": False, "reason": "lease is live", "mismatches": []}
     try:
         lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
         found = store_module.diverging(lines, run)

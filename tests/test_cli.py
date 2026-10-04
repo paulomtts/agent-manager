@@ -9440,3 +9440,51 @@ def test_an_unknown_journal_event_kind_is_skipped_by_the_check(projection, monke
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == CLEAN_INTEGRITY
+
+
+@pytest.mark.parametrize(
+    "heartbeat_at, integrity",
+    [
+        (
+            CONTROL_NOW - timedelta(seconds=5),
+            {"checked": False, "reason": "lease is live", "mismatches": []},
+        ),
+        (
+            CONTROL_NOW - timedelta(seconds=31),
+            {"checked": True, "reason": None, "mismatches": [RUN_CANCELLED_BY_HAND]},
+        ),
+    ],
+    ids=["live", "stale"],
+)
+def test_a_live_lease_is_not_checked_and_a_stale_one_is(
+    projection, monkeypatch, heartbeat_at, integrity
+):
+    """Spec test 4 (§3.5): writes in flight are noise, not divergence, even
+    against a hand-edited projection; a dead lease's run is checked."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _hand_edit_run_status(projection, "cancelled")
+    _plant_lease(projection, heartbeat_at=heartbeat_at)
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == integrity
+
+
+def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
+    """Review Focus: the live-lease rule comes first, so even a corrupt
+    journal reads as `lease is live`, and `diverging` is never called."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    with _journal_path().open("a", encoding="utf-8") as handle:
+        handle.write("not json\n")
+    _plant_lease(projection, heartbeat_at=CONTROL_NOW - timedelta(seconds=5))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a live run's journal must not be compared")
+
+    monkeypatch.setattr(store_module, "diverging", forbidden)
+
+    data = _status_data(projection, CONTROL_RUN_ID)
+
+    assert data["integrity"] == {"checked": False, "reason": "lease is live", "mismatches": []}
