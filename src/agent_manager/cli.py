@@ -1293,6 +1293,55 @@ this tuple is a bug in this program and should crash loudly with its stack intac
 """
 
 
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+
+
+def release_handed_off(root: Path, run_id: str, token: str) -> None:
+    """Release a handed-off lease's claims, then the lease, over a fresh store.
+
+    For a detach that failed after `Lease.hand_off()`: the recorded stage's
+    store is already closed and its lease no longer releases anything.
+    """
+    store = Store.open(root, run_id)
+    try:
+        try:
+            store.release_claims(token)
+        finally:
+            store.release_lease(token)
+    finally:
+        store.close()
+
+
+def run_detached_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+) -> None:
+    """What the detached child of `am run --detach` runs: stage 3, then report.
+
+    It opens its own store and adopts `token` (no new lease: the claims the
+    parent took stay under it), so the heartbeat runs here. `engine` runs
+    stage 3 on that store and lease. Its payload is written to `report.json`
+    as `ok_envelope`, or a `HANDLED` error as `error_envelope`, both while
+    the lease is still held. Leaving the lease releases the claims, then the
+    lease, then the store closes, on every exit. Anything else propagates
+    with no report: its traceback goes to `run.log`.
+    """
+    store = Store.open(root, run_id)
+    try:
+        with control.Lease(store, adopt=token) as lease:
+            try:
+                payload = engine(store, lease)
+            except HANDLED as error:
+                detach.write_report(run_id, render(error_envelope(error)))
+                return
+            detach.write_report(run_id, render(ok_envelope(payload)))
+    finally:
+        store.close()
+
+
 def _check_run_targets(
     *,
     card: str | None,

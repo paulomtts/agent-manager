@@ -9488,3 +9488,117 @@ def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
     assert word in result.output
     assert fake.calls == []
     assert not (paths.data_dir() / "runs").exists()
+
+
+def _handed_off_card_run(root: Path, card_id: str) -> tuple[Any, str]:
+    """Stage 1 and 2 of a card run, then the parent's hand-off: what the child inherits."""
+    pre = _preflight(root, card_id)
+    with cli.recorded_card_run(pre) as recorded:
+        token = recorded.lease.hand_off()
+    return pre, token
+
+
+def _no_take_lease(self, **kwargs: Any) -> Any:
+    pytest.fail("the detached child took a new lease instead of adopting its own")
+
+
+def _report_path(run_id: str) -> Path:
+    return paths.data_dir() / "runs" / run_id / detach.REPORT_NAME
+
+
+def test_the_detached_child_adopts_the_lease_reports_then_releases_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+    held_at_report: list[bool] = []
+    real_write = detach.write_report
+
+    def spying_write(run_id: str, text: str) -> Path:
+        held_at_report.append(_card_lease(root, run_id) is not None)
+        return real_write(run_id, text)
+
+    monkeypatch.setattr(detach, "write_report", spying_write)
+    seen: list[tuple[str, str, str, int]] = []
+
+    def engine(store, lease):
+        row = _card_lease(root, pre.run_id)
+        seen.append((store.run_id, lease.token, row.token, len(_alive_heartbeats())))
+        return {"run_id": pre.run_id, "status": "done"}
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert seen == [(pre.run_id, token, token, 1)]
+    report = _report_path(pre.run_id)
+    assert json.loads(report.read_text(encoding="utf-8")) == {
+        "ok": True,
+        "data": {"run_id": pre.run_id, "status": "done"},
+    }
+    assert _mode(report) == 0o600
+    assert held_at_report == [True]
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _alive_heartbeats() == []
+
+
+def test_the_detached_child_reports_a_handled_error_and_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise cli.UnknownCardError("the card is gone")
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert json.loads(_report_path(pre.run_id).read_text(encoding="utf-8")) == {
+        "ok": False,
+        "error": {"type": "UnknownCardError", "message": "the card is gone"},
+    }
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_detached_child_writes_no_report_and_still_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise RuntimeError("engine bug")
+
+    with pytest.raises(RuntimeError, match="engine bug"):
+        cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert not _report_path(pre.run_id).exists()
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _recorded_run_ids(root) == [pre.run_id]
+
+
+def test_release_handed_off_releases_the_claims_and_lease_and_closes(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    assert _card_lease(root, pre.run_id) is not None
+    closes = _close_snapshots(monkeypatch)
+
+    cli.release_handed_off(pre.root, pre.run_id, token)
+
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
