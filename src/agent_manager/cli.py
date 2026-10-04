@@ -1996,6 +1996,28 @@ def logs_for(
     ).payload()
 
 
+def logs_follow_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+    since_offset: int = 0,
+) -> Path | None:
+    """Validate `am logs --follow` and name the file it streams.
+
+    The same selection as `logs_for` (`select_logs`), so every refusal the
+    one-shot makes is made here too, before the hello line. The projection
+    connection is closed by `select_logs` before this returns, and streaming
+    reads only the returned file.
+    """
+    selection = select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    )
+    return selection.followed_path()
+
+
 @app.command("logs")
 def logs(
     run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to read."),
@@ -2006,19 +2028,53 @@ def logs(
     attempt: int | None = typer.Option(
         None, "--attempt", help="Which attempt. Defaults to the highest recorded."
     ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help=(
+            "Keep printing the attempt's stdout as it grows, one JSON object"
+            " per line, until interrupted."
+        ),
+    ),
+    since_offset: int | None = typer.Option(
+        None,
+        "--since-offset",
+        metavar="BYTES",
+        help="With --follow, start at this byte offset of the stdout file (default 0).",
+    ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository whose projection is read."
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print one attempt's prompt, result and captured stdout/stderr."""
+    """Print one attempt's prompt, result and captured stdout/stderr.
+
+    With --follow, print a hello line naming the attempt's stdout file and
+    then its bytes as `{"offset", "text"}` lines, the existing content first
+    and then each append, until interrupted. A refusal is still one envelope
+    at exit 3, printed before any stream line.
+    """
+    offset = since_offset if since_offset is not None else 0
     try:
-        payload = logs_for(
-            run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
-        )
+        if follow:
+            followed = logs_follow_for(
+                run_id,
+                card,
+                repo_dir=repo_dir,
+                phase=phase,
+                attempt=attempt,
+                since_offset=offset,
+            )
+        else:
+            payload = logs_for(
+                run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if follow:
+        _stream_logs(followed, offset=offset)
+        return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
@@ -2305,6 +2361,63 @@ def _utf8_complete_length(data: bytes) -> int:
             return end
         return index if end - index < needed else end
     return end
+
+
+def _logs_hello(path: Path, offset: int) -> dict[str, Any]:
+    """The first line of `am logs --follow`: which file, from which byte.
+
+    Its own `schema`, independent of the journal's and of `watch`'s hello,
+    so the chunk shape can evolve without touching either.
+    """
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _follow_logs(
+    path: Path,
+    *,
+    offset: int,
+    sleep: Callable[[float], None],
+    max_polls: int | None,
+) -> Iterator[dict[str, Any]]:
+    """`path`'s bytes from `offset` as `{"offset", "text"}` chunks, then each append.
+
+    One read at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
+    another read, `max_polls` times or forever when it is `None`. One byte
+    cursor spans every read, so chunks are contiguous: each starts where the
+    last ended. A trailing partial UTF-8 character stays below the cursor
+    and is read again, completed, on a later poll. A read that finds nothing
+    past the cursor (no file yet, a file shorter than the cursor) yields
+    nothing. Attempt status is not consulted: ending the stream on a
+    terminal attempt is card 4.2's.
+    """
+    cursor = offset
+    polls = 0
+    while True:
+        data = _read_log_bytes(path, cursor)
+        complete = _utf8_complete_length(data)
+        if complete:
+            yield {
+                "offset": cursor,
+                "text": data[:complete].decode("utf-8", errors="replace"),
+            }
+            cursor += complete
+        if max_polls is not None and polls >= max_polls:
+            return
+        sleep(WATCH_POLL_SECONDS)
+        polls += 1
+
+
+def _stream_logs(path: Path, *, offset: int) -> None:
+    """The body of `am logs --follow`, once `logs_follow_for` has accepted it.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll.
+    """
+    _emit_stream_line(_logs_hello(path, offset))
+    for chunk in _follow_logs(
+        path, offset=offset, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+    ):
+        _emit_stream_line(chunk)
 
 
 @app.command("watch")

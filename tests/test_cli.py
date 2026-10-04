@@ -5120,6 +5120,285 @@ def test_read_log_bytes_is_empty_for_anything_unreadable(tmp_path):
     assert not (tmp_path / "missing.log").exists()
 
 
+def _logs_follow(monkeypatch, *args: str, actions=(), follow: bool = True):
+    """Run `am logs ARGS --follow` for exactly `len(actions)` polls after the backlog.
+
+    Modelled on `_watch_follow`: sleep `i` runs `actions[i]` (an append, a
+    truncate, a Ctrl-C) before poll `i` reads. `follow=False` drops the flag
+    so the refusal of `--since-offset` alone can be driven through the same
+    helper. Returns the result and the seconds each sleep was asked for.
+    """
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        actions[len(sleeps) - 1]()
+
+    monkeypatch.setattr(cli, "_watch_sleep", fake_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", len(actions))
+    argv = ["logs", *args, *(["--follow"] if follow else [])]
+    return runner.invoke(cli.app, argv), sleeps
+
+
+def _logs_args(projection: Path, *extra: str) -> list[str]:
+    return [LOGS_RUN_ID, "card-1", *extra, "--repo-dir", str(projection)]
+
+
+def _logs_hello_line(path: Path, offset: int = 0) -> dict[str, Any]:
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _assert_contiguous(chunks: list[dict[str, Any]], start: int) -> int:
+    """Each chunk starts where the last ended, in bytes; none is empty.
+
+    Only for valid UTF-8 content: a U+FFFD from replacement re-encodes to a
+    different byte length than the bytes it replaced.
+    """
+    cursor = start
+    for chunk in chunks:
+        assert set(chunk) == {"offset", "text"}, chunk
+        assert chunk["offset"] == cursor, chunks
+        assert chunk["text"], chunks
+        cursor += len(chunk["text"].encode("utf-8"))
+    return cursor
+
+
+def test_logs_follow_hello_shape(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result, sleeps = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == []
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    assert all("ok" not in line for line in lines)
+    assert all("event" not in line for line in lines[1:])
+    assert result.stdout.endswith("\n")
+    assert all(": " not in text for text in result.stdout.splitlines())
+    assert result.stderr == ""
+
+    # `--pretty` only shapes a refusal: the stream is byte-for-byte the same.
+    pretty, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--pretty"))
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_logs_follow_streams_backlog_with_offsets(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    content = "first line\nsecond líne\n€uro\n"
+    _implement_stdout().write_bytes(content.encode("utf-8"))
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    chunks = lines[1:]
+    assert chunks[0]["offset"] == 0
+    assert "".join(chunk["text"] for chunk in chunks) == content
+    assert _assert_contiguous(chunks, 0) == len(content.encode("utf-8"))
+
+
+def test_logs_follow_multibyte_not_split(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"caf\xc3")  # the first byte of "é" only
+
+    def finish_the_character() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"\xa9 ok\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[finish_the_character, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    chunks = _stream(result)[1:]
+    assert chunks == [
+        {"offset": 0, "text": "caf"},
+        {"offset": 3, "text": "é ok\n"},
+    ]
+    assert all("�" not in chunk["text"] for chunk in chunks)
+    assert _assert_contiguous(chunks, 0) == stdout.stat().st_size
+
+
+def test_logs_follow_since_offset_resumes(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    content = _implement_stdout().read_bytes()
+    assert content == b"stdout of implement.1\n"
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--since-offset", "10"))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout(), 10)
+    assert lines[1:] == [{"offset": 10, "text": content[10:].decode("utf-8")}]
+
+
+def test_logs_follow_picks_up_appended_data(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"more\n")
+
+    # Poll 1 sees the append; poll 2 sees nothing new, so it must not repeat.
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    lines = _stream(result)
+    assert lines[1:] == [
+        {"offset": 0, "text": original.decode("utf-8")},
+        {"offset": len(original), "text": "more\n"},
+    ]
+    assert all(line.get("event") != "end" for line in lines)
+
+
+def test_logs_follow_waits_for_missing_file(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)
+    stdout = _implement_stdout()
+
+    def still_absent() -> None:
+        assert not stdout.exists()
+
+    def create_it() -> None:
+        stdout.write_bytes(b"late\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[still_absent, create_it, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": "late\n"},
+    ]
+
+
+def test_logs_follow_deterministic_phase_follows_stdout_log(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    second = _write_step_logs(LOGS_RUN_ID, 2)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--phase", "verify"))
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(second / "stdout.log"),
+        {"offset": 0, "text": "==> uv run pytest (exit 1)\nstdout of verify.2\n"},
+    ]
+
+
+def test_logs_follow_writes_nothing(projection, monkeypatch):
+    """`logs --follow` is read-only like `logs`: a missing stdout file is
+    waited on, never created, and a refusal mints no run directory."""
+    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    success, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None]
+    )
+    assert success.exit_code == 0, success.output
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not _implement_stdout().exists()
+
+    refusal, _ = _logs_follow(
+        monkeypatch, "no-such-run", "card-1", "--repo-dir", str(projection)
+    )
+    assert refusal.exit_code == cli.EXIT_ERROR
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def test_logs_follow_since_offset_beyond_end_waits(projection, monkeypatch):
+    """Review Focus 2: a cursor past EOF is not an error; bytes appear once
+    the file grows past it, starting exactly at the cursor."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+
+    def grow_short_of_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"a" * (500 - size))
+
+    def grow_past_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"b" * 505)
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", "1000"),
+        actions=[grow_short_of_the_cursor, grow_past_the_cursor],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(stdout, 1000),
+        {"offset": 1000, "text": "bbbbb"},
+    ]
+
+
+def test_logs_follow_truncated_file_emits_nothing_new(projection, monkeypatch):
+    """Review Focus 3: a file cut below the cursor is no crash and no rewind;
+    bytes below the cursor are never re-emitted."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def truncate() -> None:
+        stdout.write_bytes(b"")
+
+    def rewrite_shorter() -> None:
+        stdout.write_bytes(b"new\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[truncate, rewrite_shorter]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": original.decode("utf-8")},
+    ]
+
+
+def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
+    """Review Focus 1: invalid UTF-8 becomes U+FFFD, and the next offset
+    still counts raw bytes, not decoded characters."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"ok\xff\xfe\n")
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"next\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result)[1:] == [
+        {"offset": 0, "text": "ok��\n"},
+        {"offset": 5, "text": "next\n"},
+    ]
+
+
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
 """The clock `_crash_mid_phase` injects, so the run id is known without reading
 a payload the crash never produced."""
