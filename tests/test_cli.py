@@ -8735,3 +8735,96 @@ def test_reset_pretty_prints_an_indented_envelope(projection):
     assert result.exit_code == 0, result.output
     assert "\n" in result.stdout.strip()
     assert json.loads(result.stdout)["data"]["status"] == "cancelled"
+
+
+def _forbid_reset_writes(monkeypatch) -> None:
+    """A refusal must come before `Store.open`, so reaching it fails the test."""
+    monkeypatch.setattr(cli, "Store", _Forbidden("Store"))
+
+
+def test_reset_refuses_an_unknown_run_and_creates_no_run_directory(
+    projection, monkeypatch
+):
+    """Spec test 6."""
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection, "no-such-run")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "UnknownRunError",
+        "message": (
+            f"run 'no-such-run' is not in the projection for"
+            f" {cli.resolve_repo_dir(projection)}"
+            " (`agent-manager runs` lists the ones that are)"
+        ),
+    }
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+@pytest.mark.parametrize(
+    "lease, pid, host",
+    [
+        ({}, None, None),
+        ({"pid": 0, "host": "am-test-other-host.invalid"}, 0, "am-test-other-host.invalid"),
+    ],
+    ids=["this-host", "another-host"],
+)
+def test_reset_refuses_a_run_whose_lease_is_live_and_points_at_am_cancel(
+    projection, monkeypatch, lease, pid, host
+):
+    """Spec test 2, plus Review Focus 3: a fresh heartbeat from another host
+    is live whatever its pid."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="started")
+    _plant_lease(projection, heartbeat_at=_at(-5), **lease)
+    before = (_resume_guard_state(projection), _recorded_status(projection))
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error == {
+        "type": "RunIsLiveError",
+        "message": (
+            f"run {CONTROL_RUN_ID} is still running in pid"
+            f" {os.getpid() if pid is None else pid} on {HERE if host is None else host}"
+            f" (heartbeat 5s ago); `am cancel {CONTROL_RUN_ID}` stops it,"
+            " and `am reset` is for a run nobody is driving"
+        ),
+    }
+    assert "am resume" not in error["message"]
+    assert (_resume_guard_state(projection), _recorded_status(projection)) == before
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_reset_refuses_a_finished_run_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """Spec test 5."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection, status="done", workflow=workflow)
+    before = (_resume_guard_state(projection), _recorded_status(projection))
+    _forbid_reset_writes(monkeypatch)
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"] == {
+        "type": "NotResettableError",
+        "message": (
+            f"run {CONTROL_RUN_ID} finished (done), so there is nothing to close;"
+            " start new work with `am run`"
+        ),
+    }
+    assert (_resume_guard_state(projection), _recorded_status(projection)) == before
+
+
+def test_not_resettable_error_is_a_handled_cli_error():
+    assert isinstance(cli.NotResettableError("finished"), cli.CliError)
+    assert isinstance(cli.NotResettableError("finished"), cli.HANDLED)

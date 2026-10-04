@@ -150,6 +150,14 @@ class RunIsLiveError(CliError):
     """`am resume` was asked for a run another live process still holds (C10)."""
 
 
+class NotResettableError(CliError):
+    """`am reset` was asked to close a run that finished `done` (am-reset §3.4).
+
+    Only the CLI raises it, so it lives beside `RunIsLiveError` and
+    `DeadRunError` rather than in `runs` with `NotResumableError`.
+    """
+
+
 class ClaimedError(CliError):
     """A card or branch this run needs is claimed by another run's live lease (X5, X11).
 
@@ -2300,6 +2308,27 @@ def cancel(
     _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
 
 
+def _reset_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+    """`am reset`'s read-only refusal of a run a live process holds (am-reset §3.4).
+
+    `_run_is_live_error`'s pid, host and heartbeat age, but pointing at
+    `am cancel`: the run is being driven, and a reset is for one that is not.
+    """
+    return RunIsLiveError(
+        f"run {lease.run_id} is still running in pid {lease.pid} on {lease.host}"
+        f" (heartbeat {_heartbeat_age(lease, now)}s ago); `am cancel {lease.run_id}`"
+        " stops it, and `am reset` is for a run nobody is driving"
+    )
+
+
+def _not_resettable_error(run_id: str) -> NotResettableError:
+    """`am reset`'s refusal of a finished run, worded once for both places it is checked."""
+    return NotResettableError(
+        f"run {run_id} finished (done), so there is nothing to close;"
+        " start new work with `am run`"
+    )
+
+
 def _reset_message(run_id: str) -> str:
     """What `am reset` tells the operator after closing `run_id` (am-reset §3.5)."""
     return (
@@ -2311,17 +2340,33 @@ def _reset_message(run_id: str) -> str:
 def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     """Close a run nobody is driving by recording it `cancelled` (am-reset §3.2-3.3).
 
-    The run is loaded read-only, exactly as `resume_run` loads it. Then, as
-    `_resume_from_checkpoint` does up to its first write and no further:
-    `Store.open`, the run's own lease with no claims (a reset drives no card
-    and no branch), and one fenced `record_run` of `cancelled`. No checkpoint
-    row is written or deleted, and no other row is touched. The lease is
-    released and the store closed on every exit.
+    The run is loaded read-only, exactly as `resume_run` loads it. Refused, in
+    order and before `Store.open`: an unknown run (`UnknownRunError`), a run a
+    live process holds (`RunIsLiveError`, pointing at `am cancel`), and a
+    finished one (`NotResettableError`). Then, as `_resume_from_checkpoint`
+    does up to its first write and no further: `Store.open`, the run's own
+    lease with no claims (a reset drives no card and no branch), and one
+    fenced `record_run` of `cancelled`. No checkpoint row is written or
+    deleted, and no other row is touched. The lease is released and the store
+    closed on every exit.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
     try:
         run = store_module.load_run(conn, run_id)
+        if run is None:
+            raise UnknownRunError(
+                f"run {run_id!r} is not in the projection for {root}"
+                " (`agent-manager runs` lists the ones that are)"
+            )
+        # Unknown, live, done: read-only and before `Store.open`, which would
+        # mint a run directory, so a refusal leaves nothing behind (§3.4).
+        lease = store_module.read_lease(conn, run.id)
+        now = _utcnow()
+        if lease is not None and control.lease_is_live(lease, now=now):
+            raise _reset_live_error(lease, now)
+        if run.status == "done":
+            raise _not_resettable_error(run.id)
     finally:
         conn.close()
     store = Store.open(root, run.id)
