@@ -54,13 +54,27 @@ def store(monkeypatch, tmp_path):
     opened.close()
 
 
+WORKTREE: Path | None = None
+"""The subtask's worktree path. The autouse `worktree_dir` fixture sets it to a
+real `tmp_path` directory for every test, so a resume takes the engine's
+no-git fast path; a test may `rmdir()` that directory, or set this to `None`."""
+
+
+@pytest.fixture(autouse=True)
+def worktree_dir(tmp_path, monkeypatch) -> Path:
+    path = tmp_path / "worktree"
+    path.mkdir()
+    monkeypatch.setitem(globals(), "WORKTREE", path)
+    return path
+
+
 def _subtask() -> models.SubtaskRun:
     return models.SubtaskRun(
         card_id=CARD_ID,
         branch=f"m6/task-resume-a-subtask-from-{CARD_ID}",
         base_branch="m6/story-base",
         status="started",
-        worktree_path=Path("/w"),
+        worktree_path=WORKTREE,
     )
 
 
