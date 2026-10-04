@@ -1762,6 +1762,7 @@ def _follow_watch(
     since: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
+    from_now: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """The backlog above `since`, then every line appended after it.
 
@@ -1769,9 +1770,20 @@ def _follow_watch(
     another pass, `max_polls` times or forever when it is `None`. One cursor
     dict spans every pass, so no `seq` of a run is emitted twice and none is
     skipped, however its lines are spread across polls.
+
+    With `from_now` the backlog pass still runs, so it seeds each existing
+    run's cursor to its highest complete `seq`, but nothing it reads is
+    yielded. A torn last line is not read, so it is emitted once complete;
+    a run with no complete line, or none at all yet, has no cursor and is
+    emitted in full from `since` when its lines appear.
     """
     cursors: dict[str, int] = {}
-    yield from _poll_watch(run_id, since=since, cursors=cursors)
+    backlog = _poll_watch(run_id, since=since, cursors=cursors)
+    if from_now:
+        for _ in backlog:
+            pass
+    else:
+        yield from backlog
     polls = 0
     while max_polls is None or polls < max_polls:
         sleep(WATCH_POLL_SECONDS)
@@ -1795,7 +1807,7 @@ def _silence_stdout() -> None:
     os.close(devnull)
 
 
-def _stream_watch(run_id: str | None, *, since: int) -> None:
+def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
@@ -1808,7 +1820,11 @@ def _stream_watch(run_id: str | None, *, since: int) -> None:
     try:
         _emit_stream_line(_watch_hello())
         for event in _follow_watch(
-            run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+            run_id,
+            since=since,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            from_now=from_now,
         ):
             _emit_stream_line(event)
     except KeyboardInterrupt:
@@ -1877,7 +1893,7 @@ def watch(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_watch(run_id, since=since_value)
+        _stream_watch(run_id, since=since_value, from_now=from_now)
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 

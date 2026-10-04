@@ -8585,3 +8585,105 @@ def test_watch_from_now_keeps_existing_refusals_and_since_zero(tmp_path, monkeyp
     assert json.loads(zero.stdout) == {"ok": True, "data": {"events": written}}
     negative = _watch("run-a", "--since", "-1")
     _assert_one_cli_error(negative, "--since must be 0 or more")
+
+
+def test_watch_follow_from_now_skips_backlog(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+
+    # Nothing appended: the hello line alone.
+    idle, idle_sleeps = _watch_follow(
+        monkeypatch, "run-a", "--from-now", actions=[lambda: None]
+    )
+    assert idle.exit_code == 0, idle.output
+    assert idle_sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(idle) == [_hello(tmp_path)]
+
+    appended: list[dict[str, Any]] = []
+
+    def append_fourth() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [4]))
+
+    def append_fifth() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [5]))
+
+    # The last poll sees nothing new, so seq 5 must not repeat.
+    result, sleeps = _watch_follow(
+        monkeypatch,
+        "run-a",
+        "--from-now",
+        actions=[append_fourth, append_fifth, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS] * 3
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    assert lines[1:] == appended
+    assert [line["seq"] for line in lines[1:]] == [4, 5]
+    assert result.stderr == ""
+
+
+def test_watch_follow_all_from_now_skips_only_runs_present_at_start(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+    _write_watch_journal(tmp_path, "run-c", [1])  # present at start, never appended
+
+    def first_poll() -> None:
+        _append_watch_journal(tmp_path, "run-a", [3])
+        _write_watch_journal(tmp_path, "run-b", [1, 2])  # appears after the start
+
+    def second_poll() -> None:
+        _append_watch_journal(tmp_path, "run-a", [4])
+        _append_watch_journal(tmp_path, "run-b", [3])
+
+    result, sleeps = _watch_follow(
+        monkeypatch, "--all", "--from-now", actions=[first_poll, second_poll]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(sleeps) == 2
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    # Runs are read in sorted order on each poll: run-a, then run-b.
+    assert lines[1:] == [
+        _watch_line("run-a", 3),
+        _watch_line("run-b", 1),
+        _watch_line("run-b", 2),
+        _watch_line("run-a", 4),
+        _watch_line("run-b", 3),
+    ]
+    assert result.stderr == ""
+
+
+def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    third_a = json.dumps(_watch_line("run-a", 3), sort_keys=True)
+    first_d = json.dumps(_watch_line("run-d", 1), sort_keys=True)
+    # run-a: seqs 1-2 complete, seq 3 still being written at start.
+    _write_watch_journal(tmp_path, "run-a", [1, 2], tail=third_a[:20])
+    # run-d: only a torn first line at start, so it gets no seeded cursor.
+    _write_watch_journal(tmp_path, "run-d", [], tail=first_d[:20])
+
+    def finish_the_torn_lines() -> None:
+        for run_id, text in (("run-a", third_a), ("run-d", first_d)):
+            journal = _watch_runs_dir(tmp_path) / run_id / store_module.JOURNAL_NAME
+            with journal.open("a", encoding="utf-8") as handle:
+                handle.write(text[20:] + "\n")
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--all",
+        "--from-now",
+        actions=[lambda: None, finish_the_torn_lines, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _hello(tmp_path),
+        _watch_line("run-a", 3),
+        _watch_line("run-d", 1),
+    ]
