@@ -98,6 +98,14 @@ class Lease:
     `__exit__` wakes it at once. `__exit__` stops and joins it, then releases
     this token's claims, then this token's lease, on any exit, and never
     swallows the exception. A process that took the lease over keeps its rows.
+
+    `am run --detach` (card aff9fdbf) adds two things. `hand_off()` stops and
+    joins the heartbeat and unbinds the store but releases nothing; `__exit__`
+    then does nothing, so the token and its claims outlive this process for a
+    child to adopt. `adopt=token` enters around a token that already holds the
+    run: no `take_lease`, `Store.adopt_lease` instead (which refuses a token
+    that no longer holds it), one beat at once, then the heartbeat; its
+    `__exit__` releases exactly as above.
     """
 
     def __init__(
@@ -109,6 +117,7 @@ class Lease:
         clock: Callable[[], datetime] = _utcnow,
         pid: int | None = None,
         host: str | None = None,
+        adopt: str | None = None,
     ) -> None:
         self._store = store
         self._claims = tuple(claims)
@@ -116,23 +125,32 @@ class Lease:
         self._clock = clock
         self._pid = pid
         self._host = host
+        self._adopt = adopt
+        self._handed_off = False
         self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
         self.token = ""
         self.displaced: LeaseRow | None = None
 
     def __enter__(self) -> Lease:
-        self.token = uuid4().hex
-        now = self._clock()
-        taken = self._store.take_lease(
-            token=self.token,
-            pid=os.getpid() if self._pid is None else self._pid,
-            host=socket.gethostname() if self._host is None else self._host,
-            now=now,
-            is_live=lambda row: lease_is_live(row, now=now),
-            claims=self._claims,
-        )
-        self.displaced = taken.displaced
+        if self._adopt is None:
+            self.token = uuid4().hex
+            now = self._clock()
+            taken = self._store.take_lease(
+                token=self.token,
+                pid=os.getpid() if self._pid is None else self._pid,
+                host=socket.gethostname() if self._host is None else self._host,
+                now=now,
+                is_live=lambda row: lease_is_live(row, now=now),
+                claims=self._claims,
+            )
+            self.displaced = taken.displaced
+        else:
+            self.token = self._adopt
+            self._store.adopt_lease(self.token)
+            self.displaced = None
+            self.beat()
+        self._handed_off = False
         self._stopped.clear()
         self._thread = threading.Thread(
             target=self._keep_beating, name="am-lease-heartbeat", daemon=True
@@ -146,10 +164,10 @@ class Lease:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._stopped.set()
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+        if self._handed_off:
+            # The token and its claims now belong to the detached child.
+            return
+        self._stop_heartbeat()
         try:
             try:
                 self._store.release_claims(self.token)
@@ -159,6 +177,23 @@ class Lease:
             # This process no longer holds the run: stop fencing its writes to
             # a token that is gone, as M9's store never fenced them.
             self._store.bind_lease(None)
+
+    def hand_off(self) -> str:
+        """Stop beating and unbind the store, releasing nothing; return the token.
+
+        For `am run --detach`: called inside the `with` block, so the block's
+        exit leaves the lease row and its claims for the child to adopt.
+        """
+        self._stop_heartbeat()
+        self._store.bind_lease(None)
+        self._handed_off = True
+        return self.token
+
+    def _stop_heartbeat(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
     def beat(self) -> None:
         """Move this lease's heartbeat to `clock()`."""

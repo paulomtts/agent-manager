@@ -824,14 +824,86 @@ def diverging(lines: list[JournalLine], projection: models.Run) -> list[Mismatch
     return found
 
 
+class RunLease(BaseModel):
+    """The `lease` of one `am runs` entry: `am status`'s `control.lease`
+    without `acquired_at`.
+
+    Filled by `cli.runs_for`, never by `list_runs`: `live` is
+    `control.lease_is_live` at read time, and `control` imports this module,
+    so the reverse import would be circular. `pid`, `host` and `heartbeat_at`
+    are nullable to match the published type, though a real `run_leases` row
+    always fills them. `heartbeat_at` is an ISO string, as in `control_view`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    live: bool
+    pid: int | None
+    host: str | None
+    heartbeat_at: str | None
+    accepting: bool
+
+
+class ProgressCount(BaseModel):
+    """`done` of `total` rows at one level of a run's tree (`stories` or
+    `subtasks`). Only status `done` counts toward `done`; every other status,
+    `failed`, `escalated`, `stopped` and `cancelled` included, counts toward
+    `total` alone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    done: int
+    total: int
+
+
+class ProgressCurrent(BaseModel):
+    """The step a run is in, read from rows only: the `started` phase's
+    subtask `card`, its `phase` name, and the highest `attempt` number
+    recorded for that phase, or `None` before its first attempt row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    card: str
+    phase: str
+    attempt: int | None
+
+
+class RunProgress(BaseModel):
+    """The `progress` of one `am runs` entry, counted by `list_runs` from the
+    run's `stories`, `subtasks`, `phases` and `attempts` rows.
+
+    `current` is required: `None` is how it says no phase is `started`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stories: ProgressCount
+    subtasks: ProgressCount
+    current: ProgressCurrent | None
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
     A `models.Run` would be a lie here: its `stories` list would always be empty
-    because `runs` is the only table read. The fields are the run's identity and
-    nothing else, and they go through pydantic for the same reason `load_run`
-    does -- a projection that drifted from `models` must fail loudly rather than
-    print half a history.
+    because `runs` is the only table read for it. The fields are the run's
+    identity and nothing else, and they go through pydantic for the same reason
+    `load_run` does -- a projection that drifted from `models` must fail loudly
+    rather than print half a history.
+
+    `milestone_id` is the `runs` column: null on a `--card` run and on a row
+    written before the column existed. `card_id` is not stored anywhere on the
+    run row: it is the single subtask a `task` (`--card`) run records, and null
+    for any other workflow or before that subtask row is written. Both default
+    to `None`, so they are additive: no older key changed.
+
+    `lease` is the run's `run_leases` row as a `RunLease`, or `None` when the
+    run has no lease row. `list_runs` always leaves it `None`; `am runs`
+    fills it in `cli`. It too defaults to `None`, so it is additive.
+
+    `progress` is how far the run has got, counted from its tree rows as a
+    `RunProgress`. `list_runs` always fills it (a run with no tree rows is 0
+    of 0 with no `current`); it defaults to `None` only so that a
+    `RunSummary` built by hand stays valid, which keeps it additive.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -843,6 +915,53 @@ class RunSummary(BaseModel):
     branch_prefix: str
     status: models.Status
     started_at: datetime | None = None
+    milestone_id: str | None = None
+    card_id: str | None = None
+    lease: RunLease | None = None
+    progress: RunProgress | None = None
+
+
+def _progress_count(
+    conn: sqlite3.Connection, table: Literal["stories", "subtasks"], run_id: str
+) -> ProgressCount:
+    """`done` of `total` rows of `table` for one run. `table` is one of two
+    literals from this module, never user input, so formatting it in is safe.
+    `SUM` over no rows is NULL, hence the `COALESCE`."""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS total, COALESCE(SUM(status = 'done'), 0) AS done"
+        f" FROM {table} WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return ProgressCount(done=row["done"], total=row["total"])
+
+
+_CURRENT_PHASE_SQL = """
+SELECT phases.card_id AS card,
+       phases.name    AS phase,
+       (SELECT MAX(attempts.n) FROM attempts
+         WHERE attempts.run_id   = phases.run_id
+           AND attempts.story_id = phases.story_id
+           AND attempts.card_id  = phases.card_id
+           AND attempts.phase    = phases.name) AS attempt
+  FROM phases
+ WHERE phases.run_id = ? AND phases.status = 'started'
+ ORDER BY phases.started_at DESC, phases.story_id, phases.card_id, phases.position
+ LIMIT 1
+"""
+"""The run's in-flight phase: the `started` one that started last (a NULL
+`started_at` sorts last under `DESC`), ties broken by story, card, then
+position, with the highest attempt number of that phase, or NULL before its
+first attempt row."""
+
+
+def _run_progress(conn: sqlite3.Connection, run_id: str) -> RunProgress:
+    """One run's `RunProgress`, from read-only `SELECT`s on `conn`."""
+    row = conn.execute(_CURRENT_PHASE_SQL, (run_id,)).fetchone()
+    return RunProgress(
+        stories=_progress_count(conn, "stories", run_id),
+        subtasks=_progress_count(conn, "subtasks", run_id),
+        current=None if row is None else ProgressCurrent(**dict(row)),
+    )
 
 
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
@@ -855,12 +974,41 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     `started_at DESC` puts a NULL start time last (SQLite orders NULL below every
     value, so descending sends it to the end) and the id breaks a tie, which run
     ids minted at second resolution really do produce.
+
+    `card_id` is derived, not stored: a `task` run (`am run --card`) records one
+    story and one subtask, and that subtask's card is the run's card. Any other
+    workflow -- a milestone run records many subtasks -- gets NULL. Should a
+    `task` run ever hold several subtask rows, the lowest `position`, then the
+    lowest card id, wins, so the answer is stable rather than an error.
+
+    `progress` is counted here for every run, never left `None`, from plain
+    `SELECT`s over that run's `stories`, `subtasks`, `phases` and `attempts`
+    rows; nothing in it needs `control`. At each level `done` counts only
+    status `done` and `total` counts every row, so `failed`, `escalated`,
+    `stopped` and `cancelled` rows are in `total` alone. The synthetic
+    Integrate story and its resolver subtasks are rows like any other (`store`
+    cannot import `integration`, which imports it), so a milestone run that
+    resolved a conflict shows one story more than its milestone has.
+    `current` is the `started` phase that started last (see
+    `_CURRENT_PHASE_SQL`), or `None` when no phase is started. It is read
+    from rows, not from liveness: a run whose process died mid-phase still
+    shows the phase it stopped in, and `lease.live` tells whether anyone is
+    still working on it. A run with no tree rows is 0 of 0 with no `current`.
     """
     rows = conn.execute(
-        "SELECT id, workflow, repo_dir, base_branch, branch_prefix, status, started_at"
-        " FROM runs ORDER BY started_at DESC, id DESC"
+        "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
+        " runs.branch_prefix, runs.status, runs.started_at, runs.milestone_id,"
+        " CASE WHEN runs.workflow = 'task' THEN ("
+        "   SELECT subtasks.card_id FROM subtasks"
+        "    WHERE subtasks.run_id = runs.id"
+        "    ORDER BY subtasks.position, subtasks.card_id LIMIT 1"
+        " ) END AS card_id"
+        " FROM runs ORDER BY runs.started_at DESC, runs.id DESC"
     ).fetchall()
-    return [RunSummary.model_validate(dict(row)) for row in rows]
+    return [
+        RunSummary.model_validate({**dict(row), "progress": _run_progress(conn, row["id"])})
+        for row in rows
+    ]
 
 
 def latest_run_id(conn: sqlite3.Connection) -> str | None:
@@ -2058,6 +2206,38 @@ class Store:
             self._conn.execute(
                 "DELETE FROM run_leases WHERE run_id = ? AND token = ?",
                 (self.run_id, token),
+            )
+            self._conn.commit()
+
+    def adopt_lease(self, token: str) -> LeaseRow:
+        """Bind this store to `token`, which already holds this run's lease (card aff9fdbf).
+
+        For the detached child of `am run --detach`: the parent took the lease
+        and handed it off, so nothing is taken here. If the row is gone or
+        carries another token, `LeaseLostError` names the holder now in place
+        and the store stays unbound. Otherwise every run write is fenced by
+        `token` from here on, and the journal re-reads its highest `seq`, as
+        `take_lease` does, since the parent appended after this store opened.
+        """
+        with self._lock:
+            current = read_lease(self._conn, self.run_id)
+            if current is None or current.token != token:
+                raise LeaseLostError(self.run_id, current)
+            self.bind_lease(token)
+            self._journal.reseek()
+            return current
+
+    def set_lease_holder(self, token: str, *, pid: int, host: str) -> None:
+        """Name `pid` on `host` as this run's lease holder, if `token` still holds it.
+
+        The parent of `am run --detach` points the row at its child before it
+        prints, so `am runs` and `am status` judge the child's liveness. Any
+        other token is a silent no-op, like `beat` and `close_window`.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run_leases SET pid = ?, host = ? WHERE run_id = ? AND token = ?",
+                (pid, host, self.run_id, token),
             )
             self._conn.commit()
 

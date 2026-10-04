@@ -13,16 +13,20 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 """
 
 import asyncio
+import dataclasses
 import io
 import inspect
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +43,7 @@ from agent_manager import (
     cli,
     control,
     dag,
+    detach,
     dispatch,
     integration,
     locks,
@@ -3600,6 +3605,43 @@ def test_an_empty_board_dry_runs_to_no_levels_and_exits_zero(tmp_path, monkeypat
     }
 
 
+def test_the_board_dry_run_data_has_exactly_its_keys_and_no_ok_or_run_id(tmp_path, monkeypatch):
+    """Card a7fcc076: the `--board --dry-run` shape, pinned for the README.
+
+    `data` is exactly `{board, max_concurrent, levels}`; each level is
+    `{level, milestones}`; each milestone is exactly `{milestone_id, title,
+    branch_prefix, plan}`, and `plan` is that milestone's `dry_run_payload`
+    (`{max_concurrent, levels, already_done, integrate}`). `ok` is only on
+    the envelope, never inside `data`, and nothing carries a `run_id`: a
+    preview mints no run and opens no Store."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(first.id,))
+    _serve_roots(monkeypatch, [first, second])
+    _forbid_board_dry_run_writes(monkeypatch)
+
+    result = _board_dry_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert set(envelope) == {"ok", "data"}
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"board", "max_concurrent", "levels"}
+    assert "ok" not in data
+    assert "run_id" not in data
+    assert data["board"] is True
+    assert [set(level) for level in data["levels"]] == [{"level", "milestones"}] * 2
+    entries = [entry for level in data["levels"] for entry in level["milestones"]]
+    assert [entry["milestone_id"] for entry in entries] == [first.id, second.id]
+    for entry in entries:
+        assert set(entry) == {"milestone_id", "title", "branch_prefix", "plan"}
+        assert set(entry["plan"]) == {"max_concurrent", "levels", "already_done", "integrate"}
+        assert "ok" not in entry["plan"]
+        assert "run_id" not in entry["plan"]
+    assert list(paths.data_dir().iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "roots, error_type",
     [
@@ -3771,6 +3813,45 @@ def test_a_board_run_prints_run_boards_payload_in_the_ok_envelope(tmp_path, monk
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
+def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypatch):
+    """Card a7fcc076: `am run --board` prints `{"ok": true, "data": payload}`
+    with `run_board`'s payload untouched: `data` is exactly `{ok, board,
+    levels, milestones}`, with no board-level `run_id`, and the done,
+    escalated and blocked entries keep their own key sets. The envelope's
+    `ok` stays true when `data.ok` is false: an escalation is a truthful
+    result, reported through the exit code."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    done_id, escalated_id, blocked_id = _plan_id(1), _plan_id(2), _plan_id(3)
+    payload = {
+        "ok": False,
+        "board": True,
+        "levels": [
+            {"level": 0, "milestones": [done_id, escalated_id]},
+            {"level": 1, "milestones": [blocked_id]},
+        ],
+        "milestones": [
+            {
+                "milestone_id": done_id,
+                "status": "done",
+                "done": True,
+                "run_id": "20261001T000000Z-00000001",
+            },
+            {"milestone_id": escalated_id, "status": "escalated", "error": "RuntimeError: boom"},
+            {"milestone_id": blocked_id, "status": "blocked", "blocked_by": [escalated_id]},
+        ],
+    }
+    _patch_run_board(monkeypatch, payload)
+
+    result = _board_run(tmp_path)
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    envelope = json.loads(result.stdout)
+    # Exact equality is the whole pin: any key the CLI adds, drops or renames
+    # (a board-level `run_id`, say) breaks it. The payload's own key sets are
+    # pinned against the real `run_board` in test_orchestrate.py.
+    assert envelope == {"ok": True, "data": payload}
+
+
 @pytest.mark.parametrize(
     "statuses, exit_code",
     [
@@ -3898,20 +3979,25 @@ def _record(
     started_at: datetime,
     status: str = "done",
     with_phases: bool = True,
+    workflow: str = "task",
+    milestone_id: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
-    in `root`'s projection, written the only way this program writes rows."""
+    in `root`'s projection, written the only way this program writes rows. The
+    defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
+    `milestone_id` for a milestone-shaped one."""
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
                 id=run_id,
-                workflow="task",
+                workflow=workflow,
                 repo_dir=root,
                 base_branch="main",
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
+                milestone_id=milestone_id,
             )
         )
         opened.record_story(
@@ -4143,6 +4229,382 @@ def test_runs_agrees_with_status_about_the_most_recent_run(projection):
     assert listed["data"]["runs"][0]["id"] == reported["data"]["run"]["id"]
 
 
+RUNS_ENTRY_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "milestone_id",
+    "card_id",
+    "lease",
+    "progress",
+}
+"""Every `data.runs[]` entry: the seven names `am runs` always had, plus
+`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74) and
+`progress` (card 882b212b)."""
+
+RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
+"""A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
+`acquired_at`."""
+
+RUNS_MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
+
+
+def test_runs_shows_a_card_runs_card_id_and_a_null_milestone_id(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["card_id"] == "card-1"
+    assert entry["milestone_id"] is None
+
+
+def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection):
+    """`_record` writes a subtask row under the milestone run too, so this also
+    pins that a milestone run never reports one of its subtasks as `card_id`."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["workflow"] == "milestone"
+    assert entry["milestone_id"] == RUNS_MILESTONE_ID
+    assert entry["card_id"] is None
+
+
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_and_progress(projection):
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+    )
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        assert set(envelope) == {"ok", "data"}
+        assert envelope["ok"] is True
+        assert set(envelope["data"]) == {"runs"}
+        assert len(envelope["data"]["runs"]) == 2
+        for entry in envelope["data"]["runs"]:
+            assert set(entry) == RUNS_ENTRY_KEYS
+
+
+RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"
+"""A second run, started after `CONTROL_RUN_ID`'s `RECORDED_AT`, so it lists first."""
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid, host, accepting",
+    [
+        (0, None, None, True),
+        (-30, None, None, True),
+        (-5, 0, "elsewhere.invalid", True),
+        (-5, None, None, False),
+    ],
+    ids=["fresh-here", "boundary-30s", "other-host-unprobed-pid", "not-accepting"],
+)
+def test_runs_shows_a_live_lease(
+    projection, monkeypatch, heartbeat_offset, pid, host, accepting
+):
+    """Spec test 1, plus Review Focus: the 30s boundary is inclusive, another
+    host's pid is never probed here, and a closed control window still reads
+    live. `pid`/`host` `None` mean `_plant_lease`'s default: this process,
+    this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(
+        projection,
+        pid=pid,
+        host=host,
+        heartbeat_at=_at(heartbeat_offset),
+        accepting=accepting,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": True,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE if host is None else host,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": accepting,
+    }
+
+
+@pytest.mark.parametrize(
+    "heartbeat_offset, pid",
+    [
+        (-31, None),
+        (-5, 0),
+    ],
+    ids=["stale-heartbeat", "dead-pid-here"],
+)
+def test_runs_shows_a_dead_lease_with_its_fields_still_filled(
+    projection, monkeypatch, heartbeat_offset, pid
+):
+    """Spec test 2. Pid 0 is never alive (`control.pid_alive`), so no process
+    has to be spawned and reaped to get a dead pid on this host."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, pid=pid, heartbeat_at=_at(heartbeat_offset))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["lease"] == {
+        "live": False,
+        "pid": os.getpid() if pid is None else pid,
+        "host": HERE,
+        "heartbeat_at": _at(heartbeat_offset).isoformat(),
+        "accepting": True,
+    }
+
+
+def test_runs_shows_a_null_lease_for_a_run_with_no_lease_row(projection, monkeypatch):
+    """Spec test 3: no row is `null`, not an error and not a missing key."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    assert '"lease":null' in result.stdout
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert "lease" in entry
+    assert entry["lease"] is None
+
+
+@pytest.mark.parametrize("heartbeat_offset", [-5, -31], ids=["live", "stale"])
+def test_runs_lease_is_status_control_lease_without_acquired_at(
+    projection, monkeypatch, heartbeat_offset
+):
+    """Spec test 4: one computation, two commands, no drift."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(heartbeat_offset))
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+    reported = runner.invoke(
+        cli.app, ["status", CONTROL_RUN_ID, "--repo-dir", str(projection)]
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert reported.exit_code == 0, reported.output
+    [entry] = json.loads(listed.stdout)["data"]["runs"]
+    status_lease = json.loads(reported.stdout)["data"]["control"]["lease"]
+    assert "acquired_at" in status_lease
+    assert entry["lease"] == {
+        key: value for key, value in status_lease.items() if key != "acquired_at"
+    }
+
+
+def test_runs_lease_has_exactly_the_five_keys_plain_and_pretty(projection, monkeypatch):
+    """Spec test 5: the shape pin, beside `RUNS_ENTRY_KEYS`'s own."""
+    _freeze_clock(monkeypatch)
+    _plant_run(projection)
+    _plant_lease(projection)
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        [entry] = envelope["data"]["runs"]
+        assert set(entry) == RUNS_ENTRY_KEYS
+        assert set(entry["lease"]) == RUNS_LEASE_KEYS
+        assert isinstance(entry["lease"]["live"], bool)
+        assert isinstance(entry["lease"]["pid"], int)
+        assert isinstance(entry["lease"]["host"], str)
+        assert isinstance(entry["lease"]["heartbeat_at"], str)
+        assert isinstance(entry["lease"]["accepting"], bool)
+
+
+def test_runs_attaches_each_runs_own_lease_and_reads_the_clock_once(
+    projection, monkeypatch
+):
+    """Review Focus: a run without a lease row never inherits its neighbour's,
+    and the whole listing is judged against one instant."""
+    calls: list[datetime] = []
+
+    def counting_now() -> datetime:
+        calls.append(CONTROL_NOW)
+        return CONTROL_NOW
+
+    monkeypatch.setattr(cli, "_utcnow", counting_now)
+    _plant_run(projection)
+    _record(
+        projection,
+        RUNS_NEWER_RUN_ID,
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+        with_phases=False,
+    )
+    _plant_lease(projection, run_id=CONTROL_RUN_ID, heartbeat_at=_at(-31))
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)["data"]["runs"]
+    assert [entry["id"] for entry in entries] == [RUNS_NEWER_RUN_ID, CONTROL_RUN_ID]
+    assert entries[0]["lease"] is None
+    assert entries[1]["lease"] is not None
+    assert entries[1]["lease"]["live"] is False
+    assert entries[1]["lease"]["heartbeat_at"] == _at(-31).isoformat()
+    assert len(calls) == 1
+
+
+RUNS_PROGRESS_KEYS = {"stories", "subtasks", "current"}
+RUNS_PROGRESS_COUNT_KEYS = {"done", "total"}
+RUNS_PROGRESS_CURRENT_KEYS = {"card", "phase", "attempt"}
+"""`data.runs[].progress` (card 882b212b), its two counts, and a non-null `current`."""
+
+
+def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
+    """`_record`'s `card-1` given a third phase, `implement`, still `started`,
+    with `attempts` attempt rows numbered from 1."""
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(
+                name="implement", kind="agent", status="started", started_at=RECORDED_AT
+            ),
+        )
+        for n in range(1, attempts + 1):
+            opened.record_attempt(
+                "story-1",
+                "card-1",
+                "implement",
+                models.Attempt(n=n, dispatch=_recorded_dispatch(run_id)),
+            )
+    finally:
+        opened.close()
+
+
+def _record_bare_run(root: Path, run_id: str, *, started_at: datetime) -> None:
+    """A run row with nothing below it: a run that never got past starting."""
+    opened = store_module.Store.open(root, run_id)
+    try:
+        opened.record_run(
+            models.Run(
+                id=run_id,
+                workflow="task",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix="m1",
+                status="started",
+                started_at=started_at,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def test_runs_progress_has_exactly_its_keys_plain_and_pretty(projection):
+    """The shape pin for `progress`, beside `RUNS_ENTRY_KEYS`'s own: one run
+    with a `current`, one without."""
+    in_flight = "20260923T090000Z-cbe34d00"
+    _record(projection, in_flight, started_at=RECORDED_AT, status="started")
+    _record_started_phase(projection, in_flight, attempts=1)
+    _record(
+        projection,
+        "20260921T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    argv = ["runs", "--repo-dir", str(projection)]
+
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
+        entries = envelope["data"]["runs"]
+        assert [entry["progress"]["current"] is None for entry in entries] == [False, True]
+        for entry in entries:
+            assert set(entry) == RUNS_ENTRY_KEYS
+            progress = entry["progress"]
+            assert set(progress) == RUNS_PROGRESS_KEYS
+            for level in ("stories", "subtasks"):
+                assert set(progress[level]) == RUNS_PROGRESS_COUNT_KEYS
+                assert all(type(progress[level][key]) is int for key in RUNS_PROGRESS_COUNT_KEYS)
+            if progress["current"] is not None:
+                assert set(progress["current"]) == RUNS_PROGRESS_CURRENT_KEYS
+                assert isinstance(progress["current"]["card"], str)
+                assert isinstance(progress["current"]["phase"], str)
+                assert type(progress["current"]["attempt"]) is int
+
+
+def test_runs_shows_a_fixture_runs_progress(projection):
+    """Exact values through the CLI: a run in flight, a finished one, and one
+    with no tree rows at all, which is the zero shape and never `null`."""
+    in_flight = "20260923T090000Z-cbe34d00"
+    finished = "20260922T090000Z-cbe34d00"
+    bare = "20260921T090000Z-cbe34d00"
+    _record(projection, in_flight, started_at=RECORDED_AT, status="started")
+    _record_started_phase(projection, in_flight, attempts=2)
+    _record(
+        projection,
+        finished,
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+    )
+    _record_bare_run(
+        projection, bare, started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)["data"]["runs"]
+    assert [entry["id"] for entry in entries] == [in_flight, finished, bare]
+    assert {entry["id"]: entry["progress"] for entry in entries} == {
+        in_flight: {
+            "stories": {"done": 0, "total": 1},
+            "subtasks": {"done": 0, "total": 1},
+            "current": {"card": "card-1", "phase": "implement", "attempt": 2},
+        },
+        finished: {
+            "stories": {"done": 1, "total": 1},
+            "subtasks": {"done": 1, "total": 1},
+            "current": None,
+        },
+        bare: {
+            "stories": {"done": 0, "total": 0},
+            "subtasks": {"done": 0, "total": 0},
+            "current": None,
+        },
+    }
+
+
 def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     missing = tmp_path / "missing"
@@ -4173,14 +4635,24 @@ def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, mo
 
 
 def _write_logs_attempt(
-    run_id: str, phase: str, n: int, *, stdout: bool = True
+    run_id: str,
+    phase: str,
+    n: int,
+    *,
+    stdout: bool = True,
+    status: str | None = None,
 ) -> models.Attempt:
     """One attempt's three files on disk, plus the row that points at them.
 
     The *test* calls `paths.attempt_dir` -- which creates the directory -- because
     in production `dispatch.AgentRunner` is what creates it. `logs` itself must
     never call it, and `test_logs_writes_nothing` is what pins that.
+
+    `status=None` keeps the long-standing default (`gate_failed` for attempt 1,
+    `ok` after it). A `started` attempt has no exit code yet.
     """
+    if status is None:
+        status = "ok" if n > 1 else "gate_failed"
     directory = paths.attempt_dir(run_id, "card-1", phase, n)
     (directory / "prompt.txt").write_text(f"prompt for {phase}.{n}\n", encoding="utf-8")
     (directory / "result.json").write_text(
@@ -4191,19 +4663,28 @@ def _write_logs_attempt(
     return models.Attempt(
         n=n,
         dispatch=_recorded_dispatch(run_id),
-        status="ok" if n > 1 else "gate_failed",
-        exit_code=0 if n > 1 else 1,
+        status=status,
+        exit_code=None if status == "started" else (0 if status == "ok" else 1),
         prompt_path=directory / "prompt.txt",
         result_path=directory / "result.json",
         stdout_path=directory / "stdout.log",
     )
 
 
-def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
+def _record_for_logs(
+    root: Path,
+    run_id: str,
+    *,
+    stdout: bool = True,
+    implement_status: str | None = None,
+) -> None:
     """A run with two agent phases (two attempts, then one) and a pending phase.
 
     The trailing `verify` phase has no attempts, so the no-flag default has to
-    skip it to reach `implement`.
+    skip it to reach `implement`. `implement_status` sets `implement.1`'s
+    status; `None` keeps the default `gate_failed`, which is terminal, so a
+    `logs --follow` test that needs the stream to keep polling passes
+    `"started"`.
     """
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4245,7 +4726,9 @@ def _record_for_logs(root: Path, run_id: str, *, stdout: bool = True) -> None:
             "story-1",
             "card-1",
             "implement",
-            _write_logs_attempt(run_id, "implement", 1, stdout=stdout),
+            _write_logs_attempt(
+                run_id, "implement", 1, stdout=stdout, status=implement_status
+            ),
         )
         opened.record_phase(
             "story-1",
@@ -4613,6 +5096,1013 @@ def test_logs_for_a_deterministic_phase_writes_nothing(projection):
     assert result.exit_code == 0
     assert _runs_snapshot() == tree_before
     assert _attempt_rows(projection) == rows_before
+
+
+def _implement_stdout() -> Path:
+    """Where `_record_for_logs` puts `implement.1`'s stdout, read-only."""
+    return paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1) / "stdout.log"
+
+
+def test_logs_without_follow_unchanged(projection):
+    """Card 4.1: without `--follow`, `logs` is still exactly one envelope."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+
+    result = runner.invoke(
+        cli.app, ["logs", LOGS_RUN_ID, "card-1", "--repo-dir", str(projection)]
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert set(envelope) == {"ok", "data"}
+    assert "event" not in envelope
+    assert "offset" not in envelope["data"]
+    assert envelope["data"]["artifacts"]["stdout"]["text"] == "stdout of implement.1\n"
+
+
+def test_select_logs_names_the_file_a_follow_reads(projection):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    step_dir = _write_step_logs(LOGS_RUN_ID, 1)
+
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert agent.phase.name == "implement"
+    assert agent.attempt is not None
+    assert agent.attempt.n == 1
+    assert agent.followed_path() == _implement_stdout()
+    assert agent.payload() == cli.logs_for(LOGS_RUN_ID, "card-1", repo_dir=projection)
+
+    step = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify")
+    assert step.phase.name == "verify"
+    assert step.attempt is None
+    assert step.step_attempt == 1
+    assert step.followed_path() == step_dir / "stdout.log"
+    assert step.payload() == cli.logs_for(
+        LOGS_RUN_ID, "card-1", repo_dir=projection, phase="verify"
+    )
+
+
+def test_logs_selection_without_attempt_or_step_names_nothing(projection):
+    """A selection carrying neither an `Attempt` row nor a step directory
+    names no file to follow and refuses to build a payload."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    agent = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    empty = cli.LogsSelection(
+        run=agent.run,
+        story=agent.story,
+        subtask=agent.subtask,
+        phase=agent.phase,
+        attempt=None,
+    )
+
+    assert empty.followed_path() is None
+    with pytest.raises(cli.CliError, match="neither an attempt row nor a step"):
+        empty.payload()
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (b"", 0),
+        (b"abc", 3),
+        ("é".encode(), 2),
+        ("é".encode()[:1], 0),
+        (b"caf\xc3", 3),
+        (b"x" + "€".encode()[:2], 1),
+        (b"x" + "€".encode(), 4),
+        (b"ab" + "😀".encode()[:3], 2),
+        (b"ab" + "😀".encode(), 6),
+    ],
+)
+def test_utf8_complete_length_holds_back_only_a_truncated_tail(data, expected):
+    assert cli._utf8_complete_length(data) == expected
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"ok\xff", b"ok\xc0", b"\x80\x80\x80\x80", b"ok\x80"],
+)
+def test_utf8_complete_length_never_holds_back_invalid_bytes(data):
+    """A byte that cannot start a sequence is emitted (as U+FFFD), so an
+    invalid tail can never stall the stream."""
+    assert cli._utf8_complete_length(data) == len(data)
+
+
+def test_read_log_bytes_reads_from_the_offset(tmp_path):
+    log = tmp_path / "stdout.log"
+    log.write_bytes(b"0123456789")
+
+    assert cli._read_log_bytes(log, 0) == b"0123456789"
+    assert cli._read_log_bytes(log, 4) == b"456789"
+    assert cli._read_log_bytes(log, 10) == b""
+    assert cli._read_log_bytes(log, 50) == b""
+
+
+def test_read_log_bytes_is_empty_for_anything_unreadable(tmp_path):
+    assert cli._read_log_bytes(None, 0) == b""
+    assert cli._read_log_bytes(tmp_path / "missing.log", 0) == b""
+    assert cli._read_log_bytes(tmp_path, 0) == b""
+    assert not (tmp_path / "missing.log").exists()
+
+
+def _logs_follow(monkeypatch, *args: str, actions=(), follow: bool = True):
+    """Run `am logs ARGS --follow` for exactly `len(actions)` polls after the backlog.
+
+    Modelled on `_watch_follow`: sleep `i` runs `actions[i]` (an append, a
+    truncate, a Ctrl-C) before poll `i` reads. `follow=False` drops the flag
+    so the refusal of `--since-offset` alone can be driven through the same
+    helper. Returns the result and the seconds each sleep was asked for.
+    """
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        actions[len(sleeps) - 1]()
+
+    monkeypatch.setattr(cli, "_watch_sleep", fake_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", len(actions))
+    argv = ["logs", *args, *(["--follow"] if follow else [])]
+    return runner.invoke(cli.app, argv), sleeps
+
+
+def _logs_args(projection: Path, *extra: str) -> list[str]:
+    return [LOGS_RUN_ID, "card-1", *extra, "--repo-dir", str(projection)]
+
+
+def _logs_hello_line(path: Path, offset: int = 0) -> dict[str, Any]:
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _assert_contiguous(chunks: list[dict[str, Any]], start: int) -> int:
+    """Each chunk starts where the last ended, in bytes; none is empty.
+
+    Only for valid UTF-8 content: a U+FFFD from replacement re-encodes to a
+    different byte length than the bytes it replaced.
+    """
+    cursor = start
+    for chunk in chunks:
+        assert set(chunk) == {"offset", "text"}, chunk
+        assert chunk["offset"] == cursor, chunks
+        assert chunk["text"], chunks
+        cursor += len(chunk["text"].encode("utf-8"))
+    return cursor
+
+
+def test_logs_follow_hello_shape(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    result, sleeps = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == []
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    assert all("ok" not in line for line in lines)
+    assert all("event" not in line for line in lines[1:])
+    assert result.stdout.endswith("\n")
+    assert all(": " not in text for text in result.stdout.splitlines())
+    assert result.stderr == ""
+
+    # `--pretty` only shapes a refusal: the stream is byte-for-byte the same.
+    pretty, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--pretty"))
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_logs_follow_streams_backlog_with_offsets(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    content = "first line\nsecond líne\n€uro\n"
+    _implement_stdout().write_bytes(content.encode("utf-8"))
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout())
+    chunks = lines[1:]
+    assert chunks[0]["offset"] == 0
+    assert "".join(chunk["text"] for chunk in chunks) == content
+    assert _assert_contiguous(chunks, 0) == len(content.encode("utf-8"))
+
+
+def test_logs_follow_multibyte_not_split(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"caf\xc3")  # the first byte of "é" only
+
+    def finish_the_character() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"\xa9 ok\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[finish_the_character, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    chunks = _stream(result)[1:]
+    assert chunks == [
+        {"offset": 0, "text": "caf"},
+        {"offset": 3, "text": "é ok\n"},
+    ]
+    assert all("�" not in chunk["text"] for chunk in chunks)
+    assert _assert_contiguous(chunks, 0) == stdout.stat().st_size
+
+
+def test_logs_follow_since_offset_resumes(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    content = _implement_stdout().read_bytes()
+    assert content == b"stdout of implement.1\n"
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--since-offset", "10"))
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines[0] == _logs_hello_line(_implement_stdout(), 10)
+    assert lines[1:] == [{"offset": 10, "text": content[10:].decode("utf-8")}]
+
+
+def test_logs_follow_picks_up_appended_data(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"more\n")
+
+    # Poll 1 sees the append; poll 2 sees nothing new, so it must not repeat.
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    lines = _stream(result)
+    assert lines[1:] == [
+        {"offset": 0, "text": original.decode("utf-8")},
+        {"offset": len(original), "text": "more\n"},
+    ]
+    assert all(line.get("event") != "end" for line in lines)
+
+
+def test_logs_follow_waits_for_missing_file(projection, monkeypatch):
+    _record_for_logs(
+        projection, LOGS_RUN_ID, stdout=False, implement_status="started"
+    )
+    stdout = _implement_stdout()
+
+    def still_absent() -> None:
+        assert not stdout.exists()
+
+    def create_it() -> None:
+        stdout.write_bytes(b"late\n")
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection),
+        actions=[still_absent, create_it, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": "late\n"},
+    ]
+
+
+def test_logs_follow_deterministic_phase_follows_stdout_log(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _write_step_logs(LOGS_RUN_ID, 1)
+    second = _write_step_logs(LOGS_RUN_ID, 2)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection, "--phase", "verify"))
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(second / "stdout.log"),
+        {"offset": 0, "text": "==> uv run pytest (exit 1)\nstdout of verify.2\n"},
+    ]
+
+
+def test_logs_follow_writes_nothing(projection, monkeypatch):
+    """`logs --follow` is read-only like `logs`: a missing stdout file is
+    waited on, never created; the per-read status re-lookup creates nothing,
+    whether it finds the attempt running or over; a refusal mints no run
+    directory."""
+    _record_for_logs(
+        projection, LOGS_RUN_ID, stdout=False, implement_status="started"
+    )
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    polling, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None]
+    )
+    assert polling.exit_code == 0, polling.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert all(line.get("event") != "end" for line in _stream(polling))
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not _implement_stdout().exists()
+
+    # The test, not `logs`, records the terminal status; snapshot after it.
+    _set_implement_status(projection, "harness_error")
+    tree_before = _runs_snapshot()
+    rows_before = _attempt_rows(projection)
+
+    ended = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+    assert ended.exit_code == 0, ended.output
+    assert _stream(ended)[-1] == _end_line("harness_error")
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not _implement_stdout().exists()
+
+    refusal, _ = _logs_follow(
+        monkeypatch, "no-such-run", "card-1", "--repo-dir", str(projection)
+    )
+    assert refusal.exit_code == cli.EXIT_ERROR
+    assert _runs_snapshot() == tree_before
+    assert _attempt_rows(projection) == rows_before
+    assert not (paths.data_dir() / "runs" / "no-such-run").exists()
+
+
+def test_logs_follow_since_offset_beyond_end_waits(projection, monkeypatch):
+    """Review Focus 2: a cursor past EOF is not an error; bytes appear once
+    the file grows past it, starting exactly at the cursor."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+
+    def grow_short_of_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"a" * (500 - size))
+
+    def grow_past_the_cursor() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"b" * 505)
+
+    result, _ = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", "1000"),
+        actions=[grow_short_of_the_cursor, grow_past_the_cursor],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(stdout, 1000),
+        {"offset": 1000, "text": "bbbbb"},
+    ]
+
+
+def test_logs_follow_truncated_file_emits_nothing_new(projection, monkeypatch):
+    """Review Focus 3: a file cut below the cursor is no crash and no rewind;
+    bytes below the cursor are never re-emitted."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def truncate() -> None:
+        stdout.write_bytes(b"")
+
+    def rewrite_shorter() -> None:
+        stdout.write_bytes(b"new\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[truncate, rewrite_shorter]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": original.decode("utf-8")},
+    ]
+
+
+def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
+    """Review Focus 1: invalid UTF-8 becomes U+FFFD, and the next offset
+    still counts raw bytes, not decoded characters."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    stdout.write_bytes(b"ok\xff\xfe\n")
+
+    def append_more() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"next\n")
+
+    result, _ = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[append_more]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result)[1:] == [
+        {"offset": 0, "text": "ok��\n"},
+        {"offset": 5, "text": "next\n"},
+    ]
+
+
+def _record_review_without_stdout_path(root: Path) -> None:
+    """Add an agent `review` phase whose one attempt recorded no stdout path."""
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_phase(
+            "story-1", "card-1", models.PhaseRun(name="review", kind="agent", status="failed")
+        )
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "review",
+            models.Attempt(
+                n=1, dispatch=_recorded_dispatch(LOGS_RUN_ID), status="harness_error"
+            ),
+        )
+    finally:
+        opened.close()
+
+
+@pytest.mark.parametrize(
+    ("argv", "follow", "kind", "message"),
+    [
+        (["no-such-run", "card-1"], True, "UnknownRunError", None),
+        ([LOGS_RUN_ID, "card-9"], True, "UnknownCardError", None),
+        ([LOGS_RUN_ID, "card-1", "--phase", "reveiw"], True, "UnknownPhaseError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "explore", "--attempt", "9"],
+            True,
+            "UnknownAttemptError",
+            None,
+        ),
+        ([LOGS_RUN_ID, "card-1", "--phase", "verify"], True, "UnknownAttemptError", None),
+        (
+            [LOGS_RUN_ID, "card-1", "--phase", "review"],
+            True,
+            "CliError",
+            "attempt 1 of phase 'review' of card 'card-1' recorded no stdout path,"
+            " so there is no file to follow",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "-1"],
+            True,
+            "CliError",
+            "--since-offset must be 0 or more, got -1",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "0"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+        (
+            [LOGS_RUN_ID, "card-1", "--since-offset", "5"],
+            False,
+            "CliError",
+            "--since-offset needs --follow: it resumes a stream,"
+            " and without --follow there is no stream",
+        ),
+    ],
+)
+def test_logs_follow_refusals(projection, monkeypatch, argv, follow, kind, message):
+    _record_for_logs(projection, LOGS_RUN_ID)
+    _record_review_without_stdout_path(projection)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *argv,
+        "--repo-dir",
+        str(projection),
+        actions=[lambda: None],
+        follow=follow,
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == []
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert "event" not in envelope
+    assert envelope["error"]["type"] == kind
+    if message is not None:
+        assert envelope["error"]["message"] == message
+
+
+def test_logs_follow_ctrl_c_exits_zero(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    def press_ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[press_ctrl_c])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_closed_pipe_exits_zero_quietly(projection, monkeypatch):
+    """Review Focus 4: `am logs ... --follow | head -1`."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    real_emit = cli._emit_stream_line
+    emitted: list[Any] = []
+
+    def emit_into_a_closed_pipe(obj) -> None:
+        emitted.append(obj)
+        if len(emitted) == 2:  # the reader went away after the hello line
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_into_a_closed_pipe)
+
+    result, _ = _logs_follow(monkeypatch, *_logs_args(projection), actions=[lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [_logs_hello_line(_implement_stdout())]
+
+
+def test_logs_follow_mid_stream_error_goes_to_stderr(projection, monkeypatch):
+    """Review Focus 5: after the hello no envelope can follow, so a handled
+    error is one stderr line and exit 3, as `watch --follow` does."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_fail(path, offset):
+        reads.append(offset)
+        if len(reads) == 2:
+            raise cli.CliError("the log went away")
+        return real_read(path, offset)
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_fail)
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None, lambda: None]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert len(sleeps) == 1  # the stream ended on the failing poll
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+    assert result.stderr == "am logs: the log went away\n"
+
+
+def _verify_phase(status: str) -> tuple[models.SubtaskRun, models.PhaseRun]:
+    subtask = models.SubtaskRun(card_id="card-1", branch="m1/task-x", base_branch="main")
+    return subtask, models.PhaseRun(name="verify", kind="deterministic", status=status)
+
+
+@pytest.mark.parametrize(
+    ("status", "recorded", "n", "expected"),
+    [
+        ("done", [1, 2], 2, "ok"),
+        ("failed", [1, 2], 2, "gate_failed"),
+        ("escalated", [1], 1, "gate_failed"),
+        ("stopped", [1], 1, "gate_failed"),
+        ("cancelled", [1], 1, "gate_failed"),
+        ("started", [1, 2], 1, "gate_failed"),
+        ("done", [1, 2], 1, "gate_failed"),
+        ("pending", [1], 1, None),
+        ("started", [1], 1, None),
+    ],
+    ids=[
+        "latest-done",
+        "latest-failed",
+        "latest-escalated",
+        "latest-stopped",
+        "latest-cancelled",
+        "superseded-while-started",
+        "superseded-while-done",
+        "latest-pending",
+        "latest-started",
+    ],
+)
+def test_step_end_status(status, recorded, n, expected):
+    """Card 4.2's mapping for a deterministic phase: superseded or failed is
+    `gate_failed`, latest and `done` is `ok`, latest and running is `None`."""
+    subtask, phase = _verify_phase(status)
+
+    assert cli.step_end_status(subtask, phase, n, recorded) == expected
+
+
+@pytest.mark.parametrize(("n", "recorded"), [(3, [1, 2]), (1, [])])
+def test_step_end_status_refuses_an_attempt_no_longer_on_disk(n, recorded):
+    """Review Focus 5: the followed `<phase>.N` directory is gone, so the
+    re-lookup refuses instead of reporting an end it cannot know."""
+    subtask, phase = _verify_phase("done")
+
+    with pytest.raises(cli.UnknownAttemptError, match=f"has no attempt {n} any more"):
+        cli.step_end_status(subtask, phase, n, recorded)
+
+
+def _logs_follow_no_wait(monkeypatch, *args: str):
+    """Run `am logs ARGS --follow` with no poll bound and a sleep that fails.
+
+    For an attempt that is already over: the stream must drain and end on
+    its own, so any sleep is a bug, and an unbounded loop would hang rather
+    than pass. `pytest.fail` raises a `BaseException`, which `CliRunner`
+    does not swallow.
+    """
+
+    def no_sleep(seconds: float) -> None:
+        pytest.fail(f"the stream slept {seconds}s on an attempt that is already over")
+
+    monkeypatch.setattr(cli, "_watch_sleep", no_sleep)
+    monkeypatch.setattr(cli, "WATCH_MAX_POLLS", None)
+    return runner.invoke(cli.app, ["logs", *args, "--follow"])
+
+
+def _set_implement_status(root: Path, status: str) -> None:
+    """Re-record `implement.1` with `status`, as the runner's terminal write
+    does. Test-side only: it opens a `Store`, which `logs` must never do."""
+    directory = paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1)
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_attempt(
+            "story-1",
+            "card-1",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_recorded_dispatch(LOGS_RUN_ID),
+                status=status,
+                exit_code=None if status == "started" else (0 if status == "ok" else 1),
+                prompt_path=directory / "prompt.txt",
+                result_path=directory / "result.json",
+                stdout_path=directory / "stdout.log",
+            ),
+        )
+    finally:
+        opened.close()
+
+
+def _set_verify_status(root: Path, status: str) -> None:
+    """Re-record the deterministic `verify` phase with `status`."""
+    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    try:
+        opened.record_phase(
+            "story-1",
+            "card-1",
+            models.PhaseRun(name="verify", kind="deterministic", status=status),
+        )
+    finally:
+        opened.close()
+
+
+def _end_line(status: str) -> dict[str, Any]:
+    return {"event": "end", "status": status}
+
+
+@pytest.mark.parametrize("status", ["ok", "schema_invalid", "gate_failed", "harness_error"])
+def test_logs_follow_ends_on_terminal_status(projection, monkeypatch, status):
+    """Card 4.2: bytes appended just before the status flips are still
+    streamed, then `end` carries the attempt's status and the exit is 0."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    original = stdout.read_bytes()
+
+    def finish_the_attempt() -> None:
+        with stdout.open("ab") as handle:
+            handle.write(b"last words\n")
+        _set_implement_status(projection, status)
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[finish_the_attempt]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": original.decode("utf-8")},
+        {"offset": len(original), "text": "last words\n"},
+        _end_line(status),
+    ]
+    assert result.stdout.splitlines()[-1] == f'{{"event":"end","status":"{status}"}}'
+
+
+def test_logs_follow_checks_status_before_the_read_it_applies_to(
+    projection, monkeypatch
+):
+    """The writer appends and flips the status right after a read that found
+    nothing. Because the status was looked up *before* that read, it was
+    still `started`: the stream polls once more, reads the last bytes, and
+    only then ends. Looking the status up after the read would end here and
+    lose them."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    stdout = _implement_stdout()
+    size = stdout.stat().st_size
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_writer_finishes(path, offset):
+        data = real_read(path, offset)
+        reads.append(offset)
+        if len(reads) == 1:
+            assert data == b""
+            with stdout.open("ab") as handle:
+                handle.write(b"last words\n")
+            _set_implement_status(projection, "ok")
+        return data
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_writer_finishes)
+
+    result, sleeps = _logs_follow(
+        monkeypatch,
+        *_logs_args(projection, "--since-offset", str(size)),
+        actions=[lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(stdout, size),
+        {"offset": size, "text": "last words\n"},
+        _end_line("ok"),
+    ]
+
+
+def test_logs_follow_already_complete_file_ends_without_waiting(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID)  # implement.1 is gate_failed
+    content = "first line\nsecond líne\n€uro\n"
+    _implement_stdout().write_bytes(content.encode("utf-8"))
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": content},
+        _end_line("gate_failed"),
+    ]
+    assert result.stdout.splitlines()[-1] == '{"event":"end","status":"gate_failed"}'
+
+    # Review Focus 4: `--pretty` changes no byte of a stream that ends.
+    pretty = _logs_follow_no_wait(monkeypatch, *_logs_args(projection, "--pretty"))
+    assert pretty.exit_code == 0, pretty.output
+    assert pretty.stdout == result.stdout
+
+
+def test_logs_follow_started_attempt_never_ends_on_poll_bound(projection, monkeypatch):
+    """The bound stops a test stream; it is not an end. Passes before the
+    change too: it pins that `end` is never emitted for a `started` attempt."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[lambda: None, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_terminal_missing_file_ends(projection, monkeypatch):
+    _record_for_logs(projection, LOGS_RUN_ID, stdout=False)  # gate_failed
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        _end_line("gate_failed"),
+    ]
+    assert not _implement_stdout().exists()
+
+
+def test_logs_follow_terminal_flushes_partial_utf8_tail(projection, monkeypatch):
+    """The held-back half character can never be completed once the attempt
+    is over, so it goes out as U+FFFD at its own byte offset before `end`."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    _implement_stdout().write_bytes(b"caf\xc3")  # the first byte of "é" only
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "caf"},
+        {"offset": 3, "text": "�"},
+        _end_line("gate_failed"),
+    ]
+
+
+@pytest.mark.parametrize("past_end", [0, 978], ids=["at-eof", "past-eof"])
+def test_logs_follow_since_offset_at_eof_on_terminal_attempt(
+    projection, monkeypatch, past_end
+):
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    offset = _implement_stdout().stat().st_size + past_end
+
+    result = _logs_follow_no_wait(
+        monkeypatch, *_logs_args(projection, "--since-offset", str(offset))
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout(), offset),
+        _end_line("gate_failed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("phase_status", "attempts", "extra", "expected"),
+    [
+        ("done", 2, [], "ok"),
+        ("failed", 2, [], "gate_failed"),
+        ("started", 2, ["--attempt", "1"], "gate_failed"),
+        ("pending", 1, [], None),
+        ("started", 1, [], None),
+    ],
+    ids=["latest-done", "latest-failed", "superseded", "latest-pending", "latest-started"],
+)
+def test_logs_follow_deterministic_phase_end_status(
+    projection, monkeypatch, phase_status, attempts, extra, expected
+):
+    """Card 4.2's flagged mapping, end to end through the CLI."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    for n in range(1, attempts + 1):
+        _write_step_logs(LOGS_RUN_ID, n)
+    _set_verify_status(projection, phase_status)
+    followed = 1 if extra else attempts
+    stdout = paths.attempt_path(LOGS_RUN_ID, "card-1", "verify", followed) / "stdout.log"
+    body = {
+        "offset": 0,
+        "text": f"==> uv run pytest (exit 1)\nstdout of verify.{followed}\n",
+    }
+    args = _logs_args(projection, "--phase", "verify", *extra)
+
+    if expected is None:
+        result, sleeps = _logs_follow(monkeypatch, *args, actions=[lambda: None])
+        assert result.exit_code == 0, result.output
+        assert sleeps == [cli.WATCH_POLL_SECONDS]
+        assert _stream(result) == [_logs_hello_line(stdout), body]
+    else:
+        result = _logs_follow_no_wait(monkeypatch, *args)
+        assert result.exit_code == 0, result.output
+        assert _stream(result) == [_logs_hello_line(stdout), body, _end_line(expected)]
+    assert result.stderr == ""
+
+
+def test_logs_follow_relookup_lost_attempt_errors(projection, monkeypatch):
+    """The run vanishes from the projection after the hello: the re-lookup
+    refuses on stderr at exit 3, as any post-hello error does."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+
+    def forget_the_run() -> None:
+        conn = sqlite3.connect(paths.project_db_path(projection))
+        try:
+            conn.execute("DELETE FROM runs WHERE id = ?", (LOGS_RUN_ID,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    result, sleeps = _logs_follow(
+        monkeypatch, *_logs_args(projection), actions=[forget_the_run]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+    assert result.stderr.startswith(
+        f"am logs: run {LOGS_RUN_ID!r} is not in the projection for "
+    )
+    assert result.stderr.endswith("\n")
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        (
+            lambda s: {"subtask": s.subtask.model_copy(update={"card_id": "card-9"})},
+            cli.UnknownCardError,
+            "card 'card-9' is not in run",
+        ),
+        (
+            lambda s: {"phase": s.phase.model_copy(update={"name": "gone"})},
+            cli.UnknownPhaseError,
+            "card 'card-1' has no phase 'gone' any more",
+        ),
+        (
+            lambda s: {"attempt": s.attempt.model_copy(update={"n": 9})},
+            cli.UnknownAttemptError,
+            "phase 'implement' of card 'card-1' has no attempt 9 any more",
+        ),
+        (
+            lambda s: {"attempt": None, "step_attempt": None},
+            cli.CliError,
+            "neither an attempt row nor a step attempt",
+        ),
+    ],
+    ids=["card", "phase", "attempt", "no-attempt-key"],
+)
+def test_logs_end_status_refuses_what_it_can_no_longer_find(
+    projection, change, error, message
+):
+    """Each lookup step of the re-lookup refuses rather than guessing, so the
+    stream reports it on stderr at exit 3 instead of crashing."""
+    _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
+    selection = cli.select_logs(LOGS_RUN_ID, "card-1", repo_dir=projection)
+    assert cli.logs_end_status(selection, repo_dir=projection) is None
+
+    stale = dataclasses.replace(selection, **change(selection))
+
+    with pytest.raises(error, match=re.escape(message)):
+        cli.logs_end_status(stale, repo_dir=projection)
+
+
+@pytest.mark.parametrize(
+    ("extra", "n", "status"),
+    [
+        (["--phase", "explore", "--attempt", "1"], 1, "gate_failed"),
+        (["--phase", "explore"], 2, "ok"),
+    ],
+    ids=["older-attempt", "latest-attempt"],
+)
+def test_logs_follow_ends_with_the_followed_attempts_own_status(
+    projection, monkeypatch, extra, n, status
+):
+    """Review Focus 1: the re-lookup is keyed by the followed attempt's
+    number, never by "the latest attempt of the phase"."""
+    _record_for_logs(projection, LOGS_RUN_ID)
+    stdout = paths.attempt_path(LOGS_RUN_ID, "card-1", "explore", n) / "stdout.log"
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection, *extra))
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _logs_hello_line(stdout),
+        {"offset": 0, "text": f"stdout of explore.{n}\n"},
+        _end_line(status),
+    ]
+
+
+def test_logs_follow_closed_pipe_on_end_exits_zero_quietly(projection, monkeypatch):
+    """Review Focus 2: the reader goes away exactly as `end` is written."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    real_emit = cli._emit_stream_line
+
+    def emit_until_end(obj) -> None:
+        if obj.get("event") == "end":
+            raise BrokenPipeError(32, "Broken pipe")
+        real_emit(obj)
+
+    monkeypatch.setattr(cli, "_emit_stream_line", emit_until_end)
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
+
+
+def test_logs_follow_ctrl_c_during_drain_exits_zero(projection, monkeypatch):
+    """Review Focus 3: a terminal attempt drains without sleeping, so Ctrl-C
+    lands in a read, not a sleep; it is still exit 0 and silent."""
+    _record_for_logs(projection, LOGS_RUN_ID)  # gate_failed
+    real_read = cli._read_log_bytes
+    reads: list[int] = []
+
+    def read_then_interrupt(path, offset):
+        reads.append(offset)
+        if len(reads) == 2:
+            raise KeyboardInterrupt
+        return real_read(path, offset)
+
+    monkeypatch.setattr(cli, "_read_log_bytes", read_then_interrupt)
+
+    result = _logs_follow_no_wait(monkeypatch, *_logs_args(projection))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _logs_hello_line(_implement_stdout()),
+        {"offset": 0, "text": "stdout of implement.1\n"},
+    ]
 
 
 CRASHED_AT = datetime(2026, 9, 23, 11, 30, 0, tzinfo=timezone.utc)
@@ -8539,6 +10029,747 @@ def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
         conn.close()
 
 
+# ── am watch --from-now (card db129e6a) ────────────────────────────────────
+#
+# Default (unit) tier per design §14, like the follow tests above: journals in
+# tmp_path, polling driven by the fake `cli._watch_sleep`, no subprocess.
+
+
+def _assert_one_cli_error(result, *needles: str) -> dict[str, Any]:
+    """The refusal shape: exit 3, exactly one envelope line, ok false, CliError."""
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    assert "event" not in envelope
+    assert envelope["error"]["type"] == "CliError"
+    for needle in needles:
+        assert needle in envelope["error"]["message"], envelope
+    return envelope
+
+
+def test_watch_from_now_refused_with_since(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    for argv in (
+        ["run-a", "--from-now", "--since", "0"],
+        ["run-a", "--from-now", "--since", "2"],
+        ["--all", "--from-now", "--since", "0"],
+    ):
+        result, sleeps = _watch_follow(monkeypatch, *argv)
+        assert sleeps == [], argv
+        _assert_one_cli_error(result, "--from-now", "--since", "exclusive")
+
+    # `--pretty` still indents the refusal, and it is still the only output.
+    pretty, sleeps = _watch_follow(
+        monkeypatch, "run-a", "--from-now", "--since", "0", "--pretty"
+    )
+    assert pretty.exit_code == cli.EXIT_ERROR, pretty.output
+    assert sleeps == []
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout)["error"]["type"] == "CliError"
+
+    # Breaking both new rules at once reports the --since conflict.
+    both = _watch("run-a", "--from-now", "--since", "2")
+    _assert_one_cli_error(both, "--from-now", "--since", "exclusive")
+
+
+def test_watch_from_now_refused_without_follow(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    for argv in (["run-a", "--from-now"], ["--all", "--from-now"]):
+        result = runner.invoke(cli.app, ["watch", *argv])
+        _assert_one_cli_error(result, "--from-now", "--follow")
+
+
+def test_watch_from_now_keeps_existing_refusals_and_since_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    written = _write_watch_journal(tmp_path, "run-a", [1, 2])
+
+    # RUN_ID handling is unchanged under --from-now: no hello line, no polls.
+    for argv, kind in (
+        (["no-such-run", "--from-now"], "UnknownRunError"),
+        (["../escape", "--from-now"], "UnknownRunError"),
+        (["run-a", "--all", "--from-now"], "CliError"),
+    ):
+        refused, sleeps = _watch_follow(monkeypatch, *argv)
+        assert refused.exit_code == cli.EXIT_ERROR, (argv, refused.output)
+        assert sleeps == [], argv
+        refusal_lines = refused.stdout.splitlines()
+        assert len(refusal_lines) == 1, (argv, refused.stdout)
+        refusal = json.loads(refusal_lines[0])
+        assert refusal["ok"] is False, argv
+        assert refusal["error"]["type"] == kind, argv
+    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
+
+    # Without --from-now, `--since 0` is still the default and `--since -1`
+    # is still refused by the old check.
+    zero = _watch("run-a", "--since", "0")
+    assert zero.exit_code == 0, zero.output
+    assert json.loads(zero.stdout) == {"ok": True, "data": {"events": written}}
+    negative = _watch("run-a", "--since", "-1")
+    _assert_one_cli_error(negative, "--since must be 0 or more")
+
+
+def test_watch_follow_from_now_skips_backlog(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+
+    # Nothing appended: the hello line alone.
+    idle, idle_sleeps = _watch_follow(
+        monkeypatch, "run-a", "--from-now", actions=[lambda: None]
+    )
+    assert idle.exit_code == 0, idle.output
+    assert idle_sleeps == [cli.WATCH_POLL_SECONDS]
+    assert _stream(idle) == [_hello(tmp_path)]
+
+    appended: list[dict[str, Any]] = []
+
+    def append_fourth() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [4]))
+
+    def append_fifth() -> None:
+        appended.extend(_append_watch_journal(tmp_path, "run-a", [5]))
+
+    # The last poll sees nothing new, so seq 5 must not repeat.
+    result, sleeps = _watch_follow(
+        monkeypatch,
+        "run-a",
+        "--from-now",
+        actions=[append_fourth, append_fifth, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS] * 3
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    assert lines[1:] == appended
+    assert [line["seq"] for line in lines[1:]] == [4, 5]
+    assert result.stderr == ""
+
+
+def test_watch_follow_all_from_now_skips_only_runs_present_at_start(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+    _write_watch_journal(tmp_path, "run-c", [1])  # present at start, never appended
+
+    def first_poll() -> None:
+        _append_watch_journal(tmp_path, "run-a", [3])
+        _write_watch_journal(tmp_path, "run-b", [1, 2])  # appears after the start
+
+    def second_poll() -> None:
+        _append_watch_journal(tmp_path, "run-a", [4])
+        _append_watch_journal(tmp_path, "run-b", [3])
+
+    result, sleeps = _watch_follow(
+        monkeypatch, "--all", "--from-now", actions=[first_poll, second_poll]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(sleeps) == 2
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    # Runs are read in sorted order on each poll: run-a, then run-b.
+    assert lines[1:] == [
+        _watch_line("run-a", 3),
+        _watch_line("run-b", 1),
+        _watch_line("run-b", 2),
+        _watch_line("run-a", 4),
+        _watch_line("run-b", 3),
+    ]
+    assert result.stderr == ""
+
+
+def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    third_a = json.dumps(_watch_line("run-a", 3), sort_keys=True)
+    first_d = json.dumps(_watch_line("run-d", 1), sort_keys=True)
+    # run-a: seqs 1-2 complete, seq 3 still being written at start.
+    _write_watch_journal(tmp_path, "run-a", [1, 2], tail=third_a[:20])
+    # run-d: only a torn first line at start, so it gets no seeded cursor.
+    _write_watch_journal(tmp_path, "run-d", [], tail=first_d[:20])
+
+    def finish_the_torn_lines() -> None:
+        for run_id, text in (("run-a", third_a), ("run-d", first_d)):
+            journal = _watch_runs_dir(tmp_path) / run_id / store_module.JOURNAL_NAME
+            with journal.open("a", encoding="utf-8") as handle:
+                handle.write(text[20:] + "\n")
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--all",
+        "--from-now",
+        actions=[lambda: None, finish_the_torn_lines, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert _stream(result) == [
+        _hello(tmp_path),
+        _watch_line("run-a", 3),
+        _watch_line("run-d", 1),
+    ]
+
+
+# ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is a plain directory, and no git, brd or claude process ever starts.
+
+SEAM_AT = datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc)
+SEAM_LATER = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+
+def _seam_root(tmp_path: Path, monkeypatch) -> Path:
+    """A plain repo directory (no git, no brd) with the data dir under tmp_path."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _seam_cards(fake_board) -> dict[str, str]:
+    """The milestone -> story -> subtask chain `run --card` needs, on the FakeBoard."""
+    milestone = fake_board.add_card("Milestone 1: walking skeleton")
+    story = fake_board.add_card("The CLI: run, status, logs, resume", parent_id=milestone)
+    subtask = fake_board.add_card("Add run --card end to end", parent_id=story)
+    return {"milestone": milestone, "story": story, "subtask": subtask}
+
+
+def _preflight(root: Path, card_id: str, at: datetime = SEAM_AT) -> Any:
+    return cli.preflight_card(
+        card_id, repo_dir=root, branch_prefix="m1", base_branch="main", clock=lambda: at
+    )
+
+
+def test_preflight_card_refuses_a_parentless_card_and_creates_no_run_directory(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    loose = fake_board.add_card("A card with no story")
+
+    with pytest.raises(cli.ParentlessCardError):
+        _preflight(root, loose)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_card_refuses_a_card_another_live_run_claims(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight(root, cards["subtask"])
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    card = board.show(cards["subtask"], repo_dir=root)
+    branch = dag.task_branch("m1", card)
+
+    pre = _preflight(root, cards["subtask"])
+
+    assert pre.root == root
+    assert (pre.card.id, pre.parent.id) == (cards["subtask"], cards["story"])
+    assert pre.run_id == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert pre.branch == branch
+    assert pre.worktree == cli.worktree_for(root, branch)
+    assert pre.base_branch == "main"
+    assert pre.claims == [control.card_claim(cards["subtask"])]
+    assert (pre.run_record.id, pre.run_record.status) == (pre.run_id, "started")
+    assert (pre.run_record.workflow, pre.run_record.started_at) == (cli.WORKFLOW_NAME, SEAM_AT)
+    assert (pre.run_record.base_branch, pre.run_record.branch_prefix) == ("main", "m1")
+    assert (pre.story.card_id, pre.story.status, pre.story.tip_branch) == (
+        cards["story"],
+        "started",
+        branch,
+    )
+    assert (pre.subtask.card_id, pre.subtask.status, pre.subtask.branch) == (
+        cards["subtask"],
+        "started",
+        branch,
+    )
+    assert pre.subtask.worktree_path == cli.worktree_for(root, branch)
+    assert _run_dirs() == []
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == []
+    assert fake_board.writes == []
+
+
+def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
+    """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
+
+    `(0, 0)` means the claims and the lease were released before the store
+    closed. Counted over the closing store's own connection, before the real
+    close runs.
+    """
+    seen: list[tuple[int, int]] = []
+    real_close = store_module.Store.close
+
+    def close(self) -> None:
+        conn = self.connection
+        claims = conn.execute(
+            "SELECT COUNT(*) FROM run_claims WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        leases = conn.execute(
+            "SELECT COUNT(*) FROM run_leases WHERE run_id = ?", (self.run_id,)
+        ).fetchone()[0]
+        seen.append((claims, leases))
+        real_close(self)
+
+    monkeypatch.setattr(store_module.Store, "close", close)
+    return seen
+
+
+def _no_drive(**kwargs: Any) -> Any:
+    pytest.fail("drive_subtask_async ran in the recorded stage")
+
+
+def test_inside_recorded_card_run_the_run_is_recorded_and_leased_but_not_driven(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(cli, "drive_subtask_async", _no_drive)
+    pre = _preflight(root, cards["subtask"])
+
+    with cli.recorded_card_run(pre) as recorded:
+        assert recorded.run_id == pre.run_id
+        run = recorded.store.load_run(pre.run_id)
+        assert run is not None
+        (story,) = run.stories
+        (subtask,) = story.subtasks
+        assert (run.status, story.status, subtask.status) == ("started", "started", "started")
+        assert (story.card_id, subtask.card_id) == (cards["story"], cards["subtask"])
+        lease = _card_lease(root, pre.run_id)
+        assert lease is not None
+        assert lease.token == recorded.lease.token
+        assert _claim_rows(root) == [
+            (control.card_claim(cards["subtask"]), pre.run_id, recorded.lease.token)
+        ]
+
+
+def test_leaving_recorded_card_run_on_an_error_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+
+    with pytest.raises(RuntimeError, match="engine never started"):
+        with cli.recorded_card_run(pre):
+            raise RuntimeError("engine never started")
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    assert _card_lease(root, pre.run_id) is None
+    again = _preflight(root, cards["subtask"], SEAM_LATER)
+    assert again.run_id == cli.mint_run_id(cards["subtask"], SEAM_LATER)
+
+
+def test_a_claim_taken_after_card_preflight_is_refused_on_entry_with_nothing_recorded(
+    tmp_path, monkeypatch, fake_board
+):
+    """The lost race (spec, Error paths): another run claims the card between
+    pre-flight and the recorded stage. `take_lease` refuses it atomically,
+    nothing is recorded and the store is still closed."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    closes = _close_snapshots(monkeypatch)
+    pre = _preflight(root, cards["subtask"])
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        with cli.recorded_card_run(pre):
+            pytest.fail("the recorded stage yielded under another run's claim")
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert closes == [(0, 0)]
+    assert _recorded_run_ids(root) == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def _done_drive(calls: list[dict[str, Any]]):
+    """A fake `drive_subtask_async` that records its keywords and finishes `done`."""
+
+    async def drive(**kwargs: Any) -> cli.SubtaskDrive:
+        calls.append(kwargs)
+        return cli.SubtaskDrive(summary=SubtaskSummary(status="done"), warnings=[])
+
+    return drive
+
+
+def test_run_card_hands_the_engine_the_lease_of_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    handed: dict[str, Any] = {}
+
+    real_recorded = cli.recorded_card_run
+
+    @contextmanager
+    def spying_recorded(pre):
+        with real_recorded(pre) as recorded:
+            handed["recorded"] = recorded
+            yield recorded
+
+    real_controlled = control.controlled
+
+    async def spying_controlled(work, **kwargs):
+        handed["controlled"] = kwargs["lease"]
+        return await real_controlled(work, **kwargs)
+
+    real_comment = cli.card_outcome_comment
+
+    def spying_comment(**kwargs):
+        handed["token"] = kwargs["token"]
+        return real_comment(**kwargs)
+
+    monkeypatch.setattr(cli, "recorded_card_run", spying_recorded)
+    monkeypatch.setattr(control, "controlled", spying_controlled)
+    monkeypatch.setattr(cli, "card_outcome_comment", spying_comment)
+
+    result = cli.run_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        control_interval=0.01,
+    )
+
+    recorded = handed["recorded"]
+    assert handed["controlled"] is recorded.lease
+    assert handed["token"] == recorded.lease.token
+    assert recorded.run_id == result["run_id"] == cli.mint_run_id(cards["subtask"], SEAM_AT)
+    assert [call["run_id"] for call in calls] == [result["run_id"]]
+    assert calls[0]["store"] is recorded.store
+    assert result["status"] == "done"
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_card_engine_still_releases_the_claim_and_lease_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    """Spec: a crash in the engine still propagates, still releases the lease
+    and claims, and still closes the store. A characterization pin: it passes
+    before the split and must keep passing after it."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    async def crashing_drive(**kwargs: Any) -> Any:
+        raise RuntimeError("drive bug")
+
+    monkeypatch.setattr(cli, "drive_subtask_async", crashing_drive)
+    closes = _close_snapshots(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="drive bug"):
+        cli.run_card(
+            cards["subtask"],
+            repo_dir=root,
+            branch_prefix="m1",
+            base_branch="main",
+            clock=lambda: SEAM_AT,
+            control_interval=0.01,
+        )
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+
+
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+#
+# Unit tier: `detach.fork_detacher` is replaced by `_FakeDetacher`, which
+# forks nothing; its `body` is run inline by the tests that need the child.
+
+FAKE_CHILD_PID = 424242
+"""The pid `_FakeDetacher` reports; no such child exists."""
+
+
+class _FakeDetacher:
+    """Stands in for `detach.fork_detacher`: records the call, starts nothing.
+
+    `body` keeps what the real child would run. `at_go`, when set, runs as
+    the parent writes the go byte, so a test can see the store at that moment.
+    """
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[Path] = []
+        self.events: list[str] = []
+        self.body: Any = None
+        self.at_go: Any = None
+
+    def __call__(self, body: Any, log: Path) -> detach.Spawned:
+        self.calls.append(log)
+        if self.error is not None:
+            raise self.error
+        self.body = body
+        return detach.Spawned(pid=FAKE_CHILD_PID, go=self._go, abort=self._abort)
+
+    def _go(self) -> None:
+        if self.at_go is not None:
+            self.at_go()
+        self.events.append("go")
+
+    def _abort(self) -> None:
+        self.events.append("abort")
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _alive_heartbeats() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "am-lease-heartbeat" and thread.is_alive()
+    ]
+
+
+DRY_RUN_DETACH = "--dry-run writes nothing and cannot be detached"
+BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message", "hint"),
+    [
+        (
+            {"card": None, "milestone": "M9", "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": SOME_CARD, "milestone": None, "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": False},
+            BOARD_DETACH,
+            "'--detach' / '--board'",
+        ),
+    ],
+)
+def test_check_run_targets_refuses_detach_with_dry_run_or_board(kwargs, message, hint):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(detach=True, **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"card": SOME_CARD, "milestone": None},
+        {"card": None, "milestone": "M9", "max_concurrent": 2},
+    ],
+)
+def test_check_run_targets_accepts_detach_with_card_or_milestone(kwargs):
+    assert (
+        cli._check_run_targets(dry_run=False, branch_prefix="m9", detach=True, **kwargs) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("targets", "word"),
+    [
+        (["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"], "detached"),
+        (["--board"], "applies"),
+    ],
+)
+def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(
+        cli.app, ["run", *targets, "--detach", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert fake.calls == []
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def _handed_off_card_run(root: Path, card_id: str) -> tuple[Any, str]:
+    """Stage 1 and 2 of a card run, then the parent's hand-off: what the child inherits."""
+    pre = _preflight(root, card_id)
+    with cli.recorded_card_run(pre) as recorded:
+        token = recorded.lease.hand_off()
+    return pre, token
+
+
+def _no_take_lease(self, **kwargs: Any) -> Any:
+    pytest.fail("the detached child took a new lease instead of adopting its own")
+
+
+def _report_path(run_id: str) -> Path:
+    return paths.data_dir() / "runs" / run_id / detach.REPORT_NAME
+
+
+def test_the_detached_child_adopts_the_lease_reports_then_releases_before_closing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+    held_at_report: list[bool] = []
+    real_write = detach.write_report
+
+    def spying_write(run_id: str, text: str) -> Path:
+        held_at_report.append(_card_lease(root, run_id) is not None)
+        return real_write(run_id, text)
+
+    monkeypatch.setattr(detach, "write_report", spying_write)
+    seen: list[tuple[str, str, str, int]] = []
+
+    def engine(store, lease):
+        row = _card_lease(root, pre.run_id)
+        seen.append((store.run_id, lease.token, row.token, len(_alive_heartbeats())))
+        return {"run_id": pre.run_id, "status": "done"}
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert seen == [(pre.run_id, token, token, 1)]
+    report = _report_path(pre.run_id)
+    assert json.loads(report.read_text(encoding="utf-8")) == {
+        "ok": True,
+        "data": {"run_id": pre.run_id, "status": "done"},
+    }
+    assert _mode(report) == 0o600
+    assert held_at_report == [True]
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _alive_heartbeats() == []
+
+
+def test_the_detached_child_reports_a_handled_error_and_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise cli.UnknownCardError("the card is gone")
+
+    cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert json.loads(_report_path(pre.run_id).read_text(encoding="utf-8")) == {
+        "ok": False,
+        "error": {"type": "UnknownCardError", "message": "the card is gone"},
+    }
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_detached_child_writes_no_report_and_still_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    closes = _close_snapshots(monkeypatch)
+
+    def engine(store, lease):
+        raise RuntimeError("engine bug")
+
+    with pytest.raises(RuntimeError, match="engine bug"):
+        cli.run_detached_child(root=pre.root, run_id=pre.run_id, token=token, engine=engine)
+
+    assert not _report_path(pre.run_id).exists()
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+    assert _recorded_run_ids(root) == [pre.run_id]
+
+
+def test_release_handed_off_releases_the_claims_and_lease_and_closes(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    pre, token = _handed_off_card_run(root, cards["subtask"])
+    assert _card_lease(root, pre.run_id) is not None
+    closes = _close_snapshots(monkeypatch)
+
+    cli.release_handed_off(pre.root, pre.run_id, token)
+
+    assert closes == [(0, 0)]
+    assert _card_lease(root, pre.run_id) is None
+    assert _claim_rows(root) == []
+
+
+def _card_run_args(root: Path, card_id: str, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--card",
+        card_id,
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        "m1",
+        "--allow-no-verification",
+        *extra,
+    ]
+
+
+def _lease_pids(root: Path) -> list[int]:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [row["pid"] for row in conn.execute("SELECT pid FROM run_leases ORDER BY run_id")]
+    finally:
+        conn.close()
+
+
 def _plant_parked_checkpoint(
     root: Path,
     *,
@@ -9410,3 +11641,246 @@ def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == {"checked": False, "reason": "lease is live", "mismatches": []}
+def test_a_detached_card_run_prints_one_envelope_and_leaves_the_lease_to_the_child(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(cli, "drive_subtask_async", _no_drive)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    closes = _close_snapshots(monkeypatch)
+    pids_at_go: list[list[int]] = []
+    fake.at_go = lambda: pids_at_go.append(_lease_pids(root))
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert result.exit_code == 0, result.output
+    assert len(result.stdout.splitlines()) == 1
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    data = envelope["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert (data["pid"], data["detached"]) == (FAKE_CHILD_PID, True)
+    run_id = data["run_id"]
+    assert [entry["id"] for entry in cli.runs_for(repo_dir=root)["runs"]] == [run_id]
+    log = Path(data["log"])
+    assert log == paths.data_dir() / "runs" / run_id / detach.RUN_LOG_NAME
+    assert log.is_file() and _mode(log) == 0o600
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert pids_at_go == [[FAKE_CHILD_PID]]
+    lease = _card_lease(root, run_id)
+    assert lease is not None
+    assert (lease.pid, lease.host) == (FAKE_CHILD_PID, socket.gethostname())
+    assert _claim_rows(root) == [(control.card_claim(cards["subtask"]), run_id, lease.token)]
+    assert _alive_heartbeats() == []
+    # The recorded stage's store, then the pid update's: both closed, both still holding.
+    assert closes == [(1, 1), (1, 1)]
+    assert not (log.parent / detach.REPORT_NAME).exists()
+
+
+def test_detach_honours_pretty(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    monkeypatch.setattr(detach, "fork_detacher", _FakeDetacher())
+
+    result = runner.invoke(
+        cli.app, _card_run_args(root, cards["subtask"], "--detach", "--pretty")
+    )
+
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert result.stdout == cli.render(envelope, pretty=True) + "\n"
+    assert envelope["data"]["detached"] is True
+
+
+def test_the_detached_card_child_reports_the_foreground_payload_then_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+    assert result.exit_code == 0, result.output
+    run_id = json.loads(result.stdout)["data"]["run_id"]
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    captured: list[dict[str, Any]] = []
+    real_engine = cli.run_card_engine
+
+    async def spying_engine(pre, recorded, **kwargs):
+        payload = await real_engine(pre, recorded, **kwargs)
+        captured.append(payload)
+        return payload
+
+    monkeypatch.setattr(cli, "run_card_engine", spying_engine)
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+
+    fake.body()
+
+    (payload,) = captured
+    assert (payload["run_id"], payload["status"]) == (run_id, "done")
+    assert [call["run_id"] for call in calls] == [run_id]
+    report = _report_path(run_id)
+    assert json.loads(report.read_text(encoding="utf-8")) == json.loads(
+        cli.render(cli.ok_envelope(payload))
+    )
+    assert _mode(report) == 0o600
+    assert closes == [(0, 0)]
+    assert _card_lease(root, run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_a_parentless_card_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    loose = fake_board.add_card("A card with no story")
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = runner.invoke(cli.app, _card_run_args(root, loose))
+    detached = runner.invoke(cli.app, _card_run_args(root, loose, "--detach"))
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert json.loads(detached.stdout) == json.loads(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "ParentlessCardError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+
+
+def test_a_claimed_card_is_refused_the_same_with_or_without_detach(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    key = control.card_claim(cards["subtask"])
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    foreground = runner.invoke(cli.app, _card_run_args(root, cards["subtask"]))
+    detached = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    def steady(stdout: str) -> dict[str, Any]:
+        envelope = json.loads(stdout)
+        envelope["error"]["message"] = re.sub(r"\d+s ago", "Ns ago", envelope["error"]["message"])
+        return envelope
+
+    assert (foreground.exit_code, detached.exit_code) == (cli.EXIT_ERROR, cli.EXIT_ERROR)
+    assert steady(detached.stdout) == steady(foreground.stdout)
+    assert json.loads(detached.stdout)["error"]["type"] == "ClaimedError"
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_a_failed_detach_releases_the_claim_and_lease_and_prints_no_detached_envelope(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher(error=OSError("fork failed"))
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+    closes = _close_snapshots(monkeypatch)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, OSError)
+    assert '"detached"' not in result.stdout
+    assert len(fake.calls) == 1
+    assert closes[-1] == (0, 0)
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_run_log_that_cannot_be_created_releases_through_the_recorded_stage(
+    tmp_path, monkeypatch, fake_board
+):
+    """Spec, Error paths: the failure is raised inside the recorded stage,
+    before the hand-off, so 3.1's release-then-close covers it."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def unwritable(run_id: str) -> Path:
+        raise PermissionError("run.log: permission denied")
+
+    monkeypatch.setattr(detach, "create_run_log", unwritable)
+    closes = _close_snapshots(monkeypatch)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, PermissionError)
+    assert '"detached"' not in result.stdout
+    assert fake.calls == []
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_failed_lease_pid_update_aborts_the_child_and_releases(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 1: the child is told to abort and never runs its body."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    def locked(self, token: str, *, pid: int, host: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store_module.Store, "set_lease_holder", locked)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
+
+    assert isinstance(result.exception, sqlite3.OperationalError)
+    assert '"detached"' not in result.stdout
+    assert fake.events == ["abort"]
+    assert _claim_rows(root) == []
+    (run_id,) = _recorded_run_ids(root)
+    assert _card_lease(root, run_id) is None
+
+
+def test_a_card_run_without_detach_still_prints_its_full_payload(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"]))
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["status"] == "done"
+    assert "detached" not in data
+    assert fake.calls == []
+    assert _claim_rows(root) == []
+    assert not (paths.data_dir() / "runs" / data["run_id"] / detach.RUN_LOG_NAME).exists()
+
+
+def test_run_help_and_examples_document_detach():
+    assert "--detach" in cli.RUN_EXAMPLES
+
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--detach" in result.output

@@ -44,7 +44,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
-The one exception is `am watch --follow`, which prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)).
+The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)).
 
 ### Milestone runs
 
@@ -65,7 +65,7 @@ that matches several root cards is refused with the list of matches, and one
 that matches none is refused with the list of root cards. Both come back as
 `{"ok": false, "error": {...}}` with exit code 3.
 
-`--branch-prefix` is required. Every branch the run cuts is named
+`--branch-prefix` is required with `--card` and `--milestone`, and optional with `--board` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)). Every branch the run cuts is named
 `<prefix>/task-<title slug>-<first 8 hex of the card id>`, and its worktree is
 `<repo>/.claude/worktrees/<branch>`. `--verify` is repeatable, passed through as
 written, and run in the order given. With no `--verify`, pass
@@ -77,11 +77,28 @@ Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
 The base-branch and final integration checks run their commands with neither set.
 
-Some combinations are refused before anything is read: `--card` together with
-`--milestone`, neither of them, a blank `--milestone`, `--dry-run` with
-`--card`, `--max-concurrent` with `--card`, and a `--max-concurrent` below 1.
-These are usage errors, like a missing `--branch-prefix`: Typer prints the
-message on stderr, nothing is printed on stdout, and the exit code is 2.
+Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, none of the three, a blank `--milestone`, a missing `--branch-prefix` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run` or with `--board`.
+These are usage errors: Typer prints the message on stderr, nothing is printed on stdout, and the exit code is 2.
+
+#### Running detached with `--detach`
+
+```bash
+am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run pytest" --detach
+```
+
+`--detach` works with `--card` and `--milestone`. The command first does everything a foreground run does before its first subtask: it reads the board, makes every check, records the run and takes its lease. A refusal at that point comes back as the usual `{"ok": false, ...}` envelope with exit code 3, and nothing starts. Then the run moves to a background process in its own session, and the command prints one envelope and exits 0:
+
+```json
+{"ok":true,"data":{"detached":true,"log":"/home/me/.local/share/agent-manager/runs/20261004T090000Z-1a2b3c4d/run.log","pid":48213,"run_id":"20261004T090000Z-1a2b3c4d"}}
+```
+
+- `run_id` is the id `am runs`, `am status`, `am watch`, `am pause` and `am resume` take. `pid` is the background process. It holds the run's lease, and `am runs` and `am status` show it as the lease's `pid`.
+- The background process writes its output to `run.log`. When the run ends it writes `report.json`. Both files are in `<data dir>/runs/<run-id>/` (`$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`) and both are mode 0600. `report.json` holds the envelope the same run would have printed in the foreground: `{"ok": true, "data": ...}` for a run that finished, escalated, stopped or was cancelled, or `{"ok": false, "error": ...}` for a run the tool could not carry on. It is written in one step, so it is either absent or complete.
+- A crash writes no `report.json`. Its traceback is in `run.log`, the lease and claims are released, and the run can be resumed like any crashed run.
+- The exit code is 0 whenever the run was handed off, even if it later escalates. Read the outcome from `report.json` or `am status`.
+- A missing verification command is not caught before the run starts. The verification gate runs during the explore phase, so with `--detach` it shows up in `report.json` and `am status`, not on your terminal. Pass `--verify` or `--allow-no-verification`.
+- `--detach` with `--dry-run` or with `--board` is refused as a usage error (exit 2).
+- Later versions may add keys to these envelopes. Ignore keys you do not know.
 
 #### Preview with `--dry-run`
 
@@ -113,6 +130,61 @@ Read the `base` column before a real run:
   missing a `blocked_by` edge on the board. Add it with
   `brd block <story> --by <blocker>` and preview again.
 - A cycle between stories is refused with exit code 3 before anything is written. A story with two or more blockers is not refused.
+
+#### Running every open milestone with `--board`
+
+```bash
+am run --board --verify "uv run pytest" [--branch-prefix P] [--max-concurrent N]
+am run --board --dry-run --pretty
+```
+
+`--board` drives every open milestone on the board in one command, as one dependency graph. Each milestone runs exactly as `am run --milestone` would run it: its stories, its [merged bases](#multiple-blockers) and its own [Integrate](#integrate) into its own `<prefix>-integrate`. Across milestones:
+
+- Milestones are leveled by the `blocked_by` edges between them. A milestone that is marked done, or that has nothing open under it, drops out, and so does a blocker that is not an open milestone: it counts as satisfied.
+- A milestone starts once every open milestone blocking it has finished `done`.
+- If a blocker ends in any other status (`escalated`, `stopped`, `cancelled`, or `blocked` itself), the milestone is never started: no run, no branch, no worktree, no board change. It is reported `blocked`.
+- A milestone whose run raises an error is reported `escalated`, and the other milestones carry on.
+- A board with no open milestone is `ok`, runs nothing and exits 0.
+
+Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, and `--detach` with `--board` are usage errors (exit 2).
+
+Refusals. These come in this order, before anything is written. Each prints `{"ok": false, "error": {"type", "message"}}` and exits 3:
+
+1. A blank `--base-branch`.
+2. A blocker cycle between milestones (`DependencyCycleError`).
+3. A blank prefix, or a prefix two milestones share.
+4. A claim another live run holds, checked once over the claims of every open milestone together (`ClaimedError`, see [Several am processes](#several-am-processes)).
+
+A refused board run leaves no run row, no run directory and no lease for any milestone. A board that cannot be read is refused the same way, as on a `--milestone` run.
+
+The run's `data` is `{"ok", "board": true, "levels", "milestones"}`. It has no `run_id` of its own.
+
+- `levels` is a list of `{"level", "milestones"}`, where `milestones` lists milestone ids. As with `--milestone`, levels are a way to read the plan: a milestone waits only for its own blockers.
+- `milestones` has one entry per open milestone, in level order. Each entry has one of three shapes:
+  - A milestone that ran: `{"milestone_id", "status", ...}`, followed by every key of that milestone's own `--milestone` report (see [What a clean run leaves behind](#what-a-clean-run-leaves-behind) and [What an escalation report contains](#what-an-escalation-report-contains)), its `run_id` included. `status` is `done`, `escalated`, `stopped` (a pause) or `cancelled`.
+  - A milestone that never started: `{"milestone_id", "status": "blocked", "blocked_by"}`. `blocked_by` lists the ids of its blockers that did not finish `done`.
+  - A milestone whose run raised an error: `{"milestone_id", "status": "escalated", "error"}`, with `error` reading `"<Type>: <message>"`. It has no `run_id` key. One example is a claim that another run took after the board's up-front check.
+- `ok` is `true` only when every entry is `done`.
+
+The outer envelope's `ok` is `true` whatever the outcome, because the report itself is a true result. The exit code is 1 only when some entry is `escalated`. A board whose milestones are only `done`, `blocked`, `stopped` or `cancelled` exits 0, even when `data.ok` is `false`. Read `data.ok`, not the exit code, to know whether everything finished.
+
+`--dry-run` with `--board` is read-only. It opens no store, checks no claim, writes nothing, and exits 0. It still refuses a blocker cycle, a bad prefix and a board that cannot be read, the same way as above. Its `data` is `{"board": true, "max_concurrent", "levels"}`, with no `ok` and no `run_id`. `levels` is a list of `{"level", "milestones"}`, and each milestone is `{"milestone_id", "title", "branch_prefix", "plan"}`. `branch_prefix` is the prefix that milestone will run under. `plan` is exactly that milestone's own `--milestone --dry-run` data (`max_concurrent`, `levels`, `already_done`, `integrate`). Read each plan as described in [Preview with `--dry-run`](#preview-with---dry-run), `base` column included.
+
+`--max-concurrent N` is one slot pool for the whole board, not N per milestone. Every story of every milestone takes a slot from the same N, so N caps the stories running at once across the board. It defaults to 4, as with `--milestone`, and `--max-concurrent 1` runs one story at a time on the whole board. Integrate merges do not take a slot (see [Integrate](#integrate)). Everything else in [Parallel runs](#parallel-runs) holds inside each milestone.
+
+One run and one journal per milestone. A board run is not a run itself: nothing records it as a whole. Each milestone it starts is a run of its own, with its own run id, `<data dir>/runs/<run-id>/journal.jsonl` and lease, exactly as a `--milestone` run would be. To follow a board run, take each entry's `run_id` (or find the runs in `am runs`) and read each journal separately with `am watch <run-id>`, or read them all with `am watch --all`. In each journal:
+
+- The first line is a `run_upsert` whose `payload.milestone_id` is that milestone's full card id. It is never `null` on a board run.
+- Every line has that run's `run_id`.
+- A `story_upsert` line has the story card id in `story`, and its `payload` has no milestone key. A story belongs to the milestone named on the first line of its journal.
+- A real story id appears in only one milestone's journal. The synthetic ids `"integrate"`, `"bases"` and `"base-<story id>"` (see [Reading the stream safely](#reading-the-stream-safely)) are fixed names that may appear in several milestones' journals, so identify a story by `(run_id, story)`, never by `story` alone.
+
+Recovery. Because nothing records the board run as a whole, there is nothing to resume at the board level. After a fix, either:
+
+- run the same `am run --board` command again. Done milestones drop out, and each other open milestone starts again as a relaunch would (see [Relaunching resumes](#relaunching-resumes)), or
+- continue one `stopped` or `escalated` milestone on its own with `am resume <run-id>`, using that entry's `run_id`.
+
+A `blocked` milestone has no run to resume. It starts on a later `am run --board`, once its blockers are done.
 
 #### What a clean run leaves behind
 
@@ -430,6 +502,24 @@ and section 10 of the
 [supervisor-tree addendum](docs/superpowers/specs/2026-09-25-supervisor-tree-design.md#10-deferred)
 for everything deferred.
 
+### Listing runs
+
+`am runs` lists this repository's runs from its projection, newest first. Like `am status`, it takes no lease, no claim and no lock.
+
+```bash
+am runs --repo-dir . --pretty
+```
+
+`data.runs` is a list with one object per run. Each object has these keys:
+
+- `id`, `workflow` (`milestone` or `task`), `repo_dir`, `base_branch`, `branch_prefix`, `status`, `started_at` (`null` if never recorded).
+- `milestone_id`: the full id of the milestone card a milestone run drives. It is `null` on a `--card` run, and on a run recorded by an `am` too old to store it.
+- `card_id`: the subtask card an `am run --card` run drives. It is `null` on a milestone run, and on a `--card` run whose subtask has not been recorded yet.
+- `lease`: the process holding the run, or `null` if no process has a lease row for it. When present it is `{live, pid, host, heartbeat_at, accepting}`, the same values `am status <run-id>` shows in `control.lease` (without `acquired_at`). `live` is worked out when you ask: the heartbeat is at most 30 seconds old, and the lease is on another host or its pid is alive here. `heartbeat_at` is an ISO 8601 string. `accepting` is `false` once the run's control window has closed.
+- `progress`: how far the run has got, counted from its recorded tree: `{stories: {done, total}, subtasks: {done, total}, current}`. `done` counts only rows whose status is `done`; `failed`, `escalated`, `stopped` and `cancelled` rows count toward `total` only. A milestone run that had to resolve a merge conflict also counts its synthetic `Integrate` story and that story's resolver subtasks, so it shows one story more than the milestone has. `current` is `{card, phase, attempt}` for the `started` phase that started most recently (`attempt` is that phase's highest attempt number, `null` before its first attempt), or `null` when no phase is started. It is read from the recorded rows, not from a live process: a run whose process died mid-phase still shows the phase it stopped in, so check `lease.live` to know whether anyone is still working on it. A run with nothing recorded below it shows `0` of `0` at both levels and `current: null`; `progress` itself is never `null`.
+
+New keys are additive: a newer `am` may add keys to these objects, but never removes or renames one. Consumers should ignore any key they do not recognize.
+
 ### Watching a run
 
 `am watch` prints a run's journal: the append-only log, one JSON object per line, that every run writes to `<data dir>/runs/<run-id>/journal.jsonl` (`<data dir>` is defined under [Several am processes](#several-am-processes)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine writes under the same `<data dir>/runs/`, one `am watch --all` sees the runs of every repository at once.
@@ -438,13 +528,15 @@ for everything deferred.
 am watch 20260923T140506Z-19efcddc
 am watch --all --since 40
 am watch 20260923T140506Z-19efcddc --follow
+am watch --all --follow --from-now
 ```
 
-The shape is `am watch RUN_ID | --all [--since SEQ] [--follow]`:
+The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:
 
 - Give exactly one of `RUN_ID` and `--all`.
 - `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
 - `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+- `--from-now` needs `--follow` and skips the backlog: the stream prints only lines appended after the command started. It cannot be combined with `--since`, whatever its value.
 
 Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
 
@@ -452,6 +544,8 @@ These are refused with `{"ok": false, "error": {"type", "message"}}` and exit co
 
 - both `RUN_ID` and `--all`, or neither;
 - a `--since` below 0;
+- `--from-now` together with `--since`, any value, 0 included;
+- `--from-now` without `--follow`;
 - a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
 - a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
 
@@ -466,6 +560,8 @@ Watching a run id that does not exist creates no run directory.
 ```
 
 `am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":1`.
 
 Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
 
@@ -512,8 +608,58 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
 - An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
-- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run) are in the `payload` of its first line, a `run_upsert`.
+- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run) are in the `payload` of its first line, a `run_upsert`. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
+
+### Reading an attempt's output
+
+`am logs` prints what one attempt of one phase of one subtask was given and wrote. Like `am status` and `am runs`, it reads the projection and takes no lease, no claim and no lock, so it works beside any number of live runs.
+
+```bash
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement --follow
+am logs 20261002T140000Z-19efcddc <subtask-id> --phase implement --follow --since-offset 20
+```
+
+The shape is `am logs RUN_ID CARD [--phase P] [--attempt N] [--follow] [--since-offset BYTES] [--repo-dir DIR]`:
+
+- `--phase` defaults to the last phase with attempts, and `--attempt` to that phase's highest recorded attempt.
+- Without `--follow`, `am logs` prints one envelope with the attempt's prompt, result and captured output, and exits 0.
+
+#### Following an attempt with `--follow`
+
+`--follow` turns the output into a stream of the attempt's stdout file, one JSON object per line:
+
+```
+{"event":"logs","offset":0,"path":"/home/you/.local/share/agent-manager/runs/20261002T140000Z-19efcddc/<subtask-id>/implement.1/stdout.log","schema":1}
+{"offset":0,"text":"Reading the plan...\n"}
+{"offset":20,"text":"Running uv run pytest\n"}
+{"event":"end","status":"ok"}
+```
+
+- The first line is the hello line. `path` is the file being followed: the stdout file an agent attempt recorded (its stderr is merged into it), or `<phase>.N/stdout.log` for a deterministic phase such as `verify`. `offset` is the byte the stream starts at: 0, or the `--since-offset` you passed.
+- Then come the file's bytes as `{"offset", "text"}` lines: what is already in the file first, then each append, flushed as soon as it is written. Chunks are contiguous, and each chunk's `offset` is the byte position of its first byte in the file. `text` is decoded as UTF-8. A character split across two reads is held back and arrives whole in the next chunk. A byte that is not valid UTF-8 comes out as U+FFFD.
+- A file that is not written yet gives no chunk. The stream waits until it appears.
+- Once the attempt has a terminal status and the file has stopped growing, the stream ends. A partial character still held back at the very end of the file comes out first, as one last chunk decoded with U+FFFD. Then the last line is `{"event":"end","status":S}`, and the exit code is 0. `S` is the attempt's status: `ok`, `schema_invalid`, `gate_failed` or `harness_error`, the vocabulary of `attempt_upsert` in the [journal](#the-journal-line). A deterministic phase has no attempt status of its own, so `S` is `ok` when the attempt is the phase's latest and the phase is `done`, and `gate_failed` when a later attempt superseded it or the phase failed, escalated, stopped or was cancelled.
+
+To pick up where you left off, pass `--since-offset B`, the way `--since` resumes `am watch`. `B` is the last chunk's `offset` plus the UTF-8 byte length of its `text`. That sum is exact for valid UTF-8. A U+FFFD stands for invalid bytes of the file but is 3 bytes in `text`, so after invalid bytes the sum can overcount. The next chunk's `offset` is always exact, so prefer it when you have one.
+
+Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. An error after the hello line cannot get an envelope, for example the run, card, phase or attempt no longer being in the projection. `am logs` then prints `am logs: <message>` on stderr and exits 3, as `am watch` does.
+
+These are refused with the usual `{"ok": false, "error": {"type", "message"}}` envelope and exit code 3, before any stream line is written:
+
+- an unknown run, card, phase or attempt, as for the one-shot;
+- a `--since-offset` below 0;
+- `--since-offset` without `--follow`, whatever its value, 0 included;
+- an agent attempt that recorded no stdout path, since there is no file to follow.
+
+So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event":"logs"`. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+
+`am logs --follow` checks the file about every 250 ms. That interval is internal and is not part of the contract.
+
+The hello line's `schema` is the stream's own version, `1` today. It is independent of the journal line's version and of the `am watch` hello line's `schema`, and a change to the chunk or end lines is signaled there.
+
+New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
 ## Resuming: what runs again
 

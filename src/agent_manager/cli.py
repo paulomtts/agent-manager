@@ -20,6 +20,7 @@ Typer's own usage errors.
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -39,6 +40,7 @@ from agent_manager import (
     comments,
     control,
     dag,
+    detach,
     dispatch,
     locks,
     models,
@@ -210,8 +212,9 @@ RUN_IDENTITY = (
     "started_at",
 )
 """The run's own fields, without `config` and without the tree below it. §10's
-`status` header and `runs`' entries are the same seven names, so the two
-commands describe a run the same way."""
+`status` header is these seven names. Each `runs` entry carries the same seven,
+plus `milestone_id`, `card_id`, `lease` and `progress` (a superset), so the two
+commands still describe a run's identity the same way."""
 
 
 def status_rows(run: models.Run) -> list[dict[str, Any]]:
@@ -254,6 +257,23 @@ def status_rows(run: models.Run) -> list[dict[str, Any]]:
     return rows
 
 
+def _lease_fields(lease: store_module.LeaseRow, *, now: datetime) -> dict[str, Any]:
+    """The lease fields `am status` and `am runs` both show.
+
+    One function so the two commands cannot drift: `control_view` adds
+    `acquired_at` on top, `runs_for` shows these five as they are. `live` is
+    `control.lease_is_live` at `now`, worked out at read time and never
+    stored; `heartbeat_at` is an ISO string.
+    """
+    return {
+        "pid": lease.pid,
+        "host": lease.host,
+        "heartbeat_at": lease.heartbeat_at.isoformat(),
+        "accepting": lease.accepting,
+        "live": control.lease_is_live(lease, now=now),
+    }
+
+
 def control_view(
     lease: store_module.LeaseRow | None,
     requests: Sequence[store_module.ControlRow],
@@ -271,12 +291,8 @@ def control_view(
         "lease": None
         if lease is None
         else {
-            "pid": lease.pid,
-            "host": lease.host,
+            **_lease_fields(lease, now=now),
             "acquired_at": lease.acquired_at.isoformat(),
-            "heartbeat_at": lease.heartbeat_at.isoformat(),
-            "accepting": lease.accepting,
-            "live": control.lease_is_live(lease, now=now),
         },
         "requests": [
             {
@@ -527,6 +543,35 @@ def select_step_attempt(
         f"phase {phase.name!r} of card {subtask.card_id!r} has no attempt {attempt};"
         f" recorded attempts: {numbers}"
     )
+
+
+def step_end_status(
+    subtask: models.SubtaskRun,
+    phase: models.PhaseRun,
+    n: int,
+    recorded: Sequence[int],
+) -> str | None:
+    """The `logs --follow` end status of deterministic attempt `n`, or `None`.
+
+    A deterministic phase has no `Attempt` row, so card 4.2 maps it onto the
+    `AttemptStatus` vocabulary: attempt `n` is over once a later `<phase>.M`
+    directory exists, or once the phase is neither `pending` nor `started`.
+    It ended `ok` only when it is the latest attempt and the phase is `done`;
+    a superseded attempt, or a phase `failed`, `escalated`, `stopped` or
+    `cancelled`, ended `gate_failed`. Pure: the caller scans `recorded` with
+    the read-only `paths.recorded_attempts`.
+    """
+    if n not in recorded:
+        numbers = ", ".join(str(item) for item in recorded) or "none"
+        raise UnknownAttemptError(
+            f"phase {phase.name!r} of card {subtask.card_id!r} has no attempt {n}"
+            f" any more; recorded attempts: {numbers}"
+        )
+    if max(recorded) > n:
+        return "gate_failed"
+    if phase.status in ("pending", "started"):
+        return None
+    return "ok" if phase.status == "done" else "gate_failed"
 
 
 def step_logs_payload(
@@ -883,37 +928,44 @@ def card_outcome_comment(
     return None
 
 
-def run_card(
+@dataclass(frozen=True)
+class CardPreflight:
+    """What `preflight_card` read and decided for one `run --card` (card 5daa944e).
+
+    Everything the recorded stage and the engine read afterwards, built with
+    no side effect: no store, no run directory, no lease. The three records
+    are the `started` rows `recorded_card_run` writes. Internal state, so a
+    dataclass.
+    """
+
+    root: Path
+    card: models.Card
+    parent: models.Card
+    branch: str
+    worktree: Path
+    base_branch: str
+    claims: list[str]
+    run_id: str
+    run_record: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+
+
+def preflight_card(
     card_id: str,
     *,
     repo_dir: Path,
     branch_prefix: str,
     base_branch: str = "master",
-    allow_no_verification: bool = False,
-    commands: Sequence[str] = (),
-    runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
-    control_interval: float = control.CONTROL_POLL_SECONDS,
-) -> dict[str, Any]:
-    """Drive one subtask card through `workflow.task.TASK` once, and report.
+) -> CardPreflight:
+    """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
 
-    The order is the spec's and it is load-bearing: the board reads happen before
-    a run id exists (so a bad card leaves no run directory), and the run, story
-    and subtask rows are written before the walk starts (so `status` and `resume`
-    can see a run that died on its first phase).
-
-    Live control (C11) and claims (X5): the card is refused before
-    `Store.open` if another live run claims it, and from before the
-    `started` rows through the final ones the run holds a `control.Lease`
-    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
-    which polls for `am pause`/`am cancel` every `control_interval` seconds
-    and turns one into `stop.request`. A pause parks the walk before its next
-    phase (`stopped`, resumable); a cancel parks it the same way and records
-    the run `cancelled` (`card_run_status`). No control cancels a running phase.
-
-    Board comments (card 5d9a875f): once the rows are recorded, still under
-    the lease, the card gets at most one comment (`card_outcome_comment`);
-    a flush's warnings join the payload's `warnings` and nothing else changes.
+    In today's order: the card, `ParentlessCardError`, its parent, the branch
+    and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
+    and before any store exists, so a refused card leaves no run directory
+    (X5). Only then is the clock read and the run id minted, and the
+    `started` run, story and subtask records built. Nothing is written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -928,14 +980,20 @@ def run_card(
     worktree = worktree_for(root, branch)
     claims = [control.card_claim(card.id)]
     # Read-only and before `Store.open`, so a refused card leaves no run
-    # directory (X5); `take_lease` below re-checks atomically.
+    # directory (X5); `take_lease` in the recorded stage re-checks atomically.
     refuse_claimed(root, claims)
     started_at = clock()
     run_id = mint_run_id(card.id, started_at)
-
-    store = Store.open(root, run_id)
-    try:
-        run_record = models.Run(
+    return CardPreflight(
+        root=root,
+        card=card,
+        parent=parent,
+        branch=branch,
+        worktree=worktree,
+        base_branch=base_branch,
+        claims=claims,
+        run_id=run_id,
+        run_record=models.Run(
             id=run_id,
             workflow=WORKFLOW_NAME,
             repo_dir=root,
@@ -944,97 +1002,200 @@ def run_card(
             status="started",
             started_at=started_at,
             config=models.RunConfig(),
-        )
-        story = models.StoryRun(
+        ),
+        story=models.StoryRun(
             card_id=parent.id,
             title=parent.title,
             level=0,
             status="started",
             tip_branch=branch,
-        )
-        subtask = models.SubtaskRun(
+        ),
+        subtask=models.SubtaskRun(
             card_id=card.id,
             branch=branch,
             base_branch=base_branch,
             status="started",
             worktree_path=worktree,
-        )
-        # Inside the `try` that closes the store, so the claims and the lease
-        # are released before `store.close()` on every exit, a raising walk
-        # included (C2, X5). Taken before `record_run`, so every run write is
-        # fenced by this token; a lost race is `ClaimedError` with nothing
-        # written but the empty run directory.
-        with run_lease(store, claims=claims) as lease:
-            store.record_run(run_record)
-            store.record_story(story)
-            store.record_subtask(story.card_id, subtask)
+        ),
+    )
 
-            stop = StopSignal()
-            # `controlled` only ever parks the walk through `stop` (C3); it
-            # closes the window and runs a final sweep before returning.
-            drive = asyncio.run(
-                control.controlled(
-                    drive_subtask_async(
-                        store=store,
-                        run_id=run_id,
-                        card=card,
-                        parent=parent,
-                        subtask=subtask,
-                        repo_dir=root,
-                        commands=commands,
-                        allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
-                        stop=stop,
-                    ),
-                    store=store,
-                    stop=stop,
-                    lease=lease,
-                    interval=control_interval,
-                )
-            )
-            summary = drive.summary
-            run_status = card_run_status(summary, stop)
 
-            store.record_run(run_record.model_copy(update={"status": run_status}))
-            store.record_story(story.model_copy(update={"status": summary.status}))
-            store.record_subtask(
-                story.card_id, subtask.model_copy(update={"status": summary.status})
-            )
+@dataclass(frozen=True)
+class RecordedRun:
+    """A run past its recorded stage: its id, its open store and the lease it holds.
 
-            # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
-            # still under the lease, so the outbox write is fenced. A board
-            # failure is a warning (B8); a lost lease propagates.
-            comment = card_outcome_comment(
-                run_id=run_id,
-                card=card,
-                summary=summary,
-                stop=stop,
-                branch=branch,
-                token=lease.token,
-            )
-            if comment is not None:
-                # `orchestrate` imports `cli`, so it is read here, at call time.
-                from agent_manager import orchestrate
+    What the engine of `run --card` needs that pre-flight could not give it
+    (card 5daa944e). Internal state, so a dataclass.
+    """
 
-                drive.warnings.extend(
-                    orchestrate.post_comment(store, root, comment, run_id=run_id)
-                )
+    run_id: str
+    store: Store
+    lease: control.Lease
 
-        return {
-            "run_id": run_id,
-            "card_id": card.id,
-            "story_id": parent.id,
-            "branch": branch,
-            "base_branch": base_branch,
-            "worktree": str(worktree),
-            "status": run_status,
-            "failed_phase": summary.failed_phase,
-            "detail": summary.detail,
-            "skipped": list(summary.skipped),
-            "warnings": drive.warnings,
-        }
+
+@contextmanager
+def recorded_card_run(pre: CardPreflight) -> Iterator[RecordedRun]:
+    """Stage 2 of `run --card`: open the store, take the lease, record `started` (card 5daa944e).
+
+    The lease and the `card:<id>` claim are taken inside the `try` that closes
+    the store, so they are released before `store.close()` on every exit, an
+    exception in the block included (C2, X5). They are taken before
+    `record_run`, so every run write is fenced by this token; a lost race is
+    `ClaimedError` (or `RunIsLiveError`) with nothing written but the empty
+    run directory. The run, story and subtask rows are written before the
+    block runs, so `status` and `resume` can see a run that dies on its first
+    phase.
+    """
+    store = Store.open(pre.root, pre.run_id)
+    try:
+        with run_lease(store, claims=pre.claims) as lease:
+            store.record_run(pre.run_record)
+            store.record_story(pre.story)
+            store.record_subtask(pre.story.card_id, pre.subtask)
+            yield RecordedRun(run_id=pre.run_id, store=store, lease=lease)
     finally:
         store.close()
+
+
+async def run_card_engine(
+    pre: CardPreflight,
+    recorded: RecordedRun,
+    *,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: RunnerFactory | None = None,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Stage 3 of `run --card`: walk a recorded, leased run and report (card 5daa944e).
+
+    The walk runs under `control.controlled` with the recorded stage's lease,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request` (C11). Then the outcome rows are
+    recorded and, still under the lease, the card gets at most one comment
+    (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
+    the payload's `warnings`. The caller owns the store and the lease.
+    """
+    store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
+    stop = StopSignal()
+    # `controlled` only ever parks the walk through `stop` (C3); it
+    # closes the window and runs a final sweep before returning.
+    drive = await control.controlled(
+        drive_subtask_async(
+            store=store,
+            run_id=run_id,
+            card=pre.card,
+            parent=pre.parent,
+            subtask=pre.subtask,
+            repo_dir=pre.root,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            stop=stop,
+        ),
+        store=store,
+        stop=stop,
+        lease=lease,
+        interval=control_interval,
+    )
+    summary = drive.summary
+    run_status = card_run_status(summary, stop)
+
+    store.record_run(pre.run_record.model_copy(update={"status": run_status}))
+    store.record_story(pre.story.model_copy(update={"status": summary.status}))
+    store.record_subtask(
+        pre.story.card_id, pre.subtask.model_copy(update={"status": summary.status})
+    )
+
+    # Board-comments B2 (card 5d9a875f): after the outcome is recorded and
+    # still under the lease, so the outbox write is fenced. A board
+    # failure is a warning (B8); a lost lease propagates.
+    comment = card_outcome_comment(
+        run_id=run_id,
+        card=pre.card,
+        summary=summary,
+        stop=stop,
+        branch=pre.branch,
+        token=lease.token,
+    )
+    if comment is not None:
+        # `orchestrate` imports `cli`, so it is read here, at call time.
+        from agent_manager import orchestrate
+
+        drive.warnings.extend(orchestrate.post_comment(store, pre.root, comment, run_id=run_id))
+
+    return {
+        "run_id": run_id,
+        "card_id": pre.card.id,
+        "story_id": pre.parent.id,
+        "branch": pre.branch,
+        "base_branch": pre.base_branch,
+        "worktree": str(pre.worktree),
+        "status": run_status,
+        "failed_phase": summary.failed_phase,
+        "detail": summary.detail,
+        "skipped": list(summary.skipped),
+        "warnings": drive.warnings,
+    }
+
+
+def run_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str = "master",
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Drive one subtask card through `workflow.task.TASK` once, and report.
+
+    Three stages (card 5daa944e), composed here: `preflight_card` (the board
+    reads and every refusal, then the run id and the `started` records, with
+    no side effect), `recorded_card_run` (the store opened, the lease and
+    the `card:<id>` claim taken, the `started` rows written) and
+    `run_card_engine` (the walk, the outcome rows and the card comment),
+    which runs under one `asyncio.run`.
+
+    The order is the spec's and it is load-bearing: the board reads happen before
+    a run id exists (so a bad card leaves no run directory), and the run, story
+    and subtask rows are written before the walk starts (so `status` and `resume`
+    can see a run that died on its first phase).
+
+    Live control (C11) and claims (X5): the card is refused before
+    `Store.open` if another live run claims it, and from before the
+    `started` rows through the final ones the run holds a `control.Lease`
+    with the `card:<id>` claim (`run_lease`), and the walk runs under `control.controlled`,
+    which polls for `am pause`/`am cancel` every `control_interval` seconds
+    and turns one into `stop.request`. A pause parks the walk before its next
+    phase (`stopped`, resumable); a cancel parks it the same way and records
+    the run `cancelled` (`card_run_status`). No control cancels a running phase.
+    The lease and claim are released before `store.close()` on every exit.
+
+    Board comments (card 5d9a875f): once the rows are recorded, still under
+    the lease, the card gets at most one comment (`card_outcome_comment`);
+    a flush's warnings join the payload's `warnings` and nothing else changes.
+    """
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                recorded,
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
 
 
 DEFAULT_MAX_CONCURRENT = 4
@@ -1224,6 +1385,146 @@ and should crash loudly with its stack intact.
 """
 
 
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+
+
+def release_handed_off(root: Path, run_id: str, token: str) -> None:
+    """Release a handed-off lease's claims, then the lease, over a fresh store.
+
+    For a detach that failed after `Lease.hand_off()`: the recorded stage's
+    store is already closed and its lease no longer releases anything.
+    """
+    store = Store.open(root, run_id)
+    try:
+        try:
+            store.release_claims(token)
+        finally:
+            store.release_lease(token)
+    finally:
+        store.close()
+
+
+def run_detached_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+) -> None:
+    """What the detached child of `am run --detach` runs: stage 3, then report.
+
+    It opens its own store and adopts `token` (no new lease: the claims the
+    parent took stay under it), so the heartbeat runs here. `engine` runs
+    stage 3 on that store and lease. Its payload is written to `report.json`
+    as `ok_envelope`, or a `HANDLED` error as `error_envelope`, both while
+    the lease is still held. Leaving the lease releases the claims, then the
+    lease, then the store closes, on every exit. Anything else propagates
+    with no report: its traceback goes to `run.log`.
+    """
+    store = Store.open(root, run_id)
+    try:
+        with control.Lease(store, adopt=token) as lease:
+            try:
+                payload = engine(store, lease)
+            except HANDLED as error:
+                detach.write_report(run_id, render(error_envelope(error)))
+                return
+            detach.write_report(run_id, render(ok_envelope(payload)))
+    finally:
+        store.close()
+
+
+def hand_off_to_child(
+    *,
+    root: Path,
+    run_id: str,
+    token: str,
+    log: Path,
+    engine: Callable[[Store, control.Lease], dict[str, Any]],
+    detacher: detach.Detacher,
+) -> dict[str, Any]:
+    """Start the detached child, point the lease at it, let it go, and report.
+
+    Called with the lease already handed off and the recorded stage's store
+    closed, so no connection and no heartbeat thread crosses the fork. The
+    child blocks until `go`. The lease row is re-pointed at the child's pid
+    over a fresh store while this process is still alive, so the row never
+    names a dead pid, and only then is the child let go. A failed spawn or
+    pid update releases the claims and lease (after telling a spawned child
+    to abort) and propagates.
+    """
+
+    def body() -> None:
+        run_detached_child(root=root, run_id=run_id, token=token, engine=engine)
+
+    try:
+        spawned = detacher(body, log)
+    except BaseException:
+        release_handed_off(root, run_id, token)
+        raise
+    try:
+        store = Store.open(root, run_id)
+        try:
+            store.set_lease_holder(token, pid=spawned.pid, host=socket.gethostname())
+        finally:
+            store.close()
+    except BaseException:
+        spawned.abort()
+        release_handed_off(root, run_id, token)
+        raise
+    spawned.go()
+    return {"run_id": run_id, "pid": spawned.pid, "log": str(log), "detached": True}
+
+
+def detach_card(
+    card_id: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    base_branch: str = "master",
+    allow_no_verification: bool = False,
+    commands: Sequence[str] = (),
+    runner_factory: RunnerFactory | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
+
+    `preflight_card` and `recorded_card_run` run exactly as for `run_card`, so
+    every refusal is the same. Inside the recorded stage `run.log` is created
+    (a failure there releases as any crash does) and the lease is handed
+    off, so the stage exits releasing nothing and closes its store. The child
+    runs `run_card_engine` on this very `pre` and run id (`hand_off_to_child`).
+    """
+    pre = preflight_card(
+        card_id,
+        repo_dir=repo_dir,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        clock=clock,
+    )
+    with recorded_card_run(pre) as recorded:
+        log = detach.create_run_log(pre.run_id)
+        token = recorded.lease.hand_off()
+
+    def engine(store: Store, lease: control.Lease) -> dict[str, Any]:
+        return asyncio.run(
+            run_card_engine(
+                pre,
+                RecordedRun(run_id=pre.run_id, store=store, lease=lease),
+                commands=commands,
+                allow_no_verification=allow_no_verification,
+                runner_factory=runner_factory,
+                control_interval=control_interval,
+            )
+        )
+
+    return hand_off_to_child(
+        root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -1232,6 +1533,7 @@ def _check_run_targets(
     max_concurrent: int | None = None,
     board: bool = False,
     branch_prefix: str | None = None,
+    detach: bool = False,
 ) -> None:
     """Refuse a bad `--card` / `--milestone` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
@@ -1250,6 +1552,9 @@ def _check_run_targets(
     refused whatever its value, the default included. The Option has no
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
+    `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
+    nothing to hand off, and with `--board`, whose run was not split into
+    pre-flight, recorded stage and engine.
     """
     if board and card is not None:
         raise typer.BadParameter(
@@ -1286,6 +1591,16 @@ def _check_run_targets(
             "--branch-prefix with --board needs a non-blank prefix, not a blank string",
             param_hint="'--branch-prefix'",
         )
+    if detach and dry_run:
+        raise typer.BadParameter(
+            "--dry-run writes nothing and cannot be detached",
+            param_hint="'--detach' / '--dry-run'",
+        )
+    if detach and board:
+        raise typer.BadParameter(
+            "--detach applies to --card and --milestone, not --board",
+            param_hint="'--detach' / '--board'",
+        )
     if dry_run and card is not None:
         raise typer.BadParameter(
             "--dry-run previews a milestone and does not apply to --card",
@@ -1307,6 +1622,7 @@ RUN_EXAMPLES = """\
 Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
+  am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
   am run --board --verify "uv run pytest"                             # run every open milestone
   am status <run-id> --pretty                                         # watch it (another terminal)
   am resume <run-id> --verify "uv run pytest"                         # after a fix, stop or crash
@@ -1344,6 +1660,16 @@ def run(
             "With --milestone: show the plan (story order, each subtask's branch "
             "and base, merged bases) and write nothing. With --board: show every "
             "open milestone by level, each with its own plan, and write nothing."
+        ),
+    ),
+    detach_run: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "With --card or --milestone: check, record and lease the run here, "
+            "then hand it to a background process in its own session and print "
+            "its run id, pid and log. Its output goes to "
+            "<data dir>/runs/<run-id>/run.log and its final envelope to report.json."
         ),
     ),
     max_concurrent: int | None = typer.Option(
@@ -1399,6 +1725,7 @@ def run(
         max_concurrent=max_concurrent,
         board=whole_board,
         branch_prefix=branch_prefix,
+        detach=detach_run,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1429,6 +1756,19 @@ def run(
                 base_branch=base_branch,
                 max_concurrent=lanes,
             )
+        elif milestone is not None and detach_run:
+            # Read as `orchestrate.detach_milestone` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_milestone(
+                milestone,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                max_concurrent=lanes,
+                detacher=detach.fork_detacher,
+            )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
             # No runner_factory and no driver: production gets
@@ -1441,6 +1781,17 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+            )
+        elif detach_run:
+            # Read as `detach.fork_detacher` so a test can patch it there.
+            payload = detach_card(
+                card,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                allow_no_verification=allow_no_verification,
+                commands=list(verify),
+                detacher=detach.fork_detacher,
             )
         else:
             payload = run_card(
@@ -1455,6 +1806,9 @@ def run(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+    if detach_run:
+        # A handed-off run's outcome is in its report.json, not this exit code.
+        return
     # A board payload carries one entry per milestone under `milestones`, each
     # with a `status`; a board dry-run carries no `milestones` key at all, so
     # it is read with `.get` and an empty default. A card payload reports
@@ -1547,17 +1901,36 @@ def status(
 
 
 def runs_for(*, repo_dir: Path) -> dict[str, Any]:
-    """This project's run history, newest first.
+    """This project's run history, newest first, each run with its lease and progress.
 
     An empty history is an empty list, not a refusal: a project that has never
     been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
+
+    `lease` is filled here, not in `store.list_runs`: `live` needs `control`,
+    which `store` must not import. Each run's `run_leases` row is read on the
+    same connection and shaped by `_lease_fields`, the helper `control_view`
+    uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
+    `None` when the run has no lease row. One `now` judges the whole listing.
+
+    `progress` arrives already counted by `store.list_runs`; `model_copy`
+    keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
     try:
-        return {"runs": [summary.model_dump() for summary in store_module.list_runs(conn)]}
+        now = _utcnow()
+        entries = []
+        for summary in store_module.list_runs(conn):
+            lease = store_module.read_lease(conn, summary.id)
+            shown = (
+                None
+                if lease is None
+                else store_module.RunLease(**_lease_fields(lease, now=now))
+            )
+            entries.append(summary.model_copy(update={"lease": shown}).model_dump())
+        return {"runs": entries}
     finally:
         conn.close()
 
@@ -1578,27 +1951,72 @@ def runs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def logs_for(
+@dataclass(frozen=True)
+class LogsSelection:
+    """The attempt `am logs` reports on, as `select_logs` chose it.
+
+    An agent phase carries its `Attempt` row. A deterministic phase has no
+    row (spec e1b1e7d5 Decision 2), so it carries the `<phase>.N` number and
+    directory found on disk instead, and `attempt` is `None`.
+    """
+
+    run: models.Run
+    story: models.StoryRun
+    subtask: models.SubtaskRun
+    phase: models.PhaseRun
+    attempt: models.Attempt | None
+    step_attempt: int | None = None
+    step_directory: Path | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """`logs`' one-shot payload: `logs_payload` or `step_logs_payload`."""
+        if self.attempt is not None:
+            return logs_payload(
+                self.run, self.story, self.subtask, self.phase, self.attempt
+            )
+        if self.step_attempt is None or self.step_directory is None:
+            raise CliError(
+                f"phase {self.phase.name!r} of card {self.subtask.card_id!r}"
+                " was selected with neither an attempt row nor a step directory"
+            )
+        return step_logs_payload(
+            self.run,
+            self.story,
+            self.subtask,
+            self.phase,
+            self.step_attempt,
+            self.step_directory,
+        )
+
+    def followed_path(self) -> Path | None:
+        """The file `logs --follow` reads: the agent attempt's recorded
+        `stdout_path` (the launcher merges stderr into it), or a deterministic
+        phase's `<phase>.N/stdout.log`. `None` when an agent attempt recorded
+        no stdout path."""
+        if self.attempt is not None:
+            return self.attempt.stdout_path
+        if self.step_directory is None:
+            return None
+        return self.step_directory / verify_step.STDOUT_LOG
+
+
+def select_logs(
     run_id: str,
     card: str,
     *,
     repo_dir: Path,
     phase: str | None = None,
     attempt: int | None = None,
-) -> dict[str, Any]:
-    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+) -> LogsSelection:
+    """Which attempt §10's `logs` reports, shared by the one-shot and `--follow`.
 
     Read-only, like `status_for`: the projection is reached through the free
     `open_db` / `load_run` rather than `Store.open`, which would construct a
     `Journal` and therefore mint a run directory for a run that may not exist.
     The connection is closed on every path including the refusals.
 
-    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
-    "most recent run" reading of it to default to.
-
     A `--phase` naming a deterministic phase is answered from disk: its
-    attempts are the `<phase>.N` directories `run_one_step` created, and the
-    payload carries that attempt's `stdout.log` and `stderr.log` (spec
+    attempts are the `<phase>.N` directories `run_one_step` created (spec
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
@@ -1631,13 +2049,141 @@ def logs_for(
             recorded = paths.recorded_attempts(run_id, card, step.name)
             n = select_step_attempt(subtask, step, recorded, attempt)
             directory = paths.attempt_path(run_id, card, step.name, n)
-            return step_logs_payload(run, story, subtask, step, n, directory)
+            return LogsSelection(
+                run=run,
+                story=story,
+                subtask=subtask,
+                phase=step,
+                attempt=None,
+                step_attempt=n,
+                step_directory=directory,
+            )
         chosen_phase, chosen_attempt = select_attempt(
             subtask, phase=phase, attempt=attempt
         )
-        return logs_payload(run, story, subtask, chosen_phase, chosen_attempt)
+        return LogsSelection(
+            run=run,
+            story=story,
+            subtask=subtask,
+            phase=chosen_phase,
+            attempt=chosen_attempt,
+        )
     finally:
         conn.close()
+
+
+def logs_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    """§10's `logs`: one attempt of one card of one run, with its artifacts.
+
+    `run_id` is required -- §10 writes `logs <run-id> <card>` and there is no
+    "most recent run" reading of it to default to. The selection, and its
+    read-only rules, are `select_logs`'; the artifacts are read after the
+    projection connection is closed, from the paths the selection names.
+    """
+    return select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    ).payload()
+
+
+def logs_follow_for(
+    run_id: str,
+    card: str,
+    *,
+    repo_dir: Path,
+    phase: str | None = None,
+    attempt: int | None = None,
+    since_offset: int = 0,
+) -> LogsSelection:
+    """Validate `am logs --follow` and return the attempt it streams.
+
+    The same selection as `logs_for` (`select_logs`), so every refusal the
+    one-shot makes is made here too, before the hello line. On top of those:
+    a negative `--since-offset` (worded as `watch --since` is), and an agent
+    attempt that recorded no stdout path, since the hello must name a file.
+    The projection connection is closed by `select_logs` before this
+    returns. The selection, not only its file, is returned because the
+    stream looks the attempt's status up again before every read
+    (`logs_end_status`, card 4.2), and that needs the run, card, phase and
+    attempt number.
+    """
+    if since_offset < 0:
+        raise CliError(f"--since-offset must be 0 or more, got {since_offset}")
+    selection = select_logs(
+        run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+    )
+    if selection.followed_path() is None:
+        number = (
+            selection.attempt.n
+            if selection.attempt is not None
+            else selection.step_attempt
+        )
+        raise CliError(
+            f"attempt {number} of phase {selection.phase.name!r} of card"
+            f" {selection.subtask.card_id!r} recorded no stdout path,"
+            " so there is no file to follow"
+        )
+    return selection
+
+
+def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
+    """The followed attempt's status if it is over, `None` while it runs.
+
+    Looked up afresh on every call, because `selection` is a snapshot from
+    before the stream began. Read-only, like `select_logs`: the free
+    `open_db` / `load_run`, the connection closed before anything else, and
+    for a deterministic phase only `paths.recorded_attempts`; never
+    `Store.open`, `paths.attempt_dir` or `paths.run_dir`, which create
+    directories. An agent attempt is over once its status is anything but
+    `started`; a deterministic one maps through `step_end_status`. A run,
+    card, phase or attempt that can no longer be found is a refusal, which
+    `_stream_logs` reports on stderr at exit 3.
+    """
+    run_id = selection.run.id
+    card = selection.subtask.card_id
+    name = selection.phase.name
+    root = resolve_repo_dir(repo_dir)
+    conn = store_module.open_db(root)
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    if run is None:
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection for {root} any more"
+        )
+    found = find_subtask(run, card)
+    if found is None:
+        raise UnknownCardError(f"card {card!r} is not in run {run_id!r} any more")
+    _, subtask = found
+    phase = next((item for item in subtask.phases if item.name == name), None)
+    if phase is None:
+        raise UnknownPhaseError(f"card {card!r} has no phase {name!r} any more")
+    if selection.attempt is None:
+        if selection.step_attempt is None:
+            raise CliError(
+                f"phase {name!r} of card {card!r} was selected with neither"
+                " an attempt row nor a step attempt"
+            )
+        return step_end_status(
+            subtask,
+            phase,
+            selection.step_attempt,
+            paths.recorded_attempts(run_id, card, name),
+        )
+    n = selection.attempt.n
+    row = next((item for item in phase.attempts if item.n == n), None)
+    if row is None:
+        raise UnknownAttemptError(
+            f"phase {name!r} of card {card!r} has no attempt {n} any more"
+        )
+    return None if row.status == "started" else row.status
 
 
 @app.command("logs")
@@ -1650,19 +2196,63 @@ def logs(
     attempt: int | None = typer.Option(
         None, "--attempt", help="Which attempt. Defaults to the highest recorded."
     ),
+    follow: bool = typer.Option(
+        False,
+        "--follow",
+        help=(
+            "Keep printing the attempt's stdout as it grows, one JSON object"
+            " per line; once the attempt is over and the file stops growing,"
+            ' print {"event":"end","status":...} and exit 0.'
+        ),
+    ),
+    since_offset: int | None = typer.Option(
+        None,
+        "--since-offset",
+        metavar="BYTES",
+        help="With --follow, start at this byte offset of the stdout file (default 0).",
+    ),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository whose projection is read."
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print one attempt's prompt, result and captured stdout/stderr."""
+    """Print one attempt's prompt, result and captured stdout/stderr.
+
+    With --follow, print a hello line naming the attempt's stdout file and
+    then its bytes as `{"offset", "text"}` lines, the existing content first
+    and then each append. Once the attempt has a terminal status and the
+    file has stopped growing, a last `{"event": "end", "status": ...}` line
+    follows and the exit is 0. A refusal is still one envelope at exit 3,
+    printed before any stream line.
+    """
+    offset = since_offset if since_offset is not None else 0
     try:
-        payload = logs_for(
-            run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
-        )
+        # `None` means --since-offset was not given; any given value, 0
+        # included, needs --follow, as --from-now does for `watch`.
+        if since_offset is not None and not follow:
+            raise CliError(
+                "--since-offset needs --follow: it resumes a stream,"
+                " and without --follow there is no stream"
+            )
+        if follow:
+            selection = logs_follow_for(
+                run_id,
+                card,
+                repo_dir=repo_dir,
+                phase=phase,
+                attempt=attempt,
+                since_offset=offset,
+            )
+        else:
+            payload = logs_for(
+                run_id, card, repo_dir=repo_dir, phase=phase, attempt=attempt
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if follow:
+        _stream_logs(selection, repo_dir=repo_dir, offset=offset)
+        return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
@@ -1703,7 +2293,13 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
 
 
 def watch_for(
-    run_id: str | None, *, all_runs: bool = False, since: int = 0
+    run_id: str | None,
+    *,
+    all_runs: bool = False,
+    since: int = 0,
+    follow: bool = False,
+    from_now: bool = False,
+    since_given: bool = False,
 ) -> dict[str, Any]:
     """The payload of `am watch`: `{"events": [...]}`.
 
@@ -1713,6 +2309,11 @@ def watch_for(
     missing `runs/` is no events: a watcher pointed at the wrong data
     directory sees nothing, not an error (am-watch design 3.7). Events are
     ordered by `(run_id, seq)`; `since` filters each run's own `seq`.
+
+    `from_now` (`--from-now`) is refused with `since_given` (any `--since`
+    on the command line, 0 included) and without `follow`. Both refusals
+    come before any journal is read, so `watch` prints them as the usual
+    exit-3 envelope with no stream line.
     """
     if all_runs == (run_id is not None):
         raise CliError(
@@ -1721,6 +2322,16 @@ def watch_for(
         )
     if since < 0:
         raise CliError(f"--since must be 0 or more, got {since}")
+    if from_now and since_given:
+        raise CliError(
+            "--from-now and --since are exclusive: --from-now skips the whole"
+            " backlog, --since picks where in it to start; give one of them"
+        )
+    if from_now and not follow:
+        raise CliError(
+            "--from-now needs --follow: it skips the backlog of a stream,"
+            " and without --follow there is only the backlog"
+        )
     if run_id is not None:
         _check_watch_run_id(run_id)
         try:
@@ -1808,6 +2419,7 @@ def _follow_watch(
     since: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
+    from_now: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """The backlog above `since`, then every line appended after it.
 
@@ -1815,9 +2427,20 @@ def _follow_watch(
     another pass, `max_polls` times or forever when it is `None`. One cursor
     dict spans every pass, so no `seq` of a run is emitted twice and none is
     skipped, however its lines are spread across polls.
+
+    With `from_now` the backlog pass still runs, so it seeds each existing
+    run's cursor to its highest complete `seq`, but nothing it reads is
+    yielded. A torn last line is not read, so it is emitted once complete;
+    a run with no complete line, or none at all yet, has no cursor and is
+    emitted in full from `since` when its lines appear.
     """
     cursors: dict[str, int] = {}
-    yield from _poll_watch(run_id, since=since, cursors=cursors)
+    backlog = _poll_watch(run_id, since=since, cursors=cursors)
+    if from_now:
+        for _ in backlog:
+            pass
+    else:
+        yield from backlog
     polls = 0
     while max_polls is None or polls < max_polls:
         sleep(WATCH_POLL_SECONDS)
@@ -1841,7 +2464,7 @@ def _silence_stdout() -> None:
     os.close(devnull)
 
 
-def _stream_watch(run_id: str | None, *, since: int) -> None:
+def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
@@ -1854,7 +2477,11 @@ def _stream_watch(run_id: str | None, *, since: int) -> None:
     try:
         _emit_stream_line(_watch_hello())
         for event in _follow_watch(
-            run_id, since=since, sleep=_watch_sleep, max_polls=WATCH_MAX_POLLS
+            run_id,
+            since=since,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            from_now=from_now,
         ):
             _emit_stream_line(event)
     except KeyboardInterrupt:
@@ -1864,6 +2491,141 @@ def _stream_watch(run_id: str | None, *, since: int) -> None:
         return
     except WATCH_HANDLED as error:
         typer.echo(f"am watch: {error}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+def _read_log_bytes(path: Path | None, offset: int) -> bytes:
+    """`path`'s bytes from `offset` to its current end, for `logs --follow`.
+
+    Never raises for the file's state: a path not recorded, a file not
+    written yet, a directory, an unreadable mode, or a file shorter than
+    `offset` all read as `b""`, so a poll that finds nothing waits for the
+    next one (spec card 4.1, "File not there yet"). Opens for reading only,
+    so nothing is created.
+    """
+    if path is None:
+        return b""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _utf8_complete_length(data: bytes) -> int:
+    """How many leading bytes of `data` end on a UTF-8 character boundary.
+
+    Only a trailing sequence whose lead byte is valid but whose continuation
+    bytes have not all arrived yet is held back: at most 3 bytes. Any other
+    byte, including a stray continuation or an invalid lead, counts as
+    complete, so `errors="replace"` turns it into U+FFFD and an invalid
+    tail can never stall the stream.
+    """
+    end = len(data)
+    for index in range(end - 1, max(end - 4, 0) - 1, -1):
+        byte = data[index]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte < 0x80:
+            return end
+        if 0xC2 <= byte <= 0xDF:
+            needed = 2
+        elif 0xE0 <= byte <= 0xEF:
+            needed = 3
+        elif 0xF0 <= byte <= 0xF4:
+            needed = 4
+        else:
+            return end
+        return index if end - index < needed else end
+    return end
+
+
+def _logs_hello(path: Path, offset: int) -> dict[str, Any]:
+    """The first line of `am logs --follow`: which file, from which byte.
+
+    Its own `schema`, independent of the journal's and of `watch`'s hello,
+    so the chunk shape can evolve without touching either.
+    """
+    return {"event": "logs", "schema": 1, "path": str(path), "offset": offset}
+
+
+def _follow_logs(
+    path: Path | None,
+    *,
+    offset: int,
+    sleep: Callable[[float], None],
+    max_polls: int | None,
+    end_status: Callable[[], str | None],
+) -> Iterator[dict[str, Any]]:
+    """`path`'s bytes from `offset` as `{"offset", "text"}` chunks, then each
+    append, then `{"event": "end", "status": ...}` once the attempt is over.
+
+    `end_status()` is asked before every read, so bytes written just before
+    the status flips are still read. While it returns `None` the attempt is
+    running: one read, then `sleep(WATCH_POLL_SECONDS)` and another,
+    `max_polls` sleeps or forever when it is `None`. Once it returns a
+    status, reads repeat with no sleep and no poll bound until one finds
+    nothing new; then a trailing partial UTF-8 character still held back is
+    yielded as one replacement-decoded chunk (the file will not grow to
+    complete it) and the `end` line closes the stream. One byte cursor spans
+    every read, so chunks are contiguous. A read that finds nothing past the
+    cursor (no file yet, a file shorter than the cursor) yields nothing.
+    """
+    cursor = offset
+    polls = 0
+    while True:
+        ended = end_status()
+        data = _read_log_bytes(path, cursor)
+        complete = _utf8_complete_length(data)
+        if complete:
+            yield {
+                "offset": cursor,
+                "text": data[:complete].decode("utf-8", errors="replace"),
+            }
+            cursor += complete
+            if ended is not None:
+                continue
+        if ended is not None:
+            if data:
+                yield {"offset": cursor, "text": data.decode("utf-8", errors="replace")}
+            yield {"event": "end", "status": ended}
+            return
+        if max_polls is not None and polls >= max_polls:
+            return
+        sleep(WATCH_POLL_SECONDS)
+        polls += 1
+
+
+def _stream_logs(selection: LogsSelection, *, repo_dir: Path, offset: int) -> None:
+    """The body of `am logs --follow`, once `logs_follow_for` has accepted it.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll. The stream ends by itself
+    with the `end` line once `logs_end_status` finds the attempt over and the
+    file drained: exit 0. Ctrl-C and a closed pipe also end it at exit 0,
+    nothing on stderr. After the hello line no envelope can be printed, so a
+    handled error, a failed status re-lookup included, goes to stderr and the
+    exit is `EXIT_ERROR`, mirroring `_stream_watch`.
+    """
+    path = selection.followed_path()
+    try:
+        _emit_stream_line(_logs_hello(path, offset))
+        for line in _follow_logs(
+            path,
+            offset=offset,
+            sleep=_watch_sleep,
+            max_polls=WATCH_MAX_POLLS,
+            end_status=lambda: logs_end_status(selection, repo_dir=repo_dir),
+        ):
+            _emit_stream_line(line)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        _silence_stdout()
+        return
+    except HANDLED as error:
+        typer.echo(f"am logs: {error}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
 
 
@@ -1877,13 +2639,24 @@ def watch(
     all_runs: bool = typer.Option(
         False, "--all", help="Read every run's journal under the data directory."
     ),
-    since: int = typer.Option(
-        0, "--since", metavar="SEQ", help="Only events whose seq is greater than SEQ."
+    since: int | None = typer.Option(
+        None,
+        "--since",
+        metavar="SEQ",
+        help="Only events whose seq is greater than SEQ (default 0).",
     ),
     follow: bool = typer.Option(
         False,
         "--follow",
         help="Keep printing events, one JSON object per line, until interrupted.",
+    ),
+    from_now: bool = typer.Option(
+        False,
+        "--from-now",
+        help=(
+            "With --follow, skip the backlog: print only events appended after"
+            " the command starts. Exclusive with --since."
+        ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
@@ -1891,16 +2664,28 @@ def watch(
 
     With --follow, print a hello line and then each event as its own line of
     JSON, the backlog first and then new ones as they are appended, until
-    interrupted. A refusal is still one envelope at exit 3, printed before
-    any stream line.
+    interrupted. With --follow --from-now, the backlog is skipped and only
+    events appended after the start are printed. A refusal is still one
+    envelope at exit 3, printed before any stream line.
     """
+    # `None` means --since was not given, which --from-now must tell apart
+    # from an explicit `--since 0`; every other use wants the number.
+    since_given = since is not None
+    since_value = since if since is not None else 0
     try:
-        payload = watch_for(run_id, all_runs=all_runs, since=since)
+        payload = watch_for(
+            run_id,
+            all_runs=all_runs,
+            since=since_value,
+            follow=follow,
+            from_now=from_now,
+            since_given=since_given,
+        )
     except WATCH_HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_watch(run_id, since=since)
+        _stream_watch(run_id, since=since_value, from_now=from_now)
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
