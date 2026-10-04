@@ -175,6 +175,27 @@ async def run_subtask_async(
     # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
     compiled = C.compile_workflow(workflow)
     resumed_at: str | None = None
+    # Out-of-band lines for `summary.warnings`, handed to `RunDeps` below.
+    warnings: list[str] = []
+    if resume_from is not None:
+        digest = workflow.digest()
+        if resume_from.digest != digest:
+            raise CheckpointMismatch(
+                f"checkpoint {resume_from.card_id}#{resume_from.seq} was saved under "
+                f"digest {resume_from.digest}, but workflow {workflow.name!r} "
+                f"has digest {digest}"
+            )
+        # A run that died before its `finally` may have left its agent
+        # registered under this name; `from_dict` -- or, on a decline, the
+        # fresh `Agent` of the same name -- would be refused it.
+        _forget(resume_from.agent["name"])
+        if await _worktree_kept(resume_from, subtask, repo_dir, ensure_worktree, warnings):
+            resumed_at = pending_phase(resume_from)
+        else:
+            # Declined: the walk starts over exactly as a fresh run does. The
+            # row is neither deleted nor rewritten; the fresh walk's first
+            # `turn` save, at a higher seq, supersedes it.
+            resume_from = None
     if resume_from is None:
         agent = Agent(
             f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
@@ -185,17 +206,6 @@ async def run_subtask_async(
             tags=["subtask"],
         )
     else:
-        digest = workflow.digest()
-        if resume_from.digest != digest:
-            raise CheckpointMismatch(
-                f"checkpoint {resume_from.card_id}#{resume_from.seq} was saved under "
-                f"digest {resume_from.digest}, but workflow {workflow.name!r} "
-                f"has digest {digest}"
-            )
-        resumed_at = pending_phase(resume_from)
-        # A run that died before its `finally` may have left its agent
-        # registered under this name; `from_dict` would be refused it.
-        _forget(resume_from.agent["name"])
         # The pool (seed, earlier results) and the queue (pending turn, loop
         # count) come from the checkpoint: no seed item, no first turn.
         agent = Agent.from_dict(resume_from.agent)
@@ -218,13 +228,66 @@ async def run_subtask_async(
             else Adoption(**vars(resume_from.floor))
         )
         deps = RunDeps(
-            workflow, store, story_id, subtask, agent_runner, clock, stop=stop, adopt=adopt
+            workflow,
+            store,
+            story_id,
+            subtask,
+            agent_runner,
+            clock,
+            stop=stop,
+            adopt=adopt,
+            warnings=warnings,
         )
         summary = await _run(agent, deps)
         summary.resumed_at = resumed_at
         return summary
     finally:
         _forget(agent.name)
+
+
+async def _worktree_kept(
+    checkpoint: Checkpoint,
+    subtask: Any,
+    repo_dir: Path,
+    ensure_worktree: Callable[..., Mapping[str, object]],
+    warnings: list[str],
+) -> bool:
+    """Whether `checkpoint` may be resumed as saved, its worktree being there.
+
+    Resume worktree re-ensure §3.1-§3.4. No path, or a path that is a
+    directory, keeps the checkpoint and runs nothing: no git, no warning. A
+    missing directory gets one `ensure_worktree` call on a worker thread (it
+    is sync git): a branch that survived keeps the checkpoint, the worktree
+    re-added; a branch that is gone, or any error, declines it, so the walk
+    starts over from the first phase, whose own `ensure` step reports a real
+    failure the ordinary way. Never raises: a missing worktree is a recovery,
+    not a refusal. Each non-fast outcome appends exactly one line to `warnings`.
+    """
+    path = subtask.worktree_path
+    if path is None or Path(path).is_dir():
+        return True
+    label = f"checkpoint #{checkpoint.seq} of run {checkpoint.run_id}"
+    try:
+        report = await asyncio.to_thread(
+            ensure_worktree, subtask.branch, subtask.base_branch, path, repo_dir
+        )
+    except Exception as error:
+        warnings.append(
+            f"{label} was not resumed (worktree {path} is missing and could not be"
+            f" added again: {walk._render_error(error)}); starting from the first phase"
+        )
+        return False
+    if not report.get("branch_existed"):
+        warnings.append(
+            f"{label} was not resumed (worktree {path} is missing and branch"
+            f" '{subtask.branch}' no longer exists); starting from the first phase"
+        )
+        return False
+    warnings.append(
+        f"{label}: worktree {path} was missing and was added again for branch"
+        f" '{subtask.branch}'; resuming at '{pending_phase(checkpoint)}'"
+    )
+    return True
 
 
 async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:

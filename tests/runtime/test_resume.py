@@ -867,3 +867,211 @@ def test_resumed_at_is_reported_when_the_resumed_walk_parks_again(store):
 
     assert summary.status == "stopped"
     assert summary.resumed_at == "b"
+
+
+def _re_added(seq: int, path: Path, phase: str) -> str:
+    return (
+        f"checkpoint #{seq} of run {RUN_ID}: worktree {path} was missing and was"
+        f" added again for branch '{BRANCH}'; resuming at '{phase}'"
+    )
+
+
+def _branch_gone(seq: int, path: Path) -> str:
+    return (
+        f"checkpoint #{seq} of run {RUN_ID} was not resumed (worktree {path} is"
+        f" missing and branch '{BRANCH}' no longer exists); starting from the first phase"
+    )
+
+
+def _re_add_failed(seq: int, path: Path, rendered: str) -> str:
+    return (
+        f"checkpoint #{seq} of run {RUN_ID} was not resumed (worktree {path} is"
+        f" missing and could not be added again: {rendered}); starting from the first phase"
+    )
+
+
+def _record_adoptions(monkeypatch) -> list[tuple[str, Adoption | None, Adoption | None]]:
+    """Wrap `RunDeps.take_adoption`: `(phase, adopt before the take, what it returned)` per call."""
+    seen: list[tuple[str, Adoption | None, Adoption | None]] = []
+    take = RunDeps.take_adoption
+
+    def recording_take(self, phase, loop):
+        before = self.adopt
+        taken = take(self, phase, loop)
+        seen.append((phase, before, taken))
+        return taken
+
+    monkeypatch.setattr(RunDeps, "take_adoption", recording_take)
+    return seen
+
+
+def test_a_deleted_worktree_whose_branch_survives_is_re_added_and_resumed(
+    store, worktree_dir, monkeypatch
+):
+    """Spec test 2: the checkpoint is kept, and so is its carried floor."""
+    ran, wf, crashed = _crash_in_c(store)
+    assert _next_turn(crashed.agent)["kwargs"] == {"phase": "c", "loop": 0}
+    carried = TurnFloor("c", 0, "run-earlier", 7)
+    worktree_dir.rmdir()
+    fake = _FakeEnsure(KEPT)
+    adoptions = _record_adoptions(monkeypatch)
+    ran.clear()
+
+    summary = _go(
+        wf,
+        store,
+        resume_from=dataclasses.replace(crashed, floor=carried),
+        ensure_worktree=fake,
+    )
+
+    assert fake.calls == [(BRANCH, BASE_BRANCH, worktree_dir, REPO)]
+    assert ran == ["c", "d", "e"]
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS
+    assert summary.warnings == [_re_added(crashed.seq, worktree_dir, "c")]
+    assert summary.resumed_at == "c"
+    # Same shape as test_a_carried_floor_survives_a_resume: the resumed head
+    # takes the carried floor, unchanged.
+    assert adoptions[0][2] == Adoption("c", 0, "run-earlier", 7)
+
+
+def test_a_deleted_worktree_whose_branch_is_gone_starts_over(store, worktree_dir, monkeypatch):
+    """Spec test 3: the checkpoint is declined and the walk runs from the first phase."""
+    ran, wf, crashed = _crash_in_c(store)
+    worktree_dir.rmdir()
+    fake = _FakeEnsure(GONE)
+    adoptions = _record_adoptions(monkeypatch)
+    ran.clear()
+
+    summary = _go(
+        wf,
+        store,
+        # A floor on the declined row must not be carried into the fresh walk.
+        resume_from=dataclasses.replace(crashed, floor=TurnFloor("c", 0, "run-earlier", 7)),
+        ensure_worktree=fake,
+    )
+
+    assert fake.calls == [(BRANCH, BASE_BRANCH, worktree_dir, REPO)]
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.results == ALL_RESULTS
+    assert summary.warnings == [_branch_gone(crashed.seq, worktree_dir)]
+    assert summary.resumed_at is None
+    # deps.adopt is None: the fresh walk's first take sees no carried floor.
+    assert adoptions[0][:2] == ("a", None)
+    # The declined row stays, superseded by the fresh walk's newer rows.
+    assert store.latest_checkpoint(CARD_ID).seq > crashed.seq
+    reopened = store.latest_open_checkpoint(CARD_ID, wf.name)
+    assert reopened is None or reopened.seq != crashed.seq
+
+
+def test_a_failed_re_add_starts_over_and_phase_0_escalates(store, worktree_dir):
+    """Spec test 4: the engine declines and warns, it does not escalate itself;
+    phase 0 of the fresh walk runs the same `ensure` and fails as an ordinary step."""
+    fake = _FakeEnsure(KEPT)
+    ran: list[str] = []
+
+    def ensure_step(branch: str, base: str, worktree: Path, repo_dir: Path) -> dict[str, Any]:
+        ran.append("worktree")
+        return fake(branch, base, worktree, repo_dir)
+
+    wf = Workflow("guarded", (Step("worktree", ensure_step),) + _five(ran, {"c"}).phases)
+    with pytest.raises(_Crash):
+        _go(wf, store)
+    crashed = store.latest_checkpoint(CARD_ID)
+    assert _head(crashed.agent) == "c"
+    worktree_dir.rmdir()
+    error = GitError("fatal: could not create work tree dir", argv=["worktree", "add"], exit_code=128)
+    fake.error = error
+    fake.calls.clear()
+    ran.clear()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=fake)
+
+    # Once for the re-check, once as phase 0 of the fresh walk.
+    assert fake.calls == [(BRANCH, BASE_BRANCH, worktree_dir, REPO)] * 2
+    assert ran == ["worktree"]
+    assert summary.warnings == [_re_add_failed(crashed.seq, worktree_dir, f"GitError: {error}")]
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "worktree"
+    assert summary.detail.startswith("GitError:")
+    assert summary.resumed_at is None
+    assert _phase_rows(store)[-2:] == [("worktree", "started"), ("worktree", "failed")]
+
+
+def test_the_digest_check_runs_before_the_worktree_re_check(store, worktree_dir):
+    """Spec test 6: a changed workflow is refused before the seam is ever called."""
+    _, wf, crashed = _crash_in_c(store)
+    changed = Workflow("five", wf.phases + (Step("f", _extra),))
+    worktree_dir.rmdir()
+    fake = _FakeEnsure(KEPT)
+
+    with pytest.raises(runtime_engine.CheckpointMismatch):
+        _go(changed, store, resume_from=crashed, ensure_worktree=fake)
+
+    assert fake.calls == []
+
+
+def test_a_checkpoint_parked_before_the_worktree_existed_walks_from_the_start(
+    store, worktree_dir
+):
+    """Review Focus 1: parked before phase 0, no worktree and no branch were ever made."""
+    ran: list[str] = []
+    wf = _five(ran, set())
+    parked = _park_with_a_triggered_stop(wf, store)
+    worktree_dir.rmdir()
+    fake = _FakeEnsure(GONE)
+
+    summary = _go(wf, store, resume_from=parked, ensure_worktree=fake)
+
+    assert len(fake.calls) == 1
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.warnings == [_branch_gone(parked.seq, worktree_dir)]
+    assert summary.resumed_at is None
+
+
+def test_any_error_from_the_reensure_declines_and_never_escapes(store, worktree_dir):
+    """Review Focus 2: not only `GitError` -- `ensure`'s own `ValueError`, a lock timeout."""
+    ran, wf, crashed = _crash_in_c(store)
+    worktree_dir.rmdir()
+    error = ValueError("worktree.ensure needs a non-empty base name, got ''")
+    fake = _FakeEnsure(error=error)
+    ran.clear()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=fake)
+
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    assert summary.warnings == [_re_add_failed(crashed.seq, worktree_dir, f"ValueError: {error}")]
+    assert summary.resumed_at is None
+
+
+def test_a_stale_registry_entry_does_not_block_a_declined_resume(store, worktree_dir):
+    """Review Focus 3: the decline path frees the checkpoint's agent name too."""
+    ran, wf, crashed = _crash_in_c(store)
+    Agent(crashed.agent["name"], "left behind by a dead run", [])
+    worktree_dir.rmdir()
+    ran.clear()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=_FakeEnsure(GONE))
+
+    assert ran == list(FIVE)
+    assert summary.status == "done"
+    with pytest.raises(UnregisteredAgentError):
+        AgentRegistry.get(crashed.agent["name"])
+
+
+def test_a_file_where_the_worktree_should_be_is_not_the_fast_path(store, worktree_dir):
+    """Review Focus 4: only a directory counts as an intact worktree."""
+    ran, wf, crashed = _crash_in_c(store)
+    worktree_dir.rmdir()
+    worktree_dir.write_text("not a worktree\n", encoding="utf-8")
+    fake = _FakeEnsure(KEPT)
+    ran.clear()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=fake)
+
+    assert fake.calls == [(BRANCH, BASE_BRANCH, worktree_dir, REPO)]
+    assert ran == ["c", "d", "e"]
+    assert summary.warnings == [_re_added(crashed.seq, worktree_dir, "c")]
