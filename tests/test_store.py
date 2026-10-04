@@ -11,6 +11,7 @@ run in the default `uv run pytest` suite.
 writes nowhere real.
 """
 
+import ast
 import dataclasses
 import json
 import sqlite3
@@ -1595,12 +1596,29 @@ def test_list_runs_leaves_the_lease_to_the_caller_even_with_a_lease_row(repo):
 
 
 def test_store_does_not_import_control():
-    """`control` imports `store`; the reverse would be a circular import."""
-    source = Path(store.__file__).read_text()
+    """`control` imports `store`; the reverse would be a circular import.
 
-    assert "from agent_manager import control" not in source
-    assert "from agent_manager.control" not in source
-    assert "import agent_manager.control" not in source
+    A top-level import would already break collection, so this walks the
+    whole AST: a function-local `from . import control` or a multi-name
+    `from agent_manager import models, control` must be caught too.
+    """
+    tree = ast.parse(Path(store.__file__).read_text())
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = "agent_manager" if node.level else (node.module or "")
+            if node.level and node.module:
+                base = f"agent_manager.{node.module}"
+            imported.add(base)
+            imported.update(f"{base}.{alias.name}" for alias in node.names)
+
+    assert not {
+        name
+        for name in imported
+        if name == "agent_manager.control" or name.startswith("agent_manager.control.")
+    }
 
 
 def test_latest_run_id_is_the_newest_recorded_run(repo):
