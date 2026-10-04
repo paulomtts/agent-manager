@@ -24,6 +24,7 @@ from agent_manager.runtime import compile as C
 from agent_manager.runtime import context
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
+from agent_manager.steps import worktree
 from agent_manager.workflow.phases import Workflow
 
 if TYPE_CHECKING:
@@ -87,6 +88,7 @@ def run_subtask(
     extra_context: Mapping[str, Any] | None = None,
     agent_runner: Any = None,
     clock: Callable[[], Any] = walk._utcnow,
+    ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
     resume_from: Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
@@ -105,6 +107,7 @@ def run_subtask(
             extra_context=extra_context,
             agent_runner=agent_runner,
             clock=clock,
+            ensure_worktree=ensure_worktree,
             stop=stop,
             resume_from=resume_from,
         )
@@ -124,6 +127,7 @@ async def run_subtask_async(
     extra_context: Mapping[str, Any] | None = None,
     agent_runner: Any = None,
     clock: Callable[[], Any] = walk._utcnow,
+    ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
     resume_from: Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
@@ -145,6 +149,11 @@ async def run_subtask_async(
     no seed or first turn is added. A checkpoint saved under another workflow
     digest is refused with `CheckpointMismatch` before anything runs or is
     recorded.
+
+    `ensure_worktree` is `steps.worktree.ensure` unless a test injects a fake:
+    a resume calls it, on a worker thread, only when the subtask's worktree
+    directory is missing (resume worktree re-ensure §3.1). `summary.resumed_at`
+    names the phase a kept checkpoint continued at, else `None`.
     """
     # The binding, built and refused before any agent exists, so a refusal
     # records nothing.
@@ -165,6 +174,7 @@ async def run_subtask_async(
     # Compiled first on both paths: it registers the digest-prefixed tools
     # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
     compiled = C.compile_workflow(workflow)
+    resumed_at: str | None = None
     if resume_from is None:
         agent = Agent(
             f"{getattr(store, 'run_id', 'run')}:{subtask.card_id}",
@@ -182,6 +192,7 @@ async def run_subtask_async(
                 f"digest {resume_from.digest}, but workflow {workflow.name!r} "
                 f"has digest {digest}"
             )
+        resumed_at = pending_phase(resume_from)
         # A run that died before its `finally` may have left its agent
         # registered under this name; `from_dict` would be refused it.
         _forget(resume_from.agent["name"])
@@ -209,7 +220,9 @@ async def run_subtask_async(
         deps = RunDeps(
             workflow, store, story_id, subtask, agent_runner, clock, stop=stop, adopt=adopt
         )
-        return await _run(agent, deps)
+        summary = await _run(agent, deps)
+        summary.resumed_at = resumed_at
+        return summary
     finally:
         _forget(agent.name)
 

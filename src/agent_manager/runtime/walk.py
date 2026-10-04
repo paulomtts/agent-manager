@@ -255,6 +255,10 @@ class SubtaskSummary:
     detail: str | None = None
     before_phase: str | None = None
     """The phase a `stopped` subtask would have run next; None unless `_stop` ran."""
+    resumed_at: str | None = None
+    """The phase a resumed walk actually continued at; `None` for a fresh walk,
+    or for a resume whose checkpoint was declined and started over from the
+    first phase (resume worktree re-ensure §3.5). Set by `runtime.engine`."""
 
 
 @dataclass

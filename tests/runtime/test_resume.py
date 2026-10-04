@@ -29,6 +29,7 @@ from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
+from agent_manager.steps.worktree import GitError
 from agent_manager.store import TurnFloor
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
@@ -771,3 +772,98 @@ def test_a_floorless_row_resumes_with_a_fresh_floor(store):
 
     assert seen[0] == ("spec", None)
     assert _floors(store)[crashed.seq + 1] == ("turn", TurnFloor("spec", 1, RUN_ID, 2))
+
+
+# ── a resume re-ensures a missing worktree (card f76af5b2) ───────────────────
+
+BRANCH = f"m6/task-resume-a-subtask-from-{CARD_ID}"
+BASE_BRANCH = "m6/story-base"
+KEPT = {"branch_existed": True, "worktree_existed": False, "created": True}
+"""What `worktree.ensure` reports after re-adding a worktree whose branch survived."""
+GONE = {"branch_existed": False, "worktree_existed": False, "created": True}
+"""What `worktree.ensure` reports after cutting a branch that no longer existed."""
+
+
+class _FakeEnsure:
+    """A recording `ensure_worktree` that never runs git.
+
+    Called with `worktree.ensure`'s four positional arguments `(branch, base,
+    worktree, repo_dir)`; records each call, then raises `error` if one is set,
+    else returns `result` filled out to `ensure`'s full shape. `error` may be
+    set after construction, so one fake can succeed for a first run and fail
+    for the resume that follows.
+    """
+
+    def __init__(
+        self, result: dict[str, object] = KEPT, error: BaseException | None = None
+    ) -> None:
+        self.result = dict(result)
+        self.error = error
+        self.calls: list[tuple[str, str, Path | None, Path]] = []
+
+    def __call__(self, branch, base, worktree, repo_dir) -> dict[str, object]:
+        self.calls.append((branch, base, worktree, repo_dir))
+        if self.error is not None:
+            raise self.error
+        return {"branch": branch, "worktree": str(worktree), **self.result, "commit_count": 0}
+
+
+def _crash_in_c(opened) -> tuple[list[str], Workflow, Any]:
+    """Run `_five` until it dies in `c`; what ran, the workflow and the `turn` row."""
+    ran: list[str] = []
+    wf = _five(ran, {"c"})
+    with pytest.raises(_Crash):
+        _go(wf, opened)
+    crashed = opened.latest_checkpoint(CARD_ID)
+    assert crashed.reason == "turn"
+    assert _head(crashed.agent) == "c"
+    return ran, wf, crashed
+
+
+def test_a_fresh_walk_reports_no_resume_point(store):
+    summary = _go(_five([], set()), store)
+
+    assert summary.status == "done"
+    assert summary.resumed_at is None
+
+
+def test_an_intact_worktree_resumes_without_touching_git(store):
+    """Spec test 1: the fast path -- the directory is there, the seam is never called."""
+    ran, wf, crashed = _crash_in_c(store)
+    fake = _FakeEnsure()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=fake)
+
+    assert fake.calls == []
+    assert ran == ["a", "b", "c", "c", "d", "e"]
+    assert summary.status == "done"
+    assert summary.warnings == []
+    assert summary.resumed_at == "c"
+
+
+def test_a_subtask_with_no_worktree_path_resumes_unchanged(store, monkeypatch):
+    """Spec test 5: `worktree_path is None` is the fast path too."""
+    monkeypatch.setitem(globals(), "WORKTREE", None)
+    ran, wf, crashed = _crash_in_c(store)
+    fake = _FakeEnsure()
+
+    summary = _go(wf, store, resume_from=crashed, ensure_worktree=fake)
+
+    assert fake.calls == []
+    assert ran == ["a", "b", "c", "c", "d", "e"]
+    assert summary.status == "done"
+    assert summary.warnings == []
+    assert summary.resumed_at == "c"
+
+
+def test_resumed_at_is_reported_when_the_resumed_walk_parks_again(store):
+    """Review Focus 5: a kept resume that stops still says where it continued."""
+    ran, wf, _ = _park_after_a(store)
+    parked = store.latest_checkpoint(CARD_ID)
+    still = StopSignal()
+    still.trigger("elsewhere")
+
+    summary = _go(wf, store, resume_from=parked, stop=still, ensure_worktree=_FakeEnsure())
+
+    assert summary.status == "stopped"
+    assert summary.resumed_at == "b"

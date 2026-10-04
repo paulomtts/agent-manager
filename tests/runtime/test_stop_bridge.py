@@ -88,6 +88,7 @@ WALK_PARAMETERS = [
     "extra_context",
     "agent_runner",
     "clock",
+    "ensure_worktree",
     "stop",
     "resume_from",
 ]
