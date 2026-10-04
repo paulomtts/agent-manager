@@ -161,12 +161,20 @@ class Verdict:
     raised instead of returning a verdict, per the spec's error paths -- and is
     kept separate from `status` because the journalled outcome name is part of
     the contract and must stay one of the four.
+
+    `timed_out` is set only by `classify` reading `outcome.timed_out`, never by
+    a gate or `read_result` -- it marks a `harness_error` whose attempt ran the
+    launcher's full timeout rather than failing fast, which
+    `AgentRunner.__call__` reads to refuse the one-shot redispatch (G2's margin
+    assumes at most one launcher-timeout-length attempt per phase; redispatching
+    a second one can run the turn past its own timeout).
     """
 
     status: models.AttemptStatus
     result: Any = None
     detail: str | None = None
     fatal: bool = False
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,6 +265,7 @@ def classify(
         return Verdict(
             "harness_error",
             detail=f"the harness timed out and was killed after {outcome.duration:.1f}s",
+            timed_out=True,
         )
     if outcome.exit_code != 0:
         return Verdict("harness_error", detail=f"the harness exited {outcome.exit_code}")
@@ -409,8 +418,14 @@ class AgentRunner:
         feedback: list[str] = []
         # The first harness_error of this call gets one more dispatch, outside
         # the retry budget (1fadbbdd): a harness that died without a result --
-        # a turn ended early, a timeout, a crash -- may well succeed on a fresh
-        # process, and `retry.on` is the schema/gate contract, not this one.
+        # a turn ended early, a crash -- may well succeed on a fresh process,
+        # and `retry.on` is the schema/gate contract, not this one. Never for a
+        # verdict that timed out, though: that attempt already spent the whole
+        # launcher timeout, and G2's turn-timeout floor only has room for one
+        # of those per phase -- a second would risk the turn timing out while
+        # the redispatch is still running, leaving an abandoned `to_thread`
+        # worker to write its attempt after the walk has moved on or the store
+        # closed.
         redispatched = False
         counted = 0
 
@@ -422,7 +437,7 @@ class AgentRunner:
                 if verdict.status == "ok":
                     self._record_phase(phase, "done", started_at, self.clock(), None)
                     return verdict.result
-                if verdict.status == "harness_error" and not redispatched:
+                if verdict.status == "harness_error" and not redispatched and not verdict.timed_out:
                     # No feedback: the harness produced nothing for a complaint
                     # to correct, so the brief is re-sent as it was.
                     redispatched = True

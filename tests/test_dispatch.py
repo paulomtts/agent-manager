@@ -472,6 +472,16 @@ def test_a_timeout_classifies_harness_error_and_never_reads_the_result(tmp_path)
 
     assert verdict.status == "harness_error"
     assert "timed out" in verdict.detail
+    assert verdict.timed_out is True
+
+
+def test_a_non_zero_exit_classifies_harness_error_not_timed_out(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(VALID_RESULT, encoding="utf-8")
+
+    verdict = dispatch.classify(_outcome(tmp_path, exit_code=2), result, FakeResult)
+
+    assert verdict.timed_out is False
     assert verdict.result is None
 
 
@@ -968,7 +978,11 @@ def test_a_non_zero_exit_is_redispatched(store, tmp_path, worktree):
     assert runner.warnings == [_redispatch_warning(1, "the harness exited 3")]
 
 
-def test_a_timeout_is_redispatched(store, tmp_path, worktree):
+def test_a_timeout_is_never_redispatched(store, tmp_path, worktree):
+    # A timed-out attempt already spent the whole launcher timeout; a second
+    # one risks the turn's own timeout firing mid-redispatch (G2's floor only
+    # has room for one launcher-timeout-length attempt per phase), so this one
+    # fails the phase at once instead of getting the usual one-shot redispatch.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[None], exit_code=None, timed_out=True)
     runner, _ = _runner(store, launcher, tmp_path, worktree)
@@ -977,12 +991,9 @@ def test_a_timeout_is_redispatched(store, tmp_path, worktree):
         runner(workflow.phase("explore"), _context(worktree), _rendered())
 
     assert caught.value.outcome == "harness_error"
-    assert len(launcher.calls) == 2
-    assert _attempt_statuses(store) == [
-        (1, "started"), (1, "harness_error"), (2, "started"), (2, "harness_error")
-    ]
-    assert len(runner.warnings) == 1
-    assert "timed out" in runner.warnings[0]
+    assert len(launcher.calls) == 1
+    assert _attempt_statuses(store) == [(1, "started"), (1, "harness_error")]
+    assert runner.warnings == []
 
 
 def test_a_result_less_phase_redispatches_a_bad_exit(store, tmp_path, worktree):
