@@ -3877,15 +3877,10 @@ def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypa
 
     assert result.exit_code == cli.EXIT_ESCALATED, result.output
     envelope = json.loads(result.stdout)
+    # Exact equality is the whole pin: any key the CLI adds, drops or renames
+    # (a board-level `run_id`, say) breaks it. The payload's own key sets are
+    # pinned against the real `run_board` in test_orchestrate.py.
     assert envelope == {"ok": True, "data": payload}
-    assert set(envelope["data"]) == {"ok", "board", "levels", "milestones"}
-    assert "run_id" not in envelope["data"]
-    assert envelope["data"]["ok"] is False
-    assert [set(entry) for entry in envelope["data"]["milestones"]] == [
-        {"milestone_id", "status", "done", "run_id"},
-        {"milestone_id", "status", "error"},
-        {"milestone_id", "status", "blocked_by"},
-    ]
 
 
 @pytest.mark.parametrize(
