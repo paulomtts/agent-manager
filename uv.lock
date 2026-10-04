@@ -21,7 +21,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "grafo", specifier = ">=0.3.5" },
+    { name = "grafo", specifier = ">=0.3.6" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pygents", specifier = ">=0.7.0" },
     { name = "typer", specifier = ">=0.27.2" },
@@ -62,11 +62,11 @@ wheels = [
 
 [[package]]
 name = "grafo"
-version = "0.3.5"
+version = "0.3.6"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b1/ad/b38fb9bd732ce0e0aa6f3552ae8723fc762b08592e8b071d6ee607a5644d/grafo-0.3.5.tar.gz", hash = "sha256:211a1c0d62a4eaaa01092af16246872f44a3c88fc67657ed0d22cc0e025ef359", size = 19023, upload-time = "2026-09-25T18:26:45.239Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/31/a466f6f875d1896024848fa1c6f4b74d992e132486d87d066dbce0cae012/grafo-0.3.6.tar.gz", hash = "sha256:9d139eec771a62c2b6690c3b0aed0b02e8c63a58cbe506dac5942aae045437e4", size = 20055, upload-time = "2026-10-04T00:43:13.541Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/56/0a1fe355296160ccd6895a086717f11a235917c15f899ce35052887b5d0f/grafo-0.3.5-py3-none-any.whl", hash = "sha256:9f328aae11ec560bb3eac5a8d9e2074110dce7f7fbbf640dc1955cee08f4211c", size = 12599, upload-time = "2026-09-25T18:26:44.181Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/78/da8264e9f84c144752520bcb513eda39e97d793b44b04d91ba0360d40ab9/grafo-0.3.6-py3-none-any.whl", hash = "sha256:e4c36f88088d10177c41e3a251a79b66efc8092978df4ebbdeb965a44898d024", size = 12790, upload-time = "2026-10-04T00:43:12.5Z" },
 ]
 
 [[package]]
