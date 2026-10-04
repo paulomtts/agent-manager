@@ -7421,3 +7421,70 @@ def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
     assert _claim_rows(root) == []
     assert _held_keys(root, RESUME_RUN_ID) == []
     assert _load(root, RESUME_RUN_ID).status == "escalated"
+
+
+def test_the_milestone_engine_drives_a_recorded_run_under_its_lease(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    story = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    handed: dict[str, Any] = {}
+
+    real_supervise = orchestrate.supervise
+
+    async def spying_supervise(plan, **kwargs):
+        handed["lease_token"] = kwargs["lease_token"]
+        return await real_supervise(plan, **kwargs)
+
+    real_controlled = control.controlled
+
+    async def spying_controlled(work, **kwargs):
+        handed["lease"] = kwargs["lease"]
+        return await real_controlled(work, **kwargs)
+
+    monkeypatch.setattr(orchestrate, "supervise", spying_supervise)
+    monkeypatch.setattr(control, "controlled", spying_controlled)
+    driver = FakeDriver()
+    pre = _preflight_milestone(root, shape["milestone"], driver=driver)
+
+    with orchestrate.recorded_milestone_run(pre) as recorded:
+        result = asyncio.run(orchestrate.run_milestone_engine(pre, recorded))
+        lease = recorded.lease
+
+    assert handed["lease"] is lease
+    assert handed["lease_token"] == lease.token
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert [call["run_id"] for call in integrate_recorder.calls] == [pre.run_id]
+    assert result == {
+        "done": True,
+        "run_id": pre.run_id,
+        "levels": [{"level": 0, "stories": [story]}],
+        "completed": [a1],
+        "tips": [{"story": story, "tip": _branch(root, a1)}],
+        "warnings": [],
+        "integrated": _integrated(root, [story]),
+    }
+    assert _load(root, pre.run_id).status == "done"
+    assert _claim_rows(root) == []
+
+
+def test_a_crashing_milestone_engine_still_releases_its_lease_before_closing(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    """Spec: a crash in the engine still propagates, still releases the lease
+    and claims, and still closes the store. A characterization pin: it passes
+    before the split and must keep passing after it."""
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    integrate_recorder.outcome = RuntimeError("integrate bug")
+    closes = _close_snapshots(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="integrate bug"):
+        _run(root, shape["milestone"], FakeDriver())
+
+    assert closes == [(0, 0)]
+    assert _claim_rows(root) == []
