@@ -108,9 +108,6 @@ def test_attempt_in_flight_has_no_terminal_fields():
     assert attempt.status == "started"
     assert attempt.exit_code is None
     assert attempt.duration is None
-    assert attempt.tokens_in is None
-    assert attempt.tokens_out is None
-    assert attempt.cost is None
     assert attempt.stdout_path is None
 
 
@@ -121,9 +118,6 @@ def test_attempt_records_a_finished_outcome():
         status="ok",
         exit_code=0,
         duration=12.5,
-        tokens_in=1200,
-        tokens_out=340,
-        cost=0.42,
         prompt_path=Path("/runs/run-1/1535b285/implement.2/prompt.txt"),
         result_path=Path("/runs/run-1/1535b285/implement.2/result.json"),
         stdout_path=Path("/runs/run-1/1535b285/implement.2/stdout.log"),
@@ -160,23 +154,16 @@ def test_attempt_numbers_start_at_one():
             models.Attempt(n=bad, dispatch=_dispatch())
 
 
-def test_attempt_rejects_negative_usage_numbers():
-    for field, value in (
-        ("cost", -0.01),
-        ("duration", -5.0),
-        ("tokens_in", -1),
-        ("tokens_out", -1),
-    ):
-        with pytest.raises(ValidationError):
-            models.Attempt(n=1, dispatch=_dispatch(), **{field: value})
+def test_attempt_rejects_a_negative_duration():
+    with pytest.raises(ValidationError) as excinfo:
+        models.Attempt(n=1, dispatch=_dispatch(), duration=-5.0)
+    assert [error["loc"] for error in excinfo.value.errors()] == [("duration",)]
 
 
-def test_attempt_rejects_nan_and_infinite_usage_numbers():
-    # `inf >= 0` is true and every nan comparison is false, so a bad usage parse
-    # would sail past a plain lower bound.
+def test_attempt_rejects_a_nan_or_infinite_duration():
+    # `inf >= 0` is true and every nan comparison is false, so a bad clock
+    # reading would sail past a plain lower bound.
     for bad in (float("nan"), float("inf")):
-        with pytest.raises(ValidationError):
-            models.Attempt(n=1, dispatch=_dispatch(), cost=bad)
         with pytest.raises(ValidationError):
             models.Attempt(n=1, dispatch=_dispatch(), duration=bad)
 
@@ -195,6 +182,34 @@ def test_attempt_rejects_an_unknown_status_naming_the_allowed_set():
     message = str(excinfo.value)
     for allowed in ("started", "ok", "schema_invalid", "gate_failed", "harness_error"):
         assert allowed in message
+
+
+def test_attempt_carries_exactly_eight_fields_and_no_usage():
+    # Remove-cost-tracking §5.3 item 3: nothing ever populated tokens or cost,
+    # so the fields are gone rather than left defaulted to None.
+    assert set(models.Attempt.model_fields) == {
+        "n",
+        "dispatch",
+        "status",
+        "exit_code",
+        "duration",
+        "prompt_path",
+        "result_path",
+        "stdout_path",
+    }
+
+
+@pytest.mark.parametrize("retired", ["tokens_in", "tokens_out", "cost"])
+def test_attempt_itself_still_forbids_a_retired_usage_key(retired):
+    # Old journal lines are reconciled in `store.replay`, never by loosening
+    # the model: validating an Attempt payload with a retired key still fails.
+    payload = models.Attempt(n=1, dispatch=_dispatch()).model_dump(mode="json")
+    payload[retired] = None
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.Attempt.model_validate(payload)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [(retired,)]
 
 
 def test_phase_in_flight_has_no_end_time():
@@ -526,9 +541,6 @@ def _full_run() -> models.Run:
                                         status="ok",
                                         exit_code=0,
                                         duration=31.25,
-                                        tokens_in=8000,
-                                        tokens_out=1500,
-                                        cost=0.31,
                                         prompt_path=Path("/runs/run-1/1535b285/explore.1/prompt.txt"),
                                         result_path=Path("/runs/run-1/1535b285/explore.1/result.json"),
                                         stdout_path=Path("/runs/run-1/1535b285/explore.1/stdout.log"),
@@ -585,7 +597,7 @@ def test_round_trip_keeps_an_in_flight_attempt_in_flight():
     attempt = restored.stories[0].subtasks[1].phases[1].attempts[0]
     assert attempt.status == "started"
     assert attempt.exit_code is None
-    assert attempt.cost is None
+    assert attempt.duration is None
 
 
 def test_journal_coordinates_are_reachable_from_the_tree():

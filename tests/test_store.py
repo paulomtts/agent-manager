@@ -657,7 +657,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
             "8831189b",
             "ef248597",
             "implement",
-            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, cost=0.42),
+            models.Attempt(n=1, dispatch=_dispatch(), status="ok", exit_code=0, duration=4.5),
         )
 
         assert attempt_line.story == "8831189b"
@@ -673,7 +673,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
         attempt_row = st.connection.execute("SELECT * FROM attempts").fetchone()
         assert attempt_row["status"] == "ok"
         assert attempt_row["exit_code"] == 0
-        assert attempt_row["cost"] == pytest.approx(0.42)
+        assert attempt_row["duration"] == pytest.approx(4.5)
         assert json.loads(attempt_row["dispatch"])["role"] == "coder"
     finally:
         st.close()
@@ -810,9 +810,6 @@ def _record_full_run(st: store.Store, repo: Path) -> None:
             status="ok",
             exit_code=0,
             duration=31.25,
-            tokens_in=8000,
-            tokens_out=1500,
-            cost=0.31,
             prompt_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/prompt.txt"),
             result_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/result.json"),
             stdout_path=Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log"),
@@ -858,14 +855,14 @@ def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
 
     finished = subtask.phases[0].attempts[0]
     assert finished.status == "ok"
-    assert finished.cost == pytest.approx(0.31)
+    assert finished.duration == pytest.approx(31.25)
     assert finished.stdout_path == Path(f"/runs/{RUN_ID}/ef248597/explore.1/stdout.log")
     assert finished.dispatch.role == "coder"
 
     in_flight = subtask.phases[1].attempts[0]
     assert in_flight.status == "started"
     assert in_flight.exit_code is None
-    assert in_flight.cost is None
+    assert in_flight.duration is None
 
 
 def test_load_run_returns_none_for_an_unknown_run(repo):
@@ -951,9 +948,6 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     assert attempt.status == "started"
     assert attempt.exit_code is None
     assert attempt.duration is None
-    assert attempt.tokens_in is None
-    assert attempt.tokens_out is None
-    assert attempt.cost is None
     assert row["status"] == "started"
     assert row["exit_code"] is None
 
@@ -2079,6 +2073,121 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
         rebuilt.close()
 
     assert _phase_details(after) == _EXPECTED_DETAILS
+
+
+# -- attempts without usage columns ------------------------------------------
+#
+# Remove-cost-tracking §5.3 items 4-5: a fresh `attempts` table has no
+# tokens/cost columns, and a table created before that keeps them, unwritten
+# and unread, because migration is additive-only. Unit tier: real temp DB and
+# journal, no subprocess.
+
+ATTEMPT_COLUMNS = [
+    "run_id",
+    "story_id",
+    "card_id",
+    "phase",
+    "n",
+    "status",
+    "exit_code",
+    "duration",
+    "prompt_path",
+    "result_path",
+    "stdout_path",
+    "dispatch",
+]
+
+LEGACY_ATTEMPT_COLUMNS = [
+    *ATTEMPT_COLUMNS[:8],
+    "tokens_in",
+    "tokens_out",
+    "cost",
+    *ATTEMPT_COLUMNS[8:],
+]
+"""The `attempts` columns as they shipped before 2026-10-03, in table order."""
+
+
+def _attempt_columns(conn: sqlite3.Connection) -> list[str]:
+    return [row["name"] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()]
+
+
+def test_a_fresh_attempts_table_has_no_usage_columns(repo):
+    conn = store.open_db(repo)
+    try:
+        columns = _attempt_columns(conn)
+    finally:
+        conn.close()
+
+    assert columns == ATTEMPT_COLUMNS
+    assert len(columns) == 12
+
+
+_LEGACY_ATTEMPTS = """
+DROP TABLE attempts;
+CREATE TABLE attempts (
+    run_id       TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    card_id      TEXT NOT NULL,
+    phase        TEXT NOT NULL,
+    n            INTEGER NOT NULL,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    duration     REAL,
+    tokens_in    INTEGER,
+    tokens_out   INTEGER,
+    cost         REAL,
+    prompt_path  TEXT,
+    result_path  TEXT,
+    stdout_path  TEXT,
+    dispatch     TEXT NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id, phase, n)
+);
+"""
+"""The `attempts` table exactly as it shipped before 2026-10-03, empty."""
+
+
+def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
+    legacy = store.open_db(repo)
+    legacy.executescript(_LEGACY_ATTEMPTS)
+    legacy.commit()
+    legacy.close()
+
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        columns = _attempt_columns(st.connection)
+        _record_full_run(st, repo)
+        # Re-recording implement attempt 1 takes the ON CONFLICT path.
+        st.record_attempt(
+            "8831189b",
+            "ef248597",
+            "implement",
+            models.Attempt(
+                n=1,
+                dispatch=_dispatch(card="ef248597", phase="implement"),
+                status="ok",
+                exit_code=0,
+                duration=7.5,
+            ),
+        )
+        usage = [
+            tuple(row)
+            for row in st.connection.execute(
+                "SELECT tokens_in, tokens_out, cost FROM attempts ORDER BY phase, n"
+            ).fetchall()
+        ]
+        loaded = st.load_run(RUN_ID)
+        rebuilt = st.rebuild_from_journal(RUN_ID)
+        after = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert columns == LEGACY_ATTEMPT_COLUMNS
+    assert usage == [(None, None, None), (None, None, None)]
+    assert loaded is not None
+    implement = loaded.stories[0].subtasks[1].phases[1].attempts[0]
+    assert (implement.status, implement.exit_code, implement.duration) == ("ok", 0, 7.5)
+    assert rebuilt == loaded
+    assert after == loaded
 
 
 # -- run milestone id ----------------------------------------------------------
@@ -4780,7 +4889,9 @@ def test_diverging_ignores_every_field_but_status(repo):
     _raw_sql(repo, "UPDATE stories SET title = 'hand-edited', tip_branch = NULL, level = 3")
     _raw_sql(repo, "UPDATE subtasks SET branch = 'elsewhere', worktree_path = NULL")
     _raw_sql(repo, "UPDATE phases SET detail = 'hand-edited', ended_at = NULL")
-    _raw_sql(repo, "UPDATE attempts SET cost = 9.5, exit_code = 42, tokens_in = 7")
+    _raw_sql(
+        repo, "UPDATE attempts SET duration = 9.5, exit_code = 42, stdout_path = '/elsewhere'"
+    )
 
     assert _diverging_now(repo) == []
 

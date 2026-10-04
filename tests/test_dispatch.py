@@ -665,11 +665,15 @@ def _terminal_attempts(opened) -> list[dict]:
     ]
 
 
+_USAGE_KEYS = frozenset({"tokens_in", "tokens_out", "cost"})
+"""The attempt keys every journal written before 2026-10-03 carries, as null."""
+
+
 def test_the_outcome_is_journalled_on_the_attempt(store, tmp_path, worktree):
-    # §5.2, narrowed for this slice: `Attempt` still declares the three fields
-    # (3ebd08fb removes them and tightens this to key-absence), so they are
-    # asserted `None`. The log is deliberately the old bait -- FakeAdapter's
-    # `parse_usage` would turn it into 11/22/0.5 if anything still asked.
+    # §5.2: `Attempt` no longer declares the three usage fields, so the
+    # journalled payload carries no such keys at all. The log is deliberately
+    # the old bait -- FakeAdapter's `parse_usage` would turn it into 11/22/0.5
+    # if anything still asked.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
     launcher = FakeLauncher(results=[VALID_RESULT], stdout="usage: tokens\n")
     runner, _ = _runner(store, launcher, tmp_path, worktree)
@@ -680,9 +684,7 @@ def test_the_outcome_is_journalled_on_the_attempt(store, tmp_path, worktree):
     assert terminal["status"] == "ok"
     assert terminal["duration"] == 1.25
     assert terminal["exit_code"] == 0
-    assert terminal["tokens_in"] is None
-    assert terminal["tokens_out"] is None
-    assert terminal["cost"] is None
+    assert _USAGE_KEYS.isdisjoint(terminal)
 
 
 @dataclass
@@ -749,9 +751,7 @@ def test_the_engine_never_opens_the_harness_log(store, tmp_path, worktree, monke
     assert terminal["status"] == "ok"
     assert terminal["duration"] == 1.25
     assert terminal["exit_code"] == 0
-    assert terminal["tokens_in"] is None
-    assert terminal["tokens_out"] is None
-    assert terminal["cost"] is None
+    assert _USAGE_KEYS.isdisjoint(terminal)
 
 
 class UsageRefusingAdapter(FakeAdapter):
@@ -790,9 +790,7 @@ def test_a_timed_out_attempt_journals_its_duration_and_no_usage(store, tmp_path,
         assert terminal["status"] == "harness_error"
         assert terminal["duration"] == 1.25
         assert terminal["exit_code"] is None
-        assert terminal["tokens_in"] is None
-        assert terminal["tokens_out"] is None
-        assert terminal["cost"] is None
+        assert _USAGE_KEYS.isdisjoint(terminal)
 
 
 def test_a_persistently_invalid_result_retries_to_max_attempts_then_fails(

@@ -89,9 +89,6 @@ CREATE TABLE IF NOT EXISTS attempts (
     status       TEXT NOT NULL,
     exit_code    INTEGER,
     duration     REAL,
-    tokens_in    INTEGER,
-    tokens_out   INTEGER,
-    cost         REAL,
     prompt_path  TEXT,
     result_path  TEXT,
     stdout_path  TEXT,
@@ -246,7 +243,10 @@ def open_db(root: Path) -> sqlite3.Connection:
     `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
     table lacks, as a nullable column. Existing rows keep their data and read
     the new column as NULL. It is a no-op on a database that already has the
-    column, so opening the same database any number of times is safe.
+    column, so opening the same database any number of times is safe. Nothing
+    is ever dropped: an `attempts` table created before 2026-10-03 keeps its
+    `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
+    any more, so they stay NULL.
 
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
@@ -923,9 +923,6 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
                             status=attempt_row["status"],
                             exit_code=attempt_row["exit_code"],
                             duration=attempt_row["duration"],
-                            tokens_in=attempt_row["tokens_in"],
-                            tokens_out=attempt_row["tokens_out"],
-                            cost=attempt_row["cost"],
                             prompt_path=attempt_row["prompt_path"],
                             result_path=attempt_row["result_path"],
                             stdout_path=attempt_row["stdout_path"],
@@ -1604,18 +1601,15 @@ class Store:
         self._conn.execute(
             """
             INSERT INTO attempts (run_id, story_id, card_id, phase, n, status,
-                                  exit_code, duration, tokens_in, tokens_out, cost,
+                                  exit_code, duration,
                                   prompt_path, result_path, stdout_path, dispatch)
             VALUES (:run_id, :story_id, :card_id, :phase, :n, :status,
-                    :exit_code, :duration, :tokens_in, :tokens_out, :cost,
+                    :exit_code, :duration,
                     :prompt_path, :result_path, :stdout_path, :dispatch)
             ON CONFLICT(run_id, story_id, card_id, phase, n) DO UPDATE SET
                 status=excluded.status,
                 exit_code=excluded.exit_code,
                 duration=excluded.duration,
-                tokens_in=excluded.tokens_in,
-                tokens_out=excluded.tokens_out,
-                cost=excluded.cost,
                 prompt_path=excluded.prompt_path,
                 result_path=excluded.result_path,
                 stdout_path=excluded.stdout_path,
@@ -1630,9 +1624,6 @@ class Store:
                 "status": attempt.status,
                 "exit_code": attempt.exit_code,
                 "duration": attempt.duration,
-                "tokens_in": attempt.tokens_in,
-                "tokens_out": attempt.tokens_out,
-                "cost": attempt.cost,
                 "prompt_path": _text(attempt.prompt_path),
                 "result_path": _text(attempt.result_path),
                 "stdout_path": _text(attempt.stdout_path),
