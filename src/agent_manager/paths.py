@@ -19,8 +19,12 @@ def data_dir() -> Path:
     return result
 
 
-def _project_digest(root: Path) -> str:
-    """The per-project file stem: sha256 of the resolved root path."""
+def project_digest(root: Path) -> str:
+    """The per-project file stem: sha256 of the resolved root path, 64 hex chars.
+
+    Public because a detached board run names its files after it too
+    (`<data dir>/boards/<stamp>-<digest>.log`).
+    """
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()
 
 
@@ -31,7 +35,7 @@ def _projects_dir() -> Path:
 
 
 def project_db_path(root: Path) -> Path:
-    return _projects_dir() / f"{_project_digest(root)}.db"
+    return _projects_dir() / f"{project_digest(root)}.db"
 
 
 def project_lock_path(root: Path, name: str) -> Path:
@@ -41,7 +45,17 @@ def project_lock_path(root: Path, name: str) -> Path:
     repository. Creates the `projects` directory; the lock file itself is created
     by whoever first opens it (`locks.ProcessLock`).
     """
-    return _projects_dir() / f"{_project_digest(root)}.{name}.lock"
+    return _projects_dir() / f"{project_digest(root)}.{name}.lock"
+
+
+def boards_dir() -> Path:
+    """Where a detached board run's log and report go: `data_dir()/boards`, created.
+
+    A board run has no run id, so its files cannot live under `runs/`.
+    """
+    result = data_dir() / "boards"
+    result.mkdir(parents=True, exist_ok=True)
+    return result
 
 
 def run_dir(run_id: str) -> Path:
