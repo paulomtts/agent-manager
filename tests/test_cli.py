@@ -17,8 +17,10 @@ import io
 import inspect
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -40,6 +42,7 @@ from agent_manager import (
     cli,
     control,
     dag,
+    detach,
     dispatch,
     integration,
     locks,
@@ -9363,3 +9366,125 @@ def test_a_crashing_card_engine_still_releases_the_claim_and_lease_before_closin
 
     assert closes == [(0, 0)]
     assert _claim_rows(root) == []
+
+
+# ── am run --detach (card aff9fdbf) ─────────────────────────────────────────
+#
+# Unit tier: `detach.fork_detacher` is replaced by `_FakeDetacher`, which
+# forks nothing; its `body` is run inline by the tests that need the child.
+
+FAKE_CHILD_PID = 424242
+"""The pid `_FakeDetacher` reports; no such child exists."""
+
+
+class _FakeDetacher:
+    """Stands in for `detach.fork_detacher`: records the call, starts nothing.
+
+    `body` keeps what the real child would run. `at_go`, when set, runs as
+    the parent writes the go byte, so a test can see the store at that moment.
+    """
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.calls: list[Path] = []
+        self.events: list[str] = []
+        self.body: Any = None
+        self.at_go: Any = None
+
+    def __call__(self, body: Any, log: Path) -> detach.Spawned:
+        self.calls.append(log)
+        if self.error is not None:
+            raise self.error
+        self.body = body
+        return detach.Spawned(pid=FAKE_CHILD_PID, go=self._go, abort=self._abort)
+
+    def _go(self) -> None:
+        if self.at_go is not None:
+            self.at_go()
+        self.events.append("go")
+
+    def _abort(self) -> None:
+        self.events.append("abort")
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _alive_heartbeats() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "am-lease-heartbeat" and thread.is_alive()
+    ]
+
+
+DRY_RUN_DETACH = "--dry-run writes nothing and cannot be detached"
+BOARD_DETACH = "--detach applies to --card and --milestone, not --board"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message", "hint"),
+    [
+        (
+            {"card": None, "milestone": "M9", "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": SOME_CARD, "milestone": None, "board": False, "branch_prefix": "m9", "dry_run": True},
+            DRY_RUN_DETACH,
+            "'--detach' / '--dry-run'",
+        ),
+        (
+            {"card": None, "milestone": None, "board": True, "branch_prefix": None, "dry_run": False},
+            BOARD_DETACH,
+            "'--detach' / '--board'",
+        ),
+    ],
+)
+def test_check_run_targets_refuses_detach_with_dry_run_or_board(kwargs, message, hint):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(detach=True, **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"card": SOME_CARD, "milestone": None},
+        {"card": None, "milestone": "M9", "max_concurrent": 2},
+    ],
+)
+def test_check_run_targets_accepts_detach_with_card_or_milestone(kwargs):
+    assert (
+        cli._check_run_targets(dry_run=False, branch_prefix="m9", detach=True, **kwargs) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("targets", "word"),
+    [
+        (["--milestone", "M9", "--branch-prefix", "m9", "--dry-run"], "detached"),
+        (["--board"], "applies"),
+    ],
+)
+def test_detach_with_dry_run_or_board_is_a_usage_error_that_detaches_nothing(
+    tmp_path, monkeypatch, targets, word
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(
+        cli.app, ["run", *targets, "--detach", "--repo-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert word in result.output
+    assert fake.calls == []
+    assert not (paths.data_dir() / "runs").exists()

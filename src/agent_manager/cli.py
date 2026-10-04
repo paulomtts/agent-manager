@@ -20,6 +20,7 @@ Typer's own usage errors.
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -38,6 +39,7 @@ from agent_manager import (
     comments,
     control,
     dag,
+    detach,
     dispatch,
     locks,
     models,
@@ -1299,6 +1301,7 @@ def _check_run_targets(
     max_concurrent: int | None = None,
     board: bool = False,
     branch_prefix: str | None = None,
+    detach: bool = False,
 ) -> None:
     """Refuse a bad `--card` / `--milestone` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
@@ -1317,6 +1320,9 @@ def _check_run_targets(
     refused whatever its value, the default included. The Option has no
     `min=1`, so a value below 1 is refused here, worded and routed like every
     other run-target refusal.
+    `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
+    nothing to hand off, and with `--board`, whose run was not split into
+    pre-flight, recorded stage and engine.
     """
     if board and card is not None:
         raise typer.BadParameter(
@@ -1352,6 +1358,16 @@ def _check_run_targets(
         raise typer.BadParameter(
             "--branch-prefix with --board needs a non-blank prefix, not a blank string",
             param_hint="'--branch-prefix'",
+        )
+    if detach and dry_run:
+        raise typer.BadParameter(
+            "--dry-run writes nothing and cannot be detached",
+            param_hint="'--detach' / '--dry-run'",
+        )
+    if detach and board:
+        raise typer.BadParameter(
+            "--detach applies to --card and --milestone, not --board",
+            param_hint="'--detach' / '--board'",
         )
     if dry_run and card is not None:
         raise typer.BadParameter(
@@ -1413,6 +1429,16 @@ def run(
             "open milestone by level, each with its own plan, and write nothing."
         ),
     ),
+    detach_run: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "With --card or --milestone: check, record and lease the run here, "
+            "then hand it to a background process in its own session and print "
+            "its run id, pid and log. Its output goes to "
+            "<data dir>/runs/<run-id>/run.log and its final envelope to report.json."
+        ),
+    ),
     max_concurrent: int | None = typer.Option(
         None,
         "--max-concurrent",
@@ -1466,6 +1492,7 @@ def run(
         max_concurrent=max_concurrent,
         board=whole_board,
         branch_prefix=branch_prefix,
+        detach=detach_run,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
