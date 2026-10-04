@@ -656,22 +656,143 @@ def test_the_injected_launcher_is_the_only_way_a_process_could_start(
     assert launcher.calls[0][0] == "fake-harness"
 
 
-def test_usage_parsed_from_the_log_is_journalled_on_the_attempt(store, tmp_path, worktree):
+def _terminal_attempts(opened) -> list[dict]:
+    """Every journalled attempt payload past `started`, in journal order."""
+    return [
+        line.payload
+        for line in opened.journal.read()
+        if line.event == "attempt_upsert" and line.payload["status"] != "started"
+    ]
+
+
+def test_the_outcome_is_journalled_on_the_attempt(store, tmp_path, worktree):
+    # §5.2, narrowed for this slice: `Attempt` still declares the three fields
+    # (3ebd08fb removes them and tightens this to key-absence), so they are
+    # asserted `None`. The log is deliberately the old bait -- FakeAdapter's
+    # `parse_usage` would turn it into 11/22/0.5 if anything still asked.
     workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
-    runner, _ = _runner(store, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree)
+    launcher = FakeLauncher(results=[VALID_RESULT], stdout="usage: tokens\n")
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
 
     runner(workflow.phase("explore"), _context(worktree), _rendered())
 
-    terminal = [
-        line.payload
-        for line in store.journal.read()
-        if line.event == "attempt_upsert" and line.payload["status"] == "ok"
-    ][0]
-    assert terminal["tokens_in"] == 11
-    assert terminal["tokens_out"] == 22
-    assert terminal["cost"] == 0.5
+    [terminal] = _terminal_attempts(store)
+    assert terminal["status"] == "ok"
     assert terminal["duration"] == 1.25
     assert terminal["exit_code"] == 0
+    assert terminal["tokens_in"] is None
+    assert terminal["tokens_out"] is None
+    assert terminal["cost"] is None
+
+
+@dataclass
+class UnreadableLogLauncher(FakeLauncher):
+    """A `FakeLauncher` that leaves `stdout_path` absent or unreadable as text.
+
+    `log` is `"absent"` (no file), `"directory"` (a directory where the log
+    should be) or `"non_utf8"` (bytes that are not UTF-8 but still contain
+    the old "usage" bait once decoded with replacement).
+    """
+
+    log: str = "absent"
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        outcome = super().__call__(argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path)
+        stdout_path.unlink()
+        if self.log == "directory":
+            stdout_path.mkdir()
+        elif self.log == "non_utf8":
+            stdout_path.write_bytes(b"\xff\xfeusage: \x80tokens\n")
+        return outcome
+
+
+@pytest.mark.parametrize("log", ["absent", "directory", "non_utf8"])
+def test_the_engine_never_opens_the_harness_log(store, tmp_path, worktree, monkeypatch, log):
+    # §5.3 item 6. D4: stdout.log is a log, never read by the engine. Any read
+    # of a file named stdout.log is recorded, so "swallowed the OSError" and
+    # "never looked" are told apart.
+    reads: list[Path] = []
+    real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes
+    real_open = Path.open
+
+    def read_text(self, *args, **kwargs):
+        if self.name == dispatch.STDOUT_NAME:
+            reads.append(self)
+        return real_read_text(self, *args, **kwargs)
+
+    def read_bytes(self, *args, **kwargs):
+        if self.name == dispatch.STDOUT_NAME:
+            reads.append(self)
+        return real_read_bytes(self, *args, **kwargs)
+
+    def open_(self, *args, **kwargs):
+        # Only reads count: FakeLauncher's own `write_text` goes through
+        # `Path.open(mode="w")` on some Python versions.
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if self.name == dispatch.STDOUT_NAME and "r" in mode:
+            reads.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(Path, "open", open_)
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = UnreadableLogLauncher(results=[VALID_RESULT], log=log)
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert reads == []
+    [terminal] = _terminal_attempts(store)
+    assert terminal["status"] == "ok"
+    assert terminal["duration"] == 1.25
+    assert terminal["exit_code"] == 0
+    assert terminal["tokens_in"] is None
+    assert terminal["tokens_out"] is None
+    assert terminal["cost"] is None
+
+
+class UsageRefusingAdapter(FakeAdapter):
+    """A `FakeAdapter` whose `parse_usage` must never be reached."""
+
+    def parse_usage(self, stdout: str) -> Usage | None:
+        raise AssertionError("dispatch must never ask the adapter for usage")
+
+
+def test_dispatch_never_asks_the_adapter_for_usage(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(results=[VALID_RESULT], stdout="usage: tokens\n")
+    runner, _ = _runner(
+        store, launcher, tmp_path, worktree, adapter=UsageRefusingAdapter()
+    )
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert _attempt_statuses(store) == [(1, "started"), (1, "ok")]
+
+
+def test_a_timed_out_attempt_journals_its_duration_and_no_usage(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = FakeLauncher(
+        results=[None], exit_code=None, timed_out=True, stdout="usage: tokens\n"
+    )
+    runner, _ = _runner(store, launcher, tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed):
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    terminals = _terminal_attempts(store)
+    assert terminals
+    for terminal in terminals:
+        assert terminal["status"] == "harness_error"
+        assert terminal["duration"] == 1.25
+        assert terminal["exit_code"] is None
+        assert terminal["tokens_in"] is None
+        assert terminal["tokens_out"] is None
+        assert terminal["cost"] is None
 
 
 def test_a_persistently_invalid_result_retries_to_max_attempts_then_fails(
