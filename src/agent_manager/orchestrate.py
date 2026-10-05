@@ -2573,7 +2573,7 @@ def detach_story(
 # ── the board run (card baef4f94) ───────────────────────────────────────────
 
 
-BoardStatus = Literal["done", "escalated", "stopped", "cancelled", "blocked"]
+BoardStatus = Literal["done", "escalated", "stopped", "canceled", "blocked"]
 """How one milestone of a board run ended: its own run's outcome, or `blocked`
 when a blocker did not finish `done` and it was never dispatched."""
 
@@ -2733,14 +2733,14 @@ def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     """One `_run_milestone_async` payload read as a board status.
 
     `done` is the only clean outcome. A cancel, flagged `True` under either
-    of its keys (`canceled`, `cancelled`), is `cancelled`; an escalation (a
+    of its keys (`canceled`, `cancelled`), is `canceled`; an escalation (a
     paused one included) is `escalated`, a pause is `stopped`. Any other
     shape is not clean, so it counts as `escalated`.
     """
     if payload.get("done") is True:
         return "done"
     if any(payload.get(name) is True for name in models.CANCELED_STATUSES):
-        return "cancelled"
+        return models.CANCELED
     if payload.get("escalated") is True:
         return "escalated"
     if payload.get("paused") is True:

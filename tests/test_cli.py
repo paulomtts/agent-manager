@@ -4287,20 +4287,20 @@ def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypa
         (("done", "done"), 0),
         ((), 0),
         (("stopped",), 0),
-        (("cancelled",), 0),
+        (("canceled",), 0),
         (("done", "stopped", "blocked"), 0),
-        (("cancelled", "blocked"), 0),
+        (("canceled", "blocked"), 0),
         (("escalated",), cli.EXIT_ESCALATED),
         (("done", "escalated"), cli.EXIT_ESCALATED),
         (("escalated", "blocked"), cli.EXIT_ESCALATED),
-        (("stopped", "escalated", "cancelled"), cli.EXIT_ESCALATED),
+        (("stopped", "escalated", "canceled"), cli.EXIT_ESCALATED),
     ],
 )
 def test_a_board_run_exits_escalated_only_when_some_milestone_escalated(
     tmp_path, monkeypatch, statuses, exit_code
 ):
     """Spec test 11: the board-wide form of the milestone rule. A stopped,
-    cancelled or blocked milestone is not an escalation; an empty board is clean.
+    canceled or blocked milestone is not an escalation; an empty board is clean.
     The envelope is `ok: true` either way: an escalation is a truthful result."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     payload = _board_payload(*statuses)

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import grafo
 import pytest
@@ -723,14 +723,14 @@ def test_controlled_payload_on_cancel_without_escalations_omits_escalations_and_
 
 
 def test_a_controlled_cancel_payload_reads_as_cancelled_on_board_and_comment():
-    """The real cancel payload, not a hand-written one, still reads as the
-    `cancelled` board status and the `cancelled` run-end comment."""
+    """The real cancel payload, not a hand-written one, reads as the
+    `canceled` board status and the `cancelled` run-end comment."""
     parked = orchestrate.LaneOutcome(
         kind="stopped", story="A", level=0, subtask="a1", before_phase="plan"
     )
     payload = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
 
-    assert orchestrate.milestone_status(payload) == "cancelled"
+    assert orchestrate.milestone_status(payload) == "canceled"
     comment = comments.compose_run_end(
         run_id="run-1", milestone_id="ms-1", token="tok-1", payload=payload
     )
@@ -7154,7 +7154,7 @@ def test_board_claims_takes_each_milestones_keys_from_milestone_claims():
         ({"escalated": True, "run_id": "r"}, "escalated"),
         ({"escalated": True, "control": "pause", "run_id": "r"}, "escalated"),
         ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
-        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "run_id": "r"}, "canceled"),
         ({"run_id": "r"}, "escalated"),
     ],
 )
@@ -7165,11 +7165,11 @@ def test_milestone_status_reads_a_run_milestone_payload(payload, status):
 @pytest.mark.parametrize(
     ("payload", "status"),
     [
-        ({"canceled": True, "run_id": "r"}, "cancelled"),
-        ({"cancelled": True, "run_id": "r"}, "cancelled"),
-        ({"cancelled": False, "canceled": True, "run_id": "r"}, "cancelled"),
-        ({"canceled": True, "escalated": True, "run_id": "r"}, "cancelled"),
-        ({"canceled": True, "paused": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "run_id": "r"}, "canceled"),
+        ({"cancelled": True, "run_id": "r"}, "canceled"),
+        ({"cancelled": False, "canceled": True, "run_id": "r"}, "canceled"),
+        ({"canceled": True, "escalated": True, "run_id": "r"}, "canceled"),
+        ({"canceled": True, "paused": True, "run_id": "r"}, "canceled"),
         ({"done": True, "canceled": True, "run_id": "r"}, "done"),
         ({"canceled": False, "paused": True, "run_id": "r"}, "stopped"),
         ({"canceled": "yes", "run_id": "r"}, "escalated"),
@@ -7177,6 +7177,12 @@ def test_milestone_status_reads_a_run_milestone_payload(payload, status):
 )
 def test_milestone_status_reads_either_cancel_key(payload, status):
     assert orchestrate.milestone_status(payload) == status
+
+
+def test_milestone_status_never_returns_the_legacy_spelling():
+    assert models.LEGACY_CANCELED not in get_args(orchestrate.BoardStatus)
+    assert models.CANCELED in get_args(orchestrate.BoardStatus)
+    assert orchestrate.milestone_status({"cancelled": True}) == models.CANCELED
 
 
 # ── milestone_bases (card 40ac07f3) ─────────────────────────────────────────
@@ -7793,13 +7799,13 @@ def test_run_board_isolates_a_milestone_that_raises_and_blocks_only_its_dependen
     [
         ({"escalated": True, "run_id": "r"}, "escalated"),
         ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
-        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "run_id": "r"}, "canceled"),
     ],
 )
 def test_run_board_blocks_the_dependent_of_a_milestone_that_did_not_finish_done(
     board_seams, payload, status
 ):
-    """Review Focus 2: a paused or cancelled milestone blocks like an escalated one."""
+    """Review Focus 2: a paused or canceled milestone blocks like an escalated one."""
     a = _board_milestone(1)
     b = _board_milestone(2, blocked_by=(1,))
     board_seams.cards = [a, b]
