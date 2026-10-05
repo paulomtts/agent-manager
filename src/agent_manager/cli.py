@@ -3322,17 +3322,17 @@ def _not_resettable_error(run_id: str) -> NotResettableError:
 
 
 def _reset_message(run_id: str, *, already: bool) -> str:
-    """What `am reset` tells the operator about `run_id` (am-reset §3.5)."""
+    """What `am reset` tells the operator about `run_id`."""
     if already:
-        return f"run {run_id} was already cancelled; nothing was written"
+        return f"run {run_id} was already canceled; nothing was written"
     return (
-        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        f"run {run_id} is canceled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
     )
 
 
 def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
-    """Close a run nobody is driving by recording it `cancelled` (am-reset §3.2-3.3).
+    """Close a run nobody is driving by recording it `canceled`.
 
     The run is loaded read-only, exactly as `resume_run` loads it. Refused, in
     order and before `Store.open`: an unknown run (`UnknownRunError`), a run a
@@ -3340,16 +3340,16 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     finished one (`NotResettableError`). Then, as `_resume_from_checkpoint`
     does up to its first write and no further: `Store.open`, the run's own
     lease with no claims (a reset drives no card and no branch), and one
-    fenced `record_run` of `cancelled`. No checkpoint row is written or
+    fenced `record_run` of `canceled`. No checkpoint row is written or
     deleted, and no other row is touched. `cards` then reports each
     `(card_id, workflow)` the run checkpointed and, by
     `Store.latest_open_checkpoint`, which other run (if any) a relaunch
     would still continue it from (`open_in`). The lease is released and the
     store closed on every exit.
 
-    A run already canceled, in either spelling, is not refused: the lease is
-    taken and released around the check, and nothing is journalled
-    (`already_cancelled: true`).
+    A run already canceled, in either stored spelling, is not refused: the
+    lease is taken and released around the check, and nothing is journalled
+    (`already_canceled: true`).
     A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
@@ -3386,7 +3386,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
                 raise _not_resettable_error(run.id)
             already = models.is_canceled(current.status)
             if not already:
-                store.record_run(current.model_copy(update={"status": "cancelled"}))
+                store.record_run(current.model_copy(update={"status": models.CANCELED}))
         # After the status write (or the no-op): each `(card_id, workflow)` the
         # run checkpointed, with the run a relaunch would continue it from by
         # the newest-row rule -- `null` unless that is another run (§3.5).
@@ -3409,8 +3409,8 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "run_id": run.id,
         "previous_status": current.status,
-        "status": "cancelled",
-        "already_cancelled": already,
+        "status": models.CANCELED,
+        "already_canceled": already,
         "cards": cards,
         "message": _reset_message(run.id, already=already),
     }
@@ -3434,7 +3434,7 @@ def reset(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Close a run nobody is driving: record it cancelled under its own lease.
+    """Close a run nobody is driving: record it canceled under its own lease.
 
     A running run wants `am cancel` instead; a finished one needs nothing.
     """

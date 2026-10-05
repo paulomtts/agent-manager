@@ -461,18 +461,18 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
         "run_id",
         "previous_status",
         "status",
-        "already_cancelled",
+        "already_canceled",
         "cards",
         "message",
     }, closed
     assert closed["run_id"] == run_id
     assert closed["previous_status"] == "stopped"
-    assert closed["status"] == "cancelled"
-    assert closed["already_cancelled"] is False
+    assert closed["status"] == "canceled"
+    assert closed["already_canceled"] is False
     assert {"card_id": a1, "workflow": "task", "open_in": None} in closed["cards"], closed
     assert all(card["open_in"] is None for card in closed["cards"]), closed["cards"]
     assert closed["message"] == (
-        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        f"run {run_id} is canceled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
     )
     assert _status(root, run_id) == "canceled"
@@ -511,5 +511,5 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
     relaunched = _card_phase_counts(read_fake_log(new_run))
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
-    # The reset run stays cancelled.
+    # The reset run stays canceled.
     assert _status(root, run_id) == "canceled"

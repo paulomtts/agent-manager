@@ -3785,8 +3785,8 @@ def test_a_relaunch_after_am_reset_starts_the_card_fresh_at_worktree(
 
     reset = cli.reset_run(reset_id, repo_dir=project)
 
-    assert reset["status"] == "cancelled"
-    assert reset["already_cancelled"] is False
+    assert reset["status"] == "canceled"
+    assert reset["already_canceled"] is False
     assert reset["cards"] == [
         {"card_id": a1, "workflow": task_workflow.TASK.name, "open_in": None}
     ]
