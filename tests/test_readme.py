@@ -234,9 +234,9 @@ def test_watch_documents_from_now():
         "A line that was still being written when the command started"
         " is printed once it is complete." in section
     )
-    # The section's pre-existing hello example already holds `"schema":1`,
+    # The section's pre-existing hello example already holds `"schema":2`,
     # so pin the --from-now paragraph's own sentence, not the bare token.
-    assert 'The hello line is the same, `"schema":1`.' in section
+    assert 'The hello line is the same, `"schema":2`.' in section
 
 
 def test_logs_section_shape_line():
