@@ -8685,7 +8685,7 @@ def test_resume_refuses_run_canceled_in_either_spelling(
     assert envelope["error"] == {
         "type": "NotResumableError",
         "message": (
-            f"run {CONTROL_RUN_ID} was cancelled;"
+            f"run {CONTROL_RUN_ID} was canceled;"
             " start new work with `am run --milestone`"
         ),
     }
@@ -8752,9 +8752,9 @@ def test_resume_is_not_blocked_by_a_dead_lease(projection, monkeypatch):
         (None, "stopped", "stopped"),
         ("pause", "stopped", "stopped"),
         ("pause", "escalated", "escalated"),
-        ("cancel", "stopped", "cancelled"),
-        ("cancel", "escalated", "cancelled"),
-        ("cancel", "done", "cancelled"),
+        ("cancel", "stopped", "canceled"),
+        ("cancel", "escalated", "canceled"),
+        ("cancel", "done", "canceled"),
     ],
 )
 def test_card_run_status_follows_c6_precedence(command, summary_status, expected):
@@ -8942,7 +8942,7 @@ def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
 def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     project, cards, control_applied
 ):
-    """Spec test 3, plus Review Focus 3: the run is `cancelled`, its story and
+    """Spec test 3, plus Review Focus 3: the run is `canceled`, its story and
     subtask stay `stopped` as the park left them, `am resume` refuses it, and
     a pause sent afterwards is refused rather than queued."""
     seen: list[str] = []
@@ -8953,7 +8953,7 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     payload = _controlled_card_run(project, cards, factory)
 
     run_id = payload["run_id"]
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert payload["failed_phase"] is None
     assert "validate_spec" not in seen
     assert _card_statuses(project, run_id) == {
@@ -8968,12 +8968,31 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     assert resumed.exit_code == cli.EXIT_ERROR, resumed.output
     error = json.loads(resumed.stdout)["error"]
     assert error["type"] == "NotResumableError"
-    assert "cancelled" in error["message"]
+    assert "canceled" in error["message"]
 
     late = runner.invoke(cli.app, ["pause", run_id, "--repo-dir", str(project)])
     assert late.exit_code == cli.EXIT_ERROR, late.output
     assert json.loads(late.stdout)["error"]["type"] == "NotRunningError"
     assert [row.command for row in _card_controls(project, run_id)] == ["cancel"]
+
+
+@pytest.mark.git
+def test_card_cancel_journals_canceled(project, cards, control_applied):
+    """A canceled `--card` run journals its final `run_upsert` with status
+    `canceled`, never the legacy spelling."""
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=[]
+    )
+
+    run_id = _controlled_card_run(project, cards, factory)["run_id"]
+
+    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
+    upserts = [
+        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
+    ]
+    assert upserts, raw
+    assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
+    assert not [line for line in upserts if "cancelled" in line], upserts
 
 
 @pytest.mark.git
@@ -8988,7 +9007,7 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert _card_statuses(project, payload["run_id"]) == {
         "run": "canceled",
         "story": "escalated",
@@ -9000,8 +9019,8 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
     "command, fail, exit_code, status",
     [
         ("pause", False, 0, "stopped"),
-        ("cancel", False, 0, "cancelled"),
-        ("cancel", True, 0, "cancelled"),
+        ("cancel", False, 0, "canceled"),
+        ("cancel", True, 0, "canceled"),
         ("pause", True, cli.EXIT_ESCALATED, "escalated"),
     ],
     ids=["pause", "cancel", "cancel-over-escalation", "pause-keeps-escalation"],
@@ -9011,7 +9030,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
     project, cards, control_applied, monkeypatch, command, fail, exit_code, status
 ):
     """Spec's exit codes and Review Focus 1-2: the command's mapping still keys
-    off `escalated`, so `stopped` and `cancelled` exit 0 with an ok envelope
+    off `escalated`, so `stopped` and `canceled` exit 0 with an ok envelope
     and a paused escalation still exits 1. `run` passes no interval, so the
     real `run_card` is wrapped to add a short one and the fake factory."""
     real_run_card = cli.run_card
@@ -9164,7 +9183,7 @@ def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
 
     payload = _resume_card_run(project, run_id, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert _card_statuses(project, run_id) == {
         "run": "canceled",
         "story": "stopped",
@@ -9823,7 +9842,7 @@ def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     run_id, card = payload["run_id"], cards["subtask"]
     assert _card_comment_keys(project, card) == [f"{run_id}/{card}/cancelled"]
     (comment,) = board.comment_list(card, repo_dir=project)
@@ -9854,7 +9873,7 @@ def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
 def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
     project, cards, control_applied
 ):
-    """Review Focus 5: the run is `cancelled` (C6) but the walk escalated;
+    """Review Focus 5: the run is `canceled` (C6) but the walk escalated;
     the comment follows `summary.status`, so it is the escalation."""
     factory = _controlling_factory(
         project, control_applied, command="cancel", at="spec", seen=[], fail=True
@@ -9862,7 +9881,7 @@ def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     run_id, card = payload["run_id"], cards["subtask"]
     (key,) = _card_comment_keys(project, card)
     assert key.startswith(f"{run_id}/{card}/escalated:")
@@ -12005,7 +12024,7 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
     assert envelope["error"] == {
         "type": "NotResumableError",
         "message": (
-            f"run {CONTROL_RUN_ID} was cancelled;"
+            f"run {CONTROL_RUN_ID} was canceled;"
             " start new work with `am run --milestone`"
         ),
     }

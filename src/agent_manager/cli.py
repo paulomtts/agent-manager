@@ -819,7 +819,7 @@ def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
     subtask rows always keep `summary.status`.
     """
     if stop.requested == "cancel":
-        return "cancelled"
+        return models.CANCELED
     return summary.status
 
 
@@ -1176,7 +1176,7 @@ def run_card(
     which polls for `am pause`/`am cancel` every `control_interval` seconds
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
-    the run `cancelled` (`card_run_status`). No control cancels a running phase.
+    the run `canceled` (`card_run_status`). No control cancels a running phase.
     The lease and claim are released before `store.close()` on every exit.
 
     Board comments (card 5d9a875f): once the rows are recorded, still under
@@ -2863,7 +2863,7 @@ def _resume_from_checkpoint(
     `control.Lease` with the `card:<id>` claim (`run_lease`); a dead holder it
     took over is reported under `took_over`. The walk runs under
     `control.controlled`. A pause parks it `stopped`; a cancel parks it and
-    records the run `cancelled` (`card_run_status`).
+    records the run `canceled` (`card_run_status`).
 
     Once the checkpoint is accepted, the run's pending board comments are
     flushed (board-comments B7) and their warnings lead the payload's. Next
@@ -3030,7 +3030,7 @@ def resume_run(
         # refusal leaves no run directory, row or journal line behind.
         if models.is_canceled(run.status):
             raise NotResumableError(
-                f"run {run.id} was cancelled; start new work with `am run --milestone`"
+                f"run {run.id} was canceled; start new work with `am run --milestone`"
             )
         lease = store_module.read_lease(conn, run.id)
         now = _utcnow()

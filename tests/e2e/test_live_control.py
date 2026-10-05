@@ -372,7 +372,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert refused.exit_code == cli.EXIT_ERROR == 3, (refused.output, refused.exception)
     refusal = _error(refused)
     assert refusal["type"] == "NotResumableError"
-    assert "cancelled" in refusal["message"]
+    assert "canceled" in refusal["message"]
     assert len(read_fake_log(run_id)) == launches
     assert _status(root, run_id) == "canceled"
 
@@ -484,7 +484,7 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
     assert refused.exit_code == cli.EXIT_ERROR == 3, (refused.output, refused.exception)
     assert _error(refused) == {
         "type": "NotResumableError",
-        "message": f"run {run_id} was cancelled; start new work with `am run --milestone`",
+        "message": f"run {run_id} was canceled; start new work with `am run --milestone`",
     }
     assert len(read_fake_log(run_id)) == launches
 
