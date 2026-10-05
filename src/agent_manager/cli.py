@@ -1704,6 +1704,7 @@ Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
+  am run --story "Story 3.1" --branch-prefix m9 --verify "uv run pytest"  # one story, no Integrate
   am run --board --verify "uv run pytest"                             # run every open milestone
   am run --board --verify "uv run pytest" --detach                    # ... in the background
   am status <run-id> --pretty                                         # watch it (another terminal)
@@ -1716,14 +1717,23 @@ def run(
     card: str | None = typer.Option(
         None,
         "--card",
-        help="The subtask card id to drive. Exclusive with --milestone and --board.",
+        help="The subtask card id to drive. Exclusive with --milestone, --story and --board.",
     ),
     milestone: str | None = typer.Option(
         None,
         "--milestone",
         help=(
             "A milestone card id or title substring: drive every remaining subtask. "
-            "Exclusive with --card and --board."
+            "Exclusive with --card, --story and --board."
+        ),
+    ),
+    story: str | None = typer.Option(
+        None,
+        "--story",
+        help=(
+            "A story card id or title piece: drive every remaining subtask of that one "
+            "story, on its own stack, with no Integrate. Exclusive with --card, "
+            "--milestone and --board."
         ),
     ),
     whole_board: bool = typer.Option(
@@ -1732,7 +1742,7 @@ def run(
         help=(
             "Drive every open milestone on the board as one dependency graph: a "
             "milestone starts once every milestone blocking it finished done. "
-            "Exclusive with --card and --milestone."
+            "Exclusive with --card, --milestone and --story."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -1740,18 +1750,20 @@ def run(
         "--dry-run",
         help=(
             "With --milestone: show the plan (story order, each subtask's branch "
-            "and base, merged bases) and write nothing. With --board: show every "
-            "open milestone by level, each with its own plan, and write nothing."
+            "and base, merged bases) and write nothing. With --story: show that "
+            "one story's plan, with no Integrate, and write nothing. With --board: "
+            "show every open milestone by level, each with its own plan, and write "
+            "nothing."
         ),
     ),
     detach_run: bool = typer.Option(
         False,
         "--detach",
         help=(
-            "With --card, --milestone or --board: make every check here (and, for "
-            "--card or --milestone, record and lease the run), then hand the run to "
-            "a background process in its own session and print its pid and log. "
-            "A card or milestone run's output goes to "
+            "With --card, --milestone, --story or --board: make every check here "
+            "(and, for --card, --milestone or --story, record and lease the run), "
+            "then hand the run to a background process in its own session and print "
+            "its pid and log. A card, milestone or story run's output goes to "
             "<data dir>/runs/<run-id>/run.log and its final envelope to "
             "report.json; a board's output goes to "
             "<data dir>/boards/<stamp>-<digest>.log and its final envelope to "
@@ -1765,7 +1777,7 @@ def run(
             "With --milestone: how many stories run at once "
             f"(default {DEFAULT_MAX_CONCURRENT}). A story starts as soon as its "
             "blockers finish. With --board: how many stories run at once across "
-            "the whole board."
+            "the whole board. Not with --card or --story."
         ),
     ),
     repo_dir: Path = typer.Option(
@@ -1784,8 +1796,8 @@ def run(
         "--branch-prefix",
         help=(
             "Milestone prefix for the derived branch name, e.g. `m2`. Required with "
-            "--card and --milestone. Optional with --board: each milestone's prefix "
-            "is its own card stem, or `<prefix>-<stem>` when given."
+            "--card, --milestone and --story. Optional with --board: each milestone's "
+            "prefix is its own card stem, or `<prefix>-<stem>` when given."
         ),
     ),
     allow_no_verification: bool = typer.Option(
@@ -1803,7 +1815,7 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card, a whole milestone, or every open milestone (--board) end to end, or preview a milestone or the board with --dry-run."""
+    """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1812,6 +1824,7 @@ def run(
         board=whole_board,
         branch_prefix=branch_prefix,
         detach=detach_run,
+        story=story,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1880,6 +1893,36 @@ def run(
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
+        elif story is not None and dry_run:
+            payload = dry_run_story(
+                story,
+                repo_dir=repo_dir,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+            )
+        elif story is not None and detach_run:
+            # Read as `orchestrate.detach_story` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_story(
+                story,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                detacher=detach.fork_detacher,
+            )
+        elif story is not None:
+            # Read as `orchestrate.run_story` so a test can patch it there.
+            # No runner_factory and no driver: production gets the defaults.
+            payload = orchestrate.run_story(
+                story,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+            )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
             payload = detach_card(
@@ -1910,17 +1953,18 @@ def run(
     # A board payload carries one entry per milestone under `milestones`, each
     # with a `status`; a board dry-run carries no `milestones` key at all, so
     # it is read with `.get` and an empty default. A card payload reports
-    # `status`. A milestone payload has no `status` key: it carries
+    # `status`. A milestone or story payload has no `status` key: it carries
     # `escalated: true` only when it stopped, a clean one carries `done: true`,
-    # and a dry-run preview carries neither, so it is read with `.get`, never
-    # indexed. Every check is strict equality on purpose: a `stopped` card
-    # (addendum P4), or a stopped, cancelled or blocked milestone, is not an
-    # escalation and exits 0.
+    # a paused or cancelled one carries that flag, and a dry-run preview
+    # carries none of them, so it is read with `.get`, never indexed. Every
+    # check is strict equality on purpose: a `stopped` card (addendum P4), or a
+    # stopped, cancelled or blocked milestone or story, is not an escalation
+    # and exits 0.
     if whole_board:
         escalated = any(
             entry.get("status") == "escalated" for entry in payload.get("milestones", [])
         )
-    elif milestone is None:
+    elif card is not None:
         escalated = payload["status"] == "escalated"
     else:
         escalated = payload.get("escalated") is True

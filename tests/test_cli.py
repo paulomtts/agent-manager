@@ -12889,3 +12889,337 @@ def test_dry_run_story_refuses_a_blocker_cycle_anywhere_in_the_milestone(
 
     with pytest.raises(dag.DependencyCycleError):
         _dry_run_story(root, cards["story"])
+
+
+# ── am run --story: dispatch, exit codes and refusals ───────────────────────
+
+STORY_RUN_ID = "20260924T000000Z-0badcafe"
+
+CLEAN_STORY = {
+    "done": True,
+    "run_id": STORY_RUN_ID,
+    "levels": [{"level": 0, "stories": ["story-a"]}],
+    "completed": ["subtask-a1"],
+    "tips": [{"story": "story-a", "tip": "m3/task-a1"}],
+    "warnings": [],
+}
+"""`run_story`'s clean payload: a milestone `done` payload without `integrated`."""
+
+NOTHING_TO_RUN_STORY = {
+    "done": True,
+    "run_id": STORY_RUN_ID,
+    "levels": [],
+    "completed": [],
+    "tips": [],
+    "warnings": [],
+}
+
+PAUSED_STORY = {
+    "paused": True,
+    "run_id": STORY_RUN_ID,
+    "stopped": [],
+    "completed": [],
+    "pending": ["story-a"],
+    "warnings": [],
+    "resume": f"am resume {STORY_RUN_ID}",
+}
+
+CANCELLED_STORY = {
+    "cancelled": True,
+    "run_id": STORY_RUN_ID,
+    "stopped": [],
+    "completed": [],
+    "pending": ["story-a"],
+    "warnings": [],
+}
+
+ESCALATED_STORY = {
+    "escalated": True,
+    "run_id": STORY_RUN_ID,
+    "level": 0,
+    "story": "story-a",
+    "subtask": "subtask-a1",
+    "failed_phase": "review",
+    "detail": "phase 'review' gate 'review_gate' failed",
+    "warnings": [],
+}
+
+DETACHED_STORY_PAYLOAD = {
+    "run_id": STORY_RUN_ID,
+    "pid": FAKE_CHILD_PID,
+    "log": f"/data/agent-manager/runs/{STORY_RUN_ID}/run.log",
+    "detached": True,
+}
+
+
+def _story_run(root: Path, needle: str, *extra: str):
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--story",
+            needle,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            STORY_PREFIX,
+            *extra,
+        ],
+    )
+
+
+def _forbid_other_run_paths(monkeypatch) -> None:
+    """Every run path that is not a story's own, forbidden."""
+    _forbid_writes(monkeypatch)
+    for name in ("run_milestone", "detach_milestone", "run_board", "detach_board"):
+        monkeypatch.setattr(orchestrate, name, _Forbidden(name))
+    for name in ("dry_run_milestone", "dry_run_board", "detach_card"):
+        monkeypatch.setattr(cli, name, _Forbidden(name))
+
+
+def _patch_run_story(monkeypatch, outcome: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Replace `orchestrate.run_story`, forbid every other run path, record calls."""
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_run_story(story, **kwargs):
+        calls.append((story, kwargs))
+        return outcome
+
+    monkeypatch.setattr(orchestrate, "run_story", fake_run_story)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("targets", "word"),
+    [
+        (["--story", "S", "--board", "--branch-prefix", "m3"], "both"),
+        (["--story", "S", "--card", SOME_CARD, "--branch-prefix", "m3"], "both"),
+        (["--story", "S", "--milestone", "M", "--branch-prefix", "m3"], "both"),
+        (["--branch-prefix", "m3"], "required"),
+        (["--story", "", "--branch-prefix", "m3"], "blank"),
+        (["--story", "   ", "--branch-prefix", "m3"], "blank"),
+        (["--story", "S"], "required"),
+        (["--story", "S", "--branch-prefix", "m3", "--max-concurrent", "1"], "only"),
+        (["--story", "S", "--branch-prefix", "m3", "--max-concurrent", "4"], "only"),
+        (["--story", "S", "--branch-prefix", "m3", "--dry-run", "--detach"], "detached"),
+    ],
+)
+def test_story_usage_errors_exit_2_and_dispatch_nothing(tmp_path, monkeypatch, targets, word):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(cli.app, ["run", *targets, "--repo-dir", str(tmp_path)])
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert "No such option" not in result.output
+    assert word in result.output
+    assert fake.calls == []
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def test_a_story_run_calls_run_story_once_with_the_run_options(tmp_path, monkeypatch):
+    """The kwargs are compared whole, so an extra key (`max_concurrent`,
+    `driver`, `runner_factory`) fails."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_story(monkeypatch, CLEAN_STORY)
+
+    result = _story_run(
+        tmp_path,
+        "Story 3.1",
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+        "--allow-no-verification",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(CLEAN_STORY)
+    assert calls == [
+        (
+            "Story 3.1",
+            {
+                "repo_dir": tmp_path,
+                "base_branch": "main",
+                "branch_prefix": STORY_PREFIX,
+                "commands": ["uv run pytest", "uv run ruff check"],
+                "allow_no_verification": True,
+            },
+        )
+    ]
+
+
+def test_an_escalated_story_run_exits_escalated(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_story(monkeypatch, ESCALATED_STORY)
+
+    result = _story_run(tmp_path, "Story 3.1")
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(ESCALATED_STORY)
+
+
+@pytest.mark.parametrize(
+    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELLED_STORY]
+)
+def test_a_stopped_or_nothing_to_run_story_exits_0(tmp_path, monkeypatch, payload):
+    """None of these carries a `status` key: the rule must not index one."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_story(monkeypatch, payload)
+
+    result = _story_run(tmp_path, "Story 3.1")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [
+        ("none", "StoryNotFoundError"),
+        ("several", "StoryNotFoundError"),
+        ("milestone", "StoryNotFoundError"),
+        ("subtask", "StoryNotFoundError"),
+        ("blocked", "StoryBlockedError"),
+        ("claimed", "ClaimedError"),
+    ],
+)
+def test_story_refusals_are_the_error_envelope_with_exit_3(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    """The real `run_story` and `preflight_story`: every refusal comes before
+    git is refreshed and before any run directory exists."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker = fake_board.add_card("Story A: rows", parent_id=milestone)
+    a1 = fake_board.add_card("a1: rows", parent_id=blocker)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[blocker])
+    fake_board.add_card("s1: cols one", parent_id=story)
+    needle = {
+        "none": "no such story",
+        "several": "Story",
+        "milestone": milestone,
+        "subtask": a1,
+        "blocked": story,
+        "claimed": blocker,
+    }[case]
+
+    def held(at: Path, keys: Any, *, run_id: str | None = None) -> None:
+        key = list(keys)[0]
+        raise cli.ClaimedError(
+            f"{key} is claimed by run 20260101T000000Z-00000000",
+            key=key,
+            run_id="20260101T000000Z-00000000",
+        )
+
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(cli, "refuse_claimed", held)
+    monkeypatch.setattr(orchestrate, "refresh_git", _Forbidden("orchestrate.refresh_git"))
+    _story_lookups(monkeypatch)
+
+    error = _refusal(_story_run(root, needle))
+
+    assert error["type"] == error_type
+    assert _run_dirs() == []
+
+
+def test_a_story_dry_run_prints_its_preview_and_writes_nothing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    _story_lookups(monkeypatch)
+    expected = _dry_run_story(root, cards["story"])
+    _forbid_other_run_paths(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+
+    result = _story_run(root, "cols", "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == json.loads(cli.render(cli.ok_envelope(expected)))
+    assert json.loads(result.stdout)["data"]["integrate"] is None
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [("blocked", "StoryBlockedError"), ("several", "StoryNotFoundError")],
+)
+def test_a_story_dry_run_refusal_is_an_envelope_with_exit_3(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    blocked = fake_board.add_card(
+        "Story T: cells", parent_id=cards["milestone"], blocked_by=[cards["other"]]
+    )
+    fake_board.add_card("t1: cells", parent_id=blocked)
+    needle = {"blocked": blocked, "several": "Story"}[case]
+    _story_lookups(monkeypatch)
+    _forbid_other_run_paths(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    error = _refusal(_story_run(root, needle, "--dry-run"))
+
+    assert error["type"] == error_type
+    assert _run_dirs() == []
+
+
+def test_story_detach_dispatches_detach_story_with_the_run_options(tmp_path, monkeypatch):
+    """The kwargs are compared whole; `detacher` is `detach.fork_detacher`
+    read at call time; a detached payload exits 0."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_detach_story(story, **kwargs):
+        calls.append((story, kwargs))
+        return DETACHED_STORY_PAYLOAD
+
+    monkeypatch.setattr(orchestrate, "detach_story", fake_detach_story)
+    sentinel = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", sentinel)
+
+    result = _story_run(tmp_path, "Story 3.1", "--detach", "--verify", "X")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(DETACHED_STORY_PAYLOAD)
+    ((needle, kwargs),) = calls
+    assert kwargs.pop("detacher") is sentinel
+    assert (needle, kwargs) == (
+        "Story 3.1",
+        {
+            "repo_dir": tmp_path,
+            "base_branch": "main",
+            "branch_prefix": STORY_PREFIX,
+            "commands": ["X"],
+            "allow_no_verification": False,
+        },
+    )
+    assert sentinel.calls == []
+
+
+def test_run_help_and_examples_document_the_story_option():
+    assert (
+        'am run --story "Story 3.1" --branch-prefix m9 --verify "uv run pytest"'
+        in cli.RUN_EXAMPLES
+    )
+
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--story" in result.output

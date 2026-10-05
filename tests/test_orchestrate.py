@@ -10503,3 +10503,93 @@ def test_detach_story_refuses_an_open_blocker_before_any_fork_or_write(
     assert fake.calls == []
     assert _run_dirs() == []
     assert _run_ids(root) == []
+
+
+# ── am run --story --detach through the CLI ─────────────────────────────────
+
+
+def _story_run_args(root: Path, needle: str, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--story",
+        needle,
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        PREFIX,
+        "--allow-no-verification",
+        *extra,
+    ]
+
+
+def test_a_detached_story_run_records_and_leases_the_plan_and_drives_nothing_here(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    refreshed: list[Path] = []
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: refreshed.append(at))
+    monkeypatch.setattr(cli, "drive_subtask_async", _forbidden("drive_subtask_async"))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = detach_runner.invoke(cli.app, _story_run_args(root, story, "--detach"))
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert (data["pid"], data["detached"]) == (FAKE_CHILD_PID, True)
+    run_id = data["run_id"]
+    assert run_id.endswith(dag.short_id(story))
+    assert _run_ids(root) == [run_id]
+    run = _load(root, run_id)
+    assert run.milestone_id == shape["milestone"]
+    assert run.config == models.RunConfig(max_concurrent_stories=1, story_id=story)
+    assert _statuses(run) == {"run": "started", story: "pending", a1: "pending", a2: "pending"}
+    lease = _lease(root, run_id)
+    assert lease is not None and lease.pid == FAKE_CHILD_PID
+    assert _held_keys(root, run_id) == sorted(
+        [
+            f"card:{shape['milestone']}",
+            f"card:{story}",
+            f"card:{a1}",
+            f"card:{a2}",
+            f"branch:{_branch(root, a1)}",
+            f"branch:{_branch(root, a2)}",
+        ]
+    )
+    log = Path(data["log"])
+    assert log == paths.run_dir(run_id) / detach.RUN_LOG_NAME
+    assert stat.S_IMODE(os.stat(log).st_mode) == 0o600
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert refreshed == [root]
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [("blocked", "StoryBlockedError"), ("ambiguous", "StoryNotFoundError")],
+)
+def test_a_refused_detached_story_run_forks_nothing(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    needle = {"blocked": shape["stories"]["B"], "ambiguous": "Story"}[case]
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = detach_runner.invoke(cli.app, _story_run_args(root, needle, "--detach"))
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == error_type
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
