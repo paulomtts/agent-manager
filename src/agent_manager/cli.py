@@ -212,9 +212,11 @@ RUN_IDENTITY = (
     "started_at",
 )
 """The run's own fields, without `config` and without the tree below it. §10's
-`status` header is these seven names. Each `runs` entry carries the same seven,
-plus `milestone_id`, `card_id`, `lease` and `progress` (a superset), so the two
-commands still describe a run's identity the same way."""
+`status` header is these seven names plus `story_id`, which is the run's
+`config.story_id` (`None` unless the run is an `am run --story` run) and the
+only part of `config` the header shows. Each `runs` entry carries the same
+seven, plus `milestone_id`, `card_id`, `story_id`, `lease` and `progress` (a
+superset), so the two commands still describe a run's identity the same way."""
 
 
 def status_rows(run: models.Run) -> list[dict[str, Any]]:
@@ -368,7 +370,10 @@ def status_payload(
     """
     tree = run.model_dump()
     return {
-        "run": {field: tree[field] for field in RUN_IDENTITY},
+        "run": {
+            **{field: tree[field] for field in RUN_IDENTITY},
+            "story_id": run.config.story_id,
+        },
         "stories": tree["stories"],
         "rows": status_rows(run),
         "control": {"lease": None, "requests": [], "claims": []}
@@ -1294,6 +1299,51 @@ def dry_run_milestone(
     )
 
 
+def dry_run_story(
+    needle: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str,
+) -> dict[str, Any]:
+    """`--dry-run --story`: the one story a story run would drive, on one lane, with no Integrate.
+
+    The plan is the real run's, `orchestrate.story_census` over the story's
+    milestone, so every refusal of the run's pre-flight but `ClaimedError`
+    (a preview checks no claim) is raised the same: `StoryNotFoundError`,
+    `DependencyCycleError`, `StoryBlockedError`. `levels` is
+    `compute_dry_run_plan`'s at one lane: the selected story alone, rooted
+    where the run would root it; a done blocker it stacks on gets no row.
+    `already_done` lists the selected story's entries only, and `integrate`
+    is `None`. Read-only by construction: the two `brd` reads and, for a
+    done blocker only, the read-only local-branch lookup are its only I/O. No
+    `Store` is opened, git is not refreshed, nothing is written.
+    """
+    root = resolve_repo_dir(repo_dir)
+    match = census.find_story(board.roots(repo_dir=root), needle)
+    plan = orchestrate.story_census(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        branch_prefix=branch_prefix,
+    )
+    preview = compute_dry_run_plan(
+        plan.stories,
+        repo_dir=root,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        max_concurrent=1,
+    )
+    return {
+        "max_concurrent": 1,
+        "levels": preview.levels,
+        "already_done": already_done_entries(
+            [story for story in plan.stories if story.id == match.story.id]
+        ),
+        "integrate": None,
+    }
+
+
 def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], str]:
     """Run-board spec 3.2: how one milestone's branch prefix is derived under `--board`.
 
@@ -1554,24 +1604,26 @@ def _check_run_targets(
     board: bool = False,
     branch_prefix: str | None = None,
     detach: bool = False,
+    story: str | None = None,
 ) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
+    """Refuse a bad `--card` / `--milestone` / `--story` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
-    or dispatched. Exactly one of `--card`, `--milestone` and `--board` is a
-    target. A blank `--milestone` is refused here too: the census strips
+    or dispatched. Exactly one of `--card`, `--milestone`, `--story` and
+    `--board` is a target; two given are refused before a missing one is. A
+    blank `--milestone` or `--story` is refused here too: the census strips
     the needle, and an empty needle is a substring of every title, so on a
-    one-milestone board it would silently pick that milestone.
+    one-milestone (or one-story) board it would silently pick that card.
     `--branch-prefix` is an Option with no default so that board mode can
     omit it (each milestone then uses its own card stem, run-board spec 3.2);
-    `--card` and `--milestone` still require it, refused here at the same
-    exit 2 Typer gave a missing required option. A blank one with `--board`
-    is refused, since `<prefix>-<stem>` would start with a dash.
-    `--max-concurrent` is `None` when not given, so giving it with `--card` is
-    refused whatever its value, the default included. The Option has no
-    `min=1`, so a value below 1 is refused here, worded and routed like every
-    other run-target refusal.
+    `--card`, `--milestone` and `--story` still require it, refused here at
+    the same exit 2 Typer gave a missing required option. A blank one with
+    `--board` is refused, since `<prefix>-<stem>` would start with a dash.
+    `--max-concurrent` is `None` when not given, so giving it with `--card`
+    or `--story` is refused whatever its value, the default included. The
+    Option has no `min=1`, so a value below 1 is refused here, worded and
+    routed like every other run-target refusal.
     `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
     nothing to hand off.
     """
@@ -1590,19 +1642,39 @@ def _check_run_targets(
             "give --card or --milestone, not both",
             param_hint="'--card' / '--milestone'",
         )
-    if card is None and milestone is None and not board:
+    if story is not None and board:
         raise typer.BadParameter(
-            "one of --card, --milestone or --board is required",
-            param_hint="'--card' / '--milestone' / '--board'",
+            "give --board or --story, not both",
+            param_hint="'--board' / '--story'",
+        )
+    if story is not None and card is not None:
+        raise typer.BadParameter(
+            "give --card or --story, not both",
+            param_hint="'--card' / '--story'",
+        )
+    if story is not None and milestone is not None:
+        raise typer.BadParameter(
+            "give --milestone or --story, not both",
+            param_hint="'--milestone' / '--story'",
+        )
+    if card is None and milestone is None and story is None and not board:
+        raise typer.BadParameter(
+            "one of --card, --milestone, --story or --board is required",
+            param_hint="'--card' / '--milestone' / '--story' / '--board'",
         )
     if milestone is not None and not milestone.strip():
         raise typer.BadParameter(
             "--milestone needs a card id or a title substring, not a blank string",
             param_hint="'--milestone'",
         )
+    if story is not None and not story.strip():
+        raise typer.BadParameter(
+            "--story needs a card id or a title piece, not a blank string",
+            param_hint="'--story'",
+        )
     if not board and branch_prefix is None:
         raise typer.BadParameter(
-            "--branch-prefix is required with --card or --milestone",
+            "--branch-prefix is required with --card, --milestone or --story",
             param_hint="'--branch-prefix'",
         )
     if board and branch_prefix is not None and not branch_prefix.strip():
@@ -1625,7 +1697,7 @@ def _check_run_targets(
             f"--max-concurrent must be at least 1, got {max_concurrent}",
             param_hint="'--max-concurrent'",
         )
-    if card is not None and max_concurrent is not None:
+    if (card is not None or story is not None) and max_concurrent is not None:
         raise typer.BadParameter(
             "--max-concurrent applies only to --milestone or --board",
             param_hint="'--max-concurrent'",
@@ -1637,6 +1709,7 @@ Examples:
   am run --milestone "M9" --branch-prefix m9 --dry-run --pretty       # preview the plan
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest"  # run it
   am run --milestone "M9" --branch-prefix m9 --verify "uv run pytest" --detach  # run it in the background
+  am run --story "Story 3.1" --branch-prefix m9 --verify "uv run pytest"  # one story, no Integrate
   am run --board --verify "uv run pytest"                             # run every open milestone
   am run --board --verify "uv run pytest" --detach                    # ... in the background
   am status <run-id> --pretty                                         # watch it (another terminal)
@@ -1649,14 +1722,23 @@ def run(
     card: str | None = typer.Option(
         None,
         "--card",
-        help="The subtask card id to drive. Exclusive with --milestone and --board.",
+        help="The subtask card id to drive. Exclusive with --milestone, --story and --board.",
     ),
     milestone: str | None = typer.Option(
         None,
         "--milestone",
         help=(
             "A milestone card id or title substring: drive every remaining subtask. "
-            "Exclusive with --card and --board."
+            "Exclusive with --card, --story and --board."
+        ),
+    ),
+    story: str | None = typer.Option(
+        None,
+        "--story",
+        help=(
+            "A story card id or title piece: drive every remaining subtask of that one "
+            "story, on its own stack, with no Integrate. Exclusive with --card, "
+            "--milestone and --board."
         ),
     ),
     whole_board: bool = typer.Option(
@@ -1665,7 +1747,7 @@ def run(
         help=(
             "Drive every open milestone on the board as one dependency graph: a "
             "milestone starts once every milestone blocking it finished done. "
-            "Exclusive with --card and --milestone."
+            "Exclusive with --card, --milestone and --story."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -1673,18 +1755,20 @@ def run(
         "--dry-run",
         help=(
             "With --milestone: show the plan (story order, each subtask's branch "
-            "and base, merged bases) and write nothing. With --board: show every "
-            "open milestone by level, each with its own plan, and write nothing."
+            "and base, merged bases) and write nothing. With --story: show that "
+            "one story's plan, with no Integrate, and write nothing. With --board: "
+            "show every open milestone by level, each with its own plan, and write "
+            "nothing."
         ),
     ),
     detach_run: bool = typer.Option(
         False,
         "--detach",
         help=(
-            "With --card, --milestone or --board: make every check here (and, for "
-            "--card or --milestone, record and lease the run), then hand the run to "
-            "a background process in its own session and print its pid and log. "
-            "A card or milestone run's output goes to "
+            "With --card, --milestone, --story or --board: make every check here "
+            "(and, for --card, --milestone or --story, record and lease the run), "
+            "then hand the run to a background process in its own session and print "
+            "its pid and log. A card, milestone or story run's output goes to "
             "<data dir>/runs/<run-id>/run.log and its final envelope to "
             "report.json; a board's output goes to "
             "<data dir>/boards/<stamp>-<digest>.log and its final envelope to "
@@ -1698,7 +1782,7 @@ def run(
             "With --milestone: how many stories run at once "
             f"(default {DEFAULT_MAX_CONCURRENT}). A story starts as soon as its "
             "blockers finish. With --board: how many stories run at once across "
-            "the whole board."
+            "the whole board. Not with --card or --story."
         ),
     ),
     repo_dir: Path = typer.Option(
@@ -1717,8 +1801,8 @@ def run(
         "--branch-prefix",
         help=(
             "Milestone prefix for the derived branch name, e.g. `m2`. Required with "
-            "--card and --milestone. Optional with --board: each milestone's prefix "
-            "is its own card stem, or `<prefix>-<stem>` when given."
+            "--card, --milestone and --story. Optional with --board: each milestone's "
+            "prefix is its own card stem, or `<prefix>-<stem>` when given."
         ),
     ),
     allow_no_verification: bool = typer.Option(
@@ -1736,7 +1820,7 @@ def run(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Drive one subtask card, a whole milestone, or every open milestone (--board) end to end, or preview a milestone or the board with --dry-run."""
+    """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1745,6 +1829,7 @@ def run(
         board=whole_board,
         branch_prefix=branch_prefix,
         detach=detach_run,
+        story=story,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1813,6 +1898,36 @@ def run(
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
+        elif story is not None and dry_run:
+            payload = dry_run_story(
+                story,
+                repo_dir=repo_dir,
+                branch_prefix=branch_prefix,
+                base_branch=base_branch,
+            )
+        elif story is not None and detach_run:
+            # Read as `orchestrate.detach_story` and `detach.fork_detacher`
+            # so a test can patch either.
+            payload = orchestrate.detach_story(
+                story,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+                detacher=detach.fork_detacher,
+            )
+        elif story is not None:
+            # Read as `orchestrate.run_story` so a test can patch it there.
+            # No runner_factory and no driver: production gets the defaults.
+            payload = orchestrate.run_story(
+                story,
+                repo_dir=repo_dir,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                commands=list(verify),
+                allow_no_verification=allow_no_verification,
+            )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
             payload = detach_card(
@@ -1843,17 +1958,18 @@ def run(
     # A board payload carries one entry per milestone under `milestones`, each
     # with a `status`; a board dry-run carries no `milestones` key at all, so
     # it is read with `.get` and an empty default. A card payload reports
-    # `status`. A milestone payload has no `status` key: it carries
+    # `status`. A milestone or story payload has no `status` key: it carries
     # `escalated: true` only when it stopped, a clean one carries `done: true`,
-    # and a dry-run preview carries neither, so it is read with `.get`, never
-    # indexed. Every check is strict equality on purpose: a `stopped` card
-    # (addendum P4), or a stopped, cancelled or blocked milestone, is not an
-    # escalation and exits 0.
+    # a paused or cancelled one carries that flag, and a dry-run preview
+    # carries none of them, so it is read with `.get`, never indexed. Every
+    # check is strict equality on purpose: a `stopped` card (addendum P4), or a
+    # stopped, cancelled or blocked milestone or story, is not an escalation
+    # and exits 0.
     if whole_board:
         escalated = any(
             entry.get("status") == "escalated" for entry in payload.get("milestones", [])
         )
-    elif milestone is None:
+    elif card is not None:
         escalated = payload["status"] == "escalated"
     else:
         escalated = payload.get("escalated") is True

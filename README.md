@@ -65,7 +65,9 @@ that matches several root cards is refused with the list of matches, and one
 that matches none is refused with the list of root cards. Both come back as
 `{"ok": false, "error": {...}}` with exit code 3.
 
-`--branch-prefix` is required with `--card` and `--milestone`, and optional with `--board` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)). Every branch the run cuts is named
+To drive one story of a milestone instead of the whole milestone, with no Integrate, use `--story`: see [Running one story with `--story`](#running-one-story-with---story).
+
+`--branch-prefix` is required with `--card`, `--milestone` and `--story`, and optional with `--board` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)). Every branch the run cuts is named
 `<prefix>/task-<title slug>-<first 8 hex of the card id>`, and its worktree is
 `<repo>/.claude/worktrees/<branch>`. `--verify` is repeatable, passed through as
 written, and run in the order given. With no `--verify`, pass
@@ -77,7 +79,7 @@ Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
 The base-branch and final integration checks run their commands with neither set.
 
-Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, none of the three, a blank `--milestone`, a missing `--branch-prefix` with `--card` or `--milestone`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card`, a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run`.
+Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, `--story` together with `--card`, `--milestone` or `--board`, none of the four, a blank `--milestone`, a blank `--story`, a missing `--branch-prefix` with `--card`, `--milestone` or `--story`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card` or `--story` (whatever its value), a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run`.
 These are usage errors: Typer prints the message on stderr, nothing is printed on stdout, and the exit code is 2.
 
 #### Running detached with `--detach`
@@ -98,6 +100,7 @@ am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run
 - The exit code is 0 whenever the run was handed off, even if it later escalates. Read the outcome from `report.json` or `am status`.
 - A missing verification command is not caught before the run starts. The verification gate runs during the explore phase, so with `--detach` it shows up in `report.json` and `am status`, not on your terminal. Pass `--verify` or `--allow-no-verification`.
 - `--detach` with `--dry-run` is refused as a usage error (exit 2).
+- With `--story` it behaves as with `--milestone`: the same pre-flight refusals before anything starts (`StoryBlockedError` included), the same envelope, and the same `run.log` and `report.json`.
 - With `--board`, the command runs the board's whole pre-flight here: the argument checks, the board read, the cycle check, each milestone's prefix and base, and the up-front claim check. A refusal is the usual envelope with exit code 3, and nothing starts. Then the board run moves to the background process. The envelope's `data` has the keys `board`, `detached`, `pid`, `log`, `report` and `levels`, and no `run_id`: each milestone's run is created when that milestone starts, and `am runs` or `am watch --all` finds it. `log` is `<data dir>/boards/<stamp>-<digest>.log` and `report` is `<data dir>/boards/<stamp>-<digest>.report.json`, where `<digest>` is the repository's digest. Both are mode 0600. The report holds the envelope `am run --board` would have printed. A claim another run takes after the up-front check shows up there as an `escalated` milestone.
 - Later versions may add keys to these envelopes. Ignore keys you do not know.
 
@@ -142,6 +145,45 @@ Read the `base` column before a real run:
   `brd block <story> --by <blocker>` and preview again.
 - A cycle between stories is refused with exit code 3 before anything is written. A story with two or more blockers is not refused.
 
+#### Running one story with `--story`
+
+```bash
+am run --story "<title piece>" --branch-prefix m3 --verify "uv run pytest"
+```
+
+Drive every remaining subtask of one story, on the story's own stack: in order, each on its own local branch stacked on the branch before it. A done subtask is skipped, but its branch still anchors the next one. The shape is `am run --story STORY --branch-prefix P [--base-branch B] [--verify CMD ...] [--allow-no-verification] [--dry-run] [--detach] [--repo-dir D]`. Pass the `--branch-prefix` the milestone's other stories run under: every branch is `<prefix>/task-<title slug>-<first 8 hex of the card id>`, and a story with a blocker roots on that blocker's branch, which exists only under the prefix its own run used.
+
+How `STORY` is matched. A story is a child of a root card (a milestone), whatever its status. In this order:
+
+1. An exact story id wins.
+2. The exact id of a milestone or of a subtask is refused: it is not a story.
+3. One exact title, in any case, wins, even when it is also a piece of another story's title. Two stories with that exact title are ambiguous.
+4. Otherwise the piece must match exactly one story's title.
+
+Milestone and subtask titles never match. Each refusal is `StoryNotFoundError`, printed as `{"ok": false, "error": {...}}` with exit code 3, and its message lists the stories, or the matches for an ambiguous piece.
+
+Where the story starts. The run first checks the whole milestone for a blocker cycle, even one the story is not part of (`DependencyCycleError`, exit code 3). The story then roots as in a milestone run (see [Preview with `--dry-run`](#preview-with---dry-run)), counting only the blockers inside the milestone that it keeps: on `--base-branch` with none, on the kept blocker's tip with one, and on its own merged base `<prefix>/base-<short id>` with two or more (see [Multiple blockers](#multiple-blockers)). Each blocker, by its status, in any case:
+
+- `merged`: dropped, so with no other blocker the story roots on `--base-branch`.
+- `done`: kept when its tip, the branch of its last subtask, exists as a local branch, and the story roots on that tip. With no local tip, or no subtasks, it is dropped like a `merged` one, and the story roots on `--base-branch`.
+- `canceled` or `archived`: ignored.
+- anything else: open, and the run is refused (see below).
+
+An open blocker refuses the run with `{"ok": false, "error": {"type": "StoryBlockedError", "message"}}` and exit code 3, before anything is written: no claim, no `git fetch`, no run row and no run directory. The message names every open blocker by title and id and ends `— run them first, or run the milestone`: run those stories first, or the whole milestone with `am run --milestone`. A story with no subtask left to run is not judged on its blockers.
+
+No Integrate. A story run ends on the story's tip, the branch of its last subtask. It does not run [Integrate](#integrate): it creates no `<prefix>-integrate` branch and no integration worktree, the base branch does not move, and nothing is pushed. A clean run exits 0 with the report of [What a clean run leaves behind](#what-a-clean-run-leaves-behind) minus `integrated`: `done` is `true` without Integrate, and `tips` names this story alone. Cards roll up as in a milestone run: each finished subtask is `done`, then the story, and the milestone once all its stories are done. `am` never writes `merged`, `canceled` or `archived`. A story with no open subtask also exits 0 with that `done` report, with no level and nothing driven. Merging the tip is left to you, or to a later `am run --milestone`, whose Integrate merges every story's tip.
+
+A story run is recorded as a `milestone` run of the story's parent milestone, driving one story at a time, with `story_id` naming the story (see [Listing runs](#listing-runs)).
+
+A story run claims `card:<milestone>`, `card:<story>`, and the `card:<id>` and `branch:<branch>` of each remaining subtask, never `branch:<prefix>-integrate`. So it is refused with `ClaimedError` (exit code 3) beside a live run of its milestone, of one of its remaining subtasks (`--card`), or of the same story, and two story runs of one milestone are kept apart by the milestone's card. See [Several am processes](#several-am-processes).
+
+Pause, resume, detach and preview:
+
+- `am pause`, `am cancel` and the escalation report work as on a milestone run (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run) and [What an escalation report contains](#what-an-escalation-report-contains)).
+- `am resume <run-id>` continues that story alone, found from the run's recorded `config.story_id`, with no `--story`, `--branch-prefix` or `--base-branch`; pass your `--verify` commands again, as on a milestone run. It is refused with exit code 3, before anything is written, when the story is no longer a story of that milestone, and with `StoryBlockedError` when one of its blockers has re-opened. See [Relaunching resumes](#relaunching-resumes).
+- `--detach` works with `--story` exactly as with `--milestone`: the same envelope, `run.log` and `report.json` (see [Running detached with `--detach`](#running-detached-with---detach)).
+- `--dry-run` previews the story and writes nothing. Its `data` is `{"max_concurrent": 1, "levels", "already_done", "integrate": null}`: one level holding the story alone, with its remaining subtasks and their `branch` and `base`. A done blocker the story stacks on gets no row, and `already_done` lists only this story's entries. It refuses everything the run refuses except `ClaimedError`, since a preview checks no claim.
+
 #### Running every open milestone with `--board`
 
 ```bash
@@ -169,7 +211,7 @@ Stacking. Each milestone starts from one branch, its base. Only the ids in its `
 
 A stacked milestone runs exactly as before from its base: its stories root on the blocker's `<prefix>-integrate` instead of `--base-branch`, and its own Integrate still merges into its own `<prefix>-integrate`. `am` never merges into `--base-branch`. Stacking changes where a milestone starts, not when. It still waits for every open blocker to finish `done`, and is reported `blocked` if one ends any other way.
 
-Flags. Give exactly one of `--card`, `--milestone` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card` or `--milestone` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
+Flags. Give exactly one of `--card`, `--milestone`, `--story` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card`, `--milestone` or `--story` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
 
 Refusals. These come in this order, before anything is written. Each prints `{"ok": false, "error": {"type", "message"}}` and exits 3:
 
@@ -318,10 +360,12 @@ A claim is a key, `card:<card id>` or `branch:<branch name>`:
 | `am resume R` of a `--card` run | `card:<its one resumable subtask>` |
 | `am run --milestone M` | `card:M`, `card:<id>` of every remaining subtask, and `branch:<prefix>-integrate` |
 | `am resume R` of a milestone run | the same set, worked out again from the board with the run's recorded `--branch-prefix` |
+| `am run --story S` | `card:<milestone of S>`, `card:S`, and `card:<id>` and `branch:<branch>` of every remaining subtask of `S`; no integration branch |
+| `am resume R` of a story run | the same set, worked out again from the board for the run's recorded story and `--branch-prefix` |
 
 A subtask already `done` on the board, and every subtask of a closed story, adds no key. `card:M` keeps two runs of one milestone apart whatever their prefixes, the subtask keys keep a `--card` run and a milestone run apart on a shared card in either order, and `branch:<prefix>-integrate` keeps two milestones with one `--branch-prefix` apart. A claim lives only as long as its run's lease: when the process dies, its claims die with it, and a later run takes them over.
 
-Refusals. Each one prints `{"ok": false, "error": {"type", "message"}}`, exits 3, and comes before any write. A refused `am run --card` or `am run --milestone` leaves no run directory and does no `git fetch` and no `git worktree prune`.
+Refusals. Each one prints `{"ok": false, "error": {"type", "message"}}`, exits 3, and comes before any write. A refused `am run --card`, `am run --milestone` or `am run --story` leaves no run directory and does no `git fetch` and no `git worktree prune`.
 
 - `RunIsLiveError`: `am resume` of a run whose lease another process holds and is live, and the loser when two `am resume` race to take over the same dead run (exactly one wins). The message reads ``run <run-id> is still running in pid <pid> on <host> (heartbeat <n>s ago); wait for it to exit, or `am status <run-id>` ``.
 - `ClaimedError`: a card or a branch this run needs is claimed by another run whose lease is live. Both kinds read the same way, with the key's kind and name: ``card <card id> is being driven by run <run-id> (pid <pid> on <host>, heartbeat <n>s ago); wait for it, or `am pause <run-id>` ``, or ``branch <prefix>-integrate is being driven by run <run-id> (…); wait for it, or `am pause <run-id>` ``. The JSON envelope has only `type` and `message`, and the message names both the key and the holding run; the `ClaimedError` exception itself also carries them as its `key` and `run_id` attributes.
@@ -421,6 +465,8 @@ that already passed. Relaunching a finished milestone drives no subtask but stil
 
 `am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. Pass your `--verify` commands again: the suite is not recorded, and it is what every subtask with no checkpoint, every merged base and Integrate run. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished, was paused or was cancelled, and 1 when it escalated again.
 
+A story run relaunches the same way: running the same `am run --story` command again starts a new run of that story that skips every subtask already `done` on the board. `am resume <run-id>` of a story run continues that story alone under the same run id, found from the run's recorded `config.story_id`, with its plan, root and claims worked out again from the board as a fresh `am run --story` would. It refuses, with exit code 3 and nothing written, when the story is no longer a story of the recorded milestone (`NotResumableError`), or when one of its blockers has re-opened (`StoryBlockedError`). A story run never runs Integrate, on a resume either.
+
 A milestone resume refuses before anything is written and before git is fetched, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
 - the run is `done`. Start new work with `am run --milestone`.
@@ -516,7 +562,7 @@ On a `--card` run, a pause parks the walk before its next phase. The report's `s
 
 - `retry` does not exist.
 - `am pause --wait` does not exist, Integrate cannot be paused or cancelled, and there is no way to pause a single story: a pause or cancel always applies to the whole run.
-- There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate.
+- There is no `--no-integrate` option: a milestone run that finishes clean always ends with Integrate. `am run --story` runs one story with no Integrate.
 
 See section 4 of the
 [orchestration addendum](docs/superpowers/specs/2026-09-24-orchestration-design.md#4-deferred-to-the-follow-up-milestone-found-now-not-cut-yet),
@@ -541,6 +587,7 @@ am runs --repo-dir . --pretty
 - `id`, `workflow` (`milestone` or `task`), `repo_dir`, `base_branch`, `branch_prefix`, `status`, `started_at` (`null` if never recorded).
 - `milestone_id`: the full id of the milestone card a milestone run drives. It is `null` on a `--card` run, and on a run recorded by an `am` too old to store it.
 - `card_id`: the subtask card an `am run --card` run drives. It is `null` on a milestone run, and on a `--card` run whose subtask has not been recorded yet.
+- `story_id`: the story card an `am run --story` run drives. It is `null` on any other run (a milestone, `--card` or `--board` run), and on a run recorded by an `am` too old to store it. A story run's `workflow` is `milestone`, its `card_id` is `null`, and its `milestone_id` is still the story's parent milestone, so a consumer that maps a run to its milestone keeps working.
 - `lease`: the process holding the run, or `null` if no process has a lease row for it. When present it is `{live, pid, host, heartbeat_at, accepting}`, the same values `am status <run-id>` shows in `control.lease` (without `acquired_at`). `live` is worked out when you ask: the heartbeat is at most 30 seconds old, and the lease is on another host or its pid is alive here. `heartbeat_at` is an ISO 8601 string. `accepting` is `false` once the run's control window has closed.
 - `progress`: how far the run has got, counted from its recorded tree: `{stories: {done, total}, subtasks: {done, total}, current}`. `done` counts only rows whose status is `done`; `failed`, `escalated`, `stopped` and `cancelled` rows count toward `total` only. A milestone run that had to resolve a merge conflict also counts its synthetic `Integrate` story and that story's resolver subtasks, so it shows one story more than the milestone has. `current` is `{card, phase, attempt}` for the `started` phase that started most recently (`attempt` is that phase's highest attempt number, `null` before its first attempt), or `null` when no phase is started. It is read from the recorded rows, not from a live process: a run whose process died mid-phase still shows the phase it stopped in, so check `lease.live` to know whether anyone is still working on it. A run with nothing recorded below it shows `0` of `0` at both levels and `current: null`; `progress` itself is never `null`.
 
@@ -634,7 +681,7 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
 - An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
-- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run) are in the `payload` of its first line, a `run_upsert`. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
+- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a future schema bump is signaled. It is `1` today.
 
 ### Reading an attempt's output

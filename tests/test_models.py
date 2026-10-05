@@ -419,6 +419,32 @@ def test_run_config_rejects_a_harness_map_entry_missing_its_model():
     assert "model" in str(excinfo.value)
 
 
+def test_run_config_story_id_defaults_to_none():
+    assert models.RunConfig().story_id is None
+    run = models.Run(
+        id="run-2026-09-23-01",
+        workflow="task",
+        repo_dir=Path("/home/dev/agent-manager"),
+        base_branch="main",
+        branch_prefix="m1/",
+    )
+    assert run.config.story_id is None
+
+
+def test_run_config_accepts_a_story_id():
+    config = models.RunConfig(story_id="2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae")
+    assert config.story_id == "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+    assert config.model_dump(mode="json")["story_id"] == "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+    assert models.RunConfig().model_dump(mode="json")["story_id"] is None
+
+
+@pytest.mark.parametrize("value", [123, ["2aeb8b6e"]])
+def test_run_config_rejects_a_non_string_story_id(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(story_id=value)
+    assert "story_id" in str(excinfo.value)
+
+
 def test_story_rejects_a_negative_level():
     with pytest.raises(ValidationError) as excinfo:
         models.StoryRun(card_id="8831189b", title="Foundations", level=-1)

@@ -16,17 +16,20 @@ import inspect
 
 import pytest
 
-from agent_manager import census
+from agent_manager import census, cli
 from agent_manager.census import (
     Census,
     CensusOrderError,
     MilestoneNotFoundError,
+    StoryMatch,
     StoryPlan,
     SubtaskPlan,
     find_milestone,
+    find_story,
     flatten_milestone,
     order_siblings,
 )
+from agent_manager.errors import StoryBlockedError, StoryNotFoundError
 from agent_manager.models import CardNode
 
 
@@ -566,3 +569,213 @@ def test_landed_statuses_are_finished_but_not_plain_done_or_out_of_play():
     assert census.LANDED_STATUSES <= census.FINISHED_STATUSES | census.OUT_OF_PLAY_STATUSES
     assert "done" not in census.LANDED_STATUSES
     assert census.LANDED_STATUSES == frozenset({"merged", "canceled", "archived"})
+
+
+# --- find_story -------------------------------------------------------------
+
+TREE_STORIES = "Story: CSV writer, Story: Document it"
+
+
+def second_milestone() -> CardNode:
+    return node(7, "Milestone 13: CSV import", children=[node(8, "Story: CSV reader")])
+
+
+def refusal(roots: list[CardNode] | None, needle: str | int) -> str:
+    with pytest.raises(StoryNotFoundError) as caught:
+        find_story(roots, needle)
+    return str(caught.value)
+
+
+def test_find_story_by_exact_id_returns_the_story_and_its_milestone():
+    found = find_story([TREE], ID(2))
+    assert isinstance(found, StoryMatch)
+    assert found.story.id == ID(2)
+    assert found.milestone.id == ID(1)
+    assert found.story is TREE.children[0]
+    assert found.milestone is TREE
+
+
+def test_find_story_strips_the_id():
+    assert find_story([TREE], f"  {ID(3)} ").story.id == ID(3)
+
+
+def test_find_story_by_unique_title_piece():
+    assert find_story([TREE], "writer").story.id == ID(2)
+
+
+def test_find_story_matches_pieces_and_exact_titles_case_insensitively():
+    assert find_story([TREE], "DOCUMENT").story.id == ID(3)
+    assert find_story([TREE], "story: csv writer").story.id == ID(2)
+
+
+def test_find_story_under_the_second_root_returns_that_root():
+    found = find_story([TREE, second_milestone()], "reader")
+    assert found.story.id == ID(8)
+    assert found.milestone.id == ID(7)
+
+
+def test_find_story_ambiguous_piece_lists_the_matches():
+    assert refusal([TREE], "story") == (
+        'ambiguous story "story" — matches: Story: CSV writer, Story: Document it'
+    )
+
+
+def test_find_story_ambiguity_spans_milestones_in_board_order():
+    assert refusal([TREE, second_milestone()], "csv") == (
+        'ambiguous story "csv" — matches: Story: CSV writer, Story: CSV reader'
+    )
+
+
+def test_find_story_exact_title_wins_over_a_longer_title_containing_it():
+    roots = [
+        node(
+            1,
+            "Milestone 1: docs",
+            children=[node(2, "Docs, revisited"), node(3, "Docs")],
+        )
+    ]
+    assert find_story(roots, "docs").story.id == ID(3)
+
+
+def test_find_story_duplicate_exact_titles_are_ambiguous():
+    roots = [
+        node(1, "Milestone 1: a", children=[node(2, "Docs")]),
+        node(3, "Milestone 2: b", children=[node(4, "Docs")]),
+    ]
+    assert refusal(roots, "Docs") == 'ambiguous story "Docs" — matches: Docs, Docs'
+
+
+def test_find_story_no_match_lists_every_story():
+    assert refusal([TREE], "nonexistent") == (
+        f'no story card matching "nonexistent" — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_piece_matching_only_a_milestone_title_is_no_match():
+    assert refusal([TREE], "Milestone 12") == (
+        f'no story card matching "Milestone 12" — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_piece_matching_only_a_subtask_title_is_no_match():
+    assert refusal([TREE], "quoting") == (
+        f'no story card matching "quoting" — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_refuses_a_milestone_id():
+    assert refusal([TREE], ID(1)) == (
+        f'card "{ID(1)}" is a milestone, not a story — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_refuses_a_subtask_id():
+    assert refusal([TREE], ID(5)) == (
+        f'card "{ID(5)}" is a subtask, not a story — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_with_no_roots_lists_none():
+    expected = 'no story card matching "x" — stories are: (none)'
+    assert refusal([], "x") == expected
+    assert refusal(None, "x") == expected
+
+
+def test_find_story_milestone_without_stories_lists_none():
+    assert refusal([node(9, "Milestone 9: empty")], ID(9)) == (
+        f'card "{ID(9)}" is a milestone, not a story — stories are: (none)'
+    )
+
+
+def test_find_story_numeric_needle_does_not_resolve_via_a_longer_digit_run():
+    both = [node(1, "M", children=[node(2, "Story 12: rows"), node(3, "Story 2: cols")])]
+    assert find_story(both, "2").story.id == ID(3)
+    only_twelve = [node(1, "M", children=[node(2, "Story 12: rows")])]
+    assert refusal(only_twelve, "2") == (
+        'no story card matching "2" — stories are: Story 12: rows'
+    )
+
+
+def test_find_story_int_needle_behaves_as_its_string():
+    both = [node(1, "M", children=[node(2, "Story 12: rows"), node(3, "Story 2: cols")])]
+    assert find_story(both, 2).story.id == ID(3)
+    only_twelve = [node(1, "M", children=[node(2, "Story 12: rows")])]
+    assert refusal(only_twelve, 2) == (
+        'no story card matching "2" — stories are: Story 12: rows'
+    )
+
+
+def test_story_not_found_error_is_handled_by_the_cli():
+    assert issubclass(StoryNotFoundError, ValueError)
+    assert isinstance(StoryNotFoundError("x"), cli.HANDLED)
+
+
+def test_story_blocked_error_is_handled_by_the_cli_and_names_its_blockers():
+    error = StoryBlockedError(
+        "s-id", "Story S: cols", [("a-id", "Story A: rows"), ("b-id", "Story B: cells")]
+    )
+
+    assert issubclass(StoryBlockedError, ValueError)
+    assert isinstance(error, cli.HANDLED)
+    assert error.story_id == "s-id"
+    assert error.blockers == ("a-id", "b-id")
+    assert str(error) == (
+        'story "Story S: cols" (s-id) is blocked by "Story A: rows" (a-id),'
+        ' "Story B: cells" (b-id) — run them first, or run the milestone'
+    )
+
+
+# --- find_story: review focus -----------------------------------------------
+
+
+def test_find_story_blank_needle_resolves_one_story_and_is_ambiguous_for_two():
+    single = [node(1, "M", children=[node(2, "Only story")])]
+    assert find_story(single, "   ").story.id == ID(2)
+    assert refusal([TREE], "") == f'ambiguous story "" — matches: {TREE_STORIES}'
+
+
+def test_find_story_refuses_a_subtask_id_at_any_depth():
+    roots = [
+        node(
+            1,
+            "M",
+            children=[
+                node(2, "S", children=[node(3, "T", children=[node(4, "deep")])])
+            ],
+        )
+    ]
+    assert refusal(roots, ID(4)) == (
+        f'card "{ID(4)}" is a subtask, not a story — stories are: S'
+    )
+
+
+def test_find_story_ignores_card_status():
+    roots = [
+        node(
+            1,
+            "M",
+            children=[
+                node(2, "Story: dropped", status="canceled"),
+                node(3, "Story: shipped", status="done"),
+            ],
+        )
+    ]
+    assert find_story(roots, "dropped").story.id == ID(2)
+    assert find_story(roots, ID(3)).story.id == ID(3)
+    assert refusal(roots, "nope") == (
+        'no story card matching "nope" — stories are: Story: dropped, Story: shipped'
+    )
+
+
+def test_find_story_does_not_resolve_an_id_prefix():
+    prefix = ID(2)[:8]
+    assert refusal([TREE], prefix) == (
+        f'no story card matching "{prefix}" — stories are: {TREE_STORIES}'
+    )
+
+
+def test_find_story_resolves_a_story_even_when_the_needle_is_a_milestone_title():
+    roots = [node(1, "Docs", children=[node(2, "Docs update")])]
+    found = find_story(roots, "Docs")
+    assert found.story.id == ID(2)
+    assert found.milestone.id == ID(1)

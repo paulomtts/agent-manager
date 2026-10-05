@@ -46,7 +46,7 @@ from typer.testing import CliRunner
 
 from lockhelpers import _holder, _probe, _reap
 
-from agent_manager import bases, board, census, cli, comments, control, dag, detach, integration, locks, models, orchestrate, paths, runs
+from agent_manager import bases, board, census, cli, comments, control, dag, detach, errors, integration, locks, models, orchestrate, paths, runs
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
@@ -454,6 +454,65 @@ def test_milestone_claims_has_no_duplicates():
         f"card:{_plan_id(11)}",
         f"card:{_plan_id(12)}",
         "branch:m3-integrate",
+    ]
+
+
+def test_story_claims_lists_milestone_story_remaining_subtasks_then_their_branches():
+    """`card:M`, `card:<story>`, every remaining subtask's card in census
+    order, then one `branch:` key per remaining subtask, same order. A done
+    or out-of-play subtask adds neither key, and no integration branch is
+    claimed: a story run does not integrate."""
+    story = _plan_story(
+        1,
+        [
+            _plan_subtask(11, "done"),
+            _plan_subtask(12),
+            _plan_subtask(13, "canceled"),
+            _plan_subtask(14),
+        ],
+    )
+
+    keys = orchestrate.story_claims(_plan_id(99), story, "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+        f"card:{_plan_id(12)}",
+        f"card:{_plan_id(14)}",
+        f"branch:{_branch_of(story.subtasks[1])}",
+        f"branch:{_branch_of(story.subtasks[3])}",
+    ]
+    assert "branch:m3-integrate" not in keys
+
+
+def test_story_claims_of_a_closed_story_are_the_milestone_and_story_cards_only():
+    closed = _plan_story(1, [_plan_subtask(11), _plan_subtask(12)], status="done")
+    finished = _plan_story(2, [_plan_subtask(21, "done"), _plan_subtask(22, "merged")])
+
+    assert orchestrate.story_claims(_plan_id(99), closed, "m3") == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+    ]
+    assert orchestrate.story_claims(_plan_id(99), finished, "m3") == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(2)}",
+    ]
+
+
+def test_story_claims_has_no_duplicates():
+    """A subtask listed twice is claimed once, card and branch, at its first place."""
+    shared = _plan_subtask(11)
+    story = _plan_story(1, [shared, _plan_subtask(12), shared])
+
+    keys = orchestrate.story_claims(_plan_id(99), story, "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+        f"card:{_plan_id(11)}",
+        f"card:{_plan_id(12)}",
+        f"branch:{_branch_of(shared)}",
+        f"branch:{_branch_of(story.subtasks[1])}",
     ]
 
 
@@ -8436,6 +8495,682 @@ def test_a_fresh_milestone_preflight_refreshes_git_once_after_every_refusal(
     assert _run_ids(root) == []
 
 
+# ── story pre-flight (card 371a79c9) ────────────────────────────────────────
+#
+# Unit tier, as the milestone pre-flight above: the FakeBoard answers every
+# board call, `orchestrate.refresh_git` is patched, and the done-blocker
+# branch lookup is the stubbed `orchestrate._local_branch_exists`.
+
+
+def _preflight_story(root: Path, story: str, **overrides: Any) -> Any:
+    kwargs: dict[str, Any] = {
+        "repo_dir": root,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "clock": lambda: STARTED_AT,
+    }
+    kwargs.update(overrides)
+    return orchestrate.preflight_story(story, **kwargs)
+
+
+def _seed_story(
+    fake: Any,
+    milestone: str,
+    title: str,
+    *,
+    subtasks: int = 1,
+    status: str = "todo",
+    subtask_status: str | None = None,
+    blocked_by: tuple[str, ...] | list[str] = (),
+) -> tuple[str, list[str]]:
+    """One story under `milestone` holding a `blocked_by` chain of subtasks.
+
+    Returns `(story id, subtask ids in chain order)`. Subtasks default to
+    `done` under a finished story, else `todo`.
+    """
+    if subtask_status is None:
+        subtask_status = "done" if census.is_finished(status) else "todo"
+    story = fake.add_card(title, parent_id=milestone, status=status, blocked_by=blocked_by)
+    chain: list[str] = []
+    for n in range(1, subtasks + 1):
+        chain.append(
+            fake.add_card(
+                f"{title} subtask {n}",
+                parent_id=story,
+                status=subtask_status,
+                blocked_by=chain[-1:],
+            )
+        )
+    return story, chain
+
+
+def _branches(monkeypatch, present: set[str] | frozenset[str] = frozenset()) -> list[str]:
+    """Stub `orchestrate._local_branch_exists`: only `present` exist locally.
+
+    Returns the list every branch the pre-flight asks about is appended to.
+    """
+    asked: list[str] = []
+
+    def factory(root: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            asked.append(branch)
+            return branch in present
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", factory)
+    return asked
+
+
+def _root_of(pre: Any, story_id: str) -> dag.RootPlan:
+    """`dag.story_root` of `story_id` over the pre-flight's restricted plan."""
+    by_id = {story.id: story for story in pre.plan.stories}
+    return dag.story_root(by_id[story_id], by_id, PREFIX, "main")
+
+
+def test_preflight_story_selects_a_story_by_exact_id_under_its_milestone(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols", subtasks=2)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    driver = FakeDriver()
+
+    pre = _preflight_story(root, story, driver=driver)
+
+    assert pre.root == root
+    assert pre.resumed is None
+    assert pre.milestone_card.id == milestone
+    assert pre.plan.milestone_title == "Milestone 3: orchestration"
+    assert pre.plan.stories[-1].id == story
+    assert pre.run_id == runs.mint_run_id(story, STARTED_AT)
+    assert pre.run_id.endswith(dag.short_id(story))
+    assert (pre.run_record.id, pre.run_record.status) == (pre.run_id, "started")
+    assert pre.run_record.workflow == orchestrate.MILESTONE_WORKFLOW
+    assert pre.run_record.started_at == STARTED_AT
+    assert pre.run_record.repo_dir == root
+    assert pre.run_record.milestone_id == milestone
+    assert pre.run_record.config.story_id == story
+    assert pre.run_record.config.max_concurrent_stories == 1
+    assert (pre.run_record.base_branch, pre.run_record.branch_prefix) == ("main", PREFIX)
+    assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
+    assert pre.drive is driver
+    assert driver.calls == []
+
+
+def test_preflight_story_selects_a_story_by_title_piece_with_the_default_driver(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, "cols")
+
+    assert pre.plan.stories[-1].id == story
+    assert pre.run_record.config.story_id == story
+    assert pre.drive is cli.drive_subtask_async
+
+
+@pytest.mark.parametrize(
+    ("needle", "message"),
+    [
+        ("ambiguous", "ambiguous story"),
+        ("milestone", "is a milestone, not a story"),
+        ("subtask", "is a subtask, not a story"),
+    ],
+)
+def test_preflight_story_refuses_a_needle_that_is_not_one_story_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board, needle, message
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    _story, (subtask,) = _seed_story(fake_board, milestone, "Story B: cols")
+    typed = {"ambiguous": "Story", "milestone": milestone, "subtask": subtask}[needle]
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryNotFoundError, match=message):
+        _preflight_story(root, typed)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_story_refuses_a_blocker_cycle_elsewhere_in_the_milestone_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board
+):
+    """As for a milestone run, the whole milestone is cycle-checked, even when
+    the selected story is outside the cycle; the census is patched as in
+    test_preflight_milestone_refuses_a_blocker_cycle_before_refreshing_git."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols")
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    selected = census.StoryPlan(
+        story, "Story S: cols", "todo", [], [census.SubtaskPlan(s1, "Story S: cols subtask 1", "todo")]
+    )
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b, selected]),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(dag.DependencyCycleError):
+        _preflight_story(root, story)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_story_restricts_the_plan_levels_and_tips_to_the_selected_story(
+    tmp_path, monkeypatch, fake_board
+):
+    """Unrelated sibling stories stay out of the plan, the waves and the tips."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    story, (s1, s2) = _seed_story(fake_board, milestone, "Story B: cols", subtasks=2)
+    _seed_story(fake_board, milestone, "Story C: cells")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert [[planned.story.id for planned in level] for level in pre.levels] == [[story]]
+    assert [subtask.id for subtask in pre.levels[0][0].remaining] == [s1, s2]
+    assert pre.tips == [{"story": story, "tip": _branch(root, s2)}]
+
+
+def test_preflight_story_roots_a_story_with_no_blockers_on_the_base_branch(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, (s1, s2) = _seed_story(fake_board, milestone, "Story A: rows", subtasks=2)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert pre.levels[0][0].bases[s1] == "main"
+    assert pre.levels[0][0].bases[s2] == _branch(root, s1)
+
+
+@pytest.mark.parametrize(
+    ("status", "subtask_status"),
+    [("done", "done"), ("merged", "merged"), ("todo", "done")],
+)
+def test_preflight_story_returns_nothing_to_run_for_a_finished_story(
+    tmp_path, monkeypatch, fake_board, status, subtask_status
+):
+    """A finished story, or one whose subtasks are all done, is not an error:
+    the pre-flight returns with no wave to run."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2,
+        status=status, subtask_status=subtask_status,
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert pre.levels == []
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert pre.keys == [f"card:{milestone}", f"card:{story}"]
+
+
+@pytest.mark.parametrize("status", ["canceled", "archived"])
+def test_preflight_story_returns_an_empty_plan_for_an_out_of_play_story(
+    tmp_path, monkeypatch, fake_board, status
+):
+    """The census drops an out-of-play story, so there is nothing to run, and
+    the run still claims the milestone and story cards."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story A: rows", status=status)
+    _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert pre.plan.stories == []
+    assert pre.levels == []
+    assert pre.tips == []
+    assert pre.keys == [f"card:{milestone}", f"card:{story}"]
+    assert pre.run_record.config.story_id == story
+
+
+def test_preflight_story_claims_are_story_claims_and_never_the_integration_branch(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, (s1, s2) = _seed_story(fake_board, milestone, "Story A: rows", subtasks=2)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert pre.keys == orchestrate.story_claims(milestone, pre.plan.stories[-1], PREFIX)
+    assert pre.keys == [
+        f"card:{milestone}",
+        f"card:{story}",
+        f"card:{s1}",
+        f"card:{s2}",
+        f"branch:{_branch(root, s1)}",
+        f"branch:{_branch(root, s2)}",
+    ]
+    assert f"branch:{INTEGRATION_BRANCH}" not in pre.keys
+
+
+@pytest.mark.parametrize("claimed", ["milestone", "subtask", "branch"])
+def test_preflight_story_is_refused_while_a_live_run_claims_one_of_its_keys(
+    tmp_path, monkeypatch, fake_board, claimed
+):
+    """`milestone` is a milestone run of the parent; `subtask` and `branch`
+    are a card run on one of the story's subtasks. Refused before git is
+    refreshed and before any store or run directory exists."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story A: rows")
+    key = {
+        "milestone": f"card:{milestone}",
+        "subtask": f"card:{s1}",
+        "branch": f"branch:{_branch(root, s1)}",
+    }[claimed]
+    _plant_lease(
+        root,
+        run_id=OTHER_RUN_ID,
+        token="other-life",
+        pid=os.getpid(),
+        heartbeat_at=datetime.now(timezone.utc),
+        claims=(key,),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(cli.ClaimedError) as caught:
+        _preflight_story(root, story)
+
+    assert (caught.value.key, caught.value.run_id) == (key, OTHER_RUN_ID)
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
+    assert _claim_rows(root) == [(key, OTHER_RUN_ID, "other-life")]
+
+
+def test_a_story_preflight_refreshes_git_once_after_every_refusal(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story A: rows", subtasks=2)
+    events: list[str] = []
+    real_refuse = cli.refuse_claimed
+
+    def refuse(at: Path, keys: Any, *, run_id: str | None = None) -> None:
+        events.append("refuse_claimed")
+        real_refuse(at, keys, run_id=run_id)
+
+    monkeypatch.setattr(cli, "refuse_claimed", refuse)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: events.append(f"refresh_git:{at}"))
+
+    pre = _preflight_story(root, story)
+
+    assert events == ["refuse_claimed", f"refresh_git:{root}"]
+    assert pre.run_record.config.story_id == story
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
+
+
+def test_preflight_story_roots_on_a_done_blockers_tip_when_its_branch_exists(
+    tmp_path, monkeypatch, fake_board
+):
+    """The blocker is carried in the plan, with its own edges cut, so
+    `dag.story_root` can read its tip; it is finished, so it gets no wave.
+    Only the selected story's direct blockers are looked up."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    earlier, _ = _seed_story(fake_board, milestone, "Story E: earlier", status="done")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done", blocked_by=[earlier]
+    )
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    tip = _branch(root, b2)
+    asked = _branches(monkeypatch, {tip})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert _root_of(pre, story) == dag.RootPlan("tip", tip, (blocker,))
+    assert [[planned.story.id for planned in level] for level in pre.levels] == [[story]]
+    assert pre.levels[0][0].bases[s1] == tip
+    assert pre.tips == [{"story": story, "tip": _branch(root, s1)}]
+    assert pre.keys == [f"card:{milestone}", f"card:{story}", f"card:{s1}", f"branch:{_branch(root, s1)}"]
+    assert asked == [tip]
+
+
+def test_preflight_story_roots_on_a_merged_base_for_two_done_blockers_with_tips(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, (a1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    b, (b1,) = _seed_story(fake_board, milestone, "Story B: cells", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[b, a])
+    _branches(monkeypatch, {_branch(root, a1), _branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [a, b, story]
+    selected = pre.plan.stories[-1]
+    assert selected.blocked_by == [a, b]
+    merged = dag.base_branch_name(PREFIX, selected)
+    assert _root_of(pre, story) == dag.RootPlan("merged", merged, (a, b))
+    assert pre.levels[0][0].bases[s1] == merged
+
+
+def test_preflight_story_drops_a_done_blocker_whose_tip_branch_is_absent(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert pre.levels[0][0].bases[s1] == "main"
+    assert asked == [_branch(root, b1)]
+
+
+def test_preflight_story_drops_a_merged_blocker_without_a_branch_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="merged")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+def test_preflight_story_counts_only_kept_blockers_toward_a_merged_base(
+    tmp_path, monkeypatch, fake_board
+):
+    """Two done blockers, one tip present: a dropped blocker does not count
+    toward "two or more", so the story roots on the kept one's tip."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, (a1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    b, (b1,) = _seed_story(fake_board, milestone, "Story B: cells", status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[a, b])
+    asked = _branches(monkeypatch, {_branch(root, a1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [a, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, a1), (a,))
+    assert asked == [_branch(root, a1), _branch(root, b1)]
+
+
+def test_preflight_story_ignores_an_out_of_play_blocker(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="canceled")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+@pytest.mark.parametrize("status", ["todo", "started"])
+def test_preflight_story_refuses_a_story_with_an_open_blocker_before_anything_is_written(
+    tmp_path, monkeypatch, fake_board, status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status=status)
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    monkeypatch.setattr(
+        cli,
+        "refuse_claimed",
+        lambda *args, **kwargs: pytest.fail("claims checked before the blocker refusal"),
+    )
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.story_id == story
+    assert caught.value.blockers == (blocker,)
+    assert f'"Story A: rows" ({blocker})' in str(caught.value)
+    assert str(caught.value).endswith("run them first, or run the milestone")
+    assert asked == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == []
+
+
+def test_preflight_story_refuses_a_blocker_brd_reports_as_blocked(
+    tmp_path, monkeypatch, fake_board
+):
+    """brd derives `blocked` for a todo story with an unfinished blocker; the
+    census reads it as `todo`, so it is open. Only the direct blocker is named."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    first, _ = _seed_story(fake_board, milestone, "Story Z: first")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", blocked_by=[first])
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    assert board.show(blocker, repo_dir=root).status == "blocked"
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.blockers == (blocker,)
+    assert _run_dirs() == []
+
+
+def test_preflight_story_names_every_open_blocker_and_looks_up_no_branch(
+    tmp_path, monkeypatch, fake_board
+):
+    """Two open blockers are both named, in census order; a done blocker
+    beside them is never looked up, because the open check runs first."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, _ = _seed_story(fake_board, milestone, "Story A: rows", status="started")
+    done, _ = _seed_story(fake_board, milestone, "Story D: done", status="done")
+    b, _ = _seed_story(fake_board, milestone, "Story B: cells")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[b, done, a])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.blockers == (a, b)
+    assert f'"Story A: rows" ({a})' in str(caught.value)
+    assert f'"Story B: cells" ({b})' in str(caught.value)
+    assert asked == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == []
+
+
+def test_preflight_story_ignores_a_blocker_outside_the_milestone(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    other = fake_board.add_card("Milestone 4: later")
+    outside, _ = _seed_story(fake_board, other, "Story X: elsewhere")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[outside])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    ("status", "subtask_status"), [("done", "done"), ("todo", "done")]
+)
+def test_preflight_story_with_nothing_to_run_is_not_refused_for_an_open_blocker(
+    tmp_path, monkeypatch, fake_board, status, subtask_status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows")
+    story, _ = _seed_story(
+        fake_board, milestone, "Story S: cols",
+        status=status, subtask_status=subtask_status, blocked_by=[blocker],
+    )
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert pre.levels == []
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert asked == []
+
+
+# Review focus (see the plan's Review Focus section).
+
+
+def test_preflight_story_counts_a_blocker_listed_twice_once(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, _ = _seed_story(
+        fake_board, milestone, "Story S: cols", blocked_by=[blocker, blocker]
+    )
+    _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [blocker, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, b1), (blocker,))
+
+
+def test_preflight_story_reads_blocker_statuses_case_insensitively(
+    tmp_path, monkeypatch, fake_board
+):
+    """`Done` with its tip present is kept; `MERGED` is dropped unasked."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    done, (d1,) = _seed_story(
+        fake_board, milestone, "Story A: rows", status="Done", subtask_status="done"
+    )
+    merged, (m1,) = _seed_story(
+        fake_board, milestone, "Story B: cells", status="MERGED", subtask_status="merged"
+    )
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[done, merged])
+    asked = _branches(monkeypatch, {_branch(root, d1), _branch(root, m1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [done, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, d1), (done,))
+    assert asked == [_branch(root, d1)]
+
+
+def test_preflight_story_drops_a_done_blocker_with_no_subtasks_without_a_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", subtasks=0, status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+def test_preflight_story_propagates_a_git_error_from_the_done_rule_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    """A broken repository is a refusal, never a silent base-branch root."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+
+    def broken(at: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            raise worktree.GitError(
+                "fatal: not a git repository", argv=["rev-parse"], exit_code=128
+            )
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", broken)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(worktree.GitError):
+        _preflight_story(root, story)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_story_judges_only_direct_blockers(tmp_path, monkeypatch, fake_board):
+    """A done blocker that is itself blocked by an open story still roots the
+    story on its tip: only the selected story's own blockers are judged."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    first, _ = _seed_story(fake_board, milestone, "Story Z: first")
+    blocker, (b1,) = _seed_story(
+        fake_board, milestone, "Story A: rows", status="done", blocked_by=[first]
+    )
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, b1), (blocker,))
+
+
 def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
 
@@ -9185,3 +9920,676 @@ def test_detach_board_refuses_a_log_that_already_exists_and_forks_nothing(board_
     assert existing.read_text(encoding="utf-8") == "an earlier board run\n"
     assert not (_boards() / f"{stem}{detach.BOARD_REPORT_SUFFIX}").exists()
     assert board_seams.runs.calls == []
+
+
+# ── run_story: one story through the milestone engine, no Integrate ─────────
+
+
+def _run_story(project: Path, story: str, driver: Any, **overrides: Any) -> dict[str, Any]:
+    """`run_story` on `story` from `main` under `PREFIX`, at `STARTED_AT`."""
+    kwargs: dict[str, Any] = {
+        "repo_dir": project,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "driver": driver,
+        "clock": lambda: STARTED_AT,
+    }
+    kwargs.update(overrides)
+    return orchestrate.run_story(story, **kwargs)
+
+
+def test_run_story_propagates_a_preflight_refusal_with_nothing_written(
+    tmp_path, monkeypatch, fake_board
+):
+    """`run_story` adds no side effect ahead of `preflight_story`."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    driver = FakeDriver()
+
+    with pytest.raises(errors.StoryBlockedError):
+        orchestrate.run_story(
+            story, repo_dir=root, base_branch="main", branch_prefix=PREFIX, driver=driver
+        )
+
+    assert driver.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
+
+
+@pytest.mark.git
+def test_run_story_drives_only_the_selected_storys_subtasks_in_order(project):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert [call["parent"] for call in driver.calls] == [story_a, story_a]
+    assert [call["base"] for call in driver.calls] == ["main", _branch(project, a1)]
+    assert board.show(story_b, repo_dir=project).status == "todo"
+    assert board.show(b1, repo_dir=project).status == "todo"
+
+
+@pytest.mark.git
+def test_a_story_run_never_calls_integrate(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+
+    result = _run_story(project, shape["stories"]["A"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert INTEGRATION_BRANCH not in _local_branches(project)
+
+
+@pytest.mark.git
+def test_a_story_run_with_the_real_integrate_leaves_no_integration_branch(
+    project, real_integrate
+):
+    """Real branches and the real Integrate: a milestone run here would make
+    `m3-integrate`; a story run ends on its story's tip and makes none."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    root = cli.resolve_repo_dir(project)
+
+    result = _run_story(
+        project, shape["stories"]["A"], BranchingDriver(), runner_factory=_no_resolver
+    )
+
+    assert result["done"] is True, result
+    branches = _local_branches(project)
+    assert _branch(project, a1) in branches
+    assert _branch(project, a2) in branches
+    assert INTEGRATION_BRANCH not in branches
+    assert not cli.worktree_for(root, INTEGRATION_BRANCH).exists()
+
+
+@pytest.mark.git
+def test_a_story_runs_report_and_record_are_a_milestone_runs_without_integrate(project):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+
+    result = _run_story(project, story_a, FakeDriver(), control_interval=0)
+
+    assert result == {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": [story_a]}],
+        "completed": [a1, a2],
+        "tips": [{"story": story_a, "tip": _branch(project, a2)}],
+        "warnings": [],
+    }
+    run = _load(project, run_id)
+    assert run.workflow == "milestone"
+    assert run.milestone_id == shape["milestone"]
+    assert run.config == models.RunConfig(max_concurrent_stories=1, story_id=story_a)
+    assert _statuses(run) == {"run": "done", story_a: "done", a1: "done", a2: "done"}
+    assert _lease(project, run_id) is None
+    assert _claim_rows(project) == []
+
+
+@pytest.mark.git
+def test_a_finished_story_runs_nothing_and_is_recorded_done(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    for card in shape["subtasks"]["A"]:
+        board.set_status(card, "done", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert (result["completed"], result["levels"]) == ([], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, result["run_id"]).status == "done"
+
+
+@pytest.mark.git
+def test_an_out_of_play_story_runs_nothing_and_is_recorded_done(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    board.set_status(story_a, "canceled", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert (result["completed"], result["levels"], result["tips"]) == ([], [], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    run = _load(project, result["run_id"])
+    assert run.status == "done"
+    assert run.config.story_id == story_a
+
+
+@pytest.mark.git
+def test_a_story_run_on_a_done_blocker_names_only_its_own_story_in_levels_and_tips(
+    project, integrate_recorder
+):
+    """A is carried in the plan only so B roots on A's tip; the report and
+    the drive name B alone."""
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    for card in (a1, a2, story_a):
+        board.set_status(card, "done", repo_dir=project)
+    _git(project, "branch", _branch(project, a2), "main")
+    driver = FakeDriver()
+
+    result = _run_story(project, story_b, driver)
+
+    assert [call["card"] for call in driver.calls] == [b1]
+    assert driver.calls[0]["base"] == _branch(project, a2)
+    assert result["levels"] == [{"level": 0, "stories": [story_b]}]
+    assert result["tips"] == [{"story": story_b, "tip": _branch(project, b1)}]
+    assert result["completed"] == [b1]
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+
+
+@pytest.mark.git
+def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resumable(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    result = _run_story(project, story_a, driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+    }
+    assert integrate_recorder.calls == []
+    with pytest.raises(runs.NotResumableError, match="cancelled"):
+        _resume(project, run_id, FakeDriver())
+
+
+# ── resuming a story run restores the story ─────────────────────────────────
+# Unit tests here run the resume pre-flight over `_resume_root` and the
+# FakeBoard, with `refresh_git` failing if called and the done-blocker branch
+# lookup stubbed by `_branches`; the git tests drive the engine.
+
+
+def _record_story_run(
+    root: Path, milestone: str, story: str, *, status: str = "escalated"
+) -> None:
+    """A story run of `story` under `milestone`, recorded as `preflight_story` records one."""
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_run(
+            models.Run(
+                id=RESUME_RUN_ID,
+                workflow="milestone",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status=status,
+                config=models.RunConfig(max_concurrent_stories=1, story_id=story),
+                milestone_id=milestone,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _resume_preflight(root: Path) -> Any:
+    """`preflight_milestone` resuming `RESUME_RUN_ID`, as `am resume` reaches it."""
+    return orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+
+
+def test_a_resumed_story_run_cuts_its_plan_to_the_recorded_story(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done"
+    )
+    story, (s1, s2) = _seed_story(
+        fake_board, milestone, "Story S: cols", subtasks=2, blocked_by=[blocker]
+    )
+    _seed_story(fake_board, milestone, "Story T: other")
+    tip = _branch(root, b2)
+    _branches(monkeypatch, {tip})
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_story_run(root, milestone, story)
+
+    pre = _resume_preflight(root)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert [[planned.story.id for planned in level] for level in pre.levels] == [[story]]
+    assert pre.levels[0][0].bases[s1] == tip
+    assert pre.tips == [{"story": story, "tip": _branch(root, s2)}]
+    assert pre.keys == orchestrate.story_claims(milestone, pre.plan.stories[-1], PREFIX)
+    assert f"branch:{INTEGRATION_BRANCH}" not in pre.keys
+    assert pre.run_id == RESUME_RUN_ID
+    assert pre.resumed is not None
+    assert pre.run_record.config.story_id == story
+    assert (pre.run_record.status, pre.run_record.milestone_id) == ("started", milestone)
+    assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
+
+
+def test_a_resumed_story_run_roots_on_the_base_when_its_blockers_tip_is_gone(
+    tmp_path, monkeypatch, fake_board
+):
+    """The done blocker's tip branch was deleted after the first run: the
+    blocker is dropped and the story roots on `main`, not on a missing branch."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_story_run(root, milestone, story)
+
+    pre = _resume_preflight(root)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert pre.levels[0][0].bases[s1] == "main"
+
+
+def test_a_resumed_milestone_run_without_a_story_keeps_the_whole_milestone_plan(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone, story, subtask = _seam_resume_board(fake_board)
+    other, (o1,) = _seed_story(fake_board, milestone, "Story O: other")
+    _record_resume_run(root)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    def no_story_plan(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a milestone run's resume took the story path")
+
+    monkeypatch.setattr(orchestrate, "_story_plan", no_story_plan)
+
+    pre = _resume_preflight(root)
+
+    assert {planned.id for planned in pre.plan.stories} == {story, other}
+    assert sorted(pre.keys) == _expected_claims(milestone, [subtask, o1])
+    assert pre.run_record.config.story_id is None
+
+
+@pytest.mark.parametrize("where", ["deleted", "reparented"])
+def test_a_resumed_story_run_whose_story_left_the_milestone_is_not_resumable(
+    tmp_path, monkeypatch, fake_board, where
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    elsewhere = fake_board.add_card("Milestone 4: elsewhere")
+    moved, _ = _seed_story(fake_board, elsewhere, "Story M: moved")
+    story = {"deleted": "00000000-0000-4000-8000-00000000dead", "reparented": moved}[where]
+    _record_story_run(root, milestone, story)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    before = _runs_tree()
+
+    with pytest.raises(runs.NotResumableError) as caught:
+        _resume_preflight(root)
+
+    assert RESUME_RUN_ID in str(caught.value)
+    assert story in str(caught.value)
+    assert _runs_tree() == before
+    assert _load(root, RESUME_RUN_ID).status == "escalated"
+
+
+def test_a_resumed_story_run_whose_blocker_was_reopened_is_refused_before_git(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="started")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _record_story_run(root, milestone, story)
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _resume_preflight(root)
+
+    assert caught.value.story_id == story
+    assert caught.value.blockers == (blocker,)
+    assert asked == []
+
+
+@pytest.mark.git
+def test_am_resume_of_an_escalated_story_run_finishes_only_that_story(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    first = _run_story(project, story_a, FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    driver = FakeDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["levels"] == [{"level": 0, "stories": [story_a]}]
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    run = _load(project, run_id)
+    assert run.status == "done"
+    assert run.config.story_id == story_a
+    assert run.milestone_id == shape["milestone"]
+
+
+@pytest.mark.git
+def test_a_paused_story_run_parks_and_its_resume_finishes_only_that_story(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+    gated = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    paused = _run_story(project, story_a, gated, control_interval=0)
+
+    assert paused == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _load(project, run_id).status == "stopped"
+    driver = FakeDriver()
+
+    result = _resume(project, run_id, driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, run_id).status == "done"
+
+
+@pytest.mark.git
+def test_resuming_a_story_run_whose_escalated_subtask_was_finished_by_hand_is_a_no_op(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run_story(project, story_a, FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    board.set_status(a1, "done", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _resume(project, first["run_id"], driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert (result["completed"], result["levels"]) == ([], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, first["run_id"]).status == "done"
+
+
+# ── story_census: the story cut a run and a dry run share ───────────────────
+
+
+def _story_census(root: Path, story: str) -> census.Census:
+    """`orchestrate.story_census` over the FakeBoard's milestone holding `story`."""
+    match = census.find_story(board.roots(repo_dir=root), story)
+    return orchestrate.story_census(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        branch_prefix=PREFIX,
+    )
+
+
+def test_story_census_is_the_preflight_storys_plan_on_a_done_blockers_tip(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done"
+    )
+    _seed_story(fake_board, milestone, "Story C: cells")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch, {_branch(root, b2)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    cut = _story_census(root, story)
+    pre = _preflight_story(root, story)
+
+    assert cut.milestone_title == "Milestone 3: orchestration"
+    assert [(planned.id, planned.blocked_by) for planned in cut.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert cut.stories == pre.plan.stories
+    assert cut.milestone_title == pre.plan.milestone_title
+
+
+@pytest.mark.parametrize("status", ["canceled", "archived"])
+def test_story_census_of_an_out_of_play_story_is_empty_as_the_preflights_plan(
+    tmp_path, monkeypatch, fake_board, status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story A: rows", status=status)
+    _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    cut = _story_census(root, story)
+
+    assert cut.stories == []
+    assert cut.stories == _preflight_story(root, story).plan.stories
+
+
+# ── detach_story: a story run handed to a detached child ────────────────────
+
+
+def test_the_detached_story_child_drives_only_the_story_and_reports_no_integrate(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1})
+    (a1,) = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    fake = _FakeDetacher()
+    driver = FakeDriver()
+
+    data = orchestrate.detach_story(
+        story,
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix=PREFIX,
+        detacher=fake,
+        allow_no_verification=True,
+        driver=driver,
+        clock=lambda: STARTED_AT,
+        control_interval=0.01,
+    )
+
+    run_id = data["run_id"]
+    assert run_id == runs.mint_run_id(story, STARTED_AT)
+    log = paths.run_dir(run_id) / detach.RUN_LOG_NAME
+    assert data == {"run_id": run_id, "pid": FAKE_CHILD_PID, "log": str(log), "detached": True}
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert driver.calls == []
+    assert _load(root, run_id).config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story
+    )
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+
+    fake.body()
+
+    report = paths.run_dir(run_id) / detach.REPORT_NAME
+    assert stat.S_IMODE(os.stat(report).st_mode) == 0o600
+    expected = {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": [story]}],
+        "completed": [a1],
+        "tips": [{"story": story, "tip": _branch(root, a1)}],
+        "warnings": [],
+    }
+    assert json.loads(report.read_text(encoding="utf-8")) == json.loads(
+        cli.render(cli.ok_envelope(expected))
+    )
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert integrate_recorder.calls == []
+    assert _load(root, run_id).status == "done"
+    assert closes == [(0, 0)]
+    assert _lease(root, run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_detach_story_refuses_an_open_blocker_before_any_fork_or_write(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+
+    with pytest.raises(errors.StoryBlockedError):
+        orchestrate.detach_story(
+            shape["stories"]["B"],
+            repo_dir=root,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            detacher=fake,
+            driver=FakeDriver(),
+        )
+
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
+
+
+# ── am run --story --detach through the CLI ─────────────────────────────────
+
+
+def _story_run_args(root: Path, needle: str, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--story",
+        needle,
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        PREFIX,
+        "--allow-no-verification",
+        *extra,
+    ]
+
+
+def test_a_detached_story_run_records_and_leases_the_plan_and_drives_nothing_here(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    refreshed: list[Path] = []
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: refreshed.append(at))
+    monkeypatch.setattr(cli, "drive_subtask_async", _forbidden("drive_subtask_async"))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = detach_runner.invoke(cli.app, _story_run_args(root, story, "--detach"))
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}
+    assert (data["pid"], data["detached"]) == (FAKE_CHILD_PID, True)
+    run_id = data["run_id"]
+    assert run_id.endswith(dag.short_id(story))
+    assert _run_ids(root) == [run_id]
+    run = _load(root, run_id)
+    assert run.milestone_id == shape["milestone"]
+    assert run.config == models.RunConfig(max_concurrent_stories=1, story_id=story)
+    assert _statuses(run) == {"run": "started", story: "pending", a1: "pending", a2: "pending"}
+    lease = _lease(root, run_id)
+    assert lease is not None and lease.pid == FAKE_CHILD_PID
+    assert _held_keys(root, run_id) == sorted(
+        [
+            f"card:{shape['milestone']}",
+            f"card:{story}",
+            f"card:{a1}",
+            f"card:{a2}",
+            f"branch:{_branch(root, a1)}",
+            f"branch:{_branch(root, a2)}",
+        ]
+    )
+    log = Path(data["log"])
+    assert log == paths.run_dir(run_id) / detach.RUN_LOG_NAME
+    assert stat.S_IMODE(os.stat(log).st_mode) == 0o600
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert refreshed == [root]
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [("blocked", "StoryBlockedError"), ("ambiguous", "StoryNotFoundError")],
+)
+def test_a_refused_detached_story_run_forks_nothing(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    needle = {"blocked": shape["stories"]["B"], "ambiguous": "Story"}[case]
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = detach_runner.invoke(cli.app, _story_run_args(root, needle, "--detach"))
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == error_type
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
