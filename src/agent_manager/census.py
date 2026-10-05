@@ -34,6 +34,7 @@ This module is pure: no I/O, no subprocesses, no ``brd``. It imports
 import re
 from dataclasses import dataclass
 
+from agent_manager.errors import StoryNotFoundError
 from agent_manager.models import CardNode
 
 _NUMERIC = re.compile(r"[0-9]+")
@@ -135,6 +136,69 @@ def find_milestone(roots: list[CardNode] | None, needle: str | int) -> CardNode:
     raise MilestoneNotFoundError(
         f'ambiguous milestone "{wanted}" — matches: {listed}'
     )
+
+
+@dataclass(frozen=True)
+class StoryMatch:
+    """A story card and the root card it sits under."""
+
+    milestone: CardNode
+    story: CardNode
+
+
+def _has_id(cards: list[CardNode], card_id: str) -> bool:
+    """Whether `card_id` is the id of any card in `cards` or nested under them."""
+    return any(
+        card.id == card_id or _has_id(card.children, card_id) for card in cards
+    )
+
+
+def find_story(roots: list[CardNode] | None, needle: str | int) -> StoryMatch:
+    """The one story `needle` names, with its root: exact id, exact title, or one substring.
+
+    A story is a child of a root card; candidates are every story in board
+    order, whatever its status. An exact story id wins. The exact id of a root
+    card or of a card below a story is refused as not a story. Then exactly
+    one case-insensitive exact title wins, even when it is also a substring of
+    another story's title; two or more are ambiguous. Only then is a substring
+    tried, and it must match exactly one story. Root and subtask titles never
+    match. Raises `StoryNotFoundError` naming the candidates.
+    """
+    wanted = str(needle).strip()
+    pool = list(roots or [])
+    stories = [StoryMatch(root, story) for root in pool for story in root.children]
+    listed = ", ".join(match.story.title for match in stories) or "(none)"
+
+    for match in stories:
+        if match.story.id == wanted:
+            return match
+
+    if any(root.id == wanted for root in pool):
+        raise StoryNotFoundError(
+            f'card "{wanted}" is a milestone, not a story — stories are: {listed}'
+        )
+    if any(_has_id(match.story.children, wanted) for match in stories):
+        raise StoryNotFoundError(
+            f'card "{wanted}" is a subtask, not a story — stories are: {listed}'
+        )
+
+    lowered = wanted.lower()
+    matches = [match for match in stories if match.story.title.lower() == lowered]
+    if not matches:
+        is_numeric = _NUMERIC.fullmatch(wanted) is not None
+        matches = [
+            match
+            for match in stories
+            if _substring_hit(match.story.title.lower(), lowered, is_numeric)
+        ]
+        if not matches:
+            raise StoryNotFoundError(
+                f'no story card matching "{wanted}" — stories are: {listed}'
+            )
+    if len(matches) == 1:
+        return matches[0]
+    titles = ", ".join(match.story.title for match in matches)
+    raise StoryNotFoundError(f'ambiguous story "{wanted}" — matches: {titles}')
 
 
 class CensusOrderError(ValueError):

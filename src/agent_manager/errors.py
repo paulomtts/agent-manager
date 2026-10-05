@@ -1,4 +1,4 @@
-"""`AgentPhaseFailed`: how an agent phase's terminal failure leaves the runner.
+"""The package's exception classes.
 
 `EngineError` lives in `agent_manager.runtime.errors`, importable without
 pygents.
@@ -37,3 +37,8 @@ class AgentPhaseFailed(RuntimeError):
         self.detail = detail
         self.result = result
         super().__init__(f"phase {phase!r} ended {outcome}: {detail}")
+
+
+class StoryNotFoundError(ValueError):
+    """No story card, or more than one, matches what the caller typed, or the
+    card it names is not a story."""
