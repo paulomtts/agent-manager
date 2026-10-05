@@ -9920,3 +9920,213 @@ def test_detach_board_refuses_a_log_that_already_exists_and_forks_nothing(board_
     assert existing.read_text(encoding="utf-8") == "an earlier board run\n"
     assert not (_boards() / f"{stem}{detach.BOARD_REPORT_SUFFIX}").exists()
     assert board_seams.runs.calls == []
+
+
+# ── run_story: one story through the milestone engine, no Integrate ─────────
+
+
+def _run_story(project: Path, story: str, driver: Any, **overrides: Any) -> dict[str, Any]:
+    """`run_story` on `story` from `main` under `PREFIX`, at `STARTED_AT`."""
+    kwargs: dict[str, Any] = {
+        "repo_dir": project,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "driver": driver,
+        "clock": lambda: STARTED_AT,
+    }
+    kwargs.update(overrides)
+    return orchestrate.run_story(story, **kwargs)
+
+
+def test_run_story_propagates_a_preflight_refusal_with_nothing_written(
+    tmp_path, monkeypatch, fake_board
+):
+    """`run_story` adds no side effect ahead of `preflight_story`."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    driver = FakeDriver()
+
+    with pytest.raises(errors.StoryBlockedError):
+        orchestrate.run_story(
+            story, repo_dir=root, base_branch="main", branch_prefix=PREFIX, driver=driver
+        )
+
+    assert driver.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []
+
+
+@pytest.mark.git
+def test_run_story_drives_only_the_selected_storys_subtasks_in_order(project):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert result["done"] is True, result
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert [call["parent"] for call in driver.calls] == [story_a, story_a]
+    assert [call["base"] for call in driver.calls] == ["main", _branch(project, a1)]
+    assert board.show(story_b, repo_dir=project).status == "todo"
+    assert board.show(b1, repo_dir=project).status == "todo"
+
+
+@pytest.mark.git
+def test_a_story_run_never_calls_integrate(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+
+    result = _run_story(project, shape["stories"]["A"], FakeDriver())
+
+    assert result["done"] is True, result
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert INTEGRATION_BRANCH not in _local_branches(project)
+
+
+@pytest.mark.git
+def test_a_story_run_with_the_real_integrate_leaves_no_integration_branch(
+    project, real_integrate
+):
+    """Real branches and the real Integrate: a milestone run here would make
+    `m3-integrate`; a story run ends on its story's tip and makes none."""
+    shape = _milestone(project, {"A": 2, "B": 1})
+    a1, a2 = shape["subtasks"]["A"]
+    root = cli.resolve_repo_dir(project)
+
+    result = _run_story(
+        project, shape["stories"]["A"], BranchingDriver(), runner_factory=_no_resolver
+    )
+
+    assert result["done"] is True, result
+    branches = _local_branches(project)
+    assert _branch(project, a1) in branches
+    assert _branch(project, a2) in branches
+    assert INTEGRATION_BRANCH not in branches
+    assert not cli.worktree_for(root, INTEGRATION_BRANCH).exists()
+
+
+@pytest.mark.git
+def test_a_story_runs_report_and_record_are_a_milestone_runs_without_integrate(project):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+
+    result = _run_story(project, story_a, FakeDriver(), control_interval=0)
+
+    assert result == {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": [story_a]}],
+        "completed": [a1, a2],
+        "tips": [{"story": story_a, "tip": _branch(project, a2)}],
+        "warnings": [],
+    }
+    run = _load(project, run_id)
+    assert run.workflow == "milestone"
+    assert run.milestone_id == shape["milestone"]
+    assert run.config == models.RunConfig(max_concurrent_stories=1, story_id=story_a)
+    assert _statuses(run) == {"run": "done", story_a: "done", a1: "done", a2: "done"}
+    assert _lease(project, run_id) is None
+    assert _claim_rows(project) == []
+
+
+@pytest.mark.git
+def test_a_finished_story_runs_nothing_and_is_recorded_done(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    for card in shape["subtasks"]["A"]:
+        board.set_status(card, "done", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert (result["completed"], result["levels"]) == ([], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, result["run_id"]).status == "done"
+
+
+@pytest.mark.git
+def test_an_out_of_play_story_runs_nothing_and_is_recorded_done(project, integrate_recorder):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    board.set_status(story_a, "canceled", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _run_story(project, story_a, driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert (result["completed"], result["levels"], result["tips"]) == ([], [], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    run = _load(project, result["run_id"])
+    assert run.status == "done"
+    assert run.config.story_id == story_a
+
+
+@pytest.mark.git
+def test_a_story_run_on_a_done_blocker_names_only_its_own_story_in_levels_and_tips(
+    project, integrate_recorder
+):
+    """A is carried in the plan only so B roots on A's tip; the report and
+    the drive name B alone."""
+    shape = _milestone(project, {"A": 2, "B": 1}, blocked_by={"B": ["A"]})
+    story_a, story_b = shape["stories"]["A"], shape["stories"]["B"]
+    a1, a2 = shape["subtasks"]["A"]
+    (b1,) = shape["subtasks"]["B"]
+    for card in (a1, a2, story_a):
+        board.set_status(card, "done", repo_dir=project)
+    _git(project, "branch", _branch(project, a2), "main")
+    driver = FakeDriver()
+
+    result = _run_story(project, story_b, driver)
+
+    assert [call["card"] for call in driver.calls] == [b1]
+    assert driver.calls[0]["base"] == _branch(project, a2)
+    assert result["levels"] == [{"level": 0, "stories": [story_b]}]
+    assert result["tips"] == [{"story": story_b, "tip": _branch(project, b1)}]
+    assert result["completed"] == [b1]
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+
+
+@pytest.mark.git
+def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resumable(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    result = _run_story(project, story_a, driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert result == {
+        "cancelled": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+    }
+    assert _statuses(_load(project, run_id)) == {
+        "run": "cancelled",
+        story_a: "stopped",
+        a1: "stopped",
+        a2: "pending",
+    }
+    assert integrate_recorder.calls == []
+    with pytest.raises(runs.NotResumableError, match="cancelled"):
+        _resume(project, run_id, FakeDriver())

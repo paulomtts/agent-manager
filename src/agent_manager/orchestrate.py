@@ -34,7 +34,9 @@ directory, no store, no fetch and no prune behind.
 `preflight_story` is the same stage 1 for one story of a milestone: it
 returns a `MilestonePreflight` whose plan holds only that story and the done
 blockers it stacks on, and refuses an open blocker (`errors.StoryBlockedError`)
-before the claims, so the existing engine runs it unchanged.
+before the claims. `run_story` runs it through the same engine, which skips
+Integrate for a story run; `preflight_milestone` cuts a resumed story run's
+plan the same way.
 
 The run helpers S1 moved out of the Typer module (`RunnerFactory`, the resume
 error types, `mint_run_id`, `resolve_repo_dir`, `worktree_for`,
@@ -1916,6 +1918,10 @@ async def run_milestone_engine(
     lane bound are `pre.drive` and `pre.max_concurrent` (a resume's bound is
     the recorded run's). The caller owns the store and the lease; a crash
     propagates.
+
+    A story run (`pre.run_record.config.story_id` set) never reaches
+    Integrate: once its lanes finished clean it is recorded `done` and its
+    report is the milestone `done` payload without `integrated`.
     """
     store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
     rows, checkpoints = recorded.rows, recorded.checkpoints
@@ -2036,6 +2042,27 @@ async def run_milestone_engine(
         # a parked subtask is resumed, not closed, so it gets no comment.
         return comment_run_end(report(controlled_payload(run_id, "pause", outcomes, warnings)))
 
+    def done_payload() -> dict[str, Any]:
+        """A clean run's report before Integrate's key: each wave, what this
+        invocation finished, and every planned story's tip."""
+        return {
+            "done": True,
+            "run_id": run_id,
+            "levels": [
+                {"level": index, "stories": [planned.story.id for planned in level]}
+                for index, level in enumerate(levels)
+            ],
+            "completed": completed,
+            "tips": tips,
+            "warnings": warnings,
+        }
+
+    if run_record.config.story_id is not None:
+        # A story run ends on its story's tip branch: there is no Integrate,
+        # so no `<prefix>-integrate` branch and no `integrated` key.
+        store.record_run(run_record.model_copy(update={"status": "done"}))
+        return comment_run_end(report(done_payload()))
+
     # Integrate (addendum I6) runs only once every lane finished clean,
     # and also when there was nothing left to drive: that is how a relaunch
     # retries an Integrate escalation, and why a finished milestone's
@@ -2071,20 +2098,7 @@ async def run_milestone_engine(
 
     store.record_run(run_record.model_copy(update={"status": "done"}))
     return comment_run_end(
-        report(
-            {
-                "done": True,
-                "run_id": run_id,
-                "levels": [
-                    {"level": index, "stories": [planned.story.id for planned in level]}
-                    for index, level in enumerate(levels)
-                ],
-                "completed": completed,
-                "tips": tips,
-                "warnings": warnings,
-                "integrated": integrated_payload(outcome),
-            }
-        )
+        report({**done_payload(), "integrated": integrated_payload(outcome)})
     )
 
 
@@ -2289,6 +2303,83 @@ async def _run_milestone_async(
             runner_factory=runner_factory,
             control_interval=control_interval,
             slots=slots,
+        )
+
+
+def run_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Drive every remaining subtask of one story through the milestone engine, and report.
+
+    `story` is a story card id or a title needle. Runs the three stages under
+    one `asyncio.run(_run_story_async(...))`: `preflight_story` (every refusal
+    -- `StoryNotFoundError`, `StoryBlockedError`, `DependencyCycleError`,
+    `ClaimedError` -- before any store, run directory or git refresh),
+    `recorded_milestone_run` and `run_milestone_engine`. The run is a
+    `milestone` run of the story's parent milestone with `RunConfig.story_id`
+    set and one lane at a time. It ends on the story's tip branch: no
+    Integrate, so a clean run is recorded `done` and reports the milestone
+    `done` payload without `integrated`. A story with nothing left to run is
+    the same `done` payload with no level and nothing driven. Pause, cancel
+    and escalation report as a milestone run's do; `am resume` of the run
+    resumes this story alone (`preflight_milestone`).
+    """
+    return asyncio.run(
+        _run_story_async(
+            story,
+            repo_dir=repo_dir,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            control_interval=control_interval,
+        )
+    )
+
+
+async def _run_story_async(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`run_story`'s body, awaitable in a caller's own event loop."""
+    pre = preflight_story(
+        story,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        clock=clock,
+        driver=driver,
+    )
+    with recorded_milestone_run(pre) as recorded:
+        return await run_milestone_engine(
+            pre,
+            recorded,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            control_interval=control_interval,
         )
 
 
