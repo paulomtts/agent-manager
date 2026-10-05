@@ -16,16 +16,19 @@ Every wait is bounded and fails naming its step.
 """
 
 import json
+import os
+import signal
 import subprocess
+import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, models, paths, store
+from agent_manager import board, cli, detach, models, paths, store
 
 PREFIX = "m3"
 """Must equal the conftest's `MILESTONE_PREFIX`: the board fixture derives its branches with it."""
@@ -47,6 +50,17 @@ AGENT_PHASES = (
     "review",
 )
 """Must equal the conftest's `AGENT_PHASES`: `TASK`'s seven agent phases, in order."""
+
+
+DEADLINE = 240.0
+"""Only bounds a broken run; a healthy one never waits this long."""
+
+POLL = 0.05
+"""Seconds between checks of a waited-for condition. A polling cadence, never an ordering."""
+
+CONTROL_KEYS_NEVER_PRESENT = {"escalated", "failed_phase", "integrated", "done"}
+"""A paused payload never escalates, never names a failed phase, never
+integrates and is never done."""
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -159,6 +173,34 @@ def _run_story(root: Path, story: str):
             VERIFY,
         ],
     )
+
+
+def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{what} did not happen within {timeout}s")
+        time.sleep(POLL)
+
+
+def _status(am: Callable[..., tuple[int, dict[str, Any]]], root: Path, run_id: str) -> dict[str, Any]:
+    """`am status RUN_ID --repo-dir ROOT`'s data, from a real child process."""
+    code, envelope = am("status", run_id, "--repo-dir", str(root))
+    assert code == 0, envelope
+    assert envelope["ok"] is True, envelope
+    return envelope["data"]
+
+
+@pytest.fixture
+def detached_pids():
+    """Every detached child the test started; its whole session is killed at teardown."""
+    pids: list[int] = []
+    yield pids
+    for pid in pids:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 @pytest.mark.e2e_fake
@@ -280,3 +322,130 @@ def test_a_story_run_walks_only_its_story_and_the_next_story_roots_on_its_tip(
         run_b: (stories["B"], milestone),
     }, listing
     assert sorted(_run_ids(root)) == sorted([run_a, run_b])
+
+
+@pytest.mark.e2e_fake
+def test_a_detached_story_run_reports_its_run_id_pauses_and_resumes_to_its_story(
+    milestone_board, fake_claude_bin, hold, am, read_fake_log, detached_pids
+):
+    """`am run --story A --detach` hands the run to a child and reports its id;
+    `am runs` and `am status` name story A under the parent milestone; a pause
+    parks it; `am resume` with no `--story` finishes story A alone under the
+    same run id, with no Integrate and nothing of B or C launched."""
+    root = milestone_board["root"]
+    milestone = milestone_board["milestone"]
+    stories = milestone_board["stories"]
+    branches = milestone_board["branches"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    (b1,) = milestone_board["subtasks"]["B"]
+    (c1,) = milestone_board["subtasks"]["C"]
+    main_before = _git(root, "rev-parse", "main").strip()
+    hold.arm()
+    hold.release(a2, b1, c1)  # only a1's implement is held
+
+    # 1. Detach.
+    code, envelope = am(
+        "run",
+        "--story",
+        stories["A"],
+        "--repo-dir",
+        str(root),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        PREFIX,
+        "--verify",
+        VERIFY,
+        "--detach",
+    )
+    assert code == 0, envelope
+    assert envelope["ok"] is True, envelope
+    data = envelope["data"]
+    assert set(data) == {"run_id", "pid", "log", "detached"}, data
+    assert data["detached"] is True, data
+    run_id, pid = data["run_id"], data["pid"]
+    detached_pids.append(pid)
+    run_dir = paths.data_dir() / "runs" / run_id
+
+    # 2. Held: the listing and the status name the story, the lease is the child's.
+    _until(hold.held_marker(a1).exists, "a1's implement being held")
+    code, listing = am("runs", "--repo-dir", str(root))
+    assert code == 0, listing
+    assert listing["ok"] is True, listing
+    (row,) = listing["data"]["runs"]
+    assert row["id"] == run_id, row
+    assert row["story_id"] == stories["A"], row
+    assert row["milestone_id"] == milestone, row
+    assert row["lease"] is not None, row
+    assert row["lease"]["pid"] == pid, row
+    assert row["lease"]["live"] is True, row
+    held = _status(am, root, run_id)["run"]
+    assert held["status"] == "started", held
+    assert held["story_id"] == stories["A"], held
+
+    # 3. Pause.
+    code, paused = am("pause", run_id, "--repo-dir", str(root))
+    assert code == 0, paused
+    assert paused["ok"] is True, paused
+    assert paused["data"]["effective"] == "pause", paused
+
+    # 4. The detached child applied the pause; only then let a1 go on.
+    def pause_applied() -> bool:
+        requests = _status(am, root, run_id)["control"]["requests"]
+        return [request["command"] for request in requests] == ["pause"] and (
+            requests[0]["handled_at"] is not None
+        )
+
+    _until(pause_applied, "the detached story run applying the pause")
+    hold.release(a1)
+
+    # 5. Parked: the paused life's report, its lease released.
+    report = run_dir / detach.REPORT_NAME
+    _until(report.exists, "the paused story run's report.json")
+    _until(lambda: _lease(root, run_id) is None, "the detached child releasing its lease")
+    final = json.loads(report.read_text(encoding="utf-8"))
+    assert final["ok"] is True, final
+    parked = final["data"]
+    assert parked["paused"] is True, parked
+    assert parked["run_id"] == run_id, parked
+    assert parked["resume"] == f"am resume {run_id}", parked
+    assert not CONTROL_KEYS_NEVER_PRESENT & set(parked), parked
+    assert _status(am, root, run_id)["run"]["status"] == "stopped"
+
+    # 6. Resume in the foreground, with no --story: the run keeps its story.
+    code, resumed = am("resume", run_id, "--repo-dir", str(root), "--verify", VERIFY)
+    assert code == 0, resumed
+    assert resumed["ok"] is True, resumed
+    done = resumed["data"]
+    assert done["done"] is True, done
+    assert done["resumed"] is True, done
+    assert done["run_id"] == run_id, done
+    assert "integrated" not in done, done
+    assert "escalated" not in done, done
+    assert a1 in done["completed"], done
+    assert a2 in done["completed"], done
+    assert b1 not in done["completed"], done
+    assert c1 not in done["completed"], done
+
+    # 7. Story A done, nothing of B or C touched, one run row, main unmoved.
+    after = _status(am, root, run_id)["run"]
+    assert after["status"] == "done", after
+    assert after["story_id"] == stories["A"], after
+    assert _lease(root, run_id) is None
+    assert _run_ids(root) == [run_id]
+    local = _local_branches(root)
+    for absent in (branches[b1], branches[c1], INTEGRATION_BRANCH):
+        assert absent not in local, (absent, local)
+    assert _statuses(root, [stories["A"], a1, a2]) == dict.fromkeys(
+        [stories["A"], a1, a2], "done"
+    )
+    # Untouched: A done unblocks B and b1 (todo); C and c1 still wait on B (blocked).
+    assert _statuses(root, [stories["B"], b1, stories["C"], c1]) == {
+        stories["B"]: "todo",
+        b1: "todo",
+        stories["C"]: "blocked",
+        c1: "blocked",
+    }
+    launched = {card for card, _phase in _card_phase_counts(read_fake_log(run_id))}
+    assert launched == {a1, a2}, launched
+    assert _git(root, "rev-parse", "main").strip() == main_before
