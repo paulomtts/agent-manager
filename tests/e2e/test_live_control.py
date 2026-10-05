@@ -325,7 +325,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     two_story_board, run_milestone_cli, read_fake_log, monkeypatch, request
 ):
     """Spec §7 cancel: held in a1's plan, cancelled from another connection,
-    recorded `cancelled` without Integrate; `am resume` refuses it at exit 3
+    recorded `canceled` without Integrate; `am resume` refuses it at exit 3
     and launches nothing; a fresh `am run --milestone` drives a1 again from
     `explore`, never continuing the cancelled run's parked checkpoint (C9)."""
     assert request.node.get_closest_marker("e2e") is None

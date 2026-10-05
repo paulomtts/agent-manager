@@ -612,7 +612,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
         )
     if models.is_canceled(run.status):
         raise runs.NotResumableError(
-            f"run {run_id} was cancelled; start new work with am run --milestone"
+            f"run {run_id} was canceled; start new work with am run --milestone"
         )
     if run.status == "done":
         raise runs.NotResumableError(
@@ -2073,10 +2073,10 @@ async def run_milestone_engine(
         return payload
 
     # Outcome precedence (live control C6): the first match wins. A
-    # control is never an escalation, and a paused or cancelled run
+    # control is never an escalation, and a paused or canceled run
     # never reaches Integrate in this invocation.
     if stop.requested == "cancel":
-        store.record_run(run_record.model_copy(update={"status": "cancelled"}))
+        store.record_run(run_record.model_copy(update={"status": models.CANCELED}))
         payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
         # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
         # each subtask it parked, in wave order, then the milestone. A lane
@@ -2208,7 +2208,7 @@ def run_milestone(
 
     An applied `am cancel` or `am pause` fires the same `StopSignal` through
     `stop.request`, so lanes park exactly as for an escalation. Once the tree
-    returns, the first match wins (C6): a cancel records the run `cancelled`
+    returns, the first match wins (C6): a cancel records the run `canceled`
     and returns `controlled_payload`; an escalation records `escalated` as
     below, with `control: "pause"` added when a pause was applied; a pause
     records `stopped` and returns `controlled_payload` with its `resume`

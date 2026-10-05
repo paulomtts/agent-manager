@@ -4603,7 +4603,7 @@ def test_resume_refuses_run_canceled_in_either_spelling(tmp_path, monkeypatch, s
         orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
 
     assert str(caught.value) == (
-        f"run {RESUME_RUN_ID} was cancelled; start new work with am run --milestone"
+        f"run {RESUME_RUN_ID} was canceled; start new work with am run --milestone"
     )
     task_run = "20260924T120000Z-00000008"
     _record_resume_run(root, task_run, workflow="task", status=status)
@@ -5476,6 +5476,41 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
     assert integrate_recorder.calls == []
 
 
+def _run_upserts(run_id: str) -> list[str]:
+    """The raw `run_upsert` lines of `run_id`'s journal, in order."""
+    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
+    return [line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"]
+
+
+def _raw_run_status(project: Path, run_id: str) -> str:
+    """`runs.status` as stored, before any reader normalises it."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, run_id
+    return row["status"]
+
+
+@pytest.mark.git
+def test_milestone_cancel_journals_canceled(project, integrate_recorder):
+    """A canceled milestone run journals its final `run_upsert` with status
+    `canceled`, never the legacy spelling, and stores `canceled` in its row."""
+    shape = _milestone(project, {"A": 2})
+    a1, _ = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    _run(project, shape["milestone"], driver, control_interval=0)
+
+    upserts = _run_upserts(run_id)
+    assert upserts, run_id
+    assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
+    assert not [line for line in upserts if "cancelled" in line], upserts
+    assert _raw_run_status(project, run_id) == "canceled"
+
+
 @pytest.mark.git
 def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_recorder):
     shape = _milestone(project, {"A": 1})
@@ -5494,6 +5529,7 @@ def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_record
     assert result["cancelled"] is True, result
     assert "paused" not in result and "resume" not in result
     assert _load(project, run_id).status == "canceled"
+    assert json.loads(_run_upserts(run_id)[-1])["payload"]["status"] == "canceled"
     assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
         ("pause", True),
         ("cancel", True),
@@ -10146,7 +10182,7 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
         a2: "pending",
     }
     assert integrate_recorder.calls == []
-    with pytest.raises(runs.NotResumableError, match="cancelled"):
+    with pytest.raises(runs.NotResumableError, match="was canceled"):
         _resume(project, run_id, FakeDriver())
 
 
