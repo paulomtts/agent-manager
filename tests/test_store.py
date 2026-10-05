@@ -3416,9 +3416,10 @@ def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
 
     journal_path = store.Journal(RUN_ID).path
     records = [json.loads(text) for text in journal_path.read_text().splitlines()]
-    for record in records:
-        if record["event"] == "run_upsert":
-            del record["payload"]["config"]["story_id"]
+    upserts = [record for record in records if record["event"] == "run_upsert"]
+    assert upserts
+    for record in upserts:
+        del record["payload"]["config"]["story_id"]
     journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
     _truncate_db(repo)
