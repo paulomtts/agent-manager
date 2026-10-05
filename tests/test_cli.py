@@ -10231,10 +10231,74 @@ def _stream(result) -> list[dict[str, Any]]:
 def _hello(tmp_path: Path) -> dict[str, Any]:
     return {
         "event": "watch",
-        "schema": 1,
+        "schema": 2,
         "am": agent_manager.__version__,
         "runs_dir": str(_watch_runs_dir(tmp_path)),
     }
+
+
+def test_watch_hello_is_schema_2(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    hello = cli._watch_hello()
+    assert hello["schema"] == 2
+    assert type(hello["schema"]) is int
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+    _write_watch_journal(tmp_path, "run-b", [1])
+
+    for argv in (
+        ["run-a"],
+        ["run-a", "--since", "1"],
+        ["--all"],
+        ["run-a", "--from-now"],
+        ["--all", "--from-now"],
+    ):
+        result, _ = _watch_follow(monkeypatch, *argv)
+        assert result.exit_code == 0, (argv, result.output)
+        lines = _stream(result)
+        first = lines[0]
+        assert set(first) == {"event", "schema", "am", "runs_dir"}, argv
+        assert type(first["schema"]) is int, argv
+        assert first == _hello(tmp_path), argv
+        # One hello per stream, however many runs it covers.
+        assert [line for line in lines if "event" in line and "seq" not in line] == [
+            first
+        ], argv
+
+
+def test_logs_hello_stays_schema_1():
+    hello = cli._logs_hello(Path("x"), 0)
+    assert hello["schema"] == 1
+    assert hello == _logs_hello_line(Path("x"))
+
+
+def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    run_dir = _watch_runs_dir(tmp_path) / "run-old"
+    run_dir.mkdir(parents=True)
+    # As an `am` from before the spelling switch wrote it.
+    legacy = store_module.JournalLine(
+        seq=1,
+        ts=WATCH_TS,
+        run_id="run-old",
+        event="run_upsert",
+        payload={"run_id": "run-old", "status": "cancelled"},
+    ).model_dump(mode="json")
+    after = _watch_line("run-old", 2)
+    journal = run_dir / store_module.JOURNAL_NAME
+    journal.write_text(
+        "".join(json.dumps(line, sort_keys=True) + "\n" for line in (legacy, after)),
+        encoding="utf-8",
+    )
+    before = journal.read_bytes()
+
+    result, _ = _watch_follow(monkeypatch, "run-old")
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines == [_hello(tmp_path), legacy, after]
+    assert lines[0]["schema"] == 2
+    assert lines[1]["payload"]["status"] == "cancelled"
+    assert journal.read_bytes() == before
 
 
 def test_watch_follow_hello_line_shape(tmp_path, monkeypatch):

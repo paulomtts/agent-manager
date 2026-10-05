@@ -197,7 +197,7 @@ def test_a_detached_milestone_run_is_watched_paused_and_resumed_to_done(
         f"am watch --follow refused the just-detached run (spec candidate (a)): {hello}"
     )
     assert hello["event"] == "watch", hello
-    assert hello["schema"] == 1, hello
+    assert hello["schema"] == 2, hello
     assert "am" in hello, hello
     assert hello["runs_dir"] == str(paths.data_dir() / "runs"), hello
 

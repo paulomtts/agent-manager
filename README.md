@@ -629,12 +629,12 @@ Watching a run id that does not exist creates no run directory.
 `--follow` turns the output into a stream. The first line is a hello line, the only line that is not a journal line:
 
 ```
-{"am":"0.1.0","event":"watch","runs_dir":"/home/you/.local/share/agent-manager/runs","schema":1}
+{"am":"0.1.0","event":"watch","runs_dir":"/home/you/.local/share/agent-manager/runs","schema":2}
 ```
 
 `am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
 
-With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":1`.
+With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":2`.
 
 Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
 

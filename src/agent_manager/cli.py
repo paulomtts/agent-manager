@@ -2519,10 +2519,11 @@ def _watch_sleep(seconds: float) -> None:
 
 def _watch_hello() -> dict[str, Any]:
     """The first line of `am watch --follow`, and the only one that is not a
-    JournalLine: where a future schema bump is announced (design 3.6)."""
+    JournalLine. Its `schema` is 2; the journal lines after it are emitted as
+    stored."""
     return {
         "event": "watch",
-        "schema": 1,
+        "schema": 2,
         "am": __version__,
         "runs_dir": str(paths.data_path() / "runs"),
     }
