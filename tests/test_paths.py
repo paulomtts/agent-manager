@@ -432,3 +432,36 @@ def test_recorded_attempts_ignores_a_plain_file_in_an_attempts_place(
     (card_dir / "verify.1").write_text("not a directory\n")
 
     assert paths.recorded_attempts("run-abc", "abc123", "verify") == []
+
+
+def test_data_path_is_where_data_dir_lives_and_creates_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = paths.data_path()
+
+    assert result == tmp_path / "xdg" / "agent-manager"
+    assert not (tmp_path / "xdg").exists()
+    assert paths.data_dir() == result
+
+
+def test_project_db_location_matches_project_db_path_and_creates_nothing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+
+    result = paths.project_db_location(project_root)
+
+    assert not (tmp_path / "xdg").exists()
+    assert result == paths.project_db_path(project_root)
+
+
+def test_attempt_path_and_list_run_ids_create_no_data_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    paths.attempt_path("run-abc", "abc123", "verify", 1)
+    assert paths.recorded_attempts("run-abc", "abc123", "verify") == []
+    assert paths.list_run_ids() == []
+
+    assert not (tmp_path / "xdg").exists()

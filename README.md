@@ -328,7 +328,7 @@ Refusals. Each one prints `{"ok": false, "error": {"type", "message"}}`, exits 3
 
 A branch refusal means another milestone run uses the same `--branch-prefix`; picking another prefix avoids it.
 
-Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am run --dry-run` take no lease, no claim and no lock, and never write, so they work while any number of runs are going. `am status <run-id>` shows the keys the run's live lease holds in `control.claims`.
+Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am run --dry-run` take no lease, no claim and no lock, and never write, so they work while any number of runs are going. Run against a repository `am` has never run in, they create nothing: no projection database, no `projects/` directory, no lock file. `am status <run-id>` shows the keys the run's live lease holds in `control.claims`.
 
 `took_over`. `am resume` of a run whose process is dead takes its lease over. A lease is dead when its pid no longer exists on the same host, or when its heartbeat is more than 30 seconds old; from another host, the heartbeat is the only test. The resumed report then has `"took_over": {"pid", "host", "heartbeat_at"}`, naming the dead holder. On a milestone run it is on every report shape.
 

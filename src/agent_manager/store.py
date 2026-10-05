@@ -14,6 +14,7 @@ state tree belongs to `models`, and the resume loop that acts on an in-flight
 attempt belongs to the engine.
 """
 
+import functools
 import json
 import os
 import sqlite3
@@ -267,6 +268,65 @@ def open_db(root: Path) -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """Each table of `conn`'s main database, with its column names."""
+    tables = [
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    ]
+    return {
+        table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for table in tables
+    }
+
+
+@functools.cache
+def _current_columns() -> dict[str, set[str]]:
+    """The tables and columns `_SCHEMA` creates."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return _table_columns(conn)
+    finally:
+        conn.close()
+
+
+def _has_current_schema(conn: sqlite3.Connection) -> bool:
+    found = _table_columns(conn)
+    return all(
+        columns <= found.get(table, set())
+        for table, columns in _current_columns().items()
+    )
+
+
+def open_db_for_reading(root: Path) -> sqlite3.Connection:
+    """A connection that reads the per-project projection and never writes it.
+
+    No database for `root`: an in-memory, empty projection with the current
+    schema, and nothing is created on disk. An existing database with the
+    current schema: opened `mode=ro`, so it can never be written or created;
+    its rows are read live alongside a writer in WAL mode. An existing database
+    with an older schema: `open_db`, which migrates it as before.
+    """
+    location = paths.project_db_location(root)
+    if not location.exists():
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_SCHEMA)
+        return conn
+    conn = sqlite3.connect(
+        f"{location.absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    if _has_current_schema(conn):
+        return conn
+    conn.close()
+    return open_db(root)
+
+
 JOURNAL_NAME = "journal.jsonl"
 
 EventKind = Literal[
@@ -403,7 +463,7 @@ class Journal:
         """
         journal = cls.__new__(cls)
         journal.run_id = run_id
-        journal.path = paths.data_dir() / "runs" / run_id / JOURNAL_NAME
+        journal.path = paths.data_path() / "runs" / run_id / JOURNAL_NAME
         journal._lock = threading.Lock()
         journal._seq = 0
         return journal

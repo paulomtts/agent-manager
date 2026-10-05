@@ -11,10 +11,15 @@ import os
 from pathlib import Path
 
 
-def data_dir() -> Path:
+def data_path() -> Path:
+    """Where `data_dir` lives, without creating anything."""
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg) if xdg else Path(os.environ["HOME"]) / ".local" / "share"
-    result = base / "agent-manager"
+    return base / "agent-manager"
+
+
+def data_dir() -> Path:
+    result = data_path()
     result.mkdir(parents=True, exist_ok=True)
     return result
 
@@ -36,6 +41,11 @@ def _projects_dir() -> Path:
 
 def project_db_path(root: Path) -> Path:
     return _projects_dir() / f"{project_digest(root)}.db"
+
+
+def project_db_location(root: Path) -> Path:
+    """Where `project_db_path` puts the project's database, without creating anything."""
+    return data_path() / "projects" / f"{project_digest(root)}.db"
 
 
 def project_lock_path(root: Path, name: str) -> Path:
@@ -92,7 +102,7 @@ def attempt_path(run_id: str, card: str, phase: str, attempt: int) -> Path:
     For readers (`am logs`): `attempt_dir` and `run_dir` mkdir as a side
     effect, and a read-only command must not mint a run directory.
     """
-    return data_dir() / "runs" / run_id / card / f"{phase}.{attempt}"
+    return data_path() / "runs" / run_id / card / f"{phase}.{attempt}"
 
 
 def recorded_attempts(run_id: str, card: str, phase: str) -> list[int]:
@@ -118,7 +128,7 @@ def list_run_ids() -> list[str]:
     empty list, not an error. Plain files beside the run directories are not
     runs and are skipped.
     """
-    runs = data_dir() / "runs"
+    runs = data_path() / "runs"
     if not runs.is_dir():
         return []
     return sorted(entry.name for entry in runs.iterdir() if entry.is_dir())

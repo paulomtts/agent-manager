@@ -6481,3 +6481,91 @@ def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
 
     assert rebuilt.status == "started"
     assert _projected_run_status(repo) == "started"
+
+
+def _tree(root: Path) -> set[str]:
+    """Every path under `root`, relative, directories included."""
+    return {str(path.relative_to(root)) for path in root.rglob("*")}
+
+
+def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
+    repo, tmp_path
+):
+    before = _tree(tmp_path)
+
+    conn = store.open_db_for_reading(repo)
+    try:
+        assert store.list_runs(conn) == []
+        assert store.latest_run_id(conn) is None
+        assert store.load_run(conn, RUN_ID) is None
+        assert store.read_lease(conn, RUN_ID) is None
+        assert store.control_requests(conn, RUN_ID) == []
+    finally:
+        conn.close()
+
+    assert _tree(tmp_path) == before
+    assert not (tmp_path / "data").exists()
+
+
+def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo):
+    writer = store.Store.open(repo, RUN_ID)
+    writer.record_run(_run(repo))
+    writer.close()
+
+    conn = store.open_db_for_reading(repo)
+    try:
+        assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
+        assert store.load_run(conn, RUN_ID) is not None
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM runs")
+    finally:
+        conn.close()
+
+
+def test_open_db_for_reading_reads_while_a_writer_holds_a_write_transaction(repo):
+    writer = store.Store.open(repo, RUN_ID)
+    writer.record_run(_run(repo))
+    held = store.open_db(repo)
+    try:
+        held.execute("BEGIN IMMEDIATE")
+        held.execute("UPDATE runs SET status = 'done'")
+
+        conn = store.open_db_for_reading(repo)
+        try:
+            started = time.monotonic()
+            loaded = store.load_run(conn, RUN_ID)
+            assert time.monotonic() - started < 1.0
+            assert loaded is not None and loaded.status == "started"
+
+            held.commit()
+            assert store.load_run(conn, RUN_ID).status == "done"
+        finally:
+            conn.close()
+    finally:
+        held.close()
+        writer.close()
+
+
+def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
+    writer = store.Store.open(repo, RUN_ID)
+    writer.record_run(_run(repo))
+    writer.close()
+    old = sqlite3.connect(paths.project_db_path(repo))
+    old.execute("ALTER TABLE runs DROP COLUMN milestone_id")
+    old.execute("DROP TABLE board_comments")
+    old.commit()
+    old.close()
+
+    conn = store.open_db_for_reading(repo)
+    try:
+        assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
+        assert store.load_run(conn, RUN_ID).milestone_id is None
+    finally:
+        conn.close()
+
+
+def test_reading_a_journal_that_does_not_exist_creates_no_data_dir(repo, tmp_path):
+    with pytest.raises(store.MissingJournalError):
+        store.Journal._for_reading("run-that-never-was").read()
+
+    assert not (tmp_path / "data").exists()
