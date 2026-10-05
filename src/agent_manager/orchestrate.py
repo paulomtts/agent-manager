@@ -1776,6 +1776,30 @@ def _restricted_stories(
     ]
 
 
+def story_census(
+    tree: models.CardNode, story: models.CardNode, *, root: Path, branch_prefix: str
+) -> census.Census:
+    """A story run's census: `tree`'s, cycle-checked, cut to `story` and the done blockers it stacks on.
+
+    `story` is a child of `tree`. The whole census of `tree` is checked for a
+    blocker cycle first (`dag.DependencyCycleError`), even one `story` is not
+    part of. It is then cut by `_restricted_stories`: the kept done blockers,
+    then `story` last, or `errors.StoryBlockedError` for an open blocker. A
+    story the census dropped (out of play) leaves no stories at all.
+    Read-only, except that `_local_branch_exists` runs git to look up a done
+    blocker's tip.
+    """
+    full = census.flatten_milestone(tree)
+    dag.assert_no_blocker_cycles(full.stories)
+    selected = next((planned for planned in full.stories if planned.id == story.id), None)
+    stories = (
+        []
+        if selected is None
+        else _restricted_stories(full.stories, selected, root=root, branch_prefix=branch_prefix)
+    )
+    return census.Census(milestone_title=full.milestone_title, stories=stories)
+
+
 def _story_plan(
     tree: models.CardNode,
     story: models.CardNode,
@@ -1786,28 +1810,20 @@ def _story_plan(
 ) -> tuple[census.Census, list[list[PlannedStory]], list[dict[str, str]], list[str]]:
     """A story run's `(plan, levels, tips, keys)`, cut from its milestone's `tree`.
 
-    `story` is a child of `tree`. The census of `tree` is cycle-checked as a
-    milestone run's is (`dag.DependencyCycleError`), then cut to `story` and
-    the done blockers it stacks on (`_restricted_stories`, which raises
-    `errors.StoryBlockedError` for an open blocker). A story the census
-    dropped (out of play) leaves an empty plan, and a story with no remaining
-    subtasks a plan with no wave. `tips` names `story` alone; `keys` are
+    `story` is a child of `tree`. `plan` is `story_census` (which raises
+    `dag.DependencyCycleError` and `errors.StoryBlockedError`): empty for a
+    story the census dropped (out of play), and with no wave for a story with
+    no remaining subtasks. `tips` names `story` alone; `keys` are
     `story_claims`, never the integration branch. Read-only, except that
     `_local_branch_exists` runs git to look up a done blocker's tip.
     """
-    full = census.flatten_milestone(tree)
-    dag.assert_no_blocker_cycles(full.stories)
-    selected = next((planned for planned in full.stories if planned.id == story.id), None)
-    if selected is None:
+    plan = story_census(tree, story, root=root, branch_prefix=branch_prefix)
+    if plan.stories:
+        selected = plan.stories[-1]
+    else:
         # Out of play: the census dropped it, so it has nothing to run and
         # claims only the milestone and story cards.
         selected = census.StoryPlan(story.id, story.title, story.status, [], [])
-        stories: list[census.StoryPlan] = []
-    else:
-        stories = _restricted_stories(
-            full.stories, selected, root=root, branch_prefix=branch_prefix
-        )
-    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = [
         tip

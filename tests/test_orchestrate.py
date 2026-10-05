@@ -10363,3 +10363,58 @@ def test_resuming_a_story_run_whose_escalated_subtask_was_finished_by_hand_is_a_
     assert "integrated" not in result
     assert integrate_recorder.calls == []
     assert _load(project, first["run_id"]).status == "done"
+
+
+# ── story_census: the story cut a run and a dry run share ───────────────────
+
+
+def _story_census(root: Path, story: str) -> census.Census:
+    """`orchestrate.story_census` over the FakeBoard's milestone holding `story`."""
+    match = census.find_story(board.roots(repo_dir=root), story)
+    return orchestrate.story_census(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        branch_prefix=PREFIX,
+    )
+
+
+def test_story_census_is_the_preflight_storys_plan_on_a_done_blockers_tip(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done"
+    )
+    _seed_story(fake_board, milestone, "Story C: cells")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch, {_branch(root, b2)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    cut = _story_census(root, story)
+    pre = _preflight_story(root, story)
+
+    assert cut.milestone_title == "Milestone 3: orchestration"
+    assert [(planned.id, planned.blocked_by) for planned in cut.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert cut.stories == pre.plan.stories
+    assert cut.milestone_title == pre.plan.milestone_title
+
+
+@pytest.mark.parametrize("status", ["canceled", "archived"])
+def test_story_census_of_an_out_of_play_story_is_empty_as_the_preflights_plan(
+    tmp_path, monkeypatch, fake_board, status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story A: rows", status=status)
+    _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    cut = _story_census(root, story)
+
+    assert cut.stories == []
+    assert cut.stories == _preflight_story(root, story).plan.stories
