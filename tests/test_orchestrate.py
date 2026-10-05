@@ -457,6 +457,65 @@ def test_milestone_claims_has_no_duplicates():
     ]
 
 
+def test_story_claims_lists_milestone_story_remaining_subtasks_then_their_branches():
+    """`card:M`, `card:<story>`, every remaining subtask's card in census
+    order, then one `branch:` key per remaining subtask, same order. A done
+    or out-of-play subtask adds neither key, and no integration branch is
+    claimed: a story run does not integrate."""
+    story = _plan_story(
+        1,
+        [
+            _plan_subtask(11, "done"),
+            _plan_subtask(12),
+            _plan_subtask(13, "canceled"),
+            _plan_subtask(14),
+        ],
+    )
+
+    keys = orchestrate.story_claims(_plan_id(99), story, "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+        f"card:{_plan_id(12)}",
+        f"card:{_plan_id(14)}",
+        f"branch:{_branch_of(story.subtasks[1])}",
+        f"branch:{_branch_of(story.subtasks[3])}",
+    ]
+    assert "branch:m3-integrate" not in keys
+
+
+def test_story_claims_of_a_closed_story_are_the_milestone_and_story_cards_only():
+    closed = _plan_story(1, [_plan_subtask(11), _plan_subtask(12)], status="done")
+    finished = _plan_story(2, [_plan_subtask(21, "done"), _plan_subtask(22, "merged")])
+
+    assert orchestrate.story_claims(_plan_id(99), closed, "m3") == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+    ]
+    assert orchestrate.story_claims(_plan_id(99), finished, "m3") == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(2)}",
+    ]
+
+
+def test_story_claims_has_no_duplicates():
+    """A subtask listed twice is claimed once, card and branch, at its first place."""
+    shared = _plan_subtask(11)
+    story = _plan_story(1, [shared, _plan_subtask(12), shared])
+
+    keys = orchestrate.story_claims(_plan_id(99), story, "m3")
+
+    assert keys == [
+        f"card:{_plan_id(99)}",
+        f"card:{_plan_id(1)}",
+        f"card:{_plan_id(11)}",
+        f"card:{_plan_id(12)}",
+        f"branch:{_branch_of(shared)}",
+        f"branch:{_branch_of(story.subtasks[1])}",
+    ]
+
+
 def test_milestone_card_ids_cover_the_milestone_every_story_and_every_subtask():
     """Board-comments B7: the start flush covers done and closed cards too,
     since an earlier run may have left a pending comment on any of them."""

@@ -1541,6 +1541,28 @@ def milestone_claims(
     return list(dict.fromkeys(keys))
 
 
+def story_claims(
+    milestone_id: str, story: census.StoryPlan, branch_prefix: str
+) -> list[str]:
+    """The `run_claims` keys a story run holds under its lease (run-story design).
+
+    `card:<milestone_id>`, `card:<story.id>`, then `card:<id>` for every
+    remaining subtask (`dag.remaining_subtasks`, the set `milestone_claims`
+    uses, so a card run on a done subtask is not refused), then
+    `branch:<subtask branch>` for each of those subtasks, census order. Never
+    `branch:<prefix>-integrate`: a story run does not integrate. Pure; a key
+    already listed is not repeated, so the first occurrence keeps its place.
+    """
+    remaining = dag.remaining_subtasks(story)
+    keys = [control.card_claim(milestone_id), control.card_claim(story.id)]
+    keys.extend(control.card_claim(subtask.id) for subtask in remaining)
+    keys.extend(
+        control.branch_claim(dag.subtask_branch(branch_prefix, subtask))
+        for subtask in remaining
+    )
+    return list(dict.fromkeys(keys))
+
+
 def milestone_card_ids(
     milestone_id: str, stories: Sequence[census.StoryPlan]
 ) -> list[str]:
