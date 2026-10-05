@@ -10418,3 +10418,88 @@ def test_story_census_of_an_out_of_play_story_is_empty_as_the_preflights_plan(
 
     assert cut.stories == []
     assert cut.stories == _preflight_story(root, story).plan.stories
+
+
+# ── detach_story: a story run handed to a detached child ────────────────────
+
+
+def test_the_detached_story_child_drives_only_the_story_and_reports_no_integrate(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1})
+    (a1,) = shape["subtasks"]["A"]
+    story = shape["stories"]["A"]
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    fake = _FakeDetacher()
+    driver = FakeDriver()
+
+    data = orchestrate.detach_story(
+        story,
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix=PREFIX,
+        detacher=fake,
+        allow_no_verification=True,
+        driver=driver,
+        clock=lambda: STARTED_AT,
+        control_interval=0.01,
+    )
+
+    run_id = data["run_id"]
+    assert run_id == runs.mint_run_id(story, STARTED_AT)
+    log = paths.run_dir(run_id) / detach.RUN_LOG_NAME
+    assert data == {"run_id": run_id, "pid": FAKE_CHILD_PID, "log": str(log), "detached": True}
+    assert fake.calls == [log]
+    assert fake.events == ["go"]
+    assert driver.calls == []
+    assert _load(root, run_id).config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story
+    )
+    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    closes = _close_snapshots(monkeypatch)
+
+    fake.body()
+
+    report = paths.run_dir(run_id) / detach.REPORT_NAME
+    assert stat.S_IMODE(os.stat(report).st_mode) == 0o600
+    expected = {
+        "done": True,
+        "run_id": run_id,
+        "levels": [{"level": 0, "stories": [story]}],
+        "completed": [a1],
+        "tips": [{"story": story, "tip": _branch(root, a1)}],
+        "warnings": [],
+    }
+    assert json.loads(report.read_text(encoding="utf-8")) == json.loads(
+        cli.render(cli.ok_envelope(expected))
+    )
+    assert [call["card"] for call in driver.calls] == [a1]
+    assert integrate_recorder.calls == []
+    assert _load(root, run_id).status == "done"
+    assert closes == [(0, 0)]
+    assert _lease(root, run_id) is None
+    assert _claim_rows(root) == []
+
+
+def test_detach_story_refuses_an_open_blocker_before_any_fork_or_write(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1, "B": 1}, blocked_by={"B": ["A"]})
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    fake = _FakeDetacher()
+
+    with pytest.raises(errors.StoryBlockedError):
+        orchestrate.detach_story(
+            shape["stories"]["B"],
+            repo_dir=root,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            detacher=fake,
+            driver=FakeDriver(),
+        )
+
+    assert fake.calls == []
+    assert _run_dirs() == []
+    assert _run_ids(root) == []

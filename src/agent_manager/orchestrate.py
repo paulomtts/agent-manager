@@ -2449,40 +2449,23 @@ async def _run_story_async(
         )
 
 
-def detach_milestone(
-    milestone: str,
+def _detach_recorded(
+    pre: MilestonePreflight,
     *,
-    repo_dir: Path,
-    base_branch: str,
-    branch_prefix: str,
     detacher: detach.Detacher,
-    commands: Sequence[str] = (),
-    allow_no_verification: bool = False,
-    max_concurrent: int = 1,
-    runner_factory: runs.RunnerFactory | None = None,
-    driver: Driver | None = None,
-    clock: Callable[[], datetime] = _utcnow,
-    control_interval: float = control.CONTROL_POLL_SECONDS,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: runs.RunnerFactory | None,
+    control_interval: float,
 ) -> dict[str, Any]:
-    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+    """Stage 2 of `pre` here, stage 3 in a detached child; the hand-off's payload.
 
-    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
-    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
-    `pending` plan are the same. Inside the recorded stage `run.log` is
-    created and the lease handed off, so the stage exits releasing nothing
+    `recorded_milestone_run` records and leases the run; inside it `run.log`
+    is created and the lease handed off, so the stage exits releasing nothing
     and closes its store. The child runs `run_milestone_engine` on this very
     `pre`, with the plan rows and checkpoints the recorded stage wrote
     (`cli.hand_off_to_child`).
     """
-    pre = preflight_milestone(
-        milestone,
-        repo_dir=repo_dir,
-        base_branch=base_branch,
-        branch_prefix=branch_prefix,
-        max_concurrent=max_concurrent,
-        clock=clock,
-        driver=driver,
-    )
     with recorded_milestone_run(pre) as recorded:
         log = detach.create_run_log(pre.run_id)
         rows, checkpoints = recorded.rows, recorded.checkpoints
@@ -2505,6 +2488,85 @@ def detach_milestone(
 
     return cli.hand_off_to_child(
         root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
+
+
+def detach_milestone(
+    milestone: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+
+    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
+    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
+    `pending` plan are the same. The hand-off is `_detach_recorded`'s.
+    """
+    pre = preflight_milestone(
+        milestone,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        clock=clock,
+        driver=driver,
+    )
+    return _detach_recorded(
+        pre,
+        detacher=detacher,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        control_interval=control_interval,
+    )
+
+
+def detach_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`run_story` with its run handed to a detached child: stages 1 and 2 here, stage 3 there.
+
+    `preflight_story` runs exactly as for `run_story`, so every refusal comes
+    before any store, run directory, `refresh_git` or fork. The hand-off is
+    `_detach_recorded`'s; the child's report is the story run's payload,
+    with no `integrated`.
+    """
+    pre = preflight_story(
+        story,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        clock=clock,
+        driver=driver,
+    )
+    return _detach_recorded(
+        pre,
+        detacher=detacher,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        control_interval=control_interval,
     )
 
 
