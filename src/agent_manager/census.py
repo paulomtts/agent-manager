@@ -27,8 +27,11 @@ purpose: `ValueError` is already in `cli.HANDLED`, so a CLI caller turns them
 into an `ok: false` envelope without this module importing `cli` (which will
 import this module).
 
+`find_story` resolves one story card (a root card's child) and its root card.
+
 This module is pure: no I/O, no subprocesses, no ``brd``. It imports
-`agent_manager.models` and nothing from `cli` or `board`.
+`agent_manager.models` and `agent_manager.errors`, and nothing from `cli` or
+`board`.
 """
 
 import re
