@@ -4578,6 +4578,27 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     assert status == "canceled"
 
 
+def test_run_status_normalises_legacy_cancelled(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    for stored, expected in [
+        (models.LEGACY_CANCELED, models.CANCELED),
+        (models.CANCELED, models.CANCELED),
+        ("stopped", "stopped"),
+    ]:
+        _raw_sql(repo, "UPDATE runs SET status = ? WHERE id = ?", (stored, RUN_ID))
+        conn = store.open_db(repo)
+        try:
+            assert store.run_status(conn, RUN_ID) == expected
+            assert store.run_status(conn, "run-never-recorded") is None
+        finally:
+            conn.close()
+
+
 def test_replay_old_journal_with_legacy_cancelled(repo):
     st = store.Store.open(repo, RUN_ID)
     try:
@@ -6740,7 +6761,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     assert RUN_ID in message
     assert "run status: journal 'escalated', projection 'canceled'" in message
     assert "force=True" in message
-    assert _projected_run_status(repo) == "cancelled"
+    assert _projected_run_status(repo) == "canceled"
     assert _all_rows(repo) == before
 
 
@@ -6870,7 +6891,7 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
     assert _held_elsewhere(st._lock) is False
     kept = store.read_lease(st.connection, RUN_ID)
     assert kept is not None and kept.token == "t1"
-    assert store.run_status(st.connection, RUN_ID) == "cancelled"
+    assert store.run_status(st.connection, RUN_ID) == "canceled"
 
 
 def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):

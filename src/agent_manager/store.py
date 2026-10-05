@@ -1193,11 +1193,14 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
 def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
     """`runs.status` of `run_id`, or `None` if the run was never recorded.
 
+    The legacy spelling is returned as `canceled`; any other stored value is
+    returned as stored.
+
     A free function over a connection, like `load_run`, for a reader in
     another process that needs the status alone (`am pause`, `am resume`).
     """
     row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return None if row is None else row["status"]
+    return None if row is None else models.canonical_status(row["status"])
 
 
 @dataclass(frozen=True)

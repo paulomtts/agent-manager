@@ -11481,7 +11481,7 @@ def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
         "cards": [{"card_id": "card-1", "workflow": "task", "open_in": None}],
         "message": RESET_MESSAGE,
     }
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     lines_after = _journal_lines()
     assert lines_after[: len(lines_before)] == lines_before
     (added,) = lines_after[len(lines_before) :]
@@ -11512,7 +11512,7 @@ def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
     data = json.loads(result.stdout)["data"]
     assert data["cards"] == []
     assert data["status"] == "cancelled"
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
 
 
 @pytest.mark.parametrize("workflow", ["task", "milestone"])
@@ -11530,7 +11530,7 @@ def test_reset_closes_every_resettable_status_of_either_workflow(
     data = json.loads(result.stdout)["data"]
     assert data["previous_status"] == status
     assert data["already_cancelled"] is False
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     assert _lease(projection) is None
 
 
@@ -11667,7 +11667,7 @@ def test_reset_takes_over_a_dead_lease_and_names_its_holder(
     }
     assert data["previous_status"] == "started"
     assert data["already_cancelled"] is False
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     assert len(_journal_lines()) == len(lines_before) + 1
     assert _lease(projection) is None
 
@@ -11840,7 +11840,7 @@ def test_reset_names_the_run_a_newer_bases_row_keeps_the_card_open_in(projection
         {"card_id": "card-1", "workflow": "task", "open_in": None}
     ]
     assert _checkpoint_rows(projection) == checkpoints_before
-    assert _recorded_status(projection, OTHER_RUN_ID) == "cancelled"
+    assert _recorded_status(projection, OTHER_RUN_ID) == "canceled"
 
 
 def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
@@ -11992,7 +11992,7 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
         reset = _invoke_reset(projection)
         assert reset.exit_code == 0, reset.output
         assert json.loads(reset.stdout)["data"]["already_cancelled"] is (n > 0)
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     before = _resume_guard_state(projection)
     checkpoints_before = _checkpoint_rows(projection)
     _forbid_resume(monkeypatch)
@@ -12011,7 +12011,7 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
     }
     assert _resume_guard_state(projection) == before
     assert _checkpoint_rows(projection) == checkpoints_before
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
 
 
 # ── am status integrity (card f63036db) ─────────────────────────────────────
