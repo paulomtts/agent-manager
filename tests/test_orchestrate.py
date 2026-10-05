@@ -8799,6 +8799,351 @@ def test_a_story_preflight_refreshes_git_once_after_every_refusal(
     assert _run_ids(root) == []
 
 
+def test_preflight_story_roots_on_a_done_blockers_tip_when_its_branch_exists(
+    tmp_path, monkeypatch, fake_board
+):
+    """The blocker is carried in the plan, with its own edges cut, so
+    `dag.story_root` can read its tip; it is finished, so it gets no wave.
+    Only the selected story's direct blockers are looked up."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    earlier, _ = _seed_story(fake_board, milestone, "Story E: earlier", status="done")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done", blocked_by=[earlier]
+    )
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    tip = _branch(root, b2)
+    asked = _branches(monkeypatch, {tip})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert _root_of(pre, story) == dag.RootPlan("tip", tip, (blocker,))
+    assert [[planned.story.id for planned in level] for level in pre.levels] == [[story]]
+    assert pre.levels[0][0].bases[s1] == tip
+    assert pre.tips == [{"story": story, "tip": _branch(root, s1)}]
+    assert pre.keys == [f"card:{milestone}", f"card:{story}", f"card:{s1}", f"branch:{_branch(root, s1)}"]
+    assert asked == [tip]
+
+
+def test_preflight_story_roots_on_a_merged_base_for_two_done_blockers_with_tips(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, (a1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    b, (b1,) = _seed_story(fake_board, milestone, "Story B: cells", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[b, a])
+    _branches(monkeypatch, {_branch(root, a1), _branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [a, b, story]
+    selected = pre.plan.stories[-1]
+    assert selected.blocked_by == [a, b]
+    merged = dag.base_branch_name(PREFIX, selected)
+    assert _root_of(pre, story) == dag.RootPlan("merged", merged, (a, b))
+    assert pre.levels[0][0].bases[s1] == merged
+
+
+def test_preflight_story_drops_a_done_blocker_whose_tip_branch_is_absent(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert pre.levels[0][0].bases[s1] == "main"
+    assert asked == [_branch(root, b1)]
+
+
+def test_preflight_story_drops_a_merged_blocker_without_a_branch_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="merged")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+def test_preflight_story_counts_only_kept_blockers_toward_a_merged_base(
+    tmp_path, monkeypatch, fake_board
+):
+    """Two done blockers, one tip present: a dropped blocker does not count
+    toward "two or more", so the story roots on the kept one's tip."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, (a1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    b, (b1,) = _seed_story(fake_board, milestone, "Story B: cells", status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[a, b])
+    asked = _branches(monkeypatch, {_branch(root, a1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [a, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, a1), (a,))
+    assert asked == [_branch(root, a1), _branch(root, b1)]
+
+
+def test_preflight_story_ignores_an_out_of_play_blocker(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="canceled")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+@pytest.mark.parametrize("status", ["todo", "started"])
+def test_preflight_story_refuses_a_story_with_an_open_blocker_before_anything_is_written(
+    tmp_path, monkeypatch, fake_board, status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status=status)
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    monkeypatch.setattr(
+        cli,
+        "refuse_claimed",
+        lambda *args, **kwargs: pytest.fail("claims checked before the blocker refusal"),
+    )
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.story_id == story
+    assert caught.value.blockers == (blocker,)
+    assert f'"Story A: rows" ({blocker})' in str(caught.value)
+    assert str(caught.value).endswith("run them first, or run the milestone")
+    assert asked == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == []
+
+
+def test_preflight_story_refuses_a_blocker_brd_reports_as_blocked(
+    tmp_path, monkeypatch, fake_board
+):
+    """brd derives `blocked` for a todo story with an unfinished blocker; the
+    census reads it as `todo`, so it is open. Only the direct blocker is named."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    first, _ = _seed_story(fake_board, milestone, "Story Z: first")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", blocked_by=[first])
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    assert board.show(blocker, repo_dir=root).status == "blocked"
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.blockers == (blocker,)
+    assert _run_dirs() == []
+
+
+def test_preflight_story_names_every_open_blocker_and_looks_up_no_branch(
+    tmp_path, monkeypatch, fake_board
+):
+    """Two open blockers are both named, in census order; a done blocker
+    beside them is never looked up, because the open check runs first."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a, _ = _seed_story(fake_board, milestone, "Story A: rows", status="started")
+    done, _ = _seed_story(fake_board, milestone, "Story D: done", status="done")
+    b, _ = _seed_story(fake_board, milestone, "Story B: cells")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[b, done, a])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _preflight_story(root, story)
+
+    assert caught.value.blockers == (a, b)
+    assert f'"Story A: rows" ({a})' in str(caught.value)
+    assert f'"Story B: cells" ({b})' in str(caught.value)
+    assert asked == []
+    assert _run_dirs() == []
+    assert _claim_rows(root) == []
+
+
+def test_preflight_story_ignores_a_blocker_outside_the_milestone(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    other = fake_board.add_card("Milestone 4: later")
+    outside, _ = _seed_story(fake_board, other, "Story X: elsewhere")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[outside])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    ("status", "subtask_status"), [("done", "done"), ("todo", "done")]
+)
+def test_preflight_story_with_nothing_to_run_is_not_refused_for_an_open_blocker(
+    tmp_path, monkeypatch, fake_board, status, subtask_status
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows")
+    story, _ = _seed_story(
+        fake_board, milestone, "Story S: cols",
+        status=status, subtask_status=subtask_status, blocked_by=[blocker],
+    )
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert pre.levels == []
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert asked == []
+
+
+# Review focus (see the plan's Review Focus section).
+
+
+def test_preflight_story_counts_a_blocker_listed_twice_once(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, _ = _seed_story(
+        fake_board, milestone, "Story S: cols", blocked_by=[blocker, blocker]
+    )
+    _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [blocker, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, b1), (blocker,))
+
+
+def test_preflight_story_reads_blocker_statuses_case_insensitively(
+    tmp_path, monkeypatch, fake_board
+):
+    """`Done` with its tip present is kept; `MERGED` is dropped unasked."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    done, (d1,) = _seed_story(
+        fake_board, milestone, "Story A: rows", status="Done", subtask_status="done"
+    )
+    merged, (m1,) = _seed_story(
+        fake_board, milestone, "Story B: cells", status="MERGED", subtask_status="merged"
+    )
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[done, merged])
+    asked = _branches(monkeypatch, {_branch(root, d1), _branch(root, m1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [done, story]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, d1), (done,))
+    assert asked == [_branch(root, d1)]
+
+
+def test_preflight_story_drops_a_done_blocker_with_no_subtasks_without_a_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", subtasks=0, status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [planned.id for planned in pre.plan.stories] == [story]
+    assert _root_of(pre, story) == dag.RootPlan("base", "main", ())
+    assert asked == []
+
+
+def test_preflight_story_propagates_a_git_error_from_the_done_rule_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    """A broken repository is a refusal, never a silent base-branch root."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+
+    def broken(at: Path) -> Callable[[str], bool]:
+        def exists(branch: str) -> bool:
+            raise worktree.GitError(
+                "fatal: not a git repository", argv=["rev-parse"], exit_code=128
+            )
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", broken)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(worktree.GitError):
+        _preflight_story(root, story)
+
+    assert _run_dirs() == []
+
+
+def test_preflight_story_judges_only_direct_blockers(tmp_path, monkeypatch, fake_board):
+    """A done blocker that is itself blocked by an open story still roots the
+    story on its tip: only the selected story's own blockers are judged."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    first, _ = _seed_story(fake_board, milestone, "Story Z: first")
+    blocker, (b1,) = _seed_story(
+        fake_board, milestone, "Story A: rows", status="done", blocked_by=[first]
+    )
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch, {_branch(root, b1)})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert _root_of(pre, story) == dag.RootPlan("tip", _branch(root, b1), (blocker,))
+
+
 def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
 

@@ -1700,6 +1700,55 @@ def preflight_milestone(
     )
 
 
+def _restricted_stories(
+    stories: Sequence[census.StoryPlan],
+    selected: census.StoryPlan,
+    *,
+    root: Path,
+    branch_prefix: str,
+) -> list[census.StoryPlan]:
+    """A story run's `plan.stories`: the done blockers `selected` stacks on, then `selected`.
+
+    A story with nothing to run is carried alone, its blockers unjudged. Else
+    its in-milestone blockers (ids of `stories`, census order, each once) are
+    classified by status alone first: any not finished and not out of play is
+    open, and `errors.StoryBlockedError` names every open one before a single
+    branch is looked up. Then a `merged` blocker is dropped, and a `done` one
+    is kept only when it has subtasks and its tip is a local branch of `root`
+    (`_local_branch_exists`, read at call time; a `GitError` propagates). Kept
+    blockers lose their own edges, so `dag.story_root` roots `selected` on
+    their tips alone and never walks past them.
+    """
+    if not dag.remaining_subtasks(selected):
+        return [replace(selected, blocked_by=[])]
+    wanted = set(selected.blocked_by)
+    blockers = [story for story in stories if story.id in wanted]
+    open_blockers = [
+        blocker
+        for blocker in blockers
+        if not census.is_finished(blocker.status)
+        and not census.is_out_of_play(blocker.status)
+    ]
+    if open_blockers:
+        raise errors.StoryBlockedError(
+            selected.id,
+            selected.title,
+            [(blocker.id, blocker.title) for blocker in open_blockers],
+        )
+    exists = _local_branch_exists(root)
+    kept = [
+        blocker
+        for blocker in blockers
+        if blocker.status.lower() == "done"
+        and blocker.subtasks
+        and exists(dag.subtask_branch(branch_prefix, blocker.subtasks[-1]))
+    ]
+    return [
+        *(replace(blocker, blocked_by=[]) for blocker in kept),
+        replace(selected, blocked_by=[blocker.id for blocker in kept]),
+    ]
+
+
 def preflight_story(
     story: str,
     *,
@@ -1713,7 +1762,9 @@ def preflight_story(
 
     A fresh run only. The story is `census.find_story`'s pick
     (`StoryNotFoundError` propagates); the plan is its parent milestone's
-    census, cycle-checked as a milestone run's is, cut to that story. A story
+    census, cycle-checked as a milestone run's is, cut to that story and the
+    done blockers it stacks on (`_restricted_stories`, which refuses an open
+    blocker with `errors.StoryBlockedError` before the claims). A story
     the census dropped (out of play) leaves an empty plan, and a story with
     no remaining subtasks a plan with no wave: nothing to run, not an error.
     Then the claims (`story_claims`) and `cli.refuse_claimed` as the last
@@ -1738,7 +1789,9 @@ def preflight_story(
         )
         stories: list[census.StoryPlan] = []
     else:
-        stories = [replace(selected, blocked_by=[])]
+        stories = _restricted_stories(
+            full.stories, selected, root=root, branch_prefix=branch_prefix
+        )
     plan = census.Census(milestone_title=full.milestone_title, stories=stories)
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = [
