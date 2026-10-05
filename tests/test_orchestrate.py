@@ -8640,6 +8640,33 @@ def test_preflight_story_refuses_a_needle_that_is_not_one_story_before_refreshin
     assert _run_dirs() == []
 
 
+def test_preflight_story_refuses_a_blocker_cycle_elsewhere_in_the_milestone_before_refreshing_git(
+    tmp_path, monkeypatch, fake_board
+):
+    """As for a milestone run, the whole milestone is cycle-checked, even when
+    the selected story is outside the cycle; the census is patched as in
+    test_preflight_milestone_refuses_a_blocker_cycle_before_refreshing_git."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols")
+    a = _plan_story(1, [_plan_subtask(11)], blocked_by=[_plan_id(2)])
+    b = _plan_story(2, [_plan_subtask(21)], blocked_by=[_plan_id(1)])
+    selected = census.StoryPlan(
+        story, "Story S: cols", "todo", [], [census.SubtaskPlan(s1, "Story S: cols subtask 1", "todo")]
+    )
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b, selected]),
+    )
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(dag.DependencyCycleError):
+        _preflight_story(root, story)
+
+    assert _run_dirs() == []
+
+
 def test_preflight_story_restricts_the_plan_levels_and_tips_to_the_selected_story(
     tmp_path, monkeypatch, fake_board
 ):
