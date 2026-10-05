@@ -1637,6 +1637,12 @@ def preflight_milestone(
     run then refreshes git (its first side effect, still before the store),
     reads the clock and mints the run id; a resume keeps its own id and
     refreshes git later, under the lease. The store is never opened here.
+
+    A resumed run whose `config.story_id` is set is a story run: its story
+    must still be a child of the milestone (else `runs.NotResumableError`,
+    before any write and before git), and its plan, levels, tips and claim
+    keys are `_story_plan`'s, as a fresh `preflight_story` computes them,
+    `errors.StoryBlockedError` for a re-opened blocker included.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1649,11 +1655,30 @@ def preflight_milestone(
         milestone_card = census.find_milestone(roots, milestone)
     else:
         milestone_card = find_run_milestone(roots, resumed)
-    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
-    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tree = board.tree(milestone_card.id, repo_dir=root)
+    if resumed is None or resumed.config.story_id is None:
+        plan = census.flatten_milestone(tree)
+        levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
+    else:
+        # A resumed story run keeps its story: the plan is cut exactly as
+        # `preflight_story` cuts a fresh one.
+        story_id = resumed.config.story_id
+        story_card = next((card for card in tree.children if card.id == story_id), None)
+        if story_card is None:
+            raise runs.NotResumableError(
+                f"run {resumed.id!r} runs story {story_id}, and milestone"
+                f" {milestone_card.id} has no story card with that id"
+            )
+        plan, levels, tips, keys = _story_plan(
+            tree,
+            story_card,
+            root=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+        )
     drive = cli.drive_subtask_async if driver is None else driver
-    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
     # The last refusal (X5, X6): read-only, before `refresh_git` and before
     # `Store.open`, so a milestone, remaining subtask or integration branch
     # another live run claims leaves no fetch, prune, run row or run
@@ -1751,6 +1776,48 @@ def _restricted_stories(
     ]
 
 
+def _story_plan(
+    tree: models.CardNode,
+    story: models.CardNode,
+    *,
+    root: Path,
+    base_branch: str,
+    branch_prefix: str,
+) -> tuple[census.Census, list[list[PlannedStory]], list[dict[str, str]], list[str]]:
+    """A story run's `(plan, levels, tips, keys)`, cut from its milestone's `tree`.
+
+    `story` is a child of `tree`. The census of `tree` is cycle-checked as a
+    milestone run's is (`dag.DependencyCycleError`), then cut to `story` and
+    the done blockers it stacks on (`_restricted_stories`, which raises
+    `errors.StoryBlockedError` for an open blocker). A story the census
+    dropped (out of play) leaves an empty plan, and a story with no remaining
+    subtasks a plan with no wave. `tips` names `story` alone; `keys` are
+    `story_claims`, never the integration branch. Read-only, except that
+    `_local_branch_exists` runs git to look up a done blocker's tip.
+    """
+    full = census.flatten_milestone(tree)
+    dag.assert_no_blocker_cycles(full.stories)
+    selected = next((planned for planned in full.stories if planned.id == story.id), None)
+    if selected is None:
+        # Out of play: the census dropped it, so it has nothing to run and
+        # claims only the milestone and story cards.
+        selected = census.StoryPlan(story.id, story.title, story.status, [], [])
+        stories: list[census.StoryPlan] = []
+    else:
+        stories = _restricted_stories(
+            full.stories, selected, root=root, branch_prefix=branch_prefix
+        )
+    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = [
+        tip
+        for tip in story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        if tip["story"] == selected.id
+    ]
+    keys = story_claims(tree.id, selected, branch_prefix)
+    return plan, levels, tips, keys
+
+
 def preflight_story(
     story: str,
     *,
@@ -1778,37 +1845,20 @@ def preflight_story(
     root = runs.resolve_repo_dir(repo_dir)
     roots = board.roots(repo_dir=root)
     match = census.find_story(roots, story)
-    full = census.flatten_milestone(board.tree(match.milestone.id, repo_dir=root))
-    dag.assert_no_blocker_cycles(full.stories)
-    selected = next(
-        (planned for planned in full.stories if planned.id == match.story.id), None
+    plan, levels, tips, keys = _story_plan(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
     )
-    if selected is None:
-        # Out of play: the census dropped it, so it has nothing to run and
-        # claims only the milestone and story cards.
-        selected = census.StoryPlan(
-            match.story.id, match.story.title, match.story.status, [], []
-        )
-        stories: list[census.StoryPlan] = []
-    else:
-        stories = _restricted_stories(
-            full.stories, selected, root=root, branch_prefix=branch_prefix
-        )
-    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
-    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    tips = [
-        tip
-        for tip in story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-        if tip["story"] == selected.id
-    ]
-    keys = story_claims(match.milestone.id, selected, branch_prefix)
     # The last refusal (X5, X6), read-only, as in `preflight_milestone`.
     cli.refuse_claimed(root, keys, run_id=None)
 
     # The first side effect, after every refusal and before any store.
     refresh_git(root)
     started_at = clock()
-    run_id = runs.mint_run_id(selected.id, started_at)
+    run_id = runs.mint_run_id(match.story.id, started_at)
     run_record = models.Run(
         id=run_id,
         workflow=MILESTONE_WORKFLOW,
@@ -1817,7 +1867,7 @@ def preflight_story(
         branch_prefix=branch_prefix,
         status="started",
         started_at=started_at,
-        config=models.RunConfig(max_concurrent_stories=1, story_id=selected.id),
+        config=models.RunConfig(max_concurrent_stories=1, story_id=match.story.id),
         milestone_id=match.milestone.id,
     )
     return MilestonePreflight(

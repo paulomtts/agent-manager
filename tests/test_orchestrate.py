@@ -10130,3 +10130,236 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
     assert integrate_recorder.calls == []
     with pytest.raises(runs.NotResumableError, match="cancelled"):
         _resume(project, run_id, FakeDriver())
+
+
+# ── resuming a story run restores the story ─────────────────────────────────
+# Unit tests here run the resume pre-flight over `_resume_root` and the
+# FakeBoard, with `refresh_git` failing if called and the done-blocker branch
+# lookup stubbed by `_branches`; the git tests drive the engine.
+
+
+def _record_story_run(
+    root: Path, milestone: str, story: str, *, status: str = "escalated"
+) -> None:
+    """A story run of `story` under `milestone`, recorded as `preflight_story` records one."""
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_run(
+            models.Run(
+                id=RESUME_RUN_ID,
+                workflow="milestone",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status=status,
+                config=models.RunConfig(max_concurrent_stories=1, story_id=story),
+                milestone_id=milestone,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _resume_preflight(root: Path) -> Any:
+    """`preflight_milestone` resuming `RESUME_RUN_ID`, as `am resume` reaches it."""
+    return orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+
+
+def test_a_resumed_story_run_cuts_its_plan_to_the_recorded_story(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1, b2) = _seed_story(
+        fake_board, milestone, "Story A: rows", subtasks=2, status="done"
+    )
+    story, (s1, s2) = _seed_story(
+        fake_board, milestone, "Story S: cols", subtasks=2, blocked_by=[blocker]
+    )
+    _seed_story(fake_board, milestone, "Story T: other")
+    tip = _branch(root, b2)
+    _branches(monkeypatch, {tip})
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_story_run(root, milestone, story)
+
+    pre = _resume_preflight(root)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [
+        (blocker, []),
+        (story, [blocker]),
+    ]
+    assert [[planned.story.id for planned in level] for level in pre.levels] == [[story]]
+    assert pre.levels[0][0].bases[s1] == tip
+    assert pre.tips == [{"story": story, "tip": _branch(root, s2)}]
+    assert pre.keys == orchestrate.story_claims(milestone, pre.plan.stories[-1], PREFIX)
+    assert f"branch:{INTEGRATION_BRANCH}" not in pre.keys
+    assert pre.run_id == RESUME_RUN_ID
+    assert pre.resumed is not None
+    assert pre.run_record.config.story_id == story
+    assert (pre.run_record.status, pre.run_record.milestone_id) == ("started", milestone)
+    assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
+
+
+def test_a_resumed_story_run_roots_on_the_base_when_its_blockers_tip_is_gone(
+    tmp_path, monkeypatch, fake_board
+):
+    """The done blocker's tip branch was deleted after the first run: the
+    blocker is dropped and the story roots on `main`, not on a missing branch."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, (_b1,) = _seed_story(fake_board, milestone, "Story A: rows", status="done")
+    story, (s1,) = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_story_run(root, milestone, story)
+
+    pre = _resume_preflight(root)
+
+    assert [(planned.id, planned.blocked_by) for planned in pre.plan.stories] == [(story, [])]
+    assert pre.levels[0][0].bases[s1] == "main"
+
+
+def test_a_resumed_milestone_run_without_a_story_keeps_the_whole_milestone_plan(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone, story, subtask = _seam_resume_board(fake_board)
+    other, (o1,) = _seed_story(fake_board, milestone, "Story O: other")
+    _record_resume_run(root)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    def no_story_plan(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a milestone run's resume took the story path")
+
+    monkeypatch.setattr(orchestrate, "_story_plan", no_story_plan)
+
+    pre = _resume_preflight(root)
+
+    assert {planned.id for planned in pre.plan.stories} == {story, other}
+    assert sorted(pre.keys) == _expected_claims(milestone, [subtask, o1])
+    assert pre.run_record.config.story_id is None
+
+
+@pytest.mark.parametrize("where", ["deleted", "reparented"])
+def test_a_resumed_story_run_whose_story_left_the_milestone_is_not_resumable(
+    tmp_path, monkeypatch, fake_board, where
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    _seed_story(fake_board, milestone, "Story A: rows")
+    elsewhere = fake_board.add_card("Milestone 4: elsewhere")
+    moved, _ = _seed_story(fake_board, elsewhere, "Story M: moved")
+    story = {"deleted": "00000000-0000-4000-8000-00000000dead", "reparented": moved}[where]
+    _record_story_run(root, milestone, story)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    before = _runs_tree()
+
+    with pytest.raises(runs.NotResumableError) as caught:
+        _resume_preflight(root)
+
+    assert RESUME_RUN_ID in str(caught.value)
+    assert story in str(caught.value)
+    assert _runs_tree() == before
+    assert _load(root, RESUME_RUN_ID).status == "escalated"
+
+
+def test_a_resumed_story_run_whose_blocker_was_reopened_is_refused_before_git(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker, _ = _seed_story(fake_board, milestone, "Story A: rows", status="started")
+    story, _ = _seed_story(fake_board, milestone, "Story S: cols", blocked_by=[blocker])
+    _record_story_run(root, milestone, story)
+    asked = _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    with pytest.raises(errors.StoryBlockedError) as caught:
+        _resume_preflight(root)
+
+    assert caught.value.story_id == story
+    assert caught.value.blockers == (blocker,)
+    assert asked == []
+
+
+@pytest.mark.git
+def test_am_resume_of_an_escalated_story_run_finishes_only_that_story(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    first = _run_story(project, story_a, FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    run_id = first["run_id"]
+    driver = FakeDriver()
+
+    result = _resume(project, run_id, driver)
+
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert result["levels"] == [{"level": 0, "stories": [story_a]}]
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    run = _load(project, run_id)
+    assert run.status == "done"
+    assert run.config.story_id == story_a
+    assert run.milestone_id == shape["milestone"]
+
+
+@pytest.mark.git
+def test_a_paused_story_run_parks_and_its_resume_finishes_only_that_story(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 2, "B": 1})
+    story_a = shape["stories"]["A"]
+    a1, a2 = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(story_a, STARTED_AT)
+    gated = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "pause")})
+
+    paused = _run_story(project, story_a, gated, control_interval=0)
+
+    assert paused == {
+        "paused": True,
+        "run_id": run_id,
+        "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
+        "completed": [],
+        "pending": [],
+        "warnings": [],
+        "resume": f"am resume {run_id}",
+    }
+    assert _load(project, run_id).status == "stopped"
+    driver = FakeDriver()
+
+    result = _resume(project, run_id, driver, control_interval=0)
+
+    assert [call["card"] for call in driver.calls] == [a1, a2]
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, run_id).status == "done"
+
+
+@pytest.mark.git
+def test_resuming_a_story_run_whose_escalated_subtask_was_finished_by_hand_is_a_no_op(
+    project, integrate_recorder
+):
+    shape = _milestone(project, {"A": 1, "B": 1})
+    story_a = shape["stories"]["A"]
+    (a1,) = shape["subtasks"]["A"]
+    first = _run_story(project, story_a, FakeDriver(outcomes={a1: ("review", "boom")}))
+    assert first["escalated"] is True, first
+    board.set_status(a1, "done", repo_dir=project)
+    driver = FakeDriver()
+
+    result = _resume(project, first["run_id"], driver)
+
+    assert driver.calls == []
+    assert result["done"] is True, result
+    assert result["resumed"] is True
+    assert (result["completed"], result["levels"]) == ([], [])
+    assert "integrated" not in result
+    assert integrate_recorder.calls == []
+    assert _load(project, first["run_id"]).status == "done"
