@@ -819,7 +819,7 @@ def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
     subtask rows always keep `summary.status`.
     """
     if stop.requested == "cancel":
-        return "cancelled"
+        return models.CANCELED
     return summary.status
 
 
@@ -900,12 +900,12 @@ def card_outcome_comment(
     branch: str,
     token: str,
 ) -> comments.Comment | None:
-    """The one board comment a `run --card` walk leaves on its card, or None (card 5d9a875f).
+    """The one board comment a `run --card` walk leaves on its card, or None.
 
     Chosen by `summary.status`, so a cancel that met an escalation comments
     the escalation: `done` is the done comment, `escalated` the escalation
     keyed by this life's lease `token`, and `stopped` under a cancel the
-    cancelled comment with the `am run --card` relaunch. A stop under a pause
+    cancel comment with the `am run --card` relaunch. A stop under a pause
     is resumed, not closed, so it gets None. Never a story or milestone comment.
     """
     if summary.status == "done":
@@ -923,7 +923,7 @@ def card_outcome_comment(
             reason=comments.agent_reason(summary.results, failed_phase),
         )
     if stop.requested == "cancel":
-        return comments.compose_cancelled(
+        return comments.compose_canceled(
             run_id=run_id,
             card_id=card.id,
             before_phase=summary.before_phase,
@@ -1176,7 +1176,7 @@ def run_card(
     which polls for `am pause`/`am cancel` every `control_interval` seconds
     and turns one into `stop.request`. A pause parks the walk before its next
     phase (`stopped`, resumable); a cancel parks it the same way and records
-    the run `cancelled` (`card_run_status`). No control cancels a running phase.
+    the run `canceled` (`card_run_status`). No control cancels a running phase.
     The lease and claim are released before `store.close()` on every exit.
 
     Board comments (card 5d9a875f): once the rows are recorded, still under
@@ -2863,7 +2863,7 @@ def _resume_from_checkpoint(
     `control.Lease` with the `card:<id>` claim (`run_lease`); a dead holder it
     took over is reported under `took_over`. The walk runs under
     `control.controlled`. A pause parks it `stopped`; a cancel parks it and
-    records the run `cancelled` (`card_run_status`).
+    records the run `canceled` (`card_run_status`).
 
     Once the checkpoint is accepted, the run's pending board comments are
     flushed (board-comments B7) and their warnings lead the payload's. Next
@@ -3030,7 +3030,7 @@ def resume_run(
         # refusal leaves no run directory, row or journal line behind.
         if models.is_canceled(run.status):
             raise NotResumableError(
-                f"run {run.id} was cancelled; start new work with `am run --milestone`"
+                f"run {run.id} was canceled; start new work with `am run --milestone`"
             )
         lease = store_module.read_lease(conn, run.id)
         now = _utcnow()
@@ -3322,17 +3322,17 @@ def _not_resettable_error(run_id: str) -> NotResettableError:
 
 
 def _reset_message(run_id: str, *, already: bool) -> str:
-    """What `am reset` tells the operator about `run_id` (am-reset §3.5)."""
+    """What `am reset` tells the operator about `run_id`."""
     if already:
-        return f"run {run_id} was already cancelled; nothing was written"
+        return f"run {run_id} was already canceled; nothing was written"
     return (
-        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        f"run {run_id} is canceled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
     )
 
 
 def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
-    """Close a run nobody is driving by recording it `cancelled` (am-reset §3.2-3.3).
+    """Close a run nobody is driving by recording it `canceled`.
 
     The run is loaded read-only, exactly as `resume_run` loads it. Refused, in
     order and before `Store.open`: an unknown run (`UnknownRunError`), a run a
@@ -3340,16 +3340,16 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     finished one (`NotResettableError`). Then, as `_resume_from_checkpoint`
     does up to its first write and no further: `Store.open`, the run's own
     lease with no claims (a reset drives no card and no branch), and one
-    fenced `record_run` of `cancelled`. No checkpoint row is written or
+    fenced `record_run` of `canceled`. No checkpoint row is written or
     deleted, and no other row is touched. `cards` then reports each
     `(card_id, workflow)` the run checkpointed and, by
     `Store.latest_open_checkpoint`, which other run (if any) a relaunch
     would still continue it from (`open_in`). The lease is released and the
     store closed on every exit.
 
-    A run already canceled, in either spelling, is not refused: the lease is
-    taken and released around the check, and nothing is journalled
-    (`already_cancelled: true`).
+    A run already canceled, in either stored spelling, is not refused: the
+    lease is taken and released around the check, and nothing is journalled
+    (`already_canceled: true`).
     A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
@@ -3386,7 +3386,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
                 raise _not_resettable_error(run.id)
             already = models.is_canceled(current.status)
             if not already:
-                store.record_run(current.model_copy(update={"status": "cancelled"}))
+                store.record_run(current.model_copy(update={"status": models.CANCELED}))
         # After the status write (or the no-op): each `(card_id, workflow)` the
         # run checkpointed, with the run a relaunch would continue it from by
         # the newest-row rule -- `null` unless that is another run (§3.5).
@@ -3409,8 +3409,8 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "run_id": run.id,
         "previous_status": current.status,
-        "status": "cancelled",
-        "already_cancelled": already,
+        "status": models.CANCELED,
+        "already_canceled": already,
         "cards": cards,
         "message": _reset_message(run.id, already=already),
     }
@@ -3434,7 +3434,7 @@ def reset(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Close a run nobody is driving: record it cancelled under its own lease.
+    """Close a run nobody is driving: record it canceled under its own lease.
 
     A running run wants `am cancel` instead; a finished one needs nothing.
     """

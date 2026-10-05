@@ -218,7 +218,7 @@ def compose_done(
     return Comment(card_id=card_id, key=comment_key, body=body)
 
 
-def compose_cancelled(
+def compose_canceled(
     *,
     run_id: str,
     card_id: str,
@@ -226,7 +226,11 @@ def compose_cancelled(
     branch: str,
     relaunch: str,
 ) -> Comment:
-    """A subtask a cancel left `in_progress`: where it stopped, its branch, how to relaunch (B2)."""
+    """A subtask a cancel left `in_progress`: where it stopped, its branch, how to relaunch.
+
+    Its key keeps the legacy `cancelled` spelling, so a cancel comment an
+    older `am` queued or posted is the same comment and is never posted twice.
+    """
     lines: list[str] = []
     if before_phase is not None:
         lines.append(f"stopped before: {before_phase}")
@@ -234,7 +238,10 @@ def compose_cancelled(
     lines.append(f"relaunch: {_cmd(relaunch)}")
     comment_key = key(run_id, card_id, "cancelled")
     body = _render(
-        f"am · cancelled · run {run_id}", lines, f"am-key: {comment_key}", see=f"am status {run_id}"
+        f"am · {models.CANCELED} · run {run_id}",
+        lines,
+        f"am-key: {comment_key}",
+        see=f"am status {run_id}",
     )
     return Comment(card_id=card_id, key=comment_key, body=body)
 
@@ -286,7 +293,7 @@ def _next_command(
     integrated: str | None,
 ) -> str | None:
     """What a human runs next: relaunch, resume, or merge the integrated branch."""
-    if outcome == "cancelled" or integrate_failed:
+    if outcome == models.CANCELED or integrate_failed:
         return f"am run --milestone {milestone_id}"
     if outcome in ("escalated", "paused"):
         return f"am resume {run_id}"
@@ -305,7 +312,7 @@ def compose_run_end(
     """The milestone card's run-end comment, read from `run_milestone`'s payload.
 
     A cancel, set under either of its keys (`canceled`, `cancelled`), wins
-    over every other outcome and reads as `cancelled`; then `escalated`,
+    over every other outcome and reads as `canceled`; then `escalated`,
     `paused`, `done`. An Integrate escalation is told apart from a lane one by
     its `phase` key with no `failed_phase`. `total` (the milestone's subtask
     count) is the caller's addition; without it the count stands alone. An
@@ -313,7 +320,7 @@ def compose_run_end(
     never fails a run.
     """
     if any(payload.get(name) for name in models.CANCELED_STATUSES):
-        outcome = models.LEGACY_CANCELED
+        outcome = models.CANCELED
     else:
         outcome = next((name for name in _RUN_OUTCOMES if payload.get(name)), "ended")
     integrate_failed = (
