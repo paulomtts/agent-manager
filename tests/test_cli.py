@@ -13061,8 +13061,8 @@ PAUSED_STORY = {
     "resume": f"am resume {STORY_RUN_ID}",
 }
 
-CANCELLED_STORY = {
-    "cancelled": True,
+CANCELED_STORY = {
+    "canceled": True,
     "run_id": STORY_RUN_ID,
     "stopped": [],
     "completed": [],
@@ -13208,7 +13208,7 @@ def test_an_escalated_story_run_exits_escalated(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELLED_STORY]
+    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELED_STORY]
 )
 def test_a_stopped_or_nothing_to_run_story_exits_0(tmp_path, monkeypatch, payload):
     """None of these carries a `status` key: the rule must not index one."""

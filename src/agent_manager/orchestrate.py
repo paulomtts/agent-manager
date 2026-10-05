@@ -180,7 +180,7 @@ def controlled_payload(
 ) -> dict[str, Any]:
     """The result of a run a control ended (live control C12), outcomes in wave order.
 
-    `paused` or `cancelled`, then `run_id`, `stopped` (census order, the
+    `paused` or `canceled`, then `run_id`, `stopped` (census order, the
     `escalated_payload` row shape), `completed` (every lane's finished
     subtasks, wave order), `pending` (story ids) and `warnings`. A pause adds
     the `resume` hint. A cancel adds `escalations` only when a lane really
@@ -189,7 +189,7 @@ def controlled_payload(
     escalation.
     """
     payload: dict[str, Any] = {
-        "paused" if command == "pause" else "cancelled": True,
+        "paused" if command == "pause" else models.CANCELED: True,
         "run_id": run_id,
         "stopped": [stopped_row(outcome) for outcome in outcomes if outcome.kind == "stopped"],
         "completed": [subtask for outcome in outcomes for subtask in outcome.completed],

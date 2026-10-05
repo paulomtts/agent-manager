@@ -290,7 +290,7 @@ def test_a_paused_milestone_resumes_with_nothing_dispatched_twice(
     assert paused["paused"] is True, paused
     assert paused["run_id"] == run_id
     assert paused["resume"] == f"am resume {run_id}"
-    assert "cancelled" not in paused
+    assert "canceled" not in paused and "cancelled" not in paused, paused
     assert not CONTROL_KEYS_NEVER_PRESENT & set(paused), paused
     assert _status(root, run_id) == "stopped"
     assert INTEGRATION_BRANCH not in _local_branches(root)
@@ -354,11 +354,12 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
 
     # Cancelled: exit 0, no resume hint, never an escalation, never Integrate (C6).
     assert first.exit_code == 0, (first.output, first.exception)
-    cancelled = _envelope(first)
-    assert cancelled["cancelled"] is True, cancelled
-    assert cancelled["run_id"] == run_id
-    assert "resume" not in cancelled and "paused" not in cancelled, cancelled
-    assert not CONTROL_KEYS_NEVER_PRESENT & set(cancelled), cancelled
+    canceled = _envelope(first)
+    assert canceled["canceled"] is True, canceled
+    assert "cancelled" not in canceled, canceled
+    assert canceled["run_id"] == run_id
+    assert "resume" not in canceled and "paused" not in canceled, canceled
+    assert not CONTROL_KEYS_NEVER_PRESENT & set(canceled), canceled
     assert _status(root, run_id) == "canceled"
     assert INTEGRATION_BRANCH not in _local_branches(root)
     # a1 parked after its held plan: explore..plan once, nothing after.
