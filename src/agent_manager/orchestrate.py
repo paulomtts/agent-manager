@@ -31,6 +31,11 @@ The order is load-bearing. Everything that can refuse -- an unknown milestone,
 a blocker cycle -- runs before the first write, so a refusal leaves no run
 directory, no store, no fetch and no prune behind.
 
+`preflight_story` is the same stage 1 for one story of a milestone: it
+returns a `MilestonePreflight` whose plan holds only that story and the done
+blockers it stacks on, and refuses an open blocker (`errors.StoryBlockedError`)
+before the claims, so the existing engine runs it unchanged.
+
 The run helpers S1 moved out of the Typer module (`RunnerFactory`, the resume
 error types, `mint_run_id`, `resolve_repo_dir`, `worktree_for`,
 `orphan_attempts`, `continuable_checkpoint`) are read off `runs`. `cli` is
@@ -67,6 +72,7 @@ from agent_manager import (
     control,
     dag,
     detach,
+    errors,
     integration,
     models,
     paths,
@@ -1691,6 +1697,88 @@ def preflight_milestone(
         run_id=run_id,
         run_record=run_record,
         drive=drive,
+    )
+
+
+def preflight_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    clock: Callable[[], datetime] = _utcnow,
+    driver: Driver | None = None,
+) -> MilestonePreflight:
+    """Stage 1 of a story run: `preflight_milestone`'s result, its plan cut to one story.
+
+    A fresh run only. The story is `census.find_story`'s pick
+    (`StoryNotFoundError` propagates); the plan is its parent milestone's
+    census, cycle-checked as a milestone run's is, cut to that story. A story
+    the census dropped (out of play) leaves an empty plan, and a story with
+    no remaining subtasks a plan with no wave: nothing to run, not an error.
+    Then the claims (`story_claims`) and `cli.refuse_claimed` as the last
+    refusal. Everything up to there is read-only; `refresh_git` is the first
+    side effect, then the clock and the run id, minted from the story's id.
+    The run is recorded as a milestone run of the parent milestone, one
+    story at a time, with `RunConfig.story_id` naming the story.
+    """
+    root = runs.resolve_repo_dir(repo_dir)
+    roots = board.roots(repo_dir=root)
+    match = census.find_story(roots, story)
+    full = census.flatten_milestone(board.tree(match.milestone.id, repo_dir=root))
+    dag.assert_no_blocker_cycles(full.stories)
+    selected = next(
+        (planned for planned in full.stories if planned.id == match.story.id), None
+    )
+    if selected is None:
+        # Out of play: the census dropped it, so it has nothing to run and
+        # claims only the milestone and story cards.
+        selected = census.StoryPlan(
+            match.story.id, match.story.title, match.story.status, [], []
+        )
+        stories: list[census.StoryPlan] = []
+    else:
+        stories = [replace(selected, blocked_by=[])]
+    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = [
+        tip
+        for tip in story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        if tip["story"] == selected.id
+    ]
+    keys = story_claims(match.milestone.id, selected, branch_prefix)
+    # The last refusal (X5, X6), read-only, as in `preflight_milestone`.
+    cli.refuse_claimed(root, keys, run_id=None)
+
+    # The first side effect, after every refusal and before any store.
+    refresh_git(root)
+    started_at = clock()
+    run_id = runs.mint_run_id(selected.id, started_at)
+    run_record = models.Run(
+        id=run_id,
+        workflow=MILESTONE_WORKFLOW,
+        repo_dir=root,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        status="started",
+        started_at=started_at,
+        config=models.RunConfig(max_concurrent_stories=1, story_id=selected.id),
+        milestone_id=match.milestone.id,
+    )
+    return MilestonePreflight(
+        root=root,
+        resumed=None,
+        milestone_card=match.milestone,
+        plan=plan,
+        levels=levels,
+        tips=tips,
+        keys=keys,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=1,
+        run_id=run_id,
+        run_record=run_record,
+        drive=cli.drive_subtask_async if driver is None else driver,
     )
 
 
