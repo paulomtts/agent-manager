@@ -4429,6 +4429,114 @@ def test_latest_open_checkpoint_skips_a_cancelled_runs_row_when_it_is_not_newest
     assert found == older
 
 
+CANCEL_SPELLINGS = pytest.mark.parametrize(
+    "status",
+    [models.CANCELED, models.LEGACY_CANCELED],
+    ids=["canceled", "cancelled"],
+)
+
+
+@CANCEL_SPELLINGS
+def test_latest_open_checkpoint_closes_card_of_run_in_either_spelling(repo, status):
+    # Newest-row rule: the newest row of c1 belongs to a canceled run.
+    _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r2", status, "c1", reason="parked", saved_at=_at(1))
+    # Filter rule: c3's newest row is open (another workflow, a live run), so the
+    # card is not closed, but the canceled run's parked row is skipped.
+    older = _checkpoint_in_run(repo, "run-r3", "stopped", "c3", reason="turn", saved_at=_at(0))
+    _checkpoint_in_run(repo, "run-r4", status, "c3", reason="parked", saved_at=_at(1))
+    _checkpoint_in_run(
+        repo, "run-r5", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(2)
+    )
+    # Controls: an unrelated card in a live run, and one whose run has no `runs` row.
+    unrelated = _checkpoint_in_run(
+        repo, "run-r6", "stopped", "c2", reason="parked", saved_at=_at(0)
+    )
+    unrecorded_run = store.Store.open(repo, "run-r7")
+    try:
+        unrecorded = _save_checkpoint(unrecorded_run, "c4", reason="parked", saved_at=_at(0))
+    finally:
+        unrecorded_run.close()
+
+    st = store.Store.open(repo, "run-r8")
+    try:
+        closed = st.latest_open_checkpoint("c1", "task")
+        filtered = st.latest_open_checkpoint("c3", "task")
+        found = st.latest_open_checkpoint("c2", "task")
+        found_unrecorded = st.latest_open_checkpoint("c4", "task")
+    finally:
+        st.close()
+
+    assert closed is None
+    assert filtered == older
+    assert found == unrelated
+    assert found_unrecorded == unrecorded
+
+
+def test_latest_open_checkpoint_with_both_spellings_present(repo):
+    # c1: an older live run, then a `cancelled` run, then a newer `canceled` run.
+    _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
+    _checkpoint_in_run(
+        repo, "run-r2", models.LEGACY_CANCELED, "c1", reason="parked", saved_at=_at(1)
+    )
+    _checkpoint_in_run(repo, "run-r3", models.CANCELED, "c1", reason="parked", saved_at=_at(2))
+    # c3: the same history, topped by a newer open row of another workflow.
+    older = _checkpoint_in_run(repo, "run-r4", "stopped", "c3", reason="turn", saved_at=_at(0))
+    _checkpoint_in_run(
+        repo, "run-r5", models.LEGACY_CANCELED, "c3", reason="parked", saved_at=_at(1)
+    )
+    _checkpoint_in_run(repo, "run-r6", models.CANCELED, "c3", reason="parked", saved_at=_at(2))
+    _checkpoint_in_run(
+        repo, "run-r7", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(3)
+    )
+
+    st = store.Store.open(repo, "run-r8")
+    try:
+        closed = st.latest_open_checkpoint("c1", "task")
+        filtered = st.latest_open_checkpoint("c3", "task")
+    finally:
+        st.close()
+
+    assert closed is None
+    assert filtered == older
+
+
+@pytest.mark.parametrize("near_miss", ["Canceled", "CANCELLED", " canceled", "canceled "])
+def test_latest_open_checkpoint_ignores_a_near_miss_cancel_status(repo, near_miss):
+    # `models.Status` refuses these on write, so only a hand-edited row holds one.
+    parked = _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
+    conn = store.open_db(repo)
+    try:
+        conn.execute("UPDATE runs SET status = ? WHERE id = ?", (near_miss, "run-r1"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    st = store.Store.open(repo, "run-r2")
+    try:
+        found = st.latest_open_checkpoint("c1", "task")
+    finally:
+        st.close()
+
+    assert found == parked
+
+
+@pytest.mark.parametrize(
+    "status", ["stopped", "started", "failed", "escalated", "done", "pending"]
+)
+def test_latest_open_checkpoint_returns_rows_of_runs_in_any_other_status(repo, status):
+    _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="turn", saved_at=_at(0))
+    parked = _checkpoint_in_run(repo, "run-r2", status, "c1", reason="parked", saved_at=_at(1))
+
+    st = store.Store.open(repo, "run-r3")
+    try:
+        found = st.latest_open_checkpoint("c1", "task")
+    finally:
+        st.close()
+
+    assert found == parked
+
+
 def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     st = store.Store.open(repo, RUN_ID)
     other = store.open_db(repo)
@@ -4468,6 +4576,55 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
 
     assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "cancelled")]
     assert status == "cancelled"
+
+
+def test_replay_old_journal_with_legacy_cancelled(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    # The journal an old `am` wrote for a run it canceled.
+    journal_path = store.Journal(RUN_ID).path
+    records = [json.loads(text) for text in journal_path.read_text().splitlines()]
+    upserts = [record for record in records if record["event"] == "run_upsert"]
+    assert upserts
+    for record in upserts:
+        record["payload"]["status"] = models.LEGACY_CANCELED
+    journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt.rebuild_from_journal(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert models.is_canceled(store.replay(store.Journal(RUN_ID).read()).status)
+    assert _diverging_now(repo) == []
+
+
+@CANCEL_SPELLINGS
+def test_rebuild_from_journal_with_either_spelling(repo, status):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run_with_status(repo, RUN_ID, status))
+    finally:
+        st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt.rebuild_from_journal(RUN_ID)
+        loaded = rebuilt.load_run(RUN_ID)
+        summaries = store.list_runs(rebuilt.connection)
+    finally:
+        rebuilt.close()
+
+    assert loaded is not None
+    assert loaded.status == status
+    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, status)]
 
 
 # -- run claims, lease takeover and fencing ----------------------------------------
