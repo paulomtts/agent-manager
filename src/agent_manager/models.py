@@ -23,13 +23,38 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 Status = Literal[
-    "pending", "started", "done", "failed", "escalated", "stopped", "cancelled"
+    "pending",
+    "started",
+    "done",
+    "failed",
+    "escalated",
+    "stopped",
+    "cancelled",
+    "canceled",
 ]
 """Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
-state resume keys off (§9). `stopped` (addendum P4) is a clean stop on request
-between phases: it is not `failed`, and relaunching the same command continues
-it. `cancelled` (live control, C9) is a run closed for good by `am cancel`: its
-checkpoints are never continued and it is never resumed."""
+state resume keys off. `stopped` is a clean stop on request between phases: it
+is not `failed`, and relaunching the same command continues it. `canceled` and
+`cancelled` both mean a run closed for good: its checkpoints are never
+continued and it is never resumed. `cancelled` is the legacy spelling."""
+
+CANCELED = "canceled"
+"""The run-cancel status."""
+
+LEGACY_CANCELED = "cancelled"
+"""The legacy spelling of `CANCELED`, still accepted wherever a status is read."""
+
+CANCELED_STATUSES: frozenset[str] = frozenset({CANCELED, LEGACY_CANCELED})
+"""Every spelling of the run-cancel status."""
+
+
+def is_canceled(status: str | None) -> bool:
+    """Whether `status` is a run-cancel status, in either spelling.
+
+    Exact match only: no case folding or stripping. `None` is not canceled.
+    """
+    return status in CANCELED_STATUSES
+
 
 PhaseKind = Literal["agent", "deterministic"]
 """§5: a phase either dispatches a harness or runs a registered function."""
