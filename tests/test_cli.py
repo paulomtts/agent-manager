@@ -317,24 +317,49 @@ def test_the_status_payload_survives_render_with_its_paths():
     assert data["rows"] == []
 
 
-def test_the_status_header_is_the_runs_identity_and_not_its_config():
-    """The spec's seven identity fields, and `config` is not one of them: the
-    header is what `runs` prints for the same run, and a workflow's whole config
-    blob in it would drown the reading and let the two commands disagree."""
+STATUS_HEADER_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "story_id",
+}
+"""`am status`'s `data.run`: `cli.RUN_IDENTITY`'s seven names plus `story_id`."""
+
+CONFIG_ONLY_KEYS = {"config", "max_concurrent_stories", "dry_run", "launcher", "harness_map"}
+"""`config` and its fields other than `story_id`, none of which the header shows."""
+
+
+def test_the_status_header_is_the_runs_identity_plus_story_id_and_not_its_config():
+    """The spec's seven identity fields plus `story_id`, and `config` is not one
+    of them: the header is what `runs` prints for the same run, and a
+    workflow's whole config blob in it would drown the reading and let the two
+    commands disagree."""
     run = _pure_run([])
     run.config = models.RunConfig(max_concurrent_stories=4, dry_run=True)
 
     payload = cli.status_payload(run)
 
-    assert set(payload["run"]) == {
-        "id",
-        "workflow",
-        "repo_dir",
-        "base_branch",
-        "branch_prefix",
-        "status",
-        "started_at",
-    }
+    assert set(payload["run"]) == STATUS_HEADER_KEYS
+    assert not CONFIG_ONLY_KEYS & set(payload["run"])
+    assert payload["run"]["story_id"] is None
+
+
+def test_the_status_header_of_a_story_run_carries_its_story_id_through_render():
+    story = "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+    run = _pure_run([])
+    run.workflow = "milestone"
+    run.config = models.RunConfig(max_concurrent_stories=1, story_id=story)
+
+    payload = cli.status_payload(run)
+    data = json.loads(cli.render(cli.ok_envelope(payload)))["data"]
+
+    assert payload["run"]["story_id"] == story
+    assert data["run"]["story_id"] == story
+    assert set(data["run"]) == STATUS_HEADER_KEYS
 
 
 def _pure_subtask(card_id: str, phases: list[models.PhaseRun]) -> models.SubtaskRun:
@@ -4388,11 +4413,13 @@ def _record(
     with_phases: bool = True,
     workflow: str = "task",
     milestone_id: str | None = None,
+    story_id: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
     in `root`'s projection, written the only way this program writes rows. The
     defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
-    `milestone_id` for a milestone-shaped one."""
+    `milestone_id` for a milestone-shaped one, plus a `story_id` for a
+    story-shaped one."""
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -4404,6 +4431,7 @@ def _record(
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
+                config=models.RunConfig(story_id=story_id),
                 milestone_id=milestone_id,
             )
         )
@@ -4670,6 +4698,7 @@ def test_runs_shows_a_card_runs_card_id_and_a_null_milestone_id(projection):
     [entry] = json.loads(result.stdout)["data"]["runs"]
     assert entry["card_id"] == "card-1"
     assert entry["milestone_id"] is None
+    assert entry["story_id"] is None
 
 
 def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection):
@@ -4690,13 +4719,67 @@ def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection)
     assert entry["workflow"] == "milestone"
     assert entry["milestone_id"] == RUNS_MILESTONE_ID
     assert entry["card_id"] is None
+    assert entry["story_id"] is None
 
 
-def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_and_progress(projection):
+RUNS_STORY_ID = "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+
+
+def test_runs_shows_a_story_runs_story_id_its_milestone_id_and_no_card_id(projection):
+    """A story run is a `milestone` run with a subtask row: it lists the parent
+    milestone's id and never a `card_id`."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["story_id"] == RUNS_STORY_ID
+    assert entry["workflow"] == "milestone"
+    assert entry["milestone_id"] == RUNS_MILESTONE_ID
+    assert entry["card_id"] is None
+
+
+def test_status_on_a_story_run_shows_its_story_id_and_no_config(projection):
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection,
+        run_id,
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
+    )
+
+    result = runner.invoke(cli.app, ["status", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    header = json.loads(result.stdout)["data"]["run"]
+    assert header["story_id"] == RUNS_STORY_ID
+    assert header["workflow"] == "milestone"
+    assert set(header) == STATUS_HEADER_KEYS
+
+
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_id_lease_and_progress(projection):
     _record(
         projection,
         "20260921T090000Z-cbe34d00",
         started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260922T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
     )
     _record(
         projection,
@@ -4716,9 +4799,14 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_
         assert set(envelope) == {"ok", "data"}
         assert envelope["ok"] is True
         assert set(envelope["data"]) == {"runs"}
-        assert len(envelope["data"]["runs"]) == 2
+        assert len(envelope["data"]["runs"]) == 3
         for entry in envelope["data"]["runs"]:
             assert set(entry) == RUNS_ENTRY_KEYS
+        assert [entry["story_id"] for entry in envelope["data"]["runs"]] == [
+            None,
+            RUNS_STORY_ID,
+            None,
+        ]
 
 
 RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"

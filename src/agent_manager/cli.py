@@ -212,9 +212,11 @@ RUN_IDENTITY = (
     "started_at",
 )
 """The run's own fields, without `config` and without the tree below it. §10's
-`status` header is these seven names. Each `runs` entry carries the same seven,
-plus `milestone_id`, `card_id`, `lease` and `progress` (a superset), so the two
-commands still describe a run's identity the same way."""
+`status` header is these seven names plus `story_id`, which is the run's
+`config.story_id` (`None` unless the run is an `am run --story` run) and the
+only part of `config` the header shows. Each `runs` entry carries the same
+seven, plus `milestone_id`, `card_id`, `story_id`, `lease` and `progress` (a
+superset), so the two commands still describe a run's identity the same way."""
 
 
 def status_rows(run: models.Run) -> list[dict[str, Any]]:
@@ -368,7 +370,10 @@ def status_payload(
     """
     tree = run.model_dump()
     return {
-        "run": {field: tree[field] for field in RUN_IDENTITY},
+        "run": {
+            **{field: tree[field] for field in RUN_IDENTITY},
+            "story_id": run.config.story_id,
+        },
         "stories": tree["stories"],
         "rows": status_rows(run),
         "control": {"lease": None, "requests": [], "claims": []}
