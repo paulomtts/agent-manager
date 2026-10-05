@@ -3335,6 +3335,102 @@ def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):
     assert after == returned
 
 
+STORY_ID = "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+
+
+def _with_story(run: models.Run, story_id: str | None) -> models.Run:
+    return run.model_copy(
+        update={"config": run.config.model_copy(update={"story_id": story_id})}
+    )
+
+
+def test_a_runs_config_story_id_round_trips_through_the_row_and_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_story(_run(repo), STORY_ID))
+        via_store = st.load_run(RUN_ID)
+        via_connection = store.load_run(st.connection, RUN_ID)
+        row = st.connection.execute(
+            "SELECT config FROM runs WHERE id = ?", (RUN_ID,)
+        ).fetchone()
+        st.record_run(_with_story(_run(repo), None))
+        cleared = st.load_run(RUN_ID)
+        rows = st.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    finally:
+        st.close()
+
+    assert via_store is not None and via_store.config.story_id == STORY_ID
+    assert via_connection is not None and via_connection.config.story_id == STORY_ID
+    assert json.loads(row["config"])["story_id"] == STORY_ID
+    assert cleared is not None and cleared.config.story_id is None
+    assert rows == 1
+    upserts = [line for line in store.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    assert [line.payload["config"]["story_id"] for line in upserts] == [STORY_ID, None]
+    assert all("story_id" not in line.payload for line in upserts)
+
+
+def test_a_runs_row_whose_config_has_no_story_id_loads_with_none(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.connection.execute(
+            "UPDATE runs SET config = ? WHERE id = ?",
+            (json.dumps({"max_concurrent_stories": 2}), RUN_ID),
+        )
+        st.connection.commit()
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert loaded is not None
+    assert loaded.config.story_id is None
+    assert loaded.config.max_concurrent_stories == 2
+
+
+def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_story(_run(repo), STORY_ID))
+    finally:
+        st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.config.story_id == STORY_ID
+    assert after is not None and after.config.story_id == STORY_ID
+    assert after == returned
+
+
+def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    journal_path = store.Journal(RUN_ID).path
+    records = [json.loads(text) for text in journal_path.read_text().splitlines()]
+    for record in records:
+        if record["event"] == "run_upsert":
+            del record["payload"]["config"]["story_id"]
+    journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.config.story_id is None
+
+
 RUN_UPSERT_KEYS = {
     "id",
     "workflow",
