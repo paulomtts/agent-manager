@@ -900,12 +900,12 @@ def card_outcome_comment(
     branch: str,
     token: str,
 ) -> comments.Comment | None:
-    """The one board comment a `run --card` walk leaves on its card, or None (card 5d9a875f).
+    """The one board comment a `run --card` walk leaves on its card, or None.
 
     Chosen by `summary.status`, so a cancel that met an escalation comments
     the escalation: `done` is the done comment, `escalated` the escalation
     keyed by this life's lease `token`, and `stopped` under a cancel the
-    cancelled comment with the `am run --card` relaunch. A stop under a pause
+    cancel comment with the `am run --card` relaunch. A stop under a pause
     is resumed, not closed, so it gets None. Never a story or milestone comment.
     """
     if summary.status == "done":
@@ -923,7 +923,7 @@ def card_outcome_comment(
             reason=comments.agent_reason(summary.results, failed_phase),
         )
     if stop.requested == "cancel":
-        return comments.compose_cancelled(
+        return comments.compose_canceled(
             run_id=run_id,
             card_id=card.id,
             before_phase=summary.before_phase,

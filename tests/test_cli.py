@@ -9846,7 +9846,7 @@ def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
     run_id, card = payload["run_id"], cards["subtask"]
     assert _card_comment_keys(project, card) == [f"{run_id}/{card}/cancelled"]
     (comment,) = board.comment_list(card, repo_dir=project)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    assert comment.body.startswith(f"am · canceled · run {run_id}\n")
     assert "stopped before: validate_spec" in comment.body
     assert f"branch: {payload['branch']}" in comment.body
     assert f"relaunch: `am run --card {card}`" in comment.body

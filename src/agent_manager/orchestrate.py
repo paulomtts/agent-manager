@@ -2086,7 +2086,7 @@ async def run_milestone_engine(
             if outcome.kind != "stopped" or outcome.subtask is None:
                 continue
             assert outcome.story is not None
-            comment = comments.compose_cancelled(
+            comment = comments.compose_canceled(
                 run_id=run_id,
                 card_id=outcome.subtask,
                 before_phase=outcome.before_phase,

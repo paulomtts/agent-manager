@@ -303,8 +303,8 @@ def test_done_after_a_skipped_planning_reads_the_found_plan_and_docs_commit_hash
     )
 
 
-def test_cancelled_golden_body():
-    comment = comments.compose_cancelled(
+def test_canceled_golden_body():
+    comment = comments.compose_canceled(
         run_id=RUN,
         card_id=CARD,
         before_phase="implement",
@@ -315,13 +315,40 @@ def test_cancelled_golden_body():
     assert comment.key == "r1/card-476f1040/cancelled"
     assert comment.body == "\n".join(
         [
-            "am · cancelled · run r1",
+            "am · canceled · run r1",
             "stopped before: implement",
             "branch: m12/task-x-476f1040",
             "relaunch: `am run --milestone ms-21f4cf06`",
             "am-key: r1/card-476f1040/cancelled",
         ]
     )
+
+
+def test_cancel_comment_header_is_canceled():
+    comment = comments.compose_canceled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase="implement",
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+    assert comment.body.split("\n")[0] == "am · canceled · run r1"
+
+
+def test_cancel_comment_key_keeps_legacy_spelling():
+    comment = comments.compose_canceled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase=None,
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+    assert comment.key == "r1/card-476f1040/cancelled"
+    assert comment.body.split("\n")[-1] == "am-key: r1/card-476f1040/cancelled"
+
+
+def test_compose_cancelled_is_gone():
+    assert not hasattr(comments, "compose_cancelled")
 
 
 def test_base_failed_golden_body_goes_on_the_story():
@@ -662,8 +689,8 @@ def test_done_lists_only_the_verify_commands_that_passed():
     assert "ruff" not in "\n".join(lines)
 
 
-def test_cancelled_without_a_phase_omits_the_stopped_before_line():
-    comment = comments.compose_cancelled(
+def test_canceled_without_a_phase_omits_the_stopped_before_line():
+    comment = comments.compose_canceled(
         run_id=RUN,
         card_id=CARD,
         before_phase=None,
@@ -672,7 +699,7 @@ def test_cancelled_without_a_phase_omits_the_stopped_before_line():
     )
     assert comment.body == "\n".join(
         [
-            "am · cancelled · run r1",
+            "am · canceled · run r1",
             "branch: m12/task-x-476f1040",
             "relaunch: `am run --milestone ms-21f4cf06`",
             "am-key: r1/card-476f1040/cancelled",
@@ -767,6 +794,38 @@ def test_enqueue_queues_one_pending_row_per_key(stores):
     ]
     count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
     assert count == 1
+
+
+def _legacy_cancel(card_id: str) -> comments.Comment:
+    """A cancel comment as an older `am` composed it: `cancelled` header, same key."""
+    comment_key = comments.key(RUN, card_id, "cancelled")
+    body = "\n".join(
+        [
+            f"am · cancelled · run {RUN}",
+            "branch: m12/task-x-476f1040",
+            "relaunch: `am run --milestone ms-21f4cf06`",
+            f"am-key: {comment_key}",
+        ]
+    )
+    return comments.Comment(card_id=card_id, key=comment_key, body=body)
+
+
+def test_a_legacy_queued_cancel_comment_is_not_queued_again(stores):
+    st = stores()
+    legacy = _legacy_cancel(CARD)
+    comments.enqueue(st, legacy, run_id=RUN, now=_at(0))
+    current = comments.compose_canceled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase=None,
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+
+    comments.enqueue(st, current, run_id=RUN, now=_at(1))
+
+    assert current.key == legacy.key
+    assert [(r.key, r.body) for r in st.pending_comments()] == [(legacy.key, legacy.body)]
 
 
 def test_enqueue_on_a_taken_over_store_raises_and_writes_no_row(stores):
@@ -972,6 +1031,28 @@ def test_flush_recognises_a_posted_body_with_trailing_whitespace(stores, root):
     assert fake.added == []
     row = _row(st, comment.key)
     assert (row["state"], row["comment_id"]) == ("posted", "c-prior")
+
+
+def test_flush_recognises_a_legacy_cancel_comment_already_on_the_board(stores, root):
+    st = stores()
+    current = comments.compose_canceled(
+        run_id=RUN,
+        card_id=CARD,
+        before_phase=None,
+        branch="m12/task-x-476f1040",
+        relaunch="am run --milestone ms-21f4cf06",
+    )
+    comments.enqueue(st, current, run_id=RUN, now=_at(0))
+    fake = FakeBoard()
+    fake.cards[CARD] = [
+        board.BoardComment(id="c-legacy", body=_legacy_cancel(CARD).body, author="am")
+    ]
+
+    assert comments.flush(st, root, board_api=fake) == []
+
+    assert fake.added == []
+    row = _row(st, current.key)
+    assert (row["state"], row["comment_id"]) == ("posted", "c-legacy")
 
 
 def test_flush_ignores_comments_whose_last_line_is_another_key(stores, root):
