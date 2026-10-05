@@ -45,6 +45,7 @@ from agent_manager import (
     dag,
     detach,
     dispatch,
+    errors,
     integration,
     locks,
     models,
@@ -316,24 +317,49 @@ def test_the_status_payload_survives_render_with_its_paths():
     assert data["rows"] == []
 
 
-def test_the_status_header_is_the_runs_identity_and_not_its_config():
-    """The spec's seven identity fields, and `config` is not one of them: the
-    header is what `runs` prints for the same run, and a workflow's whole config
-    blob in it would drown the reading and let the two commands disagree."""
+STATUS_HEADER_KEYS = {
+    "id",
+    "workflow",
+    "repo_dir",
+    "base_branch",
+    "branch_prefix",
+    "status",
+    "started_at",
+    "story_id",
+}
+"""`am status`'s `data.run`: `cli.RUN_IDENTITY`'s seven names plus `story_id`."""
+
+CONFIG_ONLY_KEYS = {"config", "max_concurrent_stories", "dry_run", "launcher", "harness_map"}
+"""`config` and its fields other than `story_id`, none of which the header shows."""
+
+
+def test_the_status_header_is_the_runs_identity_plus_story_id_and_not_its_config():
+    """The spec's seven identity fields plus `story_id`, and `config` is not one
+    of them: the header is what `runs` prints for the same run, and a
+    workflow's whole config blob in it would drown the reading and let the two
+    commands disagree."""
     run = _pure_run([])
     run.config = models.RunConfig(max_concurrent_stories=4, dry_run=True)
 
     payload = cli.status_payload(run)
 
-    assert set(payload["run"]) == {
-        "id",
-        "workflow",
-        "repo_dir",
-        "base_branch",
-        "branch_prefix",
-        "status",
-        "started_at",
-    }
+    assert set(payload["run"]) == STATUS_HEADER_KEYS
+    assert not CONFIG_ONLY_KEYS & set(payload["run"])
+    assert payload["run"]["story_id"] is None
+
+
+def test_the_status_header_of_a_story_run_carries_its_story_id_through_render():
+    story = "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+    run = _pure_run([])
+    run.workflow = "milestone"
+    run.config = models.RunConfig(max_concurrent_stories=1, story_id=story)
+
+    payload = cli.status_payload(run)
+    data = json.loads(cli.render(cli.ok_envelope(payload)))["data"]
+
+    assert payload["run"]["story_id"] == story
+    assert data["run"]["story_id"] == story
+    assert set(data["run"]) == STATUS_HEADER_KEYS
 
 
 def _pure_subtask(card_id: str, phases: list[models.PhaseRun]) -> models.SubtaskRun:
@@ -3292,7 +3318,7 @@ def test_board_prefix_of_ignores_status_so_a_finished_milestone_keeps_its_prefix
 
 
 BLANK_BOARD_PREFIX = "--branch-prefix with --board needs a non-blank prefix, not a blank string"
-PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
+PREFIX_REQUIRED = "--branch-prefix is required with --card, --milestone or --story"
 
 
 @pytest.mark.parametrize(
@@ -3310,8 +3336,8 @@ PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
         ),
         (
             {"card": None, "milestone": None, "board": False, "branch_prefix": "m2"},
-            "one of --card, --milestone or --board is required",
-            "'--card' / '--milestone' / '--board'",
+            "one of --card, --milestone, --story or --board is required",
+            "'--card' / '--milestone' / '--story' / '--board'",
         ),
         (
             {"card": None, "milestone": "2", "board": False, "branch_prefix": None},
@@ -4387,11 +4413,13 @@ def _record(
     with_phases: bool = True,
     workflow: str = "task",
     milestone_id: str | None = None,
+    story_id: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
     in `root`'s projection, written the only way this program writes rows. The
     defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
-    `milestone_id` for a milestone-shaped one."""
+    `milestone_id` for a milestone-shaped one, plus a `story_id` for a
+    story-shaped one."""
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -4403,6 +4431,7 @@ def _record(
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
+                config=models.RunConfig(story_id=story_id),
                 milestone_id=milestone_id,
             )
         )
@@ -4645,12 +4674,13 @@ RUNS_ENTRY_KEYS = {
     "started_at",
     "milestone_id",
     "card_id",
+    "story_id",
     "lease",
     "progress",
 }
 """Every `data.runs[]` entry: the seven names `am runs` always had, plus
-`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74) and
-`progress` (card 882b212b)."""
+`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74),
+`progress` (card 882b212b) and `story_id` (card 3d2a3ef8)."""
 
 RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
 """A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
@@ -4668,6 +4698,7 @@ def test_runs_shows_a_card_runs_card_id_and_a_null_milestone_id(projection):
     [entry] = json.loads(result.stdout)["data"]["runs"]
     assert entry["card_id"] == "card-1"
     assert entry["milestone_id"] is None
+    assert entry["story_id"] is None
 
 
 def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection):
@@ -4688,13 +4719,67 @@ def test_runs_shows_a_milestone_runs_milestone_id_and_a_null_card_id(projection)
     assert entry["workflow"] == "milestone"
     assert entry["milestone_id"] == RUNS_MILESTONE_ID
     assert entry["card_id"] is None
+    assert entry["story_id"] is None
 
 
-def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_and_progress(projection):
+RUNS_STORY_ID = "2aeb8b6e-b24f-4d4e-ab81-138f8d7dfbae"
+
+
+def test_runs_shows_a_story_runs_story_id_its_milestone_id_and_no_card_id(projection):
+    """A story run is a `milestone` run with a subtask row: it lists the parent
+    milestone's id and never a `card_id`."""
+    _record(
+        projection,
+        "20260923T090000Z-cbe34d00",
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
+    )
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    assert entry["story_id"] == RUNS_STORY_ID
+    assert entry["workflow"] == "milestone"
+    assert entry["milestone_id"] == RUNS_MILESTONE_ID
+    assert entry["card_id"] is None
+
+
+def test_status_on_a_story_run_shows_its_story_id_and_no_config(projection):
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection,
+        run_id,
+        started_at=RECORDED_AT,
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
+    )
+
+    result = runner.invoke(cli.app, ["status", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    header = json.loads(result.stdout)["data"]["run"]
+    assert header["story_id"] == RUNS_STORY_ID
+    assert header["workflow"] == "milestone"
+    assert set(header) == STATUS_HEADER_KEYS
+
+
+def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_id_lease_and_progress(projection):
     _record(
         projection,
         "20260921T090000Z-cbe34d00",
         started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+    )
+    _record(
+        projection,
+        "20260922T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+        workflow="milestone",
+        milestone_id=RUNS_MILESTONE_ID,
+        story_id=RUNS_STORY_ID,
     )
     _record(
         projection,
@@ -4714,9 +4799,14 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_lease_
         assert set(envelope) == {"ok", "data"}
         assert envelope["ok"] is True
         assert set(envelope["data"]) == {"runs"}
-        assert len(envelope["data"]["runs"]) == 2
+        assert len(envelope["data"]["runs"]) == 3
         for entry in envelope["data"]["runs"]:
             assert set(entry) == RUNS_ENTRY_KEYS
+        assert [entry["story_id"] for entry in envelope["data"]["runs"]] == [
+            None,
+            RUNS_STORY_ID,
+            None,
+        ]
 
 
 RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"
@@ -12464,3 +12554,761 @@ def test_already_done_omits_out_of_play_cards_and_they_never_run(status):
 def test_already_done_omits_an_out_of_play_story_even_with_finished_subtasks():
     dead = _plan_story(1, [_plan_subtask(11, "done")], status="archived")
     assert cli.already_done_entries([dead]) == []
+
+
+# ── am run --story: usage refusals ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("other", "message", "hint"),
+    [
+        ({"board": True}, "give --board or --story, not both", "'--board' / '--story'"),
+        ({"card": SOME_CARD}, "give --card or --story, not both", "'--card' / '--story'"),
+        (
+            {"milestone": "M"},
+            "give --milestone or --story, not both",
+            "'--milestone' / '--story'",
+        ),
+    ],
+)
+def test_check_run_targets_refuses_story_with_another_target(other, message, hint):
+    kwargs: dict[str, Any] = {
+        "card": None,
+        "milestone": None,
+        "dry_run": False,
+        "branch_prefix": "m3",
+        **other,
+    }
+
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(story="S", **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_check_run_targets_refuses_a_blank_story(blank):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None, milestone=None, dry_run=False, branch_prefix="m3", story=blank
+        )
+
+    assert caught.value.message == (
+        "--story needs a card id or a title piece, not a blank string"
+    )
+    assert caught.value.param_hint == "'--story'"
+
+
+def test_check_run_targets_refuses_story_without_branch_prefix():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(card=None, milestone=None, dry_run=False, story="S")
+
+    assert caught.value.message == PREFIX_REQUIRED
+    assert caught.value.param_hint == "'--branch-prefix'"
+
+
+@pytest.mark.parametrize(
+    ("bound", "message"),
+    [
+        (1, "--max-concurrent applies only to --milestone or --board"),
+        (4, "--max-concurrent applies only to --milestone or --board"),
+        (0, "--max-concurrent must be at least 1, got 0"),
+    ],
+)
+def test_check_run_targets_refuses_max_concurrent_with_story(bound, message):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None,
+            milestone=None,
+            dry_run=False,
+            branch_prefix="m3",
+            story="S",
+            max_concurrent=bound,
+        )
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == "'--max-concurrent'"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dry_run": True},
+        {"dry_run": False, "detach": True},
+        {"dry_run": False},
+    ],
+)
+def test_check_run_targets_accepts_story_with_dry_run_or_detach(kwargs):
+    assert (
+        cli._check_run_targets(
+            card=None, milestone=None, branch_prefix="m3", story="S", **kwargs
+        )
+        is None
+    )
+
+
+def test_check_run_targets_refuses_story_dry_run_with_detach():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None,
+            milestone=None,
+            dry_run=True,
+            detach=True,
+            branch_prefix="m3",
+            story="S",
+        )
+
+    assert caught.value.message == DRY_RUN_DETACH
+    assert caught.value.param_hint == "'--detach' / '--dry-run'"
+
+
+def test_check_run_targets_names_story_when_no_target_is_given():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(card=None, milestone=None, dry_run=False, branch_prefix="m3")
+
+    assert caught.value.message == "one of --card, --milestone, --story or --board is required"
+    assert caught.value.param_hint == "'--card' / '--milestone' / '--story' / '--board'"
+
+
+# ── am run --story --dry-run: the story preview ─────────────────────────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is a plain directory, and the done-blocker branch lookup is the stubbed
+# `orchestrate._local_branch_exists`. No git, brd or claude process starts.
+
+STORY_PREFIX = "m3"
+
+
+def _story_root(tmp_path: Path, monkeypatch) -> Path:
+    """A plain project directory with its projection under tmp_path; no git, no brd."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _story_branch(root: Path, card_id: str) -> str:
+    return dag.task_branch(STORY_PREFIX, board.show(card_id, repo_dir=root))
+
+
+def _story_lookups(monkeypatch, present: frozenset[str] | set[str] = frozenset()) -> list[str]:
+    """Stub `orchestrate._local_branch_exists`: only `present` exist locally.
+
+    Returns the list every branch asked about is appended to.
+    """
+    asked: list[str] = []
+
+    def factory(root: Path) -> Any:
+        def exists(branch: str) -> bool:
+            asked.append(branch)
+            return branch in present
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", factory)
+    return asked
+
+
+def _forbid_story_writes(monkeypatch) -> None:
+    """A story preview opens no store, refreshes no git, checks no claim, runs nothing."""
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "Store", _Forbidden("orchestrate.Store"))
+    monkeypatch.setattr(orchestrate, "refresh_git", _Forbidden("orchestrate.refresh_git"))
+    monkeypatch.setattr(cli, "refuse_claimed", _Forbidden("refuse_claimed"))
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+
+def _seed_story_board(fake_board) -> dict[str, str]:
+    """A milestone with Story A (one todo subtask) and Story S (s1 done, s2 and s3 todo)."""
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    other = fake_board.add_card("Story A: rows", parent_id=milestone)
+    a1 = fake_board.add_card("a1: rows", parent_id=other)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone)
+    s1 = fake_board.add_card("s1: cols one", parent_id=story, status="done")
+    s2 = fake_board.add_card("s2: cols two", parent_id=story, blocked_by=[s1])
+    s3 = fake_board.add_card("s3: cols three", parent_id=story, blocked_by=[s2])
+    return {
+        "milestone": milestone,
+        "other": other,
+        "a1": a1,
+        "story": story,
+        "s1": s1,
+        "s2": s2,
+        "s3": s3,
+    }
+
+
+def _dry_run_story(root: Path, needle: str) -> dict[str, Any]:
+    return cli.dry_run_story(
+        needle, repo_dir=root, branch_prefix=STORY_PREFIX, base_branch="main"
+    )
+
+
+def test_dry_run_story_previews_only_that_story_with_no_integrate(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    asked = _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+    branch = {key: _story_branch(root, cards[key]) for key in ("s1", "s2", "s3")}
+
+    data = _dry_run_story(root, cards["story"])
+
+    assert list(data) == ["max_concurrent", "levels", "already_done", "integrate"]
+    assert data == {
+        "max_concurrent": 1,
+        "levels": [
+            {
+                "level": 0,
+                "concurrent": 1,
+                "stories": [
+                    {
+                        "story": cards["story"],
+                        "title": "Story S: cols",
+                        "root": "main",
+                        "subtasks": [
+                            {
+                                "id": cards["s2"],
+                                "title": "s2: cols two",
+                                "status": "todo",
+                                "branch": branch["s2"],
+                                "base": branch["s1"],
+                            },
+                            {
+                                "id": cards["s3"],
+                                "title": "s3: cols three",
+                                "status": "todo",
+                                "branch": branch["s3"],
+                                "base": branch["s2"],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "already_done": [
+            {"kind": "subtask", "id": cards["s1"], "title": "s1: cols one", "story": cards["story"]}
+        ],
+        "integrate": None,
+    }
+    assert asked == []
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize(
+    ("blocker_status", "tip_exists", "rooted_on_tip", "looked_up"),
+    [
+        ("done", True, True, True),
+        ("done", False, False, True),
+        ("canceled", False, False, False),
+    ],
+)
+def test_dry_run_story_roots_the_story_where_the_real_run_would(
+    tmp_path, monkeypatch, fake_board, blocker_status, tip_exists, rooted_on_tip, looked_up
+):
+    """A done blocker's tip when that branch exists locally, else the base
+    branch; an out-of-play blocker is never looked up. The blocker itself is
+    never a level row and never listed as already done."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker = fake_board.add_card("Story A: rows", parent_id=milestone, status=blocker_status)
+    b1 = fake_board.add_card(
+        "a1: rows", parent_id=blocker, status="done" if blocker_status == "done" else "todo"
+    )
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[blocker])
+    s1 = fake_board.add_card("s1: cols one", parent_id=story)
+    tip = _story_branch(root, b1)
+    asked = _story_lookups(monkeypatch, {tip} if tip_exists else set())
+    _forbid_story_writes(monkeypatch)
+    expected_root = tip if rooted_on_tip else "main"
+
+    data = _dry_run_story(root, story)
+
+    assert data["levels"] == [
+        {
+            "level": 0,
+            "concurrent": 1,
+            "stories": [
+                {
+                    "story": story,
+                    "title": "Story S: cols",
+                    "root": expected_root,
+                    "subtasks": [
+                        {
+                            "id": s1,
+                            "title": "s1: cols one",
+                            "status": "todo",
+                            "branch": _story_branch(root, s1),
+                            "base": expected_root,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    assert data["already_done"] == []
+    assert data["integrate"] is None
+    assert asked == ([tip] if looked_up else [])
+
+
+def test_dry_run_story_roots_on_a_merged_base_for_two_done_blockers(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a = fake_board.add_card("Story A: rows", parent_id=milestone, status="done")
+    a1 = fake_board.add_card("a1: rows", parent_id=a, status="done")
+    b = fake_board.add_card("Story B: cells", parent_id=milestone, status="done")
+    b1 = fake_board.add_card("b1: cells", parent_id=b, status="done")
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[b, a])
+    fake_board.add_card("s1: cols one", parent_id=story)
+    _story_lookups(monkeypatch, {_story_branch(root, a1), _story_branch(root, b1)})
+    _forbid_story_writes(monkeypatch)
+    match = census.find_story(board.roots(repo_dir=root), story)
+    cut = orchestrate.story_census(
+        board.tree(milestone, repo_dir=root), match.story, root=root, branch_prefix=STORY_PREFIX
+    )
+    merged = dag.base_branch_name(STORY_PREFIX, cut.stories[-1])
+
+    data = _dry_run_story(root, story)
+
+    (level,) = data["levels"]
+    (row,) = level["stories"]
+    assert row["story"] == story
+    assert row["root"] == merged
+    assert row["merged_from"] == [a, b]
+    assert row["subtasks"][0]["base"] == merged
+    assert data["already_done"] == []
+
+
+@pytest.mark.parametrize(
+    ("story_status", "subtask_status", "already_done_story"),
+    [("todo", "done", True), ("done", "done", True), ("canceled", "todo", False)],
+)
+def test_dry_run_story_with_nothing_to_run_has_no_level(
+    tmp_path, monkeypatch, fake_board, story_status, subtask_status, already_done_story
+):
+    """A finished story is one `kind: story` entry; an out-of-play one lists nothing."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    fake_board.add_card("Story A: rows", parent_id=milestone)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, status=story_status)
+    s1 = fake_board.add_card("s1: cols one", parent_id=story, status=subtask_status)
+    fake_board.add_card("s2: cols two", parent_id=story, status=subtask_status, blocked_by=[s1])
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    data = _dry_run_story(root, story)
+
+    assert data["levels"] == []
+    assert data["already_done"] == (
+        [{"kind": "story", "id": story, "title": "Story S: cols"}] if already_done_story else []
+    )
+    assert data["integrate"] is None
+    assert _run_dirs() == []
+
+
+def test_dry_run_story_refuses_an_open_blocker_before_any_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    blocked = fake_board.add_card(
+        "Story T: cells", parent_id=cards["milestone"], blocked_by=[cards["other"]]
+    )
+    fake_board.add_card("t1: cells", parent_id=blocked)
+    asked = _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(errors.StoryBlockedError):
+        _dry_run_story(root, blocked)
+
+    assert asked == []
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize("case", ["none", "several", "milestone", "milestone title", "subtask"])
+def test_dry_run_story_refuses_a_needle_that_is_not_one_story(
+    tmp_path, monkeypatch, fake_board, case
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    needle = {
+        "none": "no such story",
+        "several": "Story",
+        "milestone": cards["milestone"],
+        "milestone title": "orchestration",
+        "subtask": cards["s1"],
+    }[case]
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(errors.StoryNotFoundError):
+        _dry_run_story(root, needle)
+
+    assert _run_dirs() == []
+
+
+def test_dry_run_story_refuses_a_blocker_cycle_anywhere_in_the_milestone(
+    tmp_path, monkeypatch, fake_board
+):
+    """The census is patched to hand back cyclic sibling stories, as in the
+    preflight_story cycle test: the board itself cannot hold a cycle."""
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    a = census.StoryPlan(
+        "story-x", "Story X", "todo", ["story-y"], [census.SubtaskPlan("x1", "x1", "todo")]
+    )
+    b = census.StoryPlan(
+        "story-y", "Story Y", "todo", ["story-x"], [census.SubtaskPlan("y1", "y1", "todo")]
+    )
+    selected = census.StoryPlan(
+        cards["story"], "Story S: cols", "todo", [], [census.SubtaskPlan(cards["s2"], "s2", "todo")]
+    )
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b, selected]),
+    )
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(dag.DependencyCycleError):
+        _dry_run_story(root, cards["story"])
+
+
+# ── am run --story: dispatch, exit codes and refusals ───────────────────────
+
+STORY_RUN_ID = "20260924T000000Z-0badcafe"
+
+CLEAN_STORY = {
+    "done": True,
+    "run_id": STORY_RUN_ID,
+    "levels": [{"level": 0, "stories": ["story-a"]}],
+    "completed": ["subtask-a1"],
+    "tips": [{"story": "story-a", "tip": "m3/task-a1"}],
+    "warnings": [],
+}
+"""`run_story`'s clean payload: a milestone `done` payload without `integrated`."""
+
+NOTHING_TO_RUN_STORY = {
+    "done": True,
+    "run_id": STORY_RUN_ID,
+    "levels": [],
+    "completed": [],
+    "tips": [],
+    "warnings": [],
+}
+
+PAUSED_STORY = {
+    "paused": True,
+    "run_id": STORY_RUN_ID,
+    "stopped": [],
+    "completed": [],
+    "pending": ["story-a"],
+    "warnings": [],
+    "resume": f"am resume {STORY_RUN_ID}",
+}
+
+CANCELLED_STORY = {
+    "cancelled": True,
+    "run_id": STORY_RUN_ID,
+    "stopped": [],
+    "completed": [],
+    "pending": ["story-a"],
+    "warnings": [],
+}
+
+ESCALATED_STORY = {
+    "escalated": True,
+    "run_id": STORY_RUN_ID,
+    "level": 0,
+    "story": "story-a",
+    "subtask": "subtask-a1",
+    "failed_phase": "review",
+    "detail": "phase 'review' gate 'review_gate' failed",
+    "warnings": [],
+}
+
+DETACHED_STORY_PAYLOAD = {
+    "run_id": STORY_RUN_ID,
+    "pid": FAKE_CHILD_PID,
+    "log": f"/data/agent-manager/runs/{STORY_RUN_ID}/run.log",
+    "detached": True,
+}
+
+
+def _story_run(root: Path, needle: str, *extra: str):
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--story",
+            needle,
+            "--repo-dir",
+            str(root),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            STORY_PREFIX,
+            *extra,
+        ],
+    )
+
+
+def _forbid_other_run_paths(monkeypatch) -> None:
+    """Every run path that is not a story's own, forbidden."""
+    _forbid_writes(monkeypatch)
+    for name in ("run_milestone", "detach_milestone", "run_board", "detach_board"):
+        monkeypatch.setattr(orchestrate, name, _Forbidden(name))
+    for name in ("dry_run_milestone", "dry_run_board", "detach_card"):
+        monkeypatch.setattr(cli, name, _Forbidden(name))
+
+
+def _patch_run_story(monkeypatch, outcome: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Replace `orchestrate.run_story`, forbid every other run path, record calls."""
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_run_story(story, **kwargs):
+        calls.append((story, kwargs))
+        return outcome
+
+    monkeypatch.setattr(orchestrate, "run_story", fake_run_story)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("targets", "word"),
+    [
+        (["--story", "S", "--board", "--branch-prefix", "m3"], "both"),
+        (["--story", "S", "--card", SOME_CARD, "--branch-prefix", "m3"], "both"),
+        (["--story", "S", "--milestone", "M", "--branch-prefix", "m3"], "both"),
+        (["--branch-prefix", "m3"], "required"),
+        (["--story", "", "--branch-prefix", "m3"], "blank"),
+        (["--story", "   ", "--branch-prefix", "m3"], "blank"),
+        (["--story", "S"], "required"),
+        (["--story", "S", "--branch-prefix", "m3", "--max-concurrent", "1"], "only"),
+        (["--story", "S", "--branch-prefix", "m3", "--max-concurrent", "4"], "only"),
+        (["--story", "S", "--branch-prefix", "m3", "--dry-run", "--detach"], "detached"),
+    ],
+)
+def test_story_usage_errors_exit_2_and_dispatch_nothing(tmp_path, monkeypatch, targets, word):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    fake = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", fake)
+
+    result = runner.invoke(cli.app, ["run", *targets, "--repo-dir", str(tmp_path)])
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+    assert "No such option" not in result.output
+    assert word in result.output
+    assert fake.calls == []
+    assert not (paths.data_dir() / "runs").exists()
+
+
+def test_a_story_run_calls_run_story_once_with_the_run_options(tmp_path, monkeypatch):
+    """The kwargs are compared whole, so an extra key (`max_concurrent`,
+    `driver`, `runner_factory`) fails."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _patch_run_story(monkeypatch, CLEAN_STORY)
+
+    result = _story_run(
+        tmp_path,
+        "Story 3.1",
+        "--verify",
+        "uv run pytest",
+        "--verify",
+        "uv run ruff check",
+        "--allow-no-verification",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(CLEAN_STORY)
+    assert calls == [
+        (
+            "Story 3.1",
+            {
+                "repo_dir": tmp_path,
+                "base_branch": "main",
+                "branch_prefix": STORY_PREFIX,
+                "commands": ["uv run pytest", "uv run ruff check"],
+                "allow_no_verification": True,
+            },
+        )
+    ]
+
+
+def test_an_escalated_story_run_exits_escalated(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_story(monkeypatch, ESCALATED_STORY)
+
+    result = _story_run(tmp_path, "Story 3.1")
+
+    assert result.exit_code == cli.EXIT_ESCALATED, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(ESCALATED_STORY)
+
+
+@pytest.mark.parametrize(
+    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELLED_STORY]
+)
+def test_a_stopped_or_nothing_to_run_story_exits_0(tmp_path, monkeypatch, payload):
+    """None of these carries a `status` key: the rule must not index one."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_story(monkeypatch, payload)
+
+    result = _story_run(tmp_path, "Story 3.1")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(payload)
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [
+        ("none", "StoryNotFoundError"),
+        ("several", "StoryNotFoundError"),
+        ("milestone", "StoryNotFoundError"),
+        ("subtask", "StoryNotFoundError"),
+        ("blocked", "StoryBlockedError"),
+        ("claimed", "ClaimedError"),
+    ],
+)
+def test_story_refusals_are_the_error_envelope_with_exit_3(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    """The real `run_story` and `preflight_story`: every refusal comes before
+    git is refreshed and before any run directory exists."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker = fake_board.add_card("Story A: rows", parent_id=milestone)
+    a1 = fake_board.add_card("a1: rows", parent_id=blocker)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[blocker])
+    fake_board.add_card("s1: cols one", parent_id=story)
+    needle = {
+        "none": "no such story",
+        "several": "Story",
+        "milestone": milestone,
+        "subtask": a1,
+        "blocked": story,
+        "claimed": blocker,
+    }[case]
+
+    def held(at: Path, keys: Any, *, run_id: str | None = None) -> None:
+        key = list(keys)[0]
+        raise cli.ClaimedError(
+            f"{key} is claimed by run 20260101T000000Z-00000000",
+            key=key,
+            run_id="20260101T000000Z-00000000",
+        )
+
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(cli, "refuse_claimed", held)
+    monkeypatch.setattr(orchestrate, "refresh_git", _Forbidden("orchestrate.refresh_git"))
+    _story_lookups(monkeypatch)
+
+    error = _refusal(_story_run(root, needle))
+
+    assert error["type"] == error_type
+    assert _run_dirs() == []
+
+
+def test_a_story_dry_run_prints_its_preview_and_writes_nothing(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    _story_lookups(monkeypatch)
+    expected = _dry_run_story(root, cards["story"])
+    _forbid_other_run_paths(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "detach_story", _Forbidden("detach_story"))
+
+    result = _story_run(root, "cols", "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == json.loads(cli.render(cli.ok_envelope(expected)))
+    assert json.loads(result.stdout)["data"]["integrate"] is None
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    [("blocked", "StoryBlockedError"), ("several", "StoryNotFoundError")],
+)
+def test_a_story_dry_run_refusal_is_an_envelope_with_exit_3(
+    tmp_path, monkeypatch, fake_board, case, error_type
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    blocked = fake_board.add_card(
+        "Story T: cells", parent_id=cards["milestone"], blocked_by=[cards["other"]]
+    )
+    fake_board.add_card("t1: cells", parent_id=blocked)
+    needle = {"blocked": blocked, "several": "Story"}[case]
+    _story_lookups(monkeypatch)
+    _forbid_other_run_paths(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    error = _refusal(_story_run(root, needle, "--dry-run"))
+
+    assert error["type"] == error_type
+    assert _run_dirs() == []
+
+
+def test_story_detach_dispatches_detach_story_with_the_run_options(tmp_path, monkeypatch):
+    """The kwargs are compared whole; `detacher` is `detach.fork_detacher`
+    read at call time; a detached payload exits 0."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_other_run_paths(monkeypatch)
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(cli, "dry_run_story", _Forbidden("dry_run_story"))
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_detach_story(story, **kwargs):
+        calls.append((story, kwargs))
+        return DETACHED_STORY_PAYLOAD
+
+    monkeypatch.setattr(orchestrate, "detach_story", fake_detach_story)
+    sentinel = _FakeDetacher()
+    monkeypatch.setattr(detach, "fork_detacher", sentinel)
+
+    result = _story_run(tmp_path, "Story 3.1", "--detach", "--verify", "X")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == cli.ok_envelope(DETACHED_STORY_PAYLOAD)
+    ((needle, kwargs),) = calls
+    assert kwargs.pop("detacher") is sentinel
+    assert (needle, kwargs) == (
+        "Story 3.1",
+        {
+            "repo_dir": tmp_path,
+            "base_branch": "main",
+            "branch_prefix": STORY_PREFIX,
+            "commands": ["X"],
+            "allow_no_verification": False,
+        },
+    )
+    assert sentinel.calls == []
+
+
+def test_run_help_and_examples_document_the_story_option():
+    assert (
+        'am run --story "Story 3.1" --branch-prefix m9 --verify "uv run pytest"'
+        in cli.RUN_EXAMPLES
+    )
+
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--story" in result.output

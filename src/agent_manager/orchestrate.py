@@ -1776,6 +1776,30 @@ def _restricted_stories(
     ]
 
 
+def story_census(
+    tree: models.CardNode, story: models.CardNode, *, root: Path, branch_prefix: str
+) -> census.Census:
+    """A story run's census: `tree`'s, cycle-checked, cut to `story` and the done blockers it stacks on.
+
+    `story` is a child of `tree`. The whole census of `tree` is checked for a
+    blocker cycle first (`dag.DependencyCycleError`), even one `story` is not
+    part of. It is then cut by `_restricted_stories`: the kept done blockers,
+    then `story` last, or `errors.StoryBlockedError` for an open blocker. A
+    story the census dropped (out of play) leaves no stories at all.
+    Read-only, except that `_local_branch_exists` runs git to look up a done
+    blocker's tip.
+    """
+    full = census.flatten_milestone(tree)
+    dag.assert_no_blocker_cycles(full.stories)
+    selected = next((planned for planned in full.stories if planned.id == story.id), None)
+    stories = (
+        []
+        if selected is None
+        else _restricted_stories(full.stories, selected, root=root, branch_prefix=branch_prefix)
+    )
+    return census.Census(milestone_title=full.milestone_title, stories=stories)
+
+
 def _story_plan(
     tree: models.CardNode,
     story: models.CardNode,
@@ -1786,28 +1810,20 @@ def _story_plan(
 ) -> tuple[census.Census, list[list[PlannedStory]], list[dict[str, str]], list[str]]:
     """A story run's `(plan, levels, tips, keys)`, cut from its milestone's `tree`.
 
-    `story` is a child of `tree`. The census of `tree` is cycle-checked as a
-    milestone run's is (`dag.DependencyCycleError`), then cut to `story` and
-    the done blockers it stacks on (`_restricted_stories`, which raises
-    `errors.StoryBlockedError` for an open blocker). A story the census
-    dropped (out of play) leaves an empty plan, and a story with no remaining
-    subtasks a plan with no wave. `tips` names `story` alone; `keys` are
+    `story` is a child of `tree`. `plan` is `story_census` (which raises
+    `dag.DependencyCycleError` and `errors.StoryBlockedError`): empty for a
+    story the census dropped (out of play), and with no wave for a story with
+    no remaining subtasks. `tips` names `story` alone; `keys` are
     `story_claims`, never the integration branch. Read-only, except that
     `_local_branch_exists` runs git to look up a done blocker's tip.
     """
-    full = census.flatten_milestone(tree)
-    dag.assert_no_blocker_cycles(full.stories)
-    selected = next((planned for planned in full.stories if planned.id == story.id), None)
-    if selected is None:
+    plan = story_census(tree, story, root=root, branch_prefix=branch_prefix)
+    if plan.stories:
+        selected = plan.stories[-1]
+    else:
         # Out of play: the census dropped it, so it has nothing to run and
         # claims only the milestone and story cards.
         selected = census.StoryPlan(story.id, story.title, story.status, [], [])
-        stories: list[census.StoryPlan] = []
-    else:
-        stories = _restricted_stories(
-            full.stories, selected, root=root, branch_prefix=branch_prefix
-        )
-    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
     levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
     tips = [
         tip
@@ -2433,40 +2449,23 @@ async def _run_story_async(
         )
 
 
-def detach_milestone(
-    milestone: str,
+def _detach_recorded(
+    pre: MilestonePreflight,
     *,
-    repo_dir: Path,
-    base_branch: str,
-    branch_prefix: str,
     detacher: detach.Detacher,
-    commands: Sequence[str] = (),
-    allow_no_verification: bool = False,
-    max_concurrent: int = 1,
-    runner_factory: runs.RunnerFactory | None = None,
-    driver: Driver | None = None,
-    clock: Callable[[], datetime] = _utcnow,
-    control_interval: float = control.CONTROL_POLL_SECONDS,
+    commands: Sequence[str],
+    allow_no_verification: bool,
+    runner_factory: runs.RunnerFactory | None,
+    control_interval: float,
 ) -> dict[str, Any]:
-    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+    """Stage 2 of `pre` here, stage 3 in a detached child; the hand-off's payload.
 
-    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
-    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
-    `pending` plan are the same. Inside the recorded stage `run.log` is
-    created and the lease handed off, so the stage exits releasing nothing
+    `recorded_milestone_run` records and leases the run; inside it `run.log`
+    is created and the lease handed off, so the stage exits releasing nothing
     and closes its store. The child runs `run_milestone_engine` on this very
     `pre`, with the plan rows and checkpoints the recorded stage wrote
     (`cli.hand_off_to_child`).
     """
-    pre = preflight_milestone(
-        milestone,
-        repo_dir=repo_dir,
-        base_branch=base_branch,
-        branch_prefix=branch_prefix,
-        max_concurrent=max_concurrent,
-        clock=clock,
-        driver=driver,
-    )
     with recorded_milestone_run(pre) as recorded:
         log = detach.create_run_log(pre.run_id)
         rows, checkpoints = recorded.rows, recorded.checkpoints
@@ -2489,6 +2488,85 @@ def detach_milestone(
 
     return cli.hand_off_to_child(
         root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
+    )
+
+
+def detach_milestone(
+    milestone: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    max_concurrent: int = 1,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
+
+    A fresh run only. `preflight_milestone` and `recorded_milestone_run` run
+    exactly as for `run_milestone`, so every refusal, `refresh_git` and the
+    `pending` plan are the same. The hand-off is `_detach_recorded`'s.
+    """
+    pre = preflight_milestone(
+        milestone,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=max_concurrent,
+        clock=clock,
+        driver=driver,
+    )
+    return _detach_recorded(
+        pre,
+        detacher=detacher,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        control_interval=control_interval,
+    )
+
+
+def detach_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    detacher: detach.Detacher,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`run_story` with its run handed to a detached child: stages 1 and 2 here, stage 3 there.
+
+    `preflight_story` runs exactly as for `run_story`, so every refusal comes
+    before any store, run directory, `refresh_git` or fork. The hand-off is
+    `_detach_recorded`'s; the child's report is the story run's payload,
+    with no `integrated`.
+    """
+    pre = preflight_story(
+        story,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        clock=clock,
+        driver=driver,
+    )
+    return _detach_recorded(
+        pre,
+        detacher=detacher,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        control_interval=control_interval,
     )
 
 
