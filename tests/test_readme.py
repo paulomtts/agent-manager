@@ -93,7 +93,7 @@ def test_usage_names_both_streaming_commands():
 
 def test_runs_section_documents_new_keys():
     section = _section("Listing runs")
-    new_keys = ("milestone_id", "card_id", "lease", "progress")
+    new_keys = ("milestone_id", "card_id", "story_id", "lease", "progress")
     assert set(new_keys) <= set(store.RunSummary.model_fields)
     for key in new_keys:
         assert f"`{key}`" in section, key
@@ -107,10 +107,19 @@ def test_runs_section_documents_new_keys():
             assert re.search(rf"\b{field}\b", section), f"{model.__name__}.{field}"
     assert "It is `null` on a `--card` run" in section
     assert "It is `null` on a milestone run" in section
+    assert "the story card an `am run --story` run drives" in section
+    assert "It is `null` on any other run" in section
+    assert "its `milestone_id` is still the story's parent milestone" in section
     assert "`null` if no process has a lease row for it" in section
     assert "`am status <run-id>` shows in `control.lease`" in section
     assert ADDITIVE in section
     assert IGNORE_UNKNOWN in section
+
+
+def test_stream_section_names_the_head_lines_story_id():
+    section = _section("Reading the stream safely")
+    assert "`payload.config.story_id`" in section
+    assert "`null` unless the run is an `am run --story` run" in section
 
 
 def test_detach_section_documents_envelope():
