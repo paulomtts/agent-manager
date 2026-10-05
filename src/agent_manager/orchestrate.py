@@ -31,6 +31,13 @@ The order is load-bearing. Everything that can refuse -- an unknown milestone,
 a blocker cycle -- runs before the first write, so a refusal leaves no run
 directory, no store, no fetch and no prune behind.
 
+`preflight_story` is the same stage 1 for one story of a milestone: it
+returns a `MilestonePreflight` whose plan holds only that story and the done
+blockers it stacks on, and refuses an open blocker (`errors.StoryBlockedError`)
+before the claims. `run_story` runs it through the same engine, which skips
+Integrate for a story run; `preflight_milestone` cuts a resumed story run's
+plan the same way.
+
 The run helpers S1 moved out of the Typer module (`RunnerFactory`, the resume
 error types, `mint_run_id`, `resolve_repo_dir`, `worktree_for`,
 `orphan_attempts`, `continuable_checkpoint`) are read off `runs`. `cli` is
@@ -67,6 +74,7 @@ from agent_manager import (
     control,
     dag,
     detach,
+    errors,
     integration,
     models,
     paths,
@@ -1541,6 +1549,28 @@ def milestone_claims(
     return list(dict.fromkeys(keys))
 
 
+def story_claims(
+    milestone_id: str, story: census.StoryPlan, branch_prefix: str
+) -> list[str]:
+    """The `run_claims` keys a story run holds under its lease (run-story design).
+
+    `card:<milestone_id>`, `card:<story.id>`, then `card:<id>` for every
+    remaining subtask (`dag.remaining_subtasks`, the set `milestone_claims`
+    uses, so a card run on a done subtask is not refused), then
+    `branch:<subtask branch>` for each of those subtasks, census order. Never
+    `branch:<prefix>-integrate`: a story run does not integrate. Pure; a key
+    already listed is not repeated, so the first occurrence keeps its place.
+    """
+    remaining = dag.remaining_subtasks(story)
+    keys = [control.card_claim(milestone_id), control.card_claim(story.id)]
+    keys.extend(control.card_claim(subtask.id) for subtask in remaining)
+    keys.extend(
+        control.branch_claim(dag.subtask_branch(branch_prefix, subtask))
+        for subtask in remaining
+    )
+    return list(dict.fromkeys(keys))
+
+
 def milestone_card_ids(
     milestone_id: str, stories: Sequence[census.StoryPlan]
 ) -> list[str]:
@@ -1607,6 +1637,12 @@ def preflight_milestone(
     run then refreshes git (its first side effect, still before the store),
     reads the clock and mints the run id; a resume keeps its own id and
     refreshes git later, under the lease. The store is never opened here.
+
+    A resumed run whose `config.story_id` is set is a story run: its story
+    must still be a child of the milestone (else `runs.NotResumableError`,
+    before any write and before git), and its plan, levels, tips and claim
+    keys are `_story_plan`'s, as a fresh `preflight_story` computes them,
+    `errors.StoryBlockedError` for a re-opened blocker included.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1619,11 +1655,30 @@ def preflight_milestone(
         milestone_card = census.find_milestone(roots, milestone)
     else:
         milestone_card = find_run_milestone(roots, resumed)
-    plan = census.flatten_milestone(board.tree(milestone_card.id, repo_dir=root))
-    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
-    tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tree = board.tree(milestone_card.id, repo_dir=root)
+    if resumed is None or resumed.config.story_id is None:
+        plan = census.flatten_milestone(tree)
+        levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        tips = story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
+    else:
+        # A resumed story run keeps its story: the plan is cut exactly as
+        # `preflight_story` cuts a fresh one.
+        story_id = resumed.config.story_id
+        story_card = next((card for card in tree.children if card.id == story_id), None)
+        if story_card is None:
+            raise runs.NotResumableError(
+                f"run {resumed.id!r} runs story {story_id}, and milestone"
+                f" {milestone_card.id} has no story card with that id"
+            )
+        plan, levels, tips, keys = _story_plan(
+            tree,
+            story_card,
+            root=root,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+        )
     drive = cli.drive_subtask_async if driver is None else driver
-    keys = milestone_claims(milestone_card.id, plan.stories, branch_prefix)
     # The last refusal (X5, X6): read-only, before `refresh_git` and before
     # `Store.open`, so a milestone, remaining subtask or integration branch
     # another live run claims leaves no fetch, prune, run row or run
@@ -1669,6 +1724,166 @@ def preflight_milestone(
         run_id=run_id,
         run_record=run_record,
         drive=drive,
+    )
+
+
+def _restricted_stories(
+    stories: Sequence[census.StoryPlan],
+    selected: census.StoryPlan,
+    *,
+    root: Path,
+    branch_prefix: str,
+) -> list[census.StoryPlan]:
+    """A story run's `plan.stories`: the done blockers `selected` stacks on, then `selected`.
+
+    A story with nothing to run is carried alone, its blockers unjudged. Else
+    its in-milestone blockers (ids of `stories`, census order, each once) are
+    classified by status alone first: any not finished and not out of play is
+    open, and `errors.StoryBlockedError` names every open one before a single
+    branch is looked up. Then a `merged` blocker is dropped, and a `done` one
+    is kept only when it has subtasks and its tip is a local branch of `root`
+    (`_local_branch_exists`, read at call time; a `GitError` propagates). Kept
+    blockers lose their own edges, so `dag.story_root` roots `selected` on
+    their tips alone and never walks past them.
+    """
+    if not dag.remaining_subtasks(selected):
+        return [replace(selected, blocked_by=[])]
+    wanted = set(selected.blocked_by)
+    blockers = [story for story in stories if story.id in wanted]
+    open_blockers = [
+        blocker
+        for blocker in blockers
+        if not census.is_finished(blocker.status)
+        and not census.is_out_of_play(blocker.status)
+    ]
+    if open_blockers:
+        raise errors.StoryBlockedError(
+            selected.id,
+            selected.title,
+            [(blocker.id, blocker.title) for blocker in open_blockers],
+        )
+    exists = _local_branch_exists(root)
+    kept = [
+        blocker
+        for blocker in blockers
+        if blocker.status.lower() == "done"
+        and blocker.subtasks
+        and exists(dag.subtask_branch(branch_prefix, blocker.subtasks[-1]))
+    ]
+    return [
+        *(replace(blocker, blocked_by=[]) for blocker in kept),
+        replace(selected, blocked_by=[blocker.id for blocker in kept]),
+    ]
+
+
+def _story_plan(
+    tree: models.CardNode,
+    story: models.CardNode,
+    *,
+    root: Path,
+    base_branch: str,
+    branch_prefix: str,
+) -> tuple[census.Census, list[list[PlannedStory]], list[dict[str, str]], list[str]]:
+    """A story run's `(plan, levels, tips, keys)`, cut from its milestone's `tree`.
+
+    `story` is a child of `tree`. The census of `tree` is cycle-checked as a
+    milestone run's is (`dag.DependencyCycleError`), then cut to `story` and
+    the done blockers it stacks on (`_restricted_stories`, which raises
+    `errors.StoryBlockedError` for an open blocker). A story the census
+    dropped (out of play) leaves an empty plan, and a story with no remaining
+    subtasks a plan with no wave. `tips` names `story` alone; `keys` are
+    `story_claims`, never the integration branch. Read-only, except that
+    `_local_branch_exists` runs git to look up a done blocker's tip.
+    """
+    full = census.flatten_milestone(tree)
+    dag.assert_no_blocker_cycles(full.stories)
+    selected = next((planned for planned in full.stories if planned.id == story.id), None)
+    if selected is None:
+        # Out of play: the census dropped it, so it has nothing to run and
+        # claims only the milestone and story cards.
+        selected = census.StoryPlan(story.id, story.title, story.status, [], [])
+        stories: list[census.StoryPlan] = []
+    else:
+        stories = _restricted_stories(
+            full.stories, selected, root=root, branch_prefix=branch_prefix
+        )
+    plan = census.Census(milestone_title=full.milestone_title, stories=stories)
+    levels = plan_levels(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+    tips = [
+        tip
+        for tip in story_tips(plan.stories, branch_prefix=branch_prefix, base_branch=base_branch)
+        if tip["story"] == selected.id
+    ]
+    keys = story_claims(tree.id, selected, branch_prefix)
+    return plan, levels, tips, keys
+
+
+def preflight_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    clock: Callable[[], datetime] = _utcnow,
+    driver: Driver | None = None,
+) -> MilestonePreflight:
+    """Stage 1 of a story run: `preflight_milestone`'s result, its plan cut to one story.
+
+    A fresh run only. The story is `census.find_story`'s pick
+    (`StoryNotFoundError` propagates); the plan is its parent milestone's
+    census, cycle-checked as a milestone run's is, cut to that story and the
+    done blockers it stacks on (`_restricted_stories`, which refuses an open
+    blocker with `errors.StoryBlockedError` before the claims). A story
+    the census dropped (out of play) leaves an empty plan, and a story with
+    no remaining subtasks a plan with no wave: nothing to run, not an error.
+    Then the claims (`story_claims`) and `cli.refuse_claimed` as the last
+    refusal. Everything up to there is read-only; `refresh_git` is the first
+    side effect, then the clock and the run id, minted from the story's id.
+    The run is recorded as a milestone run of the parent milestone, one
+    story at a time, with `RunConfig.story_id` naming the story.
+    """
+    root = runs.resolve_repo_dir(repo_dir)
+    roots = board.roots(repo_dir=root)
+    match = census.find_story(roots, story)
+    plan, levels, tips, keys = _story_plan(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+    )
+    # The last refusal (X5, X6), read-only, as in `preflight_milestone`.
+    cli.refuse_claimed(root, keys, run_id=None)
+
+    # The first side effect, after every refusal and before any store.
+    refresh_git(root)
+    started_at = clock()
+    run_id = runs.mint_run_id(match.story.id, started_at)
+    run_record = models.Run(
+        id=run_id,
+        workflow=MILESTONE_WORKFLOW,
+        repo_dir=root,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        status="started",
+        started_at=started_at,
+        config=models.RunConfig(max_concurrent_stories=1, story_id=match.story.id),
+        milestone_id=match.milestone.id,
+    )
+    return MilestonePreflight(
+        root=root,
+        resumed=None,
+        milestone_card=match.milestone,
+        plan=plan,
+        levels=levels,
+        tips=tips,
+        keys=keys,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        max_concurrent=1,
+        run_id=run_id,
+        run_record=run_record,
+        drive=cli.drive_subtask_async if driver is None else driver,
     )
 
 
@@ -1753,6 +1968,10 @@ async def run_milestone_engine(
     lane bound are `pre.drive` and `pre.max_concurrent` (a resume's bound is
     the recorded run's). The caller owns the store and the lease; a crash
     propagates.
+
+    A story run (`pre.run_record.config.story_id` set) never reaches
+    Integrate: once its lanes finished clean it is recorded `done` and its
+    report is the milestone `done` payload without `integrated`.
     """
     store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
     rows, checkpoints = recorded.rows, recorded.checkpoints
@@ -1873,6 +2092,27 @@ async def run_milestone_engine(
         # a parked subtask is resumed, not closed, so it gets no comment.
         return comment_run_end(report(controlled_payload(run_id, "pause", outcomes, warnings)))
 
+    def done_payload() -> dict[str, Any]:
+        """A clean run's report before Integrate's key: each wave, what this
+        invocation finished, and every planned story's tip."""
+        return {
+            "done": True,
+            "run_id": run_id,
+            "levels": [
+                {"level": index, "stories": [planned.story.id for planned in level]}
+                for index, level in enumerate(levels)
+            ],
+            "completed": completed,
+            "tips": tips,
+            "warnings": warnings,
+        }
+
+    if run_record.config.story_id is not None:
+        # A story run ends on its story's tip branch: there is no Integrate,
+        # so no `<prefix>-integrate` branch and no `integrated` key.
+        store.record_run(run_record.model_copy(update={"status": "done"}))
+        return comment_run_end(report(done_payload()))
+
     # Integrate (addendum I6) runs only once every lane finished clean,
     # and also when there was nothing left to drive: that is how a relaunch
     # retries an Integrate escalation, and why a finished milestone's
@@ -1908,20 +2148,7 @@ async def run_milestone_engine(
 
     store.record_run(run_record.model_copy(update={"status": "done"}))
     return comment_run_end(
-        report(
-            {
-                "done": True,
-                "run_id": run_id,
-                "levels": [
-                    {"level": index, "stories": [planned.story.id for planned in level]}
-                    for index, level in enumerate(levels)
-                ],
-                "completed": completed,
-                "tips": tips,
-                "warnings": warnings,
-                "integrated": integrated_payload(outcome),
-            }
-        )
+        report({**done_payload(), "integrated": integrated_payload(outcome)})
     )
 
 
@@ -2126,6 +2353,83 @@ async def _run_milestone_async(
             runner_factory=runner_factory,
             control_interval=control_interval,
             slots=slots,
+        )
+
+
+def run_story(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Drive every remaining subtask of one story through the milestone engine, and report.
+
+    `story` is a story card id or a title needle. Runs the three stages under
+    one `asyncio.run(_run_story_async(...))`: `preflight_story` (every refusal
+    -- `StoryNotFoundError`, `StoryBlockedError`, `DependencyCycleError`,
+    `ClaimedError` -- before any store, run directory or git refresh),
+    `recorded_milestone_run` and `run_milestone_engine`. The run is a
+    `milestone` run of the story's parent milestone with `RunConfig.story_id`
+    set and one lane at a time. It ends on the story's tip branch: no
+    Integrate, so a clean run is recorded `done` and reports the milestone
+    `done` payload without `integrated`. A story with nothing left to run is
+    the same `done` payload with no level and nothing driven. Pause, cancel
+    and escalation report as a milestone run's do; `am resume` of the run
+    resumes this story alone (`preflight_milestone`).
+    """
+    return asyncio.run(
+        _run_story_async(
+            story,
+            repo_dir=repo_dir,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            driver=driver,
+            clock=clock,
+            control_interval=control_interval,
+        )
+    )
+
+
+async def _run_story_async(
+    story: str,
+    *,
+    repo_dir: Path,
+    base_branch: str,
+    branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    runner_factory: runs.RunnerFactory | None = None,
+    driver: Driver | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+    control_interval: float = control.CONTROL_POLL_SECONDS,
+) -> dict[str, Any]:
+    """`run_story`'s body, awaitable in a caller's own event loop."""
+    pre = preflight_story(
+        story,
+        repo_dir=repo_dir,
+        base_branch=base_branch,
+        branch_prefix=branch_prefix,
+        clock=clock,
+        driver=driver,
+    )
+    with recorded_milestone_run(pre) as recorded:
+        return await run_milestone_engine(
+            pre,
+            recorded,
+            commands=commands,
+            allow_no_verification=allow_no_verification,
+            runner_factory=runner_factory,
+            control_interval=control_interval,
         )
 
 

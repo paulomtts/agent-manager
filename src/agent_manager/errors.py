@@ -4,6 +4,7 @@
 pygents.
 """
 
+from collections.abc import Sequence
 from typing import Any
 
 
@@ -42,3 +43,24 @@ class AgentPhaseFailed(RuntimeError):
 class StoryNotFoundError(ValueError):
     """No story card, or more than one, matches what the caller typed, or the
     card it names is not a story."""
+
+
+class StoryBlockedError(ValueError):
+    """A story run refused because a direct blocker of the story is still open.
+
+    Raised before anything is written. `blockers` are `(id, title)` pairs in
+    census order; only their ids are kept, as `blockers`, so a caller can act
+    without parsing the message. Takes plain pairs rather than census plans
+    because this module imports nothing from `agent_manager`.
+    """
+
+    def __init__(
+        self, story_id: str, story_title: str, blockers: Sequence[tuple[str, str]]
+    ) -> None:
+        self.story_id = story_id
+        self.blockers = tuple(blocker_id for blocker_id, _title in blockers)
+        named = ", ".join(f'"{title}" ({blocker_id})' for blocker_id, title in blockers)
+        super().__init__(
+            f'story "{story_title}" ({story_id}) is blocked by {named}'
+            " — run them first, or run the milestone"
+        )
