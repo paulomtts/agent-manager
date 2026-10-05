@@ -593,8 +593,8 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
     `Store.open` would construct a `Journal`. Refused, in this order (live
-    control C9): an unknown run, a run of another workflow, then a
-    `cancelled` run and a `done` run (card 54e4ec29, card 0e1edf31).
+    control C9): an unknown run, a run of another workflow, then a run
+    canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
     conn = open_db(root)
     try:
@@ -610,7 +610,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
         raise runs.NotResumableError(
             f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
         )
-    if run.status == "cancelled":
+    if models.is_canceled(run.status):
         raise runs.NotResumableError(
             f"run {run_id} was cancelled; start new work with am run --milestone"
         )

@@ -3013,9 +3013,9 @@ def resume_run(
     they also reach what starts afresh -- subtasks with no checkpoint, merged
     bases and Integrate.
 
-    A cancelled run is refused for both workflows (live control C9), and so
-    is a run whose lease is still live (C10): both refusals read only the
-    connection that loaded the run.
+    A run canceled in either spelling is refused for both workflows (live
+    control C9), and so is a run whose lease is still live (C10): both
+    refusals read only the connection that loaded the run.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3028,7 +3028,7 @@ def resume_run(
             )
         # C9, then C10: both read-only and before anything is written, so a
         # refusal leaves no run directory, row or journal line behind.
-        if run.status == "cancelled":
+        if models.is_canceled(run.status):
             raise NotResumableError(
                 f"run {run.id} was cancelled; start new work with `am run --milestone`"
             )
@@ -3347,8 +3347,9 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     would still continue it from (`open_in`). The lease is released and the
     store closed on every exit.
 
-    A run already `cancelled` is not refused: the lease is taken and released
-    around the check, and nothing is journalled (`already_cancelled: true`).
+    A run already canceled, in either spelling, is not refused: the lease is
+    taken and released around the check, and nothing is journalled
+    (`already_cancelled: true`).
     A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
@@ -3376,14 +3377,14 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
         # `take_lease` re-checks liveness atomically: a live holder that
         # appeared since the check above refuses here as `RunIsLiveError`,
         # and a dead one is taken over. The status is read again under the
-        # lease, so two resets serialise (the second sees `cancelled` and
-        # writes nothing) and a run that finished meanwhile is never
+        # lease, so two resets serialise (the second sees the run canceled
+        # and writes nothing) and a run that finished meanwhile is never
         # overwritten. No claims: a reset drives no card and no branch.
         with run_lease(store) as lease:
             current = store.load_run(run.id) or run
             if current.status == "done":
                 raise _not_resettable_error(run.id)
-            already = current.status == "cancelled"
+            already = models.is_canceled(current.status)
             if not already:
                 store.record_run(current.model_copy(update={"status": "cancelled"}))
         # After the status write (or the no-op): each `(card_id, workflow)` the

@@ -8664,13 +8664,14 @@ def _resume_guard_state(root: Path) -> tuple:
 
 @pytest.mark.parametrize("leased", [False, True], ids=["no-lease", "live-lease"])
 @pytest.mark.parametrize("workflow", ["task", "milestone"])
-def test_resume_refuses_a_cancelled_run_and_writes_nothing(
-    projection, monkeypatch, workflow, leased
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_resume_refuses_run_canceled_in_either_spelling(
+    projection, monkeypatch, status, workflow, leased
 ):
-    """Spec test 11 (C9), both workflows. Review Focus: a cancelled run that
-    still holds a live lease is refused as cancelled."""
+    """Spec test 11 (C9), both workflows and both spellings. Review Focus: a
+    canceled run that still holds a live lease is refused as canceled."""
     _freeze_clock(monkeypatch)
-    _plant_run(projection, status="cancelled", workflow=workflow)
+    _plant_run(projection, status=status, workflow=workflow)
     if leased:
         _plant_lease(projection)
     before = _resume_guard_state(projection)
@@ -11671,9 +11672,11 @@ def test_reset_takes_over_a_dead_lease_and_names_its_holder(
     assert _lease(projection) is None
 
 
-def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
-    """Spec test 4."""
-    _plant_run(projection, status="cancelled")
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_reset_reports_already_for_either_spelling(projection, status):
+    """Spec test 4, both spellings: the stored spelling is echoed as
+    `previous_status`, `status` stays `cancelled`, and nothing is written."""
+    _plant_run(projection, status=status)
     lines_before = _journal_lines()
 
     result = _invoke_reset(projection)
@@ -11682,14 +11685,14 @@ def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
     data = json.loads(result.stdout)["data"]
     assert data == {
         "run_id": CONTROL_RUN_ID,
-        "previous_status": "cancelled",
+        "previous_status": status,
         "status": "cancelled",
         "already_cancelled": True,
         "cards": [],
         "message": f"run {CONTROL_RUN_ID} was already cancelled; nothing was written",
     }
     assert _journal_lines() == lines_before
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == status
     assert _lease(projection) is None
 
 
