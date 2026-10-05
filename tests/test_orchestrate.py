@@ -7105,6 +7105,23 @@ def test_milestone_status_reads_a_run_milestone_payload(payload, status):
     assert orchestrate.milestone_status(payload) == status
 
 
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"canceled": True, "run_id": "r"}, "cancelled"),
+        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"cancelled": False, "canceled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "escalated": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "paused": True, "run_id": "r"}, "cancelled"),
+        ({"done": True, "canceled": True, "run_id": "r"}, "done"),
+        ({"canceled": False, "paused": True, "run_id": "r"}, "stopped"),
+        ({"canceled": "yes", "run_id": "r"}, "escalated"),
+    ],
+)
+def test_milestone_status_reads_either_cancel_key(payload, status):
+    assert orchestrate.milestone_status(payload) == status
+
+
 # ── milestone_bases (card 40ac07f3) ─────────────────────────────────────────
 
 

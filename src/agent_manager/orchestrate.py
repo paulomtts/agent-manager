@@ -2732,13 +2732,14 @@ def board_claims(
 def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     """One `_run_milestone_async` payload read as a board status.
 
-    `done` is the only clean outcome. A cancel is `cancelled`, an escalation
-    (a paused one included) is `escalated`, a pause is `stopped`. Any other
+    `done` is the only clean outcome. A cancel, flagged `True` under either
+    of its keys (`canceled`, `cancelled`), is `cancelled`; an escalation (a
+    paused one included) is `escalated`, a pause is `stopped`. Any other
     shape is not clean, so it counts as `escalated`.
     """
     if payload.get("done") is True:
         return "done"
-    if payload.get("cancelled") is True:
+    if any(payload.get(name) is True for name in models.CANCELED_STATUSES):
         return "cancelled"
     if payload.get("escalated") is True:
         return "escalated"
