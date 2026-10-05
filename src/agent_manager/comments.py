@@ -293,7 +293,7 @@ def _next_command(
     integrated: str | None,
 ) -> str | None:
     """What a human runs next: relaunch, resume, or merge the integrated branch."""
-    if outcome == "cancelled" or integrate_failed:
+    if outcome == models.CANCELED or integrate_failed:
         return f"am run --milestone {milestone_id}"
     if outcome in ("escalated", "paused"):
         return f"am resume {run_id}"
@@ -312,7 +312,7 @@ def compose_run_end(
     """The milestone card's run-end comment, read from `run_milestone`'s payload.
 
     A cancel, set under either of its keys (`canceled`, `cancelled`), wins
-    over every other outcome and reads as `cancelled`; then `escalated`,
+    over every other outcome and reads as `canceled`; then `escalated`,
     `paused`, `done`. An Integrate escalation is told apart from a lane one by
     its `phase` key with no `failed_phase`. `total` (the milestone's subtask
     count) is the caller's addition; without it the count stands alone. An
@@ -320,7 +320,7 @@ def compose_run_end(
     never fails a run.
     """
     if any(payload.get(name) for name in models.CANCELED_STATUSES):
-        outcome = models.LEGACY_CANCELED
+        outcome = models.CANCELED
     else:
         outcome = next((name for name in _RUN_OUTCOMES if payload.get(name)), "ended")
     integrate_failed = (

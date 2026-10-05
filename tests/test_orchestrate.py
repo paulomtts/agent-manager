@@ -722,9 +722,9 @@ def test_controlled_payload_on_cancel_without_escalations_omits_escalations_and_
     assert "cancelled" not in paused
 
 
-def test_a_controlled_cancel_payload_reads_as_cancelled_on_board_and_comment():
+def test_a_controlled_cancel_payload_reads_as_canceled_on_board_and_comment():
     """The real cancel payload, not a hand-written one, reads as the
-    `canceled` board status and the `cancelled` run-end comment."""
+    `canceled` board status and the `canceled` run-end comment."""
     parked = orchestrate.LaneOutcome(
         kind="stopped", story="A", level=0, subtask="a1", before_phase="plan"
     )
@@ -734,7 +734,7 @@ def test_a_controlled_cancel_payload_reads_as_cancelled_on_board_and_comment():
     comment = comments.compose_run_end(
         run_id="run-1", milestone_id="ms-1", token="tok-1", payload=payload
     )
-    assert comment.body.splitlines()[0] == "am · cancelled · run run-1"
+    assert comment.body.splitlines()[0] == "am · canceled · run run-1"
     assert "next: `am run --milestone ms-1`" in comment.body.splitlines()
 
 

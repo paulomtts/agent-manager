@@ -452,14 +452,14 @@ _RUN_END_KEY = "am-key: r1/ms-21f4cf06/run-end:tok-1"
                 "warnings": [],
             },
             [
-                "am · cancelled · run r1",
+                "am · canceled · run r1",
                 "done: 0 of 2",
                 "parked: [[sub-2]], [[st-3]]",
                 "next: `am run --milestone ms-21f4cf06`",
             ],
         ),
     ],
-    ids=["done", "escalated", "paused", "cancelled"],
+    ids=["done", "escalated", "paused", "canceled"],
 )
 def test_run_end_golden_bodies(payload, expected):
     comment = _run_end(payload)
@@ -521,7 +521,7 @@ def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
     }
     assert _run_end(payload).body == "\n".join(
         [
-            "am · cancelled · run r1",
+            "am · canceled · run r1",
             "done: 1 of 3",
             "escalated: [[sub-1]] at implement",
             "next: `am run --milestone ms-21f4cf06`",
@@ -547,7 +547,7 @@ def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
                 "warnings": [],
             },
             [
-                "am · cancelled · run r1",
+                "am · canceled · run r1",
                 "done: 0 of 2",
                 "parked: [[sub-2]], [[st-3]]",
                 "next: `am run --milestone ms-21f4cf06`",
@@ -568,7 +568,7 @@ def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
                 "warnings": [],
             },
             [
-                "am · cancelled · run r1",
+                "am · canceled · run r1",
                 "done: 1 of 3",
                 "escalated: [[sub-1]] at implement",
                 "next: `am run --milestone ms-21f4cf06`",
@@ -583,7 +583,7 @@ def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
                 "warnings": [],
             },
             [
-                "am · cancelled · run r1",
+                "am · canceled · run r1",
                 "done: 1 of 1",
                 "next: `am run --milestone ms-21f4cf06`",
             ],
@@ -605,7 +605,7 @@ def test_run_end_comment_reads_a_cancel_when_the_other_key_is_false(false_key, t
     payload = {false_key: False, true_key: True, "run_id": RUN, "completed": [], "total": 1}
     assert _run_end(payload).body == "\n".join(
         [
-            "am · cancelled · run r1",
+            "am · canceled · run r1",
             "done: 0 of 1",
             "next: `am run --milestone ms-21f4cf06`",
             _RUN_END_KEY,
@@ -621,6 +621,42 @@ def test_run_end_comment_ignores_a_false_cancel_key(falsy):
             "am · paused · run r1",
             "done: 0 of 1",
             "next: `am resume r1`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
+@pytest.mark.parametrize("cancel_key", ["cancelled", "canceled"])
+def test_run_end_of_a_cancel_with_an_integrated_branch_relaunches(cancel_key):
+    payload = {
+        cancel_key: True,
+        "done": True,
+        "run_id": RUN,
+        "completed": ["sub-0"],
+        "integrated": {"branch": "m3-integrate"},
+        "total": 1,
+        "warnings": [],
+    }
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · canceled · run r1",
+            "done: 1 of 1",
+            "integrated: m3-integrate",
+            "next: `am run --milestone ms-21f4cf06`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
+@pytest.mark.parametrize("cancel_key", ["cancelled", "canceled"])
+@pytest.mark.parametrize("truthy", [1, "yes"])
+def test_run_end_reads_a_truthy_non_bool_cancel_flag_as_canceled(cancel_key, truthy):
+    payload = {cancel_key: truthy, "run_id": RUN, "completed": [], "total": 1}
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · canceled · run r1",
+            "done: 0 of 1",
+            "next: `am run --milestone ms-21f4cf06`",
             _RUN_END_KEY,
         ]
     )
