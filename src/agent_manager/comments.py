@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent_manager import board, locks
+from agent_manager import board, locks, models
 from agent_manager.store import COMMENT_ATTEMPTS
 
 if TYPE_CHECKING:
@@ -257,8 +257,8 @@ def compose_base_failed(
     return Comment(card_id=story_id, key=comment_key, body=body)
 
 
-_RUN_OUTCOMES = ("cancelled", "escalated", "paused", "done")
-"""Run outcomes in live-control C6 precedence: the first payload flag set wins."""
+_RUN_OUTCOMES = ("escalated", "paused", "done")
+"""Run outcomes below a cancel, in precedence order: the first payload flag set wins."""
 
 
 def _ref(card_id: str) -> str:
@@ -302,14 +302,20 @@ def compose_run_end(
     token: str,
     payload: Mapping[str, Any],
 ) -> Comment:
-    """The milestone card's run-end comment, read from `run_milestone`'s payload (B2).
+    """The milestone card's run-end comment, read from `run_milestone`'s payload.
 
-    An Integrate escalation is told apart from a lane one by its `phase` key
-    with no `failed_phase`. `total` (the milestone's subtask count) is the
-    caller's addition; without it the count stands alone. An unknown payload
-    reads as outcome `ended` rather than raising: a comment never fails a run (B8).
+    A cancel, set under either of its keys (`canceled`, `cancelled`), wins
+    over every other outcome and reads as `cancelled`; then `escalated`,
+    `paused`, `done`. An Integrate escalation is told apart from a lane one by
+    its `phase` key with no `failed_phase`. `total` (the milestone's subtask
+    count) is the caller's addition; without it the count stands alone. An
+    unknown payload reads as outcome `ended` rather than raising: a comment
+    never fails a run.
     """
-    outcome = next((name for name in _RUN_OUTCOMES if payload.get(name)), "ended")
+    if any(payload.get(name) for name in models.CANCELED_STATUSES):
+        outcome = models.LEGACY_CANCELED
+    else:
+        outcome = next((name for name in _RUN_OUTCOMES if payload.get(name)), "ended")
     integrate_failed = (
         outcome == "escalated" and "phase" in payload and "failed_phase" not in payload
     )

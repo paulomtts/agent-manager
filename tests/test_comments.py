@@ -503,6 +503,102 @@ def test_run_end_of_a_cancel_that_escalated_names_the_escalated_card():
     )
 
 
+@pytest.mark.parametrize("cancel_key", ["cancelled", "canceled"])
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "run_id": RUN,
+                "stopped": [
+                    {"story": "st-2", "subtask": "sub-2", "before_phase": "verify"},
+                    {"story": "st-3", "subtask": None, "before_phase": None},
+                ],
+                "completed": [],
+                "pending": [],
+                "total": 2,
+                "warnings": [],
+            },
+            [
+                "am · cancelled · run r1",
+                "done: 0 of 2",
+                "parked: [[sub-2]], [[st-3]]",
+                "next: `am run --milestone ms-21f4cf06`",
+            ],
+        ),
+        (
+            {
+                "escalated": True,
+                "phase": "verify",
+                "run_id": RUN,
+                "stopped": [],
+                "completed": ["sub-0"],
+                "pending": [],
+                "escalations": [
+                    {"level": 0, "story": "st-1", "subtask": "sub-1", "failed_phase": "implement", "detail": "blocked"}
+                ],
+                "total": 3,
+                "warnings": [],
+            },
+            [
+                "am · cancelled · run r1",
+                "done: 1 of 3",
+                "escalated: [[sub-1]] at implement",
+                "next: `am run --milestone ms-21f4cf06`",
+            ],
+        ),
+        (
+            {
+                "done": True,
+                "run_id": RUN,
+                "completed": ["sub-0"],
+                "total": 1,
+                "warnings": [],
+            },
+            [
+                "am · cancelled · run r1",
+                "done: 1 of 1",
+                "next: `am run --milestone ms-21f4cf06`",
+            ],
+        ),
+    ],
+    ids=["parked", "escalated", "done"],
+)
+def test_run_end_comment_reads_either_cancel_key(cancel_key, payload, expected):
+    comment = _run_end({cancel_key: True, **payload})
+    assert comment.card_id == MILESTONE
+    assert comment.key == "r1/ms-21f4cf06/run-end:tok-1"
+    assert comment.body == "\n".join([*expected, _RUN_END_KEY])
+
+
+@pytest.mark.parametrize(
+    ("false_key", "true_key"), [("cancelled", "canceled"), ("canceled", "cancelled")]
+)
+def test_run_end_comment_reads_a_cancel_when_the_other_key_is_false(false_key, true_key):
+    payload = {false_key: False, true_key: True, "run_id": RUN, "completed": [], "total": 1}
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · cancelled · run r1",
+            "done: 0 of 1",
+            "next: `am run --milestone ms-21f4cf06`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
+@pytest.mark.parametrize("falsy", [False, None, 0])
+def test_run_end_comment_ignores_a_false_cancel_key(falsy):
+    payload = {"canceled": falsy, "paused": True, "run_id": RUN, "completed": [], "total": 1}
+    assert _run_end(payload).body == "\n".join(
+        [
+            "am · paused · run r1",
+            "done: 0 of 1",
+            "next: `am resume r1`",
+            _RUN_END_KEY,
+        ]
+    )
+
+
 def test_run_end_without_a_total_reports_the_count_alone():
     body = _run_end({"paused": True, "run_id": RUN, "completed": ["sub-0"]}).body
     assert body.split("\n")[1] == "done: 1"

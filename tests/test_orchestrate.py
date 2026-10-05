@@ -4592,11 +4592,12 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
-def test_a_cancelled_milestone_run_is_refused_for_resume(tmp_path, monkeypatch):
-    """C9: unknown run, then wrong workflow, then cancelled -- the earlier
-    refusals still win for a run that is also cancelled."""
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_resume_refuses_run_canceled_in_either_spelling(tmp_path, monkeypatch, status):
+    """C9: unknown run, then wrong workflow, then canceled in either spelling --
+    the earlier refusals still win for a run that is also canceled."""
     root = _resume_root(tmp_path, monkeypatch)
-    _record_resume_run(root, status="cancelled")
+    _record_resume_run(root, status=status)
 
     with pytest.raises(cli.NotResumableError) as caught:
         orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
@@ -4605,7 +4606,7 @@ def test_a_cancelled_milestone_run_is_refused_for_resume(tmp_path, monkeypatch):
         f"run {RESUME_RUN_ID} was cancelled; start new work with am run --milestone"
     )
     task_run = "20260924T120000Z-00000008"
-    _record_resume_run(root, task_run, workflow="task", status="cancelled")
+    _record_resume_run(root, task_run, workflow="task", status=status)
     with pytest.raises(cli.NotResumableError, match="'task'"):
         orchestrate.resumable_milestone_run(root, task_run)
     with pytest.raises(cli.UnknownRunError, match="no-such-run"):
@@ -7101,6 +7102,23 @@ def test_board_claims_takes_each_milestones_keys_from_milestone_claims():
     ],
 )
 def test_milestone_status_reads_a_run_milestone_payload(payload, status):
+    assert orchestrate.milestone_status(payload) == status
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"canceled": True, "run_id": "r"}, "cancelled"),
+        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"cancelled": False, "canceled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "escalated": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "paused": True, "run_id": "r"}, "cancelled"),
+        ({"done": True, "canceled": True, "run_id": "r"}, "done"),
+        ({"canceled": False, "paused": True, "run_id": "r"}, "stopped"),
+        ({"canceled": "yes", "run_id": "r"}, "escalated"),
+    ],
+)
+def test_milestone_status_reads_either_cancel_key(payload, status):
     assert orchestrate.milestone_status(payload) == status
 
 

@@ -593,8 +593,8 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
     `Store.open` would construct a `Journal`. Refused, in this order (live
-    control C9): an unknown run, a run of another workflow, then a
-    `cancelled` run and a `done` run (card 54e4ec29, card 0e1edf31).
+    control C9): an unknown run, a run of another workflow, then a run
+    canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
     conn = open_db(root)
     try:
@@ -610,7 +610,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
         raise runs.NotResumableError(
             f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
         )
-    if run.status == "cancelled":
+    if models.is_canceled(run.status):
         raise runs.NotResumableError(
             f"run {run_id} was cancelled; start new work with am run --milestone"
         )
@@ -2732,13 +2732,14 @@ def board_claims(
 def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     """One `_run_milestone_async` payload read as a board status.
 
-    `done` is the only clean outcome. A cancel is `cancelled`, an escalation
-    (a paused one included) is `escalated`, a pause is `stopped`. Any other
+    `done` is the only clean outcome. A cancel, flagged `True` under either
+    of its keys (`canceled`, `cancelled`), is `cancelled`; an escalation (a
+    paused one included) is `escalated`, a pause is `stopped`. Any other
     shape is not clean, so it counts as `escalated`.
     """
     if payload.get("done") is True:
         return "done"
-    if payload.get("cancelled") is True:
+    if any(payload.get(name) is True for name in models.CANCELED_STATUSES):
         return "cancelled"
     if payload.get("escalated") is True:
         return "escalated"
