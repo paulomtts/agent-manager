@@ -144,6 +144,8 @@ class RunConfig(_Model):
     dry_run: bool = False
     launcher: Launcher = "direct"
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)
+    story_id: str | None = None
+    """The story card a run is restricted to; `None` when the run is not a story run."""
 
 
 class Run(_Model):
