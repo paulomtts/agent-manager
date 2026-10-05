@@ -29,7 +29,7 @@ from agent_manager.census import (
     flatten_milestone,
     order_siblings,
 )
-from agent_manager.errors import StoryNotFoundError
+from agent_manager.errors import StoryBlockedError, StoryNotFoundError
 from agent_manager.models import CardNode
 
 
@@ -708,6 +708,21 @@ def test_find_story_int_needle_behaves_as_its_string():
 def test_story_not_found_error_is_handled_by_the_cli():
     assert issubclass(StoryNotFoundError, ValueError)
     assert isinstance(StoryNotFoundError("x"), cli.HANDLED)
+
+
+def test_story_blocked_error_is_handled_by_the_cli_and_names_its_blockers():
+    error = StoryBlockedError(
+        "s-id", "Story S: cols", [("a-id", "Story A: rows"), ("b-id", "Story B: cells")]
+    )
+
+    assert issubclass(StoryBlockedError, ValueError)
+    assert isinstance(error, cli.HANDLED)
+    assert error.story_id == "s-id"
+    assert error.blockers == ("a-id", "b-id")
+    assert str(error) == (
+        'story "Story S: cols" (s-id) is blocked by "Story A: rows" (a-id),'
+        ' "Story B: cells" (b-id) — run them first, or run the milestone'
+    )
 
 
 # --- find_story: review focus -----------------------------------------------
