@@ -1874,7 +1874,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     `integrity_view`, which reads the journal and writes nothing either.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_module.open_db_for_reading(root)
     try:
         wanted = run_id
         if wanted is None:
@@ -1949,7 +1949,7 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_module.open_db_for_reading(root)
     try:
         now = _utcnow()
         entries = []
@@ -2041,17 +2041,17 @@ def select_logs(
 ) -> LogsSelection:
     """Which attempt §10's `logs` reports, shared by the one-shot and `--follow`.
 
-    Read-only, like `status_for`: the projection is reached through the free
-    `open_db` / `load_run` rather than `Store.open`, which would construct a
-    `Journal` and therefore mint a run directory for a run that may not exist.
-    The connection is closed on every path including the refusals.
+    Read-only, like `status_for`: the projection is reached through
+    `open_db_for_reading` / `load_run`, never `Store.open`, so nothing is
+    created under the data directory. The connection is closed on every path
+    including the refusals.
 
     A `--phase` naming a deterministic phase is answered from disk: its
     attempts are the `<phase>.N` directories `run_one_step` created (spec
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_module.open_db_for_reading(root)
     try:
         run = store_module.load_run(conn, run_id)
         if run is None:
@@ -2167,8 +2167,8 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     """The followed attempt's status if it is over, `None` while it runs.
 
     Looked up afresh on every call, because `selection` is a snapshot from
-    before the stream began. Read-only, like `select_logs`: the free
-    `open_db` / `load_run`, the connection closed before anything else, and
+    before the stream began. Read-only, like `select_logs`:
+    `open_db_for_reading` / `load_run`, the connection closed before anything else, and
     for a deterministic phase only `paths.recorded_attempts`; never
     `Store.open`, `paths.attempt_dir` or `paths.run_dir`, which create
     directories. An agent attempt is over once its status is anything but
@@ -2180,7 +2180,7 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     card = selection.subtask.card_id
     name = selection.phase.name
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_module.open_db_for_reading(root)
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -2408,7 +2408,7 @@ def _watch_hello() -> dict[str, Any]:
         "event": "watch",
         "schema": 1,
         "am": __version__,
-        "runs_dir": str(paths.data_dir() / "runs"),
+        "runs_dir": str(paths.data_path() / "runs"),
     }
 
 
