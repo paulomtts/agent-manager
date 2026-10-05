@@ -12,12 +12,18 @@ import re
 import typing
 from pathlib import Path
 
-from agent_manager import cli, detach, models, orchestrate, store
+from agent_manager import cli, detach, errors, models, orchestrate, runs, store
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
 ADDITIVE = "never removes or renames one"
 LOGS_TITLE = "Reading an attempt's output"
+STORY_TITLE = "Running one story with `--story`"
+STORY_SHAPE = (
+    "The shape is `am run --story STORY --branch-prefix P [--base-branch B]"
+    " [--verify CMD ...] [--allow-no-verification] [--dry-run] [--detach]"
+    " [--repo-dir D]`."
+)
 
 
 def _lines() -> list[str]:
@@ -293,3 +299,119 @@ def test_logs_examples_match_code():
     terminal = set(typing.get_args(models.AttemptStatus)) - {"started"}
     assert end["status"] in terminal
     assert end_raw == cli.render(end)
+
+
+def test_story_section_documents_the_story_flag():
+    """Card 2cc5e2a5: the `--story` section documents matching, the root,
+    the `StoryBlockedError` refusal, no Integrate, claims, and pause, resume,
+    detach and dry run."""
+    section = _section(STORY_TITLE)
+    assert STORY_SHAPE in section
+    assert "am run --story" in section and "--branch-prefix m3" in section
+    for name in (
+        errors.StoryBlockedError.__name__,
+        errors.StoryNotFoundError.__name__,
+        cli.ClaimedError.__name__,
+    ):
+        assert f"`{name}`" in section, name
+    # Matching (census.find_story).
+    assert "The exact id of a milestone or of a subtask is refused: it is not a story." in section
+    assert "Milestone and subtask titles never match." in section
+    # The blocker list, one line per status.
+    lines = section.splitlines()
+    for start in ("- `merged`: ", "- `done`: ", "- `canceled` or `archived`: ignored."):
+        assert any(line.startswith(start) for line in lines), start
+    assert "- anything else: open, and the run is refused (see below)." in section
+    assert "<prefix>/base-<short id>" in section
+    # The refusal.
+    assert "— run them first, or run the milestone" in section
+    assert "no claim, no `git fetch`, no run row and no run directory" in section
+    assert "A story with no subtask left to run is not judged on its blockers." in section
+    assert "exit code 3" in section
+    # No Integrate.
+    assert "<prefix>-integrate" in section
+    assert "minus `integrated`" in section
+    assert "`tips` names this story alone" in section
+    assert "exits 0" in section
+    # Run record, claims, resume, dry run.
+    assert "`story_id`" in section
+    assert "never `branch:<prefix>-integrate`" in section
+    assert "`config.story_id`" in section
+    assert '"integrate": null' in section
+    assert '{"max_concurrent": 1, "levels", "already_done", "integrate": null}' in section
+    # Every in-section link lands on a heading.
+    anchors = re.findall(r"\]\(#([^)]+)\)", section)
+    assert "multiple-blockers" in anchors
+    assert "what-a-clean-run-leaves-behind" in anchors
+    assert "listing-runs" in anchors
+    assert "several-am-processes" in anchors
+    slugs = {_slug(title) for _, _, title in _headings()}
+    assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
+
+
+def test_story_section_sits_next_to_milestone():
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.count(STORY_TITLE) == 1
+    assert (
+        titles.index("Preview with `--dry-run`")
+        < titles.index(STORY_TITLE)
+        < titles.index("Running every open milestone with `--board`")
+    )
+    position = titles.index(STORY_TITLE)
+    assert heads[position][1] == 4
+    parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
+    assert parent[1:] == (3, "Milestone runs")
+    assert _slug(STORY_TITLE) == "running-one-story-with---story"
+
+
+def test_run_refusals_name_story():
+    text = README.read_text(encoding="utf-8")
+    start = text.index("Some combinations are refused")
+    refusals = text[start : text.index("\n\n", start)]
+    for phrase in (
+        "`--story` together with `--card`, `--milestone` or `--board`",
+        "none of the four",
+        "a blank `--story`",
+        "a missing `--branch-prefix` with `--card`, `--milestone` or `--story`",
+        "`--max-concurrent` with `--card` or `--story` (whatever its value)",
+        "`--board` together with `--card` or with `--milestone`",
+        "a `--max-concurrent` below 1 (with `--milestone` or `--board`)",
+        "`--detach` with `--dry-run`",
+        "the exit code is 2",
+    ):
+        assert phrase in refusals, phrase
+    assert "none of the three" not in text
+    intro = _section("Milestone runs").split("\n#### ")[0]
+    assert "`--branch-prefix` is required with `--card`, `--milestone` and `--story`" in intro
+    assert "](#running-one-story-with---story)" in intro
+    flags = _section("Running every open milestone with `--board`")
+    assert "Give exactly one of `--card`, `--milestone`, `--story` and `--board`." in flags
+    assert "`--board` with `--card`, `--milestone` or `--story`" in flags
+
+
+def test_claims_table_has_story_rows():
+    section = _section("Several am processes")
+    rows = section.splitlines()
+    story = [row for row in rows if row.startswith("| `am run --story S` |")]
+    assert len(story) == 1
+    assert "`card:S`" in story[0]
+    assert "-integrate" not in story[0]
+    assert any(row.startswith("| `am resume R` of a story run |") for row in rows)
+    assert (
+        "A refused `am run --card`, `am run --milestone` or `am run --story`"
+        " leaves no run directory" in section
+    )
+
+
+def test_detach_and_resume_name_story():
+    detach_section = _section("Running detached with `--detach`")
+    assert "`--story`" in detach_section
+    relaunch = _section("Relaunching resumes")
+    assert "am run --story" in relaunch
+    assert "`config.story_id`" in relaunch
+    assert f"`{runs.NotResumableError.__name__}`" in relaunch
+    assert f"`{errors.StoryBlockedError.__name__}`" in relaunch
+    assert "A story run never runs Integrate, on a resume either." in relaunch
+    not_yet = _section("Milestone runs")
+    assert "`am run --story` runs one story with no Integrate." in not_yet
