@@ -1554,24 +1554,26 @@ def _check_run_targets(
     board: bool = False,
     branch_prefix: str | None = None,
     detach: bool = False,
+    story: str | None = None,
 ) -> None:
-    """Refuse a bad `--card` / `--milestone` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
+    """Refuse a bad `--card` / `--milestone` / `--story` / `--board` / `--branch-prefix` / `--dry-run` / `--max-concurrent` combination as a usage error.
 
     `typer.BadParameter` is Typer's own exit 2, which `EXIT_ERROR`'s docstring
     reserves. It is raised before the `HANDLED` try block, so nothing is read
-    or dispatched. Exactly one of `--card`, `--milestone` and `--board` is a
-    target. A blank `--milestone` is refused here too: the census strips
+    or dispatched. Exactly one of `--card`, `--milestone`, `--story` and
+    `--board` is a target; two given are refused before a missing one is. A
+    blank `--milestone` or `--story` is refused here too: the census strips
     the needle, and an empty needle is a substring of every title, so on a
-    one-milestone board it would silently pick that milestone.
+    one-milestone (or one-story) board it would silently pick that card.
     `--branch-prefix` is an Option with no default so that board mode can
     omit it (each milestone then uses its own card stem, run-board spec 3.2);
-    `--card` and `--milestone` still require it, refused here at the same
-    exit 2 Typer gave a missing required option. A blank one with `--board`
-    is refused, since `<prefix>-<stem>` would start with a dash.
-    `--max-concurrent` is `None` when not given, so giving it with `--card` is
-    refused whatever its value, the default included. The Option has no
-    `min=1`, so a value below 1 is refused here, worded and routed like every
-    other run-target refusal.
+    `--card`, `--milestone` and `--story` still require it, refused here at
+    the same exit 2 Typer gave a missing required option. A blank one with
+    `--board` is refused, since `<prefix>-<stem>` would start with a dash.
+    `--max-concurrent` is `None` when not given, so giving it with `--card`
+    or `--story` is refused whatever its value, the default included. The
+    Option has no `min=1`, so a value below 1 is refused here, worded and
+    routed like every other run-target refusal.
     `--detach` (card aff9fdbf) is refused with `--dry-run`, which writes
     nothing to hand off.
     """
@@ -1590,19 +1592,39 @@ def _check_run_targets(
             "give --card or --milestone, not both",
             param_hint="'--card' / '--milestone'",
         )
-    if card is None and milestone is None and not board:
+    if story is not None and board:
         raise typer.BadParameter(
-            "one of --card, --milestone or --board is required",
-            param_hint="'--card' / '--milestone' / '--board'",
+            "give --board or --story, not both",
+            param_hint="'--board' / '--story'",
+        )
+    if story is not None and card is not None:
+        raise typer.BadParameter(
+            "give --card or --story, not both",
+            param_hint="'--card' / '--story'",
+        )
+    if story is not None and milestone is not None:
+        raise typer.BadParameter(
+            "give --milestone or --story, not both",
+            param_hint="'--milestone' / '--story'",
+        )
+    if card is None and milestone is None and story is None and not board:
+        raise typer.BadParameter(
+            "one of --card, --milestone, --story or --board is required",
+            param_hint="'--card' / '--milestone' / '--story' / '--board'",
         )
     if milestone is not None and not milestone.strip():
         raise typer.BadParameter(
             "--milestone needs a card id or a title substring, not a blank string",
             param_hint="'--milestone'",
         )
+    if story is not None and not story.strip():
+        raise typer.BadParameter(
+            "--story needs a card id or a title piece, not a blank string",
+            param_hint="'--story'",
+        )
     if not board and branch_prefix is None:
         raise typer.BadParameter(
-            "--branch-prefix is required with --card or --milestone",
+            "--branch-prefix is required with --card, --milestone or --story",
             param_hint="'--branch-prefix'",
         )
     if board and branch_prefix is not None and not branch_prefix.strip():
@@ -1625,7 +1647,7 @@ def _check_run_targets(
             f"--max-concurrent must be at least 1, got {max_concurrent}",
             param_hint="'--max-concurrent'",
         )
-    if card is not None and max_concurrent is not None:
+    if (card is not None or story is not None) and max_concurrent is not None:
         raise typer.BadParameter(
             "--max-concurrent applies only to --milestone or --board",
             param_hint="'--max-concurrent'",

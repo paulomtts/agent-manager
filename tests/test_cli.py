@@ -3292,7 +3292,7 @@ def test_board_prefix_of_ignores_status_so_a_finished_milestone_keeps_its_prefix
 
 
 BLANK_BOARD_PREFIX = "--branch-prefix with --board needs a non-blank prefix, not a blank string"
-PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
+PREFIX_REQUIRED = "--branch-prefix is required with --card, --milestone or --story"
 
 
 @pytest.mark.parametrize(
@@ -3310,8 +3310,8 @@ PREFIX_REQUIRED = "--branch-prefix is required with --card or --milestone"
         ),
         (
             {"card": None, "milestone": None, "board": False, "branch_prefix": "m2"},
-            "one of --card, --milestone or --board is required",
-            "'--card' / '--milestone' / '--board'",
+            "one of --card, --milestone, --story or --board is required",
+            "'--card' / '--milestone' / '--story' / '--board'",
         ),
         (
             {"card": None, "milestone": "2", "board": False, "branch_prefix": None},
@@ -12464,3 +12464,118 @@ def test_already_done_omits_out_of_play_cards_and_they_never_run(status):
 def test_already_done_omits_an_out_of_play_story_even_with_finished_subtasks():
     dead = _plan_story(1, [_plan_subtask(11, "done")], status="archived")
     assert cli.already_done_entries([dead]) == []
+
+
+# ── am run --story: usage refusals ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("other", "message", "hint"),
+    [
+        ({"board": True}, "give --board or --story, not both", "'--board' / '--story'"),
+        ({"card": SOME_CARD}, "give --card or --story, not both", "'--card' / '--story'"),
+        (
+            {"milestone": "M"},
+            "give --milestone or --story, not both",
+            "'--milestone' / '--story'",
+        ),
+    ],
+)
+def test_check_run_targets_refuses_story_with_another_target(other, message, hint):
+    kwargs: dict[str, Any] = {
+        "card": None,
+        "milestone": None,
+        "dry_run": False,
+        "branch_prefix": "m3",
+        **other,
+    }
+
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(story="S", **kwargs)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == hint
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_check_run_targets_refuses_a_blank_story(blank):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None, milestone=None, dry_run=False, branch_prefix="m3", story=blank
+        )
+
+    assert caught.value.message == (
+        "--story needs a card id or a title piece, not a blank string"
+    )
+    assert caught.value.param_hint == "'--story'"
+
+
+def test_check_run_targets_refuses_story_without_branch_prefix():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(card=None, milestone=None, dry_run=False, story="S")
+
+    assert caught.value.message == PREFIX_REQUIRED
+    assert caught.value.param_hint == "'--branch-prefix'"
+
+
+@pytest.mark.parametrize(
+    ("bound", "message"),
+    [
+        (1, "--max-concurrent applies only to --milestone or --board"),
+        (4, "--max-concurrent applies only to --milestone or --board"),
+        (0, "--max-concurrent must be at least 1, got 0"),
+    ],
+)
+def test_check_run_targets_refuses_max_concurrent_with_story(bound, message):
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None,
+            milestone=None,
+            dry_run=False,
+            branch_prefix="m3",
+            story="S",
+            max_concurrent=bound,
+        )
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == "'--max-concurrent'"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dry_run": True},
+        {"dry_run": False, "detach": True},
+        {"dry_run": False},
+    ],
+)
+def test_check_run_targets_accepts_story_with_dry_run_or_detach(kwargs):
+    assert (
+        cli._check_run_targets(
+            card=None, milestone=None, branch_prefix="m3", story="S", **kwargs
+        )
+        is None
+    )
+
+
+def test_check_run_targets_refuses_story_dry_run_with_detach():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(
+            card=None,
+            milestone=None,
+            dry_run=True,
+            detach=True,
+            branch_prefix="m3",
+            story="S",
+        )
+
+    assert caught.value.message == DRY_RUN_DETACH
+    assert caught.value.param_hint == "'--detach' / '--dry-run'"
+
+
+def test_check_run_targets_names_story_when_no_target_is_given():
+    with pytest.raises(typer.BadParameter) as caught:
+        cli._check_run_targets(card=None, milestone=None, dry_run=False, branch_prefix="m3")
+
+    assert caught.value.message == "one of --card, --milestone, --story or --board is required"
+    assert caught.value.param_hint == "'--card' / '--milestone' / '--story' / '--board'"
