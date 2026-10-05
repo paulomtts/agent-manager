@@ -8330,7 +8330,7 @@ def test_a_request_to_a_run_that_is_not_started_is_refused_and_names_its_status(
     assert result.exit_code == cli.EXIT_ERROR, result.output
     error = json.loads(result.stdout)["error"]
     assert error["type"] == "NotRunningError"
-    assert status in error["message"]
+    assert models.canonical_status(status) in error["message"]
     assert "am status" in error["message"]
     assert _controls(projection) == []
 
@@ -8957,7 +8957,7 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     assert payload["failed_phase"] is None
     assert "validate_spec" not in seen
     assert _card_statuses(project, run_id) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "stopped",
         "subtask": "stopped",
     }
@@ -8990,7 +8990,7 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
 
     assert payload["status"] == "cancelled", payload
     assert _card_statuses(project, payload["run_id"]) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "escalated",
         "subtask": "escalated",
     }
@@ -9166,7 +9166,7 @@ def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
 
     assert payload["status"] == "cancelled", payload
     assert _card_statuses(project, run_id) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "stopped",
         "subtask": "stopped",
     }
@@ -11496,7 +11496,7 @@ def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
     assert _lease(projection) is None
     rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
-        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "cancelled"
+        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
     finally:
         rebuilt.close()
 
@@ -11674,8 +11674,9 @@ def test_reset_takes_over_a_dead_lease_and_names_its_holder(
 
 @pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
 def test_reset_reports_already_for_either_spelling(projection, status):
-    """Spec test 4, both spellings: the stored spelling is echoed as
-    `previous_status`, `status` stays `cancelled`, and nothing is written."""
+    """Spec test 4, both spellings: either stored spelling is reported as
+    `previous_status` `canceled`, `status` stays `cancelled`, and nothing is
+    written."""
     _plant_run(projection, status=status)
     lines_before = _journal_lines()
 
@@ -11685,14 +11686,14 @@ def test_reset_reports_already_for_either_spelling(projection, status):
     data = json.loads(result.stdout)["data"]
     assert data == {
         "run_id": CONTROL_RUN_ID,
-        "previous_status": status,
+        "previous_status": "canceled",
         "status": "cancelled",
         "already_cancelled": True,
         "cards": [],
         "message": f"run {CONTROL_RUN_ID} was already cancelled; nothing was written",
     }
     assert _journal_lines() == lines_before
-    assert _recorded_status(projection) == status
+    assert _recorded_status(projection) == "canceled"
     assert _lease(projection) is None
 
 
@@ -11710,7 +11711,7 @@ def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
     assert json.loads(first.stdout)["data"]["already_cancelled"] is False
     second_data = json.loads(second.stdout)["data"]
     assert second_data["already_cancelled"] is True
-    assert second_data["previous_status"] == "cancelled"
+    assert second_data["previous_status"] == "canceled"
     upserts_after = [line for line in _journal_lines() if line.event == "run_upsert"]
     assert len(upserts_after) == len(upserts_before) + 1
     assert _lease(projection) is None
@@ -12027,10 +12028,11 @@ RUN_CANCELLED_BY_HAND = {
     "node": {"story": None, "card": None, "phase": None, "attempt": None},
     "field": "status",
     "journal": "started",
-    "projection": "cancelled",
+    "projection": "canceled",
     "kind": "foreign",
 }
-"""What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`."""
+"""What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`:
+the hand-edited legacy spelling reads back as `canceled`."""
 
 
 def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:

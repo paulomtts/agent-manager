@@ -359,7 +359,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert cancelled["run_id"] == run_id
     assert "resume" not in cancelled and "paused" not in cancelled, cancelled
     assert not CONTROL_KEYS_NEVER_PRESENT & set(cancelled), cancelled
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
     assert INTEGRATION_BRANCH not in _local_branches(root)
     # a1 parked after its held plan: explore..plan once, nothing after.
     cancelled_counts = _card_phase_counts(read_fake_log(run_id))
@@ -374,7 +374,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert refusal["type"] == "NotResumableError"
     assert "cancelled" in refusal["message"]
     assert len(read_fake_log(run_id)) == launches
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
     # A fresh relaunch is new work: a new run id, a1 driven again from explore.
     relaunch = run_milestone_cli(root, milestone)
@@ -392,7 +392,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
     # The cancelled run stays cancelled.
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
 
 def _subtask_of(root: Path, run_id: str, card_id: str):
@@ -475,7 +475,7 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
         f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
     )
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
     # `am resume` of the reset run is refused at exit 3, launching nothing.
     launches = len(read_fake_log(run_id))
@@ -512,4 +512,4 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
     # The reset run stays cancelled.
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"

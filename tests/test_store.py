@@ -4557,14 +4557,14 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
         assert journal_before == ["run_upsert"]
         assert store.read_lease(st.connection, RUN_ID) == lease
         assert store.control_requests(st.connection, RUN_ID) == controls
-        assert rebuilt.status == "cancelled"
-        assert store.run_status(st.connection, RUN_ID) == "cancelled"
+        assert rebuilt.status == "canceled"
+        assert store.run_status(st.connection, RUN_ID) == "canceled"
         assert store.run_status(st.connection, "run-never-recorded") is None
     finally:
         other.close()
         st.close()
 
-    # From the journal alone: a wiped projection replays `cancelled`.
+    # From the journal alone: a wiped projection replays `canceled`.
     _truncate_db(repo)
     replayed = store.Store.open(repo, RUN_ID)
     try:
@@ -4574,8 +4574,8 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     finally:
         replayed.close()
 
-    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "cancelled")]
-    assert status == "cancelled"
+    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, "canceled")]
+    assert status == "canceled"
 
 
 def test_replay_old_journal_with_legacy_cancelled(repo):
@@ -4623,8 +4623,10 @@ def test_rebuild_from_journal_with_either_spelling(repo, status):
         rebuilt.close()
 
     assert loaded is not None
-    assert loaded.status == status
-    assert [(summary.id, summary.status) for summary in summaries] == [(RUN_ID, status)]
+    assert loaded.status == models.CANCELED
+    assert [(summary.id, summary.status) for summary in summaries] == [
+        (RUN_ID, models.CANCELED)
+    ]
 
 
 # -- run claims, lease takeover and fencing ----------------------------------------
@@ -6371,10 +6373,74 @@ def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo)
             node=_node(),
             field="status",
             journal="escalated",
-            projection="cancelled",
+            projection="canceled",
             kind="foreign",
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("journaled", "hand_set"),
+    [(models.LEGACY_CANCELED, models.CANCELED), (models.CANCELED, models.LEGACY_CANCELED)],
+    ids=["journal-cancelled-row-canceled", "journal-canceled-row-cancelled"],
+)
+def test_diverging_treats_spellings_as_equal(repo, journaled, hand_set):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        # `model_copy` does not validate, so a legacy writer's spelling reaches the journal.
+        st.record_run(_run(repo).model_copy(update={"status": journaled}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = ? WHERE id = ?", (hand_set, RUN_ID))
+
+    assert _diverging_now(repo) == []
+
+
+def test_diverging_treats_spellings_as_equal_across_a_mixed_tree(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        st.record_story(_story().model_copy(update={"status": models.CANCELED}))
+        st.record_run(_run(repo).model_copy(update={"status": models.LEGACY_CANCELED}))
+    finally:
+        st.close()
+    _raw_sql(repo, "UPDATE runs SET status = 'canceled' WHERE id = ?", (RUN_ID,))
+    _raw_sql(repo, "UPDATE stories SET status = 'cancelled' WHERE card_id = '8831189b'")
+
+    assert _diverging_now(repo) == []
+
+
+def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story().model_copy(update={"status": models.LEGACY_CANCELED}))
+        st.record_run(_run(repo).model_copy(update={"status": models.LEGACY_CANCELED}))
+    finally:
+        st.close()
+    journal_before = store.Journal(RUN_ID).path.read_bytes()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        rebuilt.rebuild_from_journal(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    conn = sqlite3.connect(paths.project_db_path(repo))
+    try:
+        run_row = conn.execute("SELECT status FROM runs WHERE id = ?", (RUN_ID,)).fetchone()
+        story_row = conn.execute(
+            "SELECT status FROM stories WHERE card_id = '8831189b'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert run_row == ("canceled",)
+    assert story_row == ("canceled",)
+    assert store.Journal(RUN_ID).path.read_bytes() == journal_before
+    assert _diverging_now(repo) == []
 
 
 def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_stale(repo):
@@ -6587,7 +6653,7 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
         ),
         store.Mismatch(
             node=_node(story="c0ffee12"), field="status", journal="started",
-            projection="cancelled", kind="foreign",
+            projection="canceled", kind="foreign",
         ),
         store.Mismatch(
             node=_node(story="feedface"), field=None, journal=None,
@@ -6666,13 +6732,13 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
             node=_node(),
             field="status",
             journal="escalated",
-            projection="cancelled",
+            projection="canceled",
             kind="foreign",
         )
     ]
     message = str(error)
     assert RUN_ID in message
-    assert "run status: journal 'escalated', projection 'cancelled'" in message
+    assert "run status: journal 'escalated', projection 'canceled'" in message
     assert "force=True" in message
     assert _projected_run_status(repo) == "cancelled"
     assert _all_rows(repo) == before
@@ -6780,7 +6846,7 @@ def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
             node=_node(),
             field="status",
             journal="started",
-            projection="cancelled",
+            projection="canceled",
             kind="foreign",
         )
     ]

@@ -18,25 +18,9 @@ row back before discarding it and re-running the phase.
 
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
-Status = Literal[
-    "pending",
-    "started",
-    "done",
-    "failed",
-    "escalated",
-    "stopped",
-    "cancelled",
-    "canceled",
-]
-"""Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
-state resume keys off. `stopped` is a clean stop on request between phases: it
-is not `failed`, and relaunching the same command continues it. `canceled` and
-`cancelled` both mean a run closed for good: its checkpoints are never
-continued and it is never resumed. `cancelled` is the legacy spelling."""
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 CANCELED = "canceled"
 """The run-cancel status."""
@@ -54,6 +38,31 @@ def is_canceled(status: str | None) -> bool:
     Exact match only: no case folding or stripping. `None` is not canceled.
     """
     return status in CANCELED_STATUSES
+
+
+def canonical_status(status: Any) -> Any:
+    """`CANCELED` for exactly `LEGACY_CANCELED`; any other value, of any type,
+    is returned unchanged."""
+    return CANCELED if status == LEGACY_CANCELED else status
+
+
+Status = Annotated[
+    Literal[
+        "pending",
+        "started",
+        "done",
+        "failed",
+        "escalated",
+        "stopped",
+        "canceled",
+    ],
+    BeforeValidator(canonical_status),
+]
+"""Lifecycle of a run, story, subtask or phase. `started` is the non-terminal
+state resume keys off. `stopped` is a clean stop on request between phases: it
+is not `failed`, and relaunching the same command continues it. `canceled` is a
+run closed for good: its checkpoints are never continued and it is never
+resumed. The legacy spelling `cancelled` is read as `canceled`."""
 
 
 PhaseKind = Literal["agent", "deterministic"]

@@ -10,6 +10,7 @@ typo has to name the statuses that would have worked.
 """
 
 import importlib
+import json
 import os
 import sys
 import typing
@@ -947,33 +948,28 @@ def test_every_status_carrying_model_accepts_stopped():
     )
 
 
-def test_status_is_exactly_the_lifecycle_set_and_still_rejects_unknown_values():
-    assert typing.get_args(models.Status) == (
-        "pending",
-        "started",
-        "done",
-        "failed",
-        "escalated",
-        "stopped",
-        "cancelled",
-        "canceled",
-    )
+CANONICAL_STATUSES = (
+    "pending",
+    "started",
+    "done",
+    "failed",
+    "escalated",
+    "stopped",
+    "canceled",
+)
+
+
+def test_status_literal_is_canonical():
+    (literal, *_) = typing.get_args(models.Status)
+    assert typing.get_args(literal) == CANONICAL_STATUSES
     with pytest.raises(ValidationError) as excinfo:
         models.SubtaskRun(
             card_id="a3dd82f4", branch="m4/x-a3dd82f4", base_branch="main", status="halted"
         )
     message = str(excinfo.value)
-    for allowed in (
-        "pending",
-        "started",
-        "done",
-        "failed",
-        "escalated",
-        "stopped",
-        "cancelled",
-        "canceled",
-    ):
+    for allowed in CANONICAL_STATUSES:
         assert f"'{allowed}'" in message
+    assert "'cancelled'" not in message
 
 
 def test_attempt_status_does_not_pick_up_stopped():
@@ -1017,7 +1013,7 @@ def test_is_canceled_false(status):
 
 
 @pytest.mark.parametrize("name", ["CANCELED", "LEGACY_CANCELED"])
-def test_status_accepts_both_cancel_spellings(name):
+def test_status_normalises_legacy_cancelled(name):
     status = getattr(models, name)
     phase = models.PhaseRun(name="implement", kind="agent", status=status)
     subtask = models.SubtaskRun(
@@ -1039,16 +1035,53 @@ def test_status_accepts_both_cancel_spellings(name):
         status=status,
         stories=[story],
     )
-    assert phase.status == status
-    assert subtask.status == status
-    assert story.status == status
-    assert run.status == status
+    assert phase.status == models.CANCELED
+    assert subtask.status == models.CANCELED
+    assert story.status == models.CANCELED
+    assert run.status == models.CANCELED
+    assert run.model_dump()["status"] == "canceled"
+    assert run.model_dump()["stories"][0]["subtasks"][0]["phases"][0]["status"] == "canceled"
 
     reloaded = models.Run.model_validate_json(run.model_dump_json())
-    assert reloaded.status == status
-    assert reloaded.stories[0].status == status
-    assert reloaded.stories[0].subtasks[0].status == status
-    assert reloaded.stories[0].subtasks[0].phases[0].status == status
+    assert reloaded.status == models.CANCELED
+    assert reloaded.stories[0].status == models.CANCELED
+    assert reloaded.stories[0].subtasks[0].status == models.CANCELED
+    assert reloaded.stories[0].subtasks[0].phases[0].status == models.CANCELED
+
+
+def test_status_normalises_legacy_cancelled_from_a_raw_payload():
+    payload = {
+        "id": "run-2026-09-29-01",
+        "workflow": "milestone",
+        "repo_dir": "/home/dev/agent-manager",
+        "base_branch": "main",
+        "branch_prefix": "m9/",
+        "status": "cancelled",
+    }
+    assert models.Run.model_validate(payload).status == models.CANCELED
+    assert models.Run.model_validate_json(json.dumps(payload)).status == models.CANCELED
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["Cancelled", "CANCELLED", " cancelled", "cancelled ", None, 1, ["cancelled"], {}],
+    ids=["title-case", "upper-case", "leading-space", "trailing-space", "none", "int", "list", "dict"],
+)
+def test_status_does_not_normalise_near_misses(status):
+    with pytest.raises(ValidationError):
+        models.SubtaskRun(
+            card_id="a3dd82f4", branch="m9/x-a3dd82f4", base_branch="main", status=status
+        )
+
+
+def test_canonical_status_maps_only_the_legacy_spelling():
+    assert models.canonical_status("cancelled") == "canceled"
+    for unchanged in ("canceled", "started", "Cancelled", None, 1):
+        assert models.canonical_status(unchanged) is unchanged
+    unhashable = ["cancelled"]
+    assert models.canonical_status(unhashable) is unhashable
+    mapping = {"status": "cancelled"}
+    assert models.canonical_status(mapping) is mapping
 
 
 @pytest.mark.parametrize("status", ["canceled", "cancelled"])

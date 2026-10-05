@@ -5468,7 +5468,7 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
         "warnings": [],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "stopped",
         a1: "stopped",
         a2: "pending",
@@ -5493,7 +5493,7 @@ def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_record
 
     assert result["cancelled"] is True, result
     assert "paused" not in result and "resume" not in result
-    assert _load(project, run_id).status == "cancelled"
+    assert _load(project, run_id).status == "canceled"
     assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
         ("pause", True),
         ("cancel", True),
@@ -5587,7 +5587,7 @@ def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations
         ],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "escalated",
         a1: "escalated",
         story_b: "stopped",
@@ -6626,7 +6626,7 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
     result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
 
     assert result["cancelled"] is True, result
-    assert _load(project, run_id).status == "cancelled"
+    assert _load(project, run_id).status == "canceled"
     parked = [row["subtask"] for row in result["stopped"]]
     assert sorted(parked) == sorted([a2, b1]), result
     for subtask in (a2, b1):
@@ -6775,7 +6775,7 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
 
     assert result["cancelled"] is True, result
     assert set(result) == {"cancelled", "run_id", "stopped", "completed", "pending", "warnings"}
-    assert _load(project, run_id).status == "cancelled"
+    assert _load(project, run_id).status == "canceled"
     assert len(result["warnings"]) == 2, result["warnings"]
     assert (
         f"board comment {run_id}/{a1}/cancelled on card {a1} not posted" in result["warnings"][0]
@@ -10140,7 +10140,7 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
         "warnings": [],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "stopped",
         a1: "stopped",
         a2: "pending",
