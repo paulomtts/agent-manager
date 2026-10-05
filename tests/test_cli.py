@@ -4646,12 +4646,13 @@ RUNS_ENTRY_KEYS = {
     "started_at",
     "milestone_id",
     "card_id",
+    "story_id",
     "lease",
     "progress",
 }
 """Every `data.runs[]` entry: the seven names `am runs` always had, plus
-`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74) and
-`progress` (card 882b212b)."""
+`milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74),
+`progress` (card 882b212b) and `story_id` (card 3d2a3ef8)."""
 
 RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
 """A non-null `data.runs[].lease`: `am status`'s `control.lease` minus

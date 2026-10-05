@@ -1487,11 +1487,13 @@ SUMMARY_KEYS = {
     "started_at",
     "milestone_id",
     "card_id",
+    "story_id",
     "lease",
     "progress",
 }
 """The seven names `am runs` always had, plus `milestone_id` and `card_id`
-(card 0b5a15d7), `lease` (card 6bf47e74) and `progress` (card 882b212b)."""
+(card 0b5a15d7), `lease` (card 6bf47e74), `progress` (card 882b212b) and
+`story_id` (card 3d2a3ef8)."""
 
 
 def _listed(root: Path) -> list[store.RunSummary]:
@@ -1605,11 +1607,12 @@ def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
     assert summary.card_id == "aaaa1111"
 
 
-def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_lease_and_progress():
+def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_story_id_lease_and_progress():
     assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
     assert store.RunSummary.model_config["extra"] == "forbid"
     assert store.RunSummary.model_fields["milestone_id"].default is None
     assert store.RunSummary.model_fields["card_id"].default is None
+    assert store.RunSummary.model_fields["story_id"].default is None
     assert store.RunSummary.model_fields["lease"].default is None
     assert store.RunSummary.model_fields["progress"].default is None
 
@@ -3277,7 +3280,7 @@ def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store.RunSummary]:
         migrated.close()
 
 
-def test_an_old_runs_row_lists_with_no_milestone_id_and_no_card_id(repo):
+def test_an_old_runs_row_lists_with_no_milestone_id_no_card_id_and_no_story_id(repo):
     [summary] = _migrated_legacy(repo)
 
     assert (summary.id, summary.workflow, summary.status) == (
@@ -3287,6 +3290,7 @@ def test_an_old_runs_row_lists_with_no_milestone_id_and_no_card_id(repo):
     )
     assert summary.milestone_id is None
     assert summary.card_id is None
+    assert summary.story_id is None
 
 
 def test_an_old_task_run_lists_its_card_id_after_the_milestone_id_migration(repo):
@@ -3387,6 +3391,90 @@ def test_a_runs_row_whose_config_has_no_story_id_loads_with_none(repo):
     assert loaded.config.max_concurrent_stories == 2
 
 
+def test_list_runs_gives_a_story_run_its_story_id_and_its_parent_milestone_id(repo):
+    """A story run is a `milestone` run holding subtask rows, so it lists with
+    the parent milestone's id and no `card_id`."""
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(
+            _with_story(_run(repo), STORY_ID).model_copy(
+                update={"milestone_id": MILESTONE_ID}
+            )
+        )
+        st.record_story(_story())
+        st.record_subtask(_story().card_id, _subtask("ef248597"))
+    finally:
+        st.close()
+
+    [summary] = _listed(repo)
+
+    assert summary.story_id == STORY_ID
+    assert summary.workflow == "milestone"
+    assert summary.milestone_id == MILESTONE_ID
+    assert summary.card_id is None
+
+
+def test_list_runs_gives_a_milestone_run_and_a_task_run_a_null_story_id(repo):
+    _record_summary(
+        repo,
+        "run-m",
+        datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+        milestone_id=MILESTONE_ID,
+    )
+    _record_summary(
+        repo,
+        "run-t",
+        datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc),
+        workflow="task",
+        subtask_cards=("ef248597",),
+    )
+
+    summaries = _listed(repo)
+
+    assert [(s.id, s.story_id) for s in summaries] == [("run-t", None), ("run-m", None)]
+
+
+def test_list_runs_gives_a_row_whose_config_has_no_story_id_a_null_story_id(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.connection.execute(
+            "UPDATE runs SET config = ? WHERE id = ?",
+            (json.dumps({"max_concurrent_stories": 2}), RUN_ID),
+        )
+        st.connection.commit()
+    finally:
+        st.close()
+
+    [summary] = _listed(repo)
+
+    assert summary.id == RUN_ID
+    assert summary.story_id is None
+
+
+@pytest.mark.parametrize(
+    "config, error",
+    [
+        ("not json", sqlite3.OperationalError),
+        (json.dumps({"story_id": 5}), ValidationError),
+        (json.dumps({"story_id": {"card": STORY_ID}}), ValidationError),
+    ],
+    ids=["malformed-json", "number", "object"],
+)
+def test_list_runs_refuses_a_config_it_cannot_read_a_story_id_from(repo, config, error):
+    """A `story_id` that cannot be read is an error, never a `null`."""
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.connection.execute("UPDATE runs SET config = ? WHERE id = ?", (config, RUN_ID))
+        st.connection.commit()
+    finally:
+        st.close()
+
+    with pytest.raises(error):
+        _listed(repo)
+
+
 def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
     st = store.Store.open(repo, RUN_ID)
     try:
@@ -3447,6 +3535,32 @@ RUN_UPSERT_KEYS = {
 
 STORY_UPSERT_KEYS = {"card_id", "title", "level", "status", "tip_branch"}
 """A `story_upsert` payload: the `StoryRun` dump without `subtasks`. No milestone key."""
+
+
+def test_a_story_runs_journal_names_its_story_and_milestone_at_the_head(repo):
+    """The first line of a story run's journal is a `run_upsert` whose
+    `config.story_id` is the story and whose `milestone_id` is the parent
+    milestone; `story_id` is not a top-level payload key."""
+    run = _with_story(_run(repo), STORY_ID).model_copy(
+        update={"milestone_id": MILESTONE_ID}
+    )
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(run)
+        st.record_story(_story())
+        st.record_run(run.model_copy(update={"status": "done"}))
+    finally:
+        st.close()
+
+    lines = store.Journal(RUN_ID).read()
+
+    head = min(lines, key=lambda line: line.seq)
+    assert head is lines[0]
+    assert head.event == "run_upsert"
+    assert set(head.payload) == RUN_UPSERT_KEYS
+    assert head.payload["workflow"] == "milestone"
+    assert head.payload["config"]["story_id"] == STORY_ID
+    assert head.payload["milestone_id"] == MILESTONE_ID
 
 
 def test_a_milestone_runs_journal_names_its_milestone_once_at_the_head(repo):

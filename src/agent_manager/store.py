@@ -896,6 +896,11 @@ class RunSummary(BaseModel):
     for any other workflow or before that subtask row is written. Both default
     to `None`, so they are additive: no older key changed.
 
+    `story_id` is the run's `config.story_id`: the story card an
+    `am run --story` run drives, `None` on any other run and on a row whose
+    stored config has no `story_id` key. It defaults to `None`, so it is
+    additive.
+
     `lease` is the run's `run_leases` row as a `RunLease`, or `None` when the
     run has no lease row. `list_runs` always leaves it `None`; `am runs`
     fills it in `cli`. It too defaults to `None`, so it is additive.
@@ -917,6 +922,7 @@ class RunSummary(BaseModel):
     started_at: datetime | None = None
     milestone_id: str | None = None
     card_id: str | None = None
+    story_id: str | None = None
     lease: RunLease | None = None
     progress: RunProgress | None = None
 
@@ -981,6 +987,11 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     `task` run ever hold several subtask rows, the lowest `position`, then the
     lowest card id, wins, so the answer is stable rather than an error.
 
+    `story_id` is read from the row's `config` JSON alone. A config with no
+    `story_id` key lists as `None`; a config that is not JSON raises
+    `sqlite3.OperationalError`, and a `story_id` that is neither a string nor
+    null fails `RunSummary` validation, so neither is listed as `None`.
+
     `progress` is counted here for every run, never left `None`, from plain
     `SELECT`s over that run's `stories`, `subtasks`, `phases` and `attempts`
     rows; nothing in it needs `control`. At each level `done` counts only
@@ -998,6 +1009,7 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     rows = conn.execute(
         "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
         " runs.branch_prefix, runs.status, runs.started_at, runs.milestone_id,"
+        " runs.config -> '$.story_id' AS story_id,"
         " CASE WHEN runs.workflow = 'task' THEN ("
         "   SELECT subtasks.card_id FROM subtasks"
         "    WHERE subtasks.run_id = runs.id"
@@ -1006,7 +1018,15 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
         " FROM runs ORDER BY runs.started_at DESC, runs.id DESC"
     ).fetchall()
     return [
-        RunSummary.model_validate({**dict(row), "progress": _run_progress(conn, row["id"])})
+        RunSummary.model_validate(
+            {
+                **dict(row),
+                "story_id": None
+                if row["story_id"] is None
+                else json.loads(row["story_id"]),
+                "progress": _run_progress(conn, row["id"]),
+            }
+        )
         for row in rows
     ]
 
