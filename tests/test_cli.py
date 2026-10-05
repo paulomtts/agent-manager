@@ -45,6 +45,7 @@ from agent_manager import (
     dag,
     detach,
     dispatch,
+    errors,
     integration,
     locks,
     models,
@@ -12579,3 +12580,312 @@ def test_check_run_targets_names_story_when_no_target_is_given():
 
     assert caught.value.message == "one of --card, --milestone, --story or --board is required"
     assert caught.value.param_hint == "'--card' / '--milestone' / '--story' / '--board'"
+
+
+# ── am run --story --dry-run: the story preview ─────────────────────────────
+#
+# Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
+# dir is a plain directory, and the done-blocker branch lookup is the stubbed
+# `orchestrate._local_branch_exists`. No git, brd or claude process starts.
+
+STORY_PREFIX = "m3"
+
+
+def _story_root(tmp_path: Path, monkeypatch) -> Path:
+    """A plain project directory with its projection under tmp_path; no git, no brd."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    return root.resolve()
+
+
+def _story_branch(root: Path, card_id: str) -> str:
+    return dag.task_branch(STORY_PREFIX, board.show(card_id, repo_dir=root))
+
+
+def _story_lookups(monkeypatch, present: frozenset[str] | set[str] = frozenset()) -> list[str]:
+    """Stub `orchestrate._local_branch_exists`: only `present` exist locally.
+
+    Returns the list every branch asked about is appended to.
+    """
+    asked: list[str] = []
+
+    def factory(root: Path) -> Any:
+        def exists(branch: str) -> bool:
+            asked.append(branch)
+            return branch in present
+
+        return exists
+
+    monkeypatch.setattr(orchestrate, "_local_branch_exists", factory)
+    return asked
+
+
+def _forbid_story_writes(monkeypatch) -> None:
+    """A story preview opens no store, refreshes no git, checks no claim, runs nothing."""
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(orchestrate, "Store", _Forbidden("orchestrate.Store"))
+    monkeypatch.setattr(orchestrate, "refresh_git", _Forbidden("orchestrate.refresh_git"))
+    monkeypatch.setattr(cli, "refuse_claimed", _Forbidden("refuse_claimed"))
+    monkeypatch.setattr(orchestrate, "run_story", _Forbidden("run_story"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("run_milestone"))
+
+
+def _seed_story_board(fake_board) -> dict[str, str]:
+    """A milestone with Story A (one todo subtask) and Story S (s1 done, s2 and s3 todo)."""
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    other = fake_board.add_card("Story A: rows", parent_id=milestone)
+    a1 = fake_board.add_card("a1: rows", parent_id=other)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone)
+    s1 = fake_board.add_card("s1: cols one", parent_id=story, status="done")
+    s2 = fake_board.add_card("s2: cols two", parent_id=story, blocked_by=[s1])
+    s3 = fake_board.add_card("s3: cols three", parent_id=story, blocked_by=[s2])
+    return {
+        "milestone": milestone,
+        "other": other,
+        "a1": a1,
+        "story": story,
+        "s1": s1,
+        "s2": s2,
+        "s3": s3,
+    }
+
+
+def _dry_run_story(root: Path, needle: str) -> dict[str, Any]:
+    return cli.dry_run_story(
+        needle, repo_dir=root, branch_prefix=STORY_PREFIX, base_branch="main"
+    )
+
+
+def test_dry_run_story_previews_only_that_story_with_no_integrate(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    asked = _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+    branch = {key: _story_branch(root, cards[key]) for key in ("s1", "s2", "s3")}
+
+    data = _dry_run_story(root, cards["story"])
+
+    assert list(data) == ["max_concurrent", "levels", "already_done", "integrate"]
+    assert data == {
+        "max_concurrent": 1,
+        "levels": [
+            {
+                "level": 0,
+                "concurrent": 1,
+                "stories": [
+                    {
+                        "story": cards["story"],
+                        "title": "Story S: cols",
+                        "root": "main",
+                        "subtasks": [
+                            {
+                                "id": cards["s2"],
+                                "title": "s2: cols two",
+                                "status": "todo",
+                                "branch": branch["s2"],
+                                "base": branch["s1"],
+                            },
+                            {
+                                "id": cards["s3"],
+                                "title": "s3: cols three",
+                                "status": "todo",
+                                "branch": branch["s3"],
+                                "base": branch["s2"],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "already_done": [
+            {"kind": "subtask", "id": cards["s1"], "title": "s1: cols one", "story": cards["story"]}
+        ],
+        "integrate": None,
+    }
+    assert asked == []
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize(
+    ("blocker_status", "tip_exists", "rooted_on_tip", "looked_up"),
+    [
+        ("done", True, True, True),
+        ("done", False, False, True),
+        ("canceled", False, False, False),
+    ],
+)
+def test_dry_run_story_roots_the_story_where_the_real_run_would(
+    tmp_path, monkeypatch, fake_board, blocker_status, tip_exists, rooted_on_tip, looked_up
+):
+    """A done blocker's tip when that branch exists locally, else the base
+    branch; an out-of-play blocker is never looked up. The blocker itself is
+    never a level row and never listed as already done."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    blocker = fake_board.add_card("Story A: rows", parent_id=milestone, status=blocker_status)
+    b1 = fake_board.add_card(
+        "a1: rows", parent_id=blocker, status="done" if blocker_status == "done" else "todo"
+    )
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[blocker])
+    s1 = fake_board.add_card("s1: cols one", parent_id=story)
+    tip = _story_branch(root, b1)
+    asked = _story_lookups(monkeypatch, {tip} if tip_exists else set())
+    _forbid_story_writes(monkeypatch)
+    expected_root = tip if rooted_on_tip else "main"
+
+    data = _dry_run_story(root, story)
+
+    assert data["levels"] == [
+        {
+            "level": 0,
+            "concurrent": 1,
+            "stories": [
+                {
+                    "story": story,
+                    "title": "Story S: cols",
+                    "root": expected_root,
+                    "subtasks": [
+                        {
+                            "id": s1,
+                            "title": "s1: cols one",
+                            "status": "todo",
+                            "branch": _story_branch(root, s1),
+                            "base": expected_root,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    assert data["already_done"] == []
+    assert data["integrate"] is None
+    assert asked == ([tip] if looked_up else [])
+
+
+def test_dry_run_story_roots_on_a_merged_base_for_two_done_blockers(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    a = fake_board.add_card("Story A: rows", parent_id=milestone, status="done")
+    a1 = fake_board.add_card("a1: rows", parent_id=a, status="done")
+    b = fake_board.add_card("Story B: cells", parent_id=milestone, status="done")
+    b1 = fake_board.add_card("b1: cells", parent_id=b, status="done")
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, blocked_by=[b, a])
+    fake_board.add_card("s1: cols one", parent_id=story)
+    _story_lookups(monkeypatch, {_story_branch(root, a1), _story_branch(root, b1)})
+    _forbid_story_writes(monkeypatch)
+    match = census.find_story(board.roots(repo_dir=root), story)
+    cut = orchestrate.story_census(
+        board.tree(milestone, repo_dir=root), match.story, root=root, branch_prefix=STORY_PREFIX
+    )
+    merged = dag.base_branch_name(STORY_PREFIX, cut.stories[-1])
+
+    data = _dry_run_story(root, story)
+
+    (level,) = data["levels"]
+    (row,) = level["stories"]
+    assert row["story"] == story
+    assert row["root"] == merged
+    assert row["merged_from"] == [a, b]
+    assert row["subtasks"][0]["base"] == merged
+    assert data["already_done"] == []
+
+
+@pytest.mark.parametrize(
+    ("story_status", "subtask_status", "already_done_story"),
+    [("todo", "done", True), ("done", "done", True), ("canceled", "todo", False)],
+)
+def test_dry_run_story_with_nothing_to_run_has_no_level(
+    tmp_path, monkeypatch, fake_board, story_status, subtask_status, already_done_story
+):
+    """A finished story is one `kind: story` entry; an out-of-play one lists nothing."""
+    root = _story_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    fake_board.add_card("Story A: rows", parent_id=milestone)
+    story = fake_board.add_card("Story S: cols", parent_id=milestone, status=story_status)
+    s1 = fake_board.add_card("s1: cols one", parent_id=story, status=subtask_status)
+    fake_board.add_card("s2: cols two", parent_id=story, status=subtask_status, blocked_by=[s1])
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    data = _dry_run_story(root, story)
+
+    assert data["levels"] == []
+    assert data["already_done"] == (
+        [{"kind": "story", "id": story, "title": "Story S: cols"}] if already_done_story else []
+    )
+    assert data["integrate"] is None
+    assert _run_dirs() == []
+
+
+def test_dry_run_story_refuses_an_open_blocker_before_any_lookup(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    blocked = fake_board.add_card(
+        "Story T: cells", parent_id=cards["milestone"], blocked_by=[cards["other"]]
+    )
+    fake_board.add_card("t1: cells", parent_id=blocked)
+    asked = _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(errors.StoryBlockedError):
+        _dry_run_story(root, blocked)
+
+    assert asked == []
+    assert _run_dirs() == []
+
+
+@pytest.mark.parametrize("case", ["none", "several", "milestone", "milestone title", "subtask"])
+def test_dry_run_story_refuses_a_needle_that_is_not_one_story(
+    tmp_path, monkeypatch, fake_board, case
+):
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    needle = {
+        "none": "no such story",
+        "several": "Story",
+        "milestone": cards["milestone"],
+        "milestone title": "orchestration",
+        "subtask": cards["s1"],
+    }[case]
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(errors.StoryNotFoundError):
+        _dry_run_story(root, needle)
+
+    assert _run_dirs() == []
+
+
+def test_dry_run_story_refuses_a_blocker_cycle_anywhere_in_the_milestone(
+    tmp_path, monkeypatch, fake_board
+):
+    """The census is patched to hand back cyclic sibling stories, as in the
+    preflight_story cycle test: the board itself cannot hold a cycle."""
+    root = _story_root(tmp_path, monkeypatch)
+    cards = _seed_story_board(fake_board)
+    a = census.StoryPlan(
+        "story-x", "Story X", "todo", ["story-y"], [census.SubtaskPlan("x1", "x1", "todo")]
+    )
+    b = census.StoryPlan(
+        "story-y", "Story Y", "todo", ["story-x"], [census.SubtaskPlan("y1", "y1", "todo")]
+    )
+    selected = census.StoryPlan(
+        cards["story"], "Story S: cols", "todo", [], [census.SubtaskPlan(cards["s2"], "s2", "todo")]
+    )
+    monkeypatch.setattr(
+        census,
+        "flatten_milestone",
+        lambda node: census.Census(milestone_title=node.title, stories=[a, b, selected]),
+    )
+    _story_lookups(monkeypatch)
+    _forbid_story_writes(monkeypatch)
+
+    with pytest.raises(dag.DependencyCycleError):
+        _dry_run_story(root, cards["story"])

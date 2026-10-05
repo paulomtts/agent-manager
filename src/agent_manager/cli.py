@@ -1294,6 +1294,51 @@ def dry_run_milestone(
     )
 
 
+def dry_run_story(
+    needle: str,
+    *,
+    repo_dir: Path,
+    branch_prefix: str,
+    base_branch: str,
+) -> dict[str, Any]:
+    """`--dry-run --story`: the one story a story run would drive, on one lane, with no Integrate.
+
+    The plan is the real run's, `orchestrate.story_census` over the story's
+    milestone, so every refusal of the run's pre-flight but `ClaimedError`
+    (a preview checks no claim) is raised the same: `StoryNotFoundError`,
+    `DependencyCycleError`, `StoryBlockedError`. `levels` is
+    `compute_dry_run_plan`'s at one lane: the selected story alone, rooted
+    where the run would root it; a done blocker it stacks on gets no row.
+    `already_done` lists the selected story's entries only, and `integrate`
+    is `None`. Read-only by construction: the two `brd` reads and, for a
+    done blocker only, the read-only local-branch lookup are its only I/O. No
+    `Store` is opened, git is not refreshed, nothing is written.
+    """
+    root = resolve_repo_dir(repo_dir)
+    match = census.find_story(board.roots(repo_dir=root), needle)
+    plan = orchestrate.story_census(
+        board.tree(match.milestone.id, repo_dir=root),
+        match.story,
+        root=root,
+        branch_prefix=branch_prefix,
+    )
+    preview = compute_dry_run_plan(
+        plan.stories,
+        repo_dir=root,
+        branch_prefix=branch_prefix,
+        base_branch=base_branch,
+        max_concurrent=1,
+    )
+    return {
+        "max_concurrent": 1,
+        "levels": preview.levels,
+        "already_done": already_done_entries(
+            [story for story in plan.stories if story.id == match.story.id]
+        ),
+        "integrate": None,
+    }
+
+
 def board_prefix_of(branch_prefix: str | None) -> Callable[[models.CardNode], str]:
     """Run-board spec 3.2: how one milestone's branch prefix is derived under `--board`.
 
