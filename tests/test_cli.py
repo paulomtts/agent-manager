@@ -13997,3 +13997,67 @@ def test_default_runner_factory_without_timeouts_keeps_the_default():
     assert runner.harness_timeout is None
     assert runner.harness_timeouts == {}
     assert runner.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT
+
+
+def _card_engine_factory(root: Path, cards: dict[str, str], monkeypatch, **kwargs: Any) -> Any:
+    """Run `run_card_engine` on a freshly recorded card run and return the
+    `runner_factory` it handed `drive_subtask_async`. `kwargs` go to
+    `preflight_card` except `runner_factory`, which goes to the engine."""
+    injected = kwargs.pop("runner_factory", None)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        **kwargs,
+    )
+    with cli.recorded_card_run(pre) as recorded:
+        asyncio.run(
+            cli.run_card_engine(
+                pre, recorded, runner_factory=injected, control_interval=CONTROL_TICK
+            )
+        )
+    (call,) = calls
+    return call["runner_factory"]
+
+
+def test_run_card_engine_hands_on_no_factory_when_no_timeout_is_recorded(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    assert _card_engine_factory(root, cards, monkeypatch) is None
+
+
+def test_run_card_engine_binds_the_recorded_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    factory = _card_engine_factory(
+        root, cards, monkeypatch, harness_timeout=2.0, harness_timeouts={"review": 5.0}
+    )
+
+    runner = _bound_runner(factory)
+    assert runner.timeout_for("explore") == 2.0
+    assert runner.timeout_for("review") == 5.0
+
+
+def test_run_card_engine_hands_an_injected_factory_on_unchanged(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 2: the test seam wins over a recorded timeout."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    def injected(*, store: Any, run_id: str, story_id: str, card_id: str) -> Any:
+        return None
+
+    factory = _card_engine_factory(
+        root, cards, monkeypatch, harness_timeout=2.0, runner_factory=injected
+    )
+
+    assert factory is injected

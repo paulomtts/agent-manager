@@ -1127,6 +1127,8 @@ async def run_card_engine(
     recorded and, still under the lease, the card gets at most one comment
     (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
     the payload's `warnings`. The caller owns the store and the lease.
+    The walk's runner gets the run's recorded harness timeouts
+    (`runner_factory_for`, card eee43099).
     """
     store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
     stop = StopSignal()
@@ -1142,7 +1144,7 @@ async def run_card_engine(
             repo_dir=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
+            runner_factory=runner_factory_for(pre.run_record.config, runner_factory),
             stop=stop,
         ),
         store=store,
