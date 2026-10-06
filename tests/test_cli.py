@@ -14134,3 +14134,48 @@ def test_the_am_script_targets_entry():
     scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
 
     assert scripts["am"] == "agent_manager.cli:entry"
+
+
+@pytest.mark.parametrize(
+    ("target", "seam"),
+    [
+        (["--story", "S", "--branch-prefix", "m1"], "run_story"),
+        (["--story", "S", "--branch-prefix", "m1", "--detach"], "detach_story"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3"], "run_milestone"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3", "--detach"], "detach_milestone"),
+        (["--board"], "run_board"),
+        (["--board", "--detach"], "detach_board"),
+        (["--card", VERIFY_CARD_ID, "--branch-prefix", "m1", "--detach"], "detach_card"),
+    ],
+)
+def test_verify_from_env_reaches_every_run_branch(tmp_path, monkeypatch, target, seam):
+    """Spec §3.4 item 6: the commands flow everywhere `list(verify)` did."""
+    seen: list[tuple[str, Any]] = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            seen.append((name, kwargs["commands"]))
+            return {"run_id": FROM_ENV_RUN_ID}
+
+        return fake
+
+    for name in (
+        "run_story",
+        "detach_story",
+        "run_milestone",
+        "detach_milestone",
+        "run_board",
+        "detach_board",
+    ):
+        monkeypatch.setattr(orchestrate, name, recorder(name))
+    monkeypatch.setattr(cli, "run_card", recorder("run_card"))
+    monkeypatch.setattr(cli, "detach_card", recorder("detach_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = runner.invoke(
+        cli.app,
+        ["run", "--verify-from-env", *target, "--repo-dir", str(tmp_path), "--base-branch", "main"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [(seam, ["a b", "c"])]
