@@ -17,6 +17,15 @@ from typing import Any, Callable, Mapping
 from pydantic import BaseModel
 
 
+LAUNCHER_MARGIN = timedelta(minutes=5)
+"""How far an agent phase's turn timeout must stay above its launcher timeout.
+
+G2: the launcher has to kill `claude -p` before the turn is cancelled, because
+cancellation cannot stop a `to_thread` worker. The workflow's declared floor
+(`workflow.task.AGENT_TIMEOUT_FLOOR`) and the compiler's per-run turn timeout
+(`runtime.compile.Compiled.turn_for`) both add this one margin."""
+
+
 class WorkflowError(ValueError):
     """A declared workflow that must not run; `.phase` names the phase at fault."""
 
