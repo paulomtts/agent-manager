@@ -12,7 +12,7 @@ import re
 import typing
 from pathlib import Path
 
-from agent_manager import cli, detach, errors, models, orchestrate, runs, store
+from agent_manager import cli, detach, dispatch, errors, models, orchestrate, runs, store
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
@@ -483,3 +483,44 @@ def test_readme_spells_canceled_outside_legacy_sites():
         assert "`cancelled`" in line, line
         assert any(marker in line for marker in legacy_markers), line
     assert "already_cancelled" not in README.read_text(encoding="utf-8")
+
+
+HARNESS_FLAG = "`--harness-timeout [PHASE=]SECONDS`"
+KEEPS_TIMEOUTS = "keeps the harness timeouts the run recorded"
+REPLACES_BOTH = "replaces both the recorded default and the recorded per-phase overrides"
+
+
+def _resume_paragraph() -> str:
+    text = README.read_text(encoding="utf-8")
+    start = text.index("Pick a run back up where it was interrupted")
+    end = text.index("\n\n", start)
+    return text[start:end]
+
+
+def test_usage_documents_the_harness_timeout_flag():
+    usage = _section("Usage")
+    assert HARNESS_FLAG in usage
+    assert f"{cli.HARNESS_TIMEOUT_MIN} to {cli.HARNESS_TIMEOUT_MAX}" in usage
+    assert f"{dispatch.DEFAULT_TIMEOUT:.0f}" in usage
+    task_phases = ", ".join(f"`{phase}`" for phase in cli.TASK_AGENT_PHASES)
+    assert task_phases in usage
+    assert "`resolve`" in usage
+    assert "exit 2" in usage
+    assert "`--dry-run`" in usage
+    assert "`harness_error`" in usage
+
+
+def test_resume_text_keeps_or_replaces_the_harness_timeouts():
+    for text in (_resume_paragraph(), _section("Relaunching resumes")):
+        assert KEEPS_TIMEOUTS in text
+        assert REPLACES_BOTH in text
+        assert "not merged" in text
+        assert "`resolve`" in text
+        assert "exit 2" in text
+    assert (
+        "There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here"
+        in _resume_paragraph()
+    )
+    assert "takes only the `--harness-timeout` values given to it" in _section(
+        "Relaunching resumes"
+    )
