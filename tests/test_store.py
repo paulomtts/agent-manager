@@ -3520,6 +3520,108 @@ def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
     assert returned.config.story_id is None
 
 
+VERIFY = ["uv run pytest", "echo a b"]
+
+
+def _with_verify(run: models.Run, verify: list[str], allow_no_verification: bool) -> models.Run:
+    return run.model_copy(
+        update={
+            "config": run.config.model_copy(
+                update={"verify": verify, "allow_no_verification": allow_no_verification}
+            )
+        }
+    )
+
+
+def test_a_runs_config_verify_and_opt_out_round_trip_through_the_row_and_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_verify(_run(repo), VERIFY, True))
+        via_store = st.load_run(RUN_ID)
+        via_connection = store.load_run(st.connection, RUN_ID)
+        row = st.connection.execute(
+            "SELECT config FROM runs WHERE id = ?", (RUN_ID,)
+        ).fetchone()
+    finally:
+        st.close()
+
+    for loaded in (via_store, via_connection):
+        assert loaded is not None
+        assert loaded.config.verify == VERIFY
+        assert loaded.config.allow_no_verification is True
+    config = json.loads(row["config"])
+    assert (config["verify"], config["allow_no_verification"]) == (VERIFY, True)
+    upserts = [line for line in store.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    assert upserts
+    assert all(line.payload["config"]["verify"] == VERIFY for line in upserts)
+    assert all(line.payload["config"]["allow_no_verification"] is True for line in upserts)
+
+
+def test_a_runs_row_whose_config_has_no_verify_loads_with_the_defaults(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_verify(_run(repo), VERIFY, True))
+        st.connection.execute(
+            "UPDATE runs SET config = ? WHERE id = ?",
+            (json.dumps({"max_concurrent_stories": 2}), RUN_ID),
+        )
+        st.connection.commit()
+        loaded = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert loaded is not None
+    assert loaded.config == models.RunConfig(max_concurrent_stories=2)
+
+
+def test_a_run_upsert_line_without_verify_or_opt_out_rebuilds_to_the_defaults(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_verify(_run(repo), VERIFY, True))
+    finally:
+        st.close()
+
+    journal_path = store.Journal(RUN_ID).path
+    records = [json.loads(text) for text in journal_path.read_text().splitlines()]
+    upserts = [record for record in records if record["event"] == "run_upsert"]
+    assert upserts
+    for record in upserts:
+        del record["payload"]["config"]["verify"]
+        del record["payload"]["config"]["allow_no_verification"]
+    journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.config == _run(repo).config
+    assert returned.config.verify == []
+    assert returned.config.allow_no_verification is False
+
+
+def test_a_runs_config_verify_survives_a_rebuild_from_the_journal(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_verify(_run(repo), VERIFY, True))
+    finally:
+        st.close()
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.config.verify == VERIFY
+    assert returned.config.allow_no_verification is True
+    assert after is not None and after == returned
+
+
 RUN_UPSERT_KEYS = {
     "id",
     "workflow",

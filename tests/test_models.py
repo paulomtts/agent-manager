@@ -446,6 +446,38 @@ def test_run_config_rejects_a_non_string_story_id(value):
     assert "story_id" in str(excinfo.value)
 
 
+def test_run_config_verify_defaults_to_an_empty_list_and_the_opt_out_to_false():
+    first, second = models.RunConfig(), models.RunConfig()
+
+    assert first.verify == []
+    assert first.allow_no_verification is False
+    first.verify.append("uv run pytest")
+    assert second.verify == []
+
+
+def test_run_config_keeps_a_verify_list_verbatim():
+    suite = ["b", "a", "a", " x ", ""]
+
+    dumped = models.RunConfig(verify=suite).model_dump(mode="json")
+
+    assert dumped["verify"] == suite
+    assert models.RunConfig.model_validate(dumped).verify == suite
+
+
+@pytest.mark.parametrize("value", ["true", [1], None])
+def test_run_config_rejects_a_non_list_verify(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(verify=value)
+    assert "verify" in str(excinfo.value)
+
+
+def test_run_config_accepts_allow_no_verification_true():
+    dumped = models.RunConfig(allow_no_verification=True).model_dump(mode="json")
+
+    assert dumped["allow_no_verification"] is True
+    assert models.RunConfig.model_validate(dumped).allow_no_verification is True
+
+
 def test_story_rejects_a_negative_level():
     with pytest.raises(ValidationError) as excinfo:
         models.StoryRun(card_id="8831189b", title="Foundations", level=-1)

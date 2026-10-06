@@ -180,6 +180,18 @@ class RunConfig(_Model):
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)
     story_id: str | None = None
     """The story card a run is restricted to; `None` when the run is not a story run."""
+    verify: list[str] = Field(default_factory=list)
+    """The verification suite the run was started with, verbatim; `[]` when none.
+
+    Resume reads it when `--verify` is omitted. Defaulted because journal
+    lines written before it carry no such key.
+    """
+    allow_no_verification: bool = False
+    """Whether the run was started opted out of verification.
+
+    Resume reads it, and a resume's flag can only add it. Defaulted because
+    journal lines written before it carry no such key.
+    """
 
 
 class Run(_Model):
