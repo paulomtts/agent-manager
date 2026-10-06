@@ -12,6 +12,8 @@ This module imports only the stdlib, and it is the only module that calls
 from __future__ import annotations
 
 import json
+import os
+import sys
 from collections.abc import Mapping, Sequence
 
 VERIFY_ENV = "AM_VERIFY_JSON"
@@ -25,6 +27,9 @@ VERIFY_FLAG = "--verify"
 
 COMMANDS = ("run", "resume")
 """The subcommands that take `--verify`; argv for any other is left alone."""
+
+ARGV_VISIBLE_WARNING = "argv: verification commands visible in the process command line"
+"""What `reexec_neutral` returns when the re-exec failed and the original argv stands."""
 
 
 def neutralize(
@@ -66,3 +71,23 @@ def neutralize(
         return None
     new_argv = [argv[0], argv[1], FROM_ENV_FLAG, *kept, *argv[end:]]
     return new_argv, {**environ, VERIFY_ENV: json.dumps(values)}
+
+
+def reexec_neutral(argv: Sequence[str]) -> str | None:
+    """Replace this process with one whose argv holds no verification text.
+
+    Returns `None` when `neutralize` leaves `argv` alone. Otherwise execs
+    `sys.executable` on the neutral argv and environment and does not return,
+    unless the exec raises `OSError`: then it returns `ARGV_VISIBLE_WARNING`
+    and the process goes on with its original argv and environment.
+    """
+    neutral = neutralize(argv, dict(os.environ))
+    if neutral is None:
+        return None
+    new_argv, new_environ = neutral
+    try:
+        # `argv[0]` of the `am` console script is the script's path, so the
+        # interpreter runs the same script again.
+        os.execve(sys.executable, [sys.executable, *new_argv], new_environ)
+    except OSError:
+        return ARGV_VISIBLE_WARNING

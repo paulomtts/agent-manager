@@ -189,3 +189,68 @@ def test_the_module_imports_only_the_stdlib():
         elif isinstance(node, ast.ImportFrom):
             modules.add((node.module or "").split(".")[0])
     assert modules <= set(sys.stdlib_module_names) | {"__future__"}
+
+
+class _Execed(Exception):
+    """Stands in for `os.execve` not returning: the fake raises it after recording."""
+
+
+def test_reexec_neutral_execs_the_interpreter_on_the_neutral_argv(monkeypatch):
+    """Spec test 14."""
+    calls: list[tuple[str, list[str], dict[str, str]]] = []
+
+    def fake_execve(path, args, env):
+        calls.append((path, list(args), dict(env)))
+        raise _Execed
+
+    monkeypatch.setattr(argv_guard.os, "execve", fake_execve)
+    monkeypatch.setenv("AM_TEST_KEPT", "yes")
+    argv = ["/usr/bin/am", "run", "--card", "c", "--verify", "uv run pytest"]
+
+    with pytest.raises(_Execed):
+        argv_guard.reexec_neutral(argv)
+
+    ((path, args, env),) = calls
+    assert path == sys.executable
+    assert args == [sys.executable, "/usr/bin/am", "run", FROM_ENV_FLAG, "--card", "c"]
+    assert _env_values(env) == ["uv run pytest"]
+    assert env["AM_TEST_KEPT"] == "yes"
+
+
+def test_reexec_neutral_leaves_a_neutral_argv_alone(monkeypatch):
+    """Spec test 15."""
+
+    def fake_execve(path, args, env):
+        pytest.fail("reexec_neutral execed an argv with no --verify")
+
+    monkeypatch.setattr(argv_guard.os, "execve", fake_execve)
+
+    assert argv_guard.reexec_neutral(["/usr/bin/am", "run", "--card", "c"]) is None
+
+
+def test_reexec_neutral_returns_the_warning_when_the_exec_fails(monkeypatch):
+    """Spec test 16."""
+
+    def fake_execve(path, args, env):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(argv_guard.os, "execve", fake_execve)
+
+    warning = argv_guard.reexec_neutral(["/usr/bin/am", "run", "--verify", "x"])
+
+    assert warning == argv_guard.ARGV_VISIBLE_WARNING
+    assert warning == "argv: verification commands visible in the process command line"
+
+
+def test_only_argv_guard_calls_os_execve():
+    """Spec test 18: pins docs/standards/architecture.md §5 row 5.15."""
+    package = Path(agent_manager.__file__).parent
+    sites: set[str] = set()
+    for path in package.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and node.attr == "execve") or (
+                isinstance(node, ast.alias) and node.name == "execve"
+            ):
+                sites.add(path.relative_to(package).as_posix())
+    assert sites == {"argv_guard.py"}
