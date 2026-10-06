@@ -1699,6 +1699,7 @@ def parse_harness_timeouts(
         per_phase[name] = seconds
     return default, per_phase
 
+
 def _check_run_targets(
     *,
     card: str | None,

@@ -7024,6 +7024,8 @@ def test_reading_a_journal_that_does_not_exist_creates_no_data_dir(repo, tmp_pat
         store.Journal._for_reading("run-that-never-was").read()
 
     assert not (tmp_path / "data").exists()
+
+
 # ── RunConfig harness timeouts (card 33dc5549) ──────────────────────────────
 
 
