@@ -38,6 +38,7 @@ from typer.testing import CliRunner
 
 import agent_manager
 from agent_manager import (
+    argv_guard,
     board,
     census,
     cli,
@@ -13806,3 +13807,191 @@ def test_run_help_and_examples_document_the_story_option():
 
     assert result.exit_code == 0, result.output
     assert "--story" in result.output
+
+
+# ── --verify-from-env (card 1b938053) ────────────────────────────────────────
+
+FROM_ENV_RUN_ID = "20260923T140506Z-cbe34d00"
+
+
+def _from_env_run(project: Path, *extra: str, **invoke_kwargs: Any):
+    """`am run --verify-from-env --card ...`, the argv `argv_guard.neutralize` builds."""
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--verify-from-env",
+            "--card",
+            VERIFY_CARD_ID,
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            *extra,
+        ],
+        **invoke_kwargs,
+    )
+
+
+def _recording_run_card(seen: dict[str, Any]):
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        seen["env"] = os.environ.get(argv_guard.VERIFY_ENV)
+        return _fake_payload(card_id, VERIFY_STORY_ID)
+
+    return fake_run_card
+
+
+def test_verify_from_env_reaches_run_card(tmp_path, monkeypatch):
+    """Spec test 19."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == ["a b", "c"]
+
+
+def test_verify_from_env_round_trips_hostile_values_to_run_card(tmp_path, monkeypatch):
+    """Review Focus 5: what `neutralize` encodes is exactly what `run_card` gets."""
+    values = ["pytest -k 'not slow'", 'echo "q"', "back\\slash", "a\nb", "café", ""]
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    _, environ = argv_guard.neutralize(
+        ["am", "run", *(token for value in values for token in ("--verify", value))], {}
+    )
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, environ[argv_guard.VERIFY_ENV])
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == values
+
+
+def test_verify_from_env_accepts_an_empty_list(tmp_path, monkeypatch):
+    """Review Focus 2: an empty suite is a suite, not a usage error."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, "[]")
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == []
+
+
+def test_resume_verify_from_env_reaches_resume_run(tmp_path, monkeypatch):
+    """Spec test 20; Review Focus 4: the flag sits before the run id, as `neutralize` puts it."""
+    seen: dict[str, Any] = {}
+
+    def fake_resume_run(run_id, **kwargs):
+        seen["run_id"] = run_id
+        seen.update(kwargs)
+        seen["env"] = os.environ.get(argv_guard.VERIFY_ENV)
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--verify-from-env", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["run_id"] == FROM_ENV_RUN_ID
+    assert seen["commands"] == ["a b", "c"]
+    assert seen["env"] is None
+
+
+def test_verify_from_env_with_the_variable_unset_is_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 21."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.delenv(argv_guard.VERIFY_ENV, raising=False)
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    assert "unset" in result.output
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not json SECRET", '"SECRET"', '{"SECRET": 1}', '["SECRET", 1]'],
+)
+def test_verify_from_env_with_a_bad_value_is_a_usage_error_that_never_echoes_it(
+    tmp_path, monkeypatch, raw
+):
+    """Spec test 22."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, raw)
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    assert "SECRET" not in result.output
+    assert argv_guard.VERIFY_ENV not in os.environ
+
+
+def test_resume_verify_from_env_with_a_bad_value_is_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 22, resume half."""
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["SECRET", 1]')
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--verify-from-env", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "SECRET" not in result.output
+
+
+def test_verify_from_env_and_verify_together_are_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 23."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a"]')
+
+    result = _from_env_run(tmp_path, "--verify", "x")
+
+    assert result.exit_code == 2, result.output
+    assert "exclusive" in result.output
+
+
+def test_am_verify_json_is_popped_before_run_card_runs(tmp_path, monkeypatch):
+    """Spec test 24, with the flag: nothing the run spawns inherits it."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a"]')
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["env"] is None
+
+
+def test_a_stray_am_verify_json_is_popped_and_ignored_without_the_flag(tmp_path, monkeypatch):
+    """Spec test 24, without the flag; Review Focus 1."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["stray"]')
+
+    result = _invoke(tmp_path, VERIFY_CARD_ID, "--verify", "mine")
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == ["mine"]
+    assert seen["env"] is None
+
+
+@pytest.mark.parametrize("command", [["run"], ["resume"]])
+def test_verify_from_env_is_hidden_from_help(command):
+    """Spec test 25."""
+    result = runner.invoke(cli.app, [*command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--verify" in result.output
+    assert "verify-from-env" not in result.output

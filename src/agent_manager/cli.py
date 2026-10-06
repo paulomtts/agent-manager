@@ -35,6 +35,7 @@ import typer
 from pydantic import ValidationError
 
 from agent_manager import (
+    argv_guard,
     board,
     census,
     comments,
@@ -1605,6 +1606,43 @@ def detach_card(
     )
 
 
+def verify_commands(verify: Sequence[str], *, from_env: bool) -> list[str]:
+    """The verification commands `run` and `resume` drive, from `--verify` or `AM_VERIFY_JSON`.
+
+    `AM_VERIFY_JSON` is popped from `os.environ` on every call, with or
+    without `from_env`, so no process the run spawns inherits it; its value
+    is read only under `--verify-from-env`, the flag `argv_guard` puts in
+    place of every `--verify`. Without the flag the commands are `verify`.
+    With it they are the variable's JSON list of strings, the empty list
+    included. The flag with any `--verify`, with the variable unset, or with
+    a value that is not a JSON list of strings is a usage error (exit 2)
+    whose message never echoes the value.
+    """
+    raw = os.environ.pop(argv_guard.VERIFY_ENV, None)
+    if not from_env:
+        return list(verify)
+    if verify:
+        raise typer.BadParameter(
+            "--verify and --verify-from-env are exclusive",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    if raw is None:
+        raise typer.BadParameter(
+            f"--verify-from-env needs {argv_guard.VERIFY_ENV}, and it is unset",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise typer.BadParameter(
+            f"{argv_guard.VERIFY_ENV} is not a JSON list of strings",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    return value
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -1828,9 +1866,13 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
+    commands = verify_commands(verify, from_env=verify_from_env)
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1857,7 +1899,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
@@ -1870,7 +1912,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
@@ -1890,7 +1932,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
@@ -1904,7 +1946,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
             )
@@ -1923,7 +1965,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
                 detacher=detach.fork_detacher,
             )
@@ -1935,7 +1977,7 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
             )
         elif detach_run:
@@ -1946,7 +1988,7 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                commands=commands,
                 detacher=detach.fork_detacher,
             )
         else:
@@ -1956,7 +1998,7 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                commands=commands,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -3126,6 +3168,9 @@ def resume(
             "and says so in `warnings` when a passed one differs."
         ),
     ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
@@ -3134,12 +3179,13 @@ def resume(
     started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
+    commands = verify_commands(verify, from_env=verify_from_env)
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
-            commands=list(verify),
+            commands=commands,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
