@@ -1922,6 +1922,16 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Recorded with the run. "
+            "Ignored with --dry-run."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
@@ -1934,6 +1944,25 @@ def run(
         branch_prefix=branch_prefix,
         detach=detach_run,
         story=story,
+    )
+    # After the target checks and before the `HANDLED` block (card 33dc5549):
+    # a bad value reads no board, opens no store and creates no run directory.
+    # A card or story run dispatches only `task` phases; a milestone or board
+    # run ends in Integrate.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values,
+        phases=(
+            TASK_AGENT_PHASES
+            if card is not None or story is not None
+            else MILESTONE_AGENT_PHASES
+        ),
+    )
+    # Passed only when given, so a run without the flag calls exactly as before.
+    # The dry-run previews never receive them.
+    timeouts: dict[str, Any] = (
+        {"harness_timeout": default_timeout, "harness_timeouts": phase_timeouts}
+        if harness_timeout_values
+        else {}
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     try:
@@ -1955,6 +1984,7 @@ def run(
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif whole_board:
             # Read as `orchestrate.run_board` so a test can patch it there.
@@ -1967,6 +1997,7 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif milestone is not None and dry_run:
             payload = dry_run_milestone(
@@ -1988,6 +2019,7 @@ def run(
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
@@ -2001,6 +2033,7 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif story is not None and dry_run:
             payload = dry_run_story(
@@ -2020,6 +2053,7 @@ def run(
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif story is not None:
             # Read as `orchestrate.run_story` so a test can patch it there.
@@ -2031,6 +2065,7 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=list(verify),
                 allow_no_verification=allow_no_verification,
+                **timeouts,
             )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
@@ -2042,6 +2077,7 @@ def run(
                 allow_no_verification=allow_no_verification,
                 commands=list(verify),
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         else:
             payload = run_card(
@@ -2051,6 +2087,7 @@ def run(
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
                 commands=list(verify),
+                **timeouts,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -3192,6 +3229,12 @@ def resume(
             "checkpoint, merged bases and Integrate."
         ),
     ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help="Accepted and validated; a resumed run keeps the timeout it was started with.",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
@@ -3200,6 +3243,11 @@ def resume(
     started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
+    # Validated only (card 33dc5549): a resumed run keeps the timeout it was
+    # started with, so nothing parsed here reaches `resume_run`. The run's
+    # workflow is known only once it is loaded, so every agent phase a
+    # `task` or `milestone` run can dispatch is accepted.
+    parse_harness_timeouts(harness_timeout_values, phases=MILESTONE_AGENT_PHASES)
     try:
         payload = resume_run(
             run_id,
