@@ -52,6 +52,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
@@ -1322,7 +1323,7 @@ def _census_stories(project: Path, milestone: str) -> list[str]:
 def _load(project: Path, run_id: str) -> models.Run:
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None

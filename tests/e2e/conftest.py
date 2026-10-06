@@ -22,8 +22,9 @@ import pytest
 from conftest import BINARY_TIERS, missing_binary
 from typer.testing import CliRunner
 
-from agent_manager import board, census, cli, dag, models, paths, store
+from agent_manager import board, census, cli, dag, models, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 FAKE_CLAUDE_SOURCE = Path(__file__).with_name("fake_claude.py")
 """The script copied to a tmp dir as the `claude` the adapter will find."""
@@ -243,7 +244,7 @@ def run_tree(project, completed_run) -> models.Run:
     """The run's `Store` projection, read back the way `status` reads it."""
     conn = store_db.open_db(project)
     try:
-        run = store.load_run(conn, completed_run["run_id"])
+        run = store_queries.load_run(conn, completed_run["run_id"])
     finally:
         conn.close()
     assert run is not None, completed_run["run_id"]

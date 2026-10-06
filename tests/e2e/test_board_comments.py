@@ -27,6 +27,7 @@ import pytest
 
 from agent_manager import board, cli, comments, store
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 KEY_LINE = "am-key: "
 """How every outcome comment's last line starts (board-comments B5)."""
@@ -34,7 +35,7 @@ KEY_LINE = "am-key: "
 def _run_status(root: Path, run_id: str) -> str:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id

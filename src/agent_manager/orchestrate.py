@@ -83,8 +83,9 @@ from agent_manager import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Checkpoint, Store, load_run
+from agent_manager.store import Checkpoint, Store
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import Workflow
@@ -599,7 +600,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     """
     conn = store_db.open_db(root)
     try:
-        run = load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     if run is None:

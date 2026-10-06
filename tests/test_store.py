@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from agent_manager import models, paths, store
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
 RUN_ID = "run-2026-09-23-01"
@@ -924,7 +925,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
 
     conn = store_db.open_db(repo)
     try:
-        summaries = store.list_runs(conn)
+        summaries = store_queries.list_runs(conn)
     finally:
         conn.close()
 
@@ -937,7 +938,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
 def test_list_runs_on_a_project_with_no_runs_is_empty(repo):
     conn = store_db.open_db(repo)
     try:
-        assert store.list_runs(conn) == []
+        assert store_queries.list_runs(conn) == []
     finally:
         conn.close()
 
@@ -949,7 +950,7 @@ def test_list_runs_puts_a_run_with_no_start_time_last(repo):
 
     conn = store_db.open_db(repo)
     try:
-        summaries = store.list_runs(conn)
+        summaries = store_queries.list_runs(conn)
     finally:
         conn.close()
 
@@ -966,7 +967,7 @@ def test_list_runs_breaks_a_started_at_tie_with_the_run_id(repo):
 
     conn = store_db.open_db(repo)
     try:
-        assert [summary.id for summary in store.list_runs(conn)] == ["run-b", "run-a"]
+        assert [summary.id for summary in store_queries.list_runs(conn)] == ["run-b", "run-a"]
     finally:
         conn.close()
 
@@ -990,10 +991,10 @@ SUMMARY_KEYS = {
 `story_id` (card 3d2a3ef8)."""
 
 
-def _listed(root: Path) -> list[store.RunSummary]:
+def _listed(root: Path) -> list[store_queries.RunSummary]:
     conn = store_db.open_db(root)
     try:
-        return store.list_runs(conn)
+        return store_queries.list_runs(conn)
     finally:
         conn.close()
 
@@ -1102,13 +1103,13 @@ def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
 
 
 def test_run_summary_fields_are_the_old_seven_plus_milestone_id_card_id_story_id_lease_and_progress():
-    assert set(store.RunSummary.model_fields) == SUMMARY_KEYS
-    assert store.RunSummary.model_config["extra"] == "forbid"
-    assert store.RunSummary.model_fields["milestone_id"].default is None
-    assert store.RunSummary.model_fields["card_id"].default is None
-    assert store.RunSummary.model_fields["story_id"].default is None
-    assert store.RunSummary.model_fields["lease"].default is None
-    assert store.RunSummary.model_fields["progress"].default is None
+    assert set(store_queries.RunSummary.model_fields) == SUMMARY_KEYS
+    assert store_queries.RunSummary.model_config["extra"] == "forbid"
+    assert store_queries.RunSummary.model_fields["milestone_id"].default is None
+    assert store_queries.RunSummary.model_fields["card_id"].default is None
+    assert store_queries.RunSummary.model_fields["story_id"].default is None
+    assert store_queries.RunSummary.model_fields["lease"].default is None
+    assert store_queries.RunSummary.model_fields["progress"].default is None
 
 
 def test_a_listed_run_dumps_exactly_the_summary_keys(repo):
@@ -1149,27 +1150,27 @@ def _run_lease_fields(**overrides) -> dict:
 
 
 def test_run_lease_has_exactly_the_five_keys_and_forbids_others():
-    assert set(store.RunLease.model_fields) == RUN_LEASE_KEYS
-    assert store.RunLease.model_config["extra"] == "forbid"
+    assert set(store_queries.RunLease.model_fields) == RUN_LEASE_KEYS
+    assert store_queries.RunLease.model_config["extra"] == "forbid"
 
 
 def test_run_summary_lease_defaults_to_none():
-    summary = store.RunSummary.model_validate(_summary_fields())
+    summary = store_queries.RunSummary.model_validate(_summary_fields())
 
     assert summary.lease is None
     assert summary.model_dump()["lease"] is None
 
 
 def test_run_summary_accepts_a_lease_object_and_dumps_it_as_a_plain_dict():
-    summary = store.RunSummary.model_validate(_summary_fields(lease=_run_lease_fields()))
+    summary = store_queries.RunSummary.model_validate(_summary_fields(lease=_run_lease_fields()))
 
-    assert isinstance(summary.lease, store.RunLease)
+    assert isinstance(summary.lease, store_queries.RunLease)
     assert summary.model_dump()["lease"] == _run_lease_fields()
 
 
 def test_run_summary_accepts_null_pid_host_and_heartbeat_in_a_lease():
     """The source design types these three as nullable; the model must agree."""
-    summary = store.RunSummary.model_validate(
+    summary = store_queries.RunSummary.model_validate(
         _summary_fields(lease=_run_lease_fields(pid=None, host=None, heartbeat_at=None))
     )
 
@@ -1185,7 +1186,7 @@ def test_run_summary_rejects_an_unknown_key_inside_the_lease():
     """The error must sit at `lease.acquired_at`: a `RunSummary` with no
     `lease` field at all would also raise, but at `lease`, the wrong reason."""
     with pytest.raises(ValidationError) as caught:
-        store.RunSummary.model_validate(
+        store_queries.RunSummary.model_validate(
             _summary_fields(
                 lease=_run_lease_fields(acquired_at="2026-09-29T08:59:00+00:00")
             )
@@ -1201,7 +1202,7 @@ def test_run_summary_rejects_a_lease_missing_a_key():
     del fields["accepting"]
 
     with pytest.raises(ValidationError) as caught:
-        store.RunSummary.model_validate(_summary_fields(lease=fields))
+        store_queries.RunSummary.model_validate(_summary_fields(lease=fields))
 
     [error] = caught.value.errors()
     assert error["loc"] == ("lease", "accepting")
@@ -1225,35 +1226,35 @@ def _progress_fields(**overrides) -> dict:
 
 
 def test_run_progress_models_have_exactly_their_keys_and_forbid_others():
-    assert set(store.RunProgress.model_fields) == PROGRESS_KEYS
-    assert set(store.ProgressCount.model_fields) == PROGRESS_COUNT_KEYS
-    assert set(store.ProgressCurrent.model_fields) == PROGRESS_CURRENT_KEYS
-    for model in (store.RunProgress, store.ProgressCount, store.ProgressCurrent):
+    assert set(store_queries.RunProgress.model_fields) == PROGRESS_KEYS
+    assert set(store_queries.ProgressCount.model_fields) == PROGRESS_COUNT_KEYS
+    assert set(store_queries.ProgressCurrent.model_fields) == PROGRESS_CURRENT_KEYS
+    for model in (store_queries.RunProgress, store_queries.ProgressCount, store_queries.ProgressCurrent):
         assert model.model_config["extra"] == "forbid"
 
 
 def test_run_summary_progress_defaults_to_none():
     """Additive for anyone who builds a `RunSummary` by hand; `list_runs`
     itself always fills it."""
-    summary = store.RunSummary.model_validate(_summary_fields())
+    summary = store_queries.RunSummary.model_validate(_summary_fields())
 
     assert summary.progress is None
     assert summary.model_dump()["progress"] is None
 
 
 def test_run_summary_accepts_a_progress_object_and_dumps_it_as_a_plain_dict():
-    summary = store.RunSummary.model_validate(_summary_fields(progress=_progress_fields()))
+    summary = store_queries.RunSummary.model_validate(_summary_fields(progress=_progress_fields()))
 
-    assert isinstance(summary.progress, store.RunProgress)
-    assert isinstance(summary.progress.current, store.ProgressCurrent)
+    assert isinstance(summary.progress, store_queries.RunProgress)
+    assert isinstance(summary.progress.current, store_queries.ProgressCurrent)
     assert summary.model_dump()["progress"] == _progress_fields()
 
 
 def test_run_summary_accepts_a_null_current_and_a_null_attempt():
-    no_current = store.RunSummary.model_validate(
+    no_current = store_queries.RunSummary.model_validate(
         _summary_fields(progress=_progress_fields(current=None))
     )
-    no_attempt = store.RunSummary.model_validate(
+    no_attempt = store_queries.RunSummary.model_validate(
         _summary_fields(
             progress=_progress_fields(
                 current={"card": "card-1", "phase": "explore", "attempt": None}
@@ -1287,7 +1288,7 @@ def test_run_summary_accepts_a_null_current_and_a_null_attempt():
 )
 def test_run_summary_rejects_an_unknown_key_anywhere_in_progress(progress, loc):
     with pytest.raises(ValidationError) as caught:
-        store.RunSummary.model_validate(_summary_fields(progress=progress))
+        store_queries.RunSummary.model_validate(_summary_fields(progress=progress))
 
     [error] = caught.value.errors()
     assert error["loc"] == loc
@@ -1301,7 +1302,7 @@ def test_run_summary_rejects_a_progress_missing_current():
     del fields["current"]
 
     with pytest.raises(ValidationError) as caught:
-        store.RunSummary.model_validate(_summary_fields(progress=fields))
+        store_queries.RunSummary.model_validate(_summary_fields(progress=fields))
 
     [error] = caught.value.errors()
     assert error["loc"] == ("progress", "current")
@@ -1578,7 +1579,7 @@ def test_list_runs_current_is_the_started_phase_with_its_latest_attempt(repo):
     [summary] = _listed(repo)
 
     assert summary.progress is not None
-    assert summary.progress.current == store.ProgressCurrent(
+    assert summary.progress.current == store_queries.ProgressCurrent(
         card="card-1", phase="implement", attempt=2
     )
 
@@ -1767,7 +1768,7 @@ def test_list_runs_progress_reads_without_writing(repo):
     conn = store_db.open_db(repo)
     try:
         before = conn.total_changes
-        [summary] = store.list_runs(conn)
+        [summary] = store_queries.list_runs(conn)
         after = conn.total_changes
         in_transaction = conn.in_transaction
     finally:
@@ -1786,8 +1787,8 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
 
     conn = store_db.open_db(repo)
     try:
-        assert store.latest_run_id(conn) == "run-c"
-        assert store.latest_run_id(conn) == store.list_runs(conn)[0].id
+        assert store_queries.latest_run_id(conn) == "run-c"
+        assert store_queries.latest_run_id(conn) == store_queries.list_runs(conn)[0].id
     finally:
         conn.close()
 
@@ -1795,7 +1796,7 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
 def test_latest_run_id_is_none_for_a_project_with_no_runs(repo):
     conn = store_db.open_db(repo)
     try:
-        assert store.latest_run_id(conn) is None
+        assert store_queries.latest_run_id(conn) is None
     finally:
         conn.close()
 
@@ -1821,7 +1822,7 @@ def test_load_run_reads_the_tree_from_a_bare_connection(repo):
 
     conn = store_db.open_db(repo)
     try:
-        run = store.load_run(conn, RUN_ID)
+        run = store_queries.load_run(conn, RUN_ID)
     finally:
         conn.close()
 
@@ -1834,7 +1835,7 @@ def test_load_run_reads_the_tree_from_a_bare_connection(repo):
 def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
     conn = store_db.open_db(repo)
     try:
-        assert store.load_run(conn, "run-that-never-was") is None
+        assert store_queries.load_run(conn, "run-that-never-was") is None
     finally:
         conn.close()
 
@@ -1974,13 +1975,13 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
 
         monkeypatch.setattr(st, "_write_attempt_row", spying_attempt_writer)
 
-        real_load_run = store.load_run
+        real_load_run = store_queries.load_run
 
         def spying_load_run(conn, run_id):
             seen.append(("load_run", _held_elsewhere(st._lock)))
             return real_load_run(conn, run_id)
 
-        monkeypatch.setattr(store, "load_run", spying_load_run)
+        monkeypatch.setattr(store_queries, "load_run", spying_load_run)
 
         rebuilt = st.rebuild_from_journal(RUN_ID)
         loaded = st.load_run(RUN_ID)
@@ -2219,7 +2220,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
         # sees exactly what the threads committed.
         reader = store_db.open_db(repo)
         try:
-            assert store.load_run(reader, RUN_ID) == before
+            assert store_queries.load_run(reader, RUN_ID) == before
         finally:
             reader.close()
 
@@ -2394,7 +2395,7 @@ def test_a_failed_phase_detail_round_trips_through_load_run(repo):
     try:
         _record_failed_phase(st, repo)
         via_store = st.load_run(RUN_ID)
-        via_connection = store.load_run(st.connection, RUN_ID)
+        via_connection = store_queries.load_run(st.connection, RUN_ID)
     finally:
         st.close()
 
@@ -2503,7 +2504,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
             (row["name"], row["status"], row["detail"])
             for row in migrated.execute("SELECT name, status, detail FROM phases")
         ]
-        stale = store.load_run(migrated, RUN_ID)
+        stale = store_queries.load_run(migrated, RUN_ID)
     finally:
         migrated.close()
 
@@ -2693,7 +2694,7 @@ def test_a_runs_milestone_id_round_trips_through_load_run_and_is_overwritten(rep
         unstamped = st.load_run(RUN_ID)
         st.record_run(_run(repo).model_copy(update={"milestone_id": MILESTONE_ID}))
         via_store = st.load_run(RUN_ID)
-        via_connection = store.load_run(st.connection, RUN_ID)
+        via_connection = store_queries.load_run(st.connection, RUN_ID)
         rows = st.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
     finally:
         st.close()
@@ -2740,7 +2741,7 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
             (row["id"], row["status"], row["milestone_id"])
             for row in migrated.execute("SELECT id, status, milestone_id FROM runs")
         ]
-        old = store.load_run(migrated, RUN_ID)
+        old = store_queries.load_run(migrated, RUN_ID)
     finally:
         migrated.close()
 
@@ -2758,7 +2759,7 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
     assert reopened_columns == RUN_COLUMNS
 
 
-def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store.RunSummary]:
+def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store_queries.RunSummary]:
     """`_LEGACY_RUNS` (plus `extra_sql`) written into a fresh database, which a
     second `open_db` then migrates; the migrated projection's listing."""
     fresh = store_db.open_db(repo)
@@ -2770,7 +2771,7 @@ def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store.RunSummary]:
 
     migrated = store_db.open_db(repo)
     try:
-        return store.list_runs(migrated)
+        return store_queries.list_runs(migrated)
     finally:
         migrated.close()
 
@@ -2848,7 +2849,7 @@ def test_a_runs_config_story_id_round_trips_through_the_row_and_the_journal(repo
     try:
         st.record_run(_with_story(_run(repo), STORY_ID))
         via_store = st.load_run(RUN_ID)
-        via_connection = store.load_run(st.connection, RUN_ID)
+        via_connection = store_queries.load_run(st.connection, RUN_ID)
         row = st.connection.execute(
             "SELECT config FROM runs WHERE id = ?", (RUN_ID,)
         ).fetchone()
@@ -4037,8 +4038,8 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
         assert store.read_lease(st.connection, RUN_ID) == lease
         assert store.control_requests(st.connection, RUN_ID) == controls
         assert rebuilt.status == "canceled"
-        assert store.run_status(st.connection, RUN_ID) == "canceled"
-        assert store.run_status(st.connection, "run-never-recorded") is None
+        assert store_queries.run_status(st.connection, RUN_ID) == "canceled"
+        assert store_queries.run_status(st.connection, "run-never-recorded") is None
     finally:
         other.close()
         st.close()
@@ -4048,8 +4049,8 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     replayed = store.Store.open(repo, RUN_ID)
     try:
         replayed.rebuild_from_journal(RUN_ID)
-        summaries = store.list_runs(replayed.connection)
-        status = store.run_status(replayed.connection, RUN_ID)
+        summaries = store_queries.list_runs(replayed.connection)
+        status = store_queries.run_status(replayed.connection, RUN_ID)
     finally:
         replayed.close()
 
@@ -4072,8 +4073,8 @@ def test_run_status_normalises_legacy_cancelled(repo):
         _raw_sql(repo, "UPDATE runs SET status = ? WHERE id = ?", (stored, RUN_ID))
         conn = store_db.open_db(repo)
         try:
-            assert store.run_status(conn, RUN_ID) == expected
-            assert store.run_status(conn, "run-never-recorded") is None
+            assert store_queries.run_status(conn, RUN_ID) == expected
+            assert store_queries.run_status(conn, "run-never-recorded") is None
         finally:
             conn.close()
 
@@ -4118,7 +4119,7 @@ def test_rebuild_from_journal_with_either_spelling(repo, status):
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
         loaded = rebuilt.load_run(RUN_ID)
-        summaries = store.list_runs(rebuilt.connection)
+        summaries = store_queries.list_runs(rebuilt.connection)
     finally:
         rebuilt.close()
 
@@ -4577,7 +4578,7 @@ def test_a_taken_over_store_writes_nothing(repo, stores):
 
     assert a.journal.path.read_bytes() == before
     # The new owner's projection is exactly what a wrote while it was the owner.
-    assert store.run_status(b.connection, RUN_ID) == "started"
+    assert store_queries.run_status(b.connection, RUN_ID) == "started"
     projected = b.load_run(RUN_ID)
     assert projected is not None
     assert [(story.status, story.subtasks) for story in projected.stories] == [("started", [])]
@@ -4606,8 +4607,8 @@ def test_an_unbound_store_writes_as_before(repo, stores):
 
     reader = store_db.open_db(repo)
     try:
-        assert store.run_status(reader, RUN_ID) == "started"
-        projected = store.load_run(reader, RUN_ID)
+        assert store_queries.run_status(reader, RUN_ID) == "started"
+        projected = store_queries.load_run(reader, RUN_ID)
     finally:
         reader.close()
     assert projected is not None
@@ -4636,8 +4637,8 @@ def test_a_bound_store_commits_each_write_inside_its_fence(repo, stores):
     # Another connection sees every write: each fence committed its own work.
     reader = store_db.open_db(repo)
     try:
-        assert store.run_status(reader, RUN_ID) == "started"
-        projected = store.load_run(reader, RUN_ID)
+        assert store_queries.run_status(reader, RUN_ID) == "started"
+        projected = store_queries.load_run(reader, RUN_ID)
         seqs = [
             row["seq"]
             for row in reader.execute(
@@ -4678,8 +4679,8 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
 
     reader = store_db.open_db(repo)
     try:
-        assert store.run_status(reader, RUN_ID) == "started"
-        projected = store.load_run(reader, RUN_ID)
+        assert store_queries.run_status(reader, RUN_ID) == "started"
+        projected = store_queries.load_run(reader, RUN_ID)
     finally:
         reader.close()
     assert projected is not None
@@ -5643,7 +5644,7 @@ def _diverging_now(repo: Path) -> list[store_replay.Mismatch]:
     lines = store_journal.Journal(RUN_ID).read()
     conn = store_db.open_db(repo)
     try:
-        projection = store.load_run(conn, RUN_ID)
+        projection = store_queries.load_run(conn, RUN_ID)
     finally:
         conn.close()
     assert projection is not None
@@ -5856,7 +5857,7 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
     lines = store_journal.Journal(RUN_ID).read()
     conn = store_db.open_db(repo)
     try:
-        projection = store.load_run(conn, RUN_ID)
+        projection = store_queries.load_run(conn, RUN_ID)
     finally:
         conn.close()
     assert projection is not None
@@ -6005,7 +6006,7 @@ def _all_rows(repo: Path) -> dict[str, list[tuple]]:
 def _projected_run_status(repo: Path) -> str | None:
     conn = store_db.open_db(repo)
     try:
-        return store.run_status(conn, RUN_ID)
+        return store_queries.run_status(conn, RUN_ID)
     finally:
         conn.close()
 
@@ -6186,7 +6187,7 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
     assert _held_elsewhere(st._lock) is False
     kept = store.read_lease(st.connection, RUN_ID)
     assert kept is not None and kept.token == "t1"
-    assert store.run_status(st.connection, RUN_ID) == "canceled"
+    assert store_queries.run_status(st.connection, RUN_ID) == "canceled"
 
 
 def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
@@ -6245,9 +6246,9 @@ def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert store.list_runs(conn) == []
-        assert store.latest_run_id(conn) is None
-        assert store.load_run(conn, RUN_ID) is None
+        assert store_queries.list_runs(conn) == []
+        assert store_queries.latest_run_id(conn) is None
+        assert store_queries.load_run(conn, RUN_ID) is None
         assert store.read_lease(conn, RUN_ID) is None
         assert store.control_requests(conn, RUN_ID) == []
     finally:
@@ -6264,8 +6265,8 @@ def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
-        assert store.load_run(conn, RUN_ID) is not None
+        assert [summary.id for summary in store_queries.list_runs(conn)] == [RUN_ID]
+        assert store_queries.load_run(conn, RUN_ID) is not None
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             conn.execute("DELETE FROM runs")
     finally:
@@ -6283,12 +6284,12 @@ def test_open_db_for_reading_reads_while_a_writer_holds_a_write_transaction(repo
         conn = store_db.open_db_for_reading(repo)
         try:
             started = time.monotonic()
-            loaded = store.load_run(conn, RUN_ID)
+            loaded = store_queries.load_run(conn, RUN_ID)
             assert time.monotonic() - started < 1.0
             assert loaded is not None and loaded.status == "started"
 
             held.commit()
-            assert store.load_run(conn, RUN_ID).status == "done"
+            assert store_queries.load_run(conn, RUN_ID).status == "done"
         finally:
             conn.close()
     finally:
@@ -6308,7 +6309,7 @@ def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
-        assert store.load_run(conn, RUN_ID).milestone_id is None
+        assert [summary.id for summary in store_queries.list_runs(conn)] == [RUN_ID]
+        assert store_queries.load_run(conn, RUN_ID).milestone_id is None
     finally:
         conn.close()

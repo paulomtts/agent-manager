@@ -59,6 +59,7 @@ from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.workflow import task as task_workflow
 
@@ -1985,7 +1986,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
 
     Read-only: no `record_*` is called, and the connection is closed on every
     path including the refusals, the way `run_card` closes its store. The default
-    run id comes from `store_module.latest_run_id`, which is the head of the very
+    run id comes from `store_queries.latest_run_id`, which is the head of the very
     listing `runs` prints, so the two commands cannot disagree about which run is
     the most recent one. The lease and every control request are read on the
     same connection and rendered by `control_view`, still without a write.
@@ -1997,13 +1998,13 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     try:
         wanted = run_id
         if wanted is None:
-            wanted = store_module.latest_run_id(conn)
+            wanted = store_queries.latest_run_id(conn)
             if wanted is None:
                 raise UnknownRunError(
                     f"no run has been recorded for {root}, so there is no most recent"
                     " run to report on; pass a run id or start one with `run --card`"
                 )
-        run = store_module.load_run(conn, wanted)
+        run = store_queries.load_run(conn, wanted)
         if run is None:
             raise UnknownRunError(
                 f"run {wanted!r} is not in the projection for {root}"
@@ -2058,13 +2059,13 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
 
-    `lease` is filled here, not in `store.list_runs`: `live` needs `control`,
+    `lease` is filled here, not in `store_queries.list_runs`: `live` needs `control`,
     which `store` must not import. Each run's `run_leases` row is read on the
     same connection and shaped by `_lease_fields`, the helper `control_view`
     uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
     `None` when the run has no lease row. One `now` judges the whole listing.
 
-    `progress` arrives already counted by `store.list_runs`; `model_copy`
+    `progress` arrives already counted by `store_queries.list_runs`; `model_copy`
     keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
@@ -2072,12 +2073,12 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     try:
         now = _utcnow()
         entries = []
-        for summary in store_module.list_runs(conn):
+        for summary in store_queries.list_runs(conn):
             lease = store_module.read_lease(conn, summary.id)
             shown = (
                 None
                 if lease is None
-                else store_module.RunLease(**_lease_fields(lease, now=now))
+                else store_queries.RunLease(**_lease_fields(lease, now=now))
             )
             entries.append(summary.model_copy(update={"lease": shown}).model_dump())
         return {"runs": entries}
@@ -2172,7 +2173,7 @@ def select_logs(
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -2301,7 +2302,7 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     if run is None:
@@ -3024,7 +3025,7 @@ def resume_run(
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -3136,7 +3137,7 @@ def _controllable_lease(
     closed. Runs inside `request_control`'s transaction, so a refusal rolls
     back and leaves no row.
     """
-    status = store_module.run_status(conn, run_id)
+    status = store_queries.run_status(conn, run_id)
     if status is None:
         raise UnknownRunError(
             f"run {run_id!r} is not in the projection"
@@ -3359,7 +3360,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"

@@ -57,6 +57,7 @@ from agent_manager import (
 )
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
@@ -7142,7 +7143,7 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
     root = cli.resolve_repo_dir(project)
     conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -7285,7 +7286,7 @@ def _resumable_subtask(project: Path, run_id: str, card_id: str) -> models.Subta
     """The subtask row `run_id` recorded for `card_id`: its branch and worktree."""
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -7915,7 +7916,7 @@ def _project_run_ids(project: Path) -> list[str]:
 def _loaded(project: Path, run_id: str) -> models.Run:
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -9346,7 +9347,7 @@ def _run_dirs() -> list[Path]:
 def _recorded_run_ids(project: Path) -> list[str]:
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return [summary.id for summary in store_module.list_runs(conn)]
+        return [summary.id for summary in store_queries.list_runs(conn)]
     finally:
         conn.close()
 
@@ -10607,7 +10608,7 @@ def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_journal.JournalLi
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store_module.run_status(conn, run_id)
+        return store_queries.run_status(conn, run_id)
     finally:
         conn.close()
 
@@ -12000,7 +12001,7 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
     `take_lease`. The read-only load is made to see `stopped`; the load
     under the lease sees the real `done` and refuses before writing."""
     _plant_run(projection, status="done")
-    real = store_module.load_run
+    real = store_queries.load_run
     calls: list[str] = []
 
     def stale_first(conn, run_id):
@@ -12010,7 +12011,7 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
             return loaded.model_copy(update={"status": "stopped"})
         return loaded
 
-    monkeypatch.setattr(store_module, "load_run", stale_first)
+    monkeypatch.setattr(store_queries, "load_run", stale_first)
     lines_before = _journal_lines()
 
     result = _invoke_reset(projection)
@@ -12197,7 +12198,7 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     _record(projection, CONTROL_RUN_ID, started_at=RECORDED_AT, status="started")
     conn = store_db.open_db(cli.resolve_repo_dir(projection))
     try:
-        run = store_module.load_run(conn, CONTROL_RUN_ID)
+        run = store_queries.load_run(conn, CONTROL_RUN_ID)
     finally:
         conn.close()
     before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))

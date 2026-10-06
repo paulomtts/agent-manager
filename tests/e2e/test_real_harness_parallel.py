@@ -39,8 +39,9 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, cli, dag, models, orchestrate, store
+from agent_manager import board, cli, dag, models, orchestrate
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 pytestmark = pytest.mark.e2e
 
@@ -369,7 +370,7 @@ def test_the_real_claude_drives_two_independent_stories_in_parallel(
     # The two implement phases overlapped in time: the run really was parallel.
     conn = store_db.open_db(project)
     try:
-        run = store.load_run(conn, completed_run["run_id"])
+        run = store_queries.load_run(conn, completed_run["run_id"])
     finally:
         conn.close()
     assert run is not None, completed_run["run_id"]

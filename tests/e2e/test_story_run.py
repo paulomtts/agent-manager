@@ -30,6 +30,7 @@ from typer.testing import CliRunner
 
 from agent_manager import board, cli, detach, models, paths, store
 from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 PREFIX = "m3"
 """Must equal the conftest's `MILESTONE_PREFIX`: the board fixture derives its branches with it."""
@@ -111,7 +112,7 @@ def _run_ids(root: Path) -> list[str]:
 def _load_run(root: Path, run_id: str) -> models.Run:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id

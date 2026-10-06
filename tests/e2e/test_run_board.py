@@ -38,10 +38,10 @@ from agent_manager import (
     models,
     orchestrate,
     paths,
-    store,
 )
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import queries as store_queries
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -132,7 +132,7 @@ def _entries(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _load_run(root: Path, run_id: str) -> models.Run:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
