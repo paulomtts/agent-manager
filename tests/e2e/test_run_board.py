@@ -40,6 +40,7 @@ from agent_manager import (
     paths,
     store,
 )
+from agent_manager.store import db as store_db
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -128,7 +129,7 @@ def _entries(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:
@@ -138,7 +139,7 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _run_ids(root: Path) -> list[str]:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -185,9 +186,9 @@ def _plant_lease(root: Path, key: str) -> None:
     Live by C2: this process's pid, this host, a fresh heartbeat.
     """
     now = datetime.now(timezone.utc).isoformat()
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
                 " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)",

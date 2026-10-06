@@ -51,6 +51,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
+from agent_manager.store import db as store_db
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
@@ -1319,7 +1320,7 @@ def _census_stories(project: Path, milestone: str) -> list[str]:
 
 
 def _load(project: Path, run_id: str) -> models.Run:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -4910,7 +4911,7 @@ def _record_bounds(monkeypatch) -> list[int]:
 
 
 def _run_ids(project: Path) -> list[str]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -4918,7 +4919,7 @@ def _run_ids(project: Path) -> list[str]:
 
 
 def _checkpoint_rows(project: Path) -> list[tuple]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             tuple(row)
@@ -5166,7 +5167,7 @@ def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monke
 
 def _lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return store_module.read_lease(conn, run_id)
     finally:
@@ -5178,13 +5179,13 @@ def _send(project: Path, run_id: str, command: str, *, token: str | None = None)
 
     Addressed to the live lease's token unless `token` names another one.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         if token is None:
             lease = store_module.read_lease(conn, run_id)
             assert lease is not None and lease.accepting, "no open lease to address the request to"
             token = lease.token
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             store_module.add_control(
                 conn, run_id, lease=token, command=command, requested_at=STARTED_AT
             )
@@ -5193,7 +5194,7 @@ def _send(project: Path, run_id: str, command: str, *, token: str | None = None)
 
 
 def _controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return store_module.control_requests(conn, run_id)
     finally:
@@ -5505,7 +5506,7 @@ def _run_upserts(run_id: str) -> list[str]:
 
 def _raw_run_status(project: Path, run_id: str) -> str:
     """`runs.status` as stored, before any reader normalises it."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
     finally:
@@ -5764,13 +5765,13 @@ def _plant_lease(
 ) -> None:
     """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
 
-    Written over a second `open_db` connection inside `store.immediate`, on
+    Written over a second `open_db` connection inside `store_db.immediate`, on
     this host, window open. Live by C2 when `pid` is alive and `heartbeat_at`
     is fresh; dead when `pid` is `_reaped_pid()`.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
                 " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
@@ -5800,7 +5801,7 @@ def _reaped_pid() -> int:
 
 def _claim_rows(project: Path) -> list[tuple[str, str, str]]:
     """Every `run_claims` row as `(key, run_id, token)`, in key order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["run_id"], row["token"])
@@ -5812,7 +5813,7 @@ def _claim_rows(project: Path) -> list[tuple[str, str, str]]:
 
 def _held_keys(project: Path, run_id: str) -> list[str]:
     """The keys `run_id`'s current lease holds, in key order, read as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         lease = store_module.read_lease(conn, run_id)
         if lease is None:
@@ -6186,7 +6187,7 @@ def _keys(found: list[board.BoardComment]) -> list[str]:
 
 def _comment_states(project: Path) -> list[tuple[str, str]]:
     """Every outbox row as `(key, state)`, in insertion order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["state"])

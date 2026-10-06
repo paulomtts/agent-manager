@@ -1,0 +1,328 @@
+"""The per-project SQLite projection's connection: its DDL, opening and
+migrating it, and the write-transaction helper.
+"""
+
+import functools
+import sqlite3
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+from agent_manager import paths
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id            TEXT PRIMARY KEY,
+    workflow      TEXT NOT NULL,
+    repo_dir      TEXT NOT NULL,
+    base_branch   TEXT NOT NULL,
+    branch_prefix TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    started_at    TEXT,
+    config        TEXT NOT NULL,
+    milestone_id  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stories (
+    run_id     TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    level      INTEGER NOT NULL,
+    status     TEXT NOT NULL,
+    tip_branch TEXT,
+    position   INTEGER NOT NULL,
+    PRIMARY KEY (run_id, card_id)
+);
+
+CREATE TABLE IF NOT EXISTS subtasks (
+    run_id        TEXT NOT NULL,
+    story_id      TEXT NOT NULL,
+    card_id       TEXT NOT NULL,
+    branch        TEXT NOT NULL,
+    base_branch   TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    worktree_path TEXT,
+    position      INTEGER NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id)
+);
+
+CREATE TABLE IF NOT EXISTS phases (
+    run_id     TEXT NOT NULL,
+    story_id   TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    started_at TEXT,
+    ended_at   TEXT,
+    position   INTEGER NOT NULL,
+    detail     TEXT,
+    PRIMARY KEY (run_id, story_id, card_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS attempts (
+    run_id       TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    card_id      TEXT NOT NULL,
+    phase        TEXT NOT NULL,
+    n            INTEGER NOT NULL,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    duration     REAL,
+    prompt_path  TEXT,
+    result_path  TEXT,
+    stdout_path  TEXT,
+    dispatch     TEXT NOT NULL,
+    PRIMARY KEY (run_id, story_id, card_id, phase, n)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    run_id    TEXT NOT NULL,
+    card_id   TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    workflow  TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    reason    TEXT NOT NULL CHECK (reason IN ('turn', 'parked', 'done', 'escalated')),
+    agent     TEXT NOT NULL,
+    saved_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, card_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoint_floors (
+    run_id     TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    phase      TEXT NOT NULL,
+    loop       INTEGER NOT NULL,
+    source_run TEXT NOT NULL,
+    floor      INTEGER NOT NULL CHECK (floor >= 0),
+    PRIMARY KEY (run_id, card_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_controls (
+    run_id       TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    lease        TEXT NOT NULL,
+    command      TEXT NOT NULL CHECK (command IN ('pause', 'cancel')),
+    requested_at TEXT NOT NULL,
+    handled_at   TEXT,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_leases (
+    run_id       TEXT PRIMARY KEY,
+    token        TEXT NOT NULL,
+    pid          INTEGER NOT NULL,
+    host         TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    accepting    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_claims (
+    key        TEXT PRIMARY KEY,
+    run_id     TEXT NOT NULL,
+    token      TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS board_comments (
+    run_id          TEXT NOT NULL,
+    card_id         TEXT NOT NULL,
+    key             TEXT PRIMARY KEY,
+    body            TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'posted', 'abandoned')),
+    comment_id      TEXT,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    posted_at       TEXT
+);
+"""
+
+
+BUSY_TIMEOUT_SECONDS = 30.0
+"""How long a statement on the projection waits for a lock held by another
+connection before raising `sqlite3.OperationalError: database is locked`.
+
+It covers a reader in another process, such as `am status`, holding the
+database briefly, and a second `am` process's short `BEGIN IMMEDIATE` write
+transactions: a lease take-over, or one fenced journal line and row
+(multi-process X4, X9)."""
+
+
+_WAL_RETRY_FIRST_PAUSE = 0.05
+"""Seconds `_enable_wal` waits after the first locked attempt; each later pause doubles."""
+
+_WAL_RETRY_PAUSE_CAP = 0.5
+"""The longest single pause `_enable_wal` takes between attempts."""
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch `conn` to WAL mode, retrying while the database is locked.
+
+    SQLite does not call the busy handler when this pragma meets another
+    connection's RESERVED lock on a database still in rollback-journal mode; it
+    fails at once with `database is locked`. So the pragma alone is retried,
+    pausing 0.05 s and doubling up to 0.5 s, each pause clamped to the time left,
+    until `BUSY_TIMEOUT_SECONDS` (read now, so tests can patch it) has passed
+    since the first attempt. Then the last error is re-raised unchanged. Any
+    other error propagates on the first attempt.
+    """
+    deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+    pause = _WAL_RETRY_FIRST_PAUSE
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if "database is locked" not in str(error):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(pause, remaining))
+            pause = min(pause * 2, _WAL_RETRY_PAUSE_CAP)
+
+
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("phases", "detail", "TEXT"),
+    ("runs", "milestone_id", "TEXT"),
+)
+"""Columns added to a table after it first shipped, as (table, column, type).
+
+`CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a database
+created before one of these columns existed would never get it. Each column
+must also appear, last, in that table's `CREATE` in `_SCHEMA`, so a fresh and a
+migrated database end up with the same column order."""
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Add each `_ADDED_COLUMNS` entry its table lacks, and touch nothing else.
+
+    SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is read first
+    and `ALTER TABLE ... ADD COLUMN` runs only for a missing column. Nothing is
+    caught: any SQLite error propagates unchanged.
+    """
+    for table, column, sql_type in _ADDED_COLUMNS:
+        present = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+
+def open_db(root: Path) -> sqlite3.Connection:
+    """Open the per-project projection, applying the schema idempotently.
+
+    WAL mode is set before the schema so a reader never blocks the writer. The
+    WAL switch is retried until `BUSY_TIMEOUT_SECONDS`, because SQLite does not
+    call the busy handler for that pragma when another connection holds a write
+    lock. Every `CREATE` is `IF NOT EXISTS`, so reopening an existing database never
+    destroys what is already there. The only migration is additive:
+    `_add_missing_columns` appends each column in `_ADDED_COLUMNS` that an older
+    table lacks, as a nullable column. Existing rows keep their data and read
+    the new column as NULL. It is a no-op on a database that already has the
+    column, so opening the same database any number of times is safe. Nothing
+    is ever dropped: an `attempts` table created before 2026-10-03 keeps its
+    `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
+    any more, so they stay NULL.
+
+    The connection may be used from any thread of the process that holds the
+    run's lease, so `check_same_thread` is off; `Store` serialises that use
+    behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
+    the database briefly; two processes never write one run, because every
+    run write is fenced by the lease token (multi-process X4).
+    """
+    conn = sqlite3.connect(
+        paths.project_db_path(root),
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    _enable_wal(conn)
+    conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
+    conn.commit()
+    return conn
+
+
+def _table_columns(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """Each table of `conn`'s main database, with its column names."""
+    tables = [
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    ]
+    return {
+        table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for table in tables
+    }
+
+
+@functools.cache
+def _current_columns() -> dict[str, set[str]]:
+    """The tables and columns `_SCHEMA` creates."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return _table_columns(conn)
+    finally:
+        conn.close()
+
+
+def _has_current_schema(conn: sqlite3.Connection) -> bool:
+    found = _table_columns(conn)
+    return all(
+        columns <= found.get(table, set())
+        for table, columns in _current_columns().items()
+    )
+
+
+def open_db_for_reading(root: Path) -> sqlite3.Connection:
+    """A connection that reads the per-project projection and never writes it.
+
+    No database for `root`: an in-memory, empty projection with the current
+    schema, and nothing is created on disk. An existing database with the
+    current schema: opened `mode=ro`, so it can never be written or created;
+    its rows are read live alongside a writer in WAL mode. An existing database
+    with an older schema: `open_db`, which migrates it as before.
+    """
+    location = paths.project_db_location(root)
+    if not location.exists():
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_SCHEMA)
+        return conn
+    conn = sqlite3.connect(
+        f"{location.absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    if _has_current_schema(conn):
+        return conn
+    conn.close()
+    return open_db(root)
+
+
+@contextmanager
+def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One write transaction that holds the database write lock from `BEGIN`.
+
+    Python's `sqlite3` in legacy transaction mode opens an implicit
+    transaction on the first DML statement, and `BEGIN` inside one raises; so
+    any open implicit transaction is committed first. The body then runs under
+    `BEGIN IMMEDIATE` and is committed on a normal exit, or rolled back and
+    the exception re-raised on any error, leaving no partial rows.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()

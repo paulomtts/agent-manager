@@ -3,7 +3,7 @@
 Steps tier of spec §14: a real temporary SQLite database and journal opened
 through `store.Store.open`, no network, no harness dispatch, so these run in
 the default `uv run pytest` suite and not under `tests/e2e/`. A "second
-process" is a second `store.open_db` connection.
+process" is a second `store_db.open_db` connection.
 
 No test sleeps to prove ordering: `_until` yields to the loop under a time
 bound, and threads synchronise on a `threading.Event`.
@@ -31,6 +31,7 @@ from typing import Any, Iterator, TypeVar
 import pytest
 
 from agent_manager import control, models, store
+from agent_manager.store import db as store_db
 from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
@@ -76,9 +77,9 @@ def _lease_row(*, heartbeat_at: datetime, pid: int = 4242, host: str = "build-bo
 
 def _send(root: Path, token: str, command: str, at: datetime | None = None) -> store.ControlRow:
     """Insert one request from a second connection, as `am pause` would."""
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             return store.add_control(
                 conn, RUN_ID, lease=token, command=command, requested_at=at or _at(0)
             )
@@ -87,7 +88,7 @@ def _send(root: Path, token: str, command: str, at: datetime | None = None) -> s
 
 
 def _read_lease(root: Path) -> store.LeaseRow | None:
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
         return store.read_lease(conn, RUN_ID)
     finally:
@@ -95,7 +96,7 @@ def _read_lease(root: Path) -> store.LeaseRow | None:
 
 
 def _requests(root: Path) -> list[store.ControlRow]:
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
         return store.control_requests(conn, RUN_ID)
     finally:
@@ -113,9 +114,9 @@ def _plant(
     claims: tuple[str, ...] = (),
 ) -> None:
     """A lease row and its claims, written by a second connection as another `am` would."""
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
                 " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
@@ -138,7 +139,7 @@ def _plant(
 
 
 def _held(root: Path, token: str) -> list[str]:
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
         return [claim.key for claim in store.held_claims(conn, RUN_ID, token)]
     finally:
@@ -147,7 +148,7 @@ def _held(root: Path, token: str) -> list[str]:
 
 def _all_claims(root: Path) -> list[tuple[str, str, str]]:
     """Every `run_claims` row as `(key, run_id, token)`, in key order."""
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
         return [
             (row["key"], row["run_id"], row["token"])

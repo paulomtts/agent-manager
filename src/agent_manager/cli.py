@@ -57,6 +57,7 @@ from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
+from agent_manager.store import db as store_db
 from agent_manager.workflow import task as task_workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
@@ -856,7 +857,7 @@ def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None
     live conflict raises `ClaimedError`; `take_lease` re-checks atomically.
     """
     now = _utcnow()
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
         conflicts = store_module.claim_conflicts(
             conn,
@@ -1990,7 +1991,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     `integrity_view`, which reads the journal and writes nothing either.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         wanted = run_id
         if wanted is None:
@@ -2065,7 +2066,7 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         now = _utcnow()
         entries = []
@@ -2167,7 +2168,7 @@ def select_logs(
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         run = store_module.load_run(conn, run_id)
         if run is None:
@@ -2296,7 +2297,7 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     card = selection.subtask.card_id
     name = selection.phase.name
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -3019,7 +3020,7 @@ def resume_run(
     refusals read only the connection that loaded the run.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
         run = store_module.load_run(conn, run_id)
         if run is None:
@@ -3241,9 +3242,9 @@ def request_control(
         )
     root = resolve_repo_dir(repo_dir)
     now = clock()
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             lease = _controllable_lease(conn, run_id, command=command, now=now)
             row, already = _record_control(
                 conn, run_id, lease=lease, command=command, now=now
@@ -3354,7 +3355,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
         run = store_module.load_run(conn, run_id)
         if run is None:

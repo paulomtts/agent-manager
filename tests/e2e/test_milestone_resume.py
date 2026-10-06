@@ -27,6 +27,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_manager import board, cli, models, paths, store
+from agent_manager.store import db as store_db
 from agent_manager.harness import launcher
 from agent_manager.workflow import task as task_workflow
 
@@ -106,7 +107,7 @@ def _error(result) -> dict:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:
@@ -116,7 +117,7 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run_id = store.latest_run_id(conn)
     finally:
@@ -126,7 +127,7 @@ def _latest_run_id(root: Path) -> str:
 
 
 def _run_ids(root: Path) -> list[str]:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -343,7 +344,7 @@ def _tree(directory: Path) -> dict[str, bytes]:
 
 
 def _checkpoints(root: Path, run_id: str) -> list[tuple]:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [
             tuple(row)

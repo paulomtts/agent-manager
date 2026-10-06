@@ -55,6 +55,7 @@ from agent_manager import (
     runs,
     store as store_module,
 )
+from agent_manager.store import db as store_db
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
@@ -7137,7 +7138,7 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
     """Re-record the subtask `started`: what a crash between the engine's closing
     checkpoint and the caller's final status write leaves behind."""
     root = cli.resolve_repo_dir(project)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -7280,7 +7281,7 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
 
 def _resumable_subtask(project: Path, run_id: str, card_id: str) -> models.SubtaskRun:
     """The subtask row `run_id` recorded for `card_id`: its branch and worktree."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -7910,7 +7911,7 @@ def _project_run_ids(project: Path) -> list[str]:
 
 
 def _loaded(project: Path, run_id: str) -> models.Run:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         run = store_module.load_run(conn, run_id)
     finally:
@@ -8153,7 +8154,7 @@ def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
 #
 # Live control spec section 7 puts CLI refusals, idempotence, status and the
 # resume guard here. Runs, leases and requests are planted straight into the
-# projection through `store_module.open_db`, which is exactly how a second
+# projection through `store_db.open_db`, which is exactly how a second
 # `am` process reaches them. No sleeps: `cli._utcnow` is frozen and every
 # heartbeat is planted relative to it.
 
@@ -8199,13 +8200,13 @@ def _plant_lease(
 ) -> None:
     """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
 
-    Written over a second `open_db` connection inside `store.immediate`.
+    Written over a second `open_db` connection inside `store_db.immediate`.
     Defaults to this process on this host with a heartbeat at the frozen
     clock: live by C2.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
                 " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -8240,7 +8241,7 @@ OTHER_RUN_ID = "20260930T080000Z-a1b2c3d4"
 
 def _claim_rows(root: Path) -> list[tuple[str, str, str]]:
     """Every `run_claims` row as `(key, run_id, token)`, in key order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [
             (row["key"], row["run_id"], row["token"])
@@ -8260,9 +8261,9 @@ def _plant_control(
     requested_at: datetime,
     handled_at: datetime | None = None,
 ) -> None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             row = store_module.add_control(
                 conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
             )
@@ -8277,7 +8278,7 @@ def _plant_control(
 
 def _controls(root: Path) -> list[tuple[str, str]]:
     """Every `run_controls` row of the run as `(lease, command)`, in seq order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [
             (row.lease, row.command)
@@ -8288,7 +8289,7 @@ def _controls(root: Path) -> list[tuple[str, str]]:
 
 
 def _lease(root: Path) -> store_module.LeaseRow | None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return store_module.read_lease(conn, CONTROL_RUN_ID)
     finally:
@@ -8796,7 +8797,7 @@ def control_applied(monkeypatch) -> threading.Event:
 
 def _card_lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return store_module.read_lease(conn, run_id)
     finally:
@@ -8804,7 +8805,7 @@ def _card_lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
 
 
 def _card_controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return store_module.control_requests(conn, run_id)
     finally:
@@ -9341,7 +9342,7 @@ def _run_dirs() -> list[Path]:
 
 
 def _recorded_run_ids(project: Path) -> list[str]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [summary.id for summary in store_module.list_runs(conn)]
     finally:
@@ -9772,7 +9773,7 @@ def _card_comment_keys(project: Path, card_id: str) -> list[str]:
 
 def _card_outbox(project: Path) -> list[tuple[str, str]]:
     """Every outbox row as `(key, state)`, in insertion order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["state"])
@@ -10602,7 +10603,7 @@ def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_module.JournalLin
 
 
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return store_module.run_status(conn, run_id)
     finally:
@@ -11487,7 +11488,7 @@ def _card_run_args(root: Path, card_id: str, *extra: str) -> list[str]:
 
 
 def _lease_pids(root: Path) -> list[int]:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [row["pid"] for row in conn.execute("SELECT pid FROM run_leases ORDER BY run_id")]
     finally:
@@ -12151,9 +12152,9 @@ def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
 def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
     """Change the run's projected status behind the store's back, as a human
     with `sqlite3` would: no journal line records it."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
     finally:
         conn.close()
@@ -12192,7 +12193,7 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     before this card."""
     _freeze_clock(monkeypatch)
     _record(projection, CONTROL_RUN_ID, started_at=RECORDED_AT, status="started")
-    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
     try:
         run = store_module.load_run(conn, CONTROL_RUN_ID)
     finally:

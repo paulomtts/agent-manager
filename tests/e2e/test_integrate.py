@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from agent_manager import cli, models, store
+from agent_manager.store import db as store_db
 
 INTEGRATION_BRANCH = "m3-integrate"
 """`integration.integration_branch` for the conftest's `m3` prefix."""
@@ -128,7 +129,7 @@ def _envelope(result) -> dict:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:

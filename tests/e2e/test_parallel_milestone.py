@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, cli, models, store
+from agent_manager.store import db as store_db
 from agent_manager.runtime.stop import StopSignal
 
 
@@ -54,7 +55,7 @@ def _envelope(result) -> dict:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:

@@ -83,7 +83,8 @@ from agent_manager import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Checkpoint, Store, load_run, open_db
+from agent_manager.store import Checkpoint, Store, load_run
+from agent_manager.store import db as store_db
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import Workflow
@@ -596,7 +597,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     control C9): an unknown run, a run of another workflow, then a run
     canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
-    conn = open_db(root)
+    conn = store_db.open_db(root)
     try:
         run = load_run(conn, run_id)
     finally:

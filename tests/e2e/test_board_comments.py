@@ -26,12 +26,13 @@ from typing import Any
 import pytest
 
 from agent_manager import board, cli, comments, store
+from agent_manager.store import db as store_db
 
 KEY_LINE = "am-key: "
 """How every outcome comment's last line starts (board-comments B5)."""
 
 def _run_status(root: Path, run_id: str) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:
@@ -183,7 +184,7 @@ def _outbox(root: Path, run_id: str) -> dict[str, tuple[str, str, int]]:
     scenario reads it, to show what the board still owes; every other
     assertion reads the board itself.
     """
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         rows = conn.execute(
             "SELECT key, card_id, state, failed_attempts FROM board_comments"

@@ -30,6 +30,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_manager import cli, models, store
+from agent_manager.store import db as store_db
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as runtime_engine
 
@@ -78,7 +79,7 @@ def _envelope(result) -> dict:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run = store.load_run(conn, run_id)
     finally:
@@ -88,7 +89,7 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         run_id = store.latest_run_id(conn)
     finally:

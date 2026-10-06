@@ -29,6 +29,7 @@ from typing import Any, get_args
 import pytest
 
 from agent_manager import cli, detach, paths, store
+from agent_manager.store import db as store_db
 
 PREFIX = "m3"
 """The `--branch-prefix` of this scenario; equals the e2e conftest's `MILESTONE_PREFIX`."""
@@ -60,7 +61,7 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
 
 
 def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return store.read_lease(conn, run_id)
     finally:

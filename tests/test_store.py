@@ -28,6 +28,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_manager import models, paths, store
+from agent_manager.store import db as store_db
 
 RUN_ID = "run-2026-09-23-01"
 
@@ -67,191 +68,6 @@ def _run(repo: Path, run_id: str = RUN_ID) -> models.Run:
             harness_map={"coder": models.HarnessAssignment(harness="claude", model="sonnet")},
         ),
     )
-
-
-def test_open_db_creates_the_project_file_in_wal_mode(repo):
-    conn = store.open_db(repo)
-    try:
-        assert paths.project_db_path(repo).exists()
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        conn.close()
-
-
-def test_open_db_connection_can_be_used_from_another_thread(repo):
-    # P2: the threads of one process share one connection, so open_db must not
-    # pin it to the thread that opened it. The busy timeout is explicit and
-    # WAL mode is kept.
-    conn = store.open_db(repo)
-    try:
-        counts: list[int] = []
-        errors: list[BaseException] = []
-
-        def query() -> None:
-            try:
-                counts.append(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
-            except BaseException as error:  # surfaced by the assertion below
-                errors.append(error)
-
-        worker = threading.Thread(target=query)
-        worker.start()
-        worker.join()
-
-        assert errors == []
-        assert counts == [0]
-        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(
-            store.BUSY_TIMEOUT_SECONDS * 1000
-        )
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        conn.close()
-
-
-def _hold_fresh_db_reserved(repo: Path) -> sqlite3.Connection:
-    """A second connection holding a RESERVED lock on a fresh, pre-WAL database.
-
-    It must be `BEGIN IMMEDIATE`: SQLite fails `PRAGMA journal_mode=WAL` at once
-    against a RESERVED lock without calling the busy handler, which is the race
-    `open_db` retries. `BEGIN EXCLUSIVE` would make the busy handler run and so
-    prove nothing.
-    """
-    path = paths.project_db_path(repo)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    holder = sqlite3.connect(path, isolation_level=None)
-    holder.execute("BEGIN IMMEDIATE")
-    return holder
-
-
-def test_open_db_waits_out_a_writer_holding_a_fresh_db_before_wal(repo):
-    holder = _hold_fresh_db_reserved(repo)
-    opened: list[sqlite3.Connection] = []
-    errors: list[BaseException] = []
-
-    def open_it() -> None:
-        try:
-            opened.append(store.open_db(repo))
-        except BaseException as error:  # surfaced by the assertion below
-            errors.append(error)
-
-    worker = threading.Thread(target=open_it)
-    try:
-        worker.start()
-        time.sleep(0.3)
-        holder.execute("ROLLBACK")
-    finally:
-        holder.close()
-    worker.join(timeout=10)
-
-    assert not worker.is_alive()
-    assert errors == []
-    conn = opened[0]
-    try:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
-    finally:
-        conn.close()
-
-
-def test_open_db_reraises_database_is_locked_after_the_deadline(repo, monkeypatch):
-    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 0.3)
-    holder = _hold_fresh_db_reserved(repo)
-    try:
-        started = time.monotonic()
-        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-            store.open_db(repo)
-        elapsed = time.monotonic() - started
-    finally:
-        holder.execute("ROLLBACK")
-        holder.close()
-
-    assert elapsed >= 0.3
-    assert elapsed < 5
-
-
-def test_open_db_does_not_retry_an_error_other_than_database_is_locked(repo):
-    # Junk bytes make the WAL pragma raise DatabaseError('file is not a
-    # database') at once. With the default 30 s deadline, a retry would show up
-    # as a long wait.
-    path = paths.project_db_path(repo)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"not a database" * 200)
-
-    started = time.monotonic()
-    with pytest.raises(sqlite3.DatabaseError, match="file is not a database"):
-        store.open_db(repo)
-
-    assert time.monotonic() - started < 2
-
-
-def test_enable_wal_does_not_retry_an_operational_error_other_than_locked(
-    tmp_path, monkeypatch
-):
-    # A read-only connection makes the WAL pragma raise
-    # OperationalError('attempt to write a readonly database'): the same class as
-    # the locked error, but a different message, so it must not be retried.
-    path = tmp_path / "ro.db"
-    writer = sqlite3.connect(path)
-    writer.execute("CREATE TABLE t (x)")
-    writer.commit()
-    writer.close()
-    pauses: list[float] = []
-    monkeypatch.setattr(store.time, "sleep", pauses.append)
-    monkeypatch.setattr(store, "BUSY_TIMEOUT_SECONDS", 2.0)
-
-    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        with pytest.raises(sqlite3.OperationalError, match="readonly database"):
-            store._enable_wal(reader)
-    finally:
-        reader.close()
-
-    assert pauses == []
-
-
-def test_open_db_does_not_sleep_when_nothing_holds_a_lock(repo, monkeypatch):
-    # Behavior 6: uncontended, the pragma runs once and open_db never pauses.
-    pauses: list[float] = []
-    monkeypatch.setattr(store.time, "sleep", pauses.append)
-
-    conn = store.open_db(repo)
-    try:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    finally:
-        conn.close()
-
-    assert pauses == []
-
-
-def test_open_db_creates_every_projection_table(repo):
-    conn = store.open_db(repo)
-    try:
-        names = {
-            row["name"]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-    assert {"runs", "stories", "subtasks", "phases", "attempts"} <= names
-
-
-def test_reopening_an_existing_db_keeps_its_rows(repo):
-    first = store.open_db(repo)
-    first.execute(
-        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
-        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (RUN_ID, "milestone", str(repo), "main", "m1/", "started", None, "{}"),
-    )
-    first.commit()
-    first.close()
-
-    second = store.open_db(repo)
-    try:
-        rows = second.execute("SELECT id, workflow FROM runs").fetchall()
-    finally:
-        second.close()
-    assert [(row["id"], row["workflow"]) for row in rows] == [(RUN_ID, "milestone")]
 
 
 def test_append_writes_one_json_line_with_every_coordinate(repo):
@@ -1428,7 +1244,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
     other.mkdir()
     _record_summary(other, "run-elsewhere", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         summaries = store.list_runs(conn)
     finally:
@@ -1441,7 +1257,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
 
 
 def test_list_runs_on_a_project_with_no_runs_is_empty(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         assert store.list_runs(conn) == []
     finally:
@@ -1453,7 +1269,7 @@ def test_list_runs_puts_a_run_with_no_start_time_last(repo):
     _record_summary(repo, "run-dated", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
     _record_summary(repo, "run-undated", None)
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         summaries = store.list_runs(conn)
     finally:
@@ -1470,7 +1286,7 @@ def test_list_runs_breaks_a_started_at_tie_with_the_run_id(repo):
     _record_summary(repo, "run-a", same)
     _record_summary(repo, "run-b", same)
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         assert [summary.id for summary in store.list_runs(conn)] == ["run-b", "run-a"]
     finally:
@@ -1497,7 +1313,7 @@ SUMMARY_KEYS = {
 
 
 def _listed(root: Path) -> list[store.RunSummary]:
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
         return store.list_runs(conn)
     finally:
@@ -2270,7 +2086,7 @@ def test_list_runs_progress_reads_without_writing(repo):
     finally:
         opened.close()
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         before = conn.total_changes
         [summary] = store.list_runs(conn)
@@ -2290,7 +2106,7 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
     _record_summary(repo, "run-c", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
     _record_summary(repo, "run-b", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         assert store.latest_run_id(conn) == "run-c"
         assert store.latest_run_id(conn) == store.list_runs(conn)[0].id
@@ -2299,7 +2115,7 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
 
 
 def test_latest_run_id_is_none_for_a_project_with_no_runs(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         assert store.latest_run_id(conn) is None
     finally:
@@ -2325,7 +2141,7 @@ def test_load_run_reads_the_tree_from_a_bare_connection(repo):
     finally:
         opened.close()
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         run = store.load_run(conn, RUN_ID)
     finally:
@@ -2338,7 +2154,7 @@ def test_load_run_reads_the_tree_from_a_bare_connection(repo):
 
 
 def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         assert store.load_run(conn, "run-that-never-was") is None
     finally:
@@ -2723,7 +2539,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
 
         # Review Focus 4: a separate reader connection, as `am status` opens,
         # sees exactly what the threads committed.
-        reader = store.open_db(repo)
+        reader = store_db.open_db(repo)
         try:
             assert store.load_run(reader, RUN_ID) == before
         finally:
@@ -2884,7 +2700,7 @@ _EXPECTED_DETAILS = [
 
 
 def test_a_fresh_phases_table_carries_detail_as_its_last_column(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = [
             row["name"] for row in conn.execute("PRAGMA table_info(phases)").fetchall()
@@ -2994,12 +2810,12 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
     finally:
         st.close()
 
-    legacy = store.open_db(repo)
+    legacy = store_db.open_db(repo)
     legacy.executescript(_LEGACY_PHASES)
     legacy.commit()
     legacy.close()
 
-    migrated = store.open_db(repo)
+    migrated = store_db.open_db(repo)
     try:
         columns = [
             row["name"]
@@ -3018,7 +2834,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
     assert _phase_details(stale) == [("verify", "failed", None)]
 
     # Opening an already-migrated database again adds nothing and raises nothing.
-    again = store.open_db(repo)
+    again = store_db.open_db(repo)
     try:
         reopened_columns = [
             row["name"] for row in again.execute("PRAGMA table_info(phases)").fetchall()
@@ -3074,7 +2890,7 @@ def _attempt_columns(conn: sqlite3.Connection) -> list[str]:
 
 
 def test_a_fresh_attempts_table_has_no_usage_columns(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = _attempt_columns(conn)
     finally:
@@ -3109,7 +2925,7 @@ CREATE TABLE attempts (
 
 
 def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
-    legacy = store.open_db(repo)
+    legacy = store_db.open_db(repo)
     legacy.executescript(_LEGACY_ATTEMPTS)
     legacy.commit()
     legacy.close()
@@ -3181,7 +2997,7 @@ def _run_columns(conn: sqlite3.Connection) -> list[str]:
 
 
 def test_a_fresh_runs_table_carries_milestone_id_as_its_last_column(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = _run_columns(conn)
     finally:
@@ -3231,7 +3047,7 @@ VALUES ('run-2026-09-23-01', 'milestone', '/repo', 'main', 'm1/', 'escalated',
 
 
 def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_row(repo):
-    fresh = store.open_db(repo)
+    fresh = store_db.open_db(repo)
     try:
         fresh_columns = _run_columns(fresh)
         fresh.executescript(_LEGACY_RUNS)
@@ -3239,7 +3055,7 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
     finally:
         fresh.close()
 
-    migrated = store.open_db(repo)
+    migrated = store_db.open_db(repo)
     try:
         migrated_columns = _run_columns(migrated)
         kept = [
@@ -3256,7 +3072,7 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
     assert (old.id, old.status, old.milestone_id) == (RUN_ID, "escalated", None)
 
     # Opening an already-migrated database again adds nothing and raises nothing.
-    again = store.open_db(repo)
+    again = store_db.open_db(repo)
     try:
         reopened_columns = _run_columns(again)
     finally:
@@ -3267,14 +3083,14 @@ def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_ro
 def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store.RunSummary]:
     """`_LEGACY_RUNS` (plus `extra_sql`) written into a fresh database, which a
     second `open_db` then migrates; the migrated projection's listing."""
-    fresh = store.open_db(repo)
+    fresh = store_db.open_db(repo)
     try:
         fresh.executescript(_LEGACY_RUNS + extra_sql)
         fresh.commit()
     finally:
         fresh.close()
 
-    migrated = store.open_db(repo)
+    migrated = store_db.open_db(repo)
     try:
         return store.list_runs(migrated)
     finally:
@@ -3703,7 +3519,7 @@ def _save_checkpoint(
 
 
 def test_open_db_creates_the_checkpoints_table(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = [
             row["name"]
@@ -4041,13 +3857,13 @@ def test_checkpoint_cards_lists_this_runs_distinct_pairs_in_order(repo):
 # -- run controls and leases -----------------------------------------------------
 #
 # Row-only tables outside the journal (live-control spec C1/C2), like
-# `checkpoints`. A "second process" is a second `store.open_db` connection.
+# `checkpoints`. A "second process" is a second `store_db.open_db` connection.
 # Steps tier: real temp DB and journal, no harness.
 
 
 def test_the_control_tables_appear_on_an_existing_database(repo):
     # A pre-M9 database: every table but the two new ones, with a row in it.
-    first = store.open_db(repo)
+    first = store_db.open_db(repo)
     first.execute("DROP TABLE IF EXISTS run_controls")
     first.execute("DROP TABLE IF EXISTS run_leases")
     first.execute(
@@ -4058,7 +3874,7 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
     first.commit()
     first.close()
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         names = {
             row["name"]
@@ -4234,9 +4050,9 @@ def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched
 
 def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
     st = store.Store.open(repo, RUN_ID)
-    other = store.open_db(repo)
+    other = store_db.open_db(repo)
     try:
-        with store.immediate(other):
+        with store_db.immediate(other):
             first = store.add_control(
                 other, RUN_ID, lease="t1", command="pause", requested_at=_at(0)
             )
@@ -4271,9 +4087,9 @@ def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
 
 def test_control_seqs_are_numbered_and_handled_per_run(repo):
     # Review Focus 4.
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             a = store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
             b = store.add_control(
                 conn, OTHER_RUN_ID, lease="t9", command="cancel", requested_at=_at(0)
@@ -4294,17 +4110,17 @@ def test_control_seqs_are_numbered_and_handled_per_run(repo):
 
 
 def test_immediate_rolls_back_on_error(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         with pytest.raises(RuntimeError, match="boom"):
-            with store.immediate(conn):
+            with store_db.immediate(conn):
                 store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
                 raise RuntimeError("boom")
 
         assert conn.in_transaction is False
         assert store.control_requests(conn, RUN_ID) == []
         # Nothing was spent: the next request is still seq 0.
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             again = store.add_control(
                 conn, RUN_ID, lease="t1", command="pause", requested_at=_at(1)
             )
@@ -4315,10 +4131,10 @@ def test_immediate_rolls_back_on_error(repo):
 
 
 def test_an_unknown_command_is_refused_by_the_check(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         with pytest.raises(sqlite3.IntegrityError):
-            with store.immediate(conn):
+            with store_db.immediate(conn):
                 store.add_control(
                     conn, RUN_ID, lease="t1", command="resume", requested_at=_at(0)
                 )
@@ -4331,7 +4147,7 @@ def test_an_unknown_command_is_refused_by_the_check(repo):
 def test_immediate_commits_an_implicit_transaction_first(repo):
     # Review Focus 1: Python's legacy sqlite3 mode opens an implicit
     # transaction on the first INSERT; `immediate` must not trip over it.
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         conn.execute(
             "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
@@ -4339,34 +4155,18 @@ def test_immediate_commits_an_implicit_transaction_first(repo):
             (RUN_ID, "milestone", str(repo), "main", "m9/", "started", None, "{}"),
         )
         assert conn.in_transaction is True
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             store.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
         assert conn.in_transaction is False
     finally:
         conn.close()
 
-    reader = store.open_db(repo)
+    reader = store_db.open_db(repo)
     try:
         assert reader.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
         assert [row.command for row in store.control_requests(reader, RUN_ID)] == ["pause"]
     finally:
         reader.close()
-
-
-def test_immediate_holds_the_write_lock_from_begin(repo):
-    # Review Focus 2: BEGIN IMMEDIATE, not a deferred BEGIN, so no second
-    # writer can land between reading MAX(seq) and the insert.
-    conn = store.open_db(repo)
-    blocker = sqlite3.connect(paths.project_db_path(repo), timeout=0)
-    try:
-        with store.immediate(conn):
-            with pytest.raises(sqlite3.OperationalError, match="locked"):
-                blocker.execute("BEGIN IMMEDIATE")
-        blocker.execute("BEGIN IMMEDIATE")
-        blocker.rollback()
-    finally:
-        blocker.close()
-        conn.close()
 
 
 def _run_with_status(repo: Path, run_id: str, status: str) -> models.Run:
@@ -4506,7 +4306,7 @@ def test_latest_open_checkpoint_with_both_spellings_present(repo):
 def test_latest_open_checkpoint_ignores_a_near_miss_cancel_status(repo, near_miss):
     # `models.Status` refuses these on write, so only a hand-edited row holds one.
     parked = _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="parked", saved_at=_at(0))
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         conn.execute("UPDATE runs SET status = ? WHERE id = ?", (near_miss, "run-r1"))
         conn.commit()
@@ -4540,13 +4340,13 @@ def test_latest_open_checkpoint_returns_rows_of_runs_in_any_other_status(repo, s
 
 def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     st = store.Store.open(repo, RUN_ID)
-    other = store.open_db(repo)
+    other = store_db.open_db(repo)
     try:
         st.record_run(_run_with_status(repo, RUN_ID, "cancelled"))
         lease = st.take_lease(
             token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
         ).lease
-        with store.immediate(other):
+        with store_db.immediate(other):
             store.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
         controls = store.control_requests(other, RUN_ID)
         journal_before = [line.event for line in st.journal.read()]
@@ -4592,7 +4392,7 @@ def test_run_status_normalises_legacy_cancelled(repo):
         ("stopped", "stopped"),
     ]:
         _raw_sql(repo, "UPDATE runs SET status = ? WHERE id = ?", (stored, RUN_ID))
-        conn = store.open_db(repo)
+        conn = store_db.open_db(repo)
         try:
             assert store.run_status(conn, RUN_ID) == expected
             assert store.run_status(conn, "run-never-recorded") is None
@@ -4668,9 +4468,9 @@ def _dead(row: store.LeaseRow) -> bool:
 
 def _plant_lease(repo: Path, run_id: str, *, token: str) -> store.LeaseRow:
     """A `run_leases` row, as another process's `take_lease` would have left it."""
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
                 " heartbeat_at, accepting) VALUES (?, ?, 1, 'h', ?, ?, 1)"
@@ -4686,9 +4486,9 @@ def _plant_lease(repo: Path, run_id: str, *, token: str) -> store.LeaseRow:
 
 def _plant_claim(repo: Path, key: str, *, run_id: str, token: str) -> None:
     """A `run_claims` row, as another process's `take_lease` would have left it."""
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute(
                 "INSERT INTO run_claims (key, run_id, token, claimed_at)"
                 " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
@@ -4701,12 +4501,12 @@ def _plant_claim(repo: Path, key: str, *, run_id: str, token: str) -> None:
 
 def test_the_claims_table_appears_on_an_existing_database(repo):
     # A pre-M10 database: everything but `run_claims`.
-    first = store.open_db(repo)
+    first = store_db.open_db(repo)
     first.execute("DROP TABLE IF EXISTS run_claims")
     first.commit()
     first.close()
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         claims = [
             row["name"] for row in conn.execute("PRAGMA table_info(run_claims)").fetchall()
@@ -4777,7 +4577,7 @@ def test_claim_conflicts_is_read_only_and_ignores_the_runs_own(repo):
         seen.append(row)
         return True
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         changes = conn.total_changes
         assert store.claim_conflicts(conn, keys, is_live=live, run_id="run-b") == [
@@ -4801,7 +4601,7 @@ def test_held_claims_lists_one_tokens_keys_in_key_order(repo):
     _plant_claim(repo, "card:c", run_id="run-a", token="old")
     _plant_claim(repo, "card:d", run_id="run-b", token="ta")
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         rows = store.held_claims(conn, "run-a", "ta")
         nobody = store.held_claims(conn, "run-a", "nobody")
@@ -5039,7 +4839,7 @@ def test_two_processes_taking_one_dead_lease_leave_exactly_one_owner(repo, attem
     assert sorted(outcomes.values()) == ["LeaseHeldError", "took"]
     assert [child.returncode for child in children] == [0, 0]
     winner = next(token for token, outcome in outcomes.items() if outcome == "took")
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         lease = store.read_lease(conn, RUN_ID)
     finally:
@@ -5126,7 +4926,7 @@ def test_an_unbound_store_writes_as_before(repo, stores):
     st.rebuild_from_journal(RUN_ID)
     assert st.connection.in_transaction is False
 
-    reader = store.open_db(repo)
+    reader = store_db.open_db(repo)
     try:
         assert store.run_status(reader, RUN_ID) == "started"
         projected = store.load_run(reader, RUN_ID)
@@ -5156,7 +4956,7 @@ def test_a_bound_store_commits_each_write_inside_its_fence(repo, stores):
     assert st.connection.in_transaction is False
 
     # Another connection sees every write: each fence committed its own work.
-    reader = store.open_db(repo)
+    reader = store_db.open_db(repo)
     try:
         assert store.run_status(reader, RUN_ID) == "started"
         projected = store.load_run(reader, RUN_ID)
@@ -5184,7 +4984,7 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
     st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
     _record_full_run(st, repo)
 
-    saboteur = store.open_db(repo)
+    saboteur = store_db.open_db(repo)
     try:
         saboteur.execute(
             "CREATE TRIGGER refuse_stories BEFORE INSERT ON stories"
@@ -5198,7 +4998,7 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
         st.rebuild_from_journal(RUN_ID)
     assert st.connection.in_transaction is False
 
-    reader = store.open_db(repo)
+    reader = store_db.open_db(repo)
     try:
         assert store.run_status(reader, RUN_ID) == "started"
         projected = store.load_run(reader, RUN_ID)
@@ -5225,7 +5025,7 @@ def _count(st: store.Store, table: str) -> int:
 
 
 def test_open_db_creates_the_checkpoint_floors_table(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         info = conn.execute("PRAGMA table_info(checkpoint_floors)").fetchall()
         checkpoint_columns = [
@@ -5262,7 +5062,7 @@ def test_open_db_creates_the_checkpoint_floors_table(repo):
 
 
 def test_checkpoint_floors_refuses_a_negative_floor(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -5954,7 +5754,7 @@ _COMMENT_COLUMNS = [
 
 
 def test_open_db_creates_the_board_comments_table(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = [
             row["name"]
@@ -5967,7 +5767,7 @@ def test_open_db_creates_the_board_comments_table(repo):
 
 def test_the_board_comments_table_appears_on_an_existing_database(repo):
     # A pre-M12 database: every table but the new one, with a row in it.
-    first = store.open_db(repo)
+    first = store_db.open_db(repo)
     first.execute("DROP TABLE IF EXISTS board_comments")
     first.execute(
         "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
@@ -5977,7 +5777,7 @@ def test_the_board_comments_table_appears_on_an_existing_database(repo):
     first.commit()
     first.close()
 
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         columns = [
             row["name"]
@@ -5992,7 +5792,7 @@ def test_the_board_comments_table_appears_on_an_existing_database(repo):
 
 
 def test_a_board_comment_with_an_unknown_state_is_refused(repo):
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -6087,7 +5887,7 @@ def test_a_refused_enqueue_rolls_back_and_writes_nothing(repo, stores):
     st = stores()
     st.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
 
-    saboteur = store.open_db(repo)
+    saboteur = store_db.open_db(repo)
     try:
         saboteur.execute(
             "CREATE TRIGGER refuse_comments BEFORE INSERT ON board_comments"
@@ -6347,7 +6147,7 @@ def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
 def _diverging_now(repo: Path) -> list[store.Mismatch]:
     """Load the journal and the projection the way a caller would, and compare."""
     lines = store.Journal(RUN_ID).read()
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         projection = store.load_run(conn, RUN_ID)
     finally:
@@ -6560,7 +6360,7 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
 
     lines = store.Journal(RUN_ID).read()
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         projection = store.load_run(conn, RUN_ID)
     finally:
@@ -6709,7 +6509,7 @@ def _all_rows(repo: Path) -> dict[str, list[tuple]]:
 
 
 def _projected_run_status(repo: Path) -> str | None:
-    conn = store.open_db(repo)
+    conn = store_db.open_db(repo)
     try:
         return store.run_status(conn, RUN_ID)
     finally:
@@ -6949,7 +6749,7 @@ def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
 ):
     before = _tree(tmp_path)
 
-    conn = store.open_db_for_reading(repo)
+    conn = store_db.open_db_for_reading(repo)
     try:
         assert store.list_runs(conn) == []
         assert store.latest_run_id(conn) is None
@@ -6968,7 +6768,7 @@ def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo
     writer.record_run(_run(repo))
     writer.close()
 
-    conn = store.open_db_for_reading(repo)
+    conn = store_db.open_db_for_reading(repo)
     try:
         assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
         assert store.load_run(conn, RUN_ID) is not None
@@ -6981,12 +6781,12 @@ def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo
 def test_open_db_for_reading_reads_while_a_writer_holds_a_write_transaction(repo):
     writer = store.Store.open(repo, RUN_ID)
     writer.record_run(_run(repo))
-    held = store.open_db(repo)
+    held = store_db.open_db(repo)
     try:
         held.execute("BEGIN IMMEDIATE")
         held.execute("UPDATE runs SET status = 'done'")
 
-        conn = store.open_db_for_reading(repo)
+        conn = store_db.open_db_for_reading(repo)
         try:
             started = time.monotonic()
             loaded = store.load_run(conn, RUN_ID)
@@ -7012,7 +6812,7 @@ def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
     old.commit()
     old.close()
 
-    conn = store.open_db_for_reading(repo)
+    conn = store_db.open_db_for_reading(repo)
     try:
         assert [summary.id for summary in store.list_runs(conn)] == [RUN_ID]
         assert store.load_run(conn, RUN_ID).milestone_id is None

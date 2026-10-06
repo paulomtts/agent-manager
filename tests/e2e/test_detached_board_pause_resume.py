@@ -33,6 +33,7 @@ from typing import Any, get_args
 import pytest
 
 from agent_manager import cli, paths, store
+from agent_manager.store import db as store_db
 
 VERIFY = "git rev-parse --verify HEAD"
 """Must equal the e2e conftest's `VERIFY_COMMANDS[0]`, as in test_detached_run.py."""
@@ -61,7 +62,7 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
 
 
 def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return store.read_lease(conn, run_id)
     finally:
