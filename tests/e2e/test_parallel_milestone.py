@@ -26,6 +26,7 @@ import pytest
 
 from agent_manager import board, cli, models, store
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.runtime.stop import StopSignal
 
 
@@ -184,7 +185,7 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
 
     assert result.exit_code == 0, (result.output, result.exception)
     run_id = _envelope(result)["run_id"]
-    lines = store.Journal(run_id).read()
+    lines = store_journal.Journal(run_id).read()
     seqs = [line.seq for line in lines]
     assert seqs == list(range(1, len(seqs) + 1))
     # Non-vacuity: the two lanes' phase lines really interleave, so contiguity

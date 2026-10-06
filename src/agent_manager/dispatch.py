@@ -38,7 +38,8 @@ from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.runtime import bridge
-from agent_manager.store import JournalError, Store
+from agent_manager.store import Store
+from agent_manager.store.journal import JournalError
 from agent_manager.workflow import phases as phase_model
 
 RESULT_NAME = "result.json"

@@ -56,6 +56,7 @@ from agent_manager import (
     store as store_module,
 )
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
@@ -2115,7 +2116,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
-    lines = store_module.Journal(payload["run_id"]).read()
+    lines = store_journal.Journal(payload["run_id"]).read()
     assert [line.event for line in lines[:3]] == [
         "run_upsert",
         "story_upsert",
@@ -9674,7 +9675,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(project, run_id=run_id, token="racer", heartbeat_at=now - timedelta(seconds=5))
-    before = (_attempt_rows(project), _checkpoint_rows(project), store_module.Journal(run_id).read())
+    before = (_attempt_rows(project), _checkpoint_rows(project), store_journal.Journal(run_id).read())
 
     with pytest.raises(cli.RunIsLiveError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -9687,7 +9688,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     assert (
         _attempt_rows(project),
         _checkpoint_rows(project),
-        store_module.Journal(run_id).read(),
+        store_journal.Journal(run_id).read(),
     ) == before
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "racer"
@@ -9952,7 +9953,7 @@ def _write_watch_journal(
     run_dir = _watch_runs_dir(tmp_path) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     dumped = [
-        store_module.JournalLine(
+        store_journal.JournalLine(
             seq=seq,
             ts=WATCH_TS,
             run_id=run_id,
@@ -9965,7 +9966,7 @@ def _write_watch_journal(
         for seq in seqs
     ]
     text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    (run_dir / store_module.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
+    (run_dir / store_journal.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
     return dumped
 
 
@@ -10072,10 +10073,10 @@ def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
     _watch_runs_dir(tmp_path).mkdir(parents=True)
     escape = tmp_path / "xdg" / "agent-manager" / "escape"
     escape.mkdir(parents=True)
-    line = store_module.JournalLine(
+    line = store_journal.JournalLine(
         seq=1, ts=WATCH_TS, run_id="escape", event="run_upsert"
     ).model_dump(mode="json")
-    (escape / store_module.JOURNAL_NAME).write_text(
+    (escape / store_journal.JOURNAL_NAME).write_text(
         json.dumps(line) + "\n", encoding="utf-8"
     )
 
@@ -10181,7 +10182,7 @@ def test_watch_rejects_run_id_with_all_and_neither(tmp_path, monkeypatch):
 
 def _watch_line(run_id: str, seq: int) -> dict[str, Any]:
     """One journal line in the shape `_write_watch_journal` writes, JSON-mode."""
-    return store_module.JournalLine(
+    return store_journal.JournalLine(
         seq=seq,
         ts=WATCH_TS,
         run_id=run_id,
@@ -10201,7 +10202,7 @@ def _append_watch_journal(
     run_dir.mkdir(parents=True, exist_ok=True)
     dumped = [_watch_line(run_id, seq) for seq in seqs]
     text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    with (run_dir / store_module.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
+    with (run_dir / store_journal.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
         handle.write(text + tail)
     return dumped
 
@@ -10277,7 +10278,7 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch
     run_dir = _watch_runs_dir(tmp_path) / "run-old"
     run_dir.mkdir(parents=True)
     # As an `am` from before the spelling switch wrote it.
-    legacy = store_module.JournalLine(
+    legacy = store_journal.JournalLine(
         seq=1,
         ts=WATCH_TS,
         run_id="run-old",
@@ -10285,7 +10286,7 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch
         payload={"run_id": "run-old", "status": "cancelled"},
     ).model_dump(mode="json")
     after = _watch_line("run-old", 2)
-    journal = run_dir / store_module.JOURNAL_NAME
+    journal = run_dir / store_journal.JOURNAL_NAME
     journal.write_text(
         "".join(json.dumps(line, sort_keys=True) + "\n" for line in (legacy, after)),
         encoding="utf-8",
@@ -10393,12 +10394,12 @@ def test_watch_follow_observes_a_line_appended_after_start(tmp_path, monkeypatch
 
 def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    old_owner = store_module.Journal("run-t")
+    old_owner = store_journal.Journal("run-t")
     for _ in range(2):
         old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
     # The new owner opens the journal now and caches seq 2, while the stuck
     # old owner is still appending: only `reseek` keeps it from reusing seq 3.
-    new_owner = store_module.Journal("run-t")
+    new_owner = store_journal.Journal("run-t")
 
     def old_owner_keeps_writing() -> None:
         for _ in range(2):
@@ -10443,7 +10444,7 @@ def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
         )
 
     def finish_the_torn_line() -> None:
-        journal = _watch_runs_dir(tmp_path) / "run-new" / store_module.JOURNAL_NAME
+        journal = _watch_runs_dir(tmp_path) / "run-new" / store_journal.JOURNAL_NAME
         with journal.open("a", encoding="utf-8") as handle:
             handle.write(third[20:] + "\n")
 
@@ -10463,7 +10464,7 @@ def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
 def test_watch_follow_tolerates_a_journal_that_disappears(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
     recreated: list[dict[str, Any]] = []
 
     def delete_journal() -> None:
@@ -10489,7 +10490,7 @@ def test_watch_follow_mid_stream_corruption_ends_stream_with_stderr_message(
 ):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
     appended: list[dict[str, Any]] = []
 
     def append_second() -> None:
@@ -10598,8 +10599,8 @@ def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
     return runner.invoke(cli.app, ["reset", run_id, "--repo-dir", str(root), *extra])
 
 
-def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_module.JournalLine]:
-    return store_module.Journal(run_id).read()
+def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_journal.JournalLine]:
+    return store_journal.Journal(run_id).read()
 
 
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
@@ -10777,7 +10778,7 @@ def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeyp
 
     def finish_the_torn_lines() -> None:
         for run_id, text in (("run-a", third_a), ("run-d", first_d)):
-            journal = _watch_runs_dir(tmp_path) / run_id / store_module.JOURNAL_NAME
+            journal = _watch_runs_dir(tmp_path) / run_id / store_journal.JOURNAL_NAME
             with journal.open("a", encoding="utf-8") as handle:
                 handle.write(text[20:] + "\n")
 
@@ -12027,7 +12028,7 @@ def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection
     non-JSON line in its middle is `CorruptJournalError` -- a refusal at
     exit 3, not a traceback."""
     _plant_run(projection, status="stopped")
-    path = store_module.Journal(CONTROL_RUN_ID).path
+    path = store_journal.Journal(CONTROL_RUN_ID).path
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
 
@@ -12045,9 +12046,9 @@ def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection
 def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
     """Only the torn-journal subclass is a refusal; a missing journal or
     any other `JournalError` stays a bug with its stack."""
-    assert isinstance(store_module.CorruptJournalError("torn"), cli.HANDLED)
-    assert not isinstance(store_module.MissingJournalError("gone"), cli.HANDLED)
-    assert not isinstance(store_module.JournalError("other"), cli.HANDLED)
+    assert isinstance(store_journal.CorruptJournalError("torn"), cli.HANDLED)
+    assert not isinstance(store_journal.MissingJournalError("gone"), cli.HANDLED)
+    assert not isinstance(store_journal.JournalError("other"), cli.HANDLED)
 
 
 @pytest.mark.parametrize(
@@ -12146,7 +12147,7 @@ the hand-edited legacy spelling reads back as `canceled`."""
 def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
     """The run's journal file, located without `Journal(run_id)`, which would
     create the run directory."""
-    return paths.data_dir() / "runs" / run_id / store_module.JOURNAL_NAME
+    return paths.data_dir() / "runs" / run_id / store_journal.JOURNAL_NAME
 
 
 def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
@@ -12259,7 +12260,7 @@ def test_status_of_a_run_with_no_journal_says_so_and_creates_no_run_directory(
     def forbidden(self, run_id):
         raise AssertionError("status must not construct Journal(run_id)")
 
-    monkeypatch.setattr(store_module.Journal, "__init__", forbidden)
+    monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 

@@ -15,40 +15,20 @@ attempt belongs to the engine.
 """
 
 import json
-import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
-from agent_manager import models, paths
+from agent_manager import models
 from agent_manager.store import db as store_db
-
-JOURNAL_NAME = "journal.jsonl"
-
-EventKind = Literal[
-    "run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"
-]
-"""Every event is an upsert of one node of the §9 tree: a status transition is
-the same node recorded again with a new status."""
-
-
-class JournalError(RuntimeError):
-    """The journal could not be read as an append-only log of this run."""
-
-
-class MissingJournalError(JournalError):
-    """There is no journal file for this run: a missing run, not an empty one."""
-
-
-class CorruptJournalError(JournalError):
-    """A journal line is not JSON. Names the file and the 1-based line number."""
+from agent_manager.store import journal as store_journal
 
 
 def _describe_node(node: dict[str, str | int | None]) -> str:
@@ -81,29 +61,6 @@ class ProjectionDivergedError(RuntimeError):
         self.mismatches = mismatches
 
 
-class JournalLine(BaseModel):
-    """The envelope around one journalled event.
-
-    `extra="forbid"` for the same reason `models._Model` uses it: an envelope
-    from an older schema must fail loudly rather than lose a coordinate.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    seq: int = Field(gt=0)
-    ts: datetime
-    run_id: str = Field(min_length=1)
-    event: EventKind
-    story: str | None = None
-    card: str | None = None
-    phase: str | None = None
-    attempt: int | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-_EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
-
-
 _RETIRED_ATTEMPT_KEYS: frozenset[str] = frozenset({"tokens_in", "tokens_out", "cost"})
 """Attempt payload keys dropped before validation (remove-cost-tracking design,
 docs/superpowers/specs/2026-10-03-remove-cost-tracking-design.md §4.3).
@@ -124,188 +81,6 @@ def _current_attempt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class _UnknownEventLine(BaseModel):
-    """What a line with an unrecognised `event` must still carry: its `seq`.
-
-    A newer `am` may journal an event kind this version's `EventKind` does not
-    list. `Journal.read` skips such a line, but `last_seq` still counts it, so
-    a later `append` never reuses a number already on disk. Every other field
-    belongs to a schema this version does not know and is ignored.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    seq: int = Field(gt=0)
-
-
-class Journal:
-    """Append-only JSONL log for one run: the truth the projection is built from.
-
-    The threads of the process that holds a run's lease share one `Journal`.
-    The highest sequence number on disk is read when the journal is opened and
-    cached; a lock serialises appends from those threads. A process that takes
-    the lease over calls `reseek`, because the previous owner may have appended
-    after this journal was opened (multi-process X4).
-    """
-
-    def __init__(self, run_id: str) -> None:
-        self.run_id = run_id
-        self.path = paths.run_dir(run_id) / JOURNAL_NAME
-        self._lock = threading.Lock()
-        self._seq = self.last_seq()
-
-    @classmethod
-    def _for_reading(cls, run_id: str) -> "Journal":
-        """Another run's journal, opened only to be read.
-
-        `__init__` scans the file for its highest `seq` with the default
-        `read()`, which would raise on the very torn tail
-        `read(ignore_torn_tail=True)` exists to tolerate, and `paths.run_dir`
-        would create a directory for a run that never existed. This instance
-        is never appended to, so it needs neither: `_seq` stays 0.
-        """
-        journal = cls.__new__(cls)
-        journal.run_id = run_id
-        journal.path = paths.data_path() / "runs" / run_id / JOURNAL_NAME
-        journal._lock = threading.Lock()
-        journal._seq = 0
-        return journal
-
-    def last_seq(self) -> int:
-        """Highest sequence number already on disk, or 0 for a fresh journal.
-
-        Counts lines `read` skips for an unrecognised `event` too: they are on
-        disk, so `append` must never number a line with one of their `seq`s.
-        """
-        if not self.path.exists():
-            return 0
-        return max((seq for seq, _ in self._scan()), default=0)
-
-    def reseek(self) -> None:
-        """Re-read the highest `seq` on disk into the cache, under the append lock.
-
-        Called by `Store.take_lease` once the lease is this process's: a stuck
-        previous owner may have appended lines after `__init__` cached `_seq`,
-        and the new owner must number its first line after them.
-        """
-        with self._lock:
-            self._seq = self.last_seq()
-
-    def _scan(
-        self, *, ignore_torn_tail: bool = False
-    ) -> list[tuple[int, JournalLine | None]]:
-        """Every non-blank line's `seq`, in file order, with its `JournalLine`.
-
-        The `JournalLine` is `None` for a line whose `event` is a string this
-        version's `EventKind` does not list: `read` skips it, but `last_seq`
-        still counts its `seq`. Such a line must still carry a positive `seq`;
-        everything else on it is ignored. Any other line is validated strictly
-        as a `JournalLine`, so a missing or non-string `event`, a non-object
-        line, or an unknown envelope key on a known event still raises.
-
-        Blank lines are skipped: a crash between the write and the flush can
-        leave one. Anything else that is not JSON is an error naming the line.
-
-        `ignore_torn_tail` is for reading *another* run's journal, which a
-        process elsewhere may be appending to right now: a final line that is
-        not JSON and has no trailing newline is that append in flight, and is
-        skipped. A non-JSON line that is newline-terminated, or that is not the
-        last, is still `CorruptJournalError`. Lines are ASCII (`json.dumps`
-        escapes), so a cut can never split a character.
-        """
-        if not self.path.exists():
-            raise MissingJournalError(
-                f"no journal for run {self.run_id!r} at {self.path}"
-            )
-        with self.path.open(encoding="utf-8") as handle:
-            texts = handle.readlines()
-        scanned: list[tuple[int, JournalLine | None]] = []
-        for number, text in enumerate(texts, start=1):
-            if not text.strip():
-                continue
-            try:
-                record = json.loads(text)
-            except json.JSONDecodeError as error:
-                torn = number == len(texts) and not text.endswith("\n")
-                if ignore_torn_tail and torn:
-                    continue
-                raise CorruptJournalError(
-                    f"{self.path}:{number}: line is not JSON: {error}"
-                ) from error
-            if (
-                isinstance(record, dict)
-                and isinstance(record.get("event"), str)
-                and record["event"] not in _EVENT_KINDS
-            ):
-                skipped = _UnknownEventLine.model_validate(record)
-                scanned.append((skipped.seq, None))
-                continue
-            line = JournalLine.model_validate(record)
-            scanned.append((line.seq, line))
-        return scanned
-
-    def read(self, *, ignore_torn_tail: bool = False) -> list[JournalLine]:
-        """Every line whose event this version knows, validated, in `seq` order.
-
-        A line whose `event` is a string outside `EventKind` (written by a
-        newer `am`) is skipped rather than raising; see `_scan` for what is
-        still an error and for `ignore_torn_tail`. Unknown keys inside a known
-        line's `payload` pass through untouched: `replay` judges payloads.
-        """
-        lines = [
-            line
-            for _, line in self._scan(ignore_torn_tail=ignore_torn_tail)
-            if line is not None
-        ]
-        lines.sort(key=lambda line: line.seq)
-        return lines
-
-    def append(
-        self,
-        event: EventKind,
-        payload: dict[str, Any],
-        *,
-        story: str | None = None,
-        card: str | None = None,
-        phase: str | None = None,
-        attempt: int | None = None,
-    ) -> JournalLine:
-        """Append one line, flushed and fsynced before returning.
-
-        Only the process holding the run's lease writes it: after a take-over
-        the new owner writes, and the old owner's writes are fenced out by the
-        lease token (multi-process X4). The sequence number is cached when the
-        journal is opened (and re-read by `reseek` on a take-over), not re-read
-        from disk on each append, and the lock is held from numbering the line
-        until it is fsynced, so the threads of that process never share a
-        number or interleave their bytes. The cached number
-        advances once the line has been written and flushed to the file; if
-        validation, the open or the write raises, the next append retries the
-        same number, and if only the fsync raises the number stays spent, so
-        no seq is ever repeated on disk. The lock is released either way.
-        """
-        with self._lock:
-            seq = self._seq + 1
-            line = JournalLine(
-                seq=seq,
-                ts=datetime.now(timezone.utc),
-                run_id=self.run_id,
-                event=event,
-                story=story,
-                card=card,
-                phase=phase,
-                attempt=attempt,
-                payload=payload,
-            )
-            text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(text + "\n")
-                handle.flush()
-                # The line is in the file now, fsynced or not: spend its number
-                # so a retry after a failed fsync cannot repeat it on disk.
-                self._seq = seq
-                os.fsync(handle.fileno())
-            return line
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -334,12 +109,12 @@ def _find(items: list[Any], key: str, value: str | None, what: str, seq: int) ->
     for existing in items:
         if getattr(existing, key) == value:
             return existing
-    raise JournalError(
+    raise store_journal.JournalError(
         f"journal line {seq} names {what} {value!r}, which no earlier line created"
     )
 
 
-def replay(lines: Iterable[JournalLine]) -> models.Run:
+def replay(lines: Iterable[store_journal.JournalLine]) -> models.Run:
     """Fold journal lines, in sequence order, back into the §9 tree.
 
     Nothing here is defensive: a line that fails `models` validation raises the
@@ -360,7 +135,7 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
             continue
 
         if run is None:
-            raise JournalError(
+            raise store_journal.JournalError(
                 f"journal line {line.seq} is a {line.event} but no run_upsert"
                 " preceded it: the head of the journal is missing"
             )
@@ -401,7 +176,7 @@ def replay(lines: Iterable[JournalLine]) -> models.Run:
         _upsert(phase.attempts, "n", attempt, None)
 
     if run is None:
-        raise JournalError("journal contains no run_upsert line")
+        raise store_journal.JournalError("journal contains no run_upsert line")
     return run
 
 
@@ -469,7 +244,7 @@ def _child_key(key: _NodeKey, depth: int, value: Any) -> _NodeKey:
     return (slots[0], slots[1], slots[2], slots[3])
 
 
-def _line_node(line: JournalLine, node: Any) -> _NodeKey:
+def _line_node(line: store_journal.JournalLine, node: Any) -> _NodeKey:
     """The node a line describes, located the way `replay` places it: the
     envelope names its ancestors, the payload's identity field names it."""
     if line.event == "run_upsert":
@@ -483,7 +258,7 @@ def _line_node(line: JournalLine, node: Any) -> _NodeKey:
     return (line.story, line.card, line.phase, node.n)
 
 
-def _journaled_statuses(lines: list[JournalLine]) -> dict[_NodeKey, set[str]]:
+def _journaled_statuses(lines: list[store_journal.JournalLine]) -> dict[_NodeKey, set[str]]:
     """Every status each node was ever journaled at, at any seq (§3.2)."""
     seen: dict[_NodeKey, set[str]] = {}
     for line in sorted(lines, key=lambda item: item.seq):
@@ -564,7 +339,7 @@ def _walk(
             )
 
 
-def diverging(lines: list[JournalLine], projection: models.Run) -> list[Mismatch]:
+def diverging(lines: list[store_journal.JournalLine], projection: models.Run) -> list[Mismatch]:
     """Every place `projection` disagrees with the journal `lines` replay to.
 
     Pure: the caller loads both sides; nothing here reads a file or the
@@ -1274,7 +1049,7 @@ class Store:
     only the append and the row write.
     """
 
-    def __init__(self, conn: sqlite3.Connection, journal: Journal) -> None:
+    def __init__(self, conn: sqlite3.Connection, journal: store_journal.Journal) -> None:
         self._conn = conn
         self._journal = journal
         self._lock = threading.RLock()
@@ -1283,14 +1058,14 @@ class Store:
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
-        return cls(store_db.open_db(root), Journal(run_id))
+        return cls(store_db.open_db(root), store_journal.Journal(run_id))
 
     @property
     def run_id(self) -> str:
         return self._journal.run_id
 
     @property
-    def journal(self) -> Journal:
+    def journal(self) -> store_journal.Journal:
         return self._journal
 
     @property
@@ -1344,7 +1119,7 @@ class Store:
     # the row write raises, the line stays on disk, the exception propagates
     # unchanged and the `with` block releases the lock.
 
-    def record_run(self, run: models.Run) -> JournalLine:
+    def record_run(self, run: models.Run) -> store_journal.JournalLine:
         with self._lock, self._fenced():
             if run.id != self.run_id:
                 raise ValueError(
@@ -1359,7 +1134,7 @@ class Store:
             self._write_run_row(self.run_id, run)
             return line
 
-    def record_story(self, story: models.StoryRun) -> JournalLine:
+    def record_story(self, story: models.StoryRun) -> store_journal.JournalLine:
         with self._lock, self._fenced():
             line = self._journal.append(
                 "story_upsert",
@@ -1369,7 +1144,7 @@ class Store:
             self._write_story_row(self.run_id, story)
             return line
 
-    def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> JournalLine:
+    def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> store_journal.JournalLine:
         with self._lock, self._fenced():
             line = self._journal.append(
                 "subtask_upsert",
@@ -1382,7 +1157,7 @@ class Store:
 
     def record_phase(
         self, story_id: str, card_id: str, phase: models.PhaseRun
-    ) -> JournalLine:
+    ) -> store_journal.JournalLine:
         with self._lock, self._fenced():
             line = self._journal.append(
                 "phase_upsert",
@@ -1396,7 +1171,7 @@ class Store:
 
     def record_attempt(
         self, story_id: str, card_id: str, phase_name: str, attempt: models.Attempt
-    ) -> JournalLine:
+    ) -> store_journal.JournalLine:
         with self._lock, self._fenced():
             line = self._journal.append(
                 "attempt_upsert",
@@ -2052,12 +1827,12 @@ class Store:
         """
         with self._lock, self._fenced():
             journal = (
-                self._journal if self._journal.run_id == run_id else Journal(run_id)
+                self._journal if self._journal.run_id == run_id else store_journal.Journal(run_id)
             )
             lines = journal.read()
             run = replay(lines)
             if run.id != run_id:
-                raise JournalError(
+                raise store_journal.JournalError(
                     f"journal of run {run_id!r} has a run_upsert naming run"
                     f" {run.id!r}: refusing to key its projection under two ids"
                 )
@@ -2105,7 +1880,7 @@ class Store:
             if run_id == self.run_id:
                 lines = self._journal.read()
             else:
-                lines = Journal._for_reading(run_id).read(ignore_torn_tail=True)
+                lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
             return replay(lines)
 
     def _delete_run(self, run_id: str) -> None:

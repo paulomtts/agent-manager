@@ -58,6 +58,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.workflow import task as task_workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
@@ -340,11 +341,11 @@ def integrity_view(
     if lease is not None and control.lease_is_live(lease, now=now):
         return {"checked": False, "reason": "lease is live", "mismatches": []}
     try:
-        lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+        lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
         found = store_module.diverging(lines, run)
-    except store_module.MissingJournalError:
+    except store_journal.MissingJournalError:
         return {"checked": False, "reason": "no journal", "mismatches": []}
-    except (store_module.JournalError, ValidationError) as error:
+    except (store_journal.JournalError, ValidationError) as error:
         return {
             "checked": False,
             "reason": f"journal unreadable: {error}",
@@ -1436,7 +1437,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     ValueError,
     locks.LockTimeoutError,
     store_module.LeaseLostError,
-    store_module.CorruptJournalError,
+    store_journal.CorruptJournalError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1448,7 +1449,7 @@ refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostErr
 is in it because another process took this run's lease over mid-walk (spec X4):
 the fence stopped every write, and the operator gets the envelope naming the new
 holder. It is a `BaseException`, so it has to be listed by name.
-`store_module.CorruptJournalError` is in it because a crashed run can leave a
+`store_journal.CorruptJournalError` is in it because a crashed run can leave a
 torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
 is a refusal naming the file and line, not a bug; only that subclass, not
 `JournalError` as a whole. Anything outside this tuple is a bug in this program
@@ -2404,7 +2405,7 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_module.JournalError)
+WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_journal.JournalError)
 """`HANDLED` plus `JournalError`, for `watch` only.
 
 A corrupt journal is a refusal for a reader, so `watch` turns it into an
@@ -2436,7 +2437,7 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
     that does not exist (am-watch design 3.7). A torn last line is an append in
     flight and is skipped. Raises `MissingJournalError` when there is no journal.
     """
-    lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+    lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
     return [line.model_dump(mode="json") for line in lines if line.seq > since]
 
 
@@ -2484,7 +2485,7 @@ def watch_for(
         _check_watch_run_id(run_id)
         try:
             return {"events": _journal_events(run_id, since=since)}
-        except store_module.MissingJournalError as error:
+        except store_journal.MissingJournalError as error:
             raise UnknownRunError(
                 f"run {run_id!r} has no journal under the data directory"
                 " (`agent-manager watch --all` reads every run there is)"
@@ -2493,7 +2494,7 @@ def watch_for(
     for each in paths.list_run_ids():
         try:
             events.extend(_journal_events(each, since=since))
-        except store_module.MissingJournalError:
+        except store_journal.MissingJournalError:
             continue
     return {"events": events}
 
@@ -2555,7 +2556,7 @@ def _poll_watch(
     for each in run_ids:
         try:
             events = _journal_events(each, since=cursors.get(each, since))
-        except store_module.MissingJournalError:
+        except store_journal.MissingJournalError:
             continue
         for event in events:
             cursors[each] = event["seq"]

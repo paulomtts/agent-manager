@@ -41,6 +41,7 @@ from agent_manager import (
     store,
 )
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -243,7 +244,7 @@ def test_two_independent_milestones_both_finish(board_root):
     real_stories: dict[str, set[str]] = {}
     for milestone in (x, y):
         run_id = entries[milestone["id"]]["run_id"]
-        lines = store.Journal(run_id).read()
+        lines = store_journal.Journal(run_id).read()
         assert lines, run_id
         assert lines[0].event == "run_upsert", lines[0]
         assert lines[0].payload["milestone_id"] == milestone["id"]
