@@ -12,7 +12,7 @@ time; `compute_dry_run_plan` imports `integration` (which still imports `cli`)
 only when called.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -124,6 +124,28 @@ class RunnerFactory(Protocol):
         story_id: str,
         card_id: str,
     ) -> AgentPhaseRunner: ...
+
+
+HarnessOverride = tuple[float | None, Mapping[str, float]]
+"""`am resume --harness-timeout`, parsed: `(run default, per-phase map)` (card eee43099).
+
+It replaces both of a run's recorded harness timeouts; `None` in its place
+means "keep the record"."""
+
+
+def with_harness_override(run: models.Run, override: HarnessOverride | None) -> models.Run:
+    """`run` with `override` replacing both recorded harness timeouts, never merged.
+
+    `None` returns `run` itself. The map is copied, so the caller's mapping
+    can change afterwards without touching the record.
+    """
+    if override is None:
+        return run
+    default, per_phase = override
+    config = run.config.model_copy(
+        update={"harness_timeout": default, "harness_timeouts": dict(per_phase)}
+    )
+    return run.model_copy(update={"config": config})
 
 
 def gate_context(commands: Sequence[str], allow_no_verification: bool) -> dict[str, Any]:

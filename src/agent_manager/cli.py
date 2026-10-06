@@ -72,6 +72,7 @@ from agent_manager.runs import (
     CheckpointMismatchError,
     CliError,
     DryRunPlan,
+    HarnessOverride,
     NotResumableError,
     RepoDirError,
     RunnerFactory,
@@ -83,6 +84,7 @@ from agent_manager.runs import (
     orphan_attempts,
     resolve_repo_dir,
     select_resumable,
+    with_harness_override,
     worktree_for,
 )
 
@@ -3030,6 +3032,7 @@ def _resume_from_checkpoint(
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
@@ -3055,7 +3058,15 @@ def _resume_from_checkpoint(
     comes, when a passed `commands` differs from the suite the checkpoint
     keeps (`runtime_engine.kept_commands`), one `verification: kept from
     checkpoint: [...]` warning naming the kept suite (card 5b19aa93).
+
+    Harness timeouts (card eee43099): `harness_override`, when given,
+    replaces both of the run's recorded values before anything is read or
+    written (`with_harness_override`), so every run record this life writes
+    carries it and a later resume keeps it. Without it the recorded values
+    stay. Either way the walk's runner launches with them
+    (`runner_factory_for`).
     """
+    run = with_harness_override(run, harness_override)
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
@@ -3115,7 +3126,7 @@ def _resume_from_checkpoint(
                         repo_dir=root,
                         commands=commands,
                         allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
+                        runner_factory=runner_factory_for(run.config, runner_factory),
                         stop=stop,
                         resume_from=checkpoint,
                     ),

@@ -14061,3 +14061,114 @@ def test_run_card_engine_hands_an_injected_factory_on_unchanged(
     )
 
     assert factory is injected
+
+
+def _timed_task_run(root: Path, cards: dict[str, str], **timeouts: Any) -> str:
+    """A recorded `task` run, its subtask `started` and parked before `plan`,
+    with its lease released: what `am resume` finds after a kill."""
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        **timeouts,
+    )
+    with cli.recorded_card_run(pre) as recorded:
+        _saved(recorded.store, cards["subtask"], "parked", queue=("plan",))
+    return pre.run_id
+
+
+def _config_drive(calls: list[dict[str, Any]], configs: list[models.RunConfig]):
+    """A fake `drive_subtask_async` that records its keywords and the run's
+    recorded config at the moment it is driven, then finishes `done`."""
+
+    async def drive(**kwargs: Any) -> cli.SubtaskDrive:
+        calls.append(kwargs)
+        run = kwargs["store"].load_run(kwargs["run_id"])
+        configs.append(run.config)
+        return cli.SubtaskDrive(summary=SubtaskSummary(status="done"), warnings=[])
+
+    return drive
+
+
+def _resume_task(root: Path, run_id: str, **extra: Any) -> dict[str, Any]:
+    return cli._resume_from_checkpoint(
+        _loaded(root, run_id),
+        root=root,
+        allow_no_verification=False,
+        commands=(),
+        runner_factory=None,
+        control_interval=CONTROL_TICK,
+        **extra,
+    )
+
+
+def test_a_resumed_task_run_keeps_its_recorded_harness_timeout(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(root, cards, harness_timeout=2.0)
+    calls: list[dict[str, Any]] = []
+    configs: list[models.RunConfig] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, configs))
+
+    payload = _resume_task(root, run_id)
+
+    assert payload["status"] == "done"
+    (call,) = calls
+    assert call["resume_from"] is not None
+    assert _bound_runner(call["runner_factory"]).timeout_for("plan") == 2.0
+    (started,) = configs
+    assert (started.harness_timeout, started.harness_timeouts) == (2.0, {})
+    final = _loaded(root, run_id).config
+    assert (final.harness_timeout, final.harness_timeouts) == (2.0, {})
+
+
+def test_a_resumed_task_run_without_a_timeout_hands_on_no_factory(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(root, cards)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, []))
+
+    _resume_task(root, run_id)
+
+    (call,) = calls
+    assert call["runner_factory"] is None
+
+
+@pytest.mark.parametrize(
+    ("override", "expected", "implement", "plan"),
+    [
+        ((900.0, {}), (900.0, {}), 900.0, 900.0),
+        ((None, {"plan": 120.0}), (None, {"plan": 120.0}), dispatch.DEFAULT_TIMEOUT, 120.0),
+    ],
+)
+def test_a_task_resume_override_replaces_both_values_and_is_recorded(
+    tmp_path, monkeypatch, fake_board, override, expected, implement, plan
+):
+    """Review Focus 3 and 4: replaced wholesale, in the `started` record and
+    in the final one a later resume loads."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(
+        root, cards, harness_timeout=600.0, harness_timeouts={"implement": 3600.0}
+    )
+    calls: list[dict[str, Any]] = []
+    configs: list[models.RunConfig] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, configs))
+
+    _resume_task(root, run_id, harness_override=override)
+
+    (call,) = calls
+    runner = _bound_runner(call["runner_factory"])
+    assert runner.timeout_for("implement") == implement
+    assert runner.timeout_for("plan") == plan
+    (started,) = configs
+    assert (started.harness_timeout, started.harness_timeouts) == expected
+    final = _loaded(root, run_id).config
+    assert (final.harness_timeout, final.harness_timeouts) == expected
