@@ -683,6 +683,8 @@ def default_runner_factory(
     run_id: str,
     story_id: str,
     card_id: str,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> AgentPhaseRunner:
     """The production runner: real adapters, real roles, the direct launcher.
 
@@ -690,6 +692,10 @@ def default_runner_factory(
     `harness_map` stays empty, so every role falls back to `DEFAULT_HARNESS` and
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
+
+    `harness_timeout` and `harness_timeouts` are the run's recorded
+    `RunConfig` values (card eee43099); `runner_factory_for` is what passes
+    them. Without them every attempt gets `dispatch.DEFAULT_TIMEOUT`.
     """
     return dispatch.AgentRunner(
         store=store,
@@ -697,7 +703,41 @@ def default_runner_factory(
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,
+        harness_timeout=harness_timeout,
+        harness_timeouts=dict(harness_timeouts or {}),
     )
+
+
+def runner_factory_for(
+    config: models.RunConfig, runner_factory: RunnerFactory | None
+) -> RunnerFactory | None:
+    """The runner factory a run's engine hands on, given its recorded `config` (card eee43099).
+
+    An injected `runner_factory` (the §14 test seam) wins and is returned as
+    is, so it is still called with the four `RunnerFactory` keywords only. A
+    config with no timeout gives `None`, exactly what was handed on before
+    timeouts were recorded. Otherwise a factory that calls
+    `default_runner_factory` -- looked up at call time, so a test that patches
+    it is honored -- with the config's two values added.
+    """
+    if runner_factory is not None:
+        return runner_factory
+    if config.harness_timeout is None and not config.harness_timeouts:
+        return None
+    harness_timeout = config.harness_timeout
+    harness_timeouts = dict(config.harness_timeouts)
+
+    def bound(*, store: Store, run_id: str, story_id: str, card_id: str) -> AgentPhaseRunner:
+        return default_runner_factory(
+            store=store,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
+        )
+
+    return bound
 
 
 @dataclass(frozen=True)

@@ -13916,3 +13916,84 @@ def test_the_harness_timeout_help_texts():
     assert resume_option.help == (
         "Accepted and validated; a resumed run keeps the timeout it was started with."
     )
+
+
+
+# ── recorded harness timeouts reach the runner (card eee43099) ──────────────
+#
+# Unit tier: an `AgentRunner` is built but never called, so nothing launches.
+
+BOUND_IDS = {"run_id": "run-1", "story_id": "story-1", "card_id": "card-1"}
+
+
+def _bound_runner(factory: Any) -> Any:
+    """The runner `factory` builds for a store nothing reads."""
+    return factory(store=object(), **BOUND_IDS)
+
+
+def test_runner_factory_for_returns_an_injected_factory_unchanged():
+    def injected(**kwargs: Any) -> Any:
+        return None
+
+    timed = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+
+    assert cli.runner_factory_for(timed, injected) is injected
+    assert cli.runner_factory_for(models.RunConfig(), injected) is injected
+
+
+def test_runner_factory_for_is_none_when_the_config_sets_no_timeout():
+    assert cli.runner_factory_for(models.RunConfig(), None) is None
+
+
+def test_runner_factory_for_binds_the_recorded_timeouts():
+    config = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+
+    factory = cli.runner_factory_for(config, None)
+
+    assert factory is not None
+    runner = _bound_runner(factory)
+    assert isinstance(runner, dispatch.AgentRunner)
+    assert (runner.run_id, runner.story_id, runner.card_id) == ("run-1", "story-1", "card-1")
+    assert runner.timeout_for("implement") == 3600.0
+    assert runner.timeout_for("plan") == 900.0
+
+
+def test_runner_factory_for_binds_a_per_phase_map_alone():
+    """Review Focus 1: no run default, one override -- still bound."""
+    config = models.RunConfig(harness_timeouts={"implement": 600.0})
+
+    runner = _bound_runner(cli.runner_factory_for(config, None))
+
+    assert runner.timeout_for("implement") == 600.0
+    assert runner.timeout_for("plan") == dispatch.DEFAULT_TIMEOUT
+
+
+def test_runner_factory_for_reads_default_runner_factory_at_call_time(monkeypatch):
+    config = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+    factory = cli.runner_factory_for(config, None)
+    seen: list[dict[str, Any]] = []
+
+    def recording(**kwargs: Any) -> str:
+        seen.append(kwargs)
+        return "patched runner"
+
+    monkeypatch.setattr(cli, "default_runner_factory", recording)
+    store = object()
+
+    assert factory(store=store, **BOUND_IDS) == "patched runner"
+    assert seen == [
+        {
+            "store": store,
+            **BOUND_IDS,
+            "harness_timeout": 900.0,
+            "harness_timeouts": {"implement": 3600.0},
+        }
+    ]
+
+
+def test_default_runner_factory_without_timeouts_keeps_the_default():
+    runner = cli.default_runner_factory(store=object(), **BOUND_IDS)
+
+    assert runner.harness_timeout is None
+    assert runner.harness_timeouts == {}
+    assert runner.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT
