@@ -10674,3 +10674,132 @@ def test_a_refused_detached_story_run_forks_nothing(
     assert fake.calls == []
     assert _run_dirs() == []
     assert _run_ids(root) == []
+
+
+# ── harness timeouts reach every fresh run's RunConfig (card 33dc5549) ──────
+#
+# Unit tier: FakeBoard, `refresh_git` patched, `board_seams` for the board;
+# a recording preflight stops the wrappers before any store or git.
+
+TIMEOUTS = {"harness_timeout": 900.0, "harness_timeouts": {"implement": 3600.0}}
+
+
+def test_preflight_milestone_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_milestone(
+        root,
+        shape["milestone"],
+        driver=FakeDriver(),
+        harness_timeout=900.0,
+        harness_timeouts={"resolve": 1200.0, "implement": 3600.0},
+    )
+    default = _preflight_milestone(root, shape["milestone"], driver=FakeDriver())
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"resolve": 1200.0, "implement": 3600.0}
+    assert pre.run_record.config.max_concurrent_stories == 1
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+def test_preflight_story_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story, driver=FakeDriver(), **TIMEOUTS)
+    default = _preflight_story(root, story, driver=FakeDriver())
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"implement": 3600.0}
+    assert pre.run_record.config.story_id == story
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+class _HaltAtPreflight(Exception):
+    """Raised by a recording preflight, so the run under test stops there."""
+
+
+def _halting_preflight(monkeypatch, name: str) -> list[dict[str, Any]]:
+    seen: list[dict[str, Any]] = []
+
+    def preflight(target, **kwargs):
+        seen.append(kwargs)
+        raise _HaltAtPreflight
+
+    monkeypatch.setattr(orchestrate, name, preflight)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("entry", "preflight", "detached"),
+    [
+        ("run_milestone", "preflight_milestone", False),
+        ("detach_milestone", "preflight_milestone", True),
+        ("run_story", "preflight_story", False),
+        ("detach_story", "preflight_story", True),
+    ],
+)
+def test_milestone_and_story_entry_points_forward_harness_timeouts_to_their_preflight(
+    tmp_path, monkeypatch, entry, preflight, detached
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    seen = _halting_preflight(monkeypatch, preflight)
+    extra = {"detacher": _FakeDetacher()} if detached else {}
+
+    with pytest.raises(_HaltAtPreflight):
+        getattr(orchestrate, entry)(
+            "M",
+            repo_dir=tmp_path,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            **TIMEOUTS,
+            **extra,
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_timeout"] == 900.0
+    assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+def test_run_board_forwards_harness_timeouts_to_each_milestone(board_seams):
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [first, second]
+
+    _board(board_seams, **TIMEOUTS)
+
+    assert board_seams.runs.called() == [first.id, second.id]
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert kwargs["harness_timeout"] == 900.0
+        assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+def test_run_board_without_harness_timeouts_forwards_none(board_seams):
+    board_seams.cards = [_board_milestone(1)]
+
+    _board(board_seams)
+
+    ((_milestone_id, kwargs),) = board_seams.runs.calls
+    assert kwargs["harness_timeout"] is None
+    assert kwargs["harness_timeouts"] is None
+
+
+def test_the_detached_board_child_forwards_harness_timeouts_to_each_milestone(board_seams):
+    first = _board_milestone(1)
+    second = _board_milestone(2)
+    board_seams.cards = [first, second]
+    fake = _FakeDetacher()
+    _detach_board(board_seams, fake, **TIMEOUTS)
+
+    fake.body()
+
+    assert sorted(board_seams.runs.called()) == sorted([first.id, second.id])
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert kwargs["harness_timeout"] == 900.0
+        assert kwargs["harness_timeouts"] == {"implement": 3600.0}

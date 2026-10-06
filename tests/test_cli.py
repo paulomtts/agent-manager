@@ -13552,3 +13552,67 @@ def test_harness_timeout_parse_lists_the_milestone_phases_in_declared_order():
     assert caught.value.message == (
         f"'bogus=600': unknown phase 'bogus'; the agent phases are: {TASK_PHASES_TEXT}, resolve"
     )
+
+
+# ── harness timeouts reach the card run's RunConfig (card 33dc5549) ─────────
+#
+# Unit tier: FakeBoard and a plain repo dir, as the preflight seam tests above.
+
+
+def test_preflight_card_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        harness_timeout=900.0,
+        harness_timeouts={"implement": 3600.0},
+    )
+    default = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+    )
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"implement": 3600.0}
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+class _HaltAtPreflight(Exception):
+    """Raised by a recording preflight, so the run under test stops there."""
+
+
+@pytest.mark.parametrize("entry", ["run_card", "detach_card"])
+def test_card_entry_points_forward_harness_timeouts_to_preflight_card(
+    tmp_path, monkeypatch, entry
+):
+    seen: list[dict[str, Any]] = []
+
+    def preflight(card_id, **kwargs):
+        seen.append(kwargs)
+        raise _HaltAtPreflight
+
+    monkeypatch.setattr(cli, "preflight_card", preflight)
+    extra = {"detacher": _Forbidden("detacher")} if entry == "detach_card" else {}
+
+    with pytest.raises(_HaltAtPreflight):
+        getattr(cli, entry)(
+            VERIFY_CARD_ID,
+            repo_dir=tmp_path,
+            branch_prefix="m1",
+            harness_timeout=900.0,
+            harness_timeouts={"implement": 3600.0},
+            **extra,
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_timeout"] == 900.0
+    assert kwargs["harness_timeouts"] == {"implement": 3600.0}

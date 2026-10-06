@@ -966,6 +966,8 @@ def preflight_card(
     branch_prefix: str,
     base_branch: str = "master",
     clock: Callable[[], datetime] = _utcnow,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
 
@@ -1009,7 +1011,10 @@ def preflight_card(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(
+                harness_timeout=harness_timeout,
+                harness_timeouts=dict(harness_timeouts or {}),
+            ),
         ),
         story=models.StoryRun(
             card_id=parent.id,
@@ -1157,6 +1162,8 @@ def run_card(
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
@@ -1192,6 +1199,8 @@ def run_card(
         branch_prefix=branch_prefix,
         base_branch=base_branch,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         return asyncio.run(
@@ -1561,6 +1570,8 @@ def detach_card(
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
 
@@ -1576,6 +1587,8 @@ def detach_card(
         branch_prefix=branch_prefix,
         base_branch=base_branch,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         log = detach.create_run_log(pre.run_id)
