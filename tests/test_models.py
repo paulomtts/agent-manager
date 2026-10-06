@@ -1095,3 +1095,99 @@ def test_attempt_status_does_not_pick_up_cancelled(status):
     )
     with pytest.raises(ValidationError):
         models.Attempt(n=1, dispatch=_dispatch(), status=status)
+
+
+# ── RunConfig harness timeouts (card 33dc5549) ──────────────────────────────
+
+
+def _bare_run(**overrides) -> models.Run:
+    fields = {
+        "id": "run-2026-10-06-01",
+        "workflow": "milestone",
+        "repo_dir": Path("/home/dev/agent-manager"),
+        "base_branch": "main",
+        "branch_prefix": "m1",
+    }
+    fields.update(overrides)
+    return models.Run(**fields)
+
+
+def test_run_config_harness_timeouts_default_to_none_and_empty():
+    config = models.RunConfig()
+    assert config.harness_timeout is None
+    assert config.harness_timeouts == {}
+    run = _bare_run()
+    assert run.config.harness_timeout is None
+    assert run.config.harness_timeouts == {}
+    dumped = config.model_dump(mode="json")
+    assert dumped["harness_timeout"] is None
+    assert dumped["harness_timeouts"] == {}
+    run_dumped = run.model_dump(mode="json")["config"]
+    assert run_dumped["harness_timeout"] is None
+    assert run_dumped["harness_timeouts"] == {}
+
+
+def test_run_config_accepts_a_harness_timeout_and_per_phase_map():
+    config = models.RunConfig(
+        harness_timeout=900.0, harness_timeouts={"implement": 3600.0, "resolve": 600.0}
+    )
+    assert config.harness_timeout == 900.0
+    assert config.harness_timeouts == {"implement": 3600.0, "resolve": 600.0}
+    dumped = config.model_dump(mode="json")
+    assert dumped["harness_timeout"] == 900.0
+    assert dumped["harness_timeouts"] == {"implement": 3600.0, "resolve": 600.0}
+    assert models.RunConfig.model_validate(dumped) == config
+    run = _bare_run(config=config)
+    assert models.Run.model_validate(run.model_dump(mode="json")) == run
+
+
+def test_run_config_accepts_a_harness_timeout_below_the_cli_floor():
+    """C8: the 60 s floor is the CLI's. A test records a 2 s timeout directly."""
+    config = models.RunConfig(harness_timeout=2.0, harness_timeouts={"implement": 2.0})
+    assert config.harness_timeout == 2.0
+    assert config.harness_timeouts == {"implement": 2.0}
+    above = models.RunConfig(harness_timeout=86401.0)
+    assert above.harness_timeout == 86401.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
+def test_run_config_rejects_a_non_finite_or_non_positive_harness_timeout(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeout=value)
+    assert "harness_timeout" in str(excinfo.value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeouts={"implement": value})
+    assert "harness_timeouts" in str(excinfo.value)
+
+
+def test_run_config_rejects_an_empty_phase_key():
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeouts={"": 600.0})
+    assert "harness_timeouts" in str(excinfo.value)
+
+
+def test_run_config_loads_a_payload_written_before_harness_timeouts():
+    """Additive: a config or run dict with neither key still loads."""
+    old_config = {
+        "max_concurrent_stories": 2,
+        "dry_run": False,
+        "launcher": "direct",
+        "harness_map": {},
+        "story_id": None,
+    }
+    config = models.RunConfig.model_validate(old_config)
+    assert config.harness_timeout is None
+    assert config.harness_timeouts == {}
+    old_run = {
+        "id": "run-2026-10-06-01",
+        "workflow": "milestone",
+        "repo_dir": "/home/dev/agent-manager",
+        "base_branch": "main",
+        "branch_prefix": "m1",
+        "status": "started",
+        "config": old_config,
+    }
+    run = models.Run.model_validate(old_run)
+    assert run.config.harness_timeout is None
+    assert run.config.harness_timeouts == {}

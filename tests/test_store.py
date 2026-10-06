@@ -7024,3 +7024,42 @@ def test_reading_a_journal_that_does_not_exist_creates_no_data_dir(repo, tmp_pat
         store.Journal._for_reading("run-that-never-was").read()
 
     assert not (tmp_path / "data").exists()
+# ── RunConfig harness timeouts (card 33dc5549) ──────────────────────────────
+
+
+def _with_timeouts(run: models.Run) -> models.Run:
+    return run.model_copy(
+        update={
+            "config": run.config.model_copy(
+                update={"harness_timeout": 900.0, "harness_timeouts": {"implement": 3600.0}}
+            )
+        }
+    )
+
+
+def test_run_config_harness_timeouts_survive_the_journal_round_trip(repo):
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_with_timeouts(_run(repo)))
+        via_store = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert via_store is not None
+    assert via_store.config.harness_timeout == 900.0
+    assert via_store.config.harness_timeouts == {"implement": 3600.0}
+    upserts = [line for line in store.Journal(RUN_ID).read() if line.event == "run_upsert"]
+    assert upserts[0].payload["config"]["harness_timeout"] == 900.0
+    assert upserts[0].payload["config"]["harness_timeouts"] == {"implement": 3600.0}
+
+    _truncate_db(repo)
+    rebuilt = store.Store.open(repo, RUN_ID)
+    try:
+        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        after = rebuilt.load_run(RUN_ID)
+    finally:
+        rebuilt.close()
+
+    assert returned.config.harness_timeout == 900.0
+    assert returned.config.harness_timeouts == {"implement": 3600.0}
+    assert after == returned
