@@ -1832,17 +1832,18 @@ def test_store_does_not_import_control():
     whole AST: a function-local `from . import control` or a multi-name
     `from agent_manager import models, control` must be caught too.
     """
-    tree = ast.parse(Path(store.__file__).read_text())
     imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            base = "agent_manager" if node.level else (node.module or "")
-            if node.level and node.module:
-                base = f"agent_manager.{node.module}"
-            imported.add(base)
-            imported.update(f"{base}.{alias.name}" for alias in node.names)
+    for source in sorted(Path(store.__file__).parent.rglob("*.py")):
+        tree = ast.parse(source.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = "agent_manager" if node.level else (node.module or "")
+                if node.level and node.module:
+                    base = f"agent_manager.{node.module}"
+                imported.add(base)
+                imported.update(f"{base}.{alias.name}" for alias in node.names)
 
     assert not {
         name
