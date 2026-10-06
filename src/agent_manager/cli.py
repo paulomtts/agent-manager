@@ -962,6 +962,8 @@ def preflight_card(
     repo_dir: Path,
     branch_prefix: str,
     base_branch: str = "master",
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
     clock: Callable[[], datetime] = _utcnow,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
@@ -970,7 +972,9 @@ def preflight_card(
     and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
     and before any store exists, so a refused card leaves no run directory
     (X5). Only then is the clock read and the run id minted, and the
-    `started` run, story and subtask records built. Nothing is written.
+    `started` run, story and subtask records built; the run's config records
+    `commands` as its `verify` suite and `allow_no_verification`. Nothing is
+    written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -1006,7 +1010,9 @@ def preflight_card(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(
+                verify=list(commands), allow_no_verification=allow_no_verification
+            ),
         ),
         story=models.StoryRun(
             card_id=parent.id,
@@ -1188,6 +1194,8 @@ def run_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:
@@ -1572,6 +1580,8 @@ def detach_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:

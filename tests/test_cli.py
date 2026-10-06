@@ -7598,6 +7598,31 @@ def test_a_refused_task_resume_with_a_differing_verify_says_nothing_of_the_suite
     assert _resume_state(project) == before
 
 
+def _run_upserts(run_id: str) -> list[Any]:
+    """Every `run_upsert` line of `run_id`'s journal, oldest first."""
+    return [line for line in store_module.Journal(run_id).read() if line.event == "run_upsert"]
+
+
+@pytest.mark.git
+def test_a_card_runs_first_run_upsert_records_its_suite(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    first = _run_upserts(run_id)[0]
+
+    assert first.payload["config"]["verify"] == ["true"]
+    assert first.payload["config"]["allow_no_verification"] is False
+
+
+@pytest.mark.git
+def test_a_card_runs_first_run_upsert_records_its_opt_out(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", allow_no_verification=True)
+
+    first = _run_upserts(run_id)[0]
+
+    assert first.payload["config"]["verify"] == []
+    assert first.payload["config"]["allow_no_verification"] is True
+
+
 @pytest.mark.git
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     project, cards, monkeypatch
@@ -10896,6 +10921,58 @@ def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
     assert _recorded_run_ids(root) == []
     assert _claim_rows(root) == []
     assert fake_board.writes == []
+
+
+def test_preflight_card_records_the_suite_and_the_opt_out(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        commands=("a", "b"),
+        allow_no_verification=True,
+        clock=lambda: SEAM_AT,
+    )
+    default = _preflight(root, cards["subtask"])
+
+    assert pre.run_record.config.verify == ["a", "b"]
+    assert pre.run_record.config.allow_no_verification is True
+    assert default.run_record.config.verify == []
+    assert default.run_record.config.allow_no_verification is False
+
+
+class _PreflightReached(Exception):
+    """Raised by a patched pre-flight once it has captured its arguments."""
+
+
+def test_run_card_and_its_detach_path_hand_the_suite_to_the_preflight(tmp_path, monkeypatch):
+    seen: list[dict[str, Any]] = []
+
+    def capture(card_id: str, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached(card_id)
+
+    monkeypatch.setattr(cli, "preflight_card", capture)
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "commands": ["a"],
+        "allow_no_verification": True,
+    }
+
+    with pytest.raises(_PreflightReached):
+        cli.run_card("c1", **common)
+    with pytest.raises(_PreflightReached):
+        cli.detach_card("c1", detacher=_Forbidden("detacher"), **common)
+
+    assert [(kwargs["commands"], kwargs["allow_no_verification"]) for kwargs in seen] == [
+        (["a"], True),
+        (["a"], True),
+    ]
 
 
 def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
