@@ -2881,6 +2881,9 @@ def _resume_from_checkpoint(
     comes, when a passed `commands` differs from the suite the checkpoint
     keeps (`runtime_engine.kept_commands`), one `verification: kept from
     checkpoint: [...]` warning naming the kept suite (card 5b19aa93).
+    `commands` is the passed `--verify` and is read for that warning only:
+    the walk is driven with `run.config.verify` and `allow_no_verification`,
+    and both `record_run` calls write `run`'s config back.
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -2939,7 +2942,7 @@ def _resume_from_checkpoint(
                         parent=parent,
                         subtask=resumed,
                         repo_dir=root,
-                        commands=commands,
+                        commands=run.config.verify,
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
@@ -3015,14 +3018,18 @@ def resume_run(
 
     Branch, base branch and worktree come from the recorded run and never
     from a flag: §9's "the run records what it was started with" is the
-    reason the record exists. The two knobs the record does *not* carry --
-    `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are still taken as arguments. A walk continued from a checkpoint never
-    reads them: its binding comes from the checkpoint's pool, and a `task`
-    resume whose `commands` differ from that pool's adds a `verification:
-    kept from checkpoint: [...]` warning. On a milestone
-    they also reach what starts afresh -- subtasks with no checkpoint, merged
-    bases and Integrate.
+    reason the record exists. So do the suite and the opt-out
+    (`RunConfig.verify`, `RunConfig.allow_no_verification`): a non-empty
+    `commands` replaces the recorded suite, `allow_no_verification` can only
+    add the opt-out, and the result is written back to the record by the
+    resume's first `record_run`, so a refused resume still writes nothing.
+    A walk continued from a checkpoint keeps the checkpoint's pool instead,
+    and a `task` resume whose passed `commands` differ from it adds a
+    `verification: kept from checkpoint: [...]` warning. On a milestone the
+    resulting suite and opt-out reach what starts afresh -- subtasks with no
+    checkpoint, merged bases and Integrate. When a passed `commands` differs
+    from the recorded suite, the payload's last warning is `verification:
+    replaced in run record: [...]`, naming the suite it replaced.
 
     A run canceled in either spelling is refused for both workflows (live
     control C9), and so is a run whose lease is still live (C10): both
@@ -3049,28 +3056,50 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    explicit = list(commands)
+    recorded = run.config.verify
+    run = run.model_copy(
+        update={
+            "config": run.config.model_copy(
+                update={
+                    "verify": explicit or list(recorded),
+                    "allow_no_verification": allow_no_verification
+                    or run.config.allow_no_verification,
+                }
+            )
+        }
+    )
+    replaced = (
+        f"verification: replaced in run record: {recorded!r}"
+        if explicit and explicit != recorded
+        else None
+    )
     if run.workflow == WORKFLOW_NAME:
-        return _resume_from_checkpoint(
+        payload = _resume_from_checkpoint(
             run,
             root=root,
-            allow_no_verification=allow_no_verification,
+            allow_no_verification=run.config.allow_no_verification,
             commands=commands,
             runner_factory=runner_factory,
         )
     # Read as `orchestrate.run_milestone` so a test can patch it there.
-    if run.workflow == orchestrate.MILESTONE_WORKFLOW:
-        return orchestrate.run_milestone(
+    elif run.workflow == orchestrate.MILESTONE_WORKFLOW:
+        payload = orchestrate.run_milestone(
             None,
             repo_dir=root,
-            commands=list(commands),
-            allow_no_verification=allow_no_verification,
+            commands=list(run.config.verify),
+            allow_no_verification=run.config.allow_no_verification,
             runner_factory=runner_factory,
             resume_run_id=run.id,
         )
-    raise NotResumableError(
-        f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
-        f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
-    )
+    else:
+        raise NotResumableError(
+            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+        )
+    if replaced is not None:
+        payload.setdefault("warnings", []).append(replaced)
+    return payload
 
 
 @app.command("resume")

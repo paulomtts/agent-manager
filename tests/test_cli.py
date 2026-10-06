@@ -4414,6 +4414,8 @@ def _record(
     workflow: str = "task",
     milestone_id: str | None = None,
     story_id: str | None = None,
+    verify: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
     in `root`'s projection, written the only way this program writes rows. The
@@ -4431,7 +4433,11 @@ def _record(
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
-                config=models.RunConfig(story_id=story_id),
+                config=models.RunConfig(
+                    story_id=story_id,
+                    verify=list(verify),
+                    allow_no_verification=allow_no_verification,
+                ),
                 milestone_id=milestone_id,
             )
         )
@@ -7598,6 +7604,98 @@ def test_a_refused_task_resume_with_a_differing_verify_says_nothing_of_the_suite
     assert _resume_state(project) == before
 
 
+def _plant_recorded_suite(project: Path, run_id: str, verify: list[str]) -> None:
+    """Re-record `run_id` with `verify` as its suite: what an earlier resume with
+    a differing `--verify` leaves behind."""
+    run = _loaded(project, run_id)
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.record_run(
+            run.model_copy(update={"config": run.config.model_copy(update={"verify": verify})})
+        )
+    finally:
+        opened.close()
+
+
+@pytest.mark.git
+def test_a_task_resume_with_a_different_verify_writes_it_back_to_the_record(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    before = len(_run_upserts(run_id))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _loaded(project, run_id).config.verify == ["echo instrumented"]
+    written = _run_upserts(run_id)[before:]
+    assert written
+    assert all(line.payload["config"]["verify"] == ["echo instrumented"] for line in written)
+    assert payload["warnings"][-1] == "verification: replaced in run record: ['true']"
+    assert "verification: kept from checkpoint: ['true']" in payload["warnings"]
+
+
+@pytest.mark.git
+def test_a_task_resume_without_verify_after_a_replacement_says_nothing_of_the_suite(
+    project, cards
+):
+    """Card 5b19aa93's T6 stays keyed on the flag: a record that differs from
+    the checkpoint's pool is not announced when `--verify` is omitted."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_recorded_suite(project, run_id, ["echo instrumented"])
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert _kept_warnings(payload) == []
+    assert not [w for w in payload["warnings"] if w.startswith(REPLACED)]
+    assert _loaded(project, run_id).config.verify == ["echo instrumented"]
+
+
+@pytest.mark.git
+def test_a_refused_resume_with_a_differing_verify_leaves_the_record_unchanged(
+    project, cards, monkeypatch
+):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", run_id, "--repo-dir", str(project), "--verify", "echo instrumented"],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"]["type"] == "CheckpointMismatchError"
+    assert REPLACED not in result.stdout
+    assert _resume_state(project) == before
+    assert _loaded(project, run_id).config.verify == ["true"]
+
+
+@pytest.mark.git
+def test_a_task_resume_without_verify_hands_the_walk_the_recorded_suite(
+    project, cards, monkeypatch
+):
+    """Review Focus 1: the walk gets the record's suite, so one that declines
+    its checkpoint and starts afresh still verifies."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_recorded_suite(project, run_id, ["echo recorded"])
+    real = cli.drive_subtask_async
+    handed: list[tuple[list[str], bool]] = []
+
+    def spy(**kwargs: Any) -> Any:
+        handed.append((list(kwargs["commands"]), kwargs["allow_no_verification"]))
+        return real(**kwargs)
+
+    monkeypatch.setattr(cli, "drive_subtask_async", spy)
+
+    cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert handed == [(["echo recorded"], False)]
+
+
 def _run_upserts(run_id: str) -> list[Any]:
     """Every `run_upsert` line of `run_id`'s journal, oldest first."""
     return [line for line in store_module.Journal(run_id).read() if line.event == "run_upsert"]
@@ -7944,7 +8042,15 @@ def _loaded(project: Path, run_id: str) -> models.Run:
     return run
 
 
-def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "milestone") -> None:
+def _record_milestone(
+    root: Path,
+    run_id: str,
+    *,
+    status: str,
+    workflow: str = "milestone",
+    verify: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
+) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -7956,6 +8062,9 @@ def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "
                 branch_prefix="m4",
                 status=status,
                 started_at=RECORDED_AT,
+                config=models.RunConfig(
+                    verify=list(verify), allow_no_verification=allow_no_verification
+                ),
             )
         )
     finally:
@@ -8111,7 +8220,7 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
 
     def fake_run_milestone(milestone, **kwargs):
         calls.append((milestone, kwargs))
-        return {"done": True, "run_id": run_id, "resumed": True}
+        return {"done": True, "run_id": run_id, "resumed": True, "warnings": []}
 
     def factory(**kwargs):
         return None
@@ -8127,7 +8236,12 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
         runner_factory=factory,
     )
 
-    assert payload == {"done": True, "run_id": run_id, "resumed": True}
+    assert payload == {
+        "done": True,
+        "run_id": run_id,
+        "resumed": True,
+        "warnings": ["verification: replaced in run record: []"],
+    }
     assert calls == [
         (
             None,
@@ -8140,6 +8254,189 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
             },
         )
     ]
+
+
+REPLACED = "verification: replaced in run record"
+
+
+def _replaced(payload: dict[str, Any]) -> list[str]:
+    return [w for w in payload.get("warnings", []) if w.startswith(REPLACED)]
+
+
+def _task_resume_spy(monkeypatch) -> list[tuple[models.Run, dict[str, Any]]]:
+    """Patch `_resume_from_checkpoint` to record the run and kwargs it is handed."""
+    seen: list[tuple[models.Run, dict[str, Any]]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append((run, kwargs))
+        return {"status": "done", "warnings": []}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    return seen
+
+
+def _milestone_resume_spy(
+    monkeypatch, returned: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Patch `orchestrate.run_milestone` to record its kwargs and return `returned`."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append(kwargs)
+        return {"done": True, "warnings": []} if returned is None else dict(returned)
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    return calls
+
+
+def test_a_task_resume_without_verify_drives_the_recorded_suite(projection, monkeypatch):
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection,
+        run_id,
+        started_at=RECORDED_AT,
+        status="started",
+        verify=("uv run pytest",),
+        allow_no_verification=True,
+    )
+    seen = _task_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    [(run, kwargs)] = seen
+    assert run.config.verify == ["uv run pytest"]
+    assert run.config.allow_no_verification is True
+    assert kwargs["allow_no_verification"] is True
+    assert kwargs["commands"] == ()
+    assert _replaced(payload) == []
+
+
+def test_a_milestone_resume_without_verify_passes_the_recorded_suite(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(
+        projection,
+        run_id,
+        status="escalated",
+        verify=("uv run pytest",),
+        allow_no_verification=True,
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    [kwargs] = calls
+    assert kwargs["commands"] == ["uv run pytest"]
+    assert kwargs["allow_no_verification"] is True
+    assert kwargs["resume_run_id"] == run_id
+    assert payload["warnings"] == []
+
+
+def test_a_milestone_resume_with_a_different_verify_passes_it_and_warns_last(
+    projection, monkeypatch
+):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("old",))
+    calls = _milestone_resume_spy(
+        monkeypatch, {"done": True, "warnings": ["an earlier warning"]}
+    )
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    [kwargs] = calls
+    assert kwargs["commands"] == ["new"]
+    assert payload["warnings"] == [
+        "an earlier warning",
+        "verification: replaced in run record: ['old']",
+    ]
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_a_resume_with_the_recorded_verify_does_not_warn(projection, monkeypatch, workflow):
+    run_id = "20260927T100000Z-cbe34d00"
+    if workflow == "task":
+        _record(
+            projection, run_id, started_at=RECORDED_AT, status="started", verify=("uv run pytest",)
+        )
+        _task_resume_spy(monkeypatch)
+    else:
+        _record_milestone(projection, run_id, status="escalated", verify=("uv run pytest",))
+        _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["uv run pytest"])
+
+    assert _replaced(payload) == []
+
+
+def test_a_resume_of_a_run_recorded_without_verify_behaves_as_before(projection, monkeypatch):
+    plain, passed = "20260923T090000Z-cbe34d00", "20260923T090000Z-cbe34d01"
+    _record(projection, plain, started_at=RECORDED_AT, status="started")
+    _record(projection, passed, started_at=RECORDED_AT, status="started")
+    seen = _task_resume_spy(monkeypatch)
+
+    quiet = cli.resume_run(plain, repo_dir=projection)
+    loud = cli.resume_run(passed, repo_dir=projection, commands=["x"])
+
+    (plain_run, plain_kwargs), (passed_run, passed_kwargs) = seen
+    assert plain_run.config == models.RunConfig()
+    assert (plain_kwargs["commands"], plain_kwargs["allow_no_verification"]) == ((), False)
+    assert quiet["warnings"] == []
+    assert passed_run.config.verify == ["x"]
+    assert passed_kwargs["commands"] == ["x"]
+    assert loud["warnings"] == ["verification: replaced in run record: []"]
+
+
+def test_the_opt_out_flag_widens_a_recorded_false(projection, monkeypatch):
+    widened, kept = "20260927T100000Z-cbe34d00", "20260927T100000Z-cbe34d01"
+    _record_milestone(projection, widened, status="escalated", allow_no_verification=False)
+    _record_milestone(projection, kept, status="escalated", allow_no_verification=True)
+    calls = _milestone_resume_spy(monkeypatch)
+
+    first = cli.resume_run(widened, repo_dir=projection, allow_no_verification=True)
+    second = cli.resume_run(kept, repo_dir=projection)
+
+    assert [kwargs["allow_no_verification"] for kwargs in calls] == [True, True]
+    assert _replaced(first) == _replaced(second) == []
+
+
+def test_an_empty_string_verify_replaces_the_record_verbatim(projection, monkeypatch):
+    """Review Focus 2: `--verify ""` is a passed suite of one empty command."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("x",))
+    calls = _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=[""])
+
+    [kwargs] = calls
+    assert kwargs["commands"] == [""]
+    assert payload["warnings"] == ["verification: replaced in run record: ['x']"]
+
+
+def test_a_refused_resume_with_a_differing_verify_keeps_the_record(projection, monkeypatch):
+    """Review Focus 3: a canceled run is refused as before and nothing is written."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="canceled", verify=("old",))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    with pytest.raises(cli.NotResumableError):
+        cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    assert _loaded(projection, run_id).config.verify == ["old"]
+
+
+def test_the_replacement_warning_creates_a_missing_warnings_key(projection, monkeypatch):
+    """Review Focus 4: a payload with no `warnings` still gets the warning."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("old",))
+    _milestone_resume_spy(monkeypatch, {"done": True})
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    assert payload == {
+        "done": True,
+        "warnings": ["verification: replaced in run record: ['old']"],
+    }
 
 
 def test_resume_refuses_a_run_of_a_workflow_it_does_not_know(projection, monkeypatch):
