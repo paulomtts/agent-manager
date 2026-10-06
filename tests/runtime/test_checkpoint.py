@@ -10,7 +10,7 @@ import asyncio
 import itertools
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -319,6 +319,82 @@ def test_an_engine_error_writes_no_after_run_row(store):
 
     assert caught.value.phase == "explore"
     assert [(seq, reason) for seq, reason, _ in _rows(store)] == [(0, "turn")]
+
+
+# ── derived turn timeouts (D3, card 4ddb0ee6) ────────────────────────────────
+
+
+def _turn_timeout(agent: dict) -> float:
+    """The timeout of the turn a stored agent would run next."""
+    return (agent["current_turn"] or agent["queue"][0])["timeout"]
+
+
+def _explore_step_implement() -> Workflow:
+    def a(card: str) -> dict[str, Any]:
+        return {"a": 1}
+
+    return Workflow("derived", (
+        AgentPhase("explore", "explorer", (), None, timeout=timedelta(seconds=2100)),
+        Step("a", a),
+        AgentPhase("implement", "implementer", (), None, timeout=timedelta(seconds=2100)),
+    ))
+
+
+class _TimedRunner:
+    """A fake agent runner resolving launcher seconds per phase, as
+    `dispatch.AgentRunner.timeout_for` does."""
+
+    def __init__(self, seconds: dict[str, float]) -> None:
+        self.seconds = seconds
+
+    def timeout_for(self, phase_name: str) -> float:
+        return self.seconds.get(phase_name, 1800.0)
+
+    def __call__(self, phase, context, rendered) -> dict[str, Any]:
+        return {"ok": True}
+
+
+def test_the_turn_checkpoint_records_the_runners_derived_timeout(store):
+    summary = runtime_engine.run_subtask(
+        _explore_step_implement(),
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=_TimedRunner({"explore": 7200.0, "implement": 7200.0}),
+        clock=lambda: FIXED,
+    )
+
+    assert summary.status == "done"
+    rows = _rows(store)
+    assert [(seq, reason) for seq, reason, _ in rows] == [
+        (0, "turn"), (1, "turn"), (2, "turn"), (3, "done"),
+    ]
+    # The first turn, the step, then an agent phase reached through `after()`.
+    assert [(_head(agent), _turn_timeout(agent)) for _, _, agent in rows[:3]] == [
+        ("explore", 7500), ("a", 3600), ("implement", 7500),
+    ]
+
+
+def test_a_runner_without_timeout_for_keeps_the_declared_timeout(store):
+    def runner(phase, context, rendered) -> dict[str, Any]:
+        return {"ok": True}
+
+    summary = runtime_engine.run_subtask(
+        _explore_step_implement(),
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=runner,
+        clock=lambda: FIXED,
+    )
+
+    assert summary.status == "done"
+    rows = _rows(store)
+    assert [(_head(agent), _turn_timeout(agent)) for _, _, agent in rows[:3]] == [
+        ("explore", 2100), ("a", 3600), ("implement", 2100),
+    ]
 
 
 # ── the floor (exactly-once 1.2, card 94088f7e) ──────────────────────────────
