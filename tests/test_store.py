@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from agent_manager import models, paths, store
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import replay as store_replay
 
 RUN_ID = "run-2026-09-23-01"
 
@@ -555,7 +556,7 @@ def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, ret
         rebuilt = st.rebuild_from_journal(RUN_ID)
         loaded = st.load_run(RUN_ID)
         assert loaded is not None
-        mismatches = store.diverging(st.journal.read(), loaded)
+        mismatches = store_replay.diverging(st.journal.read(), loaded)
     finally:
         st.close()
 
@@ -4100,7 +4101,7 @@ def test_replay_old_journal_with_legacy_cancelled(repo):
     finally:
         rebuilt.close()
 
-    assert models.is_canceled(store.replay(store_journal.Journal(RUN_ID).read()).status)
+    assert models.is_canceled(store_replay.replay(store_journal.Journal(RUN_ID).read()).status)
     assert _diverging_now(repo) == []
 
 
@@ -5117,7 +5118,7 @@ def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
         monkeypatch.setattr(st.journal, "read", interleaving_read)
         replayed = st.replay_journal(RUN_ID)
         writers[0].join()
-        after = store.replay(real_read())
+        after = store_replay.replay(real_read())
     finally:
         st.close()
 
@@ -5613,7 +5614,7 @@ def test_a_taken_over_store_neither_marks_nor_fails_a_comment(stores):
     assert (row["state"], row["comment_id"]) == ("posted", "c-202")
 
 
-# -- store.diverging (journal/DB divergence §3.2-§3.3) ------------------------
+# -- store_replay.diverging (journal/DB divergence §3.2-§3.3) ------------------------
 #
 # Unit tier: real sqlite and journal files under tmp_path, no subprocess.
 
@@ -5637,7 +5638,7 @@ def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
         conn.close()
 
 
-def _diverging_now(repo: Path) -> list[store.Mismatch]:
+def _diverging_now(repo: Path) -> list[store_replay.Mismatch]:
     """Load the journal and the projection the way a caller would, and compare."""
     lines = store_journal.Journal(RUN_ID).read()
     conn = store_db.open_db(repo)
@@ -5646,7 +5647,7 @@ def _diverging_now(repo: Path) -> list[store.Mismatch]:
     finally:
         conn.close()
     assert projection is not None
-    return store.diverging(lines, projection)
+    return store_replay.diverging(lines, projection)
 
 
 def test_diverging_finds_nothing_in_a_run_recorded_only_through_the_store(repo):
@@ -5684,7 +5685,7 @@ def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo)
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(),
             field="status",
             journal="escalated",
@@ -5770,7 +5771,7 @@ def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_st
     _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b"),
             field="status",
             journal="done",
@@ -5790,7 +5791,7 @@ def test_diverging_classifies_against_the_nodes_own_history_at_attempt_level(rep
     _raw_sql(repo, "UPDATE attempts SET status = 'ok' WHERE phase = 'implement' AND n = 1")
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b", card="ef248597", phase="implement", attempt=1),
             field="status",
             journal="started",
@@ -5820,7 +5821,7 @@ def test_diverging_ignores_every_field_but_status(repo):
 def test_diverging_lets_replays_errors_through_unchanged(repo):
     projection = _run(repo)
     with pytest.raises(store_journal.JournalError, match="no run_upsert"):
-        store.diverging([], projection)
+        store_replay.diverging([], projection)
 
     headless = store_journal.JournalLine(
         seq=1,
@@ -5831,7 +5832,7 @@ def test_diverging_lets_replays_errors_through_unchanged(repo):
         payload=_story().model_dump(mode="json", exclude={"subtasks"}),
     )
     with pytest.raises(store_journal.JournalError, match="no run_upsert preceded it"):
-        store.diverging([headless], projection)
+        store_replay.diverging([headless], projection)
 
     malformed = store_journal.JournalLine(
         seq=1,
@@ -5841,7 +5842,7 @@ def test_diverging_lets_replays_errors_through_unchanged(repo):
         payload={"id": RUN_ID},
     )
     with pytest.raises(ValidationError):
-        store.diverging([malformed], projection)
+        store_replay.diverging([malformed], projection)
 
 
 def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
@@ -5862,7 +5863,7 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
     lines_before = [line.model_copy(deep=True) for line in lines]
     projection_before = projection.model_copy(deep=True)
 
-    assert store.diverging(lines, projection) != []
+    assert store_replay.diverging(lines, projection) != []
     assert lines == lines_before
     assert projection == projection_before
 
@@ -5877,7 +5878,7 @@ def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(
         st.record_story(_story())
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b"),
             field=None,
             journal="started",
@@ -5902,7 +5903,7 @@ def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
     )
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b", card="deadbeef"),
             field=None,
             journal=None,
@@ -5923,7 +5924,7 @@ def test_diverging_reports_a_missing_subtree_once_at_its_root(repo):
     _raw_sql(repo, "DELETE FROM subtasks WHERE card_id = 'ef248597'")
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b", card="ef248597"),
             field=None,
             journal="started",
@@ -5958,19 +5959,19 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
     )
 
     assert _diverging_now(repo) == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(), field="status", journal="started", projection="done",
             kind="foreign",
         ),
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b", card="ef248597"), field="status",
             journal="started", projection="failed", kind="foreign",
         ),
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="c0ffee12"), field="status", journal="started",
             projection="canceled", kind="foreign",
         ),
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="feedface"), field=None, journal=None,
             projection="pending", kind="foreign",
         ),
@@ -6031,7 +6032,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
 
     st = store.Store.open(repo, RUN_ID)
     try:
-        with pytest.raises(store.ProjectionDivergedError) as caught:
+        with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
         assert _held_elsewhere(st._lock) is False
         assert st.connection.in_transaction is False
@@ -6043,7 +6044,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     assert not isinstance(error, store_journal.JournalError)
     assert error.run_id == RUN_ID
     assert error.mismatches == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(),
             field="status",
             journal="escalated",
@@ -6093,13 +6094,13 @@ def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
 
     st = store.Store.open(repo, RUN_ID)
     try:
-        with pytest.raises(store.ProjectionDivergedError) as caught:
+        with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
     finally:
         st.close()
 
     assert caught.value.mismatches == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(story="8831189b", card="deadbeef"),
             field=None,
             journal=None,
@@ -6151,13 +6152,13 @@ def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
 
     st = store.Store.open(repo, RUN_ID)
     try:
-        with pytest.raises(store.ProjectionDivergedError) as caught:
+        with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
     finally:
         st.close()
 
     assert caught.value.mismatches == [
-        store.Mismatch(
+        store_replay.Mismatch(
             node=_node(),
             field="status",
             journal="started",
@@ -6178,7 +6179,7 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
     st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
 
-    with pytest.raises(store.ProjectionDivergedError):
+    with pytest.raises(store_replay.ProjectionDivergedError):
         st.rebuild_from_journal(RUN_ID)
 
     assert st.connection.in_transaction is False

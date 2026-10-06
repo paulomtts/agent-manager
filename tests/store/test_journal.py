@@ -132,9 +132,9 @@ _PRIVATE_JOURNAL_NAME = re.compile(
 
 
 def test_no_source_module_reads_a_private_journal_name():
-    # `_RETIRED_ATTEMPT_KEYS` and `_current_attempt_payload` stay in the package
-    # with their readers; moving them here would make `__init__` read a private
-    # name off this module.
+    # `_RETIRED_ATTEMPT_KEYS` and `_current_attempt_payload` live in `store.replay`
+    # with their readers; moving them here would make `store.replay` read a
+    # private name off this module.
     assert _PRIVATE_JOURNAL_NAME.search("store_journal._EVENT_KINDS")
     assert not _PRIVATE_JOURNAL_NAME.search("store_journal.Journal._for_reading(run_id)")
     hits = [

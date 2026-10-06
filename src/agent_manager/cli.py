@@ -59,6 +59,7 @@ from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import replay as store_replay
 from agent_manager.workflow import task as task_workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
@@ -330,7 +331,7 @@ def integrity_view(
     run that has none, and a torn last line is an append in flight and is
     skipped, as in `_journal_events`. The one `try` covers `diverging` as well
     as `read`, because `replay` inside it raises `JournalError` or a pydantic
-    `ValidationError` of its own. Mismatches are `store.diverging`'s, in its
+    `ValidationError` of its own. Mismatches are `store_replay.diverging`'s, in its
     tree-walk order: there is one definition of divergence.
 
     A live lease (§3.5) is `checked: false, reason: "lease is live"` before the
@@ -342,7 +343,7 @@ def integrity_view(
         return {"checked": False, "reason": "lease is live", "mismatches": []}
     try:
         lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
-        found = store_module.diverging(lines, run)
+        found = store_replay.diverging(lines, run)
     except store_journal.MissingJournalError:
         return {"checked": False, "reason": "no journal", "mismatches": []}
     except (store_journal.JournalError, ValidationError) as error:

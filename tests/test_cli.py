@@ -57,6 +57,7 @@ from agent_manager import (
 )
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import replay as store_replay
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
@@ -12126,7 +12127,7 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
 # ── am status integrity (card f63036db) ─────────────────────────────────────
 #
 # journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the journal
-# with the projection through `store.diverging` and reports it under an
+# with the projection through `store_replay.diverging` and reports it under an
 # always-present `integrity` key, at exit 0, writing nothing. Unit tier: the
 # projection fixture writes SQLite rows and journal files in `tmp_path`; no
 # subprocess.
@@ -12390,7 +12391,7 @@ def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("a live run's journal must not be compared")
 
-    monkeypatch.setattr(store_module, "diverging", forbidden)
+    monkeypatch.setattr(store_replay, "diverging", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
