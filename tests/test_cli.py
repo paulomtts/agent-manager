@@ -4287,20 +4287,20 @@ def test_a_board_run_envelope_wraps_run_boards_keys_unchanged(tmp_path, monkeypa
         (("done", "done"), 0),
         ((), 0),
         (("stopped",), 0),
-        (("cancelled",), 0),
+        (("canceled",), 0),
         (("done", "stopped", "blocked"), 0),
-        (("cancelled", "blocked"), 0),
+        (("canceled", "blocked"), 0),
         (("escalated",), cli.EXIT_ESCALATED),
         (("done", "escalated"), cli.EXIT_ESCALATED),
         (("escalated", "blocked"), cli.EXIT_ESCALATED),
-        (("stopped", "escalated", "cancelled"), cli.EXIT_ESCALATED),
+        (("stopped", "escalated", "canceled"), cli.EXIT_ESCALATED),
     ],
 )
 def test_a_board_run_exits_escalated_only_when_some_milestone_escalated(
     tmp_path, monkeypatch, statuses, exit_code
 ):
     """Spec test 11: the board-wide form of the milestone rule. A stopped,
-    cancelled or blocked milestone is not an escalation; an empty board is clean.
+    canceled or blocked milestone is not an escalation; an empty board is clean.
     The envelope is `ok: true` either way: an escalation is a truthful result."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     payload = _board_payload(*statuses)
@@ -8330,7 +8330,7 @@ def test_a_request_to_a_run_that_is_not_started_is_refused_and_names_its_status(
     assert result.exit_code == cli.EXIT_ERROR, result.output
     error = json.loads(result.stdout)["error"]
     assert error["type"] == "NotRunningError"
-    assert status in error["message"]
+    assert models.canonical_status(status) in error["message"]
     assert "am status" in error["message"]
     assert _controls(projection) == []
 
@@ -8664,13 +8664,14 @@ def _resume_guard_state(root: Path) -> tuple:
 
 @pytest.mark.parametrize("leased", [False, True], ids=["no-lease", "live-lease"])
 @pytest.mark.parametrize("workflow", ["task", "milestone"])
-def test_resume_refuses_a_cancelled_run_and_writes_nothing(
-    projection, monkeypatch, workflow, leased
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_resume_refuses_run_canceled_in_either_spelling(
+    projection, monkeypatch, status, workflow, leased
 ):
-    """Spec test 11 (C9), both workflows. Review Focus: a cancelled run that
-    still holds a live lease is refused as cancelled."""
+    """Spec test 11 (C9), both workflows and both spellings. Review Focus: a
+    canceled run that still holds a live lease is refused as canceled."""
     _freeze_clock(monkeypatch)
-    _plant_run(projection, status="cancelled", workflow=workflow)
+    _plant_run(projection, status=status, workflow=workflow)
     if leased:
         _plant_lease(projection)
     before = _resume_guard_state(projection)
@@ -8684,7 +8685,7 @@ def test_resume_refuses_a_cancelled_run_and_writes_nothing(
     assert envelope["error"] == {
         "type": "NotResumableError",
         "message": (
-            f"run {CONTROL_RUN_ID} was cancelled;"
+            f"run {CONTROL_RUN_ID} was canceled;"
             " start new work with `am run --milestone`"
         ),
     }
@@ -8751,9 +8752,9 @@ def test_resume_is_not_blocked_by_a_dead_lease(projection, monkeypatch):
         (None, "stopped", "stopped"),
         ("pause", "stopped", "stopped"),
         ("pause", "escalated", "escalated"),
-        ("cancel", "stopped", "cancelled"),
-        ("cancel", "escalated", "cancelled"),
-        ("cancel", "done", "cancelled"),
+        ("cancel", "stopped", "canceled"),
+        ("cancel", "escalated", "canceled"),
+        ("cancel", "done", "canceled"),
     ],
 )
 def test_card_run_status_follows_c6_precedence(command, summary_status, expected):
@@ -8941,7 +8942,7 @@ def test_a_paused_card_run_resumes_from_the_parked_phase_to_done(
 def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     project, cards, control_applied
 ):
-    """Spec test 3, plus Review Focus 3: the run is `cancelled`, its story and
+    """Spec test 3, plus Review Focus 3: the run is `canceled`, its story and
     subtask stay `stopped` as the park left them, `am resume` refuses it, and
     a pause sent afterwards is refused rather than queued."""
     seen: list[str] = []
@@ -8952,11 +8953,11 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     payload = _controlled_card_run(project, cards, factory)
 
     run_id = payload["run_id"]
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert payload["failed_phase"] is None
     assert "validate_spec" not in seen
     assert _card_statuses(project, run_id) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "stopped",
         "subtask": "stopped",
     }
@@ -8967,12 +8968,31 @@ def test_a_cancelled_card_run_closes_the_run_and_resume_refuses_it(
     assert resumed.exit_code == cli.EXIT_ERROR, resumed.output
     error = json.loads(resumed.stdout)["error"]
     assert error["type"] == "NotResumableError"
-    assert "cancelled" in error["message"]
+    assert "canceled" in error["message"]
 
     late = runner.invoke(cli.app, ["pause", run_id, "--repo-dir", str(project)])
     assert late.exit_code == cli.EXIT_ERROR, late.output
     assert json.loads(late.stdout)["error"]["type"] == "NotRunningError"
     assert [row.command for row in _card_controls(project, run_id)] == ["cancel"]
+
+
+@pytest.mark.git
+def test_card_cancel_journals_canceled(project, cards, control_applied):
+    """A canceled `--card` run journals its final `run_upsert` with status
+    `canceled`, never the legacy spelling."""
+    factory = _controlling_factory(
+        project, control_applied, command="cancel", at="spec", seen=[]
+    )
+
+    run_id = _controlled_card_run(project, cards, factory)["run_id"]
+
+    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
+    upserts = [
+        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
+    ]
+    assert upserts, raw
+    assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
+    assert not [line for line in upserts if "cancelled" in line], upserts
 
 
 @pytest.mark.git
@@ -8987,9 +9007,9 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert _card_statuses(project, payload["run_id"]) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "escalated",
         "subtask": "escalated",
     }
@@ -8999,8 +9019,8 @@ def test_a_cancel_that_meets_an_escalation_closes_the_run_but_keeps_the_rows(
     "command, fail, exit_code, status",
     [
         ("pause", False, 0, "stopped"),
-        ("cancel", False, 0, "cancelled"),
-        ("cancel", True, 0, "cancelled"),
+        ("cancel", False, 0, "canceled"),
+        ("cancel", True, 0, "canceled"),
         ("pause", True, cli.EXIT_ESCALATED, "escalated"),
     ],
     ids=["pause", "cancel", "cancel-over-escalation", "pause-keeps-escalation"],
@@ -9010,7 +9030,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
     project, cards, control_applied, monkeypatch, command, fail, exit_code, status
 ):
     """Spec's exit codes and Review Focus 1-2: the command's mapping still keys
-    off `escalated`, so `stopped` and `cancelled` exit 0 with an ok envelope
+    off `escalated`, so `stopped` and `canceled` exit 0 with an ok envelope
     and a paused escalation still exits 1. `run` passes no interval, so the
     real `run_card` is wrapped to add a short one and the fake factory."""
     real_run_card = cli.run_card
@@ -9163,9 +9183,9 @@ def test_a_resumed_card_run_cancelled_mid_phase_is_closed_for_good(
 
     payload = _resume_card_run(project, run_id, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     assert _card_statuses(project, run_id) == {
-        "run": "cancelled",
+        "run": "canceled",
         "story": "stopped",
         "subtask": "stopped",
     }
@@ -9822,11 +9842,11 @@ def test_a_cancelled_card_run_leaves_one_cancelled_comment_naming_run_card(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     run_id, card = payload["run_id"], cards["subtask"]
     assert _card_comment_keys(project, card) == [f"{run_id}/{card}/cancelled"]
     (comment,) = board.comment_list(card, repo_dir=project)
-    assert comment.body.startswith(f"am · cancelled · run {run_id}\n")
+    assert comment.body.startswith(f"am · canceled · run {run_id}\n")
     assert "stopped before: validate_spec" in comment.body
     assert f"branch: {payload['branch']}" in comment.body
     assert f"relaunch: `am run --card {card}`" in comment.body
@@ -9853,7 +9873,7 @@ def test_a_paused_card_run_leaves_no_comment(project, cards, control_applied):
 def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
     project, cards, control_applied
 ):
-    """Review Focus 5: the run is `cancelled` (C6) but the walk escalated;
+    """Review Focus 5: the run is `canceled` (C6) but the walk escalated;
     the comment follows `summary.status`, so it is the escalation."""
     factory = _controlling_factory(
         project, control_applied, command="cancel", at="spec", seen=[], fail=True
@@ -9861,7 +9881,7 @@ def test_a_card_cancel_that_meets_an_escalation_comments_the_escalation(
 
     payload = _controlled_card_run(project, cards, factory)
 
-    assert payload["status"] == "cancelled", payload
+    assert payload["status"] == "canceled", payload
     run_id, card = payload["run_id"], cards["subtask"]
     (key,) = _card_comment_keys(project, card)
     assert key.startswith(f"{run_id}/{card}/escalated:")
@@ -10211,10 +10231,74 @@ def _stream(result) -> list[dict[str, Any]]:
 def _hello(tmp_path: Path) -> dict[str, Any]:
     return {
         "event": "watch",
-        "schema": 1,
+        "schema": 2,
         "am": agent_manager.__version__,
         "runs_dir": str(_watch_runs_dir(tmp_path)),
     }
+
+
+def test_watch_hello_is_schema_2(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    hello = cli._watch_hello()
+    assert hello["schema"] == 2
+    assert type(hello["schema"]) is int
+    _write_watch_journal(tmp_path, "run-a", [1, 2])
+    _write_watch_journal(tmp_path, "run-b", [1])
+
+    for argv in (
+        ["run-a"],
+        ["run-a", "--since", "1"],
+        ["--all"],
+        ["run-a", "--from-now"],
+        ["--all", "--from-now"],
+    ):
+        result, _ = _watch_follow(monkeypatch, *argv)
+        assert result.exit_code == 0, (argv, result.output)
+        lines = _stream(result)
+        first = lines[0]
+        assert set(first) == {"event", "schema", "am", "runs_dir"}, argv
+        assert type(first["schema"]) is int, argv
+        assert first == _hello(tmp_path), argv
+        # One hello per stream, however many runs it covers.
+        assert [line for line in lines if "event" in line and "seq" not in line] == [
+            first
+        ], argv
+
+
+def test_logs_hello_stays_schema_1():
+    hello = cli._logs_hello(Path("x"), 0)
+    assert hello["schema"] == 1
+    assert hello == _logs_hello_line(Path("x"))
+
+
+def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    run_dir = _watch_runs_dir(tmp_path) / "run-old"
+    run_dir.mkdir(parents=True)
+    # As an `am` from before the spelling switch wrote it.
+    legacy = store_module.JournalLine(
+        seq=1,
+        ts=WATCH_TS,
+        run_id="run-old",
+        event="run_upsert",
+        payload={"run_id": "run-old", "status": "cancelled"},
+    ).model_dump(mode="json")
+    after = _watch_line("run-old", 2)
+    journal = run_dir / store_module.JOURNAL_NAME
+    journal.write_text(
+        "".join(json.dumps(line, sort_keys=True) + "\n" for line in (legacy, after)),
+        encoding="utf-8",
+    )
+    before = journal.read_bytes()
+
+    result, _ = _watch_follow(monkeypatch, "run-old")
+
+    assert result.exit_code == 0, result.output
+    lines = _stream(result)
+    assert lines == [_hello(tmp_path), legacy, after]
+    assert lines[0]["schema"] == 2
+    assert lines[1]["payload"]["status"] == "cancelled"
+    assert journal.read_bytes() == before
 
 
 def test_watch_follow_hello_line_shape(tmp_path, monkeypatch):
@@ -10488,7 +10572,7 @@ def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkey
 # ── am reset (card 736d6728) ─────────────────────────────────────────────────
 #
 # `am reset RUN_ID` closes a run nobody is driving: read-only refusals, then
-# the run's own lease with no claims, one fenced `run_upsert` of `cancelled`,
+# the run's own lease with no claims, one fenced `run_upsert` of `canceled`,
 # and the lease released. Unit tier: the projection fixture and the store
 # only, no subprocess. `cards` (card af52db54) lists each `(card_id,
 # workflow)` the run checkpointed with the run a relaunch would continue it
@@ -10498,13 +10582,13 @@ RESET_KEYS = {
     "run_id",
     "previous_status",
     "status",
-    "already_cancelled",
+    "already_canceled",
     "cards",
     "message",
 }
 
 RESET_MESSAGE = (
-    f"run {CONTROL_RUN_ID} is cancelled; `am resume {CONTROL_RUN_ID}` refuses it,"
+    f"run {CONTROL_RUN_ID} is canceled; `am resume {CONTROL_RUN_ID}` refuses it,"
     " and a relaunch starts its cards from their first phase"
 )
 
@@ -11450,7 +11534,7 @@ def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
 @pytest.mark.parametrize(
     "worktree_present", [True, False], ids=["worktree-present", "worktree-removed"]
 )
-def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
+def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     projection, worktree_present
 ):
     """Spec test 1, `cards` half from af52db54: the run's own row was the
@@ -11475,12 +11559,12 @@ def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
     assert data == {
         "run_id": CONTROL_RUN_ID,
         "previous_status": "stopped",
-        "status": "cancelled",
-        "already_cancelled": False,
+        "status": "canceled",
+        "already_canceled": False,
         "cards": [{"card_id": "card-1", "workflow": "task", "open_in": None}],
         "message": RESET_MESSAGE,
     }
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     lines_after = _journal_lines()
     assert lines_after[: len(lines_before)] == lines_before
     (added,) = lines_after[len(lines_before) :]
@@ -11488,14 +11572,14 @@ def test_reset_records_a_stopped_run_cancelled_through_one_journal_line(
     assert added.seq == lines_before[-1].seq + 1
     first = next(line for line in lines_before if line.event == "run_upsert")
     # The same write whether or not the worktree exists: only `status` moved.
-    assert added.payload == {**first.payload, "status": "cancelled"}
+    assert added.payload == {**first.payload, "status": "canceled"}
     assert _checkpoint_rows(projection) == checkpoints_before
     assert _open_checkpoint(projection) is None
     assert worktree.exists() is worktree_present
     assert _lease(projection) is None
     rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
-        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "cancelled"
+        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
     finally:
         rebuilt.close()
 
@@ -11510,8 +11594,29 @@ def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)["data"]
     assert data["cards"] == []
-    assert data["status"] == "cancelled"
-    assert _recorded_status(projection) == "cancelled"
+    assert data["status"] == "canceled"
+    assert _recorded_status(projection) == "canceled"
+
+
+def test_reset_journals_canceled(projection):
+    """The `run_upsert` the reset appends carries `canceled` in the raw
+    `journal.jsonl`, and no line it writes carries the legacy spelling."""
+    _plant_run(projection, status="stopped")
+    journal = paths.run_dir(CONTROL_RUN_ID) / "journal.jsonl"
+    count_before = len(journal.read_text(encoding="utf-8").splitlines())
+
+    result = _invoke_reset(projection)
+
+    assert result.exit_code == 0, result.output
+    raw = journal.read_text(encoding="utf-8")
+    upserts = [
+        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
+    ]
+    assert upserts, raw
+    assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
+    written = raw.splitlines()[count_before:]
+    assert len(written) == 1, written
+    assert not [line for line in written if "cancelled" in line], written
 
 
 @pytest.mark.parametrize("workflow", ["task", "milestone"])
@@ -11519,7 +11624,7 @@ def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
 def test_reset_closes_every_resettable_status_of_either_workflow(
     projection, status, workflow
 ):
-    """Review Focus 2: every status but `done`/`cancelled` resets, a
+    """Review Focus 2: every status but `done`/canceled resets, a
     `started` run with no lease included, whatever the workflow."""
     _plant_run(projection, status=status, workflow=workflow)
 
@@ -11528,8 +11633,8 @@ def test_reset_closes_every_resettable_status_of_either_workflow(
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)["data"]
     assert data["previous_status"] == status
-    assert data["already_cancelled"] is False
-    assert _recorded_status(projection) == "cancelled"
+    assert data["already_canceled"] is False
+    assert _recorded_status(projection) == "canceled"
     assert _lease(projection) is None
 
 
@@ -11541,7 +11646,10 @@ def test_reset_pretty_prints_an_indented_envelope(projection):
 
     assert result.exit_code == 0, result.output
     assert "\n" in result.stdout.strip()
-    assert json.loads(result.stdout)["data"]["status"] == "cancelled"
+    data = json.loads(result.stdout)["data"]
+    assert set(data) == RESET_KEYS
+    assert data["status"] == "canceled"
+    assert data["already_canceled"] is False
 
 
 def _forbid_reset_writes(monkeypatch) -> None:
@@ -11665,15 +11773,18 @@ def test_reset_takes_over_a_dead_lease_and_names_its_holder(
         "heartbeat_at": heartbeat.isoformat(),
     }
     assert data["previous_status"] == "started"
-    assert data["already_cancelled"] is False
-    assert _recorded_status(projection) == "cancelled"
+    assert data["already_canceled"] is False
+    assert _recorded_status(projection) == "canceled"
     assert len(_journal_lines()) == len(lines_before) + 1
     assert _lease(projection) is None
 
 
-def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
-    """Spec test 4."""
-    _plant_run(projection, status="cancelled")
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_reset_reports_already_for_either_spelling(projection, status):
+    """Spec test 4, both spellings: either stored spelling is reported as
+    `previous_status` `canceled`, `status` is `canceled`, and nothing is
+    written."""
+    _plant_run(projection, status=status)
     lines_before = _journal_lines()
 
     result = _invoke_reset(projection)
@@ -11682,19 +11793,19 @@ def test_reset_of_a_cancelled_run_is_a_no_op_that_writes_nothing(projection):
     data = json.loads(result.stdout)["data"]
     assert data == {
         "run_id": CONTROL_RUN_ID,
-        "previous_status": "cancelled",
-        "status": "cancelled",
-        "already_cancelled": True,
+        "previous_status": "canceled",
+        "status": "canceled",
+        "already_canceled": True,
         "cards": [],
-        "message": f"run {CONTROL_RUN_ID} was already cancelled; nothing was written",
+        "message": f"run {CONTROL_RUN_ID} was already canceled; nothing was written",
     }
     assert _journal_lines() == lines_before
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
     assert _lease(projection) is None
 
 
 def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
-    """Spec test 8, second case: the second reset sees `cancelled` under the
+    """Spec test 8, second case: the second reset sees `canceled` under the
     lease and is a no-op."""
     _plant_run(projection, status="stopped")
     upserts_before = [line for line in _journal_lines() if line.event == "run_upsert"]
@@ -11704,10 +11815,10 @@ def test_two_resets_of_one_run_leave_exactly_one_run_upsert(projection):
 
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
-    assert json.loads(first.stdout)["data"]["already_cancelled"] is False
+    assert json.loads(first.stdout)["data"]["already_canceled"] is False
     second_data = json.loads(second.stdout)["data"]
-    assert second_data["already_cancelled"] is True
-    assert second_data["previous_status"] == "cancelled"
+    assert second_data["already_canceled"] is True
+    assert second_data["previous_status"] == "canceled"
     upserts_after = [line for line in _journal_lines() if line.event == "run_upsert"]
     assert len(upserts_after) == len(upserts_before) + 1
     assert _lease(projection) is None
@@ -11720,7 +11831,7 @@ def _plant_other_run(root: Path, status: str = "stopped") -> None:
 
 
 def test_a_repeated_reset_reports_the_same_cards_and_writes_nothing(projection):
-    """af52db54 spec test 5: an already-cancelled reset still reports `cards`."""
+    """af52db54 spec test 5: an already-canceled reset still reports `cards`."""
     _plant_run(projection, status="stopped")
     _plant_parked_checkpoint(projection)
 
@@ -11733,8 +11844,8 @@ def test_a_repeated_reset_reports_the_same_cards_and_writes_nothing(projection):
     assert second.exit_code == 0, second.output
     first_data = json.loads(first.stdout)["data"]
     second_data = json.loads(second.stdout)["data"]
-    assert first_data["already_cancelled"] is False
-    assert second_data["already_cancelled"] is True
+    assert first_data["already_canceled"] is False
+    assert second_data["already_canceled"] is True
     assert second_data["cards"] == first_data["cards"] == [
         {"card_id": "card-1", "workflow": "task", "open_in": None}
     ]
@@ -11831,12 +11942,12 @@ def test_reset_names_the_run_a_newer_bases_row_keeps_the_card_open_in(projection
 
     assert again.exit_code == 0, again.output
     again_data = json.loads(again.stdout)["data"]
-    assert again_data["already_cancelled"] is True
+    assert again_data["already_canceled"] is True
     assert again_data["cards"] == [
         {"card_id": "card-1", "workflow": "task", "open_in": None}
     ]
     assert _checkpoint_rows(projection) == checkpoints_before
-    assert _recorded_status(projection, OTHER_RUN_ID) == "cancelled"
+    assert _recorded_status(projection, OTHER_RUN_ID) == "canceled"
 
 
 def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
@@ -11978,7 +12089,7 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
 ):
     """am-reset spec test 9, both workflows, with the assertion shape of
     `test_resume_refuses_a_cancelled_run_and_writes_nothing`. Review Focus 4:
-    a second reset (`already_cancelled: true`) changes nothing about the
+    a second reset (`already_canceled: true`) changes nothing about the
     refusal. Review Focus 5: the refusal leaves every checkpoint row as the
     reset left it."""
     _freeze_clock(monkeypatch)
@@ -11987,8 +12098,8 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
     for n in range(resets):
         reset = _invoke_reset(projection)
         assert reset.exit_code == 0, reset.output
-        assert json.loads(reset.stdout)["data"]["already_cancelled"] is (n > 0)
-    assert _recorded_status(projection) == "cancelled"
+        assert json.loads(reset.stdout)["data"]["already_canceled"] is (n > 0)
+    assert _recorded_status(projection) == "canceled"
     before = _resume_guard_state(projection)
     checkpoints_before = _checkpoint_rows(projection)
     _forbid_resume(monkeypatch)
@@ -12001,13 +12112,13 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
     assert envelope["error"] == {
         "type": "NotResumableError",
         "message": (
-            f"run {CONTROL_RUN_ID} was cancelled;"
+            f"run {CONTROL_RUN_ID} was canceled;"
             " start new work with `am run --milestone`"
         ),
     }
     assert _resume_guard_state(projection) == before
     assert _checkpoint_rows(projection) == checkpoints_before
-    assert _recorded_status(projection) == "cancelled"
+    assert _recorded_status(projection) == "canceled"
 
 
 # ── am status integrity (card f63036db) ─────────────────────────────────────
@@ -12024,10 +12135,11 @@ RUN_CANCELLED_BY_HAND = {
     "node": {"story": None, "card": None, "phase": None, "attempt": None},
     "field": "status",
     "journal": "started",
-    "projection": "cancelled",
+    "projection": "canceled",
     "kind": "foreign",
 }
-"""What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`."""
+"""What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`:
+the hand-edited legacy spelling reads back as `canceled`."""
 
 
 def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
@@ -13013,8 +13125,8 @@ PAUSED_STORY = {
     "resume": f"am resume {STORY_RUN_ID}",
 }
 
-CANCELLED_STORY = {
-    "cancelled": True,
+CANCELED_STORY = {
+    "canceled": True,
     "run_id": STORY_RUN_ID,
     "stopped": [],
     "completed": [],
@@ -13160,7 +13272,7 @@ def test_an_escalated_story_run_exits_escalated(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELLED_STORY]
+    "payload", [CLEAN_STORY, NOTHING_TO_RUN_STORY, PAUSED_STORY, CANCELED_STORY]
 )
 def test_a_stopped_or_nothing_to_run_story_exits_0(tmp_path, monkeypatch, payload):
     """None of these carries a `status` key: the rule must not index one."""

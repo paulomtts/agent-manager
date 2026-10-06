@@ -234,9 +234,9 @@ def test_watch_documents_from_now():
         "A line that was still being written when the command started"
         " is printed once it is complete." in section
     )
-    # The section's pre-existing hello example already holds `"schema":1`,
+    # The section's pre-existing hello example already holds `"schema":2`,
     # so pin the --from-now paragraph's own sentence, not the bare token.
-    assert 'The hello line is the same, `"schema":1`.' in section
+    assert 'The hello line is the same, `"schema":2`.' in section
 
 
 def test_logs_section_shape_line():
@@ -415,3 +415,71 @@ def test_detach_and_resume_name_story():
     assert "A story run never runs Integrate, on a resume either." in relaunch
     not_yet = _section("Milestone runs")
     assert "`am run --story` runs one story with no Integrate." in not_yet
+
+
+LEGACY_JOURNAL_NOTE = (
+    "Journals written before this version of `am` record a canceled run as"
+    " `cancelled`, and those lines are never rewritten. Read both spellings as"
+    " the same status. `am status` and `am runs` report such a run as `canceled`."
+)
+WATCH_SCHEMA_NOTE = (
+    "- The hello line's `schema` field is where a schema bump is signaled."
+    " It is `2` today. Schema 1 became 2 when `am` started writing a canceled"
+    " run's status as `canceled` instead of `cancelled`; nothing else changed."
+    " Lines are replayed as stored, so a schema-2 stream still carries"
+    " `cancelled` for a run canceled by an older `am`: accept both, whatever"
+    " the schema."
+)
+LEGACY_REPORT_NOTE = (
+    "A report written before this version of `am`, `report.json` included,"
+    " carries `cancelled` (`true`) instead."
+)
+KEY_SPELLING_NOTE = (
+    "The `cancelled` event keeps its old spelling while the comment's first"
+    " line says `canceled`: the key is how `am` recognizes a comment it"
+    " already posted, so a cancel comment an older `am` queued or posted still"
+    " matches and is never posted twice."
+)
+
+
+def test_readme_documents_legacy_cancelled():
+    journal = _section("The journal line")
+    assert "`started`, then `done`, `escalated`, `stopped` or `canceled` |" in journal
+    assert (
+        "`done`, `escalated`, `stopped` or `canceled`, and it escalated"
+        " when that status is `escalated`." in journal
+    )
+    assert LEGACY_JOURNAL_NOTE in journal
+
+    stream = _section("Reading the stream safely")
+    assert WATCH_SCHEMA_NOTE in stream.splitlines()
+    assert "It is `1` today." not in stream
+
+    control = _section("Pausing and cancelling a run")
+    assert "`data` holds `canceled` (`true`)" in control
+    assert "The run is recorded `canceled`." in control
+    assert '"status": "canceled", "already_canceled"' in control
+    assert "`already_canceled: true`" in control
+    assert LEGACY_REPORT_NOTE in control
+
+    comments = _section("What each comment looks like").splitlines()
+    assert "am · canceled · run <run-id>" in comments
+    assert "am-key: <run-id>/<subtask-id>/cancelled" in comments
+
+    key = _section("The `am-key` line")
+    assert KEY_SPELLING_NOTE in key
+    assert "`escalated:<lease-token>`, `cancelled`, `base-failed`" in key
+
+
+def test_readme_spells_canceled_outside_legacy_sites():
+    # `cancelled` survives only as the asyncio wording, the comment key, and
+    # a backticked value in a line that says it is the legacy spelling.
+    legacy_markers = ("before this version of `am`", "an older `am`", "where the event is")
+    for line in _lines():
+        if "cancelled" not in line:
+            continue
+        if "its lanes are cancelled" in line or "/cancelled" in line:
+            continue
+        assert "`cancelled`" in line, line
+        assert any(marker in line for marker in legacy_markers), line
+    assert "already_cancelled" not in README.read_text(encoding="utf-8")

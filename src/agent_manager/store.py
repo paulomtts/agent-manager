@@ -1193,11 +1193,14 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
 def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
     """`runs.status` of `run_id`, or `None` if the run was never recorded.
 
+    The legacy spelling is returned as `canceled`; any other stored value is
+    returned as stored.
+
     A free function over a connection, like `load_run`, for a reader in
     another process that needs the status alone (`am pause`, `am resume`).
     """
     row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return None if row is None else row["status"]
+    return None if row is None else models.canonical_status(row["status"])
 
 
 @dataclass(frozen=True)
@@ -2016,12 +2019,12 @@ class Store:
         """The newest open checkpoint of `card_id` for `workflow`, across every run.
 
         The card's newest row in any run and any workflow decides first: if it
-        is `done`, or it belongs to a run whose status is `cancelled` (live
-        control C9), the card is closed and this returns `None`. Otherwise it
-        is the newest `turn`/`parked`/`escalated` row of `workflow` that does
-        not belong to a cancelled run, or `None`. A checkpoint whose run has no
-        `runs` row counts as not cancelled. "Newest" is `saved_at` descending,
-        then `seq` descending.
+        is `done`, or it belongs to a run canceled in either spelling, the card
+        is closed and this returns `None`. Otherwise it is the newest
+        `turn`/`parked`/`escalated` row of `workflow` that does not belong to a
+        run canceled in either spelling, or `None`. A checkpoint whose run has
+        no `runs` row counts as not canceled. "Newest" is `saved_at`
+        descending, then `seq` descending.
         """
         with self._lock:
             newest = self._conn.execute(
@@ -2034,16 +2037,16 @@ class Store:
             if (
                 newest is None
                 or newest["reason"] == "done"
-                or newest["status"] == "cancelled"
+                or models.is_canceled(newest["status"])
             ):
                 return None
             row = self._conn.execute(
                 _CHECKPOINT_SELECT
                 + " WHERE c.card_id = ? AND c.workflow = ?"
                 " AND c.reason IN ('turn', 'parked', 'escalated')"
-                " AND c.run_id NOT IN (SELECT id FROM runs WHERE status = 'cancelled')"
+                " AND c.run_id NOT IN (SELECT id FROM runs WHERE status IN (?, ?))"
                 " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
-                (card_id, workflow),
+                (card_id, workflow, models.CANCELED, models.LEGACY_CANCELED),
             ).fetchone()
             return None if row is None else _checkpoint_from_row(row)
 

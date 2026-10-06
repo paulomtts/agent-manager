@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import grafo
 import pytest
@@ -681,7 +681,7 @@ def test_controlled_payload_on_cancel_has_no_resume_and_lists_escalations_primar
     payload = orchestrate.controlled_payload("run-1", "cancel", [first, parked, primary], [])
 
     assert payload == {
-        "cancelled": True,
+        "canceled": True,
         "run_id": "run-1",
         "stopped": [{"story": "B", "subtask": "b1", "before_phase": "implement"}],
         "completed": [],
@@ -693,7 +693,7 @@ def test_controlled_payload_on_cancel_has_no_resume_and_lists_escalations_primar
         ],
     }
     assert list(payload) == [
-        "cancelled", "run_id", "stopped", "completed", "pending", "warnings", "escalations"
+        "canceled", "run_id", "stopped", "completed", "pending", "warnings", "escalations"
     ]
     # No outcome marked primary: the first in census order leads, as in `escalated_payload`.
     unmarked = orchestrate.controlled_payload(
@@ -711,10 +711,31 @@ def test_controlled_payload_on_cancel_without_escalations_omits_escalations_and_
         payload = orchestrate.controlled_payload("run-1", command, [parked], [])
         assert "escalated" not in payload
         assert "failed_phase" not in payload
-    cancelled = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
-    assert "escalations" not in cancelled
-    assert "resume" not in cancelled
-    assert "paused" not in cancelled
+    canceled = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
+    assert canceled["canceled"] is True
+    assert "cancelled" not in canceled
+    assert "escalations" not in canceled
+    assert "resume" not in canceled
+    assert "paused" not in canceled
+    paused = orchestrate.controlled_payload("run-1", "pause", [parked], [])
+    assert "canceled" not in paused
+    assert "cancelled" not in paused
+
+
+def test_a_controlled_cancel_payload_reads_as_canceled_on_board_and_comment():
+    """The real cancel payload, not a hand-written one, reads as the
+    `canceled` board status and the `canceled` run-end comment."""
+    parked = orchestrate.LaneOutcome(
+        kind="stopped", story="A", level=0, subtask="a1", before_phase="plan"
+    )
+    payload = orchestrate.controlled_payload("run-1", "cancel", [parked], [])
+
+    assert orchestrate.milestone_status(payload) == "canceled"
+    comment = comments.compose_run_end(
+        run_id="run-1", milestone_id="ms-1", token="tok-1", payload=payload
+    )
+    assert comment.body.splitlines()[0] == "am · canceled · run run-1"
+    assert "next: `am run --milestone ms-1`" in comment.body.splitlines()
 
 
 def test_the_integrated_payload_is_plain_json_with_the_worktree_as_a_string():
@@ -3785,8 +3806,8 @@ def test_a_relaunch_after_am_reset_starts_the_card_fresh_at_worktree(
 
     reset = cli.reset_run(reset_id, repo_dir=project)
 
-    assert reset["status"] == "cancelled"
-    assert reset["already_cancelled"] is False
+    assert reset["status"] == "canceled"
+    assert reset["already_canceled"] is False
     assert reset["cards"] == [
         {"card_id": a1, "workflow": task_workflow.TASK.name, "open_in": None}
     ]
@@ -4592,20 +4613,21 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
-def test_a_cancelled_milestone_run_is_refused_for_resume(tmp_path, monkeypatch):
-    """C9: unknown run, then wrong workflow, then cancelled -- the earlier
-    refusals still win for a run that is also cancelled."""
+@pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
+def test_resume_refuses_run_canceled_in_either_spelling(tmp_path, monkeypatch, status):
+    """C9: unknown run, then wrong workflow, then canceled in either spelling --
+    the earlier refusals still win for a run that is also canceled."""
     root = _resume_root(tmp_path, monkeypatch)
-    _record_resume_run(root, status="cancelled")
+    _record_resume_run(root, status=status)
 
     with pytest.raises(cli.NotResumableError) as caught:
         orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
 
     assert str(caught.value) == (
-        f"run {RESUME_RUN_ID} was cancelled; start new work with am run --milestone"
+        f"run {RESUME_RUN_ID} was canceled; start new work with am run --milestone"
     )
     task_run = "20260924T120000Z-00000008"
-    _record_resume_run(root, task_run, workflow="task", status="cancelled")
+    _record_resume_run(root, task_run, workflow="task", status=status)
     with pytest.raises(cli.NotResumableError, match="'task'"):
         orchestrate.resumable_milestone_run(root, task_run)
     with pytest.raises(cli.UnknownRunError, match="no-such-run"):
@@ -5199,7 +5221,7 @@ def test_a_run_with_no_control_integrates_as_before(project, integrate_recorder)
 
     run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
     assert result["done"] is True, result
-    assert not {"paused", "cancelled", "control", "escalated"} & set(result)
+    assert not {"paused", "canceled", "cancelled", "control", "escalated"} & set(result)
     assert len(integrate_recorder.calls) == 1
     assert _statuses(_load(project, run_id)) == {"run": "done", story_a: "done", a1: "done"}
     assert _controls(project, run_id) == []
@@ -5459,7 +5481,7 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
 
     assert [call["card"] for call in driver.calls] == [a1]
     assert result == {
-        "cancelled": True,
+        "canceled": True,
         "run_id": run_id,
         "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
         "completed": [],
@@ -5467,12 +5489,47 @@ def test_a_cancelled_milestone_records_cancelled_and_skips_integrate(
         "warnings": [],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "stopped",
         a1: "stopped",
         a2: "pending",
     }
     assert integrate_recorder.calls == []
+
+
+def _run_upserts(run_id: str) -> list[str]:
+    """The raw `run_upsert` lines of `run_id`'s journal, in order."""
+    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
+    return [line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"]
+
+
+def _raw_run_status(project: Path, run_id: str) -> str:
+    """`runs.status` as stored, before any reader normalises it."""
+    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    try:
+        row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, run_id
+    return row["status"]
+
+
+@pytest.mark.git
+def test_milestone_cancel_journals_canceled(project, integrate_recorder):
+    """A canceled milestone run journals its final `run_upsert` with status
+    `canceled`, never the legacy spelling, and stores `canceled` in its row."""
+    shape = _milestone(project, {"A": 2})
+    a1, _ = shape["subtasks"]["A"]
+    run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
+    driver = GatedDriver(gates={a1: _send_then_await_stop(project, run_id, "cancel")})
+
+    _run(project, shape["milestone"], driver, control_interval=0)
+
+    upserts = _run_upserts(run_id)
+    assert upserts, run_id
+    assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
+    assert not [line for line in upserts if "cancelled" in line], upserts
+    assert _raw_run_status(project, run_id) == "canceled"
 
 
 @pytest.mark.git
@@ -5490,9 +5547,10 @@ def test_cancel_after_pause_wins_and_records_cancelled(project, integrate_record
 
     result = _run(project, shape["milestone"], driver, control_interval=0)
 
-    assert result["cancelled"] is True, result
+    assert result["canceled"] is True, result
     assert "paused" not in result and "resume" not in result
-    assert _load(project, run_id).status == "cancelled"
+    assert _load(project, run_id).status == "canceled"
+    assert json.loads(_run_upserts(run_id)[-1])["payload"]["status"] == "canceled"
     assert [(row.command, row.handled_at is not None) for row in _controls(project, run_id)] == [
         ("pause", True),
         ("cancel", True),
@@ -5569,7 +5627,7 @@ def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations
     result = _run(project, shape["milestone"], driver, max_concurrent=2, control_interval=0)
 
     assert result == {
-        "cancelled": True,
+        "canceled": True,
         "run_id": run_id,
         "stopped": [{"story": story_b, "subtask": b1, "before_phase": "implement"}],
         "completed": [],
@@ -5586,7 +5644,7 @@ def test_a_cancel_with_an_escalated_lane_records_cancelled_and_lists_escalations
         ],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "escalated",
         a1: "escalated",
         story_b: "stopped",
@@ -6624,8 +6682,8 @@ def test_a_cancel_comments_each_parked_subtask_and_the_milestone(project):
 
     result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
 
-    assert result["cancelled"] is True, result
-    assert _load(project, run_id).status == "cancelled"
+    assert result["canceled"] is True, result
+    assert _load(project, run_id).status == "canceled"
     parked = [row["subtask"] for row in result["stopped"]]
     assert sorted(parked) == sorted([a2, b1]), result
     for subtask in (a2, b1):
@@ -6675,7 +6733,7 @@ def test_a_cancel_with_an_escalated_lane_comments_only_the_parked_subtask_as_can
 
     result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
 
-    assert result["cancelled"] is True, result
+    assert result["canceled"] is True, result
     a1_keys = _keys(_comments(project, a1))
     assert len(a1_keys) == 1 and a1_keys[0].startswith(f"{run_id}/{a1}/escalated:"), a1_keys
     assert _keys(_comments(project, b1)) == [f"{run_id}/{b1}/cancelled"]
@@ -6712,7 +6770,7 @@ def test_a_cancel_on_a_lane_waiting_for_a_slot_comments_its_subtask_without_a_ph
 
     result = _run(project, milestone, driver, max_concurrent=2, control_interval=0)
 
-    assert result["cancelled"] is True, result
+    assert result["canceled"] is True, result
     assert {"story": queued, "subtask": q1, "before_phase": None} in result["stopped"]
     found = _comments(project, q1)
     assert _keys(found) == [f"{run_id}/{q1}/cancelled"]
@@ -6743,7 +6801,7 @@ def test_a_cancel_while_a_base_builds_comments_no_story_and_still_ends_the_run(
 
     result = _run(project, milestone, FakeDriver(), control_interval=0)
 
-    assert result["cancelled"] is True, result
+    assert result["canceled"] is True, result
     assert result["stopped"] == [{"story": story_c, "subtask": None, "before_phase": None}]
     assert _comments(project, story_c) == []
     assert _comments(project, c1) == []
@@ -6772,9 +6830,9 @@ def test_a_cancel_whose_comments_the_board_refuses_is_still_cancelled_with_warni
 
     result = _run(project, milestone, driver, control_interval=0)
 
-    assert result["cancelled"] is True, result
-    assert set(result) == {"cancelled", "run_id", "stopped", "completed", "pending", "warnings"}
-    assert _load(project, run_id).status == "cancelled"
+    assert result["canceled"] is True, result
+    assert set(result) == {"canceled", "run_id", "stopped", "completed", "pending", "warnings"}
+    assert _load(project, run_id).status == "canceled"
     assert len(result["warnings"]) == 2, result["warnings"]
     assert (
         f"board comment {run_id}/{a1}/cancelled on card {a1} not posted" in result["warnings"][0]
@@ -7096,12 +7154,35 @@ def test_board_claims_takes_each_milestones_keys_from_milestone_claims():
         ({"escalated": True, "run_id": "r"}, "escalated"),
         ({"escalated": True, "control": "pause", "run_id": "r"}, "escalated"),
         ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
-        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "run_id": "r"}, "canceled"),
         ({"run_id": "r"}, "escalated"),
     ],
 )
 def test_milestone_status_reads_a_run_milestone_payload(payload, status):
     assert orchestrate.milestone_status(payload) == status
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        ({"canceled": True, "run_id": "r"}, "canceled"),
+        ({"cancelled": True, "run_id": "r"}, "canceled"),
+        ({"cancelled": False, "canceled": True, "run_id": "r"}, "canceled"),
+        ({"canceled": True, "escalated": True, "run_id": "r"}, "canceled"),
+        ({"canceled": True, "paused": True, "run_id": "r"}, "canceled"),
+        ({"done": True, "canceled": True, "run_id": "r"}, "done"),
+        ({"canceled": False, "paused": True, "run_id": "r"}, "stopped"),
+        ({"canceled": "yes", "run_id": "r"}, "escalated"),
+    ],
+)
+def test_milestone_status_reads_either_cancel_key(payload, status):
+    assert orchestrate.milestone_status(payload) == status
+
+
+def test_milestone_status_never_returns_the_legacy_spelling():
+    assert models.LEGACY_CANCELED not in get_args(orchestrate.BoardStatus)
+    assert models.CANCELED in get_args(orchestrate.BoardStatus)
+    assert orchestrate.milestone_status({"cancelled": True}) == models.CANCELED
 
 
 # ── milestone_bases (card 40ac07f3) ─────────────────────────────────────────
@@ -7718,13 +7799,13 @@ def test_run_board_isolates_a_milestone_that_raises_and_blocks_only_its_dependen
     [
         ({"escalated": True, "run_id": "r"}, "escalated"),
         ({"paused": True, "run_id": "r", "resume": "am resume r"}, "stopped"),
-        ({"cancelled": True, "run_id": "r"}, "cancelled"),
+        ({"canceled": True, "run_id": "r"}, "canceled"),
     ],
 )
 def test_run_board_blocks_the_dependent_of_a_milestone_that_did_not_finish_done(
     board_seams, payload, status
 ):
-    """Review Focus 2: a paused or cancelled milestone blocks like an escalated one."""
+    """Review Focus 2: a paused or canceled milestone blocks like an escalated one."""
     a = _board_milestone(1)
     b = _board_milestone(2, blocked_by=(1,))
     board_seams.cards = [a, b]
@@ -10114,7 +10195,7 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
 
     assert [call["card"] for call in driver.calls] == [a1]
     assert result == {
-        "cancelled": True,
+        "canceled": True,
         "run_id": run_id,
         "stopped": [{"story": story_a, "subtask": a1, "before_phase": "implement"}],
         "completed": [],
@@ -10122,13 +10203,13 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
         "warnings": [],
     }
     assert _statuses(_load(project, run_id)) == {
-        "run": "cancelled",
+        "run": "canceled",
         story_a: "stopped",
         a1: "stopped",
         a2: "pending",
     }
     assert integrate_recorder.calls == []
-    with pytest.raises(runs.NotResumableError, match="cancelled"):
+    with pytest.raises(runs.NotResumableError, match="was canceled"):
         _resume(project, run_id, FakeDriver())
 
 

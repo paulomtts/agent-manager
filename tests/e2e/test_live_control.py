@@ -290,7 +290,7 @@ def test_a_paused_milestone_resumes_with_nothing_dispatched_twice(
     assert paused["paused"] is True, paused
     assert paused["run_id"] == run_id
     assert paused["resume"] == f"am resume {run_id}"
-    assert "cancelled" not in paused
+    assert "canceled" not in paused and "cancelled" not in paused, paused
     assert not CONTROL_KEYS_NEVER_PRESENT & set(paused), paused
     assert _status(root, run_id) == "stopped"
     assert INTEGRATION_BRANCH not in _local_branches(root)
@@ -325,7 +325,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     two_story_board, run_milestone_cli, read_fake_log, monkeypatch, request
 ):
     """Spec §7 cancel: held in a1's plan, cancelled from another connection,
-    recorded `cancelled` without Integrate; `am resume` refuses it at exit 3
+    recorded `canceled` without Integrate; `am resume` refuses it at exit 3
     and launches nothing; a fresh `am run --milestone` drives a1 again from
     `explore`, never continuing the cancelled run's parked checkpoint (C9)."""
     assert request.node.get_closest_marker("e2e") is None
@@ -354,12 +354,13 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
 
     # Cancelled: exit 0, no resume hint, never an escalation, never Integrate (C6).
     assert first.exit_code == 0, (first.output, first.exception)
-    cancelled = _envelope(first)
-    assert cancelled["cancelled"] is True, cancelled
-    assert cancelled["run_id"] == run_id
-    assert "resume" not in cancelled and "paused" not in cancelled, cancelled
-    assert not CONTROL_KEYS_NEVER_PRESENT & set(cancelled), cancelled
-    assert _status(root, run_id) == "cancelled"
+    canceled = _envelope(first)
+    assert canceled["canceled"] is True, canceled
+    assert "cancelled" not in canceled, canceled
+    assert canceled["run_id"] == run_id
+    assert "resume" not in canceled and "paused" not in canceled, canceled
+    assert not CONTROL_KEYS_NEVER_PRESENT & set(canceled), canceled
+    assert _status(root, run_id) == "canceled"
     assert INTEGRATION_BRANCH not in _local_branches(root)
     # a1 parked after its held plan: explore..plan once, nothing after.
     cancelled_counts = _card_phase_counts(read_fake_log(run_id))
@@ -372,9 +373,9 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert refused.exit_code == cli.EXIT_ERROR == 3, (refused.output, refused.exception)
     refusal = _error(refused)
     assert refusal["type"] == "NotResumableError"
-    assert "cancelled" in refusal["message"]
+    assert "canceled" in refusal["message"]
     assert len(read_fake_log(run_id)) == launches
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
     # A fresh relaunch is new work: a new run id, a1 driven again from explore.
     relaunch = run_milestone_cli(root, milestone)
@@ -392,7 +393,7 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
     # The cancelled run stays cancelled.
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
 
 def _subtask_of(root: Path, run_id: str, card_id: str):
@@ -461,21 +462,21 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
         "run_id",
         "previous_status",
         "status",
-        "already_cancelled",
+        "already_canceled",
         "cards",
         "message",
     }, closed
     assert closed["run_id"] == run_id
     assert closed["previous_status"] == "stopped"
-    assert closed["status"] == "cancelled"
-    assert closed["already_cancelled"] is False
+    assert closed["status"] == "canceled"
+    assert closed["already_canceled"] is False
     assert {"card_id": a1, "workflow": "task", "open_in": None} in closed["cards"], closed
     assert all(card["open_in"] is None for card in closed["cards"]), closed["cards"]
     assert closed["message"] == (
-        f"run {run_id} is cancelled; `am resume {run_id}` refuses it,"
+        f"run {run_id} is canceled; `am resume {run_id}` refuses it,"
         " and a relaunch starts its cards from their first phase"
     )
-    assert _status(root, run_id) == "cancelled"
+    assert _status(root, run_id) == "canceled"
 
     # `am resume` of the reset run is refused at exit 3, launching nothing.
     launches = len(read_fake_log(run_id))
@@ -484,7 +485,7 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
     assert refused.exit_code == cli.EXIT_ERROR == 3, (refused.output, refused.exception)
     assert _error(refused) == {
         "type": "NotResumableError",
-        "message": f"run {run_id} was cancelled; start new work with `am run --milestone`",
+        "message": f"run {run_id} was canceled; start new work with `am run --milestone`",
     }
     assert len(read_fake_log(run_id)) == launches
 
@@ -511,5 +512,5 @@ def test_a_reset_of_a_paused_milestone_whose_worktree_was_removed_relaunches_it_
     relaunched = _card_phase_counts(read_fake_log(new_run))
     assert _only(relaunched, a1) == _counts(full=(a1,)), relaunched
     assert relaunched[(a1, "explore")] == 1
-    # The reset run stays cancelled.
-    assert _status(root, run_id) == "cancelled"
+    # The reset run stays canceled.
+    assert _status(root, run_id) == "canceled"

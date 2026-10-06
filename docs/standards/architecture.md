@@ -265,7 +265,9 @@ Good (`dag.py:46`):
     """First eight hex characters of a card UUID, dashes stripped, lowercased."""
 ```
 
-## 9. Status vocabulary: the `canceled` migration (decided)
+## 9. Status vocabulary: the `canceled` migration (landed)
+
+The migration has landed. Items 1 and 2 are the rules in force; items 3-6 are the record of what changed and in what order.
 
 1. **Spelling.** The canonical spelling is `canceled` everywhere, matching `brd` (`census.py:45`). New code writes only `canceled`.
 2. **Reading.** Readers accept both `canceled` and `cancelled` forever, in stored journals, SQLite rows and checkpoint queries. Journals are append-only and `am watch` replays stored lines unchanged, so a consumer can still meet `cancelled` long after the switch.
@@ -296,7 +298,7 @@ Good (`dag.py:46`):
 
 These outrank every layering move. A move that would change one of them is not a layering move: it needs its own compatibility plan, as §9 has.
 
-1. **The journal line** (`JournalLine`, `store.py:321-338`; `extra="forbid"`), its event kinds, `(run_id, seq)` cursoring, and the `am watch` / `am logs --follow` streams with their hello lines. The watch hello is `schema: 1` today and becomes 2 under §9.
+1. **The journal line** (`JournalLine`, `store.py:321-338`; `extra="forbid"`), its event kinds, `(run_id, seq)` cursoring, and the `am watch` / `am logs --follow` streams with their hello lines. The watch hello is `schema: 2`; the `am logs --follow` hello stays `schema: 1`.
 2. **The envelope** `{"ok": true, "data"}` / `{"ok": false, "error": {"type", "message"}}`, and exit codes 0 / 1 / 3 (2 is Typer's usage errors). `error.type` is the exception's class name (`cli.py:183-186`), so moving an exception class is safe and renaming one is a contract change.
 3. **Workflow identity.** The digest names callables by `module.qualname` (`workflow/phases.py:67-68,131-149`), and the checkpoint pool tags pydantic models as `module:qualname` (`runtime/context.py:31`). Moving or renaming any step, gate, `when` predicate, or result model in `results.py` that a shipped workflow references invalidates resumes of checkpointed runs.
 4. **Write order and fencing.** The journal line is written before the row. Every run write is fenced by the lease token (§6.4).

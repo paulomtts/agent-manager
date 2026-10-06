@@ -180,7 +180,7 @@ def controlled_payload(
 ) -> dict[str, Any]:
     """The result of a run a control ended (live control C12), outcomes in wave order.
 
-    `paused` or `cancelled`, then `run_id`, `stopped` (census order, the
+    `paused` or `canceled`, then `run_id`, `stopped` (census order, the
     `escalated_payload` row shape), `completed` (every lane's finished
     subtasks, wave order), `pending` (story ids) and `warnings`. A pause adds
     the `resume` hint. A cancel adds `escalations` only when a lane really
@@ -189,7 +189,7 @@ def controlled_payload(
     escalation.
     """
     payload: dict[str, Any] = {
-        "paused" if command == "pause" else "cancelled": True,
+        "paused" if command == "pause" else models.CANCELED: True,
         "run_id": run_id,
         "stopped": [stopped_row(outcome) for outcome in outcomes if outcome.kind == "stopped"],
         "completed": [subtask for outcome in outcomes for subtask in outcome.completed],
@@ -593,8 +593,8 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
     `Store.open` would construct a `Journal`. Refused, in this order (live
-    control C9): an unknown run, a run of another workflow, then a
-    `cancelled` run and a `done` run (card 54e4ec29, card 0e1edf31).
+    control C9): an unknown run, a run of another workflow, then a run
+    canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
     conn = open_db(root)
     try:
@@ -610,9 +610,9 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
         raise runs.NotResumableError(
             f"run {run_id!r} is a {run.workflow!r} run, not a {MILESTONE_WORKFLOW!r} run"
         )
-    if run.status == "cancelled":
+    if models.is_canceled(run.status):
         raise runs.NotResumableError(
-            f"run {run_id} was cancelled; start new work with am run --milestone"
+            f"run {run_id} was canceled; start new work with am run --milestone"
         )
     if run.status == "done":
         raise runs.NotResumableError(
@@ -2073,10 +2073,10 @@ async def run_milestone_engine(
         return payload
 
     # Outcome precedence (live control C6): the first match wins. A
-    # control is never an escalation, and a paused or cancelled run
+    # control is never an escalation, and a paused or canceled run
     # never reaches Integrate in this invocation.
     if stop.requested == "cancel":
-        store.record_run(run_record.model_copy(update={"status": "cancelled"}))
+        store.record_run(run_record.model_copy(update={"status": models.CANCELED}))
         payload = report(controlled_payload(run_id, "cancel", outcomes, warnings))
         # Board-comments B2 (card 5d9a875f): after the cancel is recorded,
         # each subtask it parked, in wave order, then the milestone. A lane
@@ -2086,7 +2086,7 @@ async def run_milestone_engine(
             if outcome.kind != "stopped" or outcome.subtask is None:
                 continue
             assert outcome.story is not None
-            comment = comments.compose_cancelled(
+            comment = comments.compose_canceled(
                 run_id=run_id,
                 card_id=outcome.subtask,
                 before_phase=outcome.before_phase,
@@ -2208,7 +2208,7 @@ def run_milestone(
 
     An applied `am cancel` or `am pause` fires the same `StopSignal` through
     `stop.request`, so lanes park exactly as for an escalation. Once the tree
-    returns, the first match wins (C6): a cancel records the run `cancelled`
+    returns, the first match wins (C6): a cancel records the run `canceled`
     and returns `controlled_payload`; an escalation records `escalated` as
     below, with `control: "pause"` added when a pause was applied; a pause
     records `stopped` and returns `controlled_payload` with its `resume`
@@ -2573,7 +2573,7 @@ def detach_story(
 # ── the board run (card baef4f94) ───────────────────────────────────────────
 
 
-BoardStatus = Literal["done", "escalated", "stopped", "cancelled", "blocked"]
+BoardStatus = Literal["done", "escalated", "stopped", "canceled", "blocked"]
 """How one milestone of a board run ended: its own run's outcome, or `blocked`
 when a blocker did not finish `done` and it was never dispatched."""
 
@@ -2732,14 +2732,15 @@ def board_claims(
 def milestone_status(payload: Mapping[str, Any]) -> BoardStatus:
     """One `_run_milestone_async` payload read as a board status.
 
-    `done` is the only clean outcome. A cancel is `cancelled`, an escalation
-    (a paused one included) is `escalated`, a pause is `stopped`. Any other
+    `done` is the only clean outcome. A cancel, flagged `True` under either
+    of its keys (`canceled`, `cancelled`), is `canceled`; an escalation (a
+    paused one included) is `escalated`, a pause is `stopped`. Any other
     shape is not clean, so it counts as `escalated`.
     """
     if payload.get("done") is True:
         return "done"
-    if payload.get("cancelled") is True:
-        return "cancelled"
+    if any(payload.get(name) is True for name in models.CANCELED_STATUSES):
+        return models.CANCELED
     if payload.get("escalated") is True:
         return "escalated"
     if payload.get("paused") is True:

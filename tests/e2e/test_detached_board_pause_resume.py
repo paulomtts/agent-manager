@@ -213,7 +213,7 @@ def test_a_detached_board_is_watched_with_all_and_one_milestone_is_paused_and_re
     hello = stream.hello()
     assert "ok" not in hello, f"am watch --all --follow refused to stream: {hello}"
     assert hello["event"] == "watch", hello
-    assert hello["schema"] == 1, hello
+    assert hello["schema"] == 2, hello
     assert "am" in hello, hello
     assert hello["runs_dir"] == str(paths.data_dir() / "runs"), hello
 
