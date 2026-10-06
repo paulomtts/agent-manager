@@ -15,15 +15,24 @@ The tools read each phase from the running workflow (`deps.workflow`), not the
 compiled one. Two workflow objects can share a name and a digest -- the digest
 keys a callable on `module.qualname`, which a factory's closures share -- while
 holding different callables, and a shared compilation must still call the
-running workflow's own. Everything the compilation itself reads (phase order,
-kinds, timeouts) is covered by the digest, so it cannot differ between them.
+running workflow's own. What the compilation reads from the workflow (phase
+order, kinds, declared timeouts) is covered by the digest, so it cannot differ
+between them.
+
+An agent phase's turn timeout also depends on the run: it must stay above the
+launcher timeout that phase's attempts get (G2), and a run can raise that with
+`--harness-timeout`. The digest does not cover it, so it is never cached:
+`compile_workflow(wf, launcher_timeout=...)` returns a fresh `Compiled` over
+the shared tools, and the tools build their turns from the run's own
+compilation (`deps.compiled`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
@@ -32,7 +41,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import bridge, context, walk
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
-from agent_manager.workflow.phases import AgentPhase, Workflow
+from agent_manager.workflow.phases import LAUNCHER_MARGIN, AgentPhase, Workflow
 
 STEP_TIMEOUT = 3600.0
 """A step's turn timeout, in seconds. Steps have no declared timeout; an hour
@@ -62,12 +71,22 @@ class Compiled:
     workflow: Workflow
     agent_phase: Any
     step_phase: Any
+    launcher_timeout: Callable[[str], float] | None = None
+    """The run's launcher seconds for an agent phase, by name (the contract of
+    `dispatch.AgentRunner.timeout_for`); `None` keeps the declared timeouts."""
 
     def turn_for(self, name: str, loop: int) -> Turn:
         p = self.workflow.phase(name)
         kwargs = {"phase": name, "loop": loop}
         if isinstance(p, AgentPhase):
-            return Turn(self.agent_phase, timeout=p.timeout.total_seconds(), kwargs=kwargs)
+            timeout = p.timeout.total_seconds()
+            if self.launcher_timeout is not None:
+                # G2 per phase: the turn outlives this phase's own launcher
+                # timeout; a run below the declared floor keeps the floor.
+                timeout = max(
+                    timeout, self.launcher_timeout(name) + LAUNCHER_MARGIN.total_seconds()
+                )
+            return Turn(self.agent_phase, timeout=timeout, kwargs=kwargs)
         return Turn(self.step_phase, timeout=STEP_TIMEOUT, kwargs=kwargs)
 
     def first_turn(self) -> Turn:
@@ -90,13 +109,19 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
-def compile_workflow(wf: Workflow) -> Compiled:
+def compile_workflow(
+    wf: Workflow, *, launcher_timeout: Callable[[str], float] | None = None
+) -> Compiled:
+    """The cached compilation of `wf`, or with `launcher_timeout` a new one
+    over the same tools that derives its agent turn timeouts from it."""
     key = (wf.name, wf.digest())
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
             compiled = _CACHE[key] = _build(wf, suffix=key[1][:8])
+    if launcher_timeout is None:
         return compiled
+    return dataclasses.replace(compiled, launcher_timeout=launcher_timeout)
 
 
 def _rename(fn: Any, name: str) -> None:
