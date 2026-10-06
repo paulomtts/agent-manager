@@ -1744,6 +1744,34 @@ def parse_harness_timeouts(
     return default, per_phase
 
 
+def run_agent_phases(run: models.Run) -> tuple[str, ...]:
+    """The agent phases a recorded `run` can dispatch (card eee43099).
+
+    A `task` run and a story run (`config.story_id` set) never reach
+    Integrate, so only the `task` phases; a milestone run also `resolve`.
+    """
+    if run.workflow == WORKFLOW_NAME or run.config.story_id is not None:
+        return TASK_AGENT_PHASES
+    return MILESTONE_AGENT_PHASES
+
+
+def refuse_undispatchable_harness_phases(
+    run: models.Run, per_phase: Mapping[str, float]
+) -> None:
+    """`--harness-timeout`'s usage error for a phase `run` cannot dispatch.
+
+    `resume` validates against `MILESTONE_AGENT_PHASES` before anything is
+    loaded; this is the second check, once the run's shape is known.
+    """
+    phases = run_agent_phases(run)
+    for name in per_phase:
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"run {run.id} cannot dispatch phase {name!r}; its agent phases are:"
+                f" {', '.join(phases)}"
+            )
+
+
 def _check_run_targets(
     *,
     card: str | None,
@@ -3183,6 +3211,7 @@ def resume_run(
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
 
@@ -3212,6 +3241,15 @@ def resume_run(
     A run canceled in either spelling is refused for both workflows (live
     control C9), and so is a run whose lease is still live (C10): both
     refusals read only the connection that loaded the run.
+
+    Harness timeouts (card eee43099) are recorded on the run, so a resume
+    keeps them: without `harness_override` both workflows are called exactly
+    as before and launch with the recorded values. A `harness_override`
+    `(default, per-phase map)` replaces both recorded values, never merged,
+    and is recorded by the first run record the resume writes. A per-phase
+    name the loaded run cannot dispatch (`run_agent_phases`: `resolve` on a
+    `task` or story run) is `--harness-timeout`'s usage error, exit 2,
+    raised after the refusals above and before `Store.open`.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3234,6 +3272,16 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    if run.workflow not in (WORKFLOW_NAME, orchestrate.MILESTONE_WORKFLOW):
+        raise NotResumableError(
+            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+        )
+    # Passed only when given, so a resume without the flag calls exactly as before.
+    override: dict[str, Any] = {}
+    if harness_override is not None:
+        refuse_undispatchable_harness_phases(run, harness_override[1])
+        override["harness_override"] = harness_override
     if run.workflow == WORKFLOW_NAME:
         return _resume_from_checkpoint(
             run,
@@ -3241,20 +3289,17 @@ def resume_run(
             allow_no_verification=allow_no_verification,
             commands=commands,
             runner_factory=runner_factory,
+            **override,
         )
     # Read as `orchestrate.run_milestone` so a test can patch it there.
-    if run.workflow == orchestrate.MILESTONE_WORKFLOW:
-        return orchestrate.run_milestone(
-            None,
-            repo_dir=root,
-            commands=list(commands),
-            allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
-            resume_run_id=run.id,
-        )
-    raise NotResumableError(
-        f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
-        f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+    return orchestrate.run_milestone(
+        None,
+        repo_dir=root,
+        commands=list(commands),
+        allow_no_verification=allow_no_verification,
+        runner_factory=runner_factory,
+        resume_run_id=run.id,
+        **override,
     )
 
 
@@ -3287,7 +3332,11 @@ def resume(
         [],
         "--harness-timeout",
         metavar="[PHASE=]SECONDS",
-        help="Accepted and validated; a resumed run keeps the timeout it was started with.",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Replaces both recorded "
+            "values and is recorded; without it the run keeps the timeouts it was started with."
+        ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
@@ -3297,17 +3346,27 @@ def resume(
     started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
-    # Validated only (card 33dc5549): a resumed run keeps the timeout it was
-    # started with, so nothing parsed here reaches `resume_run`. The run's
-    # workflow is known only once it is loaded, so every agent phase a
-    # `task` or `milestone` run can dispatch is accepted.
-    parse_harness_timeouts(harness_timeout_values, phases=MILESTONE_AGENT_PHASES)
+    # Before anything is loaded (card 33dc5549): the run's workflow is known
+    # only once it is, so every agent phase a `task` or `milestone` run can
+    # dispatch is accepted here, and `resume_run` refuses a phase the loaded
+    # run cannot dispatch (card eee43099). Given, the pair replaces both
+    # recorded values and is recorded; passed only when given, so a resume
+    # without the flag calls exactly as before and keeps the recorded values.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values, phases=MILESTONE_AGENT_PHASES
+    )
+    override: dict[str, Any] = (
+        {"harness_override": (default_timeout, phase_timeouts)}
+        if harness_timeout_values
+        else {}
+    )
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
             commands=list(verify),
+            **override,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

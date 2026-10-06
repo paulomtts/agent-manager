@@ -13869,10 +13869,17 @@ def test_resume_accepts_and_validates_harness_timeout(tmp_path, monkeypatch):
 
     assert plain.exit_code == 0, plain.output
     assert timed.exit_code == 0, timed.output
-    assert calls[0] == calls[1]
-    assert calls[1] == (
+    plain_call = (
         RESUME_RUN_ID,
         {"repo_dir": tmp_path, "allow_no_verification": False, "commands": []},
+    )
+    assert calls[0] == plain_call
+    assert calls[1] == (
+        RESUME_RUN_ID,
+        {
+            **plain_call[1],
+            "harness_override": (900.0, {"implement": 3600.0, "resolve": 600.0}),
+        },
     )
 
 
@@ -13914,7 +13921,9 @@ def test_the_harness_timeout_help_texts():
     )
     assert resume_option.metavar == "[PHASE=]SECONDS"
     assert resume_option.help == (
-        "Accepted and validated; a resumed run keeps the timeout it was started with."
+        "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+        "run's default, PHASE=SECONDS overrides one agent phase. Replaces both recorded "
+        "values and is recorded; without it the run keeps the timeouts it was started with."
     )
 
 
@@ -14172,3 +14181,155 @@ def test_a_task_resume_override_replaces_both_values_and_is_recorded(
     assert (started.harness_timeout, started.harness_timeouts) == expected
     final = _loaded(root, run_id).config
     assert (final.harness_timeout, final.harness_timeouts) == expected
+
+
+# ── am resume --harness-timeout replaces and is recorded (card eee43099) ────
+#
+# Unit tier: the projection is written directly; `_resume_from_checkpoint`,
+# `orchestrate.run_milestone` and `Store.open` are recorders or `_Forbidden`.
+
+TASK_RUN_ID = "20260923T090000Z-cbe34d00"
+OVERRIDE = (900.0, {"implement": 600.0})
+
+
+def test_resume_run_hands_a_harness_override_to_the_task_path(projection, monkeypatch):
+    _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    seen: list[dict[str, Any]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append(kwargs)
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    cli.resume_run(TASK_RUN_ID, repo_dir=projection, harness_override=OVERRIDE)
+
+    (kwargs,) = seen
+    assert kwargs["harness_override"] == OVERRIDE
+    assert kwargs["runner_factory"] is None
+
+
+def test_resume_run_hands_a_harness_override_to_the_milestone_path(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append(kwargs)
+        return {"done": True, "run_id": run_id, "resumed": True}
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    override = (None, {"resolve": 600.0})
+
+    cli.resume_run(run_id, repo_dir=projection, harness_override=override)
+
+    (kwargs,) = calls
+    assert kwargs["harness_override"] == override
+    assert kwargs["resume_run_id"] == run_id
+
+
+@pytest.mark.parametrize("shape", ["task", "story"])
+def test_resume_run_refuses_a_phase_the_run_cannot_dispatch(projection, monkeypatch, shape):
+    """`resolve` is Integrate's: a `task` run and a story run never reach it."""
+    if shape == "task":
+        _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    else:
+        _record(
+            projection,
+            TASK_RUN_ID,
+            started_at=RECORDED_AT,
+            status="escalated",
+            workflow="milestone",
+            milestone_id="milestone-1",
+            story_id="story-1",
+        )
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+
+    with pytest.raises(typer.BadParameter) as caught:
+        cli.resume_run(
+            TASK_RUN_ID, repo_dir=projection, harness_override=(None, {"resolve": 600.0})
+        )
+
+    assert caught.value.param_hint == "'--harness-timeout'"
+    message = str(caught.value)
+    assert "'resolve'" in message
+    assert ", ".join(cli.TASK_AGENT_PHASES) in message
+    assert ", ".join(cli.MILESTONE_AGENT_PHASES) not in message
+
+
+def test_resume_run_accepts_resolve_on_a_milestone_run(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        orchestrate, "run_milestone", lambda milestone, **kwargs: calls.append(kwargs) or {}
+    )
+
+    cli.resume_run(run_id, repo_dir=projection, harness_override=(None, {"resolve": 600.0}))
+
+    assert [kwargs["harness_override"] for kwargs in calls] == [(None, {"resolve": 600.0})]
+
+
+@pytest.mark.parametrize("status", [None, "canceled"])
+def test_resume_run_refuses_an_unknown_or_canceled_run_before_judging_the_override(
+    projection, monkeypatch, status
+):
+    """Review Focus 5: the existing refusal comes first and nothing is recorded."""
+    if status is not None:
+        _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status=status)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    expected = cli.UnknownRunError if status is None else cli.NotResumableError
+
+    with pytest.raises(expected):
+        cli.resume_run(
+            TASK_RUN_ID, repo_dir=projection, harness_override=(None, {"resolve": 600.0})
+        )
+
+
+def test_am_resume_of_a_task_run_refuses_resolve_with_exit_2_and_writes_nothing(
+    projection, monkeypatch
+):
+    _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    before = _runs_snapshot()
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            TASK_RUN_ID,
+            "--repo-dir",
+            str(projection),
+            "--harness-timeout=resolve=600",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+    assert '"ok"' not in result.stdout
+    for phase in cli.TASK_AGENT_PHASES:
+        assert phase in result.output
+    assert _runs_snapshot() == before
+    assert _loaded(projection, TASK_RUN_ID).config == models.RunConfig()
+
+
+def test_run_agent_phases_follow_the_run_shape():
+    def run(workflow: str, story_id: str | None = None) -> models.Run:
+        return models.Run(
+            id=TASK_RUN_ID,
+            workflow=workflow,
+            repo_dir=Path("/repo"),
+            base_branch="main",
+            branch_prefix="m1",
+            status="escalated",
+            config=models.RunConfig(story_id=story_id),
+        )
+
+    assert cli.run_agent_phases(run("task")) == cli.TASK_AGENT_PHASES
+    assert cli.run_agent_phases(run("milestone", "story-1")) == cli.TASK_AGENT_PHASES
+    assert cli.run_agent_phases(run("milestone")) == cli.MILESTONE_AGENT_PHASES
