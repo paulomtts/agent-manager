@@ -53,7 +53,7 @@ def _subtask() -> models.SubtaskRun:
     )
 
 
-def _deps(workflow, store, runner=None) -> state.RunDeps:
+def _deps(workflow, store, runner=None, compiled=None) -> state.RunDeps:
     return state.RunDeps(
         workflow=workflow,
         store=store,
@@ -61,6 +61,7 @@ def _deps(workflow, store, runner=None) -> state.RunDeps:
         subtask=_subtask(),
         agent_runner=runner,
         clock=lambda: FIXED,
+        compiled=compiled,
     )
 
 
@@ -706,4 +707,89 @@ async def test_a_critic_looping_back_past_an_earlier_critic_shares_its_loop(stor
     assert names == [
         "spec", "validate_spec", "plan", "validate_plan",
         "spec", "validate_spec", "plan", "validate_plan",
+    ]
+
+
+# D3 (T7): every turn a tool yields -- `after()`, a critic's `Goto`, a step's
+# `skip_to` -- comes from the run's own compilation, `deps.compiled`.
+
+
+def _timeout_recorder(fail: dict[str, int] | None = None):
+    """A fake runner that records each agent phase with its running turn's
+    timeout, read off the agent (`agents[0]`) the test drives; phases named in
+    `fail` fail that many times first."""
+    seen: list[tuple[str, float]] = []
+    agents: list[Agent] = []
+    left = dict(fail or {})
+
+    def runner(phase, table, rendered):
+        seen.append((phase.name, agents[0].to_dict()["current_turn"]["timeout"]))
+        if left.get(phase.name, 0) > 0:
+            left[phase.name] -= 1
+            raise AgentPhaseFailed(phase.name, outcome="gate_failed", detail=f"{phase.name} blocks")
+        return {"ok": True}
+
+    return runner, seen, agents
+
+
+async def _drive_compiled(compiled, deps, agents: list[Agent]) -> Agent:
+    agent = await _new_agent(compiled)
+    agents.append(agent)
+    token = state.current_run.set(deps)
+    try:
+        await _consume(agent)
+    finally:
+        state.current_run.reset(token)
+    return agent
+
+
+def _step_then_critic_loop() -> Workflow:
+    return Workflow("derived-loop", (
+        Step("a", _noop),
+        AgentPhase("spec", "spec_author", ("feedback",), None, timeout=DECLARED),
+        AgentPhase("validate_spec", "critic", (), None, timeout=DECLARED, on_fail=Goto("spec", 1)),
+    ))
+
+
+async def test_after_and_goto_turns_carry_the_derived_timeout(store):
+    runner, seen, agents = _timeout_recorder({"validate_spec": 1})
+    wf = _step_then_critic_loop()
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+
+    await _drive_compiled(compiled, _deps(wf, store, runner, compiled=compiled), agents)
+
+    # spec via after() from the step, validate_spec via after(), spec again via
+    # the critic's Goto, validate_spec via after().
+    assert seen == [
+        ("spec", 3900), ("validate_spec", 3900), ("spec", 3900), ("validate_spec", 3900),
+    ]
+
+
+async def test_a_skip_to_turn_carries_the_derived_timeout(store):
+    runner, seen, agents = _timeout_recorder()
+    wf = Workflow("derived-skip", (
+        Step("a", _noop, when=lambda result: True, skip_to="c"),
+        Step("b", _noop),
+        AgentPhase("c", "explorer", (), None, timeout=DECLARED),
+    ))
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+    deps = _deps(wf, store, runner, compiled=compiled)
+
+    await _drive_compiled(compiled, deps, agents)
+
+    assert deps.skipped == ["b"]
+    assert seen == [("c", 3900)]
+
+
+async def test_tools_without_a_run_compilation_keep_the_declared_timeout(store):
+    # A hand-built `RunDeps` (no `compiled`) falls back to the shared,
+    # launcher-less compilation, even when the first turn came from a derived one.
+    runner, seen, agents = _timeout_recorder({"validate_spec": 1})
+    wf = _step_then_critic_loop()
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+
+    await _drive_compiled(compiled, _deps(wf, store, runner), agents)
+
+    assert seen == [
+        ("spec", 2100), ("validate_spec", 2100), ("spec", 2100), ("validate_spec", 2100),
     ]

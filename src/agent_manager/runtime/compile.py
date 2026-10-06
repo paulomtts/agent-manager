@@ -162,6 +162,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
     async def agent_phase(phase: str, loop: int, pool: ContextPool, memory: ContextQueue):
         deps = current_run.get()
         deps.running = phase
+        compiled = deps.compiled or holder["compiled"]
         p = deps.workflow.phase(phase)
         if deps.agent_runner is None:
             # A wiring bug, not a phase failure: raised before anything runs,
@@ -202,7 +203,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 yield ContextItem(
                     content={"for": p.on_fail.phase, "from": phase, "detail": failure.detail}
                 )
-                yield holder["compiled"].turn_for(p.on_fail.phase, loop + 1)
+                yield compiled.turn_for(p.on_fail.phase, loop + 1)
                 return
             raise Escalated(phase, failure.detail, result=failure.result) from failure
         except Exception as error:
@@ -210,13 +211,14 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
             # recorded `started` forever.
             raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
-        nxt = holder["compiled"].after(phase, 0 if phase in fresh_loop_after else loop)
+        nxt = compiled.after(phase, 0 if phase in fresh_loop_after else loop)
         if nxt is not None:
             yield nxt
 
     async def step_phase(phase: str, loop: int, pool: ContextPool):
         deps = current_run.get()
         deps.running = phase
+        compiled = deps.compiled or holder["compiled"]
         # A step is never adopted and stays at-least-once (exactly-once E9);
         # taking the carried adoption here ends it at the first turn after
         # a resume, so no later agent phase can inherit it.
@@ -245,11 +247,11 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 id=phase, description=f"{phase} result", content=context.encode(outcome.result)
             )
             if outcome.skip_to is not None:
-                names = holder["compiled"].workflow.phase_names
+                names = compiled.workflow.phase_names
                 deps.skipped.extend(names[names.index(phase) + 1 : names.index(outcome.skip_to)])
-                yield holder["compiled"].turn_for(outcome.skip_to, loop)
+                yield compiled.turn_for(outcome.skip_to, loop)
                 return
-        nxt = holder["compiled"].after(phase, loop)
+        nxt = compiled.after(phase, loop)
         if nxt is not None:
             yield nxt
 
