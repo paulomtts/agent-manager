@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -57,7 +58,9 @@ from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import AgentPhase, Workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
 # integration and orchestrate read them off `runs`). This module uses some by
@@ -1594,6 +1597,94 @@ def detach_card(
         root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
     )
 
+
+def agent_phase_names(*workflows: Workflow) -> tuple[str, ...]:
+    """The `AgentPhase` names of `workflows`, in declared order, each once."""
+    return tuple(
+        dict.fromkeys(
+            phase.name
+            for workflow in workflows
+            for phase in workflow.phases
+            if isinstance(phase, AgentPhase)
+        )
+    )
+
+
+TASK_AGENT_PHASES = agent_phase_names(task_workflow.TASK)
+"""The phases `--harness-timeout PHASE=` may name on `run --card` and `run --story`,
+which dispatch only `task` phases."""
+
+MILESTONE_AGENT_PHASES = agent_phase_names(task_workflow.TASK, integrate_workflow.INTEGRATE)
+"""The phases `--harness-timeout PHASE=` may name on `run --milestone`, `run --board`
+and `resume`: a milestone run ends in Integrate."""
+
+HARNESS_TIMEOUT_MIN = 60
+"""The smallest `--harness-timeout` in seconds. The CLI's bound, not the model's."""
+
+HARNESS_TIMEOUT_MAX = 86400
+"""The largest `--harness-timeout` in seconds."""
+
+
+def _harness_timeout_error(message: str) -> typer.BadParameter:
+    return typer.BadParameter(message, param_hint="'--harness-timeout'")
+
+
+def _harness_seconds(text: str, given: str) -> float:
+    """`text` as seconds in bounds, or the usage error naming `given`, the whole value."""
+    if not text:
+        raise _harness_timeout_error(f"{given!r} has an empty value; expected [PHASE=]SECONDS")
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a number of seconds") from None
+    if not math.isfinite(seconds):
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a finite number of seconds")
+    if not HARNESS_TIMEOUT_MIN <= seconds <= HARNESS_TIMEOUT_MAX:
+        raise _harness_timeout_error(
+            f"{given!r}: seconds must be from {HARNESS_TIMEOUT_MIN} to"
+            f" {HARNESS_TIMEOUT_MAX} inclusive"
+        )
+    return seconds
+
+
+def parse_harness_timeouts(
+    values: Sequence[str], *, phases: Sequence[str]
+) -> tuple[float | None, dict[str, float]]:
+    """Every `--harness-timeout` value, parsed to `(run default, per-phase map)` (card 33dc5549).
+
+    A bare `SECONDS` is the run default. `PHASE=SECONDS` is split on the
+    first `=`, and `PHASE` must be one of `phases`, matched exactly. Each
+    `SECONDS` is a finite `float()` from `HARNESS_TIMEOUT_MIN` to
+    `HARNESS_TIMEOUT_MAX` inclusive. The run default or one phase given twice
+    is refused rather than last-wins, so a typo cannot hide. Every refusal is
+    `typer.BadParameter`, Typer's exit 2. Order does not matter, and no
+    values give `(None, {})`.
+    """
+    default: float | None = None
+    per_phase: dict[str, float] = {}
+    for value in values:
+        name, separator, text = value.partition("=")
+        if not separator:
+            seconds = _harness_seconds(value, value)
+            if default is not None:
+                raise _harness_timeout_error(
+                    "the run default is given twice; give one bare SECONDS"
+                )
+            default = seconds
+            continue
+        if not name:
+            raise _harness_timeout_error(
+                f"{value!r} has an empty phase name; expected PHASE=SECONDS"
+            )
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"{value!r}: unknown phase {name!r}; the agent phases are: {', '.join(phases)}"
+            )
+        seconds = _harness_seconds(text, value)
+        if name in per_phase:
+            raise _harness_timeout_error(f"phase {name!r} is given twice")
+        per_phase[name] = seconds
+    return default, per_phase
 
 def _check_run_targets(
     *,

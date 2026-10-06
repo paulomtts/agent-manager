@@ -13424,3 +13424,131 @@ def test_run_help_and_examples_document_the_story_option():
 
     assert result.exit_code == 0, result.output
     assert "--story" in result.output
+
+
+# ── --harness-timeout parsing (card 33dc5549) ───────────────────────────────
+#
+# Unit tier: the parse helper is pure.
+
+TIMEOUT_HINT = "'--harness-timeout'"
+TASK_PHASES_TEXT = "explore, spec, validate_spec, plan, validate_plan, implement, review"
+
+
+def _parse(*values: str, phases=None):
+    return cli.parse_harness_timeouts(
+        list(values), phases=cli.TASK_AGENT_PHASES if phases is None else phases
+    )
+
+
+def test_the_agent_phase_sets_are_the_declared_workflows_agent_phases():
+    assert cli.TASK_AGENT_PHASES == (
+        "explore",
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "implement",
+        "review",
+    )
+    assert "worktree" not in cli.TASK_AGENT_PHASES  # a Step, not an AgentPhase
+    assert cli.MILESTONE_AGENT_PHASES == (*cli.TASK_AGENT_PHASES, "resolve")
+    assert cli.agent_phase_names(task_workflow.TASK) == cli.TASK_AGENT_PHASES
+    assert cli.agent_phase_names(task_workflow.TASK, task_workflow.TASK) == (
+        cli.TASK_AGENT_PHASES
+    )
+
+
+def test_harness_timeout_parse_no_flag_is_none_and_empty():
+    assert _parse() == (None, {})
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"), [("600", 600.0), ("600.5", 600.5), ("1e3", 1000.0)]
+)
+def test_harness_timeout_parse_bare(value, seconds):
+    assert _parse(value) == (seconds, {})
+
+
+def test_harness_timeout_parse_per_phase():
+    assert _parse("spec=600") == (None, {"spec": 600.0})
+
+
+def test_harness_timeout_parse_repeated_mixes_bare_and_phases():
+    assert _parse("spec=600", "900", "implement=3600") == (
+        900.0,
+        {"spec": 600.0, "implement": 3600.0},
+    )
+
+
+def test_harness_timeout_parse_is_order_independent():
+    assert _parse("spec=600", "900") == _parse("900", "spec=600") == (900.0, {"spec": 600.0})
+
+
+@pytest.mark.parametrize("value", ["60", "60.0", "86400"])
+def test_harness_timeout_parse_accepts_the_bounds(value):
+    assert _parse(value) == (float(value), {})
+    assert _parse(f"review={value}") == (None, {"review": float(value)})
+
+
+def test_harness_timeout_parse_accepts_resolve_only_with_the_milestone_phases():
+    assert _parse("resolve=600", phases=cli.MILESTONE_AGENT_PHASES) == (
+        None,
+        {"resolve": 600.0},
+    )
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([""], "'' has an empty value; expected [PHASE=]SECONDS"),
+        (["spec="], "'spec=' has an empty value; expected [PHASE=]SECONDS"),
+        (["abc"], "'abc': 'abc' is not a number of seconds"),
+        (["spec=abc"], "'spec=abc': 'abc' is not a number of seconds"),
+        (["spec=600=1"], "'spec=600=1': '600=1' is not a number of seconds"),
+        (["nan"], "'nan': 'nan' is not a finite number of seconds"),
+        (["inf"], "'inf': 'inf' is not a finite number of seconds"),
+        (["-inf"], "'-inf': '-inf' is not a finite number of seconds"),
+        (["spec=nan"], "'spec=nan': 'nan' is not a finite number of seconds"),
+        (["59"], "'59': seconds must be from 60 to 86400 inclusive"),
+        (["59.9"], "'59.9': seconds must be from 60 to 86400 inclusive"),
+        (["86401"], "'86401': seconds must be from 60 to 86400 inclusive"),
+        (["0"], "'0': seconds must be from 60 to 86400 inclusive"),
+        (["-5"], "'-5': seconds must be from 60 to 86400 inclusive"),
+        (["spec=59"], "'spec=59': seconds must be from 60 to 86400 inclusive"),
+        (["=600"], "'=600' has an empty phase name; expected PHASE=SECONDS"),
+        (
+            ["bogus=600"],
+            f"'bogus=600': unknown phase 'bogus'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            ["Spec=600"],
+            f"'Spec=600': unknown phase 'Spec'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            [" spec=600"],
+            f"' spec=600': unknown phase ' spec'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            ["resolve=600"],
+            f"'resolve=600': unknown phase 'resolve'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (["600", "600"], "the run default is given twice; give one bare SECONDS"),
+        (["600", "900"], "the run default is given twice; give one bare SECONDS"),
+        (["spec=600", "spec=900"], "phase 'spec' is given twice"),
+    ],
+)
+def test_harness_timeout_parse_refuses_each_bad_value(values, message):
+    with pytest.raises(typer.BadParameter) as caught:
+        _parse(*values)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == TIMEOUT_HINT
+
+
+def test_harness_timeout_parse_lists_the_milestone_phases_in_declared_order():
+    with pytest.raises(typer.BadParameter) as caught:
+        _parse("bogus=600", phases=cli.MILESTONE_AGENT_PHASES)
+
+    assert caught.value.message == (
+        f"'bogus=600': unknown phase 'bogus'; the agent phases are: {TASK_PHASES_TEXT}, resolve"
+    )
