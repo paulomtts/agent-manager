@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13995,3 +13996,141 @@ def test_verify_from_env_is_hidden_from_help(command):
     assert result.exit_code == 0, result.output
     assert "--verify" in result.output
     assert "verify-from-env" not in result.output
+
+
+# ── the `am` entry point and the argv warning (card 1b938053) ────────────────
+
+ARGV_WARNING = argv_guard.ARGV_VISIBLE_WARNING
+WARNED = {"argv_warnings": [ARGV_WARNING]}
+
+
+def _warned_card_args(project: Path, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--card",
+        VERIFY_CARD_ID,
+        "--repo-dir",
+        str(project),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        "m1",
+        *extra,
+    ]
+
+
+def test_the_argv_warning_ends_a_card_payloads_warnings(tmp_path, monkeypatch):
+    """Spec test 26, card payload."""
+    monkeypatch.setattr(
+        cli,
+        "run_card",
+        lambda card_id, **kwargs: {
+            **_fake_payload(card_id, VERIFY_STORY_ID),
+            "warnings": ["earlier"],
+        },
+    )
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path), obj=WARNED)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["warnings"] == ["earlier", ARGV_WARNING]
+
+
+def test_the_argv_warning_reaches_a_detached_hand_off_payload(tmp_path, monkeypatch):
+    """Spec test 26, a hand-off payload that had no `warnings` key."""
+    hand_off = {"run_id": FROM_ENV_RUN_ID, "pid": 4242, "log": "/tmp/run.log", "detached": True}
+    monkeypatch.setattr(cli, "detach_card", lambda card_id, **kwargs: dict(hand_off))
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path, "--detach"), obj=WARNED)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {**hand_off, "warnings": [ARGV_WARNING]}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"run_id": FROM_ENV_RUN_ID, "status": "done"}, [ARGV_WARNING]),
+        (
+            {"run_id": FROM_ENV_RUN_ID, "status": "done", "warnings": ["replaced"]},
+            ["replaced", ARGV_WARNING],
+        ),
+    ],
+)
+def test_the_argv_warning_ends_a_resume_payloads_warnings(tmp_path, monkeypatch, payload, expected):
+    """Spec test 26, resume."""
+    monkeypatch.setattr(cli, "resume_run", lambda run_id, **kwargs: dict(payload))
+
+    result = runner.invoke(
+        cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)], obj=WARNED
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["warnings"] == expected
+
+
+def test_without_an_obj_payloads_are_unchanged(tmp_path, monkeypatch):
+    """Spec test 26: `ctx.obj` is `None` under a CliRunner that passes none."""
+    monkeypatch.setattr(
+        cli, "run_card", lambda card_id, **kwargs: _fake_payload(card_id, VERIFY_STORY_ID)
+    )
+    monkeypatch.setattr(
+        cli, "resume_run", lambda run_id, **kwargs: {"run_id": run_id, "status": "done"}
+    )
+
+    ran = runner.invoke(cli.app, _warned_card_args(tmp_path))
+    resumed = runner.invoke(cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)])
+
+    assert json.loads(ran.stdout)["data"] == _fake_payload(VERIFY_CARD_ID, VERIFY_STORY_ID)
+    assert json.loads(resumed.stdout)["data"] == {"run_id": FROM_ENV_RUN_ID, "status": "done"}
+
+
+def test_argv_warnings_never_reach_an_error_envelope(tmp_path, monkeypatch):
+    """Review Focus 3: error envelopes are unchanged."""
+
+    def failing_run_card(card_id, **kwargs):
+        raise cli.CliError("refused")
+
+    monkeypatch.setattr(cli, "run_card", failing_run_card)
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path), obj=WARNED)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert ARGV_WARNING not in result.stdout
+
+
+@pytest.mark.parametrize(("guard_result", "expected"), [(ARGV_WARNING, [ARGV_WARNING]), (None, [])])
+def test_entry_runs_the_guard_first_and_hands_its_warning_to_the_command(
+    tmp_path, monkeypatch, capsys, guard_result, expected
+):
+    """Spec test 27: entry wiring."""
+    argv = ["am", *_warned_card_args(tmp_path)]
+    guarded: list[list[str]] = []
+
+    def fake_reexec_neutral(seen_argv):
+        guarded.append(list(seen_argv))
+        return guard_result
+
+    monkeypatch.setattr(argv_guard, "reexec_neutral", fake_reexec_neutral)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        cli, "run_card", lambda card_id, **kwargs: _fake_payload(card_id, VERIFY_STORY_ID)
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        cli.entry()
+
+    assert exited.value.code == 0
+    assert guarded == [argv]
+    assert json.loads(capsys.readouterr().out)["data"]["warnings"] == expected
+
+
+def test_the_am_script_targets_entry():
+    """Spec test 28."""
+    pyproject = Path(agent_manager.__file__).parents[2] / "pyproject.toml"
+
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+
+    assert scripts["am"] == "agent_manager.cli:entry"

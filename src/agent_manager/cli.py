@@ -671,6 +671,28 @@ def main() -> None:
     """
 
 
+def entry() -> None:
+    """The `am` console script: `argv_guard` first, then the app.
+
+    `argv_guard.reexec_neutral` replaces the process when `run` or `resume`
+    has a `--verify`; when it returns, the app runs with the warnings it
+    returned (none, or `ARGV_VISIBLE_WARNING`) as `ctx.obj["argv_warnings"]`.
+    """
+    warning = argv_guard.reexec_neutral(sys.argv)
+    app(obj={"argv_warnings": [] if warning is None else [warning]})
+
+
+def add_argv_warnings(ctx: typer.Context, payload: dict[str, Any]) -> None:
+    """Append `entry`'s argv warnings to an ok payload's `warnings`, creating the list.
+
+    No warnings, or no `ctx.obj` (a `CliRunner` that passes none), leaves the
+    payload as it is.
+    """
+    warnings = (ctx.obj or {}).get("argv_warnings", [])
+    if warnings:
+        payload.setdefault("warnings", []).extend(warnings)
+
+
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
@@ -1767,6 +1789,7 @@ Examples:
 
 @app.command("run", epilog=RUN_EXAMPLES)
 def run(
+    ctx: typer.Context,
     card: str | None = typer.Option(
         None,
         "--card",
@@ -2003,6 +2026,7 @@ def run(
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     if detach_run:
         # A handed-off run's outcome is in its report.json, not this exit code.
@@ -3146,6 +3170,7 @@ def resume_run(
 
 @app.command("resume")
 def resume(
+    ctx: typer.Context,
     run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to pick back up."),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
@@ -3190,6 +3215,7 @@ def resume(
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     # A task payload reports `status`; a milestone payload has none and
     # carries `escalated: true` only when it stopped, as for `run`. Both
