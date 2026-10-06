@@ -7928,6 +7928,14 @@ def test_the_help_offers_no_engine_flag(command):
     assert "--engine" not in result.output
 
 
+def test_resume_help_says_the_recorded_suite_is_used():
+    result = runner.invoke(cli.app, ["resume", "--help"])
+
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.replace("│", " ").split())
+    assert "recorded suite is used" in flat
+
+
 # ── am resume on a milestone run (card 54e4ec29) ─────────────────────────────
 
 MILESTONE_AT = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)

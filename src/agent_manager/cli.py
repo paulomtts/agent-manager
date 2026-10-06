@@ -3112,19 +3112,18 @@ def resume(
         False,
         "--allow-no-verification",
         help=(
-            "A walk continued from a checkpoint keeps the opt-out the run started "
-            "with. On a milestone run, this applies to what starts afresh: "
-            "subtasks with no checkpoint, merged bases and Integrate."
+            "A run started with the opt-out keeps it. Passed, this adds the "
+            "opt-out to a run that lacked it, and the run records it."
         ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "A walk continued from a checkpoint keeps the suite the run started "
-            "with, and says so in `warnings` when it differs. On a milestone run, "
-            "this is the suite for what starts afresh: subtasks with no "
-            "checkpoint, merged bases and Integrate."
+            "Omitted, the run's recorded suite is used. Passed, it replaces the "
+            "recorded suite for what starts afresh and is recorded. A walk "
+            "continued from a checkpoint still keeps the checkpoint's suite, "
+            "and says so in `warnings` when a passed one differs."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
