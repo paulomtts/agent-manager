@@ -10803,3 +10803,194 @@ def test_the_detached_board_child_forwards_harness_timeouts_to_each_milestone(bo
     for _milestone_id, kwargs in board_seams.runs.calls:
         assert kwargs["harness_timeout"] == 900.0
         assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+# ── recorded harness timeouts reach the runner; resume keeps or replaces them
+#    (card eee43099) ─────────────────────────────────────────────────────────
+#
+# Unit tier: FakeBoard, FakeDriver, the autouse `integrate_recorder`, and
+# `refresh_git` patched; an `AgentRunner` is built but never called.
+
+TIMED_CONFIG = {"harness_timeout": 900.0, "harness_timeouts": {"implement": 3600.0}}
+
+
+def _record_timed_resume_run(
+    root: Path, milestone: str, *, story_id: str | None = None
+) -> None:
+    """An escalated milestone (or, with `story_id`, story) run recorded with `TIMED_CONFIG`."""
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_run(
+            models.Run(
+                id=RESUME_RUN_ID,
+                workflow="milestone",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status="escalated",
+                config=models.RunConfig(
+                    max_concurrent_stories=1, story_id=story_id, **TIMED_CONFIG
+                ),
+                milestone_id=milestone,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _timeouts(pre: Any) -> tuple[float | None, dict[str, float]]:
+    config = pre.run_record.config
+    return config.harness_timeout, config.harness_timeouts
+
+
+def _resume_preflight_with(root: Path, **extra: Any) -> Any:
+    return orchestrate.preflight_milestone(
+        None, repo_dir=root, resume_run_id=RESUME_RUN_ID, **extra
+    )
+
+
+def test_a_resumed_milestone_preflight_keeps_or_replaces_the_harness_timeouts(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 3: an override replaces both values, never merged."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone, _story, _subtask = _seam_resume_board(fake_board)
+    _record_timed_resume_run(root, milestone)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    kept = _resume_preflight_with(root)
+    replaced = _resume_preflight_with(root, harness_override=(600.0, {"resolve": 900.0}))
+    bare = _resume_preflight_with(root, harness_override=(600.0, {}))
+    per_phase = _resume_preflight_with(root, harness_override=(None, {"plan": 120.0}))
+
+    assert _timeouts(kept) == (900.0, {"implement": 3600.0})
+    assert _timeouts(replaced) == (600.0, {"resolve": 900.0})
+    assert _timeouts(bare) == (600.0, {})
+    assert _timeouts(per_phase) == (None, {"plan": 120.0})
+    assert (replaced.run_record.status, replaced.run_record.milestone_id) == (
+        "started",
+        milestone,
+    )
+    assert replaced.run_record.config.max_concurrent_stories == 1
+
+
+def test_a_resumed_story_preflight_keeps_or_replaces_the_harness_timeouts(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story S: cols")
+    _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_timed_resume_run(root, milestone, story_id=story)
+
+    kept = _resume_preflight_with(root)
+    replaced = _resume_preflight_with(root, harness_override=(None, {"plan": 120.0}))
+
+    assert _timeouts(kept) == (900.0, {"implement": 3600.0})
+    assert _timeouts(replaced) == (None, {"plan": 120.0})
+    assert replaced.run_record.config.story_id == story
+
+
+def test_a_fresh_milestone_preflight_ignores_harness_override(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_milestone(
+        root,
+        shape["milestone"],
+        driver=FakeDriver(),
+        harness_timeout=900.0,
+        harness_override=(60.0, {"resolve": 61.0}),
+    )
+
+    assert _timeouts(pre) == (900.0, {})
+
+
+def test_run_milestone_forwards_harness_override_to_preflight(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    seen = _halting_preflight(monkeypatch, "preflight_milestone")
+
+    with pytest.raises(_HaltAtPreflight):
+        orchestrate.run_milestone(
+            None,
+            repo_dir=tmp_path,
+            resume_run_id=RESUME_RUN_ID,
+            harness_override=(600.0, {"plan": 120.0}),
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_override"] == (600.0, {"plan": 120.0})
+    assert kwargs["resume_run_id"] == RESUME_RUN_ID
+
+
+def _engine_factories(
+    root: Path, monkeypatch, integrate_recorder, **kwargs: Any
+) -> tuple[Any, Any]:
+    """Drive a one-subtask milestone through `run_milestone_engine` and return
+    the factory the driver got and the one Integrate got. `kwargs` go to the
+    preflight, except `runner_factory`, which goes to the engine."""
+    injected = kwargs.pop("runner_factory", None)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    driver = FakeDriver()
+    pre = _preflight_milestone(root, shape["milestone"], driver=driver, **kwargs)
+    with orchestrate.recorded_milestone_run(pre) as recorded:
+        asyncio.run(orchestrate.run_milestone_engine(pre, recorded, runner_factory=injected))
+    (call,) = driver.calls
+    (integrated,) = integrate_recorder.calls
+    return call["runner_factory"], integrated["runner_factory"]
+
+
+def _bound(factory: Any) -> Any:
+    return factory(store=object(), run_id=RESUME_RUN_ID, story_id="story", card_id="card")
+
+
+def test_the_milestone_engine_hands_on_no_factory_when_no_timeout_is_recorded(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+
+    lane, integrate = _engine_factories(root, monkeypatch, integrate_recorder)
+
+    assert lane is None
+    assert integrate is cli.default_runner_factory
+
+
+def test_the_milestone_engine_binds_the_recorded_timeouts_for_lanes_and_integrate(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+
+    lane, integrate = _engine_factories(
+        root,
+        monkeypatch,
+        integrate_recorder,
+        harness_timeout=2.0,
+        harness_timeouts={"resolve": 5.0},
+    )
+
+    for factory in (lane, integrate):
+        runner = _bound(factory)
+        assert runner.timeout_for("explore") == 2.0
+        assert runner.timeout_for("resolve") == 5.0
+
+
+def test_the_milestone_engine_hands_an_injected_factory_on_unchanged(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    """Review Focus 2: the test seam wins over a recorded timeout."""
+    root = _resume_root(tmp_path, monkeypatch)
+
+    def injected(*, store: Any, run_id: str, story_id: str, card_id: str) -> Any:
+        return None
+
+    lane, integrate = _engine_factories(
+        root, monkeypatch, integrate_recorder, harness_timeout=2.0, runner_factory=injected
+    )
+
+    assert lane is injected
+    assert integrate is injected

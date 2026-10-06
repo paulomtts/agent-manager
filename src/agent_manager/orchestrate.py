@@ -1627,6 +1627,7 @@ def preflight_milestone(
     driver: Driver | None = None,
     harness_timeout: float | None = None,
     harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> MilestonePreflight:
     """Stage 1 of a milestone run: every read and refusal, then the run record (card 5daa944e).
 
@@ -1645,6 +1646,12 @@ def preflight_milestone(
     before any write and before git), and its plan, levels, tips and claim
     keys are `_story_plan`'s, as a fresh `preflight_story` computes them,
     `errors.StoryBlockedError` for a re-opened blocker included.
+
+    `harness_override` (card eee43099) is read only on a resume: it
+    replaces both of the recorded run's harness timeouts in `run_record`
+    (`runs.with_harness_override`), so the recorded stage writes it and the
+    engine binds it. A fresh run records `harness_timeout(s)` and never
+    reads it.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1713,7 +1720,7 @@ def preflight_milestone(
         run_id = resumed.id
         # Stamps a run recorded before `milestone_id` existed, so the next
         # resume no longer needs the short-id fallback.
-        run_record = resumed.model_copy(
+        run_record = runs.with_harness_override(resumed, harness_override).model_copy(
             update={"status": "started", "milestone_id": milestone_card.id}
         )
     return MilestonePreflight(
@@ -2007,6 +2014,10 @@ async def run_milestone_engine(
     root, plan, levels, tips = pre.root, pre.plan, pre.levels, pre.tips
     milestone_card, run_record, resumed = pre.milestone_card, pre.run_record, pre.resumed
     base_branch, branch_prefix = pre.base_branch, pre.branch_prefix
+    # Card eee43099: every lane, merged base and Integrate resolver of this
+    # run launches with the run's recorded harness timeouts; an injected
+    # factory (the test seam) is handed on unchanged.
+    runner_factory = cli.runner_factory_for(run_record.config, runner_factory)
 
     # Board-comments B7: any run's leftover comments on this milestone's
     # cards go out under this lease, before anything is driven; a board
@@ -2197,6 +2208,7 @@ def run_milestone(
     control_interval: float = control.CONTROL_POLL_SECONDS,
     harness_timeout: float | None = None,
     harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
@@ -2242,7 +2254,9 @@ def run_milestone(
     (`find_run_milestone`), and the rest is what the run recorded too. Both a
     fresh and a resumed run are recorded with `milestone_id` set to the
     milestone card's full id, which stamps a run recorded before that field
-    existed. The plan is
+    existed. `harness_override` replaces both recorded harness timeouts of a
+    resumed run, and is recorded (card eee43099); a fresh run ignores it.
+    The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
     unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
@@ -2302,6 +2316,7 @@ def run_milestone(
             control_interval=control_interval,
             harness_timeout=harness_timeout,
             harness_timeouts=harness_timeouts,
+            harness_override=harness_override,
         )
     )
 
@@ -2345,6 +2360,7 @@ async def _run_milestone_async(
     control_interval: float = control.CONTROL_POLL_SECONDS,
     harness_timeout: float | None = None,
     harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
     slots: asyncio.Semaphore | None = None,
 ) -> dict[str, Any]:
     """`run_milestone`'s body without its argument validation, awaitable in a
@@ -2380,6 +2396,7 @@ async def _run_milestone_async(
         driver=driver,
         harness_timeout=harness_timeout,
         harness_timeouts=harness_timeouts,
+        harness_override=harness_override,
     )
     with recorded_milestone_run(pre) as recorded:
         return await run_milestone_engine(
