@@ -703,9 +703,11 @@ class AmProcesses:
         self.stderr_paths[child.pid] = stderr_path
         return self.track(child)
 
-    def spawn(self, *args: str, env: Mapping[str, str] | None = None) -> subprocess.Popen:
-        """Start `am *args` as a real child process and track it."""
-        return self._start([sys.executable, "-c", AM_ENTRY, *args], env)
+    def spawn(
+        self, *args: str, env: Mapping[str, str] | None = None, entry: str = AM_ENTRY
+    ) -> subprocess.Popen:
+        """Start `am *args` as a real child process running `entry`, and track it."""
+        return self._start([sys.executable, "-c", entry, *args], env)
 
     def spawn_console(
         self, *args: str, env: Mapping[str, str] | None = None
@@ -792,7 +794,7 @@ def am_processes(tmp_path) -> Any:
 
 @pytest.fixture
 def spawn_am(am_processes) -> Callable[..., subprocess.Popen]:
-    """`spawn_am(*args, env=None)`: start a real `am` child and return it."""
+    """`spawn_am(*args, env=None, entry=AM_ENTRY)`: start a real `am` child and return it."""
     return am_processes.spawn
 
 

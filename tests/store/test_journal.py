@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import get_args
 
 import pytest
+from legacyhelpers import journal_line, write_journal
 from pydantic import ValidationError
 
-from agent_manager import paths, store
+from agent_manager import models, paths, store
 from agent_manager.store import journal as store_journal
 
 RUN_ID = "run-2026-09-23-01"
@@ -38,6 +39,10 @@ _JOURNAL_NAMES = (
     "_UnknownEventLine",
     "ts_text",
     "_TS",
+    "VerbatimLine",
+    "VerbatimJournal",
+    "UnimportableLineError",
+    "read_verbatim",
 )
 
 
@@ -809,3 +814,250 @@ def test_a_failed_mirror_write_raises_and_releases_the_lock(repo, monkeypatch):
 
     assert journal._lock.locked() is False
     assert [line.seq for line in journal.read()] == [4]
+
+
+# -- read_verbatim: a journal as `am migrate` imports it (single-store 1.3.2 D4)
+#
+# Unit tier: real JSONL files under the test's `XDG_DATA_HOME`, nothing spawned.
+
+VERBATIM_RUN = "run-a"
+VERBATIM_TS = "2026-10-07T05:48:08.123+00:00"
+_DROP = object()
+
+
+def _raw(**changes: object) -> str:
+    """A valid line of `VERBATIM_RUN` as JSON text, `changes` applied; `_DROP` removes a key."""
+    record = journal_line(VERBATIM_RUN, 1, VERBATIM_TS)
+    for key, value in changes.items():
+        if value is _DROP:
+            del record[key]
+        else:
+            record[key] = value
+    return json.dumps(record)
+
+
+def _first(seq: int = 1) -> dict[str, object]:
+    return journal_line(VERBATIM_RUN, seq, VERBATIM_TS)
+
+
+def test_unimportable_line_error_is_a_journal_error():
+    assert issubclass(store_journal.UnimportableLineError, store_journal.JournalError)
+    error = store_journal.UnimportableLineError(Path("/x/journal.jsonl"), 3, "why")
+    assert (error.path, error.line, error.why, str(error)) == (
+        Path("/x/journal.jsonl"), 3, "why", "/x/journal.jsonl:3: why"
+    )
+
+
+def test_read_verbatim_keeps_the_ts_string_and_maps_every_field():
+    payload = {"status": "running", "ratio": 1.0, "name": "é"}
+    path = write_journal(
+        VERBATIM_RUN,
+        [
+            journal_line(
+                VERBATIM_RUN, 1, VERBATIM_TS, "phase_upsert", payload,
+                story="s1", card="c1", phase="spec", attempt=2,
+            )
+        ],
+    )
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert found == store_journal.VerbatimJournal(
+        run_id=VERBATIM_RUN,
+        path=path,
+        lines=(
+            store_journal.VerbatimLine(
+                line=1,
+                run_seq=1,
+                ts=VERBATIM_TS,
+                kind="phase_upsert",
+                story_id="s1",
+                card_id="c1",
+                phase="spec",
+                attempt=2,
+                payload=payload,
+            ),
+        ),
+        torn_line=None,
+    )
+    assert type(found.lines[0].payload["ratio"]) is float
+
+
+def test_read_verbatim_keeps_retired_keys_and_cancelled_untouched():
+    run = {"status": models.LEGACY_CANCELED, "workflow": "task"}
+    attempt = {"status": "done", "tokens_in": 10, "tokens_out": 20, "cost": 0.5}
+    path = write_journal(
+        VERBATIM_RUN,
+        [
+            journal_line(VERBATIM_RUN, 1, VERBATIM_TS, "run_upsert", run),
+            journal_line(
+                VERBATIM_RUN, 2, VERBATIM_TS, "attempt_upsert", attempt,
+                story="s1", card="c1", phase="spec", attempt=1,
+            ),
+        ],
+    )
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [line.payload for line in found.lines] == [run, attempt]
+
+
+def test_read_verbatim_skips_blank_lines():
+    path = write_journal(VERBATIM_RUN, [_first()], tail="\n   \n" + _raw(seq=2) + "\n")
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [(line.line, line.run_seq) for line in found.lines] == [(1, 1), (4, 2)]
+    assert found.torn_line is None
+
+
+def test_read_verbatim_skips_a_torn_tail_and_reports_its_line():
+    path = write_journal(VERBATIM_RUN, [_first(1), _first(2)], tail='{"seq": 3, "ts')
+    before = path.read_bytes()
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [line.run_seq for line in found.lines] == [1, 2]
+    assert found.torn_line == 3
+    assert path.read_bytes() == before
+
+
+def test_read_verbatim_imports_a_json_final_line_without_newline():
+    path = write_journal(VERBATIM_RUN, [_first()], tail=_raw(seq=2))
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [line.run_seq for line in found.lines] == [1, 2]
+    assert found.torn_line is None
+
+
+def test_read_verbatim_refuses_a_non_json_line_that_ends_in_newline():
+    path = write_journal(VERBATIM_RUN, [_first()], tail="not json\n")
+
+    with pytest.raises(store_journal.UnimportableLineError) as raised:
+        store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert raised.value.path == path
+    assert raised.value.line == 2
+    assert str(raised.value).startswith(f"{path}:2: line is not JSON")
+
+
+def test_read_verbatim_refuses_a_non_json_line_before_the_last():
+    path = write_journal(VERBATIM_RUN, [_first()], tail="not json\n" + _raw(seq=3) + "\n")
+
+    with pytest.raises(store_journal.UnimportableLineError) as raised:
+        store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert raised.value.path == path
+    assert raised.value.line == 2
+    assert str(raised.value).startswith(f"{path}:2: line is not JSON")
+
+
+@pytest.mark.parametrize(
+    "texts, why",
+    [
+        (("[1, 2]",), "line is not a JSON object"),
+        ((_raw(extra=1),), "unknown key 'extra'"),
+        ((_raw(seq=_DROP),), "seq is missing"),
+        ((_raw(seq=0),), "seq is 0, expected a positive integer"),
+        ((_raw(seq=True),), "seq is True, expected a positive integer"),
+        ((_raw(seq="1"),), "seq is '1', expected a positive integer"),
+        ((_raw(), _raw()), "seq 1 repeats line 1"),
+        ((_raw(ts=_DROP),), "ts is missing"),
+        ((_raw(ts=5),), "ts is 5, expected a string"),
+        ((_raw(ts="yesterday"),), "ts 'yesterday' is not an ISO-8601 timestamp"),
+        ((_raw(ts="2026-10-07T05:48:08"),), "ts '2026-10-07T05:48:08' has no UTC offset"),
+        ((_raw(run_id="run-b"),), "run_id is 'run-b', expected 'run-a'"),
+        ((_raw(event=_DROP),), "event is missing"),
+        ((_raw(event=""),), "event is '', expected a non-empty string"),
+        ((_raw(event=5),), "event is 5, expected a non-empty string"),
+        ((_raw(story=5),), "story is 5, expected a string or null"),
+        ((_raw(attempt=True),), "attempt is True, expected an integer or null"),
+        ((_raw(attempt="1"),), "attempt is '1', expected an integer or null"),
+        ((_raw(payload=[1]),), "payload is a list, expected a JSON object"),
+    ],
+    ids=[
+        "not an object",
+        "unknown key",
+        "seq missing",
+        "seq zero",
+        "seq true",
+        "seq string",
+        "seq repeated",
+        "ts missing",
+        "ts number",
+        "ts unparseable",
+        "ts naive",
+        "run_id mismatch",
+        "event missing",
+        "event empty",
+        "event number",
+        "story number",
+        "attempt true",
+        "attempt string",
+        "payload list",
+    ],
+)
+def test_read_verbatim_refuses_a_malformed_envelope(texts, why):
+    path = write_journal(VERBATIM_RUN, [], tail="".join(text + "\n" for text in texts))
+
+    with pytest.raises(store_journal.UnimportableLineError) as raised:
+        store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert raised.value.path == path
+    assert raised.value.line == len(texts)
+    assert str(raised.value) == f"{path}:{len(texts)}: {why}"
+
+
+def test_read_verbatim_imports_an_unknown_event_kind():
+    path = write_journal(
+        VERBATIM_RUN, [journal_line(VERBATIM_RUN, 1, VERBATIM_TS, "future_upsert", {"x": 1})]
+    )
+
+    (line,) = store_journal.read_verbatim(path, VERBATIM_RUN).lines
+
+    assert (line.kind, line.payload) == ("future_upsert", {"x": 1})
+
+
+def test_read_verbatim_orders_lines_by_seq():
+    path = write_journal(VERBATIM_RUN, [_first(2), _first(1)])
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [(line.run_seq, line.line) for line in found.lines] == [(1, 2), (2, 1)]
+
+
+def test_read_verbatim_of_an_empty_file_has_no_lines():
+    path = write_journal(VERBATIM_RUN, [])
+
+    assert store_journal.read_verbatim(path, VERBATIM_RUN) == store_journal.VerbatimJournal(
+        run_id=VERBATIM_RUN, path=path, lines=(), torn_line=None
+    )
+
+
+def test_read_verbatim_of_a_missing_file_raises_missing_journal():
+    path = paths.data_path() / "runs" / VERBATIM_RUN / store_journal.JOURNAL_NAME
+
+    with pytest.raises(store_journal.MissingJournalError):
+        store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert not paths.data_path().exists()
+
+
+def test_read_verbatim_refuses_invalid_utf8_unless_it_is_the_torn_tail():
+    path = write_journal(VERBATIM_RUN, [_first()])
+    good = path.read_bytes()
+    path.write_bytes(good + b"\xff\xfe\n")
+
+    with pytest.raises(store_journal.UnimportableLineError) as raised:
+        store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert raised.value.line == 2
+    assert str(raised.value) == f"{path}:2: line is not UTF-8"
+
+    path.write_bytes(good + b"\xff\xfe")
+
+    found = store_journal.read_verbatim(path, VERBATIM_RUN)
+
+    assert [line.run_seq for line in found.lines] == [1]
+    assert found.torn_line == 2

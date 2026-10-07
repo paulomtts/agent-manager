@@ -52,6 +52,12 @@ def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
     return None if row is None else _lease_from_row(row)
 
 
+def read_leases(conn: sqlite3.Connection) -> list[LeaseRow]:
+    """Every `run_leases` row, in `run_id` order. Rows must be `sqlite3.Row`."""
+    rows = conn.execute("SELECT * FROM run_leases ORDER BY run_id").fetchall()
+    return [_lease_from_row(row) for row in rows]
+
+
 @dataclass(frozen=True)
 class ClaimRow:
     """One key a run's lease owns: a row of `run_claims` (multi-process X5).

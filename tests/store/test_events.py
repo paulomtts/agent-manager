@@ -624,6 +624,28 @@ def test_head_is_the_largest_seq(conns, project_id, other_project_id):
     assert store_events.head(conn) == last.seq
 
 
+# ── run_ids ──────────────────────────────────────────────────────────────────
+
+
+def test_run_ids_of_an_empty_table_is_empty(conns):
+    conn, _ = conns
+    assert store_events.run_ids(conn) == []
+
+
+def test_run_ids_lists_each_run_once_sorted_over_every_kind_and_project(
+    conns, project_id, other_project_id
+):
+    conn, _ = conns
+    _insert(conn, project_id, run_id="run-c", kind="phase_upsert")
+    _insert(conn, other_project_id, run_id="run-a", kind="run_upsert")
+    _insert(conn, project_id, run_id="run-b", kind="lease_acquired")
+    _insert(conn, project_id, run_id="run-c", kind="attempt_upsert")
+    conn.commit()
+
+    assert store_events.run_ids(conn) == ["run-a", "run-b", "run-c"]
+    assert not conn.in_transaction
+
+
 # ── read ─────────────────────────────────────────────────────────────────────
 
 

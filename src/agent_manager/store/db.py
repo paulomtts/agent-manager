@@ -373,40 +373,46 @@ def _read_only_uri(location: Path) -> str:
     return f"{location.absolute().as_uri()}?{'immutable=1' if settled else 'mode=ro'}"
 
 
+def migration_marker(location: Path) -> str | None:
+    """`location`'s `MIGRATED_KEY` value in `meta`, or `None` when `location`
+    does not exist, has no `meta` table, or has no such row.
+
+    Read through a `_read_only_uri` connection that is closed before
+    returning, so it takes no write lock and creates nothing. When `location`
+    is absent, nothing is opened. Never raises `MigrationRequiredError`.
+    """
+    if not location.exists():
+        return None
+    conn = sqlite3.connect(
+        _read_only_uri(location), uri=True, timeout=BUSY_TIMEOUT_SECONDS
+    )
+    try:
+        has_meta = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+            ).fetchone()
+            is not None
+        )
+        if not has_meta:
+            return None
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (MIGRATED_KEY,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
 def _refuse_unmigrated(location: Path) -> None:
     """Raise `MigrationRequiredError` when the machine still needs `am migrate`.
 
     No legacy database (`paths.legacy_project_dbs`): no refusal. Otherwise
-    refused unless `location` exists and its `meta` table has a
-    `MIGRATED_KEY` row. `location` is read through a read-only connection,
-    closed before returning or raising, so the check takes no write lock and
-    creates nothing.
+    refused unless `migration_marker(location)` finds the marker; that read
+    takes no write lock and creates nothing.
     """
     legacy = paths.legacy_project_dbs()
-    if not legacy:
+    if not legacy or migration_marker(location) is not None:
         return
-    if location.exists():
-        conn = sqlite3.connect(
-            _read_only_uri(location), uri=True, timeout=BUSY_TIMEOUT_SECONDS
-        )
-        try:
-            has_meta = (
-                conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
-                ).fetchone()
-                is not None
-            )
-            migrated = (
-                has_meta
-                and conn.execute(
-                    "SELECT 1 FROM meta WHERE key = ?", (MIGRATED_KEY,)
-                ).fetchone()
-                is not None
-            )
-        finally:
-            conn.close()
-        if migrated:
-            return
     raise MigrationRequiredError(legacy)
 
 
@@ -447,8 +453,23 @@ def open_db(root: Path) -> sqlite3.Connection:
     the database briefly; two processes never write one run, because every
     run write is fenced by the lease token (multi-process X4).
     """
+    _refuse_unmigrated(paths.db_path())
+    return open_db_for_migration()
+
+
+def open_db_for_migration() -> sqlite3.Connection:
+    """Open `paths.db_path()` exactly as `open_db` does, without its
+    `MigrationRequiredError` refusal.
+
+    The data directory is created; WAL is set (retried as in `open_db`); the
+    schema and `_ADDED_COLUMNS` are applied; a missing `STORE_ID_KEY` is
+    minted; `user_version` is stamped. A `user_version` above
+    `SCHEMA_VERSION` closes the connection and raises `StoreSchemaError`
+    with the file unchanged. Rows are `sqlite3.Row`; `check_same_thread` is
+    off. `migrate.migrate` is its only caller: it opens on a machine whose
+    per-project databases are not merged yet, which every other opener refuses.
+    """
     location = paths.db_path()
-    _refuse_unmigrated(location)
     paths.data_dir()
     conn = sqlite3.connect(
         location,
