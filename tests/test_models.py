@@ -410,8 +410,16 @@ def test_run_config_rejects_an_unknown_launcher():
     with pytest.raises(ValidationError) as excinfo:
         models.RunConfig(launcher="docker")
     message = str(excinfo.value)
-    for allowed in ("direct", "bwrap", "container"):
+    for allowed in ("direct", "bwrap", "unshare", "container"):
         assert allowed in message
+
+
+def test_run_config_accepts_and_round_trips_the_unshare_launcher():
+    config = models.RunConfig(launcher="unshare")
+    assert config.launcher == "unshare"
+    restored = models.RunConfig.model_validate_json(config.model_dump_json())
+    assert restored.launcher == "unshare"
+    assert restored == config
 
 
 def test_run_config_rejects_a_harness_map_entry_missing_its_model():
@@ -444,6 +452,56 @@ def test_run_config_rejects_a_non_string_story_id(value):
     with pytest.raises(ValidationError) as excinfo:
         models.RunConfig(story_id=value)
     assert "story_id" in str(excinfo.value)
+
+
+def test_run_config_verify_defaults_to_an_empty_list_and_the_opt_out_to_false():
+    first, second = models.RunConfig(), models.RunConfig()
+
+    assert first.verify == []
+    assert first.allow_no_verification is False
+    first.verify.append("uv run pytest")
+    assert second.verify == []
+
+
+def test_run_config_keeps_a_verify_list_verbatim():
+    suite = ["b", "a", "a", " x ", ""]
+
+    dumped = models.RunConfig(verify=suite).model_dump(mode="json")
+
+    assert dumped["verify"] == suite
+    assert models.RunConfig.model_validate(dumped).verify == suite
+
+
+@pytest.mark.parametrize("value", ["true", [1], None])
+def test_run_config_rejects_a_non_list_verify(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(verify=value)
+    assert "verify" in str(excinfo.value)
+
+
+def test_run_config_accepts_allow_no_verification_true():
+    dumped = models.RunConfig(allow_no_verification=True).model_dump(mode="json")
+
+    assert dumped["allow_no_verification"] is True
+    assert models.RunConfig.model_validate(dumped).allow_no_verification is True
+
+
+FALLBACK_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+def test_run_config_isolation_warning_defaults_to_none_and_round_trips():
+    """A5 spec test 1: defaulted, so a config recorded before the field validates."""
+    assert models.RunConfig().isolation_warning is None
+    legacy = models.RunConfig().model_dump(mode="json")
+    del legacy["isolation_warning"]
+    assert models.RunConfig.model_validate(legacy).isolation_warning is None
+
+    dumped = models.RunConfig(isolation_warning=FALLBACK_WARNING).model_dump(mode="json")
+
+    assert dumped["isolation_warning"] == FALLBACK_WARNING
+    assert models.RunConfig.model_validate(dumped).isolation_warning == FALLBACK_WARNING
 
 
 def test_story_rejects_a_negative_level():

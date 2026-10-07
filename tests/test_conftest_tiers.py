@@ -17,6 +17,7 @@ from conftest import (
     default_tier_marker,
     pytest_collection_modifyitems,
     relative_to_tests,
+    stubs_isolation_probe,
 )
 
 
@@ -182,3 +183,36 @@ def test_hook_leaves_unmarked_fake_claude_items_unmarked():
     item = _FakeItem(TESTS_DIR / "e2e" / "test_fake_claude.py")
     pytest_collection_modifyitems(None, [item])
     assert item.added == []
+
+
+@pytest.mark.parametrize("tier", ["e2e_fake", "e2e", "soak"])
+def test_the_isolation_probe_is_real_in_the_process_tiers(tier):
+    """A5 test harness rule: those tiers run the real probe."""
+    assert stubs_isolation_probe({tier}, PurePosixPath("e2e/test_x.py")) is False
+
+
+def test_the_isolation_probe_is_real_in_the_launcher_tests():
+    """`tests/harness/test_launcher.py` manages the cache and tests the real runner."""
+    assert stubs_isolation_probe(set(), PurePosixPath("harness/test_launcher.py")) is False
+
+
+@pytest.mark.parametrize(
+    ("markers", "rel_path"),
+    [
+        (set(), PurePosixPath("test_cli.py")),
+        ({"git"}, PurePosixPath("test_cli.py")),
+        ({"brd"}, PurePosixPath("test_board.py")),
+        (set(), PurePosixPath("harness/test_claude.py")),
+        (set(), None),
+    ],
+)
+def test_the_isolation_probe_is_stubbed_everywhere_else(markers, rel_path):
+    assert stubs_isolation_probe(markers, rel_path) is True
+
+
+def test_the_stubbed_probe_says_every_mode_is_available_without_a_process():
+    """The autouse fixture is live for this unit test: `auto` lands on bwrap."""
+    from agent_manager.harness import launcher
+
+    assert launcher.default_probe_runner(["/nonexistent/probe"]) == 0
+    assert launcher.resolve_isolation("auto") == launcher.Isolation("bwrap", None)

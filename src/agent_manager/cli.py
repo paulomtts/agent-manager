@@ -29,12 +29,13 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from pydantic import ValidationError
 
 from agent_manager import (
+    argv_guard,
     board,
     census,
     comments,
@@ -53,7 +54,7 @@ from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
-from agent_manager.harness.launcher import run_direct
+from agent_manager.harness import launcher
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
@@ -366,7 +367,8 @@ def status_payload(
     once, at the edge, the same way `run_card`'s `worktree` is handled. Field
     names are `models.py`'s and are not renamed for display. `control` is
     `control_view`'s result; `None` renders as no lease and no requests, so
-    the key is always present (C12).
+    the key is always present (C12). `warnings` lists the run's recorded
+    `isolation_warning`, or is empty (A5).
     """
     tree = run.model_dump()
     return {
@@ -379,6 +381,9 @@ def status_payload(
         "control": {"lease": None, "requests": [], "claims": []}
         if control is None
         else control,
+        "warnings": []
+        if run.config.isolation_warning is None
+        else [run.config.isolation_warning],
     }
 
 
@@ -670,6 +675,28 @@ def main() -> None:
     """
 
 
+def entry() -> None:
+    """The `am` console script: `argv_guard` first, then the app.
+
+    `argv_guard.reexec_neutral` replaces the process when `run` or `resume`
+    has a `--verify`; when it returns, the app runs with the warnings it
+    returned (none, or `ARGV_VISIBLE_WARNING`) as `ctx.obj["argv_warnings"]`.
+    """
+    warning = argv_guard.reexec_neutral(sys.argv)
+    app(obj={"argv_warnings": [] if warning is None else [warning]})
+
+
+def add_argv_warnings(ctx: typer.Context, payload: dict[str, Any]) -> None:
+    """Append `entry`'s argv warnings to an ok payload's `warnings`, creating the list.
+
+    No warnings, or no `ctx.obj` (a `CliRunner` that passes none), leaves the
+    payload as it is.
+    """
+    warnings = (ctx.obj or {}).get("argv_warnings", [])
+    if warnings:
+        payload.setdefault("warnings", []).extend(warnings)
+
+
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
@@ -681,16 +708,29 @@ def default_runner_factory(
     story_id: str,
     card_id: str,
 ) -> AgentPhaseRunner:
-    """The production runner: real adapters, real roles, the direct launcher.
+    """The production runner: real adapters, real roles, the run's recorded launcher.
+
+    The launcher mode is the run's `RunConfig.launcher`, read from the
+    projection on every call (A5 B2), so subtask phases, both conflict
+    resolvers, a detached child and a resumed run all launch the way the run
+    was recorded. It never probes: that happened at run or resume start. A
+    run with no row is `UnknownRunError`, never a silent `direct`.
+    `launcher.get_launcher` is read at call time so a test can patch it.
 
     `adapters` and `result_models` keep `AgentRunner`'s own defaults and
     `harness_map` stays empty, so every role falls back to `DEFAULT_HARNESS` and
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
     """
+    config = store_module.run_config(store.connection, run_id)
+    if config is None:
+        raise UnknownRunError(
+            f"run {run_id!r} has no row in the projection, so the launcher it was"
+            " recorded with is unknown; no agent is launched for it"
+        )
     return dispatch.AgentRunner(
         store=store,
-        launcher=run_direct,
+        launcher=launcher.get_launcher(config.launcher),
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,
@@ -962,6 +1002,10 @@ def preflight_card(
     repo_dir: Path,
     branch_prefix: str,
     base_branch: str = "master",
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
@@ -970,7 +1014,10 @@ def preflight_card(
     and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
     and before any store exists, so a refused card leaves no run directory
     (X5). Only then is the clock read and the run id minted, and the
-    `started` run, story and subtask records built. Nothing is written.
+    `started` run, story and subtask records built; the run's config records
+    `commands` as its `verify` suite, `allow_no_verification`, and the resolved
+    `launcher` (`None` recording `direct`) with its `isolation_warning`. Nothing
+    is written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -1006,7 +1053,12 @@ def preflight_card(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(
+                verify=list(commands),
+                allow_no_verification=allow_no_verification,
+                launcher="direct" if launcher is None else launcher,
+                isolation_warning=isolation_warning,
+            ),
         ),
         story=models.StoryRun(
             card_id=parent.id,
@@ -1150,6 +1202,8 @@ def run_card(
     branch_prefix: str,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -1188,6 +1242,10 @@ def run_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:
@@ -1554,6 +1612,8 @@ def detach_card(
     detacher: detach.Detacher,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -1572,6 +1632,10 @@ def detach_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:
@@ -1593,6 +1657,43 @@ def detach_card(
     return hand_off_to_child(
         root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
     )
+
+
+def verify_commands(verify: Sequence[str], *, from_env: bool) -> list[str]:
+    """The verification commands `run` and `resume` drive, from `--verify` or `AM_VERIFY_JSON`.
+
+    `AM_VERIFY_JSON` is popped from `os.environ` on every call, with or
+    without `from_env`, so no process the run spawns inherits it; its value
+    is read only under `--verify-from-env`, the flag `argv_guard` puts in
+    place of every `--verify`. Without the flag the commands are `verify`.
+    With it they are the variable's JSON list of strings, the empty list
+    included. The flag with any `--verify`, with the variable unset, or with
+    a value that is not a JSON list of strings is a usage error (exit 2)
+    whose message never echoes the value.
+    """
+    raw = os.environ.pop(argv_guard.VERIFY_ENV, None)
+    if not from_env:
+        return list(verify)
+    if verify:
+        raise typer.BadParameter(
+            "--verify and --verify-from-env are exclusive",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    if raw is None:
+        raise typer.BadParameter(
+            f"--verify-from-env needs {argv_guard.VERIFY_ENV}, and it is unset",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise typer.BadParameter(
+            f"{argv_guard.VERIFY_ENV} is not a JSON list of strings",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    return value
 
 
 def _check_run_targets(
@@ -1719,6 +1820,7 @@ Examples:
 
 @app.command("run", epilog=RUN_EXAMPLES)
 def run(
+    ctx: typer.Context,
     card: str | None = typer.Option(
         None,
         "--card",
@@ -1818,9 +1920,23 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
+    isolation: launcher.IsolationRequest = typer.Option(
+        "auto",
+        "--isolation",
+        help=(
+            "Run every agent in a PID namespace of its own, so it cannot signal "
+            "the engine: `bwrap`, `unshare`, `auto` (bwrap, then unshare, else "
+            "none with a warning) or `none`. A named mode this host cannot start "
+            "is refused before anything is written. Ignored with --dry-run."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
+    commands = verify_commands(verify, from_env=verify_from_env)
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1832,7 +1948,16 @@ def run(
         story=story,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
+    isolation_warning: str | None = None
     try:
+        # A5 B1: first after the argument checks, before any board read,
+        # `refresh_git`, store, lease or fork, so a refused mode writes
+        # nothing. A dry run launches nothing and probes nothing. Read as
+        # `launcher.resolve_isolation` so a test can patch it.
+        mode: models.Launcher | None = None
+        if not dry_run:
+            resolved = launcher.resolve_isolation(isolation)
+            mode, isolation_warning = resolved.mode, resolved.warning
         if whole_board and dry_run:
             payload = dry_run_board(
                 repo_dir=repo_dir,
@@ -1847,8 +1972,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
             )
@@ -1860,8 +1987,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
             )
         elif milestone is not None and dry_run:
@@ -1880,8 +2009,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
             )
@@ -1894,8 +2025,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
             )
         elif story is not None and dry_run:
@@ -1913,8 +2046,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 detacher=detach.fork_detacher,
             )
         elif story is not None:
@@ -1925,8 +2060,10 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
             )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
@@ -1936,7 +2073,9 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                launcher=mode,
+                isolation_warning=isolation_warning,
+                commands=commands,
                 detacher=detach.fork_detacher,
             )
         else:
@@ -1946,11 +2085,18 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                launcher=mode,
+                isolation_warning=isolation_warning,
+                commands=commands,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if isolation_warning is not None:
+        # Once, at the top level (a board's milestone entries never carry
+        # it), before `argv_guard`'s warning.
+        payload.setdefault("warnings", []).append(isolation_warning)
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     if detach_run:
         # A handed-off run's outcome is in its report.json, not this exit code.
@@ -2871,6 +3017,9 @@ def _resume_from_checkpoint(
     comes, when a passed `commands` differs from the suite the checkpoint
     keeps (`runtime_engine.kept_commands`), one `verification: kept from
     checkpoint: [...]` warning naming the kept suite (card 5b19aa93).
+    `commands` is the passed `--verify` and is read for that warning only:
+    the walk is driven with `run.config.verify` and `allow_no_verification`,
+    and both `record_run` calls write `run`'s config back.
     """
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
@@ -2929,7 +3078,7 @@ def _resume_from_checkpoint(
                         parent=parent,
                         subtask=resumed,
                         repo_dir=root,
-                        commands=commands,
+                        commands=run.config.verify,
                         allow_no_verification=allow_no_verification,
                         runner_factory=runner_factory,
                         stop=stop,
@@ -2988,6 +3137,7 @@ def resume_run(
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
+    isolation: Literal["none"] | None = None,
 ) -> dict[str, Any]:
     """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
 
@@ -3005,18 +3155,32 @@ def resume_run(
 
     Branch, base branch and worktree come from the recorded run and never
     from a flag: §9's "the run records what it was started with" is the
-    reason the record exists. The two knobs the record does *not* carry --
-    `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are still taken as arguments. A walk continued from a checkpoint never
-    reads them: its binding comes from the checkpoint's pool, and a `task`
-    resume whose `commands` differ from that pool's adds a `verification:
-    kept from checkpoint: [...]` warning. On a milestone
-    they also reach what starts afresh -- subtasks with no checkpoint, merged
-    bases and Integrate.
+    reason the record exists. So do the suite and the opt-out
+    (`RunConfig.verify`, `RunConfig.allow_no_verification`): a non-empty
+    `commands` replaces the recorded suite, `allow_no_verification` can only
+    add the opt-out, and the result is written back to the record by the
+    resume's first `record_run`, so a refused resume still writes nothing.
+    A walk continued from a checkpoint keeps the checkpoint's pool instead,
+    and a `task` resume whose passed `commands` differ from it adds a
+    `verification: kept from checkpoint: [...]` warning. On a milestone the
+    resulting suite and opt-out reach what starts afresh -- subtasks with no
+    checkpoint, merged bases and Integrate. When a passed `commands` differs
+    from the recorded suite, the payload's last warning is `verification:
+    replaced in run record: [...]`, naming the suite it replaced.
 
     A run canceled in either spelling is refused for both workflows (live
     control C9), and so is a run whose lease is still live (C10): both
     refusals read only the connection that loaded the run.
+
+    The launcher mode (A5 B3) is decided after those read-only refusals and
+    before anything is written. `isolation="none"` runs it `direct` with no
+    warning and probes nothing. Otherwise a run recorded `bwrap` or
+    `unshare` is re-probed (`launcher.resolve_isolation`) and refused with
+    `IsolationUnavailableError` if this host can no longer start it; a run
+    recorded `direct` keeps `direct` and its recorded `isolation_warning`
+    with no probe. The pair goes into the same config copy as the suite, so
+    a refused resume writes nothing, and a warning is placed in `warnings`
+    before the `verification: replaced` entry.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3039,32 +3203,71 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    # A5 B3: after every read-only refusal, before anything is written.
+    if isolation == "none":
+        mode: models.Launcher = "direct"
+        isolation_warning: str | None = None
+    elif run.config.launcher in ("bwrap", "unshare"):
+        # Read as `launcher.resolve_isolation` so a test can patch it.
+        restored = launcher.resolve_isolation(run.config.launcher)
+        mode, isolation_warning = restored.mode, restored.warning
+    else:
+        mode, isolation_warning = run.config.launcher, run.config.isolation_warning
+    explicit = list(commands)
+    recorded = run.config.verify
+    run = run.model_copy(
+        update={
+            "config": run.config.model_copy(
+                update={
+                    "verify": explicit or list(recorded),
+                    "allow_no_verification": allow_no_verification
+                    or run.config.allow_no_verification,
+                    "launcher": mode,
+                    "isolation_warning": isolation_warning,
+                }
+            )
+        }
+    )
+    replaced = (
+        f"verification: replaced in run record: {recorded!r}"
+        if explicit and explicit != recorded
+        else None
+    )
     if run.workflow == WORKFLOW_NAME:
-        return _resume_from_checkpoint(
+        payload = _resume_from_checkpoint(
             run,
             root=root,
-            allow_no_verification=allow_no_verification,
+            allow_no_verification=run.config.allow_no_verification,
             commands=commands,
             runner_factory=runner_factory,
         )
     # Read as `orchestrate.run_milestone` so a test can patch it there.
-    if run.workflow == orchestrate.MILESTONE_WORKFLOW:
-        return orchestrate.run_milestone(
+    elif run.workflow == orchestrate.MILESTONE_WORKFLOW:
+        payload = orchestrate.run_milestone(
             None,
             repo_dir=root,
-            commands=list(commands),
-            allow_no_verification=allow_no_verification,
+            commands=list(run.config.verify),
+            allow_no_verification=run.config.allow_no_verification,
+            launcher=mode,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             resume_run_id=run.id,
         )
-    raise NotResumableError(
-        f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
-        f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
-    )
+    else:
+        raise NotResumableError(
+            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+        )
+    if isolation_warning is not None:
+        payload.setdefault("warnings", []).append(isolation_warning)
+    if replaced is not None:
+        payload.setdefault("warnings", []).append(replaced)
+    return payload
 
 
 @app.command("resume")
 def resume(
+    ctx: typer.Context,
     run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to pick back up."),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
@@ -3073,19 +3276,30 @@ def resume(
         False,
         "--allow-no-verification",
         help=(
-            "A walk continued from a checkpoint keeps the opt-out the run started "
-            "with. On a milestone run, this applies to what starts afresh: "
-            "subtasks with no checkpoint, merged bases and Integrate."
+            "A run started with the opt-out keeps it. Passed, this adds the "
+            "opt-out to a run that lacked it, and the run records it."
         ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "A walk continued from a checkpoint keeps the suite the run started "
-            "with, and says so in `warnings` when it differs. On a milestone run, "
-            "this is the suite for what starts afresh: subtasks with no "
-            "checkpoint, merged bases and Integrate."
+            "Omitted, the run's recorded suite is used. Passed, it replaces the "
+            "recorded suite for what starts afresh and is recorded. A walk "
+            "continued from a checkpoint still keeps the checkpoint's suite, "
+            "and says so in `warnings` when a passed one differs."
+        ),
+    ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
+    isolation: Literal["none"] | None = typer.Option(
+        None,
+        "--isolation",
+        help=(
+            "Omitted, the run's recorded launcher is restored and re-probed, and a "
+            "run recorded isolated is refused if this host can no longer start it. "
+            "`none` runs the rest of it without isolation, on purpose, and records that."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
@@ -3096,16 +3310,19 @@ def resume(
     started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
+    commands = verify_commands(verify, from_env=verify_from_env)
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
-            commands=list(verify),
+            commands=commands,
+            isolation=isolation,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     # A task payload reports `status`; a milestone payload has none and
     # carries `escalated: true` only when it stopped, as for `run`. Both

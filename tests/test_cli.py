@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,7 @@ from typer.testing import CliRunner
 
 import agent_manager
 from agent_manager import (
+    argv_guard,
     board,
     census,
     cli,
@@ -56,6 +58,7 @@ from agent_manager import (
     store as store_module,
 )
 from agent_manager.errors import AgentPhaseFailed
+from agent_manager.harness import launcher
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps.reducers import verification_gate
@@ -360,6 +363,30 @@ def test_the_status_header_of_a_story_run_carries_its_story_id_through_render():
     assert payload["run"]["story_id"] == story
     assert data["run"]["story_id"] == story
     assert set(data["run"]) == STATUS_HEADER_KEYS
+
+
+FALLBACK = launcher.ISOLATION_NONE_WARNING
+"""`--isolation auto`'s warning when neither bwrap nor unshare can start."""
+
+
+def test_the_status_payload_shows_a_recorded_isolation_warning_at_the_top_level():
+    """A5 spec test 10: `warnings` is a top-level key; the header is unchanged."""
+    run = _pure_run([])
+    run.config = models.RunConfig(isolation_warning=FALLBACK)
+
+    payload = cli.status_payload(run)
+
+    assert payload["warnings"] == [FALLBACK]
+    assert set(payload["run"]) == STATUS_HEADER_KEYS
+    assert not CONFIG_ONLY_KEYS & set(payload["run"])
+
+
+@pytest.mark.parametrize("mode", ["direct", "bwrap", "unshare"])
+def test_the_status_payload_of_a_run_without_a_warning_has_empty_warnings(mode):
+    run = _pure_run([])
+    run.config = models.RunConfig(launcher=mode)
+
+    assert cli.status_payload(run)["warnings"] == []
 
 
 def _pure_subtask(card_id: str, phases: list[models.PhaseRun]) -> models.SubtaskRun:
@@ -1269,9 +1296,10 @@ def project(tmp_path, monkeypatch) -> Path:
     )
     # `brd init` leaves its own `.gitignore`/`.brd` marker untracked; committing
     # them here keeps the fixture's baseline clean so a later porcelain check
-    # reflects only what `run_card` itself adds to the repo.
+    # reflects only what `run_card` itself adds to the repo. A brd that leaves
+    # nothing untracked makes that commit empty, hence `--allow-empty`.
     _git(root, "add", "-A")
-    _git(root, "commit", "-m", "brd init")
+    _git(root, "commit", "--allow-empty", "-m", "brd init")
     return root
 
 
@@ -2271,13 +2299,14 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
 @pytest.mark.git
 def test_no_harness_is_ever_launched(project, cards, monkeypatch):
     """§14's adapter rule at the CLI seam: the launcher is injected, so a test
-    that gets as far as launching one has already failed. `run_direct` is the
-    only thing `default_runner_factory` would hand to a real `AgentRunner`."""
+    that gets as far as launching one has already failed. `launcher.get_launcher` is
+    the only source of what `default_runner_factory` would hand to a real
+    `AgentRunner`."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("the CLI launched a harness process")
 
-    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.launcher, "get_launcher", lambda kind: forbidden)
     monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
     payload = cli.run_card(
         cards["subtask"],
@@ -3182,6 +3211,8 @@ def test_a_milestone_run_calls_run_milestone_once_with_the_run_options(
                 "branch_prefix": "m3",
                 "commands": ["uv run pytest", "uv run ruff check"],
                 "allow_no_verification": True,
+                "launcher": "bwrap",
+                "isolation_warning": None,
                 "max_concurrent": 4,
             },
         )
@@ -4181,6 +4212,8 @@ def test_a_board_run_calls_run_board_once_with_the_run_options(tmp_path, monkeyp
         "base_branch": "main",
         "commands": ["uv run pytest", "uv run ruff check"],
         "allow_no_verification": True,
+        "launcher": "bwrap",
+        "isolation_warning": None,
         "max_concurrent": cli.DEFAULT_MAX_CONCURRENT,
     }
     assert prefix_of(BOARD_CARD) == "milestone-14-run-the-cbe34d00"
@@ -4414,6 +4447,10 @@ def _record(
     workflow: str = "task",
     milestone_id: str | None = None,
     story_id: str | None = None,
+    verify: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
     in `root`'s projection, written the only way this program writes rows. The
@@ -4431,7 +4468,13 @@ def _record(
                 branch_prefix="m1",
                 status=status,
                 started_at=started_at,
-                config=models.RunConfig(story_id=story_id),
+                config=models.RunConfig(
+                    story_id=story_id,
+                    verify=list(verify),
+                    allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
+                ),
                 milestone_id=milestone_id,
             )
         )
@@ -4765,6 +4808,21 @@ def test_status_on_a_story_run_shows_its_story_id_and_no_config(projection):
     assert header["story_id"] == RUNS_STORY_ID
     assert header["workflow"] == "milestone"
     assert set(header) == STATUS_HEADER_KEYS
+
+
+def test_am_status_shows_a_recorded_isolation_warning(projection):
+    """A5 spec test 10, CLI: how a detached fallback run still says it."""
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection, run_id, started_at=RECORDED_AT, status="started", isolation_warning=FALLBACK
+    )
+
+    result = runner.invoke(cli.app, ["status", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["warnings"] == [FALLBACK]
+    assert set(data["run"]) == STATUS_HEADER_KEYS
 
 
 def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_id_lease_and_progress(projection):
@@ -7598,6 +7656,123 @@ def test_a_refused_task_resume_with_a_differing_verify_says_nothing_of_the_suite
     assert _resume_state(project) == before
 
 
+def _plant_recorded_suite(project: Path, run_id: str, verify: list[str]) -> None:
+    """Re-record `run_id` with `verify` as its suite: what an earlier resume with
+    a differing `--verify` leaves behind."""
+    run = _loaded(project, run_id)
+    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    try:
+        opened.record_run(
+            run.model_copy(update={"config": run.config.model_copy(update={"verify": verify})})
+        )
+    finally:
+        opened.close()
+
+
+@pytest.mark.git
+def test_a_task_resume_with_a_different_verify_writes_it_back_to_the_record(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    before = len(_run_upserts(run_id))
+
+    payload = cli.resume_run(
+        run_id,
+        repo_dir=project,
+        commands=["echo instrumented"],
+        runner_factory=_resume_factory(),
+    )
+
+    assert _loaded(project, run_id).config.verify == ["echo instrumented"]
+    written = _run_upserts(run_id)[before:]
+    assert written
+    assert all(line.payload["config"]["verify"] == ["echo instrumented"] for line in written)
+    assert payload["warnings"][-1] == "verification: replaced in run record: ['true']"
+    assert "verification: kept from checkpoint: ['true']" in payload["warnings"]
+
+
+@pytest.mark.git
+def test_a_task_resume_without_verify_after_a_replacement_says_nothing_of_the_suite(
+    project, cards
+):
+    """Card 5b19aa93's T6 stays keyed on the flag: a record that differs from
+    the checkpoint's pool is not announced when `--verify` is omitted."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_recorded_suite(project, run_id, ["echo instrumented"])
+
+    payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert _kept_warnings(payload) == []
+    assert not [w for w in payload["warnings"] if w.startswith(REPLACED)]
+    assert _loaded(project, run_id).config.verify == ["echo instrumented"]
+
+
+@pytest.mark.git
+def test_a_refused_resume_with_a_differing_verify_leaves_the_record_unchanged(
+    project, cards, monkeypatch
+):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_changed_digest(project, run_id, cards["subtask"])
+    before = _resume_state(project)
+    monkeypatch.setattr(cli, "default_runner_factory", _Forbidden("default_runner_factory"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", run_id, "--repo-dir", str(project), "--verify", "echo instrumented"],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"]["type"] == "CheckpointMismatchError"
+    assert REPLACED not in result.stdout
+    assert _resume_state(project) == before
+    assert _loaded(project, run_id).config.verify == ["true"]
+
+
+@pytest.mark.git
+def test_a_task_resume_without_verify_hands_the_walk_the_recorded_suite(
+    project, cards, monkeypatch
+):
+    """Review Focus 1: the walk gets the record's suite, so one that declines
+    its checkpoint and starts afresh still verifies."""
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+    _plant_recorded_suite(project, run_id, ["echo recorded"])
+    real = cli.drive_subtask_async
+    handed: list[tuple[list[str], bool]] = []
+
+    def spy(**kwargs: Any) -> Any:
+        handed.append((list(kwargs["commands"]), kwargs["allow_no_verification"]))
+        return real(**kwargs)
+
+    monkeypatch.setattr(cli, "drive_subtask_async", spy)
+
+    cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
+
+    assert handed == [(["echo recorded"], False)]
+
+
+def _run_upserts(run_id: str) -> list[Any]:
+    """Every `run_upsert` line of `run_id`'s journal, oldest first."""
+    return [line for line in store_module.Journal(run_id).read() if line.event == "run_upsert"]
+
+
+@pytest.mark.git
+def test_a_card_runs_first_run_upsert_records_its_suite(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", commands=("true",))
+
+    first = _run_upserts(run_id)[0]
+
+    assert first.payload["config"]["verify"] == ["true"]
+    assert first.payload["config"]["allow_no_verification"] is False
+
+
+@pytest.mark.git
+def test_a_card_runs_first_run_upsert_records_its_opt_out(project, cards):
+    run_id = _crash_pygents(project, cards, "plan", allow_no_verification=True)
+
+    first = _run_upserts(run_id)[0]
+
+    assert first.payload["config"]["verify"] == []
+    assert first.payload["config"]["allow_no_verification"] is True
+
+
 @pytest.mark.git
 def test_a_parked_milestone_subtask_resumes_on_pygents_instead_of_being_refused(
     project, cards, monkeypatch
@@ -7766,7 +7941,7 @@ def test_resume_launches_no_harness(project, cards, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("resume launched a harness process")
 
-    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.launcher, "get_launcher", lambda kind: forbidden)
     monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
 
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
@@ -7803,6 +7978,14 @@ def test_the_help_offers_no_engine_flag(command):
 
     assert result.exit_code == 0, result.output
     assert "--engine" not in result.output
+
+
+def test_resume_help_says_the_recorded_suite_is_used():
+    result = runner.invoke(cli.app, ["resume", "--help"])
+
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.replace("│", " ").split())
+    assert "recorded suite is used" in flat
 
 
 # ── am resume on a milestone run (card 54e4ec29) ─────────────────────────────
@@ -7919,7 +8102,17 @@ def _loaded(project: Path, run_id: str) -> models.Run:
     return run
 
 
-def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "milestone") -> None:
+def _record_milestone(
+    root: Path,
+    run_id: str,
+    *,
+    status: str,
+    workflow: str = "milestone",
+    verify: tuple[str, ...] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
+) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -7931,6 +8124,12 @@ def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "
                 branch_prefix="m4",
                 status=status,
                 started_at=RECORDED_AT,
+                config=models.RunConfig(
+                    verify=list(verify),
+                    allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
+                ),
             )
         )
     finally:
@@ -8086,7 +8285,7 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
 
     def fake_run_milestone(milestone, **kwargs):
         calls.append((milestone, kwargs))
-        return {"done": True, "run_id": run_id, "resumed": True}
+        return {"done": True, "run_id": run_id, "resumed": True, "warnings": []}
 
     def factory(**kwargs):
         return None
@@ -8102,7 +8301,12 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
         runner_factory=factory,
     )
 
-    assert payload == {"done": True, "run_id": run_id, "resumed": True}
+    assert payload == {
+        "done": True,
+        "run_id": run_id,
+        "resumed": True,
+        "warnings": ["verification: replaced in run record: []"],
+    }
     assert calls == [
         (
             None,
@@ -8110,11 +8314,196 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
                 "repo_dir": projection.resolve(),
                 "commands": ["uv run pytest"],
                 "allow_no_verification": True,
+                "launcher": "direct",
+                "isolation_warning": None,
                 "runner_factory": factory,
                 "resume_run_id": run_id,
             },
         )
     ]
+
+
+REPLACED = "verification: replaced in run record"
+
+
+def _replaced(payload: dict[str, Any]) -> list[str]:
+    return [w for w in payload.get("warnings", []) if w.startswith(REPLACED)]
+
+
+def _task_resume_spy(monkeypatch) -> list[tuple[models.Run, dict[str, Any]]]:
+    """Patch `_resume_from_checkpoint` to record the run and kwargs it is handed."""
+    seen: list[tuple[models.Run, dict[str, Any]]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append((run, kwargs))
+        return {"status": "done", "warnings": []}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    return seen
+
+
+def _milestone_resume_spy(
+    monkeypatch, returned: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Patch `orchestrate.run_milestone` to record its kwargs and return `returned`."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append(kwargs)
+        return {"done": True, "warnings": []} if returned is None else dict(returned)
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    return calls
+
+
+def test_a_task_resume_without_verify_drives_the_recorded_suite(projection, monkeypatch):
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection,
+        run_id,
+        started_at=RECORDED_AT,
+        status="started",
+        verify=("uv run pytest",),
+        allow_no_verification=True,
+    )
+    seen = _task_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    [(run, kwargs)] = seen
+    assert run.config.verify == ["uv run pytest"]
+    assert run.config.allow_no_verification is True
+    assert kwargs["allow_no_verification"] is True
+    assert kwargs["commands"] == ()
+    assert _replaced(payload) == []
+
+
+def test_a_milestone_resume_without_verify_passes_the_recorded_suite(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(
+        projection,
+        run_id,
+        status="escalated",
+        verify=("uv run pytest",),
+        allow_no_verification=True,
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection)
+
+    [kwargs] = calls
+    assert kwargs["commands"] == ["uv run pytest"]
+    assert kwargs["allow_no_verification"] is True
+    assert kwargs["resume_run_id"] == run_id
+    assert payload["warnings"] == []
+
+
+def test_a_milestone_resume_with_a_different_verify_passes_it_and_warns_last(
+    projection, monkeypatch
+):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("old",))
+    calls = _milestone_resume_spy(
+        monkeypatch, {"done": True, "warnings": ["an earlier warning"]}
+    )
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    [kwargs] = calls
+    assert kwargs["commands"] == ["new"]
+    assert payload["warnings"] == [
+        "an earlier warning",
+        "verification: replaced in run record: ['old']",
+    ]
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_a_resume_with_the_recorded_verify_does_not_warn(projection, monkeypatch, workflow):
+    run_id = "20260927T100000Z-cbe34d00"
+    if workflow == "task":
+        _record(
+            projection, run_id, started_at=RECORDED_AT, status="started", verify=("uv run pytest",)
+        )
+        _task_resume_spy(monkeypatch)
+    else:
+        _record_milestone(projection, run_id, status="escalated", verify=("uv run pytest",))
+        _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["uv run pytest"])
+
+    assert _replaced(payload) == []
+
+
+def test_a_resume_of_a_run_recorded_without_verify_behaves_as_before(projection, monkeypatch):
+    plain, passed = "20260923T090000Z-cbe34d00", "20260923T090000Z-cbe34d01"
+    _record(projection, plain, started_at=RECORDED_AT, status="started")
+    _record(projection, passed, started_at=RECORDED_AT, status="started")
+    seen = _task_resume_spy(monkeypatch)
+
+    quiet = cli.resume_run(plain, repo_dir=projection)
+    loud = cli.resume_run(passed, repo_dir=projection, commands=["x"])
+
+    (plain_run, plain_kwargs), (passed_run, passed_kwargs) = seen
+    assert plain_run.config == models.RunConfig()
+    assert (plain_kwargs["commands"], plain_kwargs["allow_no_verification"]) == ((), False)
+    assert quiet["warnings"] == []
+    assert passed_run.config.verify == ["x"]
+    assert passed_kwargs["commands"] == ["x"]
+    assert loud["warnings"] == ["verification: replaced in run record: []"]
+
+
+def test_the_opt_out_flag_widens_a_recorded_false(projection, monkeypatch):
+    widened, kept = "20260927T100000Z-cbe34d00", "20260927T100000Z-cbe34d01"
+    _record_milestone(projection, widened, status="escalated", allow_no_verification=False)
+    _record_milestone(projection, kept, status="escalated", allow_no_verification=True)
+    calls = _milestone_resume_spy(monkeypatch)
+
+    first = cli.resume_run(widened, repo_dir=projection, allow_no_verification=True)
+    second = cli.resume_run(kept, repo_dir=projection)
+
+    assert [kwargs["allow_no_verification"] for kwargs in calls] == [True, True]
+    assert _replaced(first) == _replaced(second) == []
+
+
+def test_an_empty_string_verify_replaces_the_record_verbatim(projection, monkeypatch):
+    """Review Focus 2: `--verify ""` is a passed suite of one empty command."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("x",))
+    calls = _milestone_resume_spy(monkeypatch)
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=[""])
+
+    [kwargs] = calls
+    assert kwargs["commands"] == [""]
+    assert payload["warnings"] == ["verification: replaced in run record: ['x']"]
+
+
+def test_a_refused_resume_with_a_differing_verify_keeps_the_record(projection, monkeypatch):
+    """Review Focus 3: a canceled run is refused as before and nothing is written."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="canceled", verify=("old",))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    with pytest.raises(cli.NotResumableError):
+        cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    assert _loaded(projection, run_id).config.verify == ["old"]
+
+
+def test_the_replacement_warning_creates_a_missing_warnings_key(projection, monkeypatch):
+    """Review Focus 4: a payload with no `warnings` still gets the warning."""
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated", verify=("old",))
+    _milestone_resume_spy(monkeypatch, {"done": True})
+
+    payload = cli.resume_run(run_id, repo_dir=projection, commands=["new"])
+
+    assert payload == {
+        "done": True,
+        "warnings": ["verification: replaced in run record: ['old']"],
+    }
 
 
 def test_resume_refuses_a_run_of_a_workflow_it_does_not_know(projection, monkeypatch):
@@ -10898,6 +11287,112 @@ def test_preflight_card_returns_the_run_it_would_record_and_writes_nothing(
     assert fake_board.writes == []
 
 
+def test_preflight_card_records_the_suite_and_the_opt_out(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        commands=("a", "b"),
+        allow_no_verification=True,
+        clock=lambda: SEAM_AT,
+    )
+    default = _preflight(root, cards["subtask"])
+
+    assert pre.run_record.config.verify == ["a", "b"]
+    assert pre.run_record.config.allow_no_verification is True
+    assert default.run_record.config.verify == []
+    assert default.run_record.config.allow_no_verification is False
+
+
+def test_preflight_card_records_the_launcher_and_its_warning(tmp_path, monkeypatch, fake_board):
+    """A5 B5: omitted records `direct` and no warning, as before."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    common: dict[str, Any] = {
+        "repo_dir": root,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "clock": lambda: SEAM_AT,
+    }
+
+    fallback = cli.preflight_card(
+        cards["subtask"], launcher="direct", isolation_warning=FALLBACK, **common
+    )
+    isolated = cli.preflight_card(cards["subtask"], launcher="unshare", **common)
+    default = cli.preflight_card(cards["subtask"], **common)
+
+    assert fallback.run_record.config == models.RunConfig(
+        launcher="direct", isolation_warning=FALLBACK
+    )
+    assert isolated.run_record.config == models.RunConfig(launcher="unshare")
+    assert default.run_record.config == models.RunConfig()
+    assert _run_dirs() == []
+
+
+class _PreflightReached(Exception):
+    """Raised by a patched pre-flight once it has captured its arguments."""
+
+
+def test_run_card_and_its_detach_path_hand_the_suite_to_the_preflight(tmp_path, monkeypatch):
+    seen: list[dict[str, Any]] = []
+
+    def capture(card_id: str, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached(card_id)
+
+    monkeypatch.setattr(cli, "preflight_card", capture)
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "commands": ["a"],
+        "allow_no_verification": True,
+    }
+
+    with pytest.raises(_PreflightReached):
+        cli.run_card("c1", **common)
+    with pytest.raises(_PreflightReached):
+        cli.detach_card("c1", detacher=_Forbidden("detacher"), **common)
+
+    assert [(kwargs["commands"], kwargs["allow_no_verification"]) for kwargs in seen] == [
+        (["a"], True),
+        (["a"], True),
+    ]
+
+
+def test_run_card_and_detach_card_hand_the_launcher_and_its_warning_to_preflight_card(
+    tmp_path, monkeypatch
+):
+    seen: list[dict[str, Any]] = []
+
+    def capture(card_id, **kwargs):
+        seen.append(kwargs)
+        raise _PreflightReached(card_id)
+
+    monkeypatch.setattr(cli, "preflight_card", capture)
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "launcher": "direct",
+        "isolation_warning": FALLBACK,
+    }
+
+    with pytest.raises(_PreflightReached):
+        cli.run_card("c1", **common)
+    with pytest.raises(_PreflightReached):
+        cli.detach_card("c1", detacher=_Forbidden("detacher"), **common)
+
+    assert [(kwargs["launcher"], kwargs["isolation_warning"]) for kwargs in seen] == [
+        ("direct", FALLBACK),
+        ("direct", FALLBACK),
+    ]
+
+
 def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     """Patch `Store.close` to record `(claims, leases)` its run still holds as it closes.
 
@@ -11325,6 +11820,8 @@ def test_a_board_detach_calls_detach_board_once_with_the_run_options(tmp_path, m
         "base_branch": "main",
         "commands": ["X"],
         "allow_no_verification": False,
+        "launcher": "bwrap",
+        "isolation_warning": None,
         "max_concurrent": 3,
     }
     assert prefix_of(BOARD_CARD) == cli.board_prefix_of("p")(BOARD_CARD)
@@ -13256,6 +13753,8 @@ def test_a_story_run_calls_run_story_once_with_the_run_options(tmp_path, monkeyp
                 "branch_prefix": STORY_PREFIX,
                 "commands": ["uv run pytest", "uv run ruff check"],
                 "allow_no_verification": True,
+                "launcher": "bwrap",
+                "isolation_warning": None,
             },
         )
     ]
@@ -13409,6 +13908,8 @@ def test_story_detach_dispatches_detach_story_with_the_run_options(tmp_path, mon
             "branch_prefix": STORY_PREFIX,
             "commands": ["X"],
             "allow_no_verification": False,
+            "launcher": "bwrap",
+            "isolation_warning": None,
         },
     )
     assert sentinel.calls == []
@@ -13424,3 +13925,884 @@ def test_run_help_and_examples_document_the_story_option():
 
     assert result.exit_code == 0, result.output
     assert "--story" in result.output
+
+
+# ── --verify-from-env (card 1b938053) ────────────────────────────────────────
+
+FROM_ENV_RUN_ID = "20260923T140506Z-cbe34d00"
+
+
+def _from_env_run(project: Path, *extra: str, **invoke_kwargs: Any):
+    """`am run --verify-from-env --card ...`, the argv `argv_guard.neutralize` builds."""
+    return runner.invoke(
+        cli.app,
+        [
+            "run",
+            "--verify-from-env",
+            "--card",
+            VERIFY_CARD_ID,
+            "--repo-dir",
+            str(project),
+            "--base-branch",
+            "main",
+            "--branch-prefix",
+            "m1",
+            *extra,
+        ],
+        **invoke_kwargs,
+    )
+
+
+def _recording_run_card(seen: dict[str, Any]):
+    def fake_run_card(card_id, **kwargs):
+        seen.update(kwargs)
+        seen["env"] = os.environ.get(argv_guard.VERIFY_ENV)
+        return _fake_payload(card_id, VERIFY_STORY_ID)
+
+    return fake_run_card
+
+
+def test_verify_from_env_reaches_run_card(tmp_path, monkeypatch):
+    """Spec test 19."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == ["a b", "c"]
+
+
+def test_verify_from_env_round_trips_hostile_values_to_run_card(tmp_path, monkeypatch):
+    """Review Focus 5: what `neutralize` encodes is exactly what `run_card` gets."""
+    values = ["pytest -k 'not slow'", 'echo "q"', "back\\slash", "a\nb", "café", ""]
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    _, environ = argv_guard.neutralize(
+        ["am", "run", *(token for value in values for token in ("--verify", value))], {}
+    )
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, environ[argv_guard.VERIFY_ENV])
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == values
+
+
+def test_verify_from_env_accepts_an_empty_list(tmp_path, monkeypatch):
+    """Review Focus 2: an empty suite is a suite, not a usage error."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, "[]")
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == []
+
+
+def test_resume_verify_from_env_reaches_resume_run(tmp_path, monkeypatch):
+    """Spec test 20; Review Focus 4: the flag sits before the run id, as `neutralize` puts it."""
+    seen: dict[str, Any] = {}
+
+    def fake_resume_run(run_id, **kwargs):
+        seen["run_id"] = run_id
+        seen.update(kwargs)
+        seen["env"] = os.environ.get(argv_guard.VERIFY_ENV)
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--verify-from-env", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["run_id"] == FROM_ENV_RUN_ID
+    assert seen["commands"] == ["a b", "c"]
+    assert seen["env"] is None
+
+
+def test_verify_from_env_with_the_variable_unset_is_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 21."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.delenv(argv_guard.VERIFY_ENV, raising=False)
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    assert "unset" in result.output
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not json SECRET", '"SECRET"', '{"SECRET": 1}', '["SECRET", 1]'],
+)
+def test_verify_from_env_with_a_bad_value_is_a_usage_error_that_never_echoes_it(
+    tmp_path, monkeypatch, raw
+):
+    """Spec test 22."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, raw)
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    assert "SECRET" not in result.output
+    assert argv_guard.VERIFY_ENV not in os.environ
+
+
+def test_resume_verify_from_env_with_a_bad_value_is_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 22, resume half."""
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["SECRET", 1]')
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--verify-from-env", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "SECRET" not in result.output
+
+
+def test_verify_from_env_and_verify_together_are_a_usage_error(tmp_path, monkeypatch):
+    """Spec test 23."""
+    monkeypatch.setattr(cli, "run_card", _Forbidden("run_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a"]')
+
+    result = _from_env_run(tmp_path, "--verify", "x")
+
+    assert result.exit_code == 2, result.output
+    assert "exclusive" in result.output
+
+
+def test_am_verify_json_is_popped_before_run_card_runs(tmp_path, monkeypatch):
+    """Spec test 24, with the flag: nothing the run spawns inherits it."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a"]')
+
+    result = _from_env_run(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert seen["env"] is None
+
+
+def test_a_stray_am_verify_json_is_popped_and_ignored_without_the_flag(tmp_path, monkeypatch):
+    """Spec test 24, without the flag; Review Focus 1."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "run_card", _recording_run_card(seen))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["stray"]')
+
+    result = _invoke(tmp_path, VERIFY_CARD_ID, "--verify", "mine")
+
+    assert result.exit_code == 0, result.output
+    assert seen["commands"] == ["mine"]
+    assert seen["env"] is None
+
+
+@pytest.mark.parametrize("command", [["run"], ["resume"]])
+def test_verify_from_env_is_hidden_from_help(command):
+    """Spec test 25."""
+    result = runner.invoke(cli.app, [*command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--verify" in result.output
+    assert "verify-from-env" not in result.output
+
+
+# ── the `am` entry point and the argv warning (card 1b938053) ────────────────
+
+ARGV_WARNING = argv_guard.ARGV_VISIBLE_WARNING
+WARNED = {"argv_warnings": [ARGV_WARNING]}
+
+
+def _warned_card_args(project: Path, *extra: str) -> list[str]:
+    return [
+        "run",
+        "--card",
+        VERIFY_CARD_ID,
+        "--repo-dir",
+        str(project),
+        "--base-branch",
+        "main",
+        "--branch-prefix",
+        "m1",
+        *extra,
+    ]
+
+
+def test_the_argv_warning_ends_a_card_payloads_warnings(tmp_path, monkeypatch):
+    """Spec test 26, card payload."""
+    monkeypatch.setattr(
+        cli,
+        "run_card",
+        lambda card_id, **kwargs: {
+            **_fake_payload(card_id, VERIFY_STORY_ID),
+            "warnings": ["earlier"],
+        },
+    )
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path), obj=WARNED)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["warnings"] == ["earlier", ARGV_WARNING]
+
+
+def test_the_argv_warning_reaches_a_detached_hand_off_payload(tmp_path, monkeypatch):
+    """Spec test 26, a hand-off payload that had no `warnings` key."""
+    hand_off = {"run_id": FROM_ENV_RUN_ID, "pid": 4242, "log": "/tmp/run.log", "detached": True}
+    monkeypatch.setattr(cli, "detach_card", lambda card_id, **kwargs: dict(hand_off))
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path, "--detach"), obj=WARNED)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == {**hand_off, "warnings": [ARGV_WARNING]}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"run_id": FROM_ENV_RUN_ID, "status": "done"}, [ARGV_WARNING]),
+        (
+            {"run_id": FROM_ENV_RUN_ID, "status": "done", "warnings": ["replaced"]},
+            ["replaced", ARGV_WARNING],
+        ),
+    ],
+)
+def test_the_argv_warning_ends_a_resume_payloads_warnings(tmp_path, monkeypatch, payload, expected):
+    """Spec test 26, resume."""
+    monkeypatch.setattr(cli, "resume_run", lambda run_id, **kwargs: dict(payload))
+
+    result = runner.invoke(
+        cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)], obj=WARNED
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["warnings"] == expected
+
+
+def test_without_an_obj_payloads_are_unchanged(tmp_path, monkeypatch):
+    """Spec test 26: `ctx.obj` is `None` under a CliRunner that passes none."""
+    monkeypatch.setattr(
+        cli, "run_card", lambda card_id, **kwargs: _fake_payload(card_id, VERIFY_STORY_ID)
+    )
+    monkeypatch.setattr(
+        cli, "resume_run", lambda run_id, **kwargs: {"run_id": run_id, "status": "done"}
+    )
+
+    ran = runner.invoke(cli.app, _warned_card_args(tmp_path))
+    resumed = runner.invoke(cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)])
+
+    assert json.loads(ran.stdout)["data"] == _fake_payload(VERIFY_CARD_ID, VERIFY_STORY_ID)
+    assert json.loads(resumed.stdout)["data"] == {"run_id": FROM_ENV_RUN_ID, "status": "done"}
+
+
+def test_argv_warnings_never_reach_an_error_envelope(tmp_path, monkeypatch):
+    """Review Focus 3: error envelopes are unchanged."""
+
+    def failing_run_card(card_id, **kwargs):
+        raise cli.CliError("refused")
+
+    monkeypatch.setattr(cli, "run_card", failing_run_card)
+
+    result = runner.invoke(cli.app, _warned_card_args(tmp_path), obj=WARNED)
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert ARGV_WARNING not in result.stdout
+
+
+@pytest.mark.parametrize(("guard_result", "expected"), [(ARGV_WARNING, [ARGV_WARNING]), (None, [])])
+def test_entry_runs_the_guard_first_and_hands_its_warning_to_the_command(
+    tmp_path, monkeypatch, capsys, guard_result, expected
+):
+    """Spec test 27: entry wiring."""
+    argv = ["am", *_warned_card_args(tmp_path)]
+    guarded: list[list[str]] = []
+
+    def fake_reexec_neutral(seen_argv):
+        guarded.append(list(seen_argv))
+        return guard_result
+
+    monkeypatch.setattr(argv_guard, "reexec_neutral", fake_reexec_neutral)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        cli, "run_card", lambda card_id, **kwargs: _fake_payload(card_id, VERIFY_STORY_ID)
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        cli.entry()
+
+    assert exited.value.code == 0
+    assert guarded == [argv]
+    assert json.loads(capsys.readouterr().out)["data"]["warnings"] == expected
+
+
+def test_the_am_script_targets_entry():
+    """Spec test 28."""
+    pyproject = Path(agent_manager.__file__).parents[2] / "pyproject.toml"
+
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+
+    assert scripts["am"] == "agent_manager.cli:entry"
+
+
+@pytest.mark.parametrize(
+    ("target", "seam"),
+    [
+        (["--story", "S", "--branch-prefix", "m1"], "run_story"),
+        (["--story", "S", "--branch-prefix", "m1", "--detach"], "detach_story"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3"], "run_milestone"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3", "--detach"], "detach_milestone"),
+        (["--board"], "run_board"),
+        (["--board", "--detach"], "detach_board"),
+        (["--card", VERIFY_CARD_ID, "--branch-prefix", "m1", "--detach"], "detach_card"),
+    ],
+)
+def test_verify_from_env_reaches_every_run_branch(tmp_path, monkeypatch, target, seam):
+    """Spec §3.4 item 6: the commands flow everywhere `list(verify)` did."""
+    seen: list[tuple[str, Any]] = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            seen.append((name, kwargs["commands"]))
+            return {"run_id": FROM_ENV_RUN_ID}
+
+        return fake
+
+    for name in (
+        "run_story",
+        "detach_story",
+        "run_milestone",
+        "detach_milestone",
+        "run_board",
+        "detach_board",
+    ):
+        monkeypatch.setattr(orchestrate, name, recorder(name))
+    monkeypatch.setattr(cli, "run_card", recorder("run_card"))
+    monkeypatch.setattr(cli, "detach_card", recorder("detach_card"))
+    monkeypatch.setenv(argv_guard.VERIFY_ENV, '["a b", "c"]')
+
+    result = runner.invoke(
+        cli.app,
+        ["run", "--verify-from-env", *target, "--repo-dir", str(tmp_path), "--base-branch", "main"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [(seam, ["a b", "c"])]
+
+
+# ── A5: --isolation, the recorded launcher, resume restore (card 97d4b709) ───
+
+ISOLATION_RUN_ID = "20260923T090000Z-cbe34d00"
+
+
+def test_the_production_runner_factory_launches_through_the_recorded_mode(
+    projection, monkeypatch
+):
+    """A5 spec test 11: the recorded `RunConfig.launcher` picks the launcher; no probe."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    asked: list[str] = []
+
+    def chosen(argv, *, cwd, timeout, stdout_path):
+        raise AssertionError("the factory launched a harness process")
+
+    def fake_get_launcher(kind):
+        asked.append(kind)
+        return chosen
+
+    monkeypatch.setattr(cli.launcher, "get_launcher", fake_get_launcher)
+    monkeypatch.setattr(
+        cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+    )
+    opened = store_module.Store.open(projection, ISOLATION_RUN_ID)
+    try:
+        built = cli.default_runner_factory(
+            store=opened, run_id=ISOLATION_RUN_ID, story_id="story-1", card_id="card-1"
+        )
+    finally:
+        opened.close()
+
+    assert asked == ["bwrap"]
+    assert isinstance(built, dispatch.AgentRunner)
+    assert built.launcher is chosen
+
+
+def test_the_production_runner_factory_refuses_a_run_with_no_row(projection):
+    """A5 B2: never a silent fallback to `direct`."""
+    missing = "20260923T090000Z-deadbeef"
+    opened = store_module.Store.open(projection, missing)
+    try:
+        with pytest.raises(cli.UnknownRunError, match=missing):
+            cli.default_runner_factory(
+                store=opened, run_id=missing, story_id="story-1", card_id="card-1"
+            )
+    finally:
+        opened.close()
+
+
+def test_cli_imports_the_launcher_module_and_not_run_direct():
+    assert cli.launcher.__name__ == "agent_manager.harness.launcher"
+    assert not hasattr(cli, "run_direct")
+
+
+BWRAP_PROBE_FAILED = f"{' '.join(launcher.wrap_argv('bwrap', ['true'], Path('/')))} exited 1"
+"""`probe`'s reason when the bwrap probe exits 1: its exact argv, then the code."""
+
+
+def _recorded_config(root: Path, run_id: str) -> models.RunConfig:
+    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    try:
+        run = store_module.load_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run is not None
+    return run.config
+
+
+def test_run_refuses_an_unknown_isolation_mode_as_a_usage_error(tmp_path, monkeypatch):
+    """A5 spec test 3."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    monkeypatch.setattr(
+        cli.launcher, "resolve_isolation", _Forbidden("launcher.resolve_isolation")
+    )
+
+    result = _milestone_run(tmp_path, "--isolation", "bogus")
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("given", "requested"),
+    [
+        ((), "auto"),
+        (("--isolation", "auto"), "auto"),
+        (("--isolation", "bwrap"), "bwrap"),
+        (("--isolation", "unshare"), "unshare"),
+        (("--isolation", "none"), "none"),
+    ],
+)
+def test_run_hands_the_isolation_request_to_resolve_isolation(
+    tmp_path, monkeypatch, given, requested
+):
+    """A5 spec test 4: every accepted value reaches `resolve_isolation` as given."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _patch_run_milestone(monkeypatch, {**CLEAN_MILESTONE, "warnings": []})
+    asked: list[str] = []
+
+    def fake_resolve(request, *, runner=None):
+        asked.append(request)
+        return launcher.Isolation("bwrap", None)
+
+    monkeypatch.setattr(cli.launcher, "resolve_isolation", fake_resolve)
+
+    result = _milestone_run(tmp_path, *given)
+
+    assert result.exit_code == 0, result.output
+    assert asked == [requested]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ["--card", VERIFY_CARD_ID, "--branch-prefix", "m1"],
+        ["--milestone", "Milestone 3", "--branch-prefix", "m3", "--detach"],
+        ["--board"],
+    ],
+)
+def test_an_isolation_mode_this_host_cannot_start_is_refused_before_anything_is_written(
+    tmp_path, monkeypatch, target
+):
+    """A5 spec test 5: exit 3, the probe argv and the way out named, nothing written."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_board_paths(monkeypatch)
+    for name in ("run_story", "detach_story", "detach_milestone", "detach_board", "refresh_git"):
+        monkeypatch.setattr(orchestrate, name, _Forbidden(name))
+    monkeypatch.setattr(cli, "detach_card", _Forbidden("detach_card"))
+    monkeypatch.setattr(cli.board, "show", _Forbidden("board.show"))
+    monkeypatch.setattr(cli.board, "roots", _Forbidden("board.roots"))
+    monkeypatch.setattr(detach, "fork_detacher", _Forbidden("detach.fork_detacher"))
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", lambda argv: 1)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            *target,
+            "--repo-dir",
+            str(tmp_path),
+            "--base-branch",
+            "main",
+            "--isolation",
+            "bwrap",
+        ],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "IsolationUnavailableError"
+    assert BWRAP_PROBE_FAILED in envelope["error"]["message"]
+    assert "--isolation none" in envelope["error"]["message"]
+    assert list(paths.data_dir().iterdir()) == []
+
+
+@pytest.mark.git
+def test_a_dry_run_accepts_isolation_and_probes_nothing(project, milestone_board, monkeypatch):
+    """A5 spec test 6: the preview is byte-for-byte the plain one, with no warnings."""
+    _forbid_writes(monkeypatch)
+    plain = _dry_run(project, milestone_board["milestone"])
+    monkeypatch.setattr(
+        cli.launcher, "resolve_isolation", _Forbidden("launcher.resolve_isolation")
+    )
+    monkeypatch.setattr(
+        cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+    )
+
+    isolated = _dry_run(project, milestone_board["milestone"], "--isolation", "bwrap")
+
+    assert isolated.exit_code == 0, isolated.output
+    assert isolated.stdout == plain.stdout
+    assert "warnings" not in json.loads(isolated.stdout)["data"]
+
+
+@pytest.mark.git
+@pytest.mark.parametrize(
+    ("flag", "probe_exit", "recorded"),
+    [
+        ("none", None, ("direct", None)),
+        ("bwrap", 0, ("bwrap", None)),
+        ("auto", 1, ("direct", launcher.ISOLATION_NONE_WARNING)),
+    ],
+)
+def test_a_card_run_records_the_resolved_mode_and_warning(
+    project, cards, monkeypatch, flag, probe_exit, recorded
+):
+    """A5 spec test 7, through a real git worktree."""
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+    if probe_exit is None:
+        monkeypatch.setattr(
+            cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+        )
+    else:
+        monkeypatch.setattr(cli.launcher, "default_probe_runner", lambda argv: probe_exit)
+
+    result = _invoke(project, cards["subtask"], "--isolation", flag)
+
+    assert result.exit_code == 0, result.output
+    run_id = json.loads(result.stdout)["data"]["run_id"]
+    config = _recorded_config(project, run_id)
+    assert (config.launcher, config.isolation_warning) == recorded
+
+
+@pytest.mark.parametrize(
+    ("target", "seam", "payload", "expected"),
+    [
+        (
+            ["--card", VERIFY_CARD_ID, "--branch-prefix", "m1"],
+            "run_card",
+            lambda: {**_fake_payload(VERIFY_CARD_ID, VERIFY_STORY_ID), "warnings": ["earlier"]},
+            ["earlier", FALLBACK, ARGV_WARNING],
+        ),
+        (
+            ["--card", VERIFY_CARD_ID, "--branch-prefix", "m1", "--detach"],
+            "detach_card",
+            lambda: {"run_id": FROM_ENV_RUN_ID, "pid": 4242, "log": "/tmp/run.log", "detached": True},
+            [FALLBACK, ARGV_WARNING],
+        ),
+        (
+            ["--milestone", "Milestone 3", "--branch-prefix", "m3"],
+            "run_milestone",
+            lambda: {**CLEAN_MILESTONE, "warnings": []},
+            [FALLBACK, ARGV_WARNING],
+        ),
+        (["--board"], "run_board", lambda: _board_payload("done", "done"), [FALLBACK, ARGV_WARNING]),
+    ],
+)
+def test_the_fallback_warning_reaches_every_run_envelope_once(
+    tmp_path, monkeypatch, target, seam, payload, expected
+):
+    """A5 spec test 8: once, after the run's own warnings, before argv_guard's;
+    a board carries it at the top level only."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    owner = cli if seam.endswith("_card") else orchestrate
+    monkeypatch.setattr(owner, seam, lambda *args, **kwargs: payload())
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", lambda argv: 1)
+
+    result = runner.invoke(
+        cli.app,
+        ["run", *target, "--repo-dir", str(tmp_path), "--base-branch", "main"],
+        obj=WARNED,
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["warnings"] == expected
+    assert all("warnings" not in entry for entry in data.get("milestones", []))
+
+
+@pytest.mark.parametrize(
+    ("target", "seam"),
+    [
+        (["--card", VERIFY_CARD_ID, "--branch-prefix", "m1"], "run_card"),
+        (["--card", VERIFY_CARD_ID, "--branch-prefix", "m1", "--detach"], "detach_card"),
+        (["--story", "S", "--branch-prefix", "m1"], "run_story"),
+        (["--story", "S", "--branch-prefix", "m1", "--detach"], "detach_story"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3"], "run_milestone"),
+        (["--milestone", "Milestone 3", "--branch-prefix", "m3", "--detach"], "detach_milestone"),
+        (["--board"], "run_board"),
+        (["--board", "--detach"], "detach_board"),
+    ],
+)
+def test_run_hands_the_resolved_mode_and_warning_to_every_run_branch(
+    tmp_path, monkeypatch, target, seam
+):
+    """A5 spec test 9."""
+    seen: list[tuple[str, Any, Any]] = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            seen.append((name, kwargs["launcher"], kwargs["isolation_warning"]))
+            return {"run_id": FROM_ENV_RUN_ID, "status": "done"}
+
+        return fake
+
+    for name in (
+        "run_story",
+        "detach_story",
+        "run_milestone",
+        "detach_milestone",
+        "run_board",
+        "detach_board",
+    ):
+        monkeypatch.setattr(orchestrate, name, recorder(name))
+    monkeypatch.setattr(cli, "run_card", recorder("run_card"))
+    monkeypatch.setattr(cli, "detach_card", recorder("detach_card"))
+    monkeypatch.setattr(
+        cli.launcher,
+        "resolve_isolation",
+        lambda request, *, runner=None: launcher.Isolation("unshare", "a warning"),
+    )
+
+    result = runner.invoke(
+        cli.app, ["run", *target, "--repo-dir", str(tmp_path), "--base-branch", "main"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == [(seam, "unshare", "a warning")]
+
+
+MILESTONE_ISOLATION_RUN_ID = "20260927T100000Z-cbe34d00"
+
+
+def _probe_recorder(monkeypatch, exit_code: int) -> list[list[str]]:
+    probes: list[list[str]] = []
+
+    def probe_runner(argv):
+        probes.append(list(argv))
+        return exit_code
+
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", probe_runner)
+    return probes
+
+
+def _forbid_probe(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+    )
+
+
+def test_a_task_resume_re_probes_the_recorded_mode_and_keeps_it(projection, monkeypatch):
+    """A5 spec test 12, task run."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    seen = _task_resume_spy(monkeypatch)
+    probes = _probe_recorder(monkeypatch, 0)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection)
+
+    [(run, _kwargs)] = seen
+    assert probes == [launcher.wrap_argv("bwrap", ["true"], Path("/"))]
+    assert (run.config.launcher, run.config.isolation_warning) == ("bwrap", None)
+    assert payload["warnings"] == []
+
+
+def test_a_milestone_resume_re_probes_the_recorded_mode_and_hands_it_on(
+    projection, monkeypatch
+):
+    """A5 spec test 12, milestone run."""
+    _record_milestone(
+        projection, MILESTONE_ISOLATION_RUN_ID, status="escalated", launcher="unshare"
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+    probes = _probe_recorder(monkeypatch, 0)
+
+    cli.resume_run(MILESTONE_ISOLATION_RUN_ID, repo_dir=projection)
+
+    assert probes == [launcher.wrap_argv("unshare", ["true"], Path("/"))]
+    [kwargs] = calls
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("unshare", None)
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_a_resume_whose_recorded_mode_cannot_start_is_refused_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """A5 spec test 13: never silently un-isolated; row, config, journal, lease untouched."""
+    run_id = ISOLATION_RUN_ID if workflow == "task" else MILESTONE_ISOLATION_RUN_ID
+    if workflow == "task":
+        _record(projection, run_id, started_at=RECORDED_AT, status="started", launcher="bwrap")
+    else:
+        _record_milestone(projection, run_id, status="escalated", launcher="bwrap")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", lambda argv: 1)
+    before = (
+        _runs_snapshot(),
+        _recorded_config(projection, run_id),
+        len(_journal_lines(run_id)),
+    )
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "IsolationUnavailableError"
+    assert BWRAP_PROBE_FAILED in envelope["error"]["message"]
+    assert "--isolation none" in envelope["error"]["message"]
+    after = (
+        _runs_snapshot(),
+        _recorded_config(projection, run_id),
+        len(_journal_lines(run_id)),
+    )
+    assert after == before
+    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    try:
+        assert store_module.read_lease(conn, run_id) is None
+    finally:
+        conn.close()
+
+
+def test_resume_isolation_none_runs_an_isolated_task_run_direct_without_probing(
+    projection, monkeypatch
+):
+    """A5 spec test 14, task run."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection, isolation="none")
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", None)
+    assert payload["warnings"] == []
+
+
+def test_resume_isolation_none_hands_direct_to_a_milestone_resume(projection, monkeypatch):
+    """A5 spec test 14, milestone run, through the CLI flag."""
+    _record_milestone(
+        projection, MILESTONE_ISOLATION_RUN_ID, status="escalated", launcher="bwrap"
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            MILESTONE_ISOLATION_RUN_ID,
+            "--repo-dir",
+            str(projection),
+            "--isolation",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [kwargs] = calls
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", None)
+
+
+def test_resume_isolation_none_clears_a_recorded_fallback_warning(projection, monkeypatch):
+    """Review Focus 3: an explicit opt-out is not a fallback, so nothing is warned."""
+    _record(
+        projection,
+        ISOLATION_RUN_ID,
+        started_at=RECORDED_AT,
+        status="started",
+        isolation_warning=FALLBACK,
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection, isolation="none")
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", None)
+    assert payload["warnings"] == []
+
+
+def test_a_resume_of_an_auto_fallback_run_keeps_its_warning_before_the_replaced_suite(
+    projection, monkeypatch
+):
+    """A5 spec test 15 and Review Focus 2: no probe, no silent upgrade, warning kept."""
+    _record(
+        projection,
+        ISOLATION_RUN_ID,
+        started_at=RECORDED_AT,
+        status="started",
+        isolation_warning=FALLBACK,
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(
+        ISOLATION_RUN_ID, repo_dir=projection, commands=("uv run pytest",)
+    )
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", FALLBACK)
+    assert payload["warnings"] == [FALLBACK, "verification: replaced in run record: []"]
+
+
+@pytest.mark.parametrize("value", ["bwrap", "unshare", "auto", "bogus"])
+def test_resume_isolation_accepts_only_none(tmp_path, monkeypatch, value):
+    """A5 spec test 16: upgrading a run's isolation on resume is out of scope."""
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path), "--isolation", value],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+
+
+def test_resume_without_isolation_hands_none_to_resume_run(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_resume_run(run_id, **kwargs):
+        seen.update(kwargs)
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+
+    result = runner.invoke(cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert seen["isolation"] is None

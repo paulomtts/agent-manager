@@ -1697,6 +1697,7 @@ def test_a_default_runner_carries_the_shipped_result_model_table(store):
 def test_the_production_runner_factory_carries_the_shipped_table(store):
     # `cli.default_runner_factory` omits `result_models` on purpose. This is the
     # path the addendum section 1 smoke takes, and the only test that walks it.
+    _seed(store)
     runner = cli.default_runner_factory(
         store=store,
         run_id=RUN_ID,

@@ -10,7 +10,7 @@ On `merged_base_board`, A (a1) and B (b1) are independent, C (c1) is blocked by
 both and runs on their merged base, and D (d1 -> d2 -> d3) is a sibling lane.
 The manager is killed with a plain `BaseException` while c1 is inside `plan`
 and d3 inside `implement`, after C's merged base was built. The kill is test
-scaffolding in the manager process (`cli.run_direct`, read at call time); the
+scaffolding in the manager process (`launcher.get_launcher`, read at call time); the
 fake is never told anything. Unmarked on purpose: it must run on every
 `uv run pytest`.
 """
@@ -199,7 +199,7 @@ def _kill_with_c1_in_plan_and_d3_in_implement(monkeypatch, c1: str, d3: str) -> 
     """Kill the manager once, while c1 is inside `plan` and d3 inside `implement`.
 
     Test scaffolding in the manager process: `cli.default_runner_factory`
-    reads `cli.run_direct` at call time, so the real launcher still spawns the
+    reads `launcher.get_launcher` at call time, so the real `run_direct` still spawns the
     real fake, which writes its result and logs the phase as always. Both held
     launches raise after the real launch returned and before the dispatcher
     records the outcome, which leaves each attempt and phase `started`: the
@@ -238,7 +238,7 @@ def _kill_with_c1_in_plan_and_d3_in_implement(monkeypatch, c1: str, d3: str) -> 
             raise _Killed(f"killed while {c1} was in plan")
         return outcome
 
-    monkeypatch.setattr(cli, "run_direct", killing)
+    monkeypatch.setattr(launcher, "get_launcher", lambda kind: killing)
 
 
 def test_a_killed_milestone_resumes_where_it_stopped(
@@ -430,4 +430,4 @@ def test_no_kill_switch_is_left_armed_for_later_tests():
     """Review Focus 5: the kill switch is set through the function-scoped
     `monkeypatch`; it must be gone once its test ends, or every later launch
     in the session could be killed. Kept last in the module."""
-    assert cli.run_direct is launcher.run_direct
+    assert launcher.get_launcher("direct") is launcher.run_direct
