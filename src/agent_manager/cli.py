@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -58,7 +59,9 @@ from agent_manager.harness import launcher
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import AgentPhase, Workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
 # integration and orchestrate read them off `runs`). This module uses some by
@@ -70,6 +73,7 @@ from agent_manager.runs import (
     CheckpointMismatchError,
     CliError,
     DryRunPlan,
+    HarnessOverride,
     NotResumableError,
     RepoDirError,
     RunnerFactory,
@@ -81,6 +85,7 @@ from agent_manager.runs import (
     orphan_attempts,
     resolve_repo_dir,
     select_resumable,
+    with_harness_override,
     worktree_for,
 )
 
@@ -707,6 +712,8 @@ def default_runner_factory(
     run_id: str,
     story_id: str,
     card_id: str,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> AgentPhaseRunner:
     """The production runner: real adapters, real roles, the run's recorded launcher.
 
@@ -721,6 +728,10 @@ def default_runner_factory(
     `harness_map` stays empty, so every role falls back to `DEFAULT_HARNESS` and
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
+
+    `harness_timeout` and `harness_timeouts` are the run's recorded
+    `RunConfig` values (card eee43099); `runner_factory_for` is what passes
+    them. Without them every attempt gets `dispatch.DEFAULT_TIMEOUT`.
     """
     config = store_module.run_config(store.connection, run_id)
     if config is None:
@@ -734,7 +745,41 @@ def default_runner_factory(
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,
+        harness_timeout=harness_timeout,
+        harness_timeouts=dict(harness_timeouts or {}),
     )
+
+
+def runner_factory_for(
+    config: models.RunConfig, runner_factory: RunnerFactory | None
+) -> RunnerFactory | None:
+    """The runner factory a run's engine hands on, given its recorded `config` (card eee43099).
+
+    An injected `runner_factory` (the §14 test seam) wins and is returned as
+    is, so it is still called with the four `RunnerFactory` keywords only. A
+    config with no timeout gives `None`, exactly what was handed on before
+    timeouts were recorded. Otherwise a factory that calls
+    `default_runner_factory` -- looked up at call time, so a test that patches
+    it is honored -- with the config's two values added.
+    """
+    if runner_factory is not None:
+        return runner_factory
+    if config.harness_timeout is None and not config.harness_timeouts:
+        return None
+    harness_timeout = config.harness_timeout
+    harness_timeouts = dict(config.harness_timeouts)
+
+    def bound(*, store: Store, run_id: str, story_id: str, card_id: str) -> AgentPhaseRunner:
+        return default_runner_factory(
+            store=store,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
+        )
+
+    return bound
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1052,8 @@ def preflight_card(
     launcher: models.Launcher | None = None,
     isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
 
@@ -1058,6 +1105,8 @@ def preflight_card(
                 allow_no_verification=allow_no_verification,
                 launcher="direct" if launcher is None else launcher,
                 isolation_warning=isolation_warning,
+                harness_timeout=harness_timeout,
+                harness_timeouts=dict(harness_timeouts or {}),
             ),
         ),
         story=models.StoryRun(
@@ -1131,6 +1180,8 @@ async def run_card_engine(
     recorded and, still under the lease, the card gets at most one comment
     (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
     the payload's `warnings`. The caller owns the store and the lease.
+    The walk's runner gets the run's recorded harness timeouts
+    (`runner_factory_for`, card eee43099).
     """
     store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
     stop = StopSignal()
@@ -1146,7 +1197,7 @@ async def run_card_engine(
             repo_dir=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
+            runner_factory=runner_factory_for(pre.run_record.config, runner_factory),
             stop=stop,
         ),
         store=store,
@@ -1208,6 +1259,8 @@ def run_card(
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
@@ -1247,6 +1300,8 @@ def run_card(
         launcher=launcher,
         isolation_warning=isolation_warning,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         return asyncio.run(
@@ -1618,6 +1673,8 @@ def detach_card(
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
 
@@ -1637,6 +1694,8 @@ def detach_card(
         launcher=launcher,
         isolation_warning=isolation_warning,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         log = detach.create_run_log(pre.run_id)
@@ -1694,6 +1753,123 @@ def verify_commands(verify: Sequence[str], *, from_env: bool) -> list[str]:
             param_hint=argv_guard.FROM_ENV_FLAG,
         )
     return value
+
+
+def agent_phase_names(*workflows: Workflow) -> tuple[str, ...]:
+    """The `AgentPhase` names of `workflows`, in declared order, each once."""
+    return tuple(
+        dict.fromkeys(
+            phase.name
+            for workflow in workflows
+            for phase in workflow.phases
+            if isinstance(phase, AgentPhase)
+        )
+    )
+
+
+TASK_AGENT_PHASES = agent_phase_names(task_workflow.TASK)
+"""The phases `--harness-timeout PHASE=` may name on `run --card` and `run --story`,
+which dispatch only `task` phases."""
+
+MILESTONE_AGENT_PHASES = agent_phase_names(task_workflow.TASK, integrate_workflow.INTEGRATE)
+"""The phases `--harness-timeout PHASE=` may name on `run --milestone`, `run --board`
+and `resume`: a milestone run ends in Integrate."""
+
+HARNESS_TIMEOUT_MIN = 60
+"""The smallest `--harness-timeout` in seconds. The CLI's bound, not the model's."""
+
+HARNESS_TIMEOUT_MAX = 86400
+"""The largest `--harness-timeout` in seconds."""
+
+
+def _harness_timeout_error(message: str) -> typer.BadParameter:
+    return typer.BadParameter(message, param_hint="'--harness-timeout'")
+
+
+def _harness_seconds(text: str, given: str) -> float:
+    """`text` as seconds in bounds, or the usage error naming `given`, the whole value."""
+    if not text:
+        raise _harness_timeout_error(f"{given!r} has an empty value; expected [PHASE=]SECONDS")
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a number of seconds") from None
+    if not math.isfinite(seconds):
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a finite number of seconds")
+    if not HARNESS_TIMEOUT_MIN <= seconds <= HARNESS_TIMEOUT_MAX:
+        raise _harness_timeout_error(
+            f"{given!r}: seconds must be from {HARNESS_TIMEOUT_MIN} to"
+            f" {HARNESS_TIMEOUT_MAX} inclusive"
+        )
+    return seconds
+
+
+def parse_harness_timeouts(
+    values: Sequence[str], *, phases: Sequence[str]
+) -> tuple[float | None, dict[str, float]]:
+    """Every `--harness-timeout` value, parsed to `(run default, per-phase map)` (card 33dc5549).
+
+    A bare `SECONDS` is the run default. `PHASE=SECONDS` is split on the
+    first `=`, and `PHASE` must be one of `phases`, matched exactly. Each
+    `SECONDS` is a finite `float()` from `HARNESS_TIMEOUT_MIN` to
+    `HARNESS_TIMEOUT_MAX` inclusive. The run default or one phase given twice
+    is refused rather than last-wins, so a typo cannot hide. Every refusal is
+    `typer.BadParameter`, Typer's exit 2. Order does not matter, and no
+    values give `(None, {})`.
+    """
+    default: float | None = None
+    per_phase: dict[str, float] = {}
+    for value in values:
+        name, separator, text = value.partition("=")
+        if not separator:
+            seconds = _harness_seconds(value, value)
+            if default is not None:
+                raise _harness_timeout_error(
+                    "the run default is given twice; give one bare SECONDS"
+                )
+            default = seconds
+            continue
+        if not name:
+            raise _harness_timeout_error(
+                f"{value!r} has an empty phase name; expected PHASE=SECONDS"
+            )
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"{value!r}: unknown phase {name!r}; the agent phases are: {', '.join(phases)}"
+            )
+        seconds = _harness_seconds(text, value)
+        if name in per_phase:
+            raise _harness_timeout_error(f"phase {name!r} is given twice")
+        per_phase[name] = seconds
+    return default, per_phase
+
+
+def run_agent_phases(run: models.Run) -> tuple[str, ...]:
+    """The agent phases a recorded `run` can dispatch (card eee43099).
+
+    A `task` run and a story run (`config.story_id` set) never reach
+    Integrate, so only the `task` phases; a milestone run also `resolve`.
+    """
+    if run.workflow == WORKFLOW_NAME or run.config.story_id is not None:
+        return TASK_AGENT_PHASES
+    return MILESTONE_AGENT_PHASES
+
+
+def refuse_undispatchable_harness_phases(
+    run: models.Run, per_phase: Mapping[str, float]
+) -> None:
+    """`--harness-timeout`'s usage error for a phase `run` cannot dispatch.
+
+    `resume` validates against `MILESTONE_AGENT_PHASES` before anything is
+    loaded; this is the second check, once the run's shape is known.
+    """
+    phases = run_agent_phases(run)
+    for name in per_phase:
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"run {run.id} cannot dispatch phase {name!r}; its agent phases are:"
+                f" {', '.join(phases)}"
+            )
 
 
 def _check_run_targets(
@@ -1933,6 +2109,16 @@ def run(
             "is refused before anything is written. Ignored with --dry-run."
         ),
     ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Recorded with the run. "
+            "Ignored with --dry-run."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
@@ -1946,6 +2132,25 @@ def run(
         branch_prefix=branch_prefix,
         detach=detach_run,
         story=story,
+    )
+    # After the target checks and before the `HANDLED` block (card 33dc5549):
+    # a bad value reads no board, opens no store and creates no run directory.
+    # A card or story run dispatches only `task` phases; a milestone or board
+    # run ends in Integrate.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values,
+        phases=(
+            TASK_AGENT_PHASES
+            if card is not None or story is not None
+            else MILESTONE_AGENT_PHASES
+        ),
+    )
+    # Passed only when given, so a run without the flag calls exactly as before.
+    # The dry-run previews never receive them.
+    timeouts: dict[str, Any] = (
+        {"harness_timeout": default_timeout, "harness_timeouts": phase_timeouts}
+        if harness_timeout_values
+        else {}
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     isolation_warning: str | None = None
@@ -1978,6 +2183,7 @@ def run(
                 isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif whole_board:
             # Read as `orchestrate.run_board` so a test can patch it there.
@@ -1992,6 +2198,7 @@ def run(
                 launcher=mode,
                 isolation_warning=isolation_warning,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif milestone is not None and dry_run:
             payload = dry_run_milestone(
@@ -2015,6 +2222,7 @@ def run(
                 isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
@@ -2030,6 +2238,7 @@ def run(
                 launcher=mode,
                 isolation_warning=isolation_warning,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif story is not None and dry_run:
             payload = dry_run_story(
@@ -2051,6 +2260,7 @@ def run(
                 launcher=mode,
                 isolation_warning=isolation_warning,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif story is not None:
             # Read as `orchestrate.run_story` so a test can patch it there.
@@ -2064,6 +2274,7 @@ def run(
                 allow_no_verification=allow_no_verification,
                 launcher=mode,
                 isolation_warning=isolation_warning,
+                **timeouts,
             )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
@@ -2077,6 +2288,7 @@ def run(
                 isolation_warning=isolation_warning,
                 commands=commands,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         else:
             payload = run_card(
@@ -2088,6 +2300,7 @@ def run(
                 launcher=mode,
                 isolation_warning=isolation_warning,
                 commands=commands,
+                **timeouts,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
@@ -2992,6 +3205,7 @@ def _resume_from_checkpoint(
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
@@ -3020,7 +3234,15 @@ def _resume_from_checkpoint(
     `commands` is the passed `--verify` and is read for that warning only:
     the walk is driven with `run.config.verify` and `allow_no_verification`,
     and both `record_run` calls write `run`'s config back.
+
+    Harness timeouts (card eee43099): `harness_override`, when given,
+    replaces both of the run's recorded values before anything is read or
+    written (`with_harness_override`), so every run record this life writes
+    carries it and a later resume keeps it. Without it the recorded values
+    stay. Either way the walk's runner launches with them
+    (`runner_factory_for`).
     """
+    run = with_harness_override(run, harness_override)
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
@@ -3080,7 +3302,7 @@ def _resume_from_checkpoint(
                         repo_dir=root,
                         commands=run.config.verify,
                         allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
+                        runner_factory=runner_factory_for(run.config, runner_factory),
                         stop=stop,
                         resume_from=checkpoint,
                     ),
@@ -3138,6 +3360,7 @@ def resume_run(
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     isolation: Literal["none"] | None = None,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
 
@@ -3181,6 +3404,15 @@ def resume_run(
     with no probe. The pair goes into the same config copy as the suite, so
     a refused resume writes nothing, and a warning is placed in `warnings`
     before the `verification: replaced` entry.
+
+    Harness timeouts (card eee43099) are recorded on the run, so a resume
+    keeps them: without `harness_override` both workflows are called exactly
+    as before and launch with the recorded values. A `harness_override`
+    `(default, per-phase map)` replaces both recorded values, never merged,
+    and is recorded by the first run record the resume writes. A per-phase
+    name the loaded run cannot dispatch (`run_agent_phases`: `resolve` on a
+    `task` or story run) is `--harness-timeout`'s usage error, exit 2,
+    raised after the refusals above and before `Store.open`.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3203,6 +3435,16 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    if run.workflow not in (WORKFLOW_NAME, orchestrate.MILESTONE_WORKFLOW):
+        raise NotResumableError(
+            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+        )
+    # Passed only when given, so a resume without the flag calls exactly as before.
+    override: dict[str, Any] = {}
+    if harness_override is not None:
+        refuse_undispatchable_harness_phases(run, harness_override[1])
+        override["harness_override"] = harness_override
     # A5 B3: after every read-only refusal, before anything is written.
     if isolation == "none":
         mode: models.Launcher = "direct"
@@ -3240,9 +3482,10 @@ def resume_run(
             allow_no_verification=run.config.allow_no_verification,
             commands=commands,
             runner_factory=runner_factory,
+            **override,
         )
-    # Read as `orchestrate.run_milestone` so a test can patch it there.
-    elif run.workflow == orchestrate.MILESTONE_WORKFLOW:
+    else:
+        # Read as `orchestrate.run_milestone` so a test can patch it there.
         payload = orchestrate.run_milestone(
             None,
             repo_dir=root,
@@ -3252,11 +3495,7 @@ def resume_run(
             isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             resume_run_id=run.id,
-        )
-    else:
-        raise NotResumableError(
-            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
-            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+            **override,
         )
     if isolation_warning is not None:
         payload.setdefault("warnings", []).append(isolation_warning)
@@ -3302,6 +3541,16 @@ def resume(
             "`none` runs the rest of it without isolation, on purpose, and records that."
         ),
     ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Replaces both recorded "
+            "values and is recorded; without it the run keeps the timeouts it was started with."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
@@ -3311,6 +3560,20 @@ def resume(
     `milestone` run continues the whole milestone under the same run id.
     """
     commands = verify_commands(verify, from_env=verify_from_env)
+    # Before anything is loaded (card 33dc5549): the run's workflow is known
+    # only once it is, so every agent phase a `task` or `milestone` run can
+    # dispatch is accepted here, and `resume_run` refuses a phase the loaded
+    # run cannot dispatch (card eee43099). Given, the pair replaces both
+    # recorded values and is recorded; passed only when given, so a resume
+    # without the flag calls exactly as before and keeps the recorded values.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values, phases=MILESTONE_AGENT_PHASES
+    )
+    override: dict[str, Any] = (
+        {"harness_override": (default_timeout, phase_timeouts)}
+        if harness_timeout_values
+        else {}
+    )
     try:
         payload = resume_run(
             run_id,
@@ -3318,6 +3581,7 @@ def resume(
             allow_no_verification=allow_no_verification,
             commands=commands,
             isolation=isolation,
+            **override,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

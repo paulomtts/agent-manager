@@ -14806,3 +14806,929 @@ def test_resume_without_isolation_hands_none_to_resume_run(tmp_path, monkeypatch
 
     assert result.exit_code == 0, result.output
     assert seen["isolation"] is None
+
+
+# ── --harness-timeout parsing (card 33dc5549) ───────────────────────────────
+#
+# Unit tier: the parse helper is pure.
+
+TIMEOUT_HINT = "'--harness-timeout'"
+TASK_PHASES_TEXT = "explore, spec, validate_spec, plan, validate_plan, implement, review"
+
+
+def _parse(*values: str, phases=None):
+    return cli.parse_harness_timeouts(
+        list(values), phases=cli.TASK_AGENT_PHASES if phases is None else phases
+    )
+
+
+def test_the_agent_phase_sets_are_the_declared_workflows_agent_phases():
+    assert cli.TASK_AGENT_PHASES == (
+        "explore",
+        "spec",
+        "validate_spec",
+        "plan",
+        "validate_plan",
+        "implement",
+        "review",
+    )
+    assert "worktree" not in cli.TASK_AGENT_PHASES  # a Step, not an AgentPhase
+    assert cli.MILESTONE_AGENT_PHASES == (*cli.TASK_AGENT_PHASES, "resolve")
+    assert cli.agent_phase_names(task_workflow.TASK) == cli.TASK_AGENT_PHASES
+    assert cli.agent_phase_names(task_workflow.TASK, task_workflow.TASK) == (
+        cli.TASK_AGENT_PHASES
+    )
+
+
+def test_harness_timeout_parse_no_flag_is_none_and_empty():
+    assert _parse() == (None, {})
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"), [("600", 600.0), ("600.5", 600.5), ("1e3", 1000.0)]
+)
+def test_harness_timeout_parse_bare(value, seconds):
+    assert _parse(value) == (seconds, {})
+
+
+def test_harness_timeout_parse_per_phase():
+    assert _parse("spec=600") == (None, {"spec": 600.0})
+
+
+def test_harness_timeout_parse_repeated_mixes_bare_and_phases():
+    assert _parse("spec=600", "900", "implement=3600") == (
+        900.0,
+        {"spec": 600.0, "implement": 3600.0},
+    )
+
+
+def test_harness_timeout_parse_is_order_independent():
+    assert _parse("spec=600", "900") == _parse("900", "spec=600") == (900.0, {"spec": 600.0})
+
+
+@pytest.mark.parametrize("value", ["60", "60.0", "86400"])
+def test_harness_timeout_parse_accepts_the_bounds(value):
+    assert _parse(value) == (float(value), {})
+    assert _parse(f"review={value}") == (None, {"review": float(value)})
+
+
+def test_harness_timeout_parse_accepts_resolve_only_with_the_milestone_phases():
+    assert _parse("resolve=600", phases=cli.MILESTONE_AGENT_PHASES) == (
+        None,
+        {"resolve": 600.0},
+    )
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([""], "'' has an empty value; expected [PHASE=]SECONDS"),
+        (["spec="], "'spec=' has an empty value; expected [PHASE=]SECONDS"),
+        (["abc"], "'abc': 'abc' is not a number of seconds"),
+        (["spec=abc"], "'spec=abc': 'abc' is not a number of seconds"),
+        (["spec=600=1"], "'spec=600=1': '600=1' is not a number of seconds"),
+        (["nan"], "'nan': 'nan' is not a finite number of seconds"),
+        (["inf"], "'inf': 'inf' is not a finite number of seconds"),
+        (["-inf"], "'-inf': '-inf' is not a finite number of seconds"),
+        (["spec=nan"], "'spec=nan': 'nan' is not a finite number of seconds"),
+        (["59"], "'59': seconds must be from 60 to 86400 inclusive"),
+        (["59.9"], "'59.9': seconds must be from 60 to 86400 inclusive"),
+        (["86401"], "'86401': seconds must be from 60 to 86400 inclusive"),
+        (["0"], "'0': seconds must be from 60 to 86400 inclusive"),
+        (["-5"], "'-5': seconds must be from 60 to 86400 inclusive"),
+        (["spec=59"], "'spec=59': seconds must be from 60 to 86400 inclusive"),
+        (["=600"], "'=600' has an empty phase name; expected PHASE=SECONDS"),
+        (
+            ["bogus=600"],
+            f"'bogus=600': unknown phase 'bogus'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            ["Spec=600"],
+            f"'Spec=600': unknown phase 'Spec'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            [" spec=600"],
+            f"' spec=600': unknown phase ' spec'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (
+            ["resolve=600"],
+            f"'resolve=600': unknown phase 'resolve'; the agent phases are: {TASK_PHASES_TEXT}",
+        ),
+        (["600", "600"], "the run default is given twice; give one bare SECONDS"),
+        (["600", "900"], "the run default is given twice; give one bare SECONDS"),
+        (["spec=600", "spec=900"], "phase 'spec' is given twice"),
+    ],
+)
+def test_harness_timeout_parse_refuses_each_bad_value(values, message):
+    with pytest.raises(typer.BadParameter) as caught:
+        _parse(*values)
+
+    assert caught.value.message == message
+    assert caught.value.param_hint == TIMEOUT_HINT
+
+
+def test_harness_timeout_parse_lists_the_milestone_phases_in_declared_order():
+    with pytest.raises(typer.BadParameter) as caught:
+        _parse("bogus=600", phases=cli.MILESTONE_AGENT_PHASES)
+
+    assert caught.value.message == (
+        f"'bogus=600': unknown phase 'bogus'; the agent phases are: {TASK_PHASES_TEXT}, resolve"
+    )
+
+
+# ── harness timeouts reach the card run's RunConfig (card 33dc5549) ─────────
+#
+# Unit tier: FakeBoard and a plain repo dir, as the preflight seam tests above.
+
+
+def test_preflight_card_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        harness_timeout=900.0,
+        harness_timeouts={"implement": 3600.0},
+    )
+    default = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+    )
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"implement": 3600.0}
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+class _HaltAtPreflight(Exception):
+    """Raised by a recording preflight, so the run under test stops there."""
+
+
+@pytest.mark.parametrize("entry", ["run_card", "detach_card"])
+def test_card_entry_points_forward_harness_timeouts_to_preflight_card(
+    tmp_path, monkeypatch, entry
+):
+    seen: list[dict[str, Any]] = []
+
+    def preflight(card_id, **kwargs):
+        seen.append(kwargs)
+        raise _HaltAtPreflight
+
+    monkeypatch.setattr(cli, "preflight_card", preflight)
+    extra = {"detacher": _Forbidden("detacher")} if entry == "detach_card" else {}
+
+    with pytest.raises(_HaltAtPreflight):
+        getattr(cli, entry)(
+            VERIFY_CARD_ID,
+            repo_dir=tmp_path,
+            branch_prefix="m1",
+            harness_timeout=900.0,
+            harness_timeouts={"implement": 3600.0},
+            **extra,
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_timeout"] == 900.0
+    assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+# ── --harness-timeout on run and resume (card 33dc5549) ─────────────────────
+#
+# Unit tier: every run entry point is a recorder or `_Forbidden`; no board,
+# store or process is reached.
+
+RUN_ENTRY_POINTS = (
+    (cli, "run_card"),
+    (cli, "detach_card"),
+    (orchestrate, "run_milestone"),
+    (orchestrate, "detach_milestone"),
+    (orchestrate, "run_story"),
+    (orchestrate, "detach_story"),
+    (orchestrate, "run_board"),
+    (orchestrate, "detach_board"),
+)
+PREVIEWS = ("dry_run_milestone", "dry_run_story", "dry_run_board")
+TIMEOUT_FLAGS = ("--harness-timeout=900", "--harness-timeout=implement=3600")
+RESUME_RUN_ID = "20260923T140506Z-cbe34d00"
+
+
+def _record_run_entry_points(monkeypatch) -> list[tuple[str, dict[str, Any]]]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for module, name in RUN_ENTRY_POINTS:
+
+        def record(*args: Any, _name: str = name, **kwargs: Any) -> dict[str, Any]:
+            calls.append((_name, kwargs))
+            return {"status": "done"}
+
+        monkeypatch.setattr(module, name, record)
+    for name in PREVIEWS:
+        monkeypatch.setattr(cli, name, _Forbidden(name))
+    return calls
+
+
+def _forbid_every_run_path(monkeypatch) -> None:
+    _forbid_writes(monkeypatch)
+    monkeypatch.setattr(cli.board, "show", _Forbidden("board.show"))
+    monkeypatch.setattr(cli.board, "roots", _Forbidden("board.roots"))
+    for module, name in RUN_ENTRY_POINTS:
+        monkeypatch.setattr(module, name, _Forbidden(name))
+    for name in PREVIEWS:
+        monkeypatch.setattr(cli, name, _Forbidden(name))
+
+
+def _run_with(tmp_path: Path, targets: list[str], *flags: str):
+    return runner.invoke(
+        cli.app,
+        ["run", *targets, "--repo-dir", str(tmp_path), "--branch-prefix", "m3", *flags],
+    )
+
+
+TIMEOUT_TARGETS = [
+    pytest.param(["--card", VERIFY_CARD_ID], "run_card", id="card"),
+    pytest.param(["--detach", "--card", VERIFY_CARD_ID], "detach_card", id="detach-card"),
+    pytest.param(["--milestone", "M"], "run_milestone", id="milestone"),
+    pytest.param(["--detach", "--milestone", "M"], "detach_milestone", id="detach-milestone"),
+    pytest.param(["--story", "S"], "run_story", id="story"),
+    pytest.param(["--detach", "--story", "S"], "detach_story", id="detach-story"),
+    pytest.param(["--board"], "run_board", id="board"),
+    pytest.param(["--detach", "--board"], "detach_board", id="detach-board"),
+]
+
+
+@pytest.mark.parametrize(("targets", "entry"), TIMEOUT_TARGETS)
+def test_run_passes_harness_timeouts_through(tmp_path, monkeypatch, targets, entry):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _record_run_entry_points(monkeypatch)
+
+    result = _run_with(tmp_path, targets, *TIMEOUT_FLAGS)
+
+    assert result.exit_code == 0, result.output
+    ((name, kwargs),) = calls
+    assert name == entry
+    assert kwargs["harness_timeout"] == 900.0
+    assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+@pytest.mark.parametrize(("targets", "entry"), TIMEOUT_TARGETS)
+def test_run_without_harness_timeout_passes_no_new_keys(tmp_path, monkeypatch, targets, entry):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _record_run_entry_points(monkeypatch)
+
+    result = _run_with(tmp_path, targets)
+
+    assert result.exit_code == 0, result.output
+    ((name, kwargs),) = calls
+    assert name == entry
+    assert "harness_timeout" not in kwargs
+    assert "harness_timeouts" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [""],
+        ["abc"],
+        ["spec=abc"],
+        ["spec=600=1"],
+        ["nan"],
+        ["inf"],
+        ["-inf"],
+        ["spec=nan"],
+        ["59"],
+        ["59.9"],
+        ["86401"],
+        ["0"],
+        ["-5"],
+        ["spec=59"],
+        ["=600"],
+        ["spec="],
+        ["600", "600"],
+        ["600", "900"],
+        ["spec=600", "spec=900"],
+    ],
+)
+def test_run_refuses_a_bad_harness_timeout_with_exit_2_and_calls_nothing(
+    tmp_path, monkeypatch, values
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+
+    result = _run_with(
+        tmp_path,
+        ["--card", VERIFY_CARD_ID],
+        *(f"--harness-timeout={value}" for value in values),
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+    assert '"ok"' not in result.stdout
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    "targets", [["--card", VERIFY_CARD_ID], ["--story", "S"]], ids=["card", "story"]
+)
+def test_run_refuses_an_unknown_phase_and_lists_the_agent_phases(tmp_path, monkeypatch, targets):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+
+    result = _run_with(tmp_path, targets, "--harness-timeout=resolve=600")
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+    for phase in cli.TASK_AGENT_PHASES:
+        assert phase in result.output
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    ("targets", "entry"),
+    [(["--milestone", "M"], "run_milestone"), (["--board"], "run_board")],
+    ids=["milestone", "board"],
+)
+def test_milestone_and_board_runs_accept_resolve(tmp_path, monkeypatch, targets, entry):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    calls = _record_run_entry_points(monkeypatch)
+
+    result = _run_with(tmp_path, targets, "--harness-timeout=resolve=600")
+
+    assert result.exit_code == 0, result.output
+    ((name, kwargs),) = calls
+    assert name == entry
+    assert kwargs["harness_timeouts"] == {"resolve": 600.0}
+    assert kwargs["harness_timeout"] is None
+
+
+def test_a_milestone_run_lists_resolve_among_the_agent_phases(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+
+    result = _run_with(tmp_path, ["--milestone", "M"], "--harness-timeout=bogus=600")
+
+    assert result.exit_code == 2, result.output
+    for phase in cli.MILESTONE_AGENT_PHASES:
+        assert phase in result.output
+
+
+@pytest.mark.parametrize(
+    ("targets", "preview"),
+    [
+        (["--milestone", "M"], "dry_run_milestone"),
+        (["--story", "S"], "dry_run_story"),
+        (["--board"], "dry_run_board"),
+    ],
+    ids=["milestone", "story", "board"],
+)
+def test_run_dry_run_ignores_a_valid_harness_timeout(tmp_path, monkeypatch, targets, preview):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def record(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append((args, kwargs))
+        return {"levels": [], "already_done": []}
+
+    monkeypatch.setattr(cli, preview, record)
+
+    plain = _run_with(tmp_path, [*targets, "--dry-run"])
+    timed = _run_with(tmp_path, [*targets, "--dry-run"], *TIMEOUT_FLAGS)
+
+    assert plain.exit_code == 0, plain.output
+    assert timed.exit_code == 0, timed.output
+    assert timed.stdout == plain.stdout
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert not any(key.startswith("harness") for key in calls[1][1])
+    assert not (paths.data_dir() / "runs").exists()
+
+
+@pytest.mark.parametrize("value", ["abc", "59", "bogus=600"])
+def test_run_dry_run_still_refuses_a_malformed_harness_timeout(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+
+    result = _run_with(
+        tmp_path, ["--milestone", "M", "--dry-run"], f"--harness-timeout={value}"
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+
+
+def test_a_bad_run_target_is_refused_before_the_harness_timeout(tmp_path, monkeypatch):
+    """B4: `_check_run_targets` runs first, so its error is unchanged."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _forbid_every_run_path(monkeypatch)
+
+    result = _run_with(
+        tmp_path, ["--card", VERIFY_CARD_ID, "--milestone", "M"], "--harness-timeout=abc"
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "both" in result.output
+
+
+def test_resume_accepts_and_validates_harness_timeout(tmp_path, monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_resume_run(run_id, **kwargs):
+        calls.append((run_id, kwargs))
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+    base = ["resume", RESUME_RUN_ID, "--repo-dir", str(tmp_path)]
+
+    plain = runner.invoke(cli.app, base)
+    timed = runner.invoke(cli.app, [*base, *TIMEOUT_FLAGS, "--harness-timeout=resolve=600"])
+
+    assert plain.exit_code == 0, plain.output
+    assert timed.exit_code == 0, timed.output
+    plain_call = (
+        RESUME_RUN_ID,
+        {
+            "repo_dir": tmp_path,
+            "allow_no_verification": False,
+            "commands": [],
+            "isolation": None,
+        },
+    )
+    assert calls[0] == plain_call
+    assert calls[1] == (
+        RESUME_RUN_ID,
+        {
+            **plain_call[1],
+            "harness_override": (900.0, {"implement": 3600.0, "resolve": 600.0}),
+        },
+    )
+
+
+@pytest.mark.parametrize("values", [["59"], ["bogus=600"], ["600", "900"], ["nan"]])
+def test_resume_refuses_a_bad_harness_timeout_with_exit_2_and_loads_nothing(
+    tmp_path, monkeypatch, values
+):
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+    monkeypatch.setattr(cli.store_module, "open_db", _Forbidden("store.open_db"))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            RESUME_RUN_ID,
+            "--repo-dir",
+            str(tmp_path),
+            *(f"--harness-timeout={value}" for value in values),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+    assert '"ok"' not in result.stdout
+    if values == ["bogus=600"]:
+        for phase in cli.MILESTONE_AGENT_PHASES:
+            assert phase in result.output
+
+
+def test_the_harness_timeout_help_texts():
+    run_option = inspect.signature(cli.run).parameters["harness_timeout_values"].default
+    resume_option = inspect.signature(cli.resume).parameters["harness_timeout_values"].default
+
+    assert run_option.metavar == "[PHASE=]SECONDS"
+    assert run_option.help == (
+        "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+        "run's default, PHASE=SECONDS overrides one agent phase. Recorded with the run. "
+        "Ignored with --dry-run."
+    )
+    assert resume_option.metavar == "[PHASE=]SECONDS"
+    assert resume_option.help == (
+        "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+        "run's default, PHASE=SECONDS overrides one agent phase. Replaces both recorded "
+        "values and is recorded; without it the run keeps the timeouts it was started with."
+    )
+
+
+# ── recorded harness timeouts reach the runner (card eee43099) ──────────────
+#
+# Unit tier: an `AgentRunner` is built but never called, so nothing launches.
+
+BOUND_IDS = {"run_id": "run-1", "story_id": "story-1", "card_id": "card-1"}
+
+
+def _recorded_direct_store() -> Any:
+    """A stand-in store whose projection holds only `run-1`'s config, recorded
+    `direct`: all `default_runner_factory` reads to pick the launcher."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, config TEXT NOT NULL)")
+    conn.execute(
+        "INSERT INTO runs (id, config) VALUES (?, ?)",
+        (BOUND_IDS["run_id"], models.RunConfig().model_dump_json()),
+    )
+    return SimpleNamespace(connection=conn)
+
+
+def _bound_runner(factory: Any) -> Any:
+    """The runner `factory` builds for a store read only for the launcher."""
+    return factory(store=_recorded_direct_store(), **BOUND_IDS)
+
+
+def test_runner_factory_for_returns_an_injected_factory_unchanged():
+    def injected(**kwargs: Any) -> Any:
+        return None
+
+    timed = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+
+    assert cli.runner_factory_for(timed, injected) is injected
+    assert cli.runner_factory_for(models.RunConfig(), injected) is injected
+
+
+def test_runner_factory_for_is_none_when_the_config_sets_no_timeout():
+    assert cli.runner_factory_for(models.RunConfig(), None) is None
+
+
+def test_runner_factory_for_binds_the_recorded_timeouts():
+    config = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+
+    factory = cli.runner_factory_for(config, None)
+
+    assert factory is not None
+    runner = _bound_runner(factory)
+    assert isinstance(runner, dispatch.AgentRunner)
+    assert (runner.run_id, runner.story_id, runner.card_id) == ("run-1", "story-1", "card-1")
+    assert runner.timeout_for("implement") == 3600.0
+    assert runner.timeout_for("plan") == 900.0
+
+
+def test_runner_factory_for_binds_a_per_phase_map_alone():
+    """Review Focus 1: no run default, one override -- still bound."""
+    config = models.RunConfig(harness_timeouts={"implement": 600.0})
+
+    runner = _bound_runner(cli.runner_factory_for(config, None))
+
+    assert runner.timeout_for("implement") == 600.0
+    assert runner.timeout_for("plan") == dispatch.DEFAULT_TIMEOUT
+
+
+def test_runner_factory_for_reads_default_runner_factory_at_call_time(monkeypatch):
+    config = models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0})
+    factory = cli.runner_factory_for(config, None)
+    seen: list[dict[str, Any]] = []
+
+    def recording(**kwargs: Any) -> str:
+        seen.append(kwargs)
+        return "patched runner"
+
+    monkeypatch.setattr(cli, "default_runner_factory", recording)
+    store = object()
+
+    assert factory(store=store, **BOUND_IDS) == "patched runner"
+    assert seen == [
+        {
+            "store": store,
+            **BOUND_IDS,
+            "harness_timeout": 900.0,
+            "harness_timeouts": {"implement": 3600.0},
+        }
+    ]
+
+
+def test_default_runner_factory_without_timeouts_keeps_the_default():
+    runner = cli.default_runner_factory(store=_recorded_direct_store(), **BOUND_IDS)
+
+    assert runner.harness_timeout is None
+    assert runner.harness_timeouts == {}
+    assert runner.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT
+
+
+def _card_engine_factory(root: Path, cards: dict[str, str], monkeypatch, **kwargs: Any) -> Any:
+    """Run `run_card_engine` on a freshly recorded card run and return the
+    `runner_factory` it handed `drive_subtask_async`. `kwargs` go to
+    `preflight_card` except `runner_factory`, which goes to the engine."""
+    injected = kwargs.pop("runner_factory", None)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _done_drive(calls))
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        **kwargs,
+    )
+    with cli.recorded_card_run(pre) as recorded:
+        asyncio.run(
+            cli.run_card_engine(
+                pre, recorded, runner_factory=injected, control_interval=CONTROL_TICK
+            )
+        )
+    (call,) = calls
+    return call["runner_factory"]
+
+
+def test_run_card_engine_hands_on_no_factory_when_no_timeout_is_recorded(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    assert _card_engine_factory(root, cards, monkeypatch) is None
+
+
+def test_run_card_engine_binds_the_recorded_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    factory = _card_engine_factory(
+        root, cards, monkeypatch, harness_timeout=2.0, harness_timeouts={"review": 5.0}
+    )
+
+    runner = _bound_runner(factory)
+    assert runner.timeout_for("explore") == 2.0
+    assert runner.timeout_for("review") == 5.0
+
+
+def test_run_card_engine_hands_an_injected_factory_on_unchanged(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 2: the test seam wins over a recorded timeout."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+
+    def injected(*, store: Any, run_id: str, story_id: str, card_id: str) -> Any:
+        return None
+
+    factory = _card_engine_factory(
+        root, cards, monkeypatch, harness_timeout=2.0, runner_factory=injected
+    )
+
+    assert factory is injected
+
+
+def _timed_task_run(root: Path, cards: dict[str, str], **timeouts: Any) -> str:
+    """A recorded `task` run, its subtask `started` and parked before `plan`,
+    with its lease released: what `am resume` finds after a kill."""
+    pre = cli.preflight_card(
+        cards["subtask"],
+        repo_dir=root,
+        branch_prefix="m1",
+        base_branch="main",
+        clock=lambda: SEAM_AT,
+        **timeouts,
+    )
+    with cli.recorded_card_run(pre) as recorded:
+        _saved(recorded.store, cards["subtask"], "parked", queue=("plan",))
+    return pre.run_id
+
+
+def _config_drive(calls: list[dict[str, Any]], configs: list[models.RunConfig]):
+    """A fake `drive_subtask_async` that records its keywords and the run's
+    recorded config at the moment it is driven, then finishes `done`."""
+
+    async def drive(**kwargs: Any) -> cli.SubtaskDrive:
+        calls.append(kwargs)
+        run = kwargs["store"].load_run(kwargs["run_id"])
+        configs.append(run.config)
+        return cli.SubtaskDrive(summary=SubtaskSummary(status="done"), warnings=[])
+
+    return drive
+
+
+def _resume_task(root: Path, run_id: str, **extra: Any) -> dict[str, Any]:
+    return cli._resume_from_checkpoint(
+        _loaded(root, run_id),
+        root=root,
+        allow_no_verification=False,
+        commands=(),
+        runner_factory=None,
+        control_interval=CONTROL_TICK,
+        **extra,
+    )
+
+
+def test_a_resumed_task_run_keeps_its_recorded_harness_timeout(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(root, cards, harness_timeout=2.0)
+    calls: list[dict[str, Any]] = []
+    configs: list[models.RunConfig] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, configs))
+
+    payload = _resume_task(root, run_id)
+
+    assert payload["status"] == "done"
+    (call,) = calls
+    assert call["resume_from"] is not None
+    assert _bound_runner(call["runner_factory"]).timeout_for("plan") == 2.0
+    (started,) = configs
+    assert (started.harness_timeout, started.harness_timeouts) == (2.0, {})
+    final = _loaded(root, run_id).config
+    assert (final.harness_timeout, final.harness_timeouts) == (2.0, {})
+
+
+def test_a_resumed_task_run_without_a_timeout_hands_on_no_factory(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(root, cards)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, []))
+
+    _resume_task(root, run_id)
+
+    (call,) = calls
+    assert call["runner_factory"] is None
+
+
+@pytest.mark.parametrize(
+    ("override", "expected", "implement", "plan"),
+    [
+        ((900.0, {}), (900.0, {}), 900.0, 900.0),
+        ((None, {"plan": 120.0}), (None, {"plan": 120.0}), dispatch.DEFAULT_TIMEOUT, 120.0),
+    ],
+)
+def test_a_task_resume_override_replaces_both_values_and_is_recorded(
+    tmp_path, monkeypatch, fake_board, override, expected, implement, plan
+):
+    """Review Focus 3 and 4: replaced wholesale, in the `started` record and
+    in the final one a later resume loads."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    run_id = _timed_task_run(
+        root, cards, harness_timeout=600.0, harness_timeouts={"implement": 3600.0}
+    )
+    calls: list[dict[str, Any]] = []
+    configs: list[models.RunConfig] = []
+    monkeypatch.setattr(cli, "drive_subtask_async", _config_drive(calls, configs))
+
+    _resume_task(root, run_id, harness_override=override)
+
+    (call,) = calls
+    runner = _bound_runner(call["runner_factory"])
+    assert runner.timeout_for("implement") == implement
+    assert runner.timeout_for("plan") == plan
+    (started,) = configs
+    assert (started.harness_timeout, started.harness_timeouts) == expected
+    final = _loaded(root, run_id).config
+    assert (final.harness_timeout, final.harness_timeouts) == expected
+
+
+# ── am resume --harness-timeout replaces and is recorded (card eee43099) ────
+#
+# Unit tier: the projection is written directly; `_resume_from_checkpoint`,
+# `orchestrate.run_milestone` and `Store.open` are recorders or `_Forbidden`.
+
+TASK_RUN_ID = "20260923T090000Z-cbe34d00"
+OVERRIDE = (900.0, {"implement": 600.0})
+
+
+def test_resume_run_hands_a_harness_override_to_the_task_path(projection, monkeypatch):
+    _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    seen: list[dict[str, Any]] = []
+
+    def fake_resume(run, **kwargs):
+        seen.append(kwargs)
+        return {"status": "done"}
+
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", fake_resume)
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+
+    cli.resume_run(TASK_RUN_ID, repo_dir=projection, harness_override=OVERRIDE)
+
+    (kwargs,) = seen
+    assert kwargs["harness_override"] == OVERRIDE
+    assert kwargs["runner_factory"] is None
+
+
+def test_resume_run_hands_a_harness_override_to_the_milestone_path(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_milestone(milestone, **kwargs):
+        calls.append(kwargs)
+        return {"done": True, "run_id": run_id, "resumed": True}
+
+    monkeypatch.setattr(orchestrate, "run_milestone", fake_run_milestone)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    override = (None, {"resolve": 600.0})
+
+    cli.resume_run(run_id, repo_dir=projection, harness_override=override)
+
+    (kwargs,) = calls
+    assert kwargs["harness_override"] == override
+    assert kwargs["resume_run_id"] == run_id
+
+
+@pytest.mark.parametrize("shape", ["task", "story"])
+def test_resume_run_refuses_a_phase_the_run_cannot_dispatch(projection, monkeypatch, shape):
+    """`resolve` is Integrate's: a `task` run and a story run never reach it."""
+    if shape == "task":
+        _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    else:
+        _record(
+            projection,
+            TASK_RUN_ID,
+            started_at=RECORDED_AT,
+            status="escalated",
+            workflow="milestone",
+            milestone_id="milestone-1",
+            story_id="story-1",
+        )
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+
+    with pytest.raises(typer.BadParameter) as caught:
+        cli.resume_run(
+            TASK_RUN_ID, repo_dir=projection, harness_override=(None, {"resolve": 600.0})
+        )
+
+    assert caught.value.param_hint == "'--harness-timeout'"
+    message = str(caught.value)
+    assert "'resolve'" in message
+    assert ", ".join(cli.TASK_AGENT_PHASES) in message
+    assert ", ".join(cli.MILESTONE_AGENT_PHASES) not in message
+
+
+def test_resume_run_accepts_resolve_on_a_milestone_run(projection, monkeypatch):
+    run_id = "20260927T100000Z-cbe34d00"
+    _record_milestone(projection, run_id, status="escalated")
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        orchestrate, "run_milestone", lambda milestone, **kwargs: calls.append(kwargs) or {}
+    )
+
+    cli.resume_run(run_id, repo_dir=projection, harness_override=(None, {"resolve": 600.0}))
+
+    assert [kwargs["harness_override"] for kwargs in calls] == [(None, {"resolve": 600.0})]
+
+
+@pytest.mark.parametrize("status", [None, "canceled"])
+def test_resume_run_refuses_an_unknown_or_canceled_run_before_judging_the_override(
+    projection, monkeypatch, status
+):
+    """Review Focus 5: the existing refusal comes first and nothing is recorded."""
+    if status is not None:
+        _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status=status)
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    expected = cli.UnknownRunError if status is None else cli.NotResumableError
+
+    with pytest.raises(expected):
+        cli.resume_run(
+            TASK_RUN_ID, repo_dir=projection, harness_override=(None, {"resolve": 600.0})
+        )
+
+
+def test_am_resume_of_a_task_run_refuses_resolve_with_exit_2_and_writes_nothing(
+    projection, monkeypatch
+):
+    _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    before = _runs_snapshot()
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            TASK_RUN_ID,
+            "--repo-dir",
+            str(projection),
+            "--harness-timeout=resolve=600",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--harness-timeout" in result.output
+    assert '"ok"' not in result.stdout
+    for phase in cli.TASK_AGENT_PHASES:
+        assert phase in result.output
+    assert _runs_snapshot() == before
+    assert _loaded(projection, TASK_RUN_ID).config == models.RunConfig()
+
+
+def test_run_agent_phases_follow_the_run_shape():
+    def run(workflow: str, story_id: str | None = None) -> models.Run:
+        return models.Run(
+            id=TASK_RUN_ID,
+            workflow=workflow,
+            repo_dir=Path("/repo"),
+            base_branch="main",
+            branch_prefix="m1",
+            status="escalated",
+            config=models.RunConfig(story_id=story_id),
+        )
+
+    assert cli.run_agent_phases(run("task")) == cli.TASK_AGENT_PHASES
+    assert cli.run_agent_phases(run("milestone", "story-1")) == cli.TASK_AGENT_PHASES
+    assert cli.run_agent_phases(run("milestone")) == cli.MILESTONE_AGENT_PHASES

@@ -20,6 +20,7 @@ from agent_manager import (
     argv_guard,
     cli,
     detach,
+    dispatch,
     errors,
     models,
     orchestrate,
@@ -762,3 +763,37 @@ def test_isolation_and_resume_passages_link_only_to_headings():
         _assert_anchors_resolve(text)
     assert "relaunching-resumes" in _assert_anchors_resolve(_section(ISOLATION_TITLE))
     assert "resuming-what-runs-again" in _assert_anchors_resolve(_paragraph(RESUME_OPENING))
+
+
+HARNESS_FLAG = "`--harness-timeout [PHASE=]SECONDS`"
+KEEPS_TIMEOUTS = "keeps the harness timeouts the run recorded"
+REPLACES_BOTH = "replaces both the recorded default and the recorded per-phase overrides"
+
+
+def test_usage_documents_the_harness_timeout_flag():
+    usage = _section("Usage")
+    assert HARNESS_FLAG in usage
+    assert f"{cli.HARNESS_TIMEOUT_MIN} to {cli.HARNESS_TIMEOUT_MAX}" in usage
+    assert f"{dispatch.DEFAULT_TIMEOUT:.0f}" in usage
+    task_phases = ", ".join(f"`{phase}`" for phase in cli.TASK_AGENT_PHASES)
+    assert task_phases in usage
+    assert "`resolve`" in usage
+    assert "exit 2" in usage
+    assert "`--dry-run`" in usage
+    assert "`harness_error`" in usage
+
+
+def test_resume_text_keeps_or_replaces_the_harness_timeouts():
+    for text in (_paragraph(RESUME_OPENING), _section("Relaunching resumes")):
+        assert KEEPS_TIMEOUTS in text
+        assert REPLACES_BOTH in text
+        assert "not merged" in text
+        assert "`resolve`" in text
+        assert "exit 2" in text
+    assert (
+        "There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here"
+        in _paragraph(RESUME_OPENING)
+    )
+    assert "takes only the `--harness-timeout` values given to it" in _section(
+        "Relaunching resumes"
+    )

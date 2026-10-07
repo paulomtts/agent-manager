@@ -360,6 +360,13 @@ class AgentRunner:
     exact failure §12 calls out -- a run that reports success while something it
     was told about never happened. The caller that constructs the runner reads
     this list when the walk returns.
+
+    `harness_timeout` and `harness_timeouts` mirror `models.RunConfig`'s fields
+    of the same names: the run default and the per-agent-phase overrides.
+    `None` is "no run default", not a value -- `timeout_for` then falls back to
+    `DEFAULT_TIMEOUT`. They are resolved per attempt rather than once per
+    runner so the journalled `Dispatch.timeout` is the value that attempt's
+    launcher was actually given.
     """
 
     store: Store
@@ -373,9 +380,25 @@ class AgentRunner:
     )
     harness_map: Mapping[str, models.HarnessAssignment] = field(default_factory=dict)
     role_root: Path | None = None
-    timeout: float = DEFAULT_TIMEOUT
+    harness_timeout: float | None = None
+    harness_timeouts: Mapping[str, float] = field(default_factory=dict)
     clock: Clock = _utcnow
     warnings: list[str] = field(default_factory=list)
+
+    def timeout_for(self, phase_name: str) -> float:
+        """The wall-clock seconds an attempt of `phase_name` gets.
+
+        The phase's own override, else the run default, else `DEFAULT_TIMEOUT`.
+        No bounds are checked: the CLI owns 60..86400 and `RunConfig` and the
+        launcher own positivity, and a sub-floor value (an e2e_fake test's 2 s)
+        must pass through untouched. An override for a phase this runner never
+        dispatches is simply never read.
+        """
+        if phase_name in self.harness_timeouts:
+            return self.harness_timeouts[phase_name]
+        if self.harness_timeout is not None:
+            return self.harness_timeout
+        return DEFAULT_TIMEOUT
 
     def __call__(
         self,
@@ -487,13 +510,16 @@ class AgentRunner:
             attempt_dir
         )
         stdout_path = attempt_dir / STDOUT_NAME
+        # Resolved once and used twice -- the journalled dispatch and the
+        # launcher -- so the journal shows the timeout actually applied.
+        timeout = self.timeout_for(phase.name)
         dispatch_record = build_dispatch(
             target=target,
             role=role,
             cwd=cwd,
             prompt_path=prompt_path,
             attempt_dir=attempt_dir,
-            timeout=self.timeout,
+            timeout=timeout,
         )
         # Recorded `started` before the launcher runs, because that is the row
         # resume reads when the manager dies mid-attempt (§9).
@@ -512,7 +538,7 @@ class AgentRunner:
         outcome = self.launcher(
             argv,
             cwd=cwd,
-            timeout=self.timeout,
+            timeout=timeout,
             stdout_path=stdout_path,
             **_spawn_kwargs(self.launcher),
         )

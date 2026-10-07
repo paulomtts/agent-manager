@@ -7,6 +7,7 @@ tests/test_engine.py builds it. No git, no board, no harness process.
 """
 
 import asyncio
+import dataclasses
 import itertools
 import threading
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,8 @@ from agent_manager import models, store as store_module
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import compile as C, context, state
-from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
+from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow, WorkflowError
+from agent_manager.workflow.task import TASK
 
 RUN_ID = "run-2026-09-26-01"
 STORY_ID = "f9c19dc3"
@@ -51,7 +53,7 @@ def _subtask() -> models.SubtaskRun:
     )
 
 
-def _deps(workflow, store, runner=None) -> state.RunDeps:
+def _deps(workflow, store, runner=None, compiled=None) -> state.RunDeps:
     return state.RunDeps(
         workflow=workflow,
         store=store,
@@ -59,6 +61,7 @@ def _deps(workflow, store, runner=None) -> state.RunDeps:
         subtask=_subtask(),
         agent_runner=runner,
         clock=lambda: FIXED,
+        compiled=compiled,
     )
 
 
@@ -239,6 +242,123 @@ def test_turns_carry_the_phase_the_loop_and_a_timeout():
     assert nxt.kwargs == {"phase": "b", "loop": 2}
     assert nxt.timeout == 2400
     assert compiled.after("b", 0) is None
+
+
+# D3: an agent phase's turn timeout is derived from the run's launcher timeout
+# (G2) at compile time; the declared workflow and its digest never change.
+
+DECLARED = timedelta(seconds=2100)  # TASK's floor, `workflow/task.py`
+RUN_VALUES = (60.0, 1800.0, 3600.0, 86400.0)
+
+
+def _step_and_agents() -> Workflow:
+    return Workflow("derive", (
+        Step("a", _noop),
+        AgentPhase("b", "explorer", (), None, timeout=DECLARED),
+        AgentPhase("c", "critic", (), None, timeout=DECLARED),
+    ))
+
+
+@pytest.mark.parametrize(
+    ("launcher", "expected"),
+    [(60.0, 2100), (1800.0, 2100), (3600.0, 3900), (86400.0, 86700)],
+)
+def test_launcher_timeout_derives_the_agent_turn_timeout(launcher, expected):
+    asked: list[str] = []
+
+    def launcher_timeout(name: str) -> float:
+        asked.append(name)
+        return launcher
+
+    compiled = C.compile_workflow(_step_and_agents(), launcher_timeout=launcher_timeout)
+
+    assert compiled.turn_for("b", 0).timeout == expected
+    assert compiled.turn_for("a", 0).timeout == C.STEP_TIMEOUT == 3600
+    assert compiled.first_turn().timeout == C.STEP_TIMEOUT
+    assert "a" not in asked
+    assert asked == ["b"]
+
+
+def test_launcher_timeout_is_resolved_per_phase():
+    compiled = C.compile_workflow(
+        _step_and_agents(),
+        launcher_timeout=lambda name: {"b": 7200.0}.get(name, 1800.0),
+    )
+
+    assert compiled.turn_for("b", 0).timeout == 7500
+    assert compiled.turn_for("c", 0).timeout == 2100
+    assert compiled.after("a", 0).timeout == 7500
+    assert compiled.after("b", 0).timeout == 2100
+
+
+def test_without_a_launcher_timeout_the_declared_timeout_is_kept_as_is():
+    # No hidden floor: a declared 60 s phase stays 60 s when no launcher is given.
+    wf = Workflow("short", (AgentPhase("b", "explorer", (), None, timeout=timedelta(seconds=60)),))
+
+    compiled = C.compile_workflow(wf)
+
+    assert compiled.launcher_timeout is None
+    assert compiled.turn_for("b", 0).timeout == 60
+
+
+@pytest.mark.parametrize("value", RUN_VALUES)
+def test_derived_turns_keep_g2_for_every_task_phase(value):
+    compiled = C.compile_workflow(TASK, launcher_timeout=lambda _: value)
+    derived = {
+        p.name: compiled.turn_for(p.name, 0).timeout
+        for p in TASK.phases
+        if isinstance(p, AgentPhase)
+    }
+
+    assert all(timeout > value for timeout in derived.values()), derived
+    # Built in the test only: the workflow of derived turn timeouts passes G2
+    # at the run's value, which with a single value is also its largest.
+    as_turns = dataclasses.replace(TASK, phases=tuple(
+        dataclasses.replace(p, timeout=timedelta(seconds=derived[p.name]))
+        if isinstance(p, AgentPhase) else p
+        for p in TASK.phases
+    ))
+    as_turns.validate(launcher_timeout=timedelta(seconds=value))
+
+
+def test_the_declared_timeouts_alone_do_not_carry_g2_for_a_raised_launcher():
+    # Why the derivation, not the declaration, carries G2 for a run value
+    # above the floor: TASK's declared timeouts fail it at 3600 s.
+    with pytest.raises(WorkflowError):
+        TASK.validate(launcher_timeout=timedelta(seconds=3600))
+
+
+@pytest.mark.parametrize("value", RUN_VALUES)
+def test_a_launcher_timeout_leaves_the_digest_and_tool_names_alone(value):
+    before = TASK.digest()
+    cached = C.compile_workflow(TASK)
+
+    compiled = C.compile_workflow(TASK, launcher_timeout=lambda _: value)
+
+    assert compiled is not cached
+    assert compiled.workflow is TASK
+    assert TASK.digest() == before
+    assert compiled.agent_phase is cached.agent_phase
+    assert compiled.step_phase is cached.step_phase
+    assert compiled.agent_phase.__name__.endswith(before[:8])
+    assert compiled.step_phase.__name__.endswith(before[:8])
+    assert C.compile_workflow(TASK) is cached
+
+
+def test_two_launcher_timeouts_never_leak_into_each_other():
+    wf = _step_and_agents()
+
+    a = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+    b = C.compile_workflow(wf, launcher_timeout=lambda _: 60.0)
+
+    assert b.turn_for("b", 0).timeout == 2100
+    assert a.turn_for("b", 0).timeout == 3900
+    assert b.turn_for("b", 0).timeout == 2100
+    assert a is not b
+    plain = C.compile_workflow(wf)
+    assert plain is not a and plain is not b
+    assert plain.launcher_timeout is None
+    assert plain.turn_for("b", 0).timeout == 2100
 
 
 def test_the_tools_are_registered_under_digest_suffixed_names():
@@ -587,4 +707,89 @@ async def test_a_critic_looping_back_past_an_earlier_critic_shares_its_loop(stor
     assert names == [
         "spec", "validate_spec", "plan", "validate_plan",
         "spec", "validate_spec", "plan", "validate_plan",
+    ]
+
+
+# D3 (T7): every turn a tool yields -- `after()`, a critic's `Goto`, a step's
+# `skip_to` -- comes from the run's own compilation, `deps.compiled`.
+
+
+def _timeout_recorder(fail: dict[str, int] | None = None):
+    """A fake runner that records each agent phase with its running turn's
+    timeout, read off the agent (`agents[0]`) the test drives; phases named in
+    `fail` fail that many times first."""
+    seen: list[tuple[str, float]] = []
+    agents: list[Agent] = []
+    left = dict(fail or {})
+
+    def runner(phase, table, rendered):
+        seen.append((phase.name, agents[0].to_dict()["current_turn"]["timeout"]))
+        if left.get(phase.name, 0) > 0:
+            left[phase.name] -= 1
+            raise AgentPhaseFailed(phase.name, outcome="gate_failed", detail=f"{phase.name} blocks")
+        return {"ok": True}
+
+    return runner, seen, agents
+
+
+async def _drive_compiled(compiled, deps, agents: list[Agent]) -> Agent:
+    agent = await _new_agent(compiled)
+    agents.append(agent)
+    token = state.current_run.set(deps)
+    try:
+        await _consume(agent)
+    finally:
+        state.current_run.reset(token)
+    return agent
+
+
+def _step_then_critic_loop() -> Workflow:
+    return Workflow("derived-loop", (
+        Step("a", _noop),
+        AgentPhase("spec", "spec_author", ("feedback",), None, timeout=DECLARED),
+        AgentPhase("validate_spec", "critic", (), None, timeout=DECLARED, on_fail=Goto("spec", 1)),
+    ))
+
+
+async def test_after_and_goto_turns_carry_the_derived_timeout(store):
+    runner, seen, agents = _timeout_recorder({"validate_spec": 1})
+    wf = _step_then_critic_loop()
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+
+    await _drive_compiled(compiled, _deps(wf, store, runner, compiled=compiled), agents)
+
+    # spec via after() from the step, validate_spec via after(), spec again via
+    # the critic's Goto, validate_spec via after().
+    assert seen == [
+        ("spec", 3900), ("validate_spec", 3900), ("spec", 3900), ("validate_spec", 3900),
+    ]
+
+
+async def test_a_skip_to_turn_carries_the_derived_timeout(store):
+    runner, seen, agents = _timeout_recorder()
+    wf = Workflow("derived-skip", (
+        Step("a", _noop, when=lambda result: True, skip_to="c"),
+        Step("b", _noop),
+        AgentPhase("c", "explorer", (), None, timeout=DECLARED),
+    ))
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+    deps = _deps(wf, store, runner, compiled=compiled)
+
+    await _drive_compiled(compiled, deps, agents)
+
+    assert deps.skipped == ["b"]
+    assert seen == [("c", 3900)]
+
+
+async def test_tools_without_a_run_compilation_keep_the_declared_timeout(store):
+    # A hand-built `RunDeps` (no `compiled`) falls back to the shared,
+    # launcher-less compilation, even when the first turn came from a derived one.
+    runner, seen, agents = _timeout_recorder({"validate_spec": 1})
+    wf = _step_then_critic_loop()
+    compiled = C.compile_workflow(wf, launcher_timeout=lambda _: 3600.0)
+
+    await _drive_compiled(compiled, _deps(wf, store, runner), agents)
+
+    assert seen == [
+        ("spec", 2100), ("validate_spec", 2100), ("spec", 2100), ("validate_spec", 2100),
     ]

@@ -77,6 +77,13 @@ outcomes."""
 Launcher = Literal["direct", "bwrap", "unshare", "container"]
 """§4: how a harness process is contained when it runs."""
 
+HarnessSeconds = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+"""A recorded harness timeout in seconds: finite and positive, nothing more.
+
+The CLI's 60..86400 bounds are the CLI's (card 33dc5549): a test records a
+2 s timeout directly, so the model must not enforce them.
+"""
+
 
 class _Model(BaseModel):
     """Shared config for every state model.
@@ -198,6 +205,22 @@ class RunConfig(_Model):
     `am status` and `am resume` show it, so a detached run whose envelope is
     gone still says it is un-isolated. Defaulted because journal lines
     written before it carry no such key.
+    """
+
+    harness_timeout: HarnessSeconds | None = None
+    """The run's default harness timeout in seconds, as `--harness-timeout` gave it.
+
+    `None` means the 1800 s default. It is stored as `None` and never
+    resolved here. Defaulted because journal lines written before it carry
+    no such key.
+    """
+
+    harness_timeouts: dict[Annotated[str, Field(min_length=1)], HarnessSeconds] = Field(
+        default_factory=dict
+    )
+    """Per-agent-phase overrides of `harness_timeout`, keyed by phase name.
+
+    The keys are not checked against any workflow: this module knows none.
     """
 
 

@@ -15,15 +15,24 @@ The tools read each phase from the running workflow (`deps.workflow`), not the
 compiled one. Two workflow objects can share a name and a digest -- the digest
 keys a callable on `module.qualname`, which a factory's closures share -- while
 holding different callables, and a shared compilation must still call the
-running workflow's own. Everything the compilation itself reads (phase order,
-kinds, timeouts) is covered by the digest, so it cannot differ between them.
+running workflow's own. What the compilation reads from the workflow (phase
+order, kinds, declared timeouts) is covered by the digest, so it cannot differ
+between them.
+
+An agent phase's turn timeout also depends on the run: it must stay above the
+launcher timeout that phase's attempts get (G2), and a run can raise that with
+`--harness-timeout`. The digest does not cover it, so it is never cached:
+`compile_workflow(wf, launcher_timeout=...)` returns a fresh `Compiled` over
+the shared tools, and the tools build their turns from the run's own
+compilation (`deps.compiled`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
@@ -32,7 +41,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import bridge, context, walk
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
-from agent_manager.workflow.phases import AgentPhase, Workflow
+from agent_manager.workflow.phases import LAUNCHER_MARGIN, AgentPhase, Workflow
 
 STEP_TIMEOUT = 3600.0
 """A step's turn timeout, in seconds. Steps have no declared timeout; an hour
@@ -62,12 +71,22 @@ class Compiled:
     workflow: Workflow
     agent_phase: Any
     step_phase: Any
+    launcher_timeout: Callable[[str], float] | None = None
+    """The run's launcher seconds for an agent phase, by name (the contract of
+    `dispatch.AgentRunner.timeout_for`); `None` keeps the declared timeouts."""
 
     def turn_for(self, name: str, loop: int) -> Turn:
         p = self.workflow.phase(name)
         kwargs = {"phase": name, "loop": loop}
         if isinstance(p, AgentPhase):
-            return Turn(self.agent_phase, timeout=p.timeout.total_seconds(), kwargs=kwargs)
+            timeout = p.timeout.total_seconds()
+            if self.launcher_timeout is not None:
+                # G2 per phase: the turn outlives this phase's own launcher
+                # timeout; a run below the declared floor keeps the floor.
+                timeout = max(
+                    timeout, self.launcher_timeout(name) + LAUNCHER_MARGIN.total_seconds()
+                )
+            return Turn(self.agent_phase, timeout=timeout, kwargs=kwargs)
         return Turn(self.step_phase, timeout=STEP_TIMEOUT, kwargs=kwargs)
 
     def first_turn(self) -> Turn:
@@ -90,13 +109,19 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
-def compile_workflow(wf: Workflow) -> Compiled:
+def compile_workflow(
+    wf: Workflow, *, launcher_timeout: Callable[[str], float] | None = None
+) -> Compiled:
+    """The cached compilation of `wf`, or with `launcher_timeout` a new one
+    over the same tools that derives its agent turn timeouts from it."""
     key = (wf.name, wf.digest())
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
             compiled = _CACHE[key] = _build(wf, suffix=key[1][:8])
+    if launcher_timeout is None:
         return compiled
+    return dataclasses.replace(compiled, launcher_timeout=launcher_timeout)
 
 
 def _rename(fn: Any, name: str) -> None:
@@ -137,6 +162,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
     async def agent_phase(phase: str, loop: int, pool: ContextPool, memory: ContextQueue):
         deps = current_run.get()
         deps.running = phase
+        compiled = deps.compiled or holder["compiled"]
         p = deps.workflow.phase(phase)
         if deps.agent_runner is None:
             # A wiring bug, not a phase failure: raised before anything runs,
@@ -177,7 +203,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 yield ContextItem(
                     content={"for": p.on_fail.phase, "from": phase, "detail": failure.detail}
                 )
-                yield holder["compiled"].turn_for(p.on_fail.phase, loop + 1)
+                yield compiled.turn_for(p.on_fail.phase, loop + 1)
                 return
             raise Escalated(phase, failure.detail, result=failure.result) from failure
         except Exception as error:
@@ -185,13 +211,14 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
             # recorded `started` forever.
             raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
-        nxt = holder["compiled"].after(phase, 0 if phase in fresh_loop_after else loop)
+        nxt = compiled.after(phase, 0 if phase in fresh_loop_after else loop)
         if nxt is not None:
             yield nxt
 
     async def step_phase(phase: str, loop: int, pool: ContextPool):
         deps = current_run.get()
         deps.running = phase
+        compiled = deps.compiled or holder["compiled"]
         # A step is never adopted and stays at-least-once (exactly-once E9);
         # taking the carried adoption here ends it at the first turn after
         # a resume, so no later agent phase can inherit it.
@@ -220,11 +247,11 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 id=phase, description=f"{phase} result", content=context.encode(outcome.result)
             )
             if outcome.skip_to is not None:
-                names = holder["compiled"].workflow.phase_names
+                names = compiled.workflow.phase_names
                 deps.skipped.extend(names[names.index(phase) + 1 : names.index(outcome.skip_to)])
-                yield holder["compiled"].turn_for(outcome.skip_to, loop)
+                yield compiled.turn_for(outcome.skip_to, loop)
                 return
-        nxt = holder["compiled"].after(phase, loop)
+        nxt = compiled.after(phase, loop)
         if nxt is not None:
             yield nxt
 

@@ -1629,6 +1629,9 @@ def preflight_milestone(
     clock: Callable[[], datetime] = _utcnow,
     resume_run_id: str | None = None,
     driver: Driver | None = None,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> MilestonePreflight:
     """Stage 1 of a milestone run: every read and refusal, then the run record (card 5daa944e).
 
@@ -1655,6 +1658,12 @@ def preflight_milestone(
     before any write and before git), and its plan, levels, tips and claim
     keys are `_story_plan`'s, as a fresh `preflight_story` computes them,
     `errors.StoryBlockedError` for a re-opened blocker included.
+
+    `harness_override` (card eee43099) is read only on a resume: it
+    replaces both of the recorded run's harness timeouts in `run_record`
+    (`runs.with_harness_override`), so the recorded stage writes it and the
+    engine binds it. A fresh run records `harness_timeout(s)` and never
+    reads it.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1718,6 +1727,8 @@ def preflight_milestone(
                 allow_no_verification=allow_no_verification,
                 launcher="direct" if launcher is None else launcher,
                 isolation_warning=isolation_warning,
+                harness_timeout=harness_timeout,
+                harness_timeouts=dict(harness_timeouts or {}),
             ),
             milestone_id=milestone_card.id,
         )
@@ -1734,11 +1745,12 @@ def preflight_milestone(
             config_update["isolation_warning"] = isolation_warning
         # Stamps a run recorded before `milestone_id` existed, so the next
         # resume no longer needs the short-id fallback.
-        run_record = resumed.model_copy(
+        overridden = runs.with_harness_override(resumed, harness_override)
+        run_record = overridden.model_copy(
             update={
                 "status": "started",
                 "milestone_id": milestone_card.id,
-                "config": resumed.config.model_copy(update=config_update),
+                "config": overridden.config.model_copy(update=config_update),
             }
         )
     return MilestonePreflight(
@@ -1877,6 +1889,8 @@ def preflight_story(
     isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
     driver: Driver | None = None,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> MilestonePreflight:
     """Stage 1 of a story run: `preflight_milestone`'s result, its plan cut to one story.
 
@@ -1926,6 +1940,8 @@ def preflight_story(
             allow_no_verification=allow_no_verification,
             launcher="direct" if launcher is None else launcher,
             isolation_warning=isolation_warning,
+            harness_timeout=harness_timeout,
+            harness_timeouts=dict(harness_timeouts or {}),
         ),
         milestone_id=match.milestone.id,
     )
@@ -2037,6 +2053,10 @@ async def run_milestone_engine(
     root, plan, levels, tips = pre.root, pre.plan, pre.levels, pre.tips
     milestone_card, run_record, resumed = pre.milestone_card, pre.run_record, pre.resumed
     base_branch, branch_prefix = pre.base_branch, pre.branch_prefix
+    # Card eee43099: every lane, merged base and Integrate resolver of this
+    # run launches with the run's recorded harness timeouts; an injected
+    # factory (the test seam) is handed on unchanged.
+    runner_factory = cli.runner_factory_for(run_record.config, runner_factory)
 
     # Board-comments B7: any run's leftover comments on this milestone's
     # cards go out under this lease, before anything is driven; a board
@@ -2227,6 +2247,9 @@ def run_milestone(
     max_concurrent: int = 1,
     resume_run_id: str | None = None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
@@ -2272,7 +2295,9 @@ def run_milestone(
     (`find_run_milestone`), and the rest is what the run recorded too. Both a
     fresh and a resumed run are recorded with `milestone_id` set to the
     milestone card's full id, which stamps a run recorded before that field
-    existed. The plan is
+    existed. `harness_override` replaces both recorded harness timeouts of a
+    resumed run, and is recorded (card eee43099); a fresh run ignores it.
+    The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
     unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
@@ -2332,6 +2357,9 @@ def run_milestone(
             max_concurrent=max_concurrent,
             resume_run_id=resume_run_id,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
+            harness_override=harness_override,
         )
     )
 
@@ -2375,6 +2403,9 @@ async def _run_milestone_async(
     max_concurrent: int = 1,
     resume_run_id: str | None = None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
     slots: asyncio.Semaphore | None = None,
 ) -> dict[str, Any]:
     """`run_milestone`'s body without its argument validation, awaitable in a
@@ -2412,6 +2443,9 @@ async def _run_milestone_async(
         clock=clock,
         resume_run_id=resume_run_id,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
+        harness_override=harness_override,
     )
     with recorded_milestone_run(pre) as recorded:
         return await run_milestone_engine(
@@ -2439,6 +2473,8 @@ def run_story(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of one story through the milestone engine, and report.
 
@@ -2469,6 +2505,8 @@ def run_story(
             driver=driver,
             clock=clock,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
         )
     )
 
@@ -2487,6 +2525,8 @@ async def _run_story_async(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`run_story`'s body, awaitable in a caller's own event loop."""
     pre = preflight_story(
@@ -2500,6 +2540,8 @@ async def _run_story_async(
         isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_milestone_run(pre) as recorded:
         return await run_milestone_engine(
@@ -2570,6 +2612,8 @@ def detach_milestone(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
 
@@ -2589,6 +2633,8 @@ def detach_milestone(
         isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     return _detach_recorded(
         pre,
@@ -2615,6 +2661,8 @@ def detach_story(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`run_story` with its run handed to a detached child: stages 1 and 2 here, stage 3 there.
 
@@ -2634,6 +2682,8 @@ def detach_story(
         isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     return _detach_recorded(
         pre,
@@ -2933,6 +2983,8 @@ def run_board_engine(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Stage 2 of a board run: run the board `pre` approved, and report (card 203a9a5e).
 
@@ -2943,7 +2995,8 @@ def run_board_engine(
     `escalated` entry. With nothing open it returns `ok` with no milestones and
     starts no event loop. Otherwise one `asyncio.run(_run_board_async(...))`
     on `pre.max_concurrent`, and `run_board`'s payload with `pre.levels_payload`
-    as its `levels`. Synchronous; does not mutate `pre`.
+    as its `levels`. Synchronous; does not mutate `pre`. `harness_timeout(s)` are
+    handed to every milestone run it starts (card 33dc5549).
     """
     if not pre.milestones:
         return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
@@ -2962,6 +3015,8 @@ def run_board_engine(
             clock=clock,
             max_concurrent=pre.max_concurrent,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
         )
     )
     return {
@@ -2986,6 +3041,8 @@ def run_board(
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive every open milestone on the board as one grafo tree, and report.
 
@@ -3046,6 +3103,8 @@ def run_board(
         driver=driver,
         clock=clock,
         control_interval=control_interval,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
 
 
@@ -3074,6 +3133,8 @@ def detach_board(
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --board --detach` (card 03f027ea): pre-flight here, the board run in a child.
 
@@ -3124,6 +3185,8 @@ def detach_board(
                 driver=driver,
                 clock=clock,
                 control_interval=control_interval,
+                harness_timeout=harness_timeout,
+                harness_timeouts=harness_timeouts,
             )
         except cli.HANDLED as error:
             detach.write_board_report(report, cli.render(cli.error_envelope(error)))
@@ -3157,6 +3220,8 @@ async def _run_board_async(
     clock: Callable[[], datetime],
     max_concurrent: int,
     control_interval: float,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """`run_board`'s one event loop: one entry per milestone, in `milestones` order.
 
@@ -3208,6 +3273,8 @@ async def _run_board_async(
                     clock=clock,
                     max_concurrent=max_concurrent,
                     control_interval=control_interval,
+                    harness_timeout=harness_timeout,
+                    harness_timeouts=harness_timeouts,
                     slots=slots,
                 )
             except Exception as error:
