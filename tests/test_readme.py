@@ -606,3 +606,40 @@ def test_isolation_section_describes_each_mode():
     assert "isolation is the guarantee" in section
     assert "advice" in section
     _assert_anchors_resolve(section)
+
+
+def test_neutral_argv_section():
+    section = _section(ARGV_TITLE)
+    assert argv_guard.COMMANDS == ("run", "resume")
+    for text in (
+        f"`{argv_guard.FROM_ENV_FLAG}`",
+        f"`{argv_guard.VERIFY_ENV}`",
+        argv_guard.ARGV_VISIBLE_WARNING,
+        "`am run`",
+        "`am resume`",
+        "`--detach`",
+        "`--milestone`",
+        "`--story`",
+        "`--branch-prefix`",
+        "`--verify=X`",
+        "exit code 2",
+    ):
+        assert text in section, text
+    assert "matches command lines, never environments" in section
+    assert "removes it from its own environment" in section
+    assert "not an option to type" in section
+    for reason in (
+        "combined with `--verify`",
+        "when `AM_VERIFY_JSON` is unset",
+        "not a JSON list of strings",
+    ):
+        assert reason in section, reason
+    assert "never echoed" in section
+    assert "`data.warnings` ends with" in section
+    for command in ("run", "resume"):
+        assert _command_param(command, "verify_from_env").hidden is True
+
+    titles = [title for _, _, title in _headings()]
+    assert titles.index(ARGV_TITLE) == titles.index(ISOLATION_TITLE) + 1
+    assert _slug(ARGV_TITLE) == "verification-commands-stay-out-of-ps"
+    _assert_anchors_resolve(section)

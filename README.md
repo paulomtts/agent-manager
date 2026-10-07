@@ -134,6 +134,20 @@ Where you see which mode a run got:
 
 Every agent's brief also carries a "Process safety" block telling it never to use `pkill -f`, `pkill` by name, `killall`, `kill -1` or `kill` with a pattern, and to stop a stuck test with `timeout` or by a PID it recorded. That is advice an agent can ignore; isolation is the guarantee. `am resume` restores the mode a run recorded (see [Relaunching resumes](#relaunching-resumes)).
 
+#### Verification commands stay out of `ps`
+
+An agent's `pkill -f "uv run pytest"` matches every process whose command line holds that text, and `am run --verify "uv run pytest"` used to be one of them. So when `am run` or `am resume` is given at least one `--verify X` or `--verify=X` (before any `--`), `am` re-execs itself at once with a neutral command line: every `--verify` is removed, the hidden flag `--verify-from-env` takes their place, and the commands travel in the environment variable `AM_VERIFY_JSON`, a JSON list in command-line order. `pkill -f` matches command lines, never environments, so it can no longer match `am`. Every other token stays, so identity options such as `--milestone`, `--story` and `--branch-prefix` remain visible in `ps`:
+
+```text
+/usr/bin/python3 /home/me/.local/bin/am run --verify-from-env --milestone document milestone runs --branch-prefix m3
+```
+
+This holds for a foreground run, for a `--detach` run (the background process is forked after the re-exec, so it has the neutral command line too) and for `am resume`. The run reads `AM_VERIFY_JSON` once, at start, and removes it from its own environment, so no agent, verification command or other child process inherits it. Each `--verify` command still runs exactly as written.
+
+`--verify-from-env` is internal: it is what `ps` shows, not an option to type, and `--help` does not list it. Typed by hand it is a usage error (exit code 2, the message on stderr, the variable's value never echoed) when it is combined with `--verify`, when `AM_VERIFY_JSON` is unset, or when `AM_VERIFY_JSON` is not a JSON list of strings.
+
+If the re-exec itself fails, the run goes on with its original command line, verification text included, and the ok envelope's `data.warnings` ends with `argv: verification commands visible in the process command line`.
+
 #### Preview with `--dry-run`
 
 ```bash
