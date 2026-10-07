@@ -71,6 +71,7 @@ from agent_manager.runs import (
     DryRunPlan,
     NotResumableError,
     RepoDirError,
+    BaseBranchError,
     RunnerFactory,
     UnknownRunError,
     compute_dry_run_plan,
@@ -78,6 +79,7 @@ from agent_manager.runs import (
     gate_context,
     mint_run_id,
     orphan_attempts,
+    resolve_base_branch,
     resolve_repo_dir,
     select_resumable,
     worktree_for,
@@ -1805,11 +1807,13 @@ def run(
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
     ),
-    base_branch: str = typer.Option(
-        "master",
+    base_branch: str | None = typer.Option(
+        None,
         "--base-branch",
         help=(
             "Where unblocked stories start (and --card's branch is cut from). "
+            "Must be an existing branch. Default: the repository's default "
+            "branch (origin/HEAD, else the checked-out branch, else `master`). "
             "Never modified."
         ),
     ),
@@ -1851,6 +1855,8 @@ def run(
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     models.max_limit_wait_default.set(max_limit_wait)
     try:
+        # Before any run row, claim or worktree exists, and for --dry-run too.
+        base_branch = resolve_base_branch(repo_dir, base_branch)
         if whole_board and dry_run:
             payload = dry_run_board(
                 repo_dir=repo_dir,
