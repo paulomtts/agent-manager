@@ -12,7 +12,8 @@ Three rules shape everything here, and none of them is negotiable:
   `LauncherFn`, which is what keeps `bwrap` a later swap and every test above
   the launcher process-free. `subprocess` is deliberately not imported.
 - D4 / §6 step 5: the contract is `result.json`. `stdout.log` is captured as a
-  log and never read by the engine.
+  log; after a non-zero exit the adapter may read its tail to report a usage-limit
+  hit (`HarnessAdapter.limit_hit`), never as a result.
 - §6 step 3: the attempt directory comes from `paths.attempt_dir`, which is
   rooted under `paths.data_dir()` and therefore outside every worktree -- a
   result file written inside the worktree would fail the verify step's
@@ -21,23 +22,25 @@ Three rules shape everything here, and none of them is negotiable:
 
 import inspect
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from agent_manager import models, paths, prompt, results
-from agent_manager.errors import AgentPhaseFailed
+from agent_manager.errors import AgentPhaseFailed, LimitWaitInterrupted
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import walk
 from agent_manager.harness.base import HarnessAdapter, Outcome
+from agent_manager.harness import limits
 from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
-from agent_manager.runtime import bridge
+from agent_manager.runtime import bridge, state
 from agent_manager.store import JournalError, Store
 from agent_manager.workflow import phases as phase_model
 
@@ -158,6 +161,8 @@ class Verdict:
     detail: str | None = None
     fatal: bool = False
     timed_out: bool = False
+    limit: limits.LimitHit | None = None
+    """Set on a `harness_error` whose log reports a usage limit; the runner waits it out."""
 
 
 @dataclass(frozen=True)
@@ -220,7 +225,11 @@ def build_dispatch(
 
 
 def classify(
-    outcome: Outcome, result_path: Path | None, model: type[BaseModel] | None
+    outcome: Outcome,
+    result_path: Path | None,
+    model: type[BaseModel] | None,
+    clock: Callable[[], datetime] | None = None,
+    adapter: Any = None,
 ) -> Verdict:
     """One attempt's outcome, from the launcher's report and the result file.
 
@@ -235,6 +244,10 @@ def classify(
     is no contract in its brief, so there is nothing to read or validate, and a
     file the harness wrote anyway is not adopted as a result. `result_path` is
     never dereferenced on that path, so `None` is accepted and it never raises.
+
+    A non-zero exit that `adapter.limit_hit` (when it has one) reports as a
+    usage-limit hit is still a `harness_error`, with `limit` set; `clock`
+    anchors a reset time the harness states without a date.
 
     A verdict of `ok` here means "the result file is good"; the gates run after
     and may still turn it into `gate_failed`.
@@ -251,7 +264,11 @@ def classify(
             timed_out=True,
         )
     if outcome.exit_code != 0:
-        return Verdict("harness_error", detail=f"the harness exited {outcome.exit_code}")
+        reporter = getattr(adapter, "limit_hit", None)
+        hit = None if reporter is None else reporter(outcome.stdout_path, (clock or _utcnow)())
+        return Verdict(
+            "harness_error", detail=f"the harness exited {outcome.exit_code}", limit=hit
+        )
     return read_result(result_path, model)
 
 
@@ -344,6 +361,21 @@ def _spawn_kwargs(launcher: LauncherFn) -> dict[str, Any]:
 
 Clock = Callable[[], datetime]
 
+MAX_LIMIT_WAITS = 6
+"""Usage-limit waits one phase call accepts before escalating."""
+
+LIMIT_MARGIN = 60.0
+"""Seconds past a stated reset the phase waits before dispatching again."""
+
+UNKNOWN_RESET_BACKOFF = 900.0
+"""Seconds waited when a limit hit names no usable reset time."""
+
+UNKNOWN_RESET_RETRIES = 4
+"""Waits a phase call spends on limit hits with no usable reset time."""
+
+LIMIT_POLL = 5.0
+"""Longest sleep slice of a limit wait; a stop request is noticed between slices."""
+
 
 @dataclass
 class AgentRunner:
@@ -376,6 +408,22 @@ class AgentRunner:
     timeout: float = DEFAULT_TIMEOUT
     clock: Clock = _utcnow
     warnings: list[str] = field(default_factory=list)
+    max_limit_wait_hours: float = models.DEFAULT_MAX_LIMIT_WAIT_HOURS
+    """Longest wait for a usage-limit reset; a later reset escalates, 0 (the default) never waits."""
+    sleeper: Callable[[float], None] = time.sleep
+    limit_margin: float = LIMIT_MARGIN
+    unknown_reset_backoff: float = UNKNOWN_RESET_BACKOFF
+    poll_interval: float = LIMIT_POLL
+    stop_requested: Callable[[], bool] | None = None
+    """Whether a stop was asked for; defaults to the running subtask's `StopSignal`."""
+
+    @property
+    def turn_allowance(self) -> float:
+        """Seconds a phase's turn timeout must grow by so limit waits fit inside it."""
+        if self.max_limit_wait_hours <= 0:
+            return 0.0
+        longest = max(self.max_limit_wait_hours * 3600.0, self.unknown_reset_backoff)
+        return MAX_LIMIT_WAITS * (longest + self.limit_margin)
 
     def __call__(
         self,
@@ -411,6 +459,10 @@ class AgentRunner:
         # closed.
         redispatched = False
         counted = 0
+        # A usage-limit hit is neither retried nor counted: it says nothing about
+        # the attempt, and every concurrent run shares the account's limit.
+        waits = 0
+        unknown_waits = 0
 
         try:
             while True:
@@ -420,6 +472,21 @@ class AgentRunner:
                 if verdict.status == "ok":
                     self._record_phase(phase, "done", started_at, self.clock(), None)
                     return verdict.result
+                if verdict.limit is not None:
+                    waits += 1
+                    unknown_waits += verdict.limit.resets_at is None
+                    until, refusal = self._limit_deadline(
+                        verdict.limit, waits, unknown_waits
+                    )
+                    if until is None:
+                        verdict = replace(verdict, detail=refusal)
+                        break
+                    self._wait_out(phase, started_at, verdict.limit, until)
+                    self.warnings.append(
+                        f"phase {phase.name!r}: attempt {n} hit the {verdict.limit.kind} "
+                        f"usage limit; waited until {until.isoformat()} and dispatched again"
+                    )
+                    continue
                 if verdict.status == "harness_error" and not redispatched and not verdict.timed_out:
                     # No feedback: the harness produced nothing for a complaint
                     # to correct, so the brief is re-sent as it was.
@@ -436,6 +503,8 @@ class AgentRunner:
                 # the whole brief from the base prompt every time, so re-feeding a
                 # composed brief would duplicate the result contract.
                 feedback.append(verdict.detail or verdict.status)
+        except LimitWaitInterrupted:
+            raise
         except Exception as error:
             # Symmetric with `walk.run_one_step`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for
@@ -452,6 +521,65 @@ class AgentRunner:
         raise AgentPhaseFailed(
             phase.name, outcome=verdict.status, detail=detail, result=verdict.result
         )
+
+    def _limit_deadline(
+        self, hit: limits.LimitHit, waits: int, unknown_waits: int
+    ) -> tuple[datetime | None, str]:
+        """When to dispatch again after `hit`, or `None` and why the phase escalates."""
+        cap = self.max_limit_wait_hours
+        reset = "reset time unknown" if hit.resets_at is None else (
+            f"resets at {hit.resets_at.isoformat()}"
+        )
+        prefix = f"usage limit hit ({hit.kind}, {reset}): {hit.raw}"
+        if cap <= 0:
+            return None, f"{prefix}; waiting is disabled (--max-limit-wait 0)"
+        if waits > MAX_LIMIT_WAITS or unknown_waits > UNKNOWN_RESET_RETRIES:
+            return None, f"{prefix}; the limit was still hit after {waits - 1} waits"
+        now = self.clock()
+        if hit.resets_at is None:
+            return now + timedelta(seconds=self.unknown_reset_backoff), ""
+        until = hit.resets_at + timedelta(seconds=self.limit_margin)
+        away = (until - now).total_seconds()
+        if away > cap * 3600.0:
+            return None, (
+                f"{prefix}; that is {away / 3600.0:.1f}h away, over "
+                f"--max-limit-wait {cap:g}h"
+            )
+        return until, ""
+
+    def _wait_out(
+        self,
+        phase: phase_model.AgentPhase,
+        started_at: datetime,
+        hit: limits.LimitHit,
+        until: datetime,
+    ) -> None:
+        """Sleep in short slices until `until`; raise `LimitWaitInterrupted` on a stop."""
+        self._record_phase(
+            phase,
+            "started",
+            started_at,
+            None,
+            f"waiting for usage limit reset at {until.isoformat()} ({hit.kind} limit)",
+        )
+        while True:
+            remaining = (until - self.clock()).total_seconds()
+            if remaining <= 0:
+                break
+            if self._stopped():
+                self._record_phase(
+                    phase, "started", started_at, None,
+                    "usage-limit wait interrupted by a stop request",
+                )
+                raise LimitWaitInterrupted(phase.name)
+            self.sleeper(min(self.poll_interval, remaining))
+        self._record_phase(phase, "started", started_at, None, None)
+
+    def _stopped(self) -> bool:
+        if self.stop_requested is not None:
+            return self.stop_requested()
+        deps = state.current_run.get(None)
+        return deps is not None and deps.stop is not None and deps.stop.triggered
 
     def _attempt(
         self,
@@ -521,7 +649,11 @@ class AgentRunner:
         # attempt keep the concrete path (the adapter builds argv from it and
         # `cli.read_artifact` reads it).
         verdict = classify(
-            outcome, None if model is None else dispatch_record.result_path, model
+            outcome,
+            None if model is None else dispatch_record.result_path,
+            model,
+            self.clock,
+            target.adapter,
         )
         if verdict.status == "ok":
             # The one evaluator both phase kinds share (S3). `pass` and `warn`

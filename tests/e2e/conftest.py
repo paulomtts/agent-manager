@@ -184,7 +184,7 @@ def _init_project(root: Path, board_name: str) -> Path:
     # brd leaves its `.gitignore`/`.brd` markers untracked; committing them keeps
     # the baseline clean, so the later porcelain check reflects only the run.
     git(root, "add", "-A")
-    git(root, "commit", "-m", "brd init")
+    git(root, "commit", "--allow-empty", "-m", "brd init")
     return root
 
 

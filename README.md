@@ -79,7 +79,7 @@ Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
 The base-branch and final integration checks run their commands with neither set.
 
-Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, `--story` together with `--card`, `--milestone` or `--board`, none of the four, a blank `--milestone`, a blank `--story`, a missing `--branch-prefix` with `--card`, `--milestone` or `--story`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card` or `--story` (whatever its value), a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run`.
+Some combinations are refused before anything is read: `--card` together with `--milestone`, `--board` together with `--card` or with `--milestone`, `--story` together with `--card`, `--milestone` or `--board`, none of the four, a blank `--milestone`, a blank `--story`, a missing `--branch-prefix` with `--card`, `--milestone` or `--story`, a blank `--branch-prefix` with `--board`, `--dry-run` with `--card`, `--max-concurrent` with `--card` or `--story` (whatever its value), a `--max-concurrent` below 1 (with `--milestone` or `--board`), and `--detach` with `--dry-run`. `--max-limit-wait HOURS` (see [Usage limits](#usage-limits)) applies to every run kind that dispatches agents and must not be negative.
 These are usage errors: Typer prints the message on stderr, nothing is printed on stdout, and the exit code is 2.
 
 #### Running detached with `--detach`
@@ -318,6 +318,22 @@ Limits, stated plainly:
 - **A resolver can misjudge what two edits meant**, even when the result compiles and passes. The final check narrows that risk but does not remove it, so review the integration branch before you merge it, as with every branch here.
 - **Merges are sequential.** There is one integration worktree, so tips are merged one after another, and `--max-concurrent` does not apply.
 - **Nothing batches them.** A milestone with hundreds of stories means hundreds of sequential merges.
+
+#### Usage limits
+
+An account's usage limit is shared by every harness process on the machine, so a run that hits it is not failing: it is out of quota until the limit resets. A harness adapter can recognise this on a failed exit (the `claude` adapter does; an adapter that cannot says nothing, and its failures stay ordinary `harness_error`s). A recognised hit has a kind (`session`, `weekly` or `other`) and, when the harness states it, a reset time.
+
+By default a hit escalates the phase at once. It is not retried, and it uses up neither the phase's retry budget nor the one free redispatch of a `harness_error`. Its `detail` names the kind and the reset time, for example `usage limit hit (session, resets at 2026-10-07T17:30:00+00:00): ...; waiting is disabled (--max-limit-wait 0)`, instead of `the harness exited 1`. The attempt is still recorded with status `harness_error`.
+
+`--max-limit-wait HOURS` (default 0, which never waits) opts in to waiting it out:
+
+- The phase waits until the reset time plus a 60 second margin and dispatches again, with the same brief. The failed dispatch stays recorded as a `harness_error` attempt, and the next dispatch is the next attempt number. Nothing is counted against the phase.
+- A reset further away than HOURS escalates the phase with a `detail` that names the reset time, for example `usage limit hit (weekly, resets at 2026-10-09T23:00:00+00:00): ...; that is 51.0h away, over --max-limit-wait 8h`.
+- While it waits, the phase is recorded `started` with `detail` `waiting for usage limit reset at <ISO time> (<kind> limit)` (a `phase_upsert` line, see [The journal line](#the-journal-line)), and `detail` is cleared when the wait ends. The run's lease keeps its heartbeat, so `am status` shows it live. `am pause` and `am cancel` are noticed within a few seconds: the run parks before that phase and `am resume` dispatches it again. A wait adds one line to `data.warnings`; the envelopes have no other new key.
+- A hit with no reset time is waited out for a fixed 15 minutes, at most 4 times per phase run. More than 6 waits in one phase run escalate too.
+- The phase's turn timeout grows by the time the waits can take, so the engine never cuts a wait short.
+
+The value is recorded in the run's config as `max_limit_wait_hours` and a resume reuses it; it is an option of `am run`, not of `am resume`, and must not be negative. What `am` does not know is how each harness words its limit messages: an unrecognised message is an ordinary `harness_error`.
 
 #### Parallel runs
 
@@ -669,7 +685,7 @@ Every line records one node of the run's tree. A status change is the same node 
 | `run_upsert` | the run starting and finishing: `started`, then `done`, `escalated`, `stopped` or `canceled` |
 | `story_upsert` | a story's own progress: `pending`, `started`, `done`, `stopped`, `escalated` |
 | `subtask_upsert` | a subtask's status: `pending`, `started`, `done`, `stopped`, `escalated` (recorded `started` again on a resume) |
-| `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed |
+| `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed, or, on a `started` one, that it is waiting for a usage limit to reset (see [Usage limits](#usage-limits)) |
 | `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its `exit_code` and `duration` |
 
 There is no separate "run finished" or "escalation" event. A run has finished when a `run_upsert` line's `payload.status` is `done`, `escalated`, `stopped` or `canceled`, and it escalated when that status is `escalated`.

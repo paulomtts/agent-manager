@@ -13,7 +13,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -28,11 +28,13 @@ from agent_manager import (
     results,
     store as store_module,
 )
-from agent_manager.errors import AgentPhaseFailed
+from agent_manager.errors import AgentPhaseFailed, LimitWaitInterrupted
 from agent_manager.runtime.errors import EngineError
+from agent_manager.harness import limits
 from agent_manager.harness.base import Outcome
 from agent_manager.roles.loader import load_role
-from agent_manager.runtime import bridge, walk
+from agent_manager.runtime import bridge, state as run_state, walk
+from agent_manager.runtime.stop import StopSignal
 from agent_manager.workflow import phases
 
 RUN_ID = "run-2026-09-23-01"
@@ -2510,3 +2512,316 @@ def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
     assert done.status == "done"
     assert done.started_at == recorded.started_at
     assert done.ended_at == later
+
+
+# -- usage-limit waits ---------------------------------------------------------
+
+LIMIT_SESSION = "LIMIT session 2026-10-07T17:30:00+00:00\n"
+LIMIT_WEEKLY = "LIMIT weekly 2026-10-09T23:00:00+00:00\n"
+LIMIT_LATER = "LIMIT session 2026-10-07T20:00:00+00:00\n"
+LIMIT_UNKNOWN = "LIMIT session none\n"
+PLAIN_FAILURE = "something broke\n"
+SUCCEEDS = "ok"
+NOW = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
+SESSION_RESET = datetime(2026, 10, 7, 17, 30, tzinfo=timezone.utc)
+
+
+class FakeClock:
+    """A clock the injected sleeper moves; nothing here really sleeps."""
+
+    def __init__(self) -> None:
+        self.now = NOW
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += timedelta(seconds=seconds)
+
+
+@dataclass
+class ScriptedLauncher:
+    """One entry per launch: the stdout of a failing exit 1, or `SUCCEEDS` for a valid result."""
+
+    script: list[str]
+    calls: int = 0
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        step = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        ok = step == SUCCEEDS
+        stdout_path.write_text("fine\n" if ok else step, encoding="utf-8")
+        if ok:
+            Path(argv[argv.index("--result") + 1]).write_text(VALID_RESULT, encoding="utf-8")
+        return Outcome(
+            argv=list(argv),
+            exit_code=0 if ok else 1,
+            timed_out=False,
+            duration=1.0,
+            stdout_path=stdout_path,
+        )
+
+
+class LimitAdapter(FakeAdapter):
+    """A fake adapter that reports a limit hit from a generic `LIMIT <kind> <ISO|none>` line."""
+
+    def limit_hit(self, stdout_path, now):
+        for line in stdout_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("LIMIT "):
+                _, kind, reset = line.split()
+                return limits.LimitHit(
+                    kind, None if reset == "none" else datetime.fromisoformat(reset), line
+                )
+        return None
+
+
+def _limit_runner(store, script, tmp_path, worktree, **overrides):
+    clock = FakeClock()
+    launcher = ScriptedLauncher(script)
+    overrides.setdefault("sleeper", clock.sleep)
+    overrides.setdefault("max_limit_wait_hours", 8)
+    overrides.setdefault("adapter", LimitAdapter())
+    runner, _ = _runner(store, launcher, tmp_path, worktree, clock=clock, **overrides)
+    return runner, launcher, clock
+
+
+def _phase_details(opened) -> list[str | None]:
+    return [
+        line.payload.get("detail")
+        for line in opened.journal.read()
+        if line.event == "phase_upsert"
+    ]
+
+
+def _explore(runner, worktree):
+    phase = _agentic(lambda result: None).phase("explore")
+    return runner(phase, _context(worktree), _rendered())
+
+
+def test_a_limit_hit_waits_for_the_reset_then_dispatches_again(store, tmp_path, worktree):
+    runner, launcher, clock = _limit_runner(store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree)
+
+    result = _explore(runner, worktree)
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert launcher.calls == 2
+    reset = SESSION_RESET + timedelta(seconds=dispatch.LIMIT_MARGIN)
+    assert clock.now == reset
+    assert max(clock.sleeps) <= dispatch.LIMIT_POLL
+    assert _attempt_statuses(store) == [
+        (1, "started"), (1, "harness_error"), (2, "started"), (2, "ok")
+    ]
+    details = _phase_details(store)
+    assert f"waiting for usage limit reset at {reset.isoformat()} (session limit)" in details
+    assert details[-2:] == [None, None]
+    assert _phase_statuses(store)[-1] == ("explore", "done")
+    assert not any("dispatching once more" in warning for warning in runner.warnings)
+    assert any("session usage limit" in warning for warning in runner.warnings)
+
+
+def test_a_limit_hit_uses_up_neither_the_retry_budget_nor_the_free_redispatch(
+    store, tmp_path, worktree
+):
+    # Each limit hit would have spent the free redispatch or, once a schema
+    # failure had, a retry; none of them may.
+    runner, launcher, _ = _limit_runner(
+        store,
+        [LIMIT_SESSION, PLAIN_FAILURE, LIMIT_LATER, SUCCEEDS],
+        tmp_path,
+        worktree,
+    )
+
+    assert _explore(runner, worktree) == {"summary": "explored the tree", "ok": True}
+    assert launcher.calls == 4
+
+
+def test_a_reset_beyond_the_cap_escalates_naming_the_reset_time(store, tmp_path, worktree):
+    runner, launcher, clock = _limit_runner(store, [LIMIT_WEEKLY], tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        _explore(runner, worktree)
+
+    assert caught.value.outcome == "harness_error"
+    detail = caught.value.detail
+    assert "2026-10-09T23:00:00+00:00" in detail
+    assert "weekly" in detail
+    assert "--max-limit-wait 8h" in detail
+    assert launcher.calls == 1
+    assert clock.sleeps == []
+    assert _phase_statuses(store)[-1] == ("explore", "failed")
+
+
+def test_a_cap_of_zero_never_waits(store, tmp_path, worktree):
+    runner, launcher, clock = _limit_runner(
+        store, [LIMIT_SESSION], tmp_path, worktree, max_limit_wait_hours=0
+    )
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        _explore(runner, worktree)
+
+    assert "waiting is disabled" in caught.value.detail
+    assert "2026-10-07T17:30:00+00:00" in caught.value.detail
+    assert launcher.calls == 1
+    assert clock.sleeps == []
+
+
+def test_a_cap_above_the_wait_still_waits(store, tmp_path, worktree):
+    runner, launcher, _ = _limit_runner(
+        store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree, max_limit_wait_hours=1.6
+    )
+
+    _explore(runner, worktree)
+
+    assert launcher.calls == 2
+
+
+def test_an_unknown_reset_backs_off_a_fixed_time(store, tmp_path, worktree):
+    runner, launcher, clock = _limit_runner(store, [LIMIT_UNKNOWN, SUCCEEDS], tmp_path, worktree)
+
+    _explore(runner, worktree)
+
+    assert launcher.calls == 2
+    assert clock.now == NOW + timedelta(seconds=dispatch.UNKNOWN_RESET_BACKOFF)
+
+
+def test_an_unknown_reset_that_keeps_coming_back_escalates(store, tmp_path, worktree):
+    runner, launcher, _ = _limit_runner(store, [LIMIT_UNKNOWN], tmp_path, worktree)
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        _explore(runner, worktree)
+
+    assert "reset time unknown" in caught.value.detail
+    assert launcher.calls == dispatch.UNKNOWN_RESET_RETRIES + 1
+
+
+def test_a_stop_during_the_wait_interrupts_it_without_failing_the_phase(
+    store, tmp_path, worktree
+):
+    asked = []
+
+    def sleeper(seconds):
+        clock.sleep(seconds)
+        asked[:] = [len(clock.sleeps) >= 3]
+
+    runner, launcher, clock = _limit_runner(
+        store,
+        [LIMIT_SESSION, SUCCEEDS],
+        tmp_path,
+        worktree,
+        sleeper=sleeper,
+        stop_requested=lambda: bool(asked and asked[0]),
+    )
+
+    with pytest.raises(LimitWaitInterrupted):
+        _explore(runner, worktree)
+
+    assert launcher.calls == 1
+    assert len(clock.sleeps) == 3
+    assert _phase_statuses(store)[-1] == ("explore", "started")
+    assert "interrupted" in _phase_details(store)[-1]
+
+
+def test_the_default_stop_is_the_running_subtasks_signal(store, tmp_path, worktree):
+    signal = StopSignal()
+    runner, launcher, clock = _limit_runner(store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree)
+    deps = run_state.RunDeps(None, store, STORY_ID, None, runner, clock, stop=signal)
+    token = run_state.current_run.set(deps)
+    try:
+        signal.request("pause")
+        with pytest.raises(LimitWaitInterrupted):
+            _explore(runner, worktree)
+    finally:
+        run_state.current_run.reset(token)
+
+    assert launcher.calls == 1
+    assert clock.sleeps == []
+
+
+def test_the_turn_allowance_covers_the_waits_and_is_zero_when_waiting_is_off(
+    store, tmp_path, worktree
+):
+    on, _, _ = _limit_runner(store, [SUCCEEDS], tmp_path, worktree, max_limit_wait_hours=2)
+    off, _, _ = _limit_runner(store, [SUCCEEDS], tmp_path, worktree, max_limit_wait_hours=0)
+
+    assert on.turn_allowance == dispatch.MAX_LIMIT_WAITS * (2 * 3600 + dispatch.LIMIT_MARGIN)
+    assert off.turn_allowance == 0
+
+
+def test_only_a_failing_exit_can_be_a_limit_hit(tmp_path):
+    log = tmp_path / "stdout.log"
+    log.write_text(LIMIT_SESSION, encoding="utf-8")
+
+    adapter = LimitAdapter()
+    failing = dispatch.classify(Outcome(["x"], 1, False, 1.0, log), None, None, lambda: NOW, adapter)
+    clean = dispatch.classify(Outcome(["x"], 0, False, 1.0, log), None, None, lambda: NOW, adapter)
+    blind = dispatch.classify(
+        Outcome(["x"], 1, False, 1.0, log), None, None, lambda: NOW, FakeAdapter()
+    )
+
+    assert failing.status == "harness_error"
+    assert failing.limit.kind == "session"
+    assert clean == dispatch.Verdict("ok")
+    assert blind.status == "harness_error"
+    assert blind.limit is None
+
+
+def test_by_default_a_limit_hit_escalates_at_once_without_spending_any_budget(
+    store, tmp_path, worktree
+):
+    runner, launcher, clock = _limit_runner(
+        store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree, max_limit_wait_hours=0
+    )
+    default = dispatch.AgentRunner.__dataclass_fields__["max_limit_wait_hours"].default
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        _explore(runner, worktree)
+
+    assert default == 0
+    assert caught.value.outcome == "harness_error"
+    assert caught.value.detail.startswith(
+        "usage limit hit (session, resets at 2026-10-07T17:30:00+00:00)"
+    )
+    assert "harness exited" not in caught.value.detail
+    assert launcher.calls == 1
+    assert clock.sleeps == []
+
+
+def test_a_harness_without_limit_reporting_keeps_the_ordinary_harness_error_path(
+    store, tmp_path, worktree
+):
+    runner, launcher, _ = _limit_runner(
+        store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree, adapter=FakeAdapter()
+    )
+
+    assert _explore(runner, worktree) == {"summary": "explored the tree", "ok": True}
+    assert any("dispatching once more" in warning for warning in runner.warnings)
+
+
+def test_the_default_runner_factory_restores_the_runs_recorded_limit_wait(store, tmp_path):
+    store.record_run(
+        models.Run(
+            id=RUN_ID,
+            workflow="task",
+            repo_dir=tmp_path / "repo",
+            base_branch="main",
+            branch_prefix="m1",
+            config=models.RunConfig(max_limit_wait_hours=3),
+        )
+    )
+
+    runner = cli.default_runner_factory(
+        store=store, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD
+    )
+
+    assert runner.max_limit_wait_hours == 3
+
+
+def test_the_default_runner_factory_without_a_recorded_run_uses_the_default_wait(store):
+    runner = cli.default_runner_factory(
+        store=store, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD
+    )
+
+    assert runner.max_limit_wait_hours == models.DEFAULT_MAX_LIMIT_WAIT_HOURS

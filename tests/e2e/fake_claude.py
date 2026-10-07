@@ -10,7 +10,7 @@ adapter's `-p` sentence (`harness/claude.py:30`), and the absolute result path
 plus the JSON Schema from the `## Result contract` section the brief carries
 (`prompt.py:281-374`). There is deliberately no extra argv flag and no import
 of `agent_manager` -- a brief that omits the contract must make this script
-fail, because that failure is the test's whole point. There are exactly six
+fail, because that failure is the test's whole point. There are exactly seven
 test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
 from its own cwd and compares with the brief's `## branch`;
@@ -23,7 +23,8 @@ still claiming `resolved`, so git has to catch the lie;
 `CRITIC_BLOCKS_ENV`, a budget file that makes a critic block a set number of
 times with a fixed reason; and the hold (`HOLD_DIR_ENV` / `HOLD_PHASE_ENV`),
 which only parks one phase of the card the brief's result path names until a
-release file appears. The resolve phase learns the tip and the
+release file appears; and `USAGE_LIMIT_ENV`, a table that makes a phase print the
+account's usage-limit line and exit 1 a set number of times. The resolve phase learns the tip and the
 conflicting files from the brief's `## merge_tip` and `## conflict_files` and
 nowhere else.
 
@@ -400,6 +401,33 @@ def hold(phase, result_path):
                 f"{release} was never written"
             )
         time.sleep(RENDEZVOUS_POLL)
+
+
+USAGE_LIMIT_ENV = "FAKE_CLAUDE_USAGE_LIMIT"
+"""Test scaffolding, never in a brief: the path of a JSON table of usage-limit hits.
+
+Unset or empty means the fake never reports one. Set, it names a file the test
+wrote, mapping a phase to `{"hits": n, "line": "<stdout line>"}`: while `hits`
+is above zero the fake spends one, writes the file back, prints `line` and
+exits 1 without a result, as the real CLI does when the account's limit is
+spent. The line comes from the file alone, so a test controls the reset time."""
+
+
+def usage_limit_line(phase):
+    """The limit line this launch must print, spending one hit, or `None`."""
+    raw = os.environ.get(USAGE_LIMIT_ENV, "")
+    if raw == "":
+        return None
+    path = Path(raw)
+    if not path.is_file():
+        raise FakeClaudeError(f"{USAGE_LIMIT_ENV} names {path}, which is not a file")
+    table = json.loads(path.read_text(encoding="utf-8"))
+    entry = table.get(phase)
+    if not entry or entry["hits"] <= 0:
+        return None
+    entry["hits"] -= 1
+    path.write_text(json.dumps(table, sort_keys=True), encoding="utf-8")
+    return entry["line"]
 
 
 CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
@@ -808,6 +836,10 @@ def main(argv):
     text = prompt_path_from_argv(argv).read_text(encoding="utf-8")
     phase = phase_of(text)
     result_path = result_path_of(text)
+    limit = usage_limit_line(phase)
+    if limit is not None:
+        print(limit)
+        return 1
     # Test scaffolding: park here, before any work, when the hold is armed.
     hold(phase, result_path)
     cwd = Path(os.getcwd())
