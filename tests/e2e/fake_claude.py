@@ -748,11 +748,12 @@ def build_result(phase, payload, text, cwd):
         relative = _section(found, "plan_path", phase)
         base = _section(found, "base_branch", phase)
         branch = _section(found, "branch", phase)
+        recorded = _section(found, "plan_hash", phase)
         revisions = git(cwd, "rev-list", f"{base}..HEAD").split()
         tagged = [
             revision
             for revision in revisions
-            if "Plan-Hash:" in git(cwd, "show", "-s", "--format=%B", revision)
+            if f"Plan-Hash: {recorded}" in git(cwd, "show", "-s", "--format=%B", revision)
         ]
         if branch in review_fail_branches(cwd):
             # A review the production gates block. `review_blockers_gate`,
@@ -772,7 +773,7 @@ def build_result(phase, payload, text, cwd):
             porcelain=porcelain,
             commit_count=len(revisions),
             tagged_count=len(tagged),
-            plan_hash=plan_hash_of(Path(cwd) / relative),
+            plan_hash=recorded,
         )
     if phase == "resolve":
         # Everything is checked before anything is touched: the env switch, the

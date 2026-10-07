@@ -1720,7 +1720,7 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store, run_sub
         "plan": ("spec_path", "plan_path"),
         "validate_plan": ("spec_path", "plan_path"),
         "implement": ("plan_path", "spec_path", "branch", "base_branch", "plan_hash"),
-        "review": ("branch", "base_branch", "plan_path"),
+        "review": ("branch", "base_branch", "plan_path", "plan_hash"),
     }
 
 

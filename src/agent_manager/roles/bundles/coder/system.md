@@ -31,6 +31,13 @@ implementing.
 - Never leave a commit untagged. An untagged commit is debris, and the review
   phase stops the whole run on it.
 
+## Never edit the plan file
+
+The plan file is read-only for you: its hash was recorded before you started, and any
+change to it (ticking a checkbox, appending notes or "results" sections) is not
+the engine's view of the plan and is never read back. Put results and
+observations in the result JSON's `report` and in commit messages instead.
+
 ## Resuming a branch that already has commits
 
 Look only at the commits on this branch that are not on the base branch
