@@ -286,7 +286,7 @@ def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
         st.close()
 
     assert list(repo.iterdir()) == []
-    assert paths.project_db_path(repo).is_relative_to(tmp_path / "data")
+    assert paths.db_path().is_relative_to(tmp_path / "data")
     assert store_journal.Journal(RUN_ID).path.is_relative_to(tmp_path / "data")
 
 
@@ -397,9 +397,10 @@ def _truncate_db(repo: Path) -> Path:
     """Wipe the projection the way a crashed or corrupted disk would.
 
     The WAL sidecars are removed too: zeroing the main file while a populated
-    `-wal` survives would not actually lose the rows.
+    `-wal` survives would not actually lose the rows. `repo` is the project
+    whose store wrote it; the file is the machine one.
     """
-    db_path = paths.project_db_path(repo)
+    db_path = paths.db_path()
     db_path.write_bytes(b"")
     for suffix in ("-wal", "-shm"):
         db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
@@ -5701,7 +5702,7 @@ def _node(
 
 def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
     """Write the projection behind the store's back, as a hand-edit would."""
-    conn = sqlite3.connect(paths.project_db_path(repo))
+    conn = sqlite3.connect(paths.db_path())
     try:
         conn.execute(sql, params)
         conn.commit()
@@ -5816,7 +5817,7 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
     finally:
         rebuilt.close()
 
-    conn = sqlite3.connect(paths.project_db_path(repo))
+    conn = sqlite3.connect(paths.db_path())
     try:
         run_row = conn.execute("SELECT status FROM runs WHERE id = ?", (RUN_ID,)).fetchone()
         story_row = conn.execute(
@@ -6059,7 +6060,7 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
 
 def _all_rows(repo: Path) -> dict[str, list[tuple]]:
     """Every row of every table, in rowid order, read behind the store's back."""
-    conn = sqlite3.connect(paths.project_db_path(repo))
+    conn = sqlite3.connect(paths.db_path())
     try:
         tables = [
             row[0]
@@ -6376,7 +6377,7 @@ def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
     writer = store_writer.Store.open(repo, RUN_ID)
     writer.record_run(_run(repo))
     writer.close()
-    old = sqlite3.connect(paths.project_db_path(repo))
+    old = sqlite3.connect(paths.db_path())
     old.execute("ALTER TABLE runs DROP COLUMN milestone_id")
     old.execute("DROP TABLE board_comments")
     old.commit()

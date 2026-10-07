@@ -30,7 +30,12 @@ def _tree(root: Path) -> set[str]:
     return {str(path.relative_to(root)) for path in root.rglob("*")}
 
 
-def _record(root: Path, run_id: str = RUN_ID) -> None:
+def _record(
+    root: Path,
+    run_id: str = RUN_ID,
+    *,
+    started_at: datetime = datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+) -> None:
     opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
@@ -41,7 +46,7 @@ def _record(root: Path, run_id: str = RUN_ID) -> None:
                 base_branch="main",
                 branch_prefix="m1",
                 status="started",
-                started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+                started_at=started_at,
             )
         )
     finally:
@@ -197,7 +202,8 @@ def test_a_writer_still_creates_the_projection(tmp_path, monkeypatch):
 
     _record(root)
 
-    assert paths.project_db_location(root).is_file()
+    assert paths.db_path().is_file()
+    assert not (paths.data_path() / "projects").exists()
 
 
 def test_project_run_hides_a_run_another_project_recorded_in_the_same_file(
@@ -225,3 +231,80 @@ def test_project_run_hides_a_run_another_project_recorded_in_the_same_file(
         assert cli._project_run(conn, theirs, "no-such-run") is None
     finally:
         conn.close()
+
+
+A_RUN = "20260921T090000Z-aaaaaaaa"
+B_RUN = "20260922T090000Z-bbbbbbbb"
+
+
+@pytest.fixture
+def two_repos(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """Repos `a` and `b` sharing one data dir, one run each; `b`'s is newer."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    _record(a, A_RUN, started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(b, B_RUN, started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc))
+    return a, b
+
+
+def _row_counts() -> dict[str, int]:
+    """Every table of `am.db` with its row count, over a plain connection."""
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        return {
+            table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def test_runs_and_status_of_one_repo_never_show_another_repos_run(two_repos):
+    a, _ = two_repos
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(a)])
+    latest = runner.invoke(cli.app, ["status", "--repo-dir", str(a)])
+    dotted = runner.invoke(cli.app, ["runs", "--repo-dir", str(a / ".." / "a")])
+
+    assert paths.db_path().is_file()
+    assert listed.exit_code == 0, listed.output
+    assert [run["id"] for run in json.loads(listed.stdout)["data"]["runs"]] == [A_RUN]
+    assert latest.exit_code == 0, latest.output
+    assert json.loads(latest.stdout)["data"]["run"]["id"] == A_RUN
+    assert dotted.exit_code == 0, dotted.output
+    assert [run["id"] for run in json.loads(dotted.stdout)["data"]["runs"]] == [A_RUN]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", B_RUN],
+        ["logs", B_RUN, "card"],
+        ["resume", B_RUN],
+        ["reset", B_RUN],
+        ["cancel", B_RUN],
+        ["pause", B_RUN],
+    ],
+)
+def test_a_run_of_another_repo_is_an_unknown_run_and_nothing_is_written(two_repos, argv):
+    a, _ = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, [*argv, "--repo-dir", str(a)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert "UnknownRunError" in result.output
+    assert f"run {B_RUN!r} is not in the projection" in result.output
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before

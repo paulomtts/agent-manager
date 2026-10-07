@@ -1,4 +1,4 @@
-"""Behaviour of `agent_manager.store.db`: the projection's DDL, opening and
+"""Behaviour of `agent_manager.store.db`: the machine database's DDL, opening and
 migrating it, and the write-transaction helper.
 
 Real SQLite files under `tmp_path`; nothing spawns a process, so these are
@@ -157,7 +157,7 @@ _DB_NAMES = (
 )
 
 
-def _hold_fresh_db_reserved(repo: Path) -> sqlite3.Connection:
+def _hold_fresh_db_reserved() -> sqlite3.Connection:
     """A second connection holding a RESERVED lock on a fresh, pre-WAL database.
 
     It must be `BEGIN IMMEDIATE`: SQLite fails `PRAGMA journal_mode=WAL` at once
@@ -165,7 +165,7 @@ def _hold_fresh_db_reserved(repo: Path) -> sqlite3.Connection:
     `open_db` retries. `BEGIN EXCLUSIVE` would make the busy handler run and so
     prove nothing.
     """
-    path = paths.project_db_path(repo)
+    path = paths.db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     holder = sqlite3.connect(path, isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
@@ -226,7 +226,7 @@ def test_the_wal_deadline_is_read_from_db_at_call_time(repo, monkeypatch):
 
     monkeypatch.setattr(db, "BUSY_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(db.time, "sleep", no_sleep)
-    holder = _hold_fresh_db_reserved(repo)
+    holder = _hold_fresh_db_reserved()
     try:
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             db.open_db(repo)
@@ -260,13 +260,34 @@ def test_no_caller_reaches_a_db_name_through_the_store_package():
     assert hits == []
 
 
-def test_open_db_creates_the_project_file_in_wal_mode(repo):
+def test_open_db_creates_the_machine_file_in_wal_mode_and_no_projects_dir(repo):
+    assert not paths.data_path().exists()
+
     conn = db.open_db(repo)
     try:
-        assert paths.project_db_path(repo).exists()
+        assert paths.db_path().is_file()
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     finally:
         conn.close()
+
+    assert not (paths.data_path() / "projects").exists()
+
+
+def test_two_roots_open_one_file(repo, tmp_path):
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    first = db.open_db(repo)
+    second = db.open_db(other)
+    try:
+        project_id = store_projects.resolve(first, repo, now=NOW)
+        first.commit()
+        assert store_projects.lookup(second, repo) == project_id
+        machine = paths.db_path().resolve()
+        assert Path(first.execute("PRAGMA database_list").fetchone()["file"]).resolve() == machine
+        assert Path(second.execute("PRAGMA database_list").fetchone()["file"]).resolve() == machine
+    finally:
+        first.close()
+        second.close()
 
 
 def test_open_db_connection_can_be_used_from_another_thread(repo):
@@ -299,7 +320,7 @@ def test_open_db_connection_can_be_used_from_another_thread(repo):
 
 
 def test_open_db_waits_out_a_writer_holding_a_fresh_db_before_wal(repo):
-    holder = _hold_fresh_db_reserved(repo)
+    holder = _hold_fresh_db_reserved()
     opened: list[sqlite3.Connection] = []
     errors: list[BaseException] = []
 
@@ -330,7 +351,7 @@ def test_open_db_waits_out_a_writer_holding_a_fresh_db_before_wal(repo):
 
 def test_open_db_reraises_database_is_locked_after_the_deadline(repo, monkeypatch):
     monkeypatch.setattr(db, "BUSY_TIMEOUT_SECONDS", 0.3)
-    holder = _hold_fresh_db_reserved(repo)
+    holder = _hold_fresh_db_reserved()
     try:
         started = time.monotonic()
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
@@ -348,7 +369,7 @@ def test_open_db_does_not_retry_an_error_other_than_database_is_locked(repo):
     # Junk bytes make the WAL pragma raise DatabaseError('file is not a
     # database') at once. With the default 30 s deadline, a retry would show up
     # as a long wait.
-    path = paths.project_db_path(repo)
+    path = paths.db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"not a database" * 200)
 
@@ -463,7 +484,7 @@ def test_immediate_holds_the_write_lock_from_begin(repo):
     # Review Focus 2: BEGIN IMMEDIATE, not a deferred BEGIN, so no second
     # writer can land between reading MAX(seq) and the insert.
     conn = db.open_db(repo)
-    blocker = sqlite3.connect(paths.project_db_path(repo), timeout=0)
+    blocker = sqlite3.connect(paths.db_path(), timeout=0)
     try:
         with db.immediate(conn):
             with pytest.raises(sqlite3.OperationalError, match="locked"):
@@ -541,3 +562,13 @@ def test_added_columns_stay_last(repo):
     finally:
         conn.close()
     assert last == {"phases": "detail", "runs": "milestone_id"}
+
+
+def test_open_db_for_reading_a_settled_db_creates_no_sidecars(repo):
+    db.open_db(repo).close()
+    sidecars = [paths.db_path().with_name(paths.db_path().name + s) for s in ("-wal", "-shm")]
+    assert not any(path.exists() for path in sidecars)
+
+    db.open_db_for_reading(repo).close()
+
+    assert not any(path.exists() for path in sidecars)

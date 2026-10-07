@@ -2190,18 +2190,18 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
     # No run was left behind: the data directory holds nothing but the `git`
     # ProcessLock's own lock file, the one thing spec X7 does put there even on
     # this early a failure (paths.project_lock_path creates its `projects`
-    # directory as soon as the lock object exists), and the project's
-    # projection, which the read-only claims preflight (`cli.refuse_claimed`,
-    # X5) opens before the fetch. That projection records no run.
+    # directory as soon as the lock object exists), and the machine database
+    # `am.db` with its WAL sidecars, which the read-only claims preflight
+    # (`cli.refuse_claimed`, X5) opens before the fetch. It records no run.
     data = paths.data_dir()
     projects = data / "projects"
-    db_name = paths.project_db_path(cli.resolve_repo_dir(project)).name
+    machine_db = {"am.db", "am.db-wal", "am.db-shm"}
     written = sorted(
         str(entry.relative_to(data))
         for entry in data.rglob("*")
         if entry != projects
         and not (entry.parent == projects and entry.suffix == ".lock")
-        and not (entry.parent == projects and entry.name.startswith(db_name))
+        and not (entry.parent == data and entry.name in machine_db)
     )
     assert written == []
     assert _run_ids(project) == []

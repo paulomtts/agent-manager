@@ -49,11 +49,16 @@ def _projects_dir() -> Path:
 
 
 def project_db_path(root: Path) -> Path:
+    """The legacy per-project database of `root`, `projects/<digest>.db`; creates `projects`.
+
+    The store no longer opens it: `am.db` (`db_path`) replaced it. It names
+    the pre-`am.db` layout `am migrate` reads.
+    """
     return _projects_dir() / f"{project_digest(root)}.db"
 
 
 def project_db_location(root: Path) -> Path:
-    """Where `project_db_path` puts the project's database, without creating anything."""
+    """Where `project_db_path` names the legacy per-project database, without creating anything."""
     return data_path() / "projects" / f"{project_digest(root)}.db"
 
 

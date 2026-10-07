@@ -1,4 +1,4 @@
-"""The per-project SQLite projection's connection: its DDL, opening and
+"""The machine-wide SQLite projection `<data dir>/am.db`: its DDL, opening and
 migrating it, and the write-transaction helper.
 """
 
@@ -235,7 +235,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
 
 
 def open_db(root: Path) -> sqlite3.Connection:
-    """Open the per-project projection, applying the schema idempotently.
+    """Open the machine-wide projection `paths.db_path()`, applying the schema idempotently.
+
+    `root` does not choose the file: every root opens `paths.db_path()`. The
+    data directory is created first; `<data dir>/projects` never is.
 
     WAL mode is set before the schema so a reader never blocks the writer. The
     WAL switch is retried until `BUSY_TIMEOUT_SECONDS`, because SQLite does not
@@ -256,8 +259,10 @@ def open_db(root: Path) -> sqlite3.Connection:
     the database briefly; two processes never write one run, because every
     run write is fenced by the lease token (multi-process X4).
     """
+    location = paths.db_path()
+    paths.data_dir()
     conn = sqlite3.connect(
-        paths.project_db_path(root),
+        location,
         timeout=BUSY_TIMEOUT_SECONDS,
         check_same_thread=False,
     )
@@ -301,22 +306,30 @@ def _has_current_schema(conn: sqlite3.Connection) -> bool:
 
 
 def open_db_for_reading(root: Path) -> sqlite3.Connection:
-    """A connection that reads the per-project projection and never writes it.
+    """A connection that reads the machine-wide projection and never writes it.
 
-    No database for `root`: an in-memory, empty projection with the current
-    schema, and nothing is created on disk. An existing database with the
-    current schema: opened `mode=ro`, so it can never be written or created;
+    `root` does not choose the file, as for `open_db`. No `am.db`: an
+    in-memory, empty projection with the current schema, and nothing is
+    created on disk. An existing database with the current schema: opened `mode=ro`, so it can never be written or created;
     its rows are read live alongside a writer in WAL mode. An existing database
     with an older schema: `open_db`, which migrates it as before.
+
+    A read through `mode=ro` of a WAL database creates its `-wal` and `-shm`
+    sidecars. When neither exists, no connection holds the file open, so it is
+    opened `immutable=1` instead: that read takes no lock and creates nothing,
+    and the connection is for one short read, never held across writes.
     """
-    location = paths.project_db_location(root)
+    location = paths.db_path()
     if not location.exists():
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         return conn
+    settled = not any(
+        location.with_name(location.name + suffix).exists() for suffix in ("-wal", "-shm")
+    )
     conn = sqlite3.connect(
-        f"{location.absolute().as_uri()}?mode=ro",
+        f"{location.absolute().as_uri()}?{'immutable=1' if settled else 'mode=ro'}",
         uri=True,
         timeout=BUSY_TIMEOUT_SECONDS,
         check_same_thread=False,
