@@ -11667,7 +11667,8 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert lines_after[: len(lines_before)] == lines_before
     (added,) = lines_after[len(lines_before) :]
     assert added.event == "run_upsert"
-    assert added.seq == lines_before[-1].seq + 1
+    # `am reset`'s own `lease_acquired` takes the number in between (card 1.2.7).
+    assert added.seq == lines_before[-1].seq + 2
     first = next(line for line in lines_before if line.event == "run_upsert")
     # The same write whether or not the worktree exists: only `status` moved.
     assert added.payload == {**first.payload, "status": "canceled"}

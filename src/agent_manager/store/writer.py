@@ -950,15 +950,19 @@ class Store:
         One `BEGIN IMMEDIATE` transaction (X5, X9): a live lease under another
         token raises `LeaseHeldError`; otherwise that row, or `None`, is the
         `displaced` one. Then the first key another run of this project holds
-        under a live lease raises `ClaimHeldError`. Only then are the lease (window open)
-        and every claim upserted and committed. Any raise rolls all of it
-        back and leaves the bound token as it was. On success, after the
-        commit and before any other job runs, the store is bound to `token`.
+        under a live lease raises `ClaimHeldError`. Only then are the lease
+        (window open) and every claim upserted, and one event inserted:
+        `lease_acquired` (with the claim keys in the order given) when nothing
+        was displaced, `lease_taken_over` (naming the displaced row) otherwise,
+        even under the same token. Any raise rolls all of it back and leaves
+        the bound token as it was. On success, after the commit and before any
+        other job runs, the store is bound to `token`. The event is never
+        mirrored to the journal file.
         """
         keys = tuple(claims)
 
         def job(conn: sqlite3.Connection) -> store_leases.LeaseTake:
-            return store_leases.take_lease(
+            taken = store_leases.take_lease(
                 conn,
                 self.run_id,
                 project_id=self._project_id,
@@ -969,6 +973,29 @@ class Store:
                 is_live=is_live,
                 claims=keys,
             )
+            displaced = taken.displaced
+            if displaced is None:
+                self._insert_event(
+                    conn,
+                    "lease_acquired",
+                    {"token": token, "pid": pid, "host": host, "claims": list(keys)},
+                )
+            else:
+                self._insert_event(
+                    conn,
+                    "lease_taken_over",
+                    {
+                        "token": token,
+                        "pid": pid,
+                        "host": host,
+                        "displaced": {
+                            "pid": displaced.pid,
+                            "host": displaced.host,
+                            "heartbeat_at": store_db.iso(displaced.heartbeat_at),
+                        },
+                    },
+                )
+            return taken
 
         return self._submit(
             job, operation="take_lease", after_commit=lambda: self.bind_lease(token)

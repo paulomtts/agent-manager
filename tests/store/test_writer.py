@@ -1914,8 +1914,11 @@ def test_heartbeats_racing_records_all_land(repo):
     assert len(lines) == 40
     assert len({line.seq for line in lines}) == 40
     assert rows == 40
-    assert [event.run_seq for event in events] == list(range(1, 41))
-    assert texts == [_line_text(event) for event in events]
+    # `_take_t1`'s `lease_acquired` is run_seq 1 and is never mirrored.
+    assert [(event.kind, event.run_seq) for event in events[:1]] == [("lease_acquired", 1)]
+    attempts = events[1:]
+    assert [event.run_seq for event in attempts] == list(range(2, 42))
+    assert texts == [_line_text(event) for event in attempts]
 
 
 def test_a_lost_lease_writes_no_line_no_event_and_no_row(repo):
@@ -1941,7 +1944,8 @@ def test_a_lost_lease_writes_no_line_no_event_and_no_row(repo):
         st.close()
 
     assert events == ["run_upsert"]
-    assert kinds == ["run_upsert"]
+    # The take's own event committed; the lost store's record added nothing.
+    assert kinds == ["run_upsert", "lease_acquired"]
     assert stories == 0
 
 
@@ -2062,7 +2066,7 @@ def test_taking_or_adopting_a_lease_never_reads_the_journal(repo, monkeypatch):
         st.close()
 
     assert held.token == "t1"
-    assert line.seq == 1
+    assert line.seq == 2  # the take's `lease_acquired` is run_seq 1
     assert not hasattr(store_journal.Journal, "reseek")
 
 
@@ -2235,3 +2239,191 @@ def test_a_failed_control_handled_insert_leaves_the_request_pending(repo, monkey
 
     assert [row.handled_at for row in requests] == [None]
     assert events == []
+
+
+def test_a_first_take_lease_writes_one_lease_acquired_event(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        before = datetime.now(timezone.utc)
+        taken = st.take_lease(
+            token="t1",
+            pid=1,
+            host="h",
+            now=NOW,
+            is_live=lambda row: True,
+            claims=["card:b", "card:a"],
+        )
+        after = datetime.now(timezone.utc)
+        events = _events(st)
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    assert taken.displaced is None
+    (event,) = events
+    assert (event.kind, event.source, event.project_id, event.schema, event.run_seq) == (
+        "lease_acquired",
+        "live",
+        project_id,
+        1,
+        1,
+    )
+    assert (event.story_id, event.card_id, event.phase, event.attempt) == _NO_COORDINATES
+    # The claim keys in the order passed, not sorted.
+    assert event.payload == {"token": "t1", "pid": 1, "host": "h", "claims": ["card:b", "card:a"]}
+    # `ts` is the wall clock inside the job, not the lease's `now`.
+    assert _stamped_between(event, before, after)
+
+
+def test_a_take_lease_with_no_claims_records_an_empty_claims_list(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        events = _events(st)
+    finally:
+        st.close()
+
+    (event,) = events
+    assert event.payload["claims"] == []
+
+
+def test_a_take_over_a_dead_holder_writes_lease_taken_over_naming_it(repo):
+    _plant_holder(repo, token="t0", pid=7, host="other-box", heartbeat_at=NOW)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        taken = st.take_lease(
+            token="t1", pid=1, host="h", now=LATER, is_live=lambda row: False, claims=["card:a"]
+        )
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert taken.displaced is not None and taken.displaced.token == "t0"
+    (event,) = events
+    assert (event.kind, event.run_seq) == ("lease_taken_over", 1)
+    assert (event.story_id, event.card_id, event.phase, event.attempt) == _NO_COORDINATES
+    # No `claims` key on a takeover.
+    assert event.payload == {
+        "token": "t1",
+        "pid": 1,
+        "host": "h",
+        "displaced": {"pid": 7, "host": "other-box", "heartbeat_at": NOW.isoformat()},
+    }
+
+
+def test_a_re_take_under_the_same_token_writes_lease_taken_over(repo):
+    # Review Focus 1: `LeaseTake` reports the old row as displaced, and the
+    # event follows `LeaseTake`.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        taken = st.take_lease(token="t1", pid=2, host="h2", now=LATER, is_live=lambda row: True)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert taken.displaced is not None and taken.displaced.token == "t1"
+    assert [(event.kind, event.run_seq) for event in events] == [
+        ("lease_acquired", 1),
+        ("lease_taken_over", 2),
+    ]
+    assert events[1].payload == {
+        "token": "t1",
+        "pid": 2,
+        "host": "h2",
+        "displaced": {"pid": 1, "host": "h", "heartbeat_at": NOW.isoformat()},
+    }
+
+
+def test_a_failed_lease_event_rolls_the_take_back_and_leaves_the_store_unbound(
+    repo, monkeypatch
+):
+    # Review Focus 4.
+    monkeypatch.setattr(
+        store_events,
+        "insert",
+        _failing_insert_for("lease_acquired", sqlite3.OperationalError("disk I/O error")),
+    )
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            st.take_lease(
+                token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True, claims=["card:a"]
+            )
+        lease = store_leases.read_lease(st.read_connection, RUN_A)
+        claims = _claims(st)
+        events = _events(st)
+        # Fenced to "t1" with no "t1" row, this would raise `LeaseLostError`.
+        line = st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    assert lease is None
+    assert claims == []
+    assert events == []
+    assert line.seq == 1  # no `run_seq` was spent by the rolled-back take
+
+
+def test_a_busy_re_run_of_take_lease_commits_one_lease_event(repo, monkeypatch):
+    # Review Focus 3: the busy error comes after the lease event was inserted.
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    real = store_events.insert
+    kinds: list[str] = []
+
+    def busy_after_the_first_insert(conn, **kwargs):
+        event = real(conn, **kwargs)
+        kinds.append(kwargs["kind"])
+        if len(kinds) == 1:
+            raise _busy()
+        return event
+
+    monkeypatch.setattr(store_events, "insert", busy_after_the_first_insert)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert kinds == ["lease_acquired", "lease_acquired"]
+    assert [(event.kind, event.run_seq) for event in events] == [("lease_acquired", 1)]
+
+
+def test_a_lease_event_takes_a_run_seq_but_never_reaches_the_journal_file(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        line = st.record_run(_run(repo))
+        events = _events(st)
+        texts = _file_texts(st)
+        lines = store_events.run_lines(st.read_connection, RUN_A)
+    finally:
+        st.close()
+
+    assert [(event.kind, event.run_seq) for event in events] == [
+        ("lease_acquired", 1),
+        ("run_upsert", 2),
+    ]
+    assert line.seq == 2
+    assert texts == [_line_text(events[1])]
+    assert lines == [line]
+
+
+def test_the_other_lease_writes_record_no_event(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(
+            token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True, claims=["card:a"]
+        )
+        st.beat("t1", LATER)
+        st.close_window("t1")
+        st.set_lease_holder("t1", pid=2, host="h2")
+        st.bind_lease(None)
+        st.adopt_lease("t1")
+        st.release_claims("t1")
+        st.release_lease("t1")
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert [event.kind for event in events] == ["lease_acquired"]

@@ -3775,14 +3775,15 @@ def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
     second = store_writer.Store.open(repo, RUN_ID)
     try:
         first.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=lambda row: False)
-        assert first.record_run(_run(repo)).seq == 1
+        # The take's `lease_acquired` is run_seq 1.
+        assert first.record_run(_run(repo)).seq == 2
         first.bind_lease(None)
 
         held = second.adopt_lease("t1")
 
         assert held.token == "t1"
-        # Opened before line 1 was written: the table's `MAX(run_seq)` numbers this line 2.
-        assert second.record_run(_run(repo)).seq == 2
+        # Opened before line 2 was written: the table's `MAX(run_seq)` numbers this line 3.
+        assert second.record_run(_run(repo)).seq == 3
         thief = store_writer.Store.open(repo, RUN_ID)
         try:
             thief.take_lease(token="thief", pid=9, host="h", now=_at(1), is_live=lambda row: False)
@@ -4563,14 +4564,15 @@ def test_release_claims_deletes_only_its_own_tokens_rows(repo, stores):
 
 def test_the_new_owner_continues_the_sequence(repo, stores):
     a = stores()
-    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)
+    a.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=_alive)  # run_seq 1
     b = stores()  # opened, its seq cached at 0, before a's write
-    assert a.record_run(_run(repo)).seq == 1  # a writes seq 1 while still the owner
+    assert a.record_run(_run(repo)).seq == 2  # a writes seq 2 while still the owner
 
-    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
+    b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)  # run_seq 3
 
-    assert b.record_run(_run_with_status(repo, RUN_ID, "stopped")).seq == 2
-    assert [line.seq for line in b.journal.read()] == [1, 2]
+    assert b.record_run(_run_with_status(repo, RUN_ID, "stopped")).seq == 4
+    # The file mirrors node upserts only, so it skips the two lease events' numbers.
+    assert [line.seq for line in b.journal.read()] == [2, 4]
 
 
 _TAKER = """
