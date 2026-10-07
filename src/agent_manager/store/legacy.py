@@ -1,13 +1,22 @@
 """Per-project databases from an older `am`: each read through a private copy
-that leaves the file and its sidecars untouched."""
+that leaves the file and its sidecars untouched, and all of them merged into
+`am.db` in one write transaction."""
 
 import shutil
 import sqlite3
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
+
+_NOT_COPIED = frozenset({"projects", "meta", "events"})
+"""`am.db` tables no legacy row is copied into: `merge` writes the project row
+and the marker itself, and no legacy row becomes an event."""
 
 
 @dataclass(frozen=True)
@@ -112,3 +121,139 @@ def read_legacy(path: Path) -> LegacyFile:
             raise LegacyUnreadableError(path) from error
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class MergedFile:
+    """One legacy file as merged: the `projects` row it went under (`repo_dir`
+    as stored), the rows copied into each copied table (every one present, 0
+    included), and its tables nothing was copied from, sorted."""
+
+    path: Path
+    repo_dir: str
+    project_id: int
+    rows: dict[str, int]
+    ignored_tables: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeOutcome:
+    """What `merge` did. `migrated_at` is the marker's value. With
+    `already_migrated`, the marker was already there, so nothing was written
+    and `merged` is empty."""
+
+    migrated_at: str
+    already_migrated: bool
+    merged: tuple[MergedFile, ...]
+
+
+class LegacyRunClashError(RuntimeError):
+    """`run_id`, a run of the legacy file at `path`, is already a run of `am.db`."""
+
+    def __init__(self, run_id: str, path: Path) -> None:
+        super().__init__(f"run id {run_id} from {path} is already in am.db")
+        self.run_id = run_id
+        self.path = path
+
+
+class LegacyRowClashError(RuntimeError):
+    """`am.db` refused a `table` row of the legacy file at `path` with
+    `sqlite3.IntegrityError`: a key clash, a `NOT NULL` or a `CHECK`."""
+
+    def __init__(self, table: str, path: Path, cause: str) -> None:
+        super().__init__(f"a {table} row from {path} was refused: {cause}")
+        self.table = table
+        self.path = path
+
+
+def _copied_tables(conn: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """`conn`'s tables that legacy rows are copied into, in name order, with their columns."""
+    return {
+        name: tuple(row[1] for row in conn.execute(f"PRAGMA table_info({_quoted(name)})"))
+        for name in _table_names(conn)
+        if name not in _NOT_COPIED
+    }
+
+
+def _copy(
+    conn: sqlite3.Connection,
+    legacy: LegacyFile,
+    table: str,
+    columns: tuple[str, ...],
+    project_id: int,
+) -> int:
+    """Insert every `table` row of `legacy` under `project_id`; the count inserted.
+
+    Columns are matched by name: legacy columns `table` lacks (and a legacy
+    `project_id`) are dropped, and `table` columns the legacy table lacks take
+    their default.
+    """
+    source = legacy.tables.get(table)
+    if source is None or not source.rows:
+        return 0
+    shared = [c for c in columns if c != "project_id" and c in source.columns]
+    positions = [source.columns.index(c) for c in shared]
+    names = ", ".join(_quoted(c) for c in ("project_id", *shared))
+    marks = ", ".join("?" for _ in range(len(shared) + 1))
+    try:
+        conn.executemany(
+            f"INSERT INTO {_quoted(table)} ({names}) VALUES ({marks})",
+            [(project_id, *(row[i] for i in positions)) for row in source.rows],
+        )
+    except sqlite3.IntegrityError as error:
+        raise LegacyRowClashError(table, legacy.path, str(error)) from error
+    return len(source.rows)
+
+
+def merge(
+    conn: sqlite3.Connection, files: Sequence[LegacyFile], *, now: datetime
+) -> MergeOutcome:
+    """Merge `files` into `am.db` through `conn` in one `immediate` transaction.
+
+    Each file must have exactly one `repo_dirs` value. Inside the transaction:
+    a `MIGRATED_KEY` row already in `meta` returns it as `already_migrated`
+    with nothing written; a run id of a file already in `runs` raises
+    `LegacyRunClashError`; then each file, in order, gets its project through
+    `store_projects.resolve` (an existing row is adopted) and its rows copied
+    into every `am.db` table but `projects`, `meta`, `events` and `sqlite_*`,
+    values verbatim; an `IntegrityError` there raises `LegacyRowClashError`;
+    last, `MIGRATED_KEY` is written as `store_db.iso(now)` and everything is
+    committed. Any raise rolls the whole transaction back.
+    """
+    with store_db.immediate(conn):
+        found = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)
+        ).fetchone()
+        if found is not None:
+            return MergeOutcome(migrated_at=found[0], already_migrated=True, merged=())
+        for legacy in files:
+            for run_id in legacy.run_ids:
+                if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone():
+                    raise LegacyRunClashError(run_id, legacy.path)
+        targets = _copied_tables(conn)
+        merged: list[MergedFile] = []
+        for legacy in files:
+            (repo_dir,) = legacy.repo_dirs
+            project_id = store_projects.resolve(conn, Path(repo_dir), now=now)
+            key = conn.execute(
+                "SELECT repo_dir FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()[0]
+            rows = {
+                table: _copy(conn, legacy, table, columns, project_id)
+                for table, columns in targets.items()
+            }
+            merged.append(
+                MergedFile(
+                    path=legacy.path,
+                    repo_dir=key,
+                    project_id=project_id,
+                    rows=rows,
+                    ignored_tables=tuple(sorted(set(legacy.tables) - set(targets))),
+                )
+            )
+        migrated_at = store_db.iso(now)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            (store_db.MIGRATED_KEY, migrated_at),
+        )
+    return MergeOutcome(migrated_at=migrated_at, already_migrated=False, merged=tuple(merged))

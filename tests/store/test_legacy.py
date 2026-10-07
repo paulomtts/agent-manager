@@ -5,12 +5,15 @@ process is spawned, so these are unit tests.
 
 import sqlite3
 import tempfile
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 from legacyhelpers import (
     LEGACY_TABLES,
+    NOW,
+    OLD_SCHEMA,
     STAMP,
     full_rows,
     lease_row,
@@ -20,8 +23,11 @@ from legacyhelpers import (
     write_wal_db,
 )
 
+from agent_manager import paths
+from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store import legacy as store_legacy
+from agent_manager.store import projects as store_projects
 
 
 @pytest.fixture
@@ -140,3 +146,188 @@ def test_read_legacy_reads_wal_rows_and_leaves_every_file_as_it_was(
     assert tree(directory) == before
     assert opened and not [entry for entry in opened if str(directory) in entry]
     assert list(scratch.iterdir()) == []
+
+
+@pytest.fixture
+def am() -> Iterator[sqlite3.Connection]:
+    """A connection on the test's `am.db`, opened as `migrate` opens it."""
+    conn = store_db.open_db_for_migration()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _observe(sql: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
+    """`sql` on a fresh connection: only what has been committed."""
+    conn = sqlite3.connect(paths.db_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _legacy(tmp_path: Path, name: str, rows, *, schema: str | None = None):
+    kwargs = {} if schema is None else {"schema": schema}
+    return store_legacy.read_legacy(write_db(tmp_path / "legacy" / name, rows, **kwargs))
+
+
+def test_merge_copies_every_table_under_the_new_project_and_writes_the_marker(
+    tmp_path, am
+):
+    alpha, beta = tmp_path / "alpha", tmp_path / "beta"
+    first = _legacy(tmp_path, "a.db", full_rows("run-a", alpha))
+    second = _legacy(tmp_path, "b.db", full_rows("run-b", beta))
+
+    outcome = store_legacy.merge(am, [first, second], now=NOW)
+
+    assert outcome.already_migrated is False
+    assert outcome.migrated_at == store_db.iso(NOW)
+    assert [merged.path for merged in outcome.merged] == [first.path, second.path]
+    ids = {row["repo_dir"]: row["id"] for row in _observe("SELECT id, repo_dir FROM projects")}
+    assert ids == {
+        str(alpha.resolve()): outcome.merged[0].project_id,
+        str(beta.resolve()): outcome.merged[1].project_id,
+    }
+    for merged, run_id in zip(outcome.merged, ("run-a", "run-b"), strict=True):
+        assert merged.repo_dir in ids
+        assert merged.rows == {table: 1 for table in LEGACY_TABLES}
+        assert merged.ignored_tables == ()
+        for table in LEGACY_TABLES:
+            column = "id" if table == "runs" else "run_id"
+            found = _observe(f"SELECT project_id FROM {table} WHERE {column} = ?", (run_id,))
+            assert [row["project_id"] for row in found] == [merged.project_id], table
+    marker = _observe("SELECT value FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,))
+    assert [row["value"] for row in marker] == [store_db.iso(NOW)]
+
+
+_SPARSE = """
+CREATE TABLE runs (
+    id TEXT PRIMARY KEY, workflow TEXT, repo_dir TEXT, base_branch TEXT,
+    branch_prefix TEXT, status TEXT, started_at TEXT, config TEXT,
+    project_id INTEGER, tokens_in INTEGER
+);
+CREATE TABLE board_comments (
+    run_id TEXT, card_id TEXT, key TEXT PRIMARY KEY, body TEXT, state TEXT,
+    comment_id TEXT, created_at TEXT, posted_at TEXT
+);
+CREATE TABLE notes (x);
+"""
+"""A legacy file whose columns differ from `am.db`'s both ways."""
+
+
+def test_merge_matches_columns_by_name(tmp_path, am):
+    repo = tmp_path / "alpha"
+    rows = {
+        "runs": [{**run_row("run-a", repo), "project_id": 99, "tokens_in": 7}],
+        "board_comments": [
+            {"run_id": "run-a", "card_id": "c1", "key": "k1", "body": "b",
+             "state": "pending", "created_at": STAMP},
+        ],
+        "notes": [{"x": 1}],
+    }
+    legacy = _legacy(tmp_path, "a.db", rows, schema=_SPARSE)
+
+    (merged,) = store_legacy.merge(am, [legacy], now=NOW).merged
+
+    run = _observe("SELECT * FROM runs")[0]
+    assert run["project_id"] == merged.project_id != 99
+    assert run["milestone_id"] is None
+    assert "tokens_in" not in run.keys()
+    comment = _observe("SELECT failed_attempts, project_id FROM board_comments")[0]
+    assert comment["failed_attempts"] == 0
+    assert comment["project_id"] == merged.project_id
+    assert merged.ignored_tables == ("notes",)
+    assert merged.rows == {table: 0 for table in LEGACY_TABLES} | {
+        "runs": 1,
+        "board_comments": 1,
+    }
+
+
+def test_merge_reads_an_old_schema_by_name(tmp_path, am):
+    repo = tmp_path / "alpha"
+    rows = full_rows("run-a", repo)
+    rows["attempts"] = [{**rows["attempts"][0], "tokens_in": 1, "tokens_out": 2, "cost": 0.5}]
+    legacy = _legacy(tmp_path, "a.db", rows, schema=OLD_SCHEMA)
+
+    (merged,) = store_legacy.merge(am, [legacy], now=NOW).merged
+
+    assert merged.rows["attempts"] == 1
+    assert _observe("SELECT detail FROM phases")[0]["detail"] is None
+    assert _observe("SELECT milestone_id FROM runs")[0]["milestone_id"] is None
+
+
+def test_merge_adopts_an_existing_project_row_with_its_created_at(tmp_path, am):
+    repo = tmp_path / "alpha"
+    earlier = datetime.fromisoformat(STAMP)
+    with store_db.immediate(am):
+        existing = store_projects.resolve(am, repo, now=earlier)
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", repo))
+
+    (merged,) = store_legacy.merge(am, [legacy], now=NOW).merged
+
+    assert merged.project_id == existing
+    assert [row["created_at"] for row in _observe("SELECT created_at FROM projects")] == [
+        STAMP
+    ]
+
+
+def test_merge_returns_the_marker_already_there_and_writes_nothing(tmp_path, am):
+    with store_db.immediate(am):
+        am.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)", (store_db.MIGRATED_KEY, STAMP)
+        )
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+
+    outcome = store_legacy.merge(am, [legacy], now=NOW)
+
+    assert outcome == store_legacy.MergeOutcome(
+        migrated_at=STAMP, already_migrated=True, merged=()
+    )
+    assert _observe("SELECT * FROM projects") == []
+    assert _observe("SELECT * FROM runs") == []
+
+
+def test_merge_refuses_a_run_id_already_in_am_db_and_commits_nothing(tmp_path, am):
+    other = tmp_path / "other"
+    with store_db.immediate(am):
+        project_id = store_projects.resolve(am, other, now=NOW)
+        am.execute(
+            "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+            " branch_prefix, status, config) VALUES (?, 'run-a', 'task', ?, 'main',"
+            " 'am/', 'done', '{}')",
+            (project_id, str(other.resolve())),
+        )
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+
+    with pytest.raises(store_legacy.LegacyRunClashError) as raised:
+        store_legacy.merge(am, [legacy], now=NOW)
+
+    assert raised.value.run_id == "run-a"
+    assert raised.value.path == legacy.path
+    assert len(_observe("SELECT * FROM projects")) == 1
+    assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
+
+
+def test_merge_reports_a_clashing_row_and_rolls_everything_back(tmp_path, am):
+    orphan = {"run_id": "ghost", "card_id": "s9", "title": "t", "level": 0,
+              "status": "done", "position": 0}
+    first_rows = full_rows("run-a", tmp_path / "alpha")
+    first_rows["stories"].append(orphan)
+    second_rows = full_rows("run-b", tmp_path / "beta")
+    second_rows["stories"].append(orphan)
+    first = _legacy(tmp_path, "a.db", first_rows)
+    second = _legacy(tmp_path, "b.db", second_rows)
+
+    with pytest.raises(store_legacy.LegacyRowClashError) as raised:
+        store_legacy.merge(am, [first, second], now=NOW)
+
+    assert raised.value.table == "stories"
+    assert raised.value.path == second.path
+    assert "stories" in str(raised.value)
+    assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+    assert not am.in_transaction
+    assert _observe("SELECT * FROM projects") == []
+    assert _observe("SELECT * FROM runs") == []
+    assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
