@@ -12,6 +12,7 @@ import pytest
 
 from agent_manager import board, comments, locks, store
 from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -1167,7 +1168,7 @@ def test_three_failures_abandon_a_row_with_one_warning(stores, root):
     assert comment.key in third[0] and "card-a" in third[0] and "abandoned" in third[0]
     assert "will retry" not in third[0]
     row = _row(st, comment.key)
-    assert (row["state"], row["failed_attempts"]) == ("abandoned", store.COMMENT_ATTEMPTS)
+    assert (row["state"], row["failed_attempts"]) == ("abandoned", store_outbox.COMMENT_ATTEMPTS)
     assert st.pending_comments() == []
 
     fake.down = False

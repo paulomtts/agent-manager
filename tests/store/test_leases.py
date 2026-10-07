@@ -21,6 +21,7 @@ from agent_manager.store import Store
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -564,6 +565,36 @@ _DELEGATIONS = [
         _no_setup,
         lambda st: st.checkpoint_cards(RUN_ID),
         id="checkpoints.checkpoint_cards",
+    ),
+    pytest.param(
+        store_outbox,
+        "enqueue_comment",
+        _no_setup,
+        lambda st: st.enqueue_comment(
+            run_id=RUN_ID, card_id="card-a", key="k1", body="b", now=NOW
+        ),
+        id="outbox.enqueue_comment",
+    ),
+    pytest.param(
+        store_outbox,
+        "pending_comments",
+        _no_setup,
+        lambda st: st.pending_comments(),
+        id="outbox.pending_comments",
+    ),
+    pytest.param(
+        store_outbox,
+        "mark_comment_posted",
+        _no_setup,
+        lambda st: st.mark_comment_posted("k1", "c1", NOW),
+        id="outbox.mark_comment_posted",
+    ),
+    pytest.param(
+        store_outbox,
+        "record_comment_failure",
+        _no_setup,
+        lambda st: st.record_comment_failure("k1"),
+        id="outbox.record_comment_failure",
     ),
 ]
 

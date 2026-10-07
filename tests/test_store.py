@@ -32,6 +32,7 @@ from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
@@ -5440,7 +5441,7 @@ def test_pending_comments_filters_by_run_and_cards_oldest_first(repo):
         st.close()
 
     assert [row.key for row in every] == ["k3", "k2", "k1"]
-    assert every[0] == store.CommentRow(
+    assert every[0] == store_outbox.CommentRow(
         run_id=OTHER_RUN_ID,
         card_id="card-a",
         key="k3",
@@ -5501,7 +5502,7 @@ def test_record_comment_failure_abandons_the_row_on_the_third_failure(repo):
         _enqueue(st, "k1")
         counts = []
         states = []
-        for _ in range(store.COMMENT_ATTEMPTS):
+        for _ in range(store_outbox.COMMENT_ATTEMPTS):
             counts.append(st.record_comment_failure("k1"))
             row = _comment_row(st.connection, "k1")
             assert row is not None
@@ -5510,7 +5511,7 @@ def test_record_comment_failure_abandons_the_row_on_the_third_failure(repo):
     finally:
         st.close()
 
-    assert store.COMMENT_ATTEMPTS == 3
+    assert store_outbox.COMMENT_ATTEMPTS == 3
     assert counts == [1, 2, 3]
     assert states == ["pending", "pending", "abandoned"]
     assert pending == []
@@ -5539,7 +5540,7 @@ def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
         _enqueue(st, "k-posted", body="first")
         st.mark_comment_posted("k-posted", "c-101", _at(1))
         _enqueue(st, "k-gone", body="first")
-        for _ in range(store.COMMENT_ATTEMPTS):
+        for _ in range(store_outbox.COMMENT_ATTEMPTS):
             st.record_comment_failure("k-gone")
 
         replays = [
@@ -5562,7 +5563,7 @@ def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
     assert (gone["state"], gone["body"], gone["failed_attempts"]) == (
         "abandoned",
         "first",
-        store.COMMENT_ATTEMPTS,
+        store_outbox.COMMENT_ATTEMPTS,
     )
     assert pending == []
 
@@ -5573,7 +5574,7 @@ def test_a_failure_on_a_posted_comment_never_abandons_it(repo):
     try:
         _enqueue(st, "k1")
         st.mark_comment_posted("k1", "c-101", _at(1))
-        for _ in range(store.COMMENT_ATTEMPTS):
+        for _ in range(store_outbox.COMMENT_ATTEMPTS):
             st.record_comment_failure("k1")
         row = _comment_row(st.connection, "k1")
     finally:

@@ -19,7 +19,6 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -28,47 +27,13 @@ from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
 
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
-
-
-COMMENT_ATTEMPTS = 3
-"""Failed posts after which a `board_comments` row is `abandoned` (board-comments
-B7). The warning that names an abandoned row belongs to `comments.py`."""
-
-
-@dataclass(frozen=True)
-class CommentRow:
-    """One queued outcome comment: a row of `board_comments` (board-comments B6).
-
-    Row-only and outside the journal, like `Checkpoint`. `key` is the
-    idempotency key a replay or resume enqueues again (B9); `comment_id` is
-    the board's id once posted, else `None`.
-    """
-
-    run_id: str
-    card_id: str
-    key: str
-    body: str
-    state: str
-    comment_id: str | None
-    failed_attempts: int
-
-
-def _comment_from_row(row: sqlite3.Row) -> CommentRow:
-    return CommentRow(
-        run_id=row["run_id"],
-        card_id=row["card_id"],
-        key=row["key"],
-        body=row["body"],
-        state=row["state"],
-        comment_id=row["comment_id"],
-        failed_attempts=row["failed_attempts"],
-    )
 
 
 class Store:
@@ -525,24 +490,25 @@ class Store:
         """
         with self._lock, self._fenced():
             try:
-                cursor = self._conn.execute(
-                    "INSERT INTO board_comments (run_id, card_id, key, body, state,"
-                    " comment_id, failed_attempts, created_at, posted_at)"
-                    " VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
-                    " ON CONFLICT(key) DO NOTHING",
-                    (run_id, card_id, key, body, store_db.iso(now)),
+                inserted = store_outbox.enqueue_comment(
+                    self._conn,
+                    run_id=run_id,
+                    card_id=card_id,
+                    key=key,
+                    body=body,
+                    now=now,
                 )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
                 raise
-            return cursor.rowcount == 1
+            return inserted
 
     def pending_comments(
         self,
         run_id: str | None = None,
         card_ids: Iterable[str] | None = None,
-    ) -> list[CommentRow]:
+    ) -> list[store_outbox.CommentRow]:
         """Every `pending` row, oldest `created_at` first, then insertion order.
 
         Each given filter narrows the result and they are ANDed; with neither,
@@ -550,25 +516,8 @@ class Store:
         runs, which is what a relaunch needs; an empty `card_ids` matches
         nothing.
         """
-        clauses = ["state = 'pending'"]
-        params: list[str] = []
-        if run_id is not None:
-            clauses.append("run_id = ?")
-            params.append(run_id)
-        if card_ids is not None:
-            cards = list(card_ids)
-            if not cards:
-                return []
-            clauses.append(f"card_id IN ({', '.join('?' for _ in cards)})")
-            params.extend(cards)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM board_comments WHERE "
-                + " AND ".join(clauses)
-                + " ORDER BY created_at, rowid",
-                params,
-            ).fetchall()
-            return [_comment_from_row(row) for row in rows]
+            return store_outbox.pending_comments(self._conn, run_id, card_ids)
 
     def mark_comment_posted(self, key: str, comment_id: str, now: datetime) -> None:
         """Record that `key`'s body is on the board as `comment_id`.
@@ -577,11 +526,7 @@ class Store:
         """
         with self._lock, self._fenced():
             try:
-                self._conn.execute(
-                    "UPDATE board_comments SET state = 'posted', comment_id = ?,"
-                    " posted_at = ? WHERE key = ?",
-                    (comment_id, store_db.iso(now), key),
-                )
+                store_outbox.mark_comment_posted(self._conn, key, comment_id, now)
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
@@ -596,20 +541,12 @@ class Store:
         """
         with self._lock, self._fenced():
             try:
-                self._conn.execute(
-                    "UPDATE board_comments SET failed_attempts = failed_attempts + 1,"
-                    " state = CASE WHEN state = 'pending' AND failed_attempts + 1 >= ?"
-                    " THEN 'abandoned' ELSE state END WHERE key = ?",
-                    (COMMENT_ATTEMPTS, key),
-                )
-                row = self._conn.execute(
-                    "SELECT failed_attempts FROM board_comments WHERE key = ?", (key,)
-                ).fetchone()
+                failures = store_outbox.record_comment_failure(self._conn, key)
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
                 raise
-            return 0 if row is None else row["failed_attempts"]
+            return failures
 
     # -- leases, claims and control requests -----------------------------------
     #
