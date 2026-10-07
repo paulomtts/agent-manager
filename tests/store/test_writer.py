@@ -963,6 +963,206 @@ def test_a_busy_re_run_of_a_record_appends_the_journal_line_once(repo, monkeypat
     assert runs == 1
 
 
+# -- batches: coalesced jobs share one transaction ---------------------------
+
+
+def _traced(st: store_writer.Store) -> list[str]:
+    """Every SQL statement `st`'s writing connection runs from now on, in order."""
+    statements: list[str] = []
+    st.connection.set_trace_callback(statements.append)
+    return statements
+
+
+def _begins(statements: list[str]) -> int:
+    return sum(1 for statement in statements if statement == "BEGIN IMMEDIATE")
+
+
+def _savepoints(statements: list[str]) -> int:
+    return sum(1 for statement in statements if statement.startswith("SAVEPOINT"))
+
+
+def _inserting(key: str):
+    """A job body that inserts `key` into `meta` and returns it."""
+
+    def body(conn: sqlite3.Connection) -> str:
+        _insert_meta(conn, key)
+        return key
+
+    return body
+
+
+def _coalesced(st: store_writer.Store, body, operation: str = "batch"):
+    """A call that submits `body` to `st` as a job that may batch."""
+    return lambda: st._submit(body, operation=operation, coalesce=True)
+
+
+def _enqueue_in_order(st: store_writer.Store, calls) -> list[_Caller]:
+    """Start a `_Caller` per call, each enqueued before the next starts.
+
+    Call it while a `_Gate` holds the writer: the queue then holds the jobs
+    in exactly this order.
+    """
+    callers: list[_Caller] = []
+    for call in calls:
+        callers.append(_Caller(call))
+        _wait_enqueued(st, len(callers))
+    return callers
+
+
+def _wait_all(callers: list[_Caller]) -> None:
+    for caller in callers:
+        caller.wait()
+
+
+def test_coalesced_jobs_queued_together_commit_in_one_transaction(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    statements = _traced(st)
+    try:
+        with _Gate(st):
+            callers = _enqueue_in_order(
+                st, [_coalesced(st, _inserting(f"batch-{n}")) for n in range(3)]
+            )
+        _wait_all(callers)
+        keys = _meta_keys(st.connection, "batch-")
+    finally:
+        st.close()
+
+    assert [(caller.value, caller.error) for caller in callers] == [
+        (f"batch-{n}", None) for n in range(3)
+    ]
+    assert keys == ["batch-0", "batch-1", "batch-2"]
+    assert _begins(statements) == 2  # the gate's, then the batch's
+    assert _savepoints(statements) == 3
+
+
+def test_no_caller_in_a_batch_returns_before_the_commit(repo):
+    b_entered = threading.Event()
+    b_released = threading.Event()
+
+    def job_b(conn):
+        _insert_meta(conn, "batch-b")
+        b_entered.set()
+        assert b_released.wait(TIMEOUT), "job B was never released"
+        return "batch-b"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            a, b = _enqueue_in_order(
+                st, [_coalesced(st, _inserting("batch-a")), _coalesced(st, job_b)]
+            )
+        assert b_entered.wait(TIMEOUT), "job B never started"
+        a.thread.join(0.05)
+        a_still_waiting = a.thread.is_alive()
+        seen_before_commit = _meta_keys(st.read_connection, "batch-")
+        b_released.set()
+        _wait_all([a, b])
+        keys = _meta_keys(st.connection, "batch-")
+    finally:
+        b_released.set()
+        st.close()
+
+    assert a_still_waiting
+    assert seen_before_commit == []
+    assert (a.value, a.error) == ("batch-a", None)
+    assert (b.value, b.error) == ("batch-b", None)
+    assert keys == ["batch-a", "batch-b"]
+
+
+def test_a_job_that_cannot_batch_runs_alone_in_queue_order(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    statements = _traced(st)
+    try:
+        with _Gate(st):
+            callers = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("order-c1")),
+                    _coalesced(st, _inserting("order-c2")),
+                    lambda: st._submit(_inserting("order-p"), operation="plain"),
+                    _coalesced(st, _inserting("order-c3")),
+                ],
+            )
+        _wait_all(callers)
+        keys = _meta_keys(st.connection, "order-")
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None] * 4
+    assert keys == ["order-c1", "order-c2", "order-p", "order-c3"]
+    # The gate, {c1, c2}, p alone, c3 alone.
+    assert _begins(statements) == 4
+
+
+def test_a_coalesced_job_with_after_commit_runs_alone(repo):
+    order: list[str] = []
+
+    def first(conn):
+        order.append("body 1")
+        return "one"
+
+    def second(conn):
+        order.append("body 2")
+        return "two"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    statements = _traced(st)
+    try:
+        with _Gate(st):
+            callers = _enqueue_in_order(
+                st,
+                [
+                    lambda: st._submit(
+                        first,
+                        operation="first",
+                        coalesce=True,
+                        after_commit=lambda: order.append("after_commit 1"),
+                    ),
+                    _coalesced(st, second),
+                ],
+            )
+        _wait_all(callers)
+    finally:
+        st.close()
+
+    assert [(caller.value, caller.error) for caller in callers] == [
+        ("one", None),
+        ("two", None),
+    ]
+    assert order == ["body 1", "after_commit 1", "body 2"]
+    assert _begins(statements) == 3  # the gate's, then one per job
+
+
+def test_close_finishes_a_queued_batch_then_stops(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    gate = _Gate(st)
+    try:
+        callers = _enqueue_in_order(
+            st, [_coalesced(st, _inserting(f"closing-{n}")) for n in range(3)]
+        )
+        closer = _Caller(st.close)
+        _wait_enqueued(st, 4)
+        gate.release()
+        closer.wait()
+        _wait_all(callers)
+    finally:
+        gate.release()
+        st.close()
+
+    observer = store_db.open_db(repo)
+    try:
+        keys = _meta_keys(observer, "closing-")
+    finally:
+        observer.close()
+
+    assert [(caller.value, caller.error) for caller in callers] == [
+        (f"closing-{n}", None) for n in range(3)
+    ]
+    assert closer.error is None
+    assert keys == ["closing-0", "closing-1", "closing-2"]
+    assert _writer_threads(RUN_A) == []
+
+
 def test_a_lost_lease_writes_neither_line_nor_row(repo):
     st = store_writer.Store.open(repo, RUN_A)
     try:

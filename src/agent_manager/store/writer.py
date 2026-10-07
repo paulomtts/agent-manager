@@ -1,8 +1,10 @@
 """`Store`: every write to a run's journal and its SQLite projection, as a job
-on one writer thread that drains a FIFO queue, one `BEGIN IMMEDIATE`
-transaction per job, under the lease fence; reads run on a separate read
-connection. The journal line is appended before the row it describes, so the
-journal is the truth the projection is rebuilt from.
+on one writer thread that drains a FIFO queue, under the lease fence. A job
+runs in a `BEGIN IMMEDIATE` transaction of its own, except that jobs which may
+batch and wait in the queue together share one transaction, each inside a
+savepoint of its own. Reads run on a separate read connection. The journal
+line is appended before the row it describes, so the journal is the truth the
+projection is rebuilt from.
 """
 
 import json
@@ -40,17 +42,30 @@ closed `sqlite3.Connection` words it."""
 
 @dataclass
 class _Job:
-    """One write: `body(conn)` inside one transaction, then `after_commit`.
+    """One write: `body(conn)` inside a transaction, then `after_commit`.
 
-    `future` carries the body's return value, or whatever the body, the retry
-    or `after_commit` raised, to the thread that submitted the job.
+    The job runs alone, in a transaction of its own, unless it `batches`: then
+    it may share one transaction with the jobs that batch and wait directly
+    behind it in the queue, inside a savepoint of its own. `future` carries
+    the body's return value, or whatever the body, the retry or
+    `after_commit` raised, to the thread that submitted the job.
     """
 
     body: Callable[[sqlite3.Connection], Any]
     operation: str
     fenced: bool
     after_commit: Callable[[], object] | None
+    coalesce: bool = False
     future: Future = field(default_factory=Future)
+
+    @property
+    def batches(self) -> bool:
+        """Whether the job may share a transaction: `coalesce` and no `after_commit`.
+
+        A job with `after_commit` always runs alone, so `after_commit` still
+        runs before the next job starts.
+        """
+        return self.coalesce and self.after_commit is None
 
 
 def _main_file(conn: sqlite3.Connection) -> str:
@@ -73,9 +88,13 @@ class Store:
 
     The threads of the process holding a run's lease share one `Store`. Every
     write is one job on the store's single writer thread, run in the order it
-    was submitted, inside one `BEGIN IMMEDIATE` transaction that is re-run
-    from its start while SQLite is busy; the calling thread blocks until its
-    job is done and gets the job's result or exception. A `record_*` job
+    was submitted, inside a `BEGIN IMMEDIATE` transaction that is re-run from
+    its start while SQLite is busy. Heartbeat writes (`beat`, `close_window`,
+    `set_lease_holder`) waiting in the queue together share one transaction,
+    each inside a savepoint of its own, so one that raises fails only its own
+    caller; every other write has a transaction of its own. The calling
+    thread blocks until its job's transaction has committed or given up and
+    gets the job's result or exception. A `record_*` job
     appends the journal line and writes the row, so journal order equals row
     order. Once `take_lease` or `adopt_lease` has bound a token, every run
     write first checks, inside its transaction, that the token still holds the
@@ -184,16 +203,21 @@ class Store:
         operation: str,
         fenced: bool = False,
         after_commit: Callable[[], object] | None = None,
+        coalesce: bool = False,
     ) -> T:
         """Run `body` as one job on the writer thread and return what it returned.
 
-        Blocks until the job is done; jobs run one at a time in the order they
-        were submitted. `body` gets the writing connection inside one
+        Blocks until the job is done; jobs run in the order they were
+        submitted. `body` gets the writing connection inside a
         `BEGIN IMMEDIATE` transaction, under the lease fence when `fenced`, and
         the whole attempt re-runs from `BEGIN` while SQLite is busy
-        (`store_db.run_with_retry`, `operation` naming the write). `after_commit`
-        runs on the writer thread after the commit and before the next job, and
-        is neither retried nor rolled back. Whatever the body, the retry or
+        (`store_db.run_with_retry`, `operation` naming the write). With
+        `coalesce` and no `after_commit`, the job may share its transaction
+        with the coalesced jobs waiting directly behind it, inside a savepoint
+        of its own: a raise then undoes only this job's writes, and this call
+        returns once the shared transaction has committed. `after_commit` runs
+        on the writer thread after the commit and before the next job, and is
+        neither retried nor rolled back. Whatever the body, the retry or
         `after_commit` raised is raised here as the same object. The first call
         starts the writer. Raises `RuntimeError` on the writer thread itself and
         `sqlite3.ProgrammingError` once `close` has begun.
@@ -203,7 +227,7 @@ class Store:
                 f"{operation}: a Store write was submitted from inside a job on"
                 " the writer thread, which would wait on itself forever"
             )
-        job = _Job(body, operation, fenced, after_commit)
+        job = _Job(body, operation, fenced, after_commit, coalesce)
         with self._state_lock:
             if self._closed:
                 raise sqlite3.ProgrammingError(_CLOSED)
@@ -220,35 +244,106 @@ class Store:
     def _drain(self) -> None:
         """The writer thread: run each job in turn until `close` enqueues `None`.
 
-        Every outcome of a job, `BaseException`s included, goes to that job's
-        caller; the loop always moves on to the next job.
+        A job that batches takes along every job that batches and already
+        waits directly behind it, and they run as one batch. The first job
+        that does not batch, or `None`, is held over and taken next, so jobs
+        still run in the order they were submitted, and `None` ends the loop
+        only once the batch before it is done. Every outcome of a job,
+        `BaseException`s included, goes to that job's caller; the loop always
+        moves on to the next job.
         """
-        while (job := self._jobs.get()) is not None:
-            try:
-                result = store_db.run_with_retry(
-                    lambda: self._transact(job), operation=job.operation
-                )
-                if job.after_commit is not None:
-                    job.after_commit()
-            except BaseException as error:  # re-raised by the caller
-                job.future.set_exception(error)
+        held: list[_Job | None] = []
+        while (job := held.pop() if held else self._jobs.get()) is not None:
+            if not job.batches:
+                self._run_alone(job)
+                continue
+            batch = [job]
+            while not held:
+                try:
+                    waiting = self._jobs.get_nowait()
+                except queue.Empty:
+                    break
+                if waiting is not None and waiting.batches:
+                    batch.append(waiting)
+                else:
+                    held.append(waiting)
+            if len(batch) == 1:
+                self._run_alone(job)
             else:
-                job.future.set_result(result)
+                self._run_batch(batch)
+
+    def _run_alone(self, job: _Job) -> None:
+        """Run `job` in a transaction of its own, then its `after_commit`."""
+        try:
+            result = store_db.run_with_retry(
+                lambda: self._transact(job), operation=job.operation
+            )
+            if job.after_commit is not None:
+                job.after_commit()
+        except BaseException as error:  # re-raised by the caller
+            job.future.set_exception(error)
+        else:
+            job.future.set_result(result)
+
+    def _run_batch(self, batch: list[_Job]) -> None:
+        """Run `batch` as one transaction, re-run from its first job while busy.
+
+        No caller hears back before the commit; each then gets its own job's
+        value or exception from the final attempt. If the retry gives up, or
+        something outside every job's savepoint raises, nothing of the batch
+        is committed and every caller gets that same exception. The retry's
+        `operation` is the jobs' distinct operations joined with `+`.
+        """
+        operation = "+".join(dict.fromkeys(job.operation for job in batch))
+        try:
+            outcomes = store_db.run_with_retry(
+                lambda: self._transact_batch(batch), operation=operation
+            )
+        except BaseException as error:  # re-raised by every caller
+            for job in batch:
+                job.future.set_exception(error)
+            return
+        for job, (value, error) in zip(batch, outcomes, strict=True):
+            if error is None:
+                job.future.set_result(value)
+            else:
+                job.future.set_exception(error)
 
     def _transact(self, job: _Job) -> Any:
-        """One attempt at `job`: `BEGIN IMMEDIATE`, the fence, the body, `COMMIT`.
+        """One attempt at `job` alone: `BEGIN IMMEDIATE`, the fence, the body, `COMMIT`.
 
-        A fenced job, while a token is bound, first checks that this run's
-        lease row still carries the token and raises `LeaseLostError` before
-        the body otherwise. Any raise rolls the whole transaction back.
+        Any raise rolls the whole transaction back.
         """
         with store_db.immediate(self._conn) as conn:
-            token = self._token
-            if job.fenced and token is not None:
-                current = store_leases.read_lease(conn, self.run_id)
-                if current is None or current.token != token:
-                    raise store_leases.LeaseLostError(self.run_id, current)
+            self._check_fence(conn, job)
             return job.body(conn)
+
+    def _transact_batch(
+        self, batch: list[_Job]
+    ) -> list[tuple[Any, BaseException | None]]:
+        """One attempt at `batch`: `BEGIN IMMEDIATE`, each job in a savepoint, `COMMIT`.
+
+        Each job's fence and body run inside `SAVEPOINT job_<n>`, `n` its place
+        in the batch. Returns each job's `(value, None)`, in batch order.
+        """
+        outcomes: list[tuple[Any, BaseException | None]] = []
+        with store_db.immediate(self._conn) as conn:
+            for n, job in enumerate(batch):
+                savepoint = f"job_{n}"
+                conn.execute(f"SAVEPOINT {savepoint}")
+                self._check_fence(conn, job)
+                outcomes.append((job.body(conn), None))
+                conn.execute(f"RELEASE {savepoint}")
+        return outcomes
+
+    def _check_fence(self, conn: sqlite3.Connection, job: _Job) -> None:
+        """Raise `LeaseLostError` if `job` is fenced, a token is bound, and this
+        run's lease row no longer carries that token."""
+        token = self._token
+        if job.fenced and token is not None:
+            current = store_leases.read_lease(conn, self.run_id)
+            if current is None or current.token != token:
+                raise store_leases.LeaseLostError(self.run_id, current)
 
     def _read(self, query: Callable[[sqlite3.Connection], T]) -> T:
         """Run `query` on the read connection, on the calling thread.
