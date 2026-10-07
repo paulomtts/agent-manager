@@ -933,8 +933,7 @@ class Store:
         under a live lease raises `ClaimHeldError`. Only then are the lease (window open)
         and every claim upserted and committed. Any raise rolls all of it
         back and leaves the bound token as it was. On success, after the
-        commit and before any other job runs, the store is bound to `token`
-        and the journal re-reads its highest `seq`.
+        commit and before any other job runs, the store is bound to `token`.
         """
         keys = tuple(claims)
 
@@ -951,7 +950,9 @@ class Store:
                 claims=keys,
             )
 
-        return self._submit(job, operation="take_lease", after_commit=lambda: self._bind(token))
+        return self._submit(
+            job, operation="take_lease", after_commit=lambda: self.bind_lease(token)
+        )
 
     def bind_lease(self, token: str | None) -> None:
         """Fence this store's run writes to `token`, or stop fencing with `None`.
@@ -959,12 +960,6 @@ class Store:
         Every fenced job reads the token bound when it runs.
         """
         self._token = token
-
-    def _bind(self, token: str) -> None:
-        """Bind `token` and re-read the journal's highest `seq`: the
-        `after_commit` of `take_lease` and `adopt_lease`."""
-        self.bind_lease(token)
-        self._journal.reseek()
 
     def release_claims(self, token: str) -> None:
         """Delete this run's claims held under `token`; any other row is untouched."""
@@ -1011,8 +1006,7 @@ class Store:
         and handed it off, so nothing is taken here. If the row is gone or
         carries another token, `LeaseLostError` names the holder now in place
         and the store stays unbound. Otherwise every run write is fenced by
-        `token` from here on, and the journal re-reads its highest `seq`, as
-        `take_lease` does, since the parent appended after this store opened.
+        `token` from here on.
         """
         def job(conn: sqlite3.Connection) -> store_leases.LeaseRow:
             current = store_leases.read_lease(conn, self.run_id)
@@ -1020,7 +1014,9 @@ class Store:
                 raise store_leases.LeaseLostError(self.run_id, current)
             return current
 
-        return self._submit(job, operation="adopt_lease", after_commit=lambda: self._bind(token))
+        return self._submit(
+            job, operation="adopt_lease", after_commit=lambda: self.bind_lease(token)
+        )
 
     def set_lease_holder(self, token: str, *, pid: int, host: str) -> None:
         """Name `pid` on `host` as this run's lease holder, if `token` still holds it.

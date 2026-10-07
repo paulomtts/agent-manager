@@ -10493,16 +10493,15 @@ def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
     old_owner = store_journal.Journal("run-t")
     for _ in range(2):
         old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
-    # The new owner opens the journal now and caches seq 2, while the stuck
-    # old owner is still appending: only `reseek` keeps it from reusing seq 3.
-    new_owner = store_journal.Journal("run-t")
 
     def old_owner_keeps_writing() -> None:
         for _ in range(2):
             old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
 
     def new_owner_takes_over() -> None:
-        new_owner.reseek()
+        # The new owner opens the journal once the old owner has stopped
+        # appending, so it numbers after the old owner's last line.
+        new_owner = store_journal.Journal("run-t")
         for _ in range(2):
             new_owner.append("phase_upsert", {"by": "new"}, card="card-1", phase="implement", attempt=1)
 

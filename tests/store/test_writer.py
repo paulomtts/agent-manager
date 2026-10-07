@@ -2013,13 +2013,13 @@ def test_an_after_commit_failure_reaches_the_caller_and_keeps_the_commit(repo, m
     ran_on: list[str] = []
     st = store_writer.Store.open(repo, RUN_A)
 
-    def failing_reseek():
+    def failing_bind(token):
         ran_on.append(threading.current_thread().name)
-        raise OSError("journal unreadable")
+        raise OSError("bind failed")
 
-    monkeypatch.setattr(st.journal, "reseek", failing_reseek)
+    monkeypatch.setattr(st, "bind_lease", failing_bind)
     try:
-        with pytest.raises(OSError, match="journal unreadable"):
+        with pytest.raises(OSError, match="bind failed"):
             st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
         lease = store_leases.read_lease(st.connection, RUN_A)
         after = st._submit(lambda conn: "next", operation="next")
@@ -2029,3 +2029,25 @@ def test_an_after_commit_failure_reaches_the_caller_and_keeps_the_commit(repo, m
     assert ran_on == [f"am-store-writer-{RUN_A}"]
     assert lease is not None and lease.token == "t1"
     assert after == "next"
+
+
+def test_taking_or_adopting_a_lease_never_reads_the_journal(repo, monkeypatch):
+    # Records are numbered by the events table, so a new lease holder has no
+    # file `seq` to re-read.
+    st = store_writer.Store.open(repo, RUN_A)
+
+    def unreadable(*args, **kwargs):
+        raise AssertionError("the journal was read")
+
+    monkeypatch.setattr(st.journal, "last_seq", unreadable)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        st.bind_lease(None)
+        held = st.adopt_lease("t1")
+        line = st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    assert held.token == "t1"
+    assert line.seq == 1
+    assert not hasattr(store_journal.Journal, "reseek")

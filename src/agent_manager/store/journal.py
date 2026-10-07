@@ -79,13 +79,13 @@ class _UnknownEventLine(BaseModel):
 
 
 class Journal:
-    """Append-only JSONL log for one run: the truth the projection is built from.
+    """Append-only JSONL log for one run.
 
-    The threads of the process that holds a run's lease share one `Journal`.
-    The highest sequence number on disk is read when the journal is opened and
-    cached; a lock serialises appends from those threads. A process that takes
-    the lease over calls `reseek`, because the previous owner may have appended
-    after this journal was opened (multi-process X4).
+    The threads of the process that holds a run's lease share one `Journal`;
+    a lock serialises writes from those threads. Live lines arrive through
+    `mirror`, already numbered by the store from its `events` table. `append`
+    numbers a line itself, one past the highest `seq` this journal has seen:
+    on disk when it was opened, or written since through `append` or `mirror`.
     """
 
     def __init__(self, run_id: str) -> None:
@@ -120,16 +120,6 @@ class Journal:
         if not self.path.exists():
             return 0
         return max((seq for seq, _ in self._scan()), default=0)
-
-    def reseek(self) -> None:
-        """Re-read the highest `seq` on disk into the cache, under the append lock.
-
-        Called by `Store.take_lease` once the lease is this process's: a stuck
-        previous owner may have appended lines after `__init__` cached `_seq`,
-        and the new owner must number its first line after them.
-        """
-        with self._lock:
-            self._seq = self.last_seq()
 
     def _scan(
         self, *, ignore_torn_tail: bool = False
@@ -214,17 +204,16 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        Only the process holding the run's lease writes it: after a take-over
-        the new owner writes, and the old owner's writes are fenced out by the
-        lease token (multi-process X4). The sequence number is cached when the
-        journal is opened (and re-read by `reseek` on a take-over), not re-read
-        from disk on each append, and the lock is held from numbering the line
-        until it is fsynced, so the threads of that process never share a
-        number or interleave their bytes. The cached number
-        advances once the line has been written and flushed to the file; if
-        validation, the open or the write raises, the next append retries the
-        same number, and if only the fsync raises the number stays spent, so
-        no seq is ever repeated on disk. The lock is released either way.
+        The sequence number is one past the cached highest `seq` (read when
+        the journal is opened, and raised by every `append` and `mirror`
+        since), not re-read from disk on each append, and the lock is held
+        from numbering the line until it is fsynced, so the threads of this
+        process never share a number or interleave their bytes. The cached
+        number advances once the line has been written and flushed to the
+        file; if validation, the open or the write raises, the next append
+        retries the same number, and if only the fsync raises the number stays
+        spent, so no seq is ever repeated on disk by this journal. The lock is
+        released either way.
         """
         with self._lock:
             seq = self._seq + 1

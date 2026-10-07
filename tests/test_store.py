@@ -3731,7 +3731,7 @@ def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
         held = second.adopt_lease("t1")
 
         assert held.token == "t1"
-        # Opened before line 1 was written: only the reseek numbers this line 2.
+        # Opened before line 1 was written: the table's `MAX(run_seq)` numbers this line 2.
         assert second.record_run(_run(repo)).seq == 2
         thief = store_writer.Store.open(repo, RUN_ID)
         try:

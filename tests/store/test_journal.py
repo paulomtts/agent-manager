@@ -683,17 +683,6 @@ def test_a_skipped_line_still_counts_toward_last_seq(repo):
     assert [line.seq for line in again.read()] == [1, 3]
 
 
-def test_reseek_counts_a_skipped_line(repo):
-    # Review Focus 5: a lease take-over re-reads the highest seq on disk.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", {"i": 0})
-    _append_raw(journal, _unrecognised_line(2))
-
-    journal.reseek()
-
-    assert journal.append("run_upsert", {"i": 1}).seq == 3
-
-
 def test_read_holds_the_append_lock_across_the_scan(repo, monkeypatch):
     # Deterministic: check the lock is held at the moment the file is scanned,
     # so an append on another thread can never be met half-written.
