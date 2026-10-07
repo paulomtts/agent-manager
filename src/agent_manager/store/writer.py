@@ -9,9 +9,11 @@ mirrored to the run's journal file, best-effort.
 
 import json
 import logging
+import os
 import queue
 import sqlite3
 import threading
+import weakref
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -52,6 +54,12 @@ T = TypeVar("T")
 _CLOSED = "Cannot operate on a closed database."
 """The message of the `sqlite3.ProgrammingError` a closed `Store` raises, as a
 closed `sqlite3.Connection` words it."""
+
+_FORKED = (
+    "this Store was inherited across a fork; the child process must open a Store of its own"
+)
+"""The message of the `sqlite3.ProgrammingError` a `Store` inherited by a
+forked child raises."""
 
 
 @dataclass
@@ -122,7 +130,9 @@ class Store:
     write first checks, inside its transaction, that the token still holds the
     lease (multi-process X4). Reads run on the calling thread, on a separate
     read-only connection: they see only committed rows and never wait for a
-    write.
+    write. A process forked while a `Store` is open gets an inert copy of it:
+    every write and read raises `sqlite3.ProgrammingError`, and `close`
+    touches neither connection, so the child opens a `Store` of its own.
     """
 
     def __init__(
@@ -142,6 +152,8 @@ class Store:
         self._file = _main_file(conn)
         self._reader: sqlite3.Connection | None = None
         self._reader_lock = threading.Lock()
+        self._forked = False
+        _STORES.add(self)
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
@@ -218,6 +230,25 @@ class Store:
             if self._reader is not None:
                 self._reader.close()
 
+    def _inherit_across_fork(self) -> None:
+        """In a forked child, leave this store inert; a closed store is left alone.
+
+        The job queue, the writer handle and both locks are replaced, so
+        nothing waits on a thread that did not survive the fork or a lock one
+        of the parent's threads held. The store then counts as closed, as an
+        inherited one: every write and read raises `sqlite3.ProgrammingError`
+        naming the fork, and `close` returns without touching either
+        connection, which belong to the parent.
+        """
+        if self._closed:
+            return
+        self._jobs = queue.SimpleQueue()
+        self._writer = None
+        self._state_lock = threading.Lock()
+        self._reader_lock = threading.Lock()
+        self._forked = True
+        self._closed = True
+
     def _submit(
         self,
         body: Callable[[sqlite3.Connection], T],
@@ -252,7 +283,7 @@ class Store:
         job = _Job(body, operation, fenced, after_commit, coalesce)
         with self._state_lock:
             if self._closed:
-                raise sqlite3.ProgrammingError(_CLOSED)
+                raise sqlite3.ProgrammingError(_FORKED if self._forked else _CLOSED)
             if self._writer is None:
                 self._writer = threading.Thread(
                     target=self._drain,
@@ -393,7 +424,7 @@ class Store:
     def _open_reader(self) -> sqlite3.Connection:
         """The read connection, opened on first use. Callers hold `_reader_lock`."""
         if self._closed:
-            raise sqlite3.ProgrammingError(_CLOSED)
+            raise sqlite3.ProgrammingError(_FORKED if self._forked else _CLOSED)
         if self._reader is None:
             if not self._file:
                 raise ValueError(
@@ -1250,3 +1281,15 @@ class Store:
         conn.execute("DELETE FROM stories WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
 
+
+_STORES: "weakref.WeakSet[Store]" = weakref.WeakSet()
+"""Every `Store` constructed in this process, held weakly for the at-fork hook."""
+
+
+def _after_fork_in_child() -> None:
+    """Leave every `Store` the parent still had open inert in a forked child."""
+    for store in list(_STORES):
+        store._inherit_across_fork()
+
+
+os.register_at_fork(after_in_child=_after_fork_in_child)

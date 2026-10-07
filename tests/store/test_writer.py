@@ -6,19 +6,25 @@ connection behave.
 The rest of `Store`'s behaviour is tested in `tests/test_store.py`. The tests
 here import modules, read source files, or drive a `Store` on a real SQLite
 file under `tmp_path` with in-process threads; nothing spawns a process, so
-these are unit tests.
+these are unit tests. The one exception forks a real child to prove the
+at-fork hook, and is marked `e2e_fake`.
 """
 
 import ast
 import contextlib
+import gc
 import inspect
 import json
 import logging
+import os
 import re
+import signal
 import sqlite3
 import sys
 import threading
 import time
+import warnings
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2561,3 +2567,126 @@ def test_a_base_exception_from_the_claim_conflict_job_propagates(repo, monkeypat
             st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
     finally:
         st.close()
+
+
+# -- the at-fork hook ------------------------------------------------------------
+
+
+def test_every_store_is_tracked_weakly_for_the_fork_hook(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    assert st in store_writer._STORES
+    st.close()
+    gone = weakref.ref(st)
+    del st
+    gc.collect()
+
+    assert gone() is None
+
+
+def test_the_at_fork_hook_leaves_every_open_store_inert(repo, monkeypatch):
+    # Review Focus 5: `idle` never started its writer or opened its reader.
+    busy = store_writer.Store.open(repo, RUN_A)
+    idle = store_writer.Store.open(repo, RUN_B)
+    closed = store_writer.Store.open(repo, "run-2026-10-07-03")
+    closed.close()
+    busy.record_run(_run(repo))
+    assert busy.load_run(RUN_A) is not None
+    jobs, writer = busy._jobs, busy._writer
+    state_lock, reader_lock = busy._state_lock, busy._reader_lock
+    closed_jobs = closed._jobs
+    assert writer is not None and writer.is_alive()
+    monkeypatch.setattr(store_writer, "_STORES", weakref.WeakSet([busy, idle, closed]))
+    try:
+        store_writer._after_fork_in_child()
+
+        assert busy._jobs is not jobs
+        assert busy._writer is None
+        assert busy._state_lock is not state_lock
+        assert busy._reader_lock is not reader_lock
+        for st in (busy, idle):
+            began = time.monotonic()
+            with pytest.raises(sqlite3.ProgrammingError, match="inherited across a fork"):
+                st.record_run(_run(repo))
+            with pytest.raises(sqlite3.ProgrammingError, match="inherited across a fork"):
+                st.load_run(RUN_A)
+            st.close()
+            assert time.monotonic() - began < 1.0
+            # `close` touched neither connection.
+            assert tuple(st.connection.execute("SELECT 1").fetchone()) == (1,)
+        assert closed._jobs is closed_jobs
+        assert closed._forked is False
+    finally:
+        # In this process the old writer thread is real: stop it on its old queue.
+        jobs.put(None)
+        writer.join(timeout=5.0)
+        for st in (busy, idle):
+            st.connection.close()
+            if st._reader is not None:
+                st._reader.close()
+
+
+FORK_DEADLINE = 10.0
+"""Only bounds a child that hangs on the inherited store; a healthy one exits at once."""
+
+
+def _in_forked_child(inherited: store_writer.Store, repo: Path) -> int:
+    """What the child does with the parent's store, then with its own; 0 when all held."""
+    try:
+        inherited.record_run(_run(repo))
+    except sqlite3.ProgrammingError as error:
+        if "inherited across a fork" not in str(error):
+            return 3
+    else:
+        return 2
+    try:
+        inherited.load_run(RUN_A)
+    except sqlite3.ProgrammingError:
+        pass
+    else:
+        return 4
+    inherited.close()
+    own = store_writer.Store.open(repo, RUN_B)
+    try:
+        own.record_run(_run(repo).model_copy(update={"id": RUN_B}))
+    finally:
+        own.close()
+    return 0
+
+
+@pytest.mark.e2e_fake
+def test_a_forked_child_never_waits_on_the_parents_writer(repo):
+    parent = store_writer.Store.open(repo, RUN_A)
+    try:
+        # The writer thread is running, and the parent holds `_state_lock` at
+        # the moment of the fork: without the hook the child's first write
+        # would wait on that lock forever.
+        parent.record_run(_run(repo))
+        with warnings.catch_warnings():
+            # Python warns on any fork of a process that has threads.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with parent._state_lock:
+                pid = os.fork()
+                if pid == 0:
+                    code = 1
+                    try:
+                        code = _in_forked_child(parent, repo)
+                    finally:
+                        os._exit(code)
+        deadline = time.monotonic() + FORK_DEADLINE
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                break
+            if time.monotonic() >= deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail(f"the forked child {pid} did not exit within {FORK_DEADLINE}s")
+            time.sleep(0.01)
+
+        assert os.waitstatus_to_exitcode(status) == 0
+        parent.record_run(_run(repo).model_copy(update={"status": "done"}))
+        assert parent.load_run(RUN_A).status == "done"
+        child_run = parent.load_run(RUN_B)
+        assert child_run is not None and child_run.id == RUN_B
+    finally:
+        parent.close()
