@@ -43,6 +43,7 @@ from agent_manager import (
     detach,
     dispatch,
     locks,
+    migrate,
     models,
     orchestrate,
     paths,
@@ -3527,3 +3528,17 @@ def reset(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
+@app.command("migrate")
+def migrate_command(
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Merge the per-project databases and run journals an older `am` left
+    into `am.db`: once, refused while a run is live, legacy files untouched."""
+    try:
+        report = migrate.migrate(now=_utcnow())
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(asdict(report)), pretty=pretty))
