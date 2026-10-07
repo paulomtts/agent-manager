@@ -424,7 +424,9 @@ class Store:
             },
         )
 
-    def _write_story_row(self, conn: sqlite3.Connection, run_id: str, story: models.StoryRun) -> None:
+    def _write_story_row(
+        self, conn: sqlite3.Connection, run_id: str, story: models.StoryRun
+    ) -> None:
         conn.execute(
             """
             INSERT INTO stories (project_id, run_id, card_id, title, level, status,
@@ -478,7 +480,12 @@ class Store:
         )
 
     def _write_phase_row(
-        self, conn: sqlite3.Connection, run_id: str, story_id: str, card_id: str, phase: models.PhaseRun
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        story_id: str,
+        card_id: str,
+        phase: models.PhaseRun,
     ) -> None:
         conn.execute(
             """
@@ -764,8 +771,9 @@ class Store:
         `displaced` one. Then the first key another run of this project holds
         under a live lease raises `ClaimHeldError`. Only then are the lease (window open)
         and every claim upserted and committed. Any raise rolls all of it
-        back and leaves the bound token as it was. On success, after the commit and before any other job runs, the store is
-        bound to `token` and the journal re-reads its highest `seq`.
+        back and leaves the bound token as it was. On success, after the
+        commit and before any other job runs, the store is bound to `token`
+        and the journal re-reads its highest `seq`.
         """
         keys = tuple(claims)
 
