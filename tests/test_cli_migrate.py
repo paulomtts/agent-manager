@@ -244,3 +244,60 @@ def test_migrate_takes_no_repo_dir(repos):
     assert result.exit_code == 2, result.output
     assert not paths.db_path().exists()
     assert tree(paths.data_path()) == before
+
+
+def test_a_migration_refusal_is_handled():
+    assert migrate.MigrationRefusedError in cli.HANDLED
+
+
+def test_a_live_run_refuses_with_exit_3_and_commits_nothing(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), _live_rows("run-a", alpha))
+    before = tree(projects_dir())
+
+    result = _migrate()
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = _envelope(result)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRefusedError"
+    message = envelope["error"]["message"]
+    assert "live_run" in message
+    assert "run-a" in message
+    assert message.endswith("nothing has been migrated")
+    assert not paths.db_path().exists()
+    assert tree(projects_dir()) == before
+
+
+def test_a_bad_journal_line_refuses_with_exit_3_and_commits_nothing(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), _stale_rows("run-a", alpha))
+    good = [journal_line("run-a", 1, _ts(1)), journal_line("run-a", 2, _ts(2))]
+    path = write_journal(
+        "run-a", good[:1], tail="not json\n" + json.dumps(good[1], sort_keys=True) + "\n"
+    )
+    journal_bytes = path.read_bytes()
+
+    result = _migrate()
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = _envelope(result)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRefusedError"
+    message = envelope["error"]["message"]
+    assert "bad_journal_line" in message
+    assert f"{path}:2" in message
+    assert store_db.migration_marker(paths.db_path()) is None
+    assert path.read_bytes() == journal_bytes
+
+
+def test_a_refusal_under_pretty_is_an_indented_envelope(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), _live_rows("run-a", alpha))
+
+    result = _migrate("--pretty")
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert result.stdout.count("\n") > 1
+    assert '\n  "error": {\n' in result.stdout
+    assert json.loads(result.stdout)["error"]["type"] == "MigrationRefusedError"
