@@ -59,6 +59,12 @@ FAKE_IMPLEMENT_EDITS_MARKER = "fake-claude-implement-edits"
 A JSON file in the repo's git common dir mapping a branch to
 `{relative path: full file content}`: what that branch's implement writes."""
 
+FAKE_PKILL_MARKER = "fake-claude-pkill"
+"""Must equal `fake_claude.PKILL_MARKER`, which `test_fake_claude.py` pins.
+
+A JSON list of `pkill -f` patterns in the repo's git common dir: every
+implement runs them after its hold (card 4a3e0414)."""
+
 FAKE_RESOLVER_ENV = "FAKE_CLAUDE_RESOLVER"
 """Must equal `fake_claude.RESOLVER_ENV`, which `test_fake_claude.py` pins."""
 
@@ -599,6 +605,16 @@ def review_fail_marker(milestone_board) -> Path:
     worktree's tree and never in `git status`. The test writes it and removes it.
     """
     return milestone_board["root"] / ".git" / FAKE_REVIEW_FAIL_MARKER
+
+
+@pytest.fixture
+def pkill_marker(milestone_board) -> Path:
+    """Where the fake looks for the `pkill -f` patterns every implement runs.
+
+    The repo's git common dir, like `review_fail_marker`: in no worktree's tree
+    and never in `git status`. The test writes it as a JSON list.
+    """
+    return milestone_board["root"] / ".git" / FAKE_PKILL_MARKER
 
 
 @pytest.fixture
