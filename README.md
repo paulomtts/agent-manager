@@ -22,6 +22,7 @@ To work on agent-manager itself, clone the repository and run `uv sync`.
 - `git`
 - [`brd`](https://github.com/paulomtts/brd) — the board `am` drives
 - `claude` (Claude Code) on `PATH` — the only harness wired up today; Codex and Pi are planned
+- `bwrap` (bubblewrap) or `unshare` (util-linux), optional — `am run` starts every agent in a PID namespace of its own with one of them, so an agent cannot signal `am` (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)). Without either, runs go un-isolated with a warning.
 
 ## Usage
 
@@ -103,6 +104,35 @@ am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run
 - With `--story` it behaves as with `--milestone`: the same pre-flight refusals before anything starts (`StoryBlockedError` included), the same envelope, and the same `run.log` and `report.json`.
 - With `--board`, the command runs the board's whole pre-flight here: the argument checks, the board read, the cycle check, each milestone's prefix and base, and the up-front claim check. A refusal is the usual envelope with exit code 3, and nothing starts. Then the board run moves to the background process. The envelope's `data` has the keys `board`, `detached`, `pid`, `log`, `report` and `levels`, and no `run_id`: each milestone's run is created when that milestone starts, and `am runs` or `am watch --all` finds it. `log` is `<data dir>/boards/<stamp>-<digest>.log` and `report` is `<data dir>/boards/<stamp>-<digest>.report.json`, where `<digest>` is the repository's digest. Both are mode 0600. The report holds the envelope `am run --board` would have printed. A claim another run takes after the up-front check shows up there as an `escalated` milestone.
 - Later versions may add keys to these envelopes. Ignore keys you do not know.
+
+#### Isolating agents with `--isolation`
+
+```bash
+am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run pytest" --isolation bwrap
+```
+
+An agent that stops a stuck test with `pkill -f pytest`, `killall python` or `kill -9 -1` can hit `am` itself and end the whole run. `--isolation` starts every agent in a PID namespace of its own, where it sees and can signal only its own process tree. It takes `auto` (the default), `bwrap`, `unshare` or `none`, and works with every form of `am run`: `--card`, `--milestone`, `--story` and `--board`, with or without `--detach`. It is ignored with `--dry-run`: a preview launches nothing and probes nothing.
+
+The mode is decided once, right after the argument checks and before the board is read, the run is recorded, its lease is taken or anything is forked:
+
+- `none`: agents run un-isolated. Nothing is probed and there is no warning.
+- `bwrap` or `unshare`: only that mode is probed, and there is no fallback. When it cannot start, the run is refused with `IsolationUnavailableError`, as `{"ok": false, "error": {"type": "IsolationUnavailableError", "message"}}`, and exit code 3, before anything is written: no run row, no run directory, no lease and no claim. The message is `isolation <mode> is unavailable: <reason> — pass --isolation none to run without it`. `<reason>` starts with the exact command the probe ran and ends with what went wrong (`exited 1`, `timed out after 10s`, or `could not start: ...`), so you can run that command by hand to see why.
+- `auto`: `bwrap` if it starts, else `unshare` (still isolated, no warning), else the run goes on un-isolated with the warning `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`. `auto` never refuses.
+
+A probe runs the mode's command on `true`, with a 10-second timeout, at most once per process for each mode.
+
+What each mode changes:
+
+- `bwrap` starts each agent under `bwrap --bind / / --dev-bind /dev /dev --proc /proc --unshare-pid --die-with-parent --new-session`. The whole filesystem stays bound read-write, so the worktree, `~/.claude`, caches and tools are exactly what they are un-isolated, and the network is untouched: `bwrap` here is not a filesystem or network sandbox. Only the PID namespace is new (`--unshare-pid`), with a fresh `/proc`, so inside it `ps` and `pkill -f` see only the agent's own process tree.
+- `unshare` starts each agent under `unshare --user --map-root-user --pid --fork --mount-proc`: a new user namespace and a new PID namespace. The user namespace is what lets an unprivileged user create the PID namespace, and it maps you to uid 0 inside, so file ownership looks different from inside the agent: your own files show as owned by `root`.
+
+Where you see which mode a run got:
+
+- The run records its mode as `config.launcher` (`direct` when un-isolated, else `bwrap` or `unshare`) and the `auto` warning as `config.isolation_warning` (`null` when there is none), for example in the journal head line's `payload.config`.
+- The warning is appended once to the envelope's `data.warnings`, at the top level (on `--board`, never inside a milestone's entry). With `--detach` it is in the hand-off envelope.
+- `am status <run-id>` always has a `warnings` key: `[]`, or a list holding the run's recorded isolation warning, so a detached run whose envelope is gone still says it is un-isolated.
+
+Every agent's brief also carries a "Process safety" block telling it never to use `pkill -f`, `pkill` by name, `killall`, `kill -1` or `kill` with a pattern, and to stop a stuck test with `timeout` or by a PID it recorded. That is advice an agent can ignore; isolation is the guarantee. `am resume` restores the mode a run recorded (see [Relaunching resumes](#relaunching-resumes)).
 
 #### Preview with `--dry-run`
 

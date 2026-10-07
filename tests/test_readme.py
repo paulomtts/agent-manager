@@ -12,7 +12,20 @@ import re
 import typing
 from pathlib import Path
 
-from agent_manager import cli, detach, errors, models, orchestrate, runs, store
+import typer
+
+from agent_manager import (
+    argv_guard,
+    cli,
+    detach,
+    errors,
+    models,
+    orchestrate,
+    prompt,
+    runs,
+    store,
+)
+from agent_manager.harness import launcher
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
@@ -24,6 +37,8 @@ STORY_SHAPE = (
     " [--verify CMD ...] [--allow-no-verification] [--dry-run] [--detach]"
     " [--repo-dir D]`."
 )
+ISOLATION_TITLE = "Isolating agents with `--isolation`"
+ARGV_TITLE = "Verification commands stay out of `ps`"
 
 
 def _lines() -> list[str]:
@@ -77,6 +92,20 @@ def _fenced_json_lines(section: str) -> list[tuple[str, dict]]:
         if fenced and line.startswith("{"):
             found.append((line, json.loads(line)))
     return found
+
+
+def _assert_anchors_resolve(text: str) -> list[str]:
+    """Every `](#anchor)` in `text`, each asserted to be some heading's slug."""
+    anchors = re.findall(r"\]\(#([^)]+)\)", text)
+    slugs = {_slug(title) for _, _, title in _headings()}
+    assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
+    return anchors
+
+
+def _command_param(command: str, name: str):
+    """The Click parameter `name` of the `am` subcommand `command`, introspected in-process."""
+    group = typer.main.get_command(cli.app)
+    return next(param for param in group.commands[command].params if param.name == name)
 
 
 def _usage_paragraph() -> str:
@@ -483,3 +512,97 @@ def test_readme_spells_canceled_outside_legacy_sites():
         assert "`cancelled`" in line, line
         assert any(marker in line for marker in legacy_markers), line
     assert "already_cancelled" not in README.read_text(encoding="utf-8")
+
+
+def test_requires_names_bwrap_and_unshare():
+    section = _section("Requires")
+    assert "`bwrap`" in section
+    assert "`unshare`" in section
+    assert "un-isolated with a warning" in section
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(section)
+
+
+def test_isolation_section_names_every_mode():
+    section = _section(ISOLATION_TITLE)
+    values = typing.get_args(launcher.IsolationRequest)
+    for value in values:
+        assert f"`{value}`" in section, value
+    assert "`auto` (the default)" in section
+    for form in ("`--card`", "`--milestone`", "`--story`", "`--board`", "`--detach`"):
+        assert form in section, form
+    assert "It is ignored with `--dry-run`" in section
+    assert "am run --milestone" in section and "--isolation bwrap" in section
+
+    option = _command_param("run", "isolation")
+    assert option.default == "auto"
+    assert list(option.type.choices) == list(values)
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert (
+        titles.index("Running detached with `--detach`")
+        < titles.index(ISOLATION_TITLE)
+        < titles.index("Preview with `--dry-run`")
+    )
+    position = titles.index(ISOLATION_TITLE)
+    assert heads[position][1] == 4
+    parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
+    assert parent[1:] == (3, "Milestone runs")
+    assert _slug(ISOLATION_TITLE) == "isolating-agents-with---isolation"
+
+
+def test_isolation_section_quotes_the_warning_and_refusal():
+    section = _section(ISOLATION_TITLE)
+    tail = "pass --isolation none to run without it"
+    assert tail in str(errors.IsolationUnavailableError("bwrap", "x"))
+    assert launcher.ISOLATION_NONE_WARNING in section
+    assert f"`{errors.IsolationUnavailableError.__name__}`" in section
+    assert "exit code 3" in section
+    assert "before anything is written" in section
+    assert f"isolation <mode> is unavailable: <reason> — {tail}" in section
+    assert "starts with the exact command the probe ran" in section
+    assert f"timed out after {launcher.PROBE_TIMEOUT:g}s" in section
+    assert f"{launcher.PROBE_TIMEOUT:g}-second timeout" in section
+    assert "at most once per process" in section
+    assert "`auto` never refuses" in section
+    assert "there is no fallback" in section
+
+
+def test_isolation_section_names_where_the_mode_is_recorded():
+    section = _section(ISOLATION_TITLE)
+    assert {"launcher", "isolation_warning"} <= set(models.RunConfig.model_fields)
+    assert {"direct", "bwrap", "unshare"} <= set(typing.get_args(models.Launcher))
+    for phrase in (
+        "`config.launcher`",
+        "`config.isolation_warning`",
+        "`direct`",
+        "`payload.config`",
+        "`data.warnings`",
+        "`am status <run-id>` always has a `warnings` key",
+    ):
+        assert phrase in section, phrase
+
+
+def test_isolation_section_describes_each_mode():
+    section = _section(ISOLATION_TITLE)
+    bwrap = launcher.wrap_argv("bwrap", ["true"], Path("/"))
+    unshare = launcher.wrap_argv("unshare", ["true"], Path("/"))
+    assert "--unshare-pid" in bwrap
+    assert "--map-root-user" in unshare
+    # The full prefixes, quoted, so the docs cannot outlive a flag.
+    assert f"`{' '.join(bwrap[:-1])}`" in section
+    assert f"`{' '.join(unshare[:-1])}`" in section
+    assert "PID namespace" in section
+    assert "uid 0" in section
+    assert "read-write" in section
+    assert "the network is untouched" in section
+    assert "not a filesystem or network sandbox" in section
+
+    assert prompt.PROCESS_SAFETY_BLOCK.startswith("## Process safety")
+    assert '"Process safety" block' in section
+    for command in ("`pkill -f`", "`killall`", "`kill -1`"):
+        assert command in prompt.PROCESS_SAFETY_BLOCK
+        assert command in section, command
+    assert "isolation is the guarantee" in section
+    assert "advice" in section
+    _assert_anchors_resolve(section)
