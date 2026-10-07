@@ -237,36 +237,33 @@ def is_plan_hash(value: object) -> bool:
     return isinstance(value, str) and _PLAN_HASH.fullmatch(value) is not None
 
 
-# Implement writes the trailers; Review recomputes the hash from the plan file
-# independently, which is deliberate — Review is the ground truth a FUTURE run
-# will reproduce, so it must never just echo what Implement claimed. Comparing
-# the two costs no command and catches the one thing neither stage can see on
-# its own: the plan file changing mid-run (ticked checkboxes are the usual
-# culprit), which silently invalidates every trailer already written.
-def plan_hash_mismatch(impl_hash: object, review_hash: object) -> str | None:
-    """The drift diagnosis, or ``None`` when there is nothing trustworthy to say."""
-    if not is_plan_hash(impl_hash) or not is_plan_hash(review_hash):
+# The hash `docs_commit` recorded is the single source of truth: Implement
+# stamps it, Review is handed it and counts trailers against it. The live plan
+# file is NOT re-hashed, because an agent may append to it after the trailers
+# are written (the file is often git-ignored), which would make a recomputed
+# hash disagree with every correct commit. A reviewer that still reports a
+# different hash is wrong about its own report, not about the branch, so this
+# is a warning and never a stop.
+def plan_hash_mismatch(recorded: object, reported: object) -> str | None:
+    """The warning text, or ``None`` when there is nothing trustworthy to say."""
+    if not is_plan_hash(recorded) or not is_plan_hash(reported):
         return None
-    if impl_hash == review_hash:
+    if recorded == reported:
         return None
     return (
-        f"plan hash CHANGED mid-run: implement committed trailers as {impl_hash}, "
-        f"review recomputed {review_hash} from the same plan file. "
-        "The plan's bytes were modified after implementation, so every trailer on "
-        "this branch is now stale and a future resume would hard-reset the work. "
-        "The Plan-Hash gate below will stop the run; this is why."
+        f"review reported plan_hash {reported}, but docs_commit recorded "
+        f"{recorded}; the recorded value is authoritative and the report is "
+        "ignored (the plan file may have changed after its trailers were written)."
     )
 
 
-def plan_hash_gate(impl_hash: object, review_hash: object) -> dict[str, str] | None:
-    """Verdict form of :func:`plan_hash_mismatch`, for the card's singular name.
+def plan_hash_gate(recorded: object, reported: object) -> dict[str, str] | None:
+    """``{"warn": ...}`` when the reported hash differs from the recorded one, else ``None``.
 
-    Carries no ``blocked`` key on purpose: in `task.js` the drift is *logged*
-    as a diagnosis (line 833) and the stop itself comes from
-    :func:`review_gate`'s untagged-commit branch.
+    Never blocks: the stop on missing trailers is :func:`review_gate`'s.
     """
-    detail = plan_hash_mismatch(impl_hash, review_hash)
-    return None if detail is None else {"detail": detail}
+    detail = plan_hash_mismatch(recorded, reported)
+    return None if detail is None else {"warn": detail}
 
 
 def exploration_output_gate(
@@ -445,25 +442,16 @@ def _plan_hash_of(result: object) -> object:
 
 
 def plan_hash_gate_adapter(
-    implement: object = None, review: object = None
+    docs_commit: object = None, review: object = None
 ) -> dict[str, str] | None:
-    """`reducers.plan_hash_gate` bound to the two phase results it compares.
+    """`reducers.plan_hash_gate` bound to the recorded hash and the review result.
 
-    The document names this gate on the `review` phase, and
-    `walk.bind_arguments` binds strictly by parameter name out of a table of
-    whole values -- nothing in that table is called `impl_hash` or
-    `review_hash`, and a step's declared `args` hold literals, so neither could be
-    written there either. This adapter takes the two names the table *does*
-    hold, the phase names `implement` and `review`, and does the one field
-    lookup the binder cannot do for itself. The reducer keeps its signature and
-    its tests; nothing about the comparison moves.
+    `walk.bind_arguments` binds whole values by parameter name only, so this
+    takes the two phase names the table holds and does the one field lookup the
+    binder cannot. Module-level, not a closure: `TASK`'s digest names it by
+    `module.qualname`.
 
-    A module-level function rather than a closure: `TASK`'s digest names it by
-    `module.qualname`, and one function object is what every workflow gating
-    on it shares.
-
-    Both parameters default to `None` so a run where `implement` never executed
-    in this process (a `plan_check` skip, or a resume started later) still binds
-    and passes, rather than failing to bind and reading as a document bug.
+    Both parameters default to `None` so a run where `docs_commit` did not
+    execute in this process still binds and passes.
     """
-    return plan_hash_gate(_plan_hash_of(implement), _plan_hash_of(review))
+    return plan_hash_gate(_plan_hash_of(docs_commit), _plan_hash_of(review))

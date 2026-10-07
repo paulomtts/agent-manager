@@ -105,7 +105,7 @@ TASK = Workflow("task", (
     AgentPhase(
         "review",
         role="reviewer",
-        inputs=("branch", "base_branch", "plan_path"),
+        inputs=("branch", "base_branch", "plan_path", "plan_hash"),
         result=results.ReviewResult,
         gates=(
             reducers.review_blockers_gate,

@@ -18,7 +18,7 @@ def test_reviewer_brief_carries_the_task_js_contract():
         'grep -c "^Plan-Hash: $PLAN_HASH"',
         "Co-Authored-By:",
         "Plan-Hash: $PLAN_HASH",
-        "sha256sum",
+        "## plan_hash",
         "unresolved_blockers",
         "Never weaken, skip, xfail, or delete a test",
         "report their output verbatim",
@@ -30,7 +30,7 @@ def test_reviewer_brief_carries_the_task_js_contract():
 THREE_COMMANDS = (
     "git status --porcelain",
     "git rev-list --count <base>..HEAD",
-    'PLAN_HASH=$(sha256sum "<plan>" | cut -c1-8); '
+    'PLAN_HASH=<hash>; '
     'git log <base>..HEAD --format=%B | grep -c "^Plan-Hash: $PLAN_HASH"',
 )
 
@@ -55,7 +55,8 @@ def test_reviewer_brief_uses_agent_managers_inputs_and_result_fields():
         "base_branch",
         "plan_path",
         "git diff <base>...HEAD",
-        'PLAN_HASH=$(sha256sum "<plan>" | cut -c1-8)',
+        "PLAN_HASH=<hash>",
+        "Never hash the plan file yourself",
         "Co-Authored-By: Claude <noreply@anthropic.com>",
         *(f"`{field}`" for field in RESULT_FIELDS),
     ):
@@ -91,3 +92,13 @@ def test_reviewer_policy_adds_edit_and_write_and_changes_nothing_else():
     assert policy.max_attempts == 1
     assert policy.required_capabilities == []
     assert policy.default_model == {"claude": "opus"}
+
+
+def test_reviewer_is_never_told_to_hash_the_live_plan_file():
+    assert "sha256sum" not in load_role("reviewer").system
+
+
+def test_coder_is_told_never_to_edit_the_plan_file():
+    text = load_role("coder").system
+    assert "## Never edit the plan file" in text
+    assert "result JSON" in text
