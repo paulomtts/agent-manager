@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from agent_manager import models, paths, store
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
@@ -209,7 +210,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
 
 def _record_story_whose_row_write_fails(st: store_writer.Store) -> None:
     """`record_story` as the writer runs it when SQLite fails the row write: the
-    journal line is appended, then the row write raises and nothing commits."""
+    event is inserted, then the row write raises and nothing commits."""
 
     def failing_row_write(*args):
         raise sqlite3.OperationalError("disk I/O error")
@@ -219,23 +220,34 @@ def _record_story_whose_row_write_fails(st: store_writer.Store) -> None:
         st.record_story(_story())
 
 
-def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
-    # §9 line 365: the journal is appended first, so the line must survive a
-    # failed row write.
+def _journal_a_story_whose_row_never_landed(st: store_writer.Store) -> None:
+    """A `story_upsert` line in the journal file with neither a row nor an
+    event behind it. No `record_*` may follow it on this run: the next one
+    would take its `seq` from the events table and repeat this line's."""
+    story = _story()
+    st.journal.append(
+        "story_upsert", story.model_dump(mode="json", exclude={"subtasks"}), story=story.card_id
+    )
+
+
+def test_a_failed_sqlite_write_leaves_neither_line_nor_event(repo):
+    # The event and the row are one transaction, and the file line is mirrored
+    # only after its commit, so a failed row write leaves none of the three.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     _record_story_whose_row_write_fails(st)
     st.close()
 
     lines = store_journal.Journal(RUN_ID).read()
-    assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
-    assert lines[1].story == "8831189b"
+    assert [line.event for line in lines] == ["run_upsert"]
 
     reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         assert reopened.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+        events = store_events.read(reopened.connection, run_id=RUN_ID)
     finally:
         reopened.close()
+    assert [event.kind for event in events] == ["run_upsert"]
 
 
 def test_recording_a_node_again_updates_it_without_duplicating_or_reordering(repo):
@@ -488,11 +500,11 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
 
 
 def test_rebuild_picks_up_a_journal_line_whose_row_never_landed(repo):
-    # The other half of the ordering guarantee: the row the failed SQLite write
-    # never produced is materialised by the rebuild.
+    # The rebuild materialises a row the journal file records and the
+    # projection lacks.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
-    _record_story_whose_row_write_fails(st)
+    _journal_a_story_whose_row_never_landed(st)
     st.close()
 
     reopened = store_writer.Store.open(repo, RUN_ID)
@@ -1915,19 +1927,29 @@ class _SpyingConnection:
         return getattr(self._real, name)
 
 
-def test_every_record_appends_and_writes_its_row_on_the_writer_thread(repo, monkeypatch):
-    # P2: the journal append and the row write are one job, so journal order
-    # equals row order. Checked at the moment each happens.
+def test_every_record_inserts_its_event_writes_its_row_then_mirrors_on_the_writer_thread(
+    repo, monkeypatch
+):
+    # The event and the row are written in one job; the file line follows the
+    # commit, on the same thread, before the next job.
     st = store_writer.Store.open(repo, RUN_ID)
     seen: list[tuple[str, bool]] = []
 
-    real_append = st.journal.append
+    real_insert = store_events.insert
 
-    def spying_append(*args, **kwargs):
-        seen.append(("journal", _on_the_writer()))
-        return real_append(*args, **kwargs)
+    def spying_insert(*args, **kwargs):
+        seen.append(("event", _on_the_writer()))
+        return real_insert(*args, **kwargs)
 
-    monkeypatch.setattr(st.journal, "append", spying_append)
+    monkeypatch.setattr(store_events, "insert", spying_insert)
+
+    real_mirror = st.journal.mirror
+
+    def spying_mirror(*args, **kwargs):
+        seen.append(("mirror", _on_the_writer()))
+        return real_mirror(*args, **kwargs)
+
+    monkeypatch.setattr(st.journal, "mirror", spying_mirror)
 
     for writer in (
         "_write_run_row",
@@ -1956,16 +1978,21 @@ def test_every_record_appends_and_writes_its_row_on_the_writer_thread(repo, monk
         st.close()
 
     assert seen == [
-        ("journal", True),
+        ("event", True),
         ("_write_run_row", True),
-        ("journal", True),
+        ("mirror", True),
+        ("event", True),
         ("_write_story_row", True),
-        ("journal", True),
+        ("mirror", True),
+        ("event", True),
         ("_write_subtask_row", True),
-        ("journal", True),
+        ("mirror", True),
+        ("event", True),
         ("_write_phase_row", True),
-        ("journal", True),
+        ("mirror", True),
+        ("event", True),
         ("_write_attempt_row", True),
+        ("mirror", True),
     ]
 
 
@@ -2040,10 +2067,8 @@ def test_close_closes_the_connection_after_the_writer_has_stopped(repo):
     assert alive_at_close == [False]
 
 
-def test_a_failed_row_write_keeps_its_journal_line_and_the_writer_serves_on(
-    repo, monkeypatch
-):
-    # §9: the journal line survives the failed row write, and the writer runs
+def test_a_failed_row_write_leaves_no_line_and_the_writer_serves_on(repo, monkeypatch):
+    # The failed record leaves no line and spends no `seq`; the writer runs
     # the next record as usual.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -2062,7 +2087,8 @@ def test_a_failed_row_write_keeps_its_journal_line_and_the_writer_serves_on(
         st.close()
 
     lines = store_journal.Journal(RUN_ID).read()
-    assert [line.event for line in lines] == ["run_upsert", "story_upsert", "subtask_upsert"]
+    assert [line.event for line in lines] == ["run_upsert", "subtask_upsert"]
+    assert [line.seq for line in lines] == [1, 2]
 
 
 def test_a_record_on_a_closed_store_raises_and_appends_nothing(repo):
@@ -2075,29 +2101,6 @@ def test_a_record_on_a_closed_store_raises_and_appends_nothing(repo):
 
     lines = store_journal.Journal(RUN_ID).read()
     assert [line.event for line in lines] == ["run_upsert"]
-
-
-def test_a_failed_journal_append_writes_no_row_and_the_writer_serves_on(
-    repo, monkeypatch
-):
-    # Review Focus 1: the journal is written first, so when it fails there is
-    # no row, the same exception propagates, and the lock is free.
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        st.record_run(_run(repo))
-
-        def failing_append(*args, **kwargs):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(st.journal, "append", failing_append)
-
-        with pytest.raises(OSError, match="disk full"):
-            st.record_story(_story())
-
-        assert _writer_serves(st)
-        assert st.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
-    finally:
-        st.close()
 
 
 def test_a_refused_record_run_leaves_the_writer_serving(repo):
@@ -5296,8 +5299,10 @@ def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
     assert [story.card_id for story in after.stories] == ["8831189b"]
 
 
-def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
-    # Review Focus 5: `Store.open` builds the journal from `last_seq`.
+def test_a_resumed_store_numbers_its_next_record_from_the_events_table(repo):
+    # The next `seq` is the run's `MAX(run_seq) + 1` in the events table, read
+    # inside the writing transaction: a line in the file that no event holds
+    # does not move it.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
@@ -5308,11 +5313,13 @@ def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
     reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
+        events = store_events.read(reopened.connection, run_id=RUN_ID)
     finally:
         reopened.close()
 
-    assert line.seq == 3
-    assert [line.seq for line in store_journal.Journal(RUN_ID).read()] == [1, 3]
+    assert line.seq == 2
+    assert [event.run_seq for event in events] == [1, 2]
+    assert [line.seq for line in store_journal.Journal(RUN_ID).read()] == [1, 2]
 
 
 # -- board comment outbox ----------------------------------------------------------
@@ -5962,11 +5969,10 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
 
 
 def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
-    # The setup of test_rebuild_picks_up_a_journal_line_whose_row_never_landed:
-    # the journal line is appended, the row write fails.
+    # A story line in the journal file with no row behind it.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
-    _record_story_whose_row_write_fails(st)
+    _journal_a_story_whose_row_never_landed(st)
     st.close()
 
     assert _diverging_now(repo) == [

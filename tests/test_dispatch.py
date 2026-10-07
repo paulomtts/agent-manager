@@ -1586,10 +1586,11 @@ def test_a_context_with_no_worktree_is_a_named_engine_error(store, tmp_path, wor
     assert launcher.calls == []
 
 
-def test_the_journal_holds_the_edge_even_when_the_row_write_fails(
+def test_a_failed_attempt_row_write_leaves_neither_line_nor_row(
     data_home, tmp_path, worktree
 ):
-    # Spec test 16 (§9 line 365: journal first, row second, journal is truth).
+    # The attempt's event and row are one transaction and its file line is
+    # mirrored only after the commit, so a failed row write leaves none of them.
     class ExplodingStore(store_writer.Store):
         def _write_attempt_row(self, *args, **kwargs):
             raise RuntimeError("the projection is on fire")
@@ -1603,7 +1604,7 @@ def test_the_journal_holds_the_edge_even_when_the_row_write_fails(
         with pytest.raises(RuntimeError, match="the projection is on fire"):
             runner(workflow.phase("explore"), _context(worktree), _rendered())
 
-        assert _attempt_statuses(opened) == [(1, "started")]
+        assert _attempt_statuses(opened) == []
         assert opened.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
     finally:
         opened.close()

@@ -1,13 +1,14 @@
-"""`Store`: every write to a run's journal and its SQLite projection, as a job
-on one writer thread that drains a FIFO queue, under the lease fence. A job
-runs in a `BEGIN IMMEDIATE` transaction of its own, except that jobs which may
-batch and wait in the queue together share one transaction, each inside a
-savepoint of its own. Reads run on a separate read connection. The journal
-line is appended before the row it describes, so the journal is the truth the
-projection is rebuilt from.
+"""`Store`: every write to a run's SQLite projection, as a job on one writer
+thread that drains a FIFO queue, under the lease fence. A job runs in a
+`BEGIN IMMEDIATE` transaction of its own, except that jobs which may batch and
+wait in the queue together share one transaction, each inside a savepoint of
+its own. Reads run on a separate read connection. A `record_*` writes an event
+and the row it explains in one transaction; after the commit the event is
+mirrored to the run's journal file, best-effort.
 """
 
 import json
+import logging
 import queue
 import sqlite3
 import threading
@@ -21,6 +22,7 @@ from typing import Any, TypeVar
 from agent_manager import models
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
@@ -31,6 +33,26 @@ from agent_manager.store import replay as store_replay
 
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
+
+
+_log = logging.getLogger(__name__)
+
+
+def _line_from_event(event: store_events.EventRow) -> store_journal.JournalLine:
+    """The journal line `event` is mirrored to: its `run_seq` is the line's
+    `seq` and its `kind` the line's `event`; `ts`, coordinates and payload are
+    the event's own, unchanged."""
+    return store_journal.JournalLine(
+        seq=event.run_seq,
+        ts=event.ts,
+        run_id=event.run_id,
+        event=event.kind,
+        story=event.story_id,
+        card=event.card_id,
+        phase=event.phase,
+        attempt=event.attempt,
+        payload=event.payload,
+    )
 
 
 T = TypeVar("T")
@@ -74,17 +96,19 @@ def _main_file(conn: sqlite3.Connection) -> str:
 
 
 class Store:
-    """The two stores of D5, bound together by the write ordering of §9.
+    """A run's projection rows and the events that explain them, with the run's
+    journal file kept as their mirror.
 
-    Every `record_*` appends the journal line first and writes the row second.
-    There is deliberately no public method that writes a tree row on its own.
-    The exceptions are `checkpoints` (pygents spec §6), `checkpoint_floors`
-    (exactly-once 1.1), `run_controls` and `run_leases` (live control C1/C2),
-    `run_claims` (multi-process X5) and `board_comments` (board-comments B6):
-    the six row-only tables, which have no journal and are the projection's
-    alone. Every row this store writes carries its `project_id`.
-    Their methods write rows and never touch the journal, and
-    `rebuild_from_journal` leaves those rows alone.
+    Every `record_*` inserts an `events` row and writes the row it explains in
+    one transaction, then mirrors the event to the journal file after the
+    commit. There is deliberately no public method that writes a tree row on
+    its own. The exceptions are `checkpoints` (pygents spec §6),
+    `checkpoint_floors` (exactly-once 1.1), `run_controls` and `run_leases`
+    (live control C1/C2), `run_claims` (multi-process X5) and
+    `board_comments` (board-comments B6): the six row-only tables, which have
+    no journal and are the projection's alone. Every row this store writes
+    carries its `project_id`. Their methods write rows and never touch the
+    journal, and `rebuild_from_journal` leaves those rows alone.
 
     The threads of the process holding a run's lease share one `Store`. Every
     write is one job on the store's single writer thread, run in the order it
@@ -94,8 +118,8 @@ class Store:
     each inside a savepoint of its own, so one that raises fails only its own
     caller; every other write has a transaction of its own. The calling
     thread blocks until its job's transaction has committed or given up and
-    gets the job's result or exception. A `record_*` job
-    appends the journal line and writes the row, so journal order equals row
+    gets the job's result or exception. A `record_*` job mirrors its line
+    before the next job starts, so the file lists a store's lines in `run_seq`
     order. Once `take_lease` or `adopt_lease` has bound a token, every run
     write first checks, inside its transaction, that the token still holds the
     lease (multi-process X4). Reads run on the calling thread, on a separate
@@ -127,8 +151,8 @@ class Store:
 
         The row is resolved, or created on first sight, and committed before
         the store exists, so every run of one project shares one id. The
-        wall clock is read here for the row's `created_at`, as
-        `Journal.append` reads it for a line's time.
+        wall clock is read here for the row's `created_at`, as a `record_*`
+        reads it for its event's `ts`.
         """
         conn = store_db.open_db(root)
         try:
@@ -383,34 +407,67 @@ class Store:
 
     # -- recording ---------------------------------------------------------
     #
-    # Each method is one fenced job: the journal line is appended first and
-    # the row written second (§9), in one transaction, with no other write
-    # able to land in between. A store whose lease was lost raises
-    # `LeaseLostError` before appending. If the row write raises, the line
-    # stays on disk and the exception propagates unchanged. Until the journal
-    # append moves after the commit, a busy re-run of the job reuses the line
-    # its first attempt appended instead of appending a second one.
+    # Each method is one fenced job: the event is inserted and the row it
+    # explains written in one transaction, the event numbered one past the
+    # run's highest `run_seq` inside it. A store whose lease was lost raises
+    # `LeaseLostError` before inserting. If the row write raises, the
+    # exception propagates unchanged and neither the event nor the row is
+    # committed, so no `run_seq` is spent. After the commit the event is
+    # mirrored to the journal file (`_mirror`).
 
-    def _append_once(
+    def _record(
         self,
-        held: list[store_journal.JournalLine],
-        event: store_journal.EventKind,
+        operation: str,
+        kind: store_journal.EventKind,
         payload: dict,
-        **coordinates: str | int | None,
+        write_row: Callable[[sqlite3.Connection], None],
+        *,
+        story_id: str | None = None,
+        card_id: str | None = None,
+        phase: str | None = None,
+        attempt: int | None = None,
     ) -> store_journal.JournalLine:
-        """The line `held` kept from an earlier attempt of this call, or a new one.
+        """Insert `kind`'s event, run `write_row`, commit, then mirror the line.
 
-        `held` belongs to one call of a `record_*` method and outlives its
-        attempts, so the journal gets at most one line per call.
+        The event's `ts` is the wall clock read inside the job. A busy re-run
+        starts the job over, and only the committed attempt's line is
+        mirrored. Returns the line the committed event mirrors to, whether or
+        not the mirror reached the file.
         """
-        if not held:
-            held.append(self._journal.append(event, payload, **coordinates))
-        return held[0]
-
-    def record_run(self, run: models.Run) -> store_journal.JournalLine:
-        held: list[store_journal.JournalLine] = []
+        committed: list[store_journal.JournalLine] = []
 
         def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
+            event = store_events.insert(
+                conn,
+                project_id=self._project_id,
+                run_id=self.run_id,
+                ts=store_journal.ts_text(datetime.now(timezone.utc)),
+                kind=kind,
+                payload=payload,
+                source="live",
+                story_id=story_id,
+                card_id=card_id,
+                phase=phase,
+                attempt=attempt,
+            )
+            write_row(conn)
+            committed[:] = [_line_from_event(event)]
+            return committed[0]
+
+        return self._submit(
+            job,
+            operation=operation,
+            fenced=True,
+            after_commit=lambda: self._mirror(committed[0]),
+        )
+
+    def _mirror(self, line: store_journal.JournalLine) -> None:
+        """Append `line` to the run's journal file: the `after_commit` of every
+        `record_*`, run once its event and row are committed."""
+        self._journal.mirror(line)
+
+    def record_run(self, run: models.Run) -> store_journal.JournalLine:
+        def write_row(conn: sqlite3.Connection) -> None:
             if run.id != self.run_id:
                 raise ValueError(
                     f"store is bound to run {self.run_id!r} but was handed run"
@@ -418,83 +475,62 @@ class Store:
                     " journal payload keeps the model's, so the two stores would"
                     " disagree about which run this is"
                 )
-            line = self._append_once(
-                held, "run_upsert", run.model_dump(mode="json", exclude={"stories"})
-            )
             self._write_run_row(conn, self.run_id, run)
-            return line
 
-        return self._submit(job, operation="record_run", fenced=True)
+        return self._record(
+            "record_run",
+            "run_upsert",
+            run.model_dump(mode="json", exclude={"stories"}),
+            write_row,
+        )
 
     def record_story(self, story: models.StoryRun) -> store_journal.JournalLine:
-        held: list[store_journal.JournalLine] = []
-
-        def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
-            line = self._append_once(
-                held,
-                "story_upsert",
-                story.model_dump(mode="json", exclude={"subtasks"}),
-                story=story.card_id,
-            )
-            self._write_story_row(conn, self.run_id, story)
-            return line
-
-        return self._submit(job, operation="record_story", fenced=True)
+        return self._record(
+            "record_story",
+            "story_upsert",
+            story.model_dump(mode="json", exclude={"subtasks"}),
+            lambda conn: self._write_story_row(conn, self.run_id, story),
+            story_id=story.card_id,
+        )
 
     def record_subtask(self, story_id: str, subtask: models.SubtaskRun) -> store_journal.JournalLine:
-        held: list[store_journal.JournalLine] = []
-
-        def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
-            line = self._append_once(
-                held,
-                "subtask_upsert",
-                subtask.model_dump(mode="json", exclude={"phases"}),
-                story=story_id,
-                card=subtask.card_id,
-            )
-            self._write_subtask_row(conn, self.run_id, story_id, subtask)
-            return line
-
-        return self._submit(job, operation="record_subtask", fenced=True)
+        return self._record(
+            "record_subtask",
+            "subtask_upsert",
+            subtask.model_dump(mode="json", exclude={"phases"}),
+            lambda conn: self._write_subtask_row(conn, self.run_id, story_id, subtask),
+            story_id=story_id,
+            card_id=subtask.card_id,
+        )
 
     def record_phase(
         self, story_id: str, card_id: str, phase: models.PhaseRun
     ) -> store_journal.JournalLine:
-        held: list[store_journal.JournalLine] = []
-
-        def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
-            line = self._append_once(
-                held,
-                "phase_upsert",
-                phase.model_dump(mode="json", exclude={"attempts"}),
-                story=story_id,
-                card=card_id,
-                phase=phase.name,
-            )
-            self._write_phase_row(conn, self.run_id, story_id, card_id, phase)
-            return line
-
-        return self._submit(job, operation="record_phase", fenced=True)
+        return self._record(
+            "record_phase",
+            "phase_upsert",
+            phase.model_dump(mode="json", exclude={"attempts"}),
+            lambda conn: self._write_phase_row(conn, self.run_id, story_id, card_id, phase),
+            story_id=story_id,
+            card_id=card_id,
+            phase=phase.name,
+        )
 
     def record_attempt(
         self, story_id: str, card_id: str, phase_name: str, attempt: models.Attempt
     ) -> store_journal.JournalLine:
-        held: list[store_journal.JournalLine] = []
-
-        def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
-            line = self._append_once(
-                held,
-                "attempt_upsert",
-                attempt.model_dump(mode="json"),
-                story=story_id,
-                card=card_id,
-                phase=phase_name,
-                attempt=attempt.n,
-            )
-            self._write_attempt_row(conn, self.run_id, story_id, card_id, phase_name, attempt)
-            return line
-
-        return self._submit(job, operation="record_attempt", fenced=True)
+        return self._record(
+            "record_attempt",
+            "attempt_upsert",
+            attempt.model_dump(mode="json"),
+            lambda conn: self._write_attempt_row(
+                conn, self.run_id, story_id, card_id, phase_name, attempt
+            ),
+            story_id=story_id,
+            card_id=card_id,
+            phase=phase_name,
+            attempt=attempt.n,
+        )
 
     # -- row writers -------------------------------------------------------
     #

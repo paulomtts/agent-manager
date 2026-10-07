@@ -12,12 +12,14 @@ these are unit tests.
 import ast
 import contextlib
 import inspect
+import json
+import logging
 import re
 import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,7 @@ from agent_manager import (
 from agent_manager.runtime import walk as runtime_walk
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
@@ -938,7 +941,202 @@ def test_after_commit_runs_on_the_writer_thread_before_the_next_job(repo):
     assert isinstance(recording.error, store_leases.LeaseLostError)
 
 
-def test_a_busy_re_run_of_a_record_appends_the_journal_line_once(repo, monkeypatch):
+# -- records: one event and its row in one transaction, the line after -------
+
+
+_STORY = models.StoryRun(card_id="story-a", title="Fundações — ü", level=0, status="started")
+_SUBTASK = models.SubtaskRun(
+    card_id="card-a", branch="m1/task-card-a", base_branch="main", status="started"
+)
+_PHASE = models.PhaseRun(name="implement", kind="agent", status="started", started_at=NOW)
+
+
+def _events(st: store_writer.Store, run_id: str = RUN_A) -> list[store_events.EventRow]:
+    """`run_id`'s committed events, in `seq` order, read on `st`'s read connection."""
+    return store_events.read(st.read_connection, run_id=run_id)
+
+
+def _file_texts(st: store_writer.Store) -> list[str]:
+    """`st`'s run's journal file, one raw text line per entry, in file order."""
+    if not st.journal.path.exists():
+        return []
+    return st.journal.path.read_text(encoding="utf-8").splitlines()
+
+
+def _line_text(event: store_events.EventRow) -> str:
+    """The text of the journal line `event` is mirrored to."""
+    return json.dumps(
+        {
+            "seq": event.run_seq,
+            "ts": event.ts,
+            "run_id": event.run_id,
+            "event": event.kind,
+            "story": event.story_id,
+            "card": event.card_id,
+            "phase": event.phase,
+            "attempt": event.attempt,
+            "payload": event.payload,
+        },
+        sort_keys=True,
+    )
+
+
+_RECORDS = [
+    pytest.param(
+        lambda st, repo: st.record_run(_run(repo)),
+        "run_upsert",
+        (None, None, None, None),
+        lambda repo: _run(repo).model_dump(mode="json", exclude={"stories"}),
+        "runs",
+        id="run",
+    ),
+    pytest.param(
+        lambda st, repo: st.record_story(_STORY),
+        "story_upsert",
+        ("story-a", None, None, None),
+        lambda repo: _STORY.model_dump(mode="json", exclude={"subtasks"}),
+        "stories",
+        id="story",
+    ),
+    pytest.param(
+        lambda st, repo: st.record_subtask("story-a", _SUBTASK),
+        "subtask_upsert",
+        ("story-a", "card-a", None, None),
+        lambda repo: _SUBTASK.model_dump(mode="json", exclude={"phases"}),
+        "subtasks",
+        id="subtask",
+    ),
+    pytest.param(
+        lambda st, repo: st.record_phase("story-a", "card-a", _PHASE),
+        "phase_upsert",
+        ("story-a", "card-a", "implement", None),
+        lambda repo: _PHASE.model_dump(mode="json", exclude={"attempts"}),
+        "phases",
+        id="phase",
+    ),
+    pytest.param(
+        lambda st, repo: st.record_attempt("story-a", "card-a", "implement", _attempt(repo, 1)),
+        "attempt_upsert",
+        ("story-a", "card-a", "implement", 1),
+        lambda repo: _attempt(repo, 1).model_dump(mode="json"),
+        "attempts",
+        id="attempt",
+    ),
+]
+
+
+@pytest.mark.parametrize(("record", "kind", "coordinates", "payload", "table"), _RECORDS)
+def test_a_record_commits_its_event_and_its_row_together(
+    repo, record, kind, coordinates, payload, table
+):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        line = record(st, repo)
+        events = _events(st)
+        rows = st.read_connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    (event,) = events
+    assert (event.kind, event.source, event.project_id, event.schema) == (
+        kind,
+        "live",
+        project_id,
+        1,
+    )
+    assert (event.story_id, event.card_id, event.phase, event.attempt) == coordinates
+    assert event.payload == payload(repo)
+    assert event.run_seq == line.seq == 1
+    assert rows == 1
+
+
+def test_a_failed_row_write_leaves_no_event_and_consumes_no_run_seq(repo, monkeypatch):
+    st = store_writer.Store.open(repo, RUN_A)
+    real = st._write_story_row
+
+    def failing_row_write(*args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    try:
+        st.record_run(_run(repo))
+        monkeypatch.setattr(st, "_write_story_row", failing_row_write)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            st.record_story(_STORY)
+        kinds = [event.kind for event in _events(st)]
+        texts = _file_texts(st)
+        monkeypatch.setattr(st, "_write_story_row", real)
+        line = st.record_story(_STORY)
+    finally:
+        st.close()
+
+    assert kinds == ["run_upsert"]
+    assert [json.loads(text)["seq"] for text in texts] == [1]
+    assert line.seq == 2
+
+
+def test_the_file_line_equals_the_event(repo):
+    # Review Focus 5: `_STORY`'s title is not ASCII.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_STORY)
+        st.record_subtask("story-a", _SUBTASK)
+        st.record_phase("story-a", "card-a", _PHASE)
+        line = st.record_attempt("story-a", "card-a", "implement", _attempt(repo, 1))
+        events = _events(st)
+        texts = _file_texts(st)
+    finally:
+        st.close()
+
+    assert [event.kind for event in events] == [
+        "run_upsert",
+        "story_upsert",
+        "subtask_upsert",
+        "phase_upsert",
+        "attempt_upsert",
+    ]
+    assert texts == [_line_text(event) for event in events]
+    assert line == store_journal.Journal(RUN_A).read()[-1]
+
+
+def test_record_returns_the_line_numbered_by_the_events_table(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        lines = [
+            st.record_run(_run(repo)),
+            st.record_story(_STORY),
+            st.record_subtask("story-a", _SUBTASK),
+        ]
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert [line.seq for line in lines] == [event.run_seq for event in events] == [1, 2, 3]
+    for line, event in zip(lines, events, strict=True):
+        stamped = datetime.fromisoformat(event.ts)
+        assert stamped.utcoffset() == timedelta(0)
+        assert stamped == line.ts
+
+
+def test_each_run_numbers_its_own_events_from_one(repo):
+    # Review Focus 3: two runs share the machine-wide file.
+    first = store_writer.Store.open(repo, RUN_A)
+    second = store_writer.Store.open(repo, RUN_B)
+    try:
+        first.record_run(_run(repo))
+        first.record_story(_STORY)
+        line = second.record_run(_run(repo).model_copy(update={"id": RUN_B}))
+        events = _events(second, RUN_B)
+    finally:
+        first.close()
+        second.close()
+
+    assert line.seq == 1
+    assert [(event.run_id, event.run_seq) for event in events] == [(RUN_B, 1)]
+
+
+def test_a_busy_re_run_of_a_record_writes_one_event_and_one_line(repo, monkeypatch):
     monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
     st = store_writer.Store.open(repo, RUN_A)
     real = st._write_run_row
@@ -953,15 +1151,77 @@ def test_a_busy_re_run_of_a_record_appends_the_journal_line_once(repo, monkeypat
     monkeypatch.setattr(st, "_write_run_row", busy_once)
     try:
         line = st.record_run(_run(repo))
+        events = _events(st)
         lines = st.journal.read()
         runs = _count(st, "runs")
     finally:
         st.close()
 
     assert calls == [1, 1]
-    assert [journalled.event for journalled in lines] == ["run_upsert"]
-    assert lines[0] == line
+    assert [event.run_seq for event in events] == [1]
+    assert lines == [line]
     assert runs == 1
+
+
+def test_the_mirror_runs_after_the_commit_on_the_writer_thread(repo, monkeypatch):
+    st = store_writer.Store.open(repo, RUN_A)
+    real = st.journal.mirror
+    seen: list[tuple[str, list[int]]] = []
+
+    def spying_mirror(line):
+        committed = [event.run_seq for event in _events(st)]
+        seen.append((threading.current_thread().name, committed))
+        real(line)
+
+    monkeypatch.setattr(st.journal, "mirror", spying_mirror)
+    try:
+        st.record_run(_run(repo))
+    finally:
+        st.close()
+
+    assert seen == [(f"am-store-writer-{RUN_A}", [1])]
+
+
+def test_a_canceled_status_is_stored_and_mirrored_verbatim(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.record_run(_run(repo).model_copy(update={"status": models.CANCELED}))
+        (event,) = _events(st)
+        (text,) = _file_texts(st)
+    finally:
+        st.close()
+
+    assert event.payload["status"] == models.CANCELED
+    assert json.loads(text)["payload"]["status"] == models.CANCELED
+
+
+def test_a_legacy_cancelled_event_mirrors_verbatim(repo):
+    # Models canonicalise on validation, so only an event already stored with
+    # the legacy spelling can carry it: the event -> line -> file layer keeps it.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        event = st._submit(
+            lambda conn: store_events.insert(
+                conn,
+                project_id=st.project_id,
+                run_id=RUN_A,
+                ts=store_journal.ts_text(NOW),
+                kind="run_upsert",
+                payload={"status": models.LEGACY_CANCELED},
+                source="live",
+            ),
+            operation="seed",
+        )
+        line = store_writer._line_from_event(event)
+        st.journal.mirror(line)
+        (stored,) = _events(st)
+        (text,) = _file_texts(st)
+    finally:
+        st.close()
+
+    assert line.payload == {"status": models.LEGACY_CANCELED}
+    assert stored.payload == {"status": models.LEGACY_CANCELED}
+    assert json.loads(text)["payload"] == {"status": models.LEGACY_CANCELED}
 
 
 # -- batches: coalesced jobs share one transaction ---------------------------
@@ -1580,6 +1840,8 @@ def test_heartbeats_racing_records_all_land(repo):
         _wait_all(callers)
         lines = [line for line in st.journal.read() if line.event == "attempt_upsert"]
         rows = _count(st, "attempts")
+        events = _events(st)
+        texts = _file_texts(st)
     finally:
         st.close()
 
@@ -1587,9 +1849,11 @@ def test_heartbeats_racing_records_all_land(repo):
     assert len(lines) == 40
     assert len({line.seq for line in lines}) == 40
     assert rows == 40
+    assert [event.run_seq for event in events] == list(range(1, 41))
+    assert texts == [_line_text(event) for event in events]
 
 
-def test_a_lost_lease_writes_neither_line_nor_row(repo):
+def test_a_lost_lease_writes_no_line_no_event_and_no_row(repo):
     st = store_writer.Store.open(repo, RUN_A)
     try:
         st.record_run(_run(repo))
@@ -1606,11 +1870,13 @@ def test_a_lost_lease_writes_neither_line_nor_row(repo):
                 models.StoryRun(card_id="story-a", title="Story", level=0, status="started")
             )
         events = [line.event for line in st.journal.read()]
+        kinds = [event.kind for event in _events(st)]
         stories = _count(st, "stories")
     finally:
         st.close()
 
     assert events == ["run_upsert"]
+    assert kinds == ["run_upsert"]
     assert stories == 0
 
 
