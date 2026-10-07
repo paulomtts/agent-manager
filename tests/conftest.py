@@ -54,6 +54,9 @@ def _real_data_dir() -> Path:
 REAL_DATA_DIR = _real_data_dir()
 
 
+_MACHINE_DB_FILES = frozenset({("am.db",), ("am.db-wal",), ("am.db-shm",)})
+
+
 def _snapshot(root: Path) -> frozenset[str]:
     """Every path under `root`; empty when `root` is absent.
 
@@ -74,12 +77,20 @@ def _snapshot(root: Path) -> frozenset[str]:
     directory (`projects/`, a stray top-level entry); narrowing it further to
     "new paths under this run's own id only" needs a marker a verification
     command doesn't have yet (see card e2efd21d, AM_RUN_ID).
+
+    The machine database at the root (`am.db`, `am.db-wal`, `am.db-shm`) is
+    excluded too, by exact top-level name: the live `am` run that is the
+    parent of a dogfooding verify opens it, and SQLite's WAL sidecars appear
+    and disappear as that process's connections open and close, so their
+    presence changing is the parent's churn, not a leak. Anything else named
+    like it (`am.db.bak`, `projects/am.db`, `sub/am.db`) is still reported.
     """
     if not root.exists():
         return frozenset()
     return frozenset(
         str(rel) for path in root.rglob("*")
         if (rel := path.relative_to(root)).parts[:1] != ("runs",)
+        and rel.parts not in _MACHINE_DB_FILES
     )
 
 
