@@ -652,7 +652,7 @@ Every event, in the envelope's `events` and on the stream, is one journal line (
 
 | Field | What it holds |
 |---|---|
-| `seq` | the line's number in its run's journal, from 1, increasing |
+| `seq` | the line's number in its run's journal, increasing; a run's other events (lease and control) take numbers too, so the first line may be above 1 and numbers may skip |
 | `ts` | when the line was written, ISO 8601 in UTC |
 | `run_id` | the run |
 | `event` | which kind of node the line records, one of the five below |

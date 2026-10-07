@@ -99,8 +99,14 @@ class Store:
     (live control C1/C2), `run_claims` (multi-process X5) and
     `board_comments` (board-comments B6): the six row-only tables, which have
     no journal and are the projection's alone. Every row this store writes
-    carries its `project_id`. Their methods write rows and never touch the
-    journal, and `rebuild_from_events` leaves those rows alone.
+    carries its `project_id`. Their methods never touch the journal file, and
+    `rebuild_from_events` leaves those rows alone. The lease and control
+    writes still record their facts as events (card 1.2.7): `take_lease`
+    inserts `lease_acquired` or `lease_taken_over` in its transaction, a
+    refused take records `claim_conflict` in a job of its own after the
+    rollback, and `mark_control_handled` inserts `control_handled` with the
+    mark. Those events take `run_seq` numbers like any other and are never
+    mirrored, so the journal file skips them.
 
     The threads of the process holding a run's lease share one `Store`. Every
     write is one job on the store's single writer thread, run in the order it
@@ -931,9 +937,13 @@ class Store:
     #
     # Row-only tables outside the journal (live control C2, multi-process X5):
     # nothing here calls `self._journal`, and `rebuild_from_events` leaves the
-    # rows alone. `take_lease` is the only check-and-set; every other method
-    # touches only the rows whose token matches, and any other token is a
-    # silent no-op.
+    # rows alone. `take_lease` and `mark_control_handled` insert their event
+    # (`lease_acquired`/`lease_taken_over`, `control_handled`) in the same
+    # transaction as the rows, and a refused take records `claim_conflict`
+    # afterwards; none of those events reaches the journal file, and every
+    # other method here writes none. `take_lease` is the only check-and-set;
+    # every other method touches only the rows whose token matches, and any
+    # other token is a silent no-op.
 
     def take_lease(
         self,

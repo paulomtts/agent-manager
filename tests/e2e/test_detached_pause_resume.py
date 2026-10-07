@@ -265,7 +265,8 @@ def test_a_detached_milestone_run_is_watched_paused_and_resumed_to_done(
     assert _status(am, root, run_id)["run"]["status"] == "done"
     assert _lease(root, run_id) is None
 
-    # 8. One stream across both lives: exactly the journal, seq 1..N.
+    # 8. One stream across both lives: exactly the journal, seq strictly
+    # increasing (lease and control events take numbers the journal skips).
     code, once = am("watch", run_id)
     assert code == 0, once
     assert once["ok"] is True, once
@@ -276,9 +277,8 @@ def test_a_detached_milestone_run_is_watched_paused_and_resumed_to_done(
         f"the stream reaching seq {last_seq}",
     )
     assert stream.events == expected
-    assert [event["seq"] for event in stream.events] == list(
-        range(1, len(stream.events) + 1)
-    )
+    seqs = [event["seq"] for event in stream.events]
+    assert seqs == sorted(set(seqs)) and seqs[0] >= 1, seqs
     statuses = _collapse(_run_statuses(stream.events))
     assert _is_subsequence(["started", "stopped", "started", "done"], statuses), statuses
 
