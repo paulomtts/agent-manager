@@ -7,6 +7,7 @@ tier and carries no marker.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import typing
@@ -106,6 +107,14 @@ def _command_param(command: str, name: str):
     """The Click parameter `name` of the `am` subcommand `command`, introspected in-process."""
     group = typer.main.get_command(cli.app)
     return next(param for param in group.commands[command].params if param.name == name)
+
+
+def _paragraph(opening: str) -> str:
+    """The README paragraph that starts at the first occurrence of `opening`."""
+    text = README.read_text(encoding="utf-8")
+    start = text.index(opening)
+    end = text.find("\n\n", start)
+    return text[start : len(text) if end == -1 else end]
 
 
 def _usage_paragraph() -> str:
@@ -643,3 +652,40 @@ def test_neutral_argv_section():
     assert titles.index(ARGV_TITLE) == titles.index(ISOLATION_TITLE) + 1
     assert _slug(ARGV_TITLE) == "verification-commands-stay-out-of-ps"
     _assert_anchors_resolve(section)
+
+
+RESUME_OPENING = "Pick a run back up where it was interrupted"
+REPLACED = "verification: replaced in run record:"
+
+
+def test_resume_documents_the_recorded_suite():
+    assert REPLACED in inspect.getsource(cli.resume_run)
+    assert {"verify", "allow_no_verification"} <= set(models.RunConfig.model_fields)
+
+    text = README.read_text(encoding="utf-8")
+    assert "The verification suite is not recorded" not in text
+    assert "the suite is not recorded" not in text
+    assert "pass your `--verify` commands again" not in text.lower()
+    assert "pass the same `--verify` commands" not in text
+
+    usage = _paragraph(RESUME_OPENING)
+    assert usage in _section("Usage")
+    assert "So are the verification suite and the opt-out." in usage
+    assert f"`{REPLACED} [...]`" in usage
+    assert "can only add the opt-out" in usage
+    assert "verification: kept from checkpoint: [...]" in usage
+    assert (
+        "with the run's recorded suite (or the `--verify` passed now, which replaces it)"
+        in usage
+    )
+
+    relaunch = _section("Relaunching resumes")
+    assert f"`{REPLACED} [...]`" in relaunch
+    assert "The run's recorded suite is restored" in relaunch
+
+    story = _section(STORY_TITLE)
+    assert (
+        "the recorded suite is restored; a `--verify` passed now replaces it,"
+        " as on a milestone run" in story
+    )
+    assert STORY_SHAPE in story
