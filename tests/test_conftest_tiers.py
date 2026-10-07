@@ -1,7 +1,7 @@
 """Unit tier: the directory-to-tier decision and the data-dir snapshot in `tests/conftest.py`.
 
-Both helpers are pure (no subprocess, no collection), so these tests carry
-no tier marker and run in the default suite. This file sits at the top of
+The tier helpers are pure and `_snapshot` only walks a `tmp_path` tree (no
+subprocess, no collection), so these tests carry no tier marker and run in the default suite. This file sits at the top of
 `tests/`, so the auto-mark hook leaves it unmarked.
 """
 
