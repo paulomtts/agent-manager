@@ -2512,13 +2512,16 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     Every statement runs in one `store_db.read_snapshot`, and the first one
     reads `store_events.head`: that is `as_of_seq`, the machine-wide head (so
     it can be above 0 on an empty listing), and the listing reflects every
-    event up to it and none after it.
+    event up to it and none after it. `store_id` is `store_db.store_id`, read
+    in the same snapshot and never minted here, so it is `None` when no
+    `am.db` exists yet or its `meta` has no `store_id` row.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
         with store_db.read_snapshot(conn):
             as_of_seq = store_events.head(conn)
+            store_id = store_db.store_id(conn)
             now = _utcnow()
             entries = []
             for summary in store_queries.list_runs(
@@ -2531,7 +2534,7 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
                     else store_queries.RunLease(**_lease_fields(lease, now=now))
                 )
                 entries.append(summary.model_copy(update={"lease": shown}).model_dump())
-            return {"runs": entries, "as_of_seq": as_of_seq}
+            return {"runs": entries, "as_of_seq": as_of_seq, "store_id": store_id}
     finally:
         conn.close()
 

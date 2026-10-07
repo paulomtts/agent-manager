@@ -5131,7 +5131,7 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_
     for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
         assert set(envelope) == {"ok", "data"}
         assert envelope["ok"] is True
-        assert set(envelope["data"]) == {"runs", "as_of_seq"}
+        assert set(envelope["data"]) == {"runs", "as_of_seq", "store_id"}
         assert isinstance(envelope["data"]["as_of_seq"], int)
         assert len(envelope["data"]["runs"]) == 3
         for entry in envelope["data"]["runs"]:
@@ -5227,18 +5227,104 @@ def test_runs_reads_every_lease_inside_the_snapshot(projection, monkeypatch):
         writer.close()
 
 
-def test_runs_as_of_seq_on_an_empty_listing(projection):
-    assert cli.runs_for(repo_dir=projection) == {"runs": [], "as_of_seq": 0}
+def test_runs_store_id_is_the_meta_store_id(projection):
+    _record_two_started_runs(projection)
+    expected = _store_id(projection)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert isinstance(payload["store_id"], str)
+    assert _HEX_ID.fullmatch(payload["store_id"])
+    assert payload["store_id"] == expected
+    argv = ["runs", "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["store_id"] == expected
+
+
+def test_runs_store_id_is_stable(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    first = cli.runs_for(repo_dir=projection)
+    second = cli.runs_for(repo_dir=projection)
+    _record(
+        projection,
+        "20260930T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+    )
+    third = cli.runs_for(repo_dir=projection)
+
+    assert first["store_id"] == second["store_id"] == third["store_id"]
+    assert _HEX_ID.fullmatch(first["store_id"])
+    assert third["as_of_seq"] > first["as_of_seq"]
+
+
+def test_runs_store_id_differs_across_databases(projection, tmp_path, monkeypatch):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    first = cli.runs_for(repo_dir=projection)["store_id"]
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "other-xdg"))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    second = cli.runs_for(repo_dir=projection)["store_id"]
+
+    assert _HEX_ID.fullmatch(first)
+    assert _HEX_ID.fullmatch(second)
+    assert first != second
+
+
+def test_runs_reads_store_id_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 2: on the command's own connection, inside `read_snapshot`."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    opened: list[sqlite3.Connection] = []
+    seen: list[tuple[sqlite3.Connection, bool]] = []
+    original_open = cli.store_db.open_db_for_reading
+    original_store_id = cli.store_db.store_id
+
+    def capture_open(root):
+        conn = original_open(root)
+        opened.append(conn)
+        return conn
+
+    def capture_store_id(conn):
+        seen.append((conn, conn.in_transaction))
+        return original_store_id(conn)
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture_open)
+    monkeypatch.setattr(cli.store_db, "store_id", capture_store_id)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert len(opened) == 1
+    assert seen == [(opened[0], True)]
+    assert _HEX_ID.fullmatch(payload["store_id"])
+
+
+def test_runs_store_id_on_an_empty_listing(projection):
+    """No `am.db`: `null`, and nothing created. Then another repo's runs make
+    the database exist: this repo's listing is still empty, but it carries
+    that database's id, since `store_id` is machine-wide like `as_of_seq`."""
+    assert cli.runs_for(repo_dir=projection) == {
+        "runs": [],
+        "as_of_seq": 0,
+        "store_id": None,
+    }
+    assert not paths.db_path().exists()
 
     elsewhere = projection.parent / "elsewhere"
     elsewhere.mkdir()
     _record(elsewhere, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
     head = _events_head(elsewhere)
+    expected = _store_id(elsewhere)
 
     payload = cli.runs_for(repo_dir=projection)
 
     assert payload["runs"] == []
     assert payload["as_of_seq"] == head > 0
+    assert expected is not None
+    assert payload["store_id"] == expected
 
 
 RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"

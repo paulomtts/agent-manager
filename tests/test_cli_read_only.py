@@ -86,15 +86,18 @@ def test_runs_on_an_unknown_repo_is_empty_and_creates_nothing(unknown_repo, tmp_
 
     assert result.exit_code == 0, result.output
     head = 0
+    store_id = None
     if paths.db_path().exists():
         conn = store_db.open_db_for_reading(unknown_repo)
         try:
             head = store_events.head(conn)
+            store_id = store_db.store_id(conn)
         finally:
             conn.close()
+        assert store_id is not None
     assert json.loads(result.stdout) == {
         "ok": True,
-        "data": {"runs": [], "as_of_seq": head},
+        "data": {"runs": [], "as_of_seq": head, "store_id": store_id},
     }
 
 
@@ -126,6 +129,44 @@ def test_status_without_a_run_id_on_an_unknown_repo_refuses_and_creates_nothing(
     assert error["message"].startswith(
         f"no run has been recorded for {unknown_repo.resolve()}"
     )
+
+
+def _write_stamped_db_without_a_store_id(path: Path) -> None:
+    """A current-schema `am.db` at `SCHEMA_VERSION` that no `open_db` has
+    touched: no `store_id` row in `meta`, no sidecars."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    try:
+        built.executescript(store_db._SCHEMA)
+        built.execute(f"PRAGMA user_version = {store_db.SCHEMA_VERSION}")
+        built.commit()
+    finally:
+        built.close()
+
+
+def test_runs_and_status_on_a_database_without_a_store_id_report_null_and_write_nothing(
+    tmp_path, monkeypatch
+):
+    """Review Focus 1 and 3: a reader never back-fills `store_id`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = paths.db_path()
+    _write_stamped_db_without_a_store_id(path)
+    before = path.read_bytes()
+
+    listed = _invoke_creating_nothing(tmp_path, ["runs", "--repo-dir", str(root)])
+    shown = _invoke_creating_nothing(tmp_path, ["status", "--repo-dir", str(root)])
+
+    assert listed.exit_code == 0, listed.output
+    assert json.loads(listed.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": 0, "store_id": None},
+    }
+    assert shown.exit_code == cli.EXIT_ERROR, shown.output
+    assert json.loads(shown.stdout)["error"]["type"] == "UnknownRunError"
+    assert "store_id" not in shown.stdout
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("extra", [[], ["--phase", "verify"], ["--follow"]])

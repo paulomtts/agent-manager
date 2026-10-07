@@ -698,6 +698,8 @@ am runs --repo-dir . --pretty
 
 `data.as_of_seq` is the `seq` of the newest event the listing reflects (`0` when no event has been recorded). It is the machine-wide newest event, so it can be above `0` when this repository has no runs. Every row in the listing is read in one read transaction together with it; only `lease.live` is judged at the moment you ask.
 
+`data.store_id` is the identity of the `am.db` the listing was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. Like `as_of_seq` it is machine-wide, so an empty listing still carries it. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds. It is `null` when no database exists yet; `am runs` never creates one to report it.
+
 New keys are additive: a newer `am` may add keys to these objects, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
 ### Watching a run
