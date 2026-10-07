@@ -29,7 +29,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import cli, models, store
+from agent_manager import cli, models
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as runtime_engine
 
@@ -78,9 +83,9 @@ def _envelope(result) -> dict:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
@@ -88,17 +93,20 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        run_id = store.latest_run_id(conn)
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, resolved)
+        )
     finally:
         conn.close()
     assert run_id is not None
     return run_id
 
 
-def _latest_checkpoint(root: Path, run_id: str, card_id: str) -> store.Checkpoint:
-    opened = store.Store.open(cli.resolve_repo_dir(root), run_id)
+def _latest_checkpoint(root: Path, run_id: str, card_id: str) -> store_checkpoints.Checkpoint:
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         checkpoint = opened.latest_checkpoint(card_id)
     finally:

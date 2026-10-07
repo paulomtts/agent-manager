@@ -51,7 +51,12 @@ from agent_manager import bases, board, census, cli, comments, control, dag, det
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
-from agent_manager import store as store_module
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
@@ -1320,9 +1325,9 @@ def _census_stories(project: Path, milestone: str) -> list[str]:
 
 
 def _load(project: Path, run_id: str) -> models.Run:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -1556,7 +1561,7 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
         "integrated": _integrated(root, [story_a, story_b]),
     }
     (integrate_call,) = integrate_recorder.calls
-    assert isinstance(integrate_call.pop("store"), store_module.Store)
+    assert isinstance(integrate_call.pop("store"), store_writer.Store)
     assert integrate_call == {
         "stories": [story_a, story_b],
         "repo_dir": root,
@@ -2188,18 +2193,18 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
     # No run was left behind: the data directory holds nothing but the `git`
     # ProcessLock's own lock file, the one thing spec X7 does put there even on
     # this early a failure (paths.project_lock_path creates its `projects`
-    # directory as soon as the lock object exists), and the project's
-    # projection, which the read-only claims preflight (`cli.refuse_claimed`,
-    # X5) opens before the fetch. That projection records no run.
+    # directory as soon as the lock object exists), and the machine database
+    # `am.db` with its WAL sidecars, which the read-only claims preflight
+    # (`cli.refuse_claimed`, X5) opens before the fetch. It records no run.
     data = paths.data_dir()
     projects = data / "projects"
-    db_name = paths.project_db_path(cli.resolve_repo_dir(project)).name
+    machine_db = {"am.db", "am.db-wal", "am.db-shm"}
     written = sorted(
         str(entry.relative_to(data))
         for entry in data.rglob("*")
         if entry != projects
         and not (entry.parent == projects and entry.suffix == ".lock")
-        and not (entry.parent == projects and entry.name.startswith(db_name))
+        and not (entry.parent == data and entry.name in machine_db)
     )
     assert written == []
     assert _run_ids(project) == []
@@ -2459,7 +2464,7 @@ def test_at_most_max_concurrent_lanes_run(project):
 
 def _supervised_run(
     project: Path, milestone: str
-) -> tuple[store_module.Store, str, orchestrate.SupervisorPlan]:
+) -> tuple[store_writer.Store, str, orchestrate.SupervisorPlan]:
     """What `run_milestone` sets up before it calls `supervise`, without the
     lease, the git refresh or Integrate: a recorded run, its planned rows, and
     the plan built from them. The caller closes the store."""
@@ -2467,7 +2472,7 @@ def _supervised_run(
     stories = census.flatten_milestone(board.tree(milestone, repo_dir=root)).stories
     levels = orchestrate.plan_levels(stories, branch_prefix=PREFIX, base_branch="main")
     run_id = cli.mint_run_id(milestone, STARTED_AT)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     store.record_run(
         models.Run(
             id=run_id,
@@ -2490,7 +2495,7 @@ def _supervised_run(
 
 async def _supervise_shared(
     project: Path,
-    store: store_module.Store,
+    store: store_writer.Store,
     run_id: str,
     plan: orchestrate.SupervisorPlan,
     driver: Any,
@@ -3629,7 +3634,7 @@ def test_an_escalation_parks_running_lanes_and_blocks_new_ones(project, fresh_py
         story_c: "pending",
         c1: "pending",
     }
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(b1)
     finally:
@@ -3681,9 +3686,9 @@ def _plant(
     digest: str | None = None,
     queue: tuple[str, ...] = ("implement",),
     minute: int = 0,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One checkpoint row of `TASK` for `card_id`, saved by an earlier run."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return opened.save_checkpoint(
             card_id,
@@ -3761,9 +3766,9 @@ FIRST_PHASE = "worktree"
 """`TASK`'s first phase: where a walk handed no `resume_from` begins."""
 
 
-def _continuable(project: Path, run_id: str, card_id: str) -> store_module.Checkpoint | None:
+def _continuable(project: Path, run_id: str, card_id: str) -> store_checkpoints.Checkpoint | None:
     """What a relaunch's lane would continue `card_id` from, read as the lane reads it."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return runs.continuable_checkpoint(opened, card_id)
     finally:
@@ -4546,7 +4551,7 @@ def _record_resume_run(
     launcher: models.Launcher = "direct",
     isolation_warning: str | None = None,
 ) -> None:
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -4569,14 +4574,14 @@ def _record_resume_run(
 
 
 def _save(
-    store: store_module.Store,
+    store: store_writer.Store,
     card_id: str,
     reason: str,
     *,
     phase: str | None = None,
     workflow: Workflow = task_workflow.TASK,
     digest: str | None = None,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One checkpoint of `card_id`; `phase` is the turn in flight, None for a row holding no turn."""
     return store.save_checkpoint(
         card_id,
@@ -4622,6 +4627,23 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
     with pytest.raises(cli.UnknownRunError, match="no-such-run"):
         orchestrate.resumable_milestone_run(root, "no-such-run")
+
+
+def test_a_milestone_run_of_another_repo_is_an_unknown_run(tmp_path, monkeypatch):
+    """`am.db` holds every repository's runs: a run another repository
+    recorded is unknown to this one, and to a repository with no project."""
+    theirs = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(theirs)
+    mine = (tmp_path / "mine").resolve()
+    mine.mkdir()
+    _record_resume_run(mine, "20260924T120000Z-00000008")
+    stranger = (tmp_path / "stranger").resolve()
+    stranger.mkdir()
+
+    for root in (mine, stranger):
+        with pytest.raises(cli.UnknownRunError, match=RESUME_RUN_ID):
+            orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+    assert orchestrate.resumable_milestone_run(theirs, RESUME_RUN_ID).id == RESUME_RUN_ID
 
 
 @pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
@@ -4749,7 +4771,7 @@ def test_each_open_card_resumes_from_its_newest_row_or_the_turn_it_failed_in(
     its parked INTEGRATE row."""
     root = _resume_root(tmp_path, monkeypatch)
     base_c = bases.resolver_card_id(_plan_id(3))
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(12), "turn", phase="implement")
         failed = _save(opened, _plan_id(12), "turn", phase="review")
@@ -4773,7 +4795,7 @@ def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_dig
     tmp_path, monkeypatch
 ):
     root = _resume_root(tmp_path, monkeypatch)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(13), "parked", phase="plan", digest="saved-under-another-task")
         cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
@@ -4793,7 +4815,7 @@ def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_dig
 def test_a_resolver_is_judged_against_integrate_not_task(tmp_path, monkeypatch):
     root = _resume_root(tmp_path, monkeypatch)
     base_c = bases.resolver_card_id(_plan_id(3))
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, base_c, "parked", phase="verify", workflow=task_workflow.TASK)
         cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
@@ -4812,7 +4834,7 @@ def test_an_escalation_with_no_turn_row_left_starts_the_card_fresh(tmp_path, mon
     rewind to, the card is started fresh rather than handed a checkpoint
     that names no phase to continue."""
     root = _resume_root(tmp_path, monkeypatch)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(31), "escalated")
 
@@ -4845,7 +4867,7 @@ def test_reopening_marks_orphans_harness_error_and_open_rows_started(tmp_path, m
         "closed": "escalated",
     }
     _record_resume_run(root)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         opened.record_story(models.StoryRun(card_id="story-a", title="A", level=0, status="escalated"))
         for card, status in statuses.items():
@@ -4890,9 +4912,9 @@ def _resume(project: Path, run_id: str, driver: Any, **overrides: Any) -> dict[s
 
 def _plant_integrate(
     project: Path, run_id: str, story_id: str, reason: str, *, digest: str | None = None
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One `INTEGRATE` checkpoint of `story_id`'s resolver, saved by `run_id`."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return opened.save_checkpoint(
             bases.resolver_card_id(story_id),
@@ -4921,7 +4943,7 @@ def _record_bounds(monkeypatch) -> list[int]:
 
 
 def _run_ids(project: Path) -> list[str]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -4929,7 +4951,7 @@ def _run_ids(project: Path) -> list[str]:
 
 
 def _checkpoint_rows(project: Path) -> list[tuple]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             tuple(row)
@@ -5175,11 +5197,11 @@ def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monke
 # ── live control: pause and cancel (card 0e1edf31) ──────────────────────────
 
 
-def _lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+def _lease(project: Path, run_id: str) -> store_leases.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
@@ -5189,24 +5211,31 @@ def _send(project: Path, run_id: str, command: str, *, token: str | None = None)
 
     Addressed to the live lease's token unless `token` names another one.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         if token is None:
-            lease = store_module.read_lease(conn, run_id)
+            lease = store_leases.read_lease(conn, run_id)
             assert lease is not None and lease.accepting, "no open lease to address the request to"
             token = lease.token
-        with store_module.immediate(conn):
-            store_module.add_control(
-                conn, run_id, lease=token, command=command, requested_at=STARTED_AT
+        with store_db.immediate(conn):
+            store_leases.add_control(
+                conn,
+                run_id,
+                project_id=store_projects.resolve(
+                    conn, cli.resolve_repo_dir(project), now=STARTED_AT
+                ),
+                lease=token,
+                command=command,
+                requested_at=STARTED_AT,
             )
     finally:
         conn.close()
 
 
-def _controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+def _controls(project: Path, run_id: str) -> list[store_leases.ControlRow]:
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.control_requests(conn, run_id)
+        return store_leases.control_requests(conn, run_id)
     finally:
         conn.close()
 
@@ -5247,7 +5276,7 @@ def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
     `run_milestone` returns."""
     shape = _milestone(project, {"A": 1})
     run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
-    seen: list[store_module.LeaseRow | None] = []
+    seen: list[store_leases.LeaseRow | None] = []
 
     def integrate_reading_the_lease(**kwargs: Any) -> Any:
         seen.append(_lease(project, run_id))
@@ -5320,7 +5349,7 @@ def test_resuming_a_run_recorded_before_milestone_id_stamps_it(project):
     first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
     assert first["escalated"] is True, first
     run_id = first["run_id"]
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.record_run(_load(project, run_id).model_copy(update={"milestone_id": None}))
     finally:
@@ -5516,7 +5545,7 @@ def _run_upserts(run_id: str) -> list[str]:
 
 def _raw_run_status(project: Path, run_id: str) -> str:
     """`runs.status` as stored, before any reader normalises it."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
     finally:
@@ -5745,7 +5774,7 @@ def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
         a1: "stopped",
     }
     assert integrate_recorder.calls == []
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(a1)
     finally:
@@ -5775,28 +5804,32 @@ def _plant_lease(
 ) -> None:
     """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
 
-    Written over a second `open_db` connection inside `store.immediate`, on
+    Written over a second `open_db` connection inside `store_db.immediate`, on
     this host, window open. Live by C2 when `pid` is alive and `heartbeat_at`
     is fresh; dead when `pid` is `_reaped_pid()`.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
+            project_id = store_projects.resolve(
+                conn, cli.resolve_repo_dir(project), now=heartbeat_at
+            )
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
                 " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
                 " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
                 " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                (run_id, token, pid, HERE, heartbeat_at.isoformat(), heartbeat_at.isoformat()),
+                (project_id, run_id, token, pid, HERE, heartbeat_at.isoformat(),
+                 heartbeat_at.isoformat()),
             )
             for key in claims:
                 conn.execute(
-                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                     " run_id=excluded.run_id, token=excluded.token,"
                     " claimed_at=excluded.claimed_at",
-                    (key, run_id, token, heartbeat_at.isoformat()),
+                    (project_id, key, run_id, token, heartbeat_at.isoformat()),
                 )
     finally:
         conn.close()
@@ -5811,7 +5844,7 @@ def _reaped_pid() -> int:
 
 def _claim_rows(project: Path) -> list[tuple[str, str, str]]:
     """Every `run_claims` row as `(key, run_id, token)`, in key order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["run_id"], row["token"])
@@ -5823,12 +5856,12 @@ def _claim_rows(project: Path) -> list[tuple[str, str, str]]:
 
 def _held_keys(project: Path, run_id: str) -> list[str]:
     """The keys `run_id`'s current lease holds, in key order, read as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        lease = store_module.read_lease(conn, run_id)
+        lease = store_leases.read_lease(conn, run_id)
         if lease is None:
             return []
-        return [claim.key for claim in store_module.held_claims(conn, run_id, lease.token)]
+        return [claim.key for claim in store_leases.held_claims(conn, run_id, lease.token)]
     finally:
         conn.close()
 
@@ -6052,7 +6085,7 @@ def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_c
         heartbeat_at=datetime.now(timezone.utc),
         claims=(key,),
     )
-    monkeypatch.setattr(store_module.Store, "open", _forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _forbidden("Store.open"))
     monkeypatch.setattr(orchestrate, "refresh_git", _forbidden("refresh_git"))
     driver = FakeDriver()
 
@@ -6074,7 +6107,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
     (b1,) = shape["subtasks"]["B"]
     first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
     run_id = first["run_id"]
-    seen_by_git: list[store_module.LeaseRow | None] = []
+    seen_by_git: list[store_leases.LeaseRow | None] = []
     real_refresh = orchestrate.refresh_git
 
     def refresh_spy(root: Path) -> None:
@@ -6082,7 +6115,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
         real_refresh(root)
 
     first_write: list[tuple[str | None, list[str]]] = []
-    real_record_run = store_module.Store.record_run
+    real_record_run = store_writer.Store.record_run
 
     def record_spy(self, run):
         if not first_write:
@@ -6092,14 +6125,14 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
                 if token is None
                 else [
                     claim.key
-                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                    for claim in store_leases.held_claims(self.connection, self.run_id, token)
                 ]
             )
             first_write.append((token, held))
         return real_record_run(self, run)
 
     monkeypatch.setattr(orchestrate, "refresh_git", refresh_spy)
-    monkeypatch.setattr(store_module.Store, "record_run", record_spy)
+    monkeypatch.setattr(store_writer.Store, "record_run", record_spy)
 
     result = _resume(project, run_id, FakeDriver())
 
@@ -6197,7 +6230,7 @@ def _keys(found: list[board.BoardComment]) -> list[str]:
 
 def _comment_states(project: Path) -> list[tuple[str, str]]:
     """Every outbox row as `(key, state)`, in insertion order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["state"])
@@ -9509,7 +9542,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     close runs.
     """
     seen: list[tuple[int, int]] = []
-    real_close = store_module.Store.close
+    real_close = store_writer.Store.close
 
     def close(self) -> None:
         conn = self.connection
@@ -9522,7 +9555,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
         seen.append((claims, leases))
         real_close(self)
 
-    monkeypatch.setattr(store_module.Store, "close", close)
+    monkeypatch.setattr(store_writer.Store, "close", close)
     return seen
 
 
@@ -9659,7 +9692,7 @@ def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
     root = _resume_root(tmp_path, monkeypatch)
     _milestone_id, _story, subtask = _seam_resume_board(fake_board)
     _record_resume_run(root)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, subtask, "parked", phase="plan", digest="saved-under-another-task")
     finally:
@@ -9952,7 +9985,7 @@ def test_the_detached_milestone_child_drives_the_recorded_plan_and_reports_it(
     run_id = data["run_id"]
     assert run_id == runs.mint_run_id(shape["milestone"], STARTED_AT)
     assert driver.calls == []
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()
@@ -10499,7 +10532,7 @@ def _record_story_run(
     verify: tuple[str, ...] = (),
 ) -> None:
     """A story run of `story` under `milestone`, recorded as `preflight_story` records one."""
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         opened.record_run(
             models.Run(
@@ -10838,7 +10871,7 @@ def test_the_detached_story_child_drives_only_the_story_and_reports_no_integrate
     assert _load(root, run_id).config == models.RunConfig(
         max_concurrent_stories=1, story_id=story, allow_no_verification=True
     )
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()
@@ -11140,7 +11173,7 @@ def _record_timed_resume_run(
     root: Path, milestone: str, *, story_id: str | None = None
 ) -> None:
     """An escalated milestone (or, with `story_id`, story) run recorded with `TIMED_CONFIG`."""
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         opened.record_run(
             models.Run(

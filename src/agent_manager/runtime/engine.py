@@ -25,12 +25,13 @@ from agent_manager.runtime import context
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import worktree
+from agent_manager.store import db as store_db
 from agent_manager.workflow.phases import Workflow
 
 if TYPE_CHECKING:
     # Annotation only (the module has `from __future__ import annotations`);
     # the name `store` is taken by `run_subtask`'s parameter.
-    from agent_manager.store import Checkpoint
+    from agent_manager.store import checkpoints as store_checkpoints
 
 
 class CheckpointMismatch(Exception):
@@ -39,7 +40,7 @@ class CheckpointMismatch(Exception):
     is built, so nothing is run or recorded."""
 
 
-def pending_phase(checkpoint: Checkpoint) -> str | None:
+def pending_phase(checkpoint: store_checkpoints.Checkpoint) -> str | None:
     """The phase `checkpoint`'s agent would run next, or `None` if it holds no turn.
 
     Read-only: it reads the stored `Agent.to_dict()` and builds nothing, so a
@@ -55,7 +56,7 @@ def pending_phase(checkpoint: Checkpoint) -> str | None:
     return None if turn is None else turn["kwargs"]["phase"]
 
 
-def kept_commands(checkpoint: Checkpoint) -> list[str] | None:
+def kept_commands(checkpoint: store_checkpoints.Checkpoint) -> list[str] | None:
     """The verification commands `checkpoint`'s walk keeps, or `None` if it does not say.
 
     Read-only, as `pending_phase` is: it reads the `"subtask"` seed item out of
@@ -90,7 +91,7 @@ def run_subtask(
     clock: Callable[[], Any] = walk._utcnow,
     ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`
     around `run_subtask_async`, which documents the parameters."""
@@ -129,7 +130,7 @@ async def run_subtask_async(
     clock: Callable[[], Any] = walk._utcnow,
     ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on the running event loop.
 
@@ -142,6 +143,10 @@ async def run_subtask_async(
     phase is not started, and the subtask is recorded `stopped before
     <phase>`. A trigger after the last phase finished changes nothing: the
     subtask ends `done`.
+
+    A `StoreBusyError` from any write of the walk -- a phase or attempt
+    record, a checkpoint save -- ends it at that write: `stop` is triggered
+    with `story_id`, nothing more is written, and the same error is raised.
 
     `resume_from` continues from a saved checkpoint instead of the first phase:
     the agent is rebuilt from it, so the pool (seed and earlier results) and
@@ -251,7 +256,7 @@ async def run_subtask_async(
 
 
 async def _worktree_kept(
-    checkpoint: Checkpoint,
+    checkpoint: store_checkpoints.Checkpoint,
     subtask: Any,
     repo_dir: Path,
     ensure_worktree: Callable[..., Mapping[str, object]],
@@ -330,6 +335,14 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
         # A missing runner or an unresolvable input: a wiring or workflow bug
         # raised to the caller, `.phase`/`.parameter` intact.
         # Not an escalation, so no checkpoint row.
+        raise
+    except store_db.StoreBusyError:
+        # A store write gave up after its retry budget. Nothing more is
+        # written for this subtask -- no checkpoint, no phase, no subtask
+        # row -- so the newest committed `turn` row stays the one a resume
+        # continues from. The stop parks every agent on the signal.
+        if deps.stop is not None:
+            deps.stop.trigger(deps.story_id)
         raise
     except Exception as error:
         _collect(agent, deps, summary)

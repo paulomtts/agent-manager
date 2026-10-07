@@ -22,7 +22,9 @@ import pytest
 from conftest import BINARY_TIERS, missing_binary
 from typer.testing import CliRunner
 
-from agent_manager import board, census, cli, dag, models, paths, store
+from agent_manager import board, census, cli, dag, models, paths
+from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 FAKE_CLAUDE_SOURCE = Path(__file__).with_name("fake_claude.py")
 """The script copied to a tmp dir as the `claude` the adapter will find."""
@@ -247,9 +249,9 @@ def completed_run(project, cards, fake_claude_bin) -> dict[str, Any]:
 @pytest.fixture(scope="module")
 def run_tree(project, completed_run) -> models.Run:
     """The run's `Store` projection, read back the way `status` reads it."""
-    conn = store.open_db(project)
+    conn = store_db.open_db(project)
     try:
-        run = store.load_run(conn, completed_run["run_id"])
+        run = store_queries.load_run(conn, completed_run["run_id"])
     finally:
         conn.close()
     assert run is not None, completed_run["run_id"]
@@ -627,7 +629,7 @@ def checkpoint_rows() -> Callable[[Path, str], int]:
     """
 
     def count(root: Path, run_id: str) -> int:
-        conn = store.open_db(cli.resolve_repo_dir(root))
+        conn = store_db.open_db(cli.resolve_repo_dir(root))
         try:
             (rows,) = conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE run_id = ?", (run_id,)
@@ -701,9 +703,11 @@ class AmProcesses:
         self.stderr_paths[child.pid] = stderr_path
         return self.track(child)
 
-    def spawn(self, *args: str, env: Mapping[str, str] | None = None) -> subprocess.Popen:
-        """Start `am *args` as a real child process and track it."""
-        return self._start([sys.executable, "-c", AM_ENTRY, *args], env)
+    def spawn(
+        self, *args: str, env: Mapping[str, str] | None = None, entry: str = AM_ENTRY
+    ) -> subprocess.Popen:
+        """Start `am *args` as a real child process running `entry`, and track it."""
+        return self._start([sys.executable, "-c", entry, *args], env)
 
     def spawn_console(
         self, *args: str, env: Mapping[str, str] | None = None
@@ -790,7 +794,7 @@ def am_processes(tmp_path) -> Any:
 
 @pytest.fixture
 def spawn_am(am_processes) -> Callable[..., subprocess.Popen]:
-    """`spawn_am(*args, env=None)`: start a real `am` child and return it."""
+    """`spawn_am(*args, env=None, entry=AM_ENTRY)`: start a real `am` child and return it."""
     return am_processes.spawn
 
 

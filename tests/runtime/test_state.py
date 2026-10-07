@@ -7,7 +7,7 @@ import dataclasses
 
 import pytest
 
-from agent_manager import store as store_module
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.runtime.state import Adoption, RunDeps
 
 
@@ -16,7 +16,7 @@ def _deps(adopt: Adoption | None = None) -> RunDeps:
 
 
 def test_an_adoption_is_built_from_a_turn_floor_and_is_frozen():
-    adoption = Adoption(**vars(store_module.TurnFloor("explore", 1, "run-earlier", 2)))
+    adoption = Adoption(**vars(store_checkpoints.TurnFloor("explore", 1, "run-earlier", 2)))
 
     assert adoption == Adoption("explore", 1, "run-earlier", 2)
     with pytest.raises(dataclasses.FrozenInstanceError):

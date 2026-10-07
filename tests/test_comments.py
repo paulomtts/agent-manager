@@ -10,7 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import board, comments, locks, store
+from agent_manager import board, comments, locks
+from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
+from agent_manager.store import writer as store_writer
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -774,15 +777,15 @@ def root(tmp_path) -> Path:
 
 
 @pytest.fixture
-def stores(root) -> Iterator[Callable[..., store.Store]]:
+def stores(root) -> Iterator[Callable[..., store_writer.Store]]:
     """Open any number of `Store`s on `root`, each on its own connection; close them all.
 
     A local copy of `tests/test_store.py`'s `stores` fixture (M10 takeover pattern).
     """
-    opened: list[store.Store] = []
+    opened: list[store_writer.Store] = []
 
-    def open_store(run_id: str = RUN) -> store.Store:
-        st = store.Store.open(root, run_id)
+    def open_store(run_id: str = RUN) -> store_writer.Store:
+        st = store_writer.Store.open(root, run_id)
         opened.append(st)
         return st
 
@@ -795,11 +798,11 @@ def _at(minute: int) -> datetime:
     return datetime(2026, 9, 30, 12, minute, tzinfo=timezone.utc)
 
 
-def _alive(row: store.LeaseRow) -> bool:
+def _alive(row: store_leases.LeaseRow) -> bool:
     return True
 
 
-def _dead(row: store.LeaseRow) -> bool:
+def _dead(row: store_leases.LeaseRow) -> bool:
     return False
 
 
@@ -809,7 +812,7 @@ def _comment(card_id: str, event: str, *, run_id: str = RUN) -> comments.Comment
     return comments.Comment(card_id=card_id, key=comment_key, body=body)
 
 
-def _row(st: store.Store, key: str):
+def _row(st: store_writer.Store, key: str):
     return st.connection.execute(
         "SELECT * FROM board_comments WHERE key = ?", (key,)
     ).fetchone()
@@ -871,7 +874,7 @@ def test_enqueue_on_a_taken_over_store_raises_and_writes_no_row(stores):
     b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
     comment = _comment("card-a", "done")
 
-    with pytest.raises(store.LeaseLostError) as caught:
+    with pytest.raises(store_leases.LeaseLostError) as caught:
         comments.enqueue(a, comment, run_id=RUN, now=_at(2))
 
     assert caught.value.holder is not None and caught.value.holder.token == "t2"
@@ -937,7 +940,7 @@ class _Crash(Exception):
 class CrashOnFirstMark:
     """A `Store` whose first `mark_comment_posted` raises `error`; everything else delegates."""
 
-    def __init__(self, inner: store.Store, error: BaseException) -> None:
+    def __init__(self, inner: store_writer.Store, error: BaseException) -> None:
         self._inner = inner
         self._error = error
         self.marks = 0
@@ -1166,7 +1169,7 @@ def test_three_failures_abandon_a_row_with_one_warning(stores, root):
     assert comment.key in third[0] and "card-a" in third[0] and "abandoned" in third[0]
     assert "will retry" not in third[0]
     row = _row(st, comment.key)
-    assert (row["state"], row["failed_attempts"]) == ("abandoned", store.COMMENT_ATTEMPTS)
+    assert (row["state"], row["failed_attempts"]) == ("abandoned", store_outbox.COMMENT_ATTEMPTS)
     assert st.pending_comments() == []
 
     fake.down = False
@@ -1197,9 +1200,9 @@ def test_a_lost_lease_while_marking_propagates_and_counts_no_failure(stores, roo
     st = stores()
     comment = _queue(st, "card-a", "done")
     fake = FakeBoard()
-    losing = CrashOnFirstMark(st, store.LeaseLostError(RUN, None))
+    losing = CrashOnFirstMark(st, store_leases.LeaseLostError(RUN, None))
 
-    with pytest.raises(store.LeaseLostError):
+    with pytest.raises(store_leases.LeaseLostError):
         comments.flush(losing, root, board_api=fake)
 
     row = _row(st, comment.key)

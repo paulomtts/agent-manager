@@ -39,7 +39,8 @@ from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, _ref_exists, merge_tip
 from agent_manager.steps.worktree import GitError, ensure, run_git
-from agent_manager.store import Checkpoint, Store
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 BASES_STORY_ID = "bases"
@@ -167,14 +168,14 @@ async def _resolve_conflict(
     run_id: str,
     runner_factory: runs.RunnerFactory,
     stop: StopSignal | None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskSummary:
     """Walk `workflow.integrate.INTEGRATE` once for one conflicting tip.
 
     Mirrors `integration._resolve_conflict`, awaited on the running loop and
     stop-aware. The synthetic subtask `base-<story id>` is recorded before the
-    engine journals its first phase, because `store.rebuild_from_journal`
-    refuses a phase whose subtask no earlier line created. The caller has
+    engine records its first phase, because `store.rebuild_from_events`
+    refuses a phase whose subtask no earlier event created. The caller has
     already recorded the `bases` story. `resume_from` continues the walk from
     a saved checkpoint (card 54e4ec29); the engine then binds from the
     checkpoint's pool, so `tip` and `files` only name it.
@@ -255,7 +256,7 @@ async def build(
     story_id: str | None,
     runner_factory: runs.RunnerFactory | None,
     stop: StopSignal | None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> BaseResult:
     """Cut `root.branch` from `tips[0]`, merge every other tip, verify once.
 

@@ -28,7 +28,10 @@ from typing import Any, get_args
 
 import pytest
 
-from agent_manager import cli, detach, paths, store
+from agent_manager import cli, detach, paths
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 
 PREFIX = "m3"
 """The `--branch-prefix` of this scenario; equals the e2e conftest's `MILESTONE_PREFIX`."""
@@ -45,9 +48,9 @@ CONTROL_KEYS_NEVER_PRESENT = {"escalated", "failed_phase", "integrated", "done"}
 """A paused payload never escalates, never names a failed phase and never
 reaches Integrate (live control C6); as in test_live_control.py."""
 
-EVENT_KINDS = frozenset(get_args(store.EventKind))
+EVENT_KINDS = frozenset(get_args(store_journal.EventKind))
 
-JOURNAL_KEYS = frozenset(store.JournalLine.model_fields)
+JOURNAL_KEYS = frozenset(store_journal.JournalLine.model_fields)
 """Every key a JournalLine dumps; `am watch` prints `model_dump(mode="json")`."""
 
 
@@ -59,10 +62,10 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
         time.sleep(POLL)
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
@@ -262,7 +265,8 @@ def test_a_detached_milestone_run_is_watched_paused_and_resumed_to_done(
     assert _status(am, root, run_id)["run"]["status"] == "done"
     assert _lease(root, run_id) is None
 
-    # 8. One stream across both lives: exactly the journal, seq 1..N.
+    # 8. One stream across both lives: exactly the journal, seq strictly
+    # increasing (lease and control events take numbers the journal skips).
     code, once = am("watch", run_id)
     assert code == 0, once
     assert once["ok"] is True, once
@@ -273,9 +277,8 @@ def test_a_detached_milestone_run_is_watched_paused_and_resumed_to_done(
         f"the stream reaching seq {last_seq}",
     )
     assert stream.events == expected
-    assert [event["seq"] for event in stream.events] == list(
-        range(1, len(stream.events) + 1)
-    )
+    seqs = [event["seq"] for event in stream.events]
+    assert seqs == sorted(set(seqs)) and seqs[0] >= 1, seqs
     statuses = _collapse(_run_statuses(stream.events))
     assert _is_subsequence(["started", "stopped", "started", "done"], statuses), statuses
 

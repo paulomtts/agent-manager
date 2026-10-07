@@ -19,7 +19,9 @@ from typing import Any
 
 import pytest
 
-from agent_manager import dispatch, models, results, store as store_module
+from agent_manager import dispatch, models, results
+from agent_manager.store import db as store_db
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime import walk
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
@@ -332,7 +334,7 @@ def store(monkeypatch, tmp_path):
     """A real temp projection plus a real temp journal, writing nowhere real."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -2083,7 +2085,7 @@ def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path, run
         return {"ok": True}
 
     workflow = phase_model.Workflow("one", (Step("only", step),))
-    store = store_module.Store.open(tmp_path, "run-extra-1")
+    store = store_writer.Store.open(tmp_path, "run-extra-1")
 
     summary = run_subtask(
         workflow,
@@ -2103,7 +2105,7 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path, run_subta
     overwrite one would point every later step at a path the engine never chose.
     """
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
-    store = store_module.Store.open(tmp_path, "run-extra-2")
+    store = store_writer.Store.open(tmp_path, "run-extra-2")
 
     with pytest.raises(walk.EngineError) as caught:
         run_subtask(
@@ -2122,7 +2124,7 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path, ru
     """A caller that could set `base_branch` would point `review_gate` at a base
     the engine never derived, while every step still used the real one."""
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
-    store = store_module.Store.open(tmp_path, "run-extra-3")
+    store = store_writer.Store.open(tmp_path, "run-extra-3")
 
     with pytest.raises(walk.EngineError) as caught:
         run_subtask(
@@ -2790,3 +2792,259 @@ def test_an_agent_turn_timeout_grows_by_the_runners_limit_wait_allowance():
     plain = compiled.turn_for("explore", 0).timeout
     assert compiled.turn_for("explore", 0, 7200.0).timeout == plain + 7200.0
     assert compiled.turn_for("prepare", 0, 7200.0).timeout == turns.STEP_TIMEOUT
+
+
+# ── a store write that gave up stops the walk with no further write ─────────
+
+
+def _checkpoint_reasons(opened) -> list[str]:
+    return [
+        row[0]
+        for row in opened.connection.execute(
+            "SELECT reason FROM checkpoints ORDER BY card_id, seq"
+        ).fetchall()
+    ]
+
+
+def _busy(operation: str = "record_phase") -> store_db.StoreBusyError:
+    return store_db.StoreBusyError(operation, 5, 10.0)
+
+
+def test_a_busy_store_error_from_an_agent_phase_stops_the_walk_without_writing(
+    store, run_subtask
+):
+    busy = _busy()
+    calls: list[str] = []
+
+    def a(card: str) -> dict[str, Any]:
+        calls.append("a")
+        return {}
+
+    def b(card: str) -> dict[str, Any]:
+        calls.append("b")
+        return {}
+
+    def agent_runner(phase, context, rendered):
+        calls.append(phase.name)
+        raise busy
+
+    workflow = phase_model.Workflow(
+        "busy_agent", (Step("a", a), _agent("explore", "explorer"), Step("b", b))
+    )
+    stop = StopSignal()
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            agent_runner=agent_runner,
+            stop=stop,
+        )
+
+    # pygents and the bridge hand a tool's exception back as the same object.
+    assert caught.value is busy
+    assert calls == ["a", "explore"]
+    assert stop.triggered is True
+    assert stop.primary == STORY_ID
+    assert _checkpoint_reasons(store) == ["turn", "turn"]
+    newest = store.latest_checkpoint(_subtask().card_id)
+    assert newest.reason == "turn"
+    assert new_engine.pending_phase(newest) == "explore"
+    assert _journalled_phases(store) == [("a", "started"), ("a", "done")]
+    assert _subtask_journal_statuses(store) == []
+    assert _projected_subtask_status(store) is None
+
+
+def test_a_busy_store_error_from_a_critic_never_loops_back(store, run_subtask):
+    busy = _busy()
+    calls: list[str] = []
+
+    def agent_runner(phase, context, rendered):
+        calls.append(phase.name)
+        if phase.name == "review":
+            raise busy
+        return {"ok": True}
+
+    workflow = phase_model.Workflow(
+        "busy_critic",
+        (
+            _agent("implement", "coder"),
+            phase_model.AgentPhase(
+                "review",
+                role="reviewer",
+                inputs=(),
+                result=None,
+                on_fail=phase_model.Goto("implement"),
+            ),
+        ),
+    )
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        run_subtask(
+            workflow,
+            store,
+            story_id=STORY_ID,
+            subtask=_subtask(),
+            repo_dir=REPO,
+            agent_runner=agent_runner,
+        )
+
+    assert caught.value is busy
+    assert calls == ["implement", "review"]
+    assert _checkpoint_reasons(store) == ["turn", "turn"]
+    assert _projected_subtask_status(store) is None
+
+
+@pytest.mark.parametrize("with_stop", [True, False], ids=["stop", "no-stop"])
+def test_a_busy_done_record_of_a_step_stops_the_walk_without_writing(
+    store, run_subtask, monkeypatch, with_stop
+):
+    busy = _busy()
+    attempted: list[tuple[str, str]] = []
+    real_record_phase = store.record_phase
+
+    def record_phase(story_id, card_id, phase):
+        attempted.append((phase.name, phase.status))
+        if (phase.name, phase.status) == ("alpha", "done"):
+            raise busy
+        return real_record_phase(story_id, card_id, phase)
+
+    monkeypatch.setattr(store, "record_phase", record_phase)
+    calls: list[str] = []
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        return {}
+
+    workflow = _workflow(TWO_PHASES, {"step.alpha": alpha, "step.beta": beta})
+    stop = StopSignal() if with_stop else None
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        run_subtask(
+            workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO, stop=stop
+        )
+
+    assert caught.value is busy
+    assert calls == ["alpha"]
+    assert attempted == [("alpha", "started"), ("alpha", "done")]
+    assert _checkpoint_reasons(store) == ["turn"]
+    assert _subtask_journal_statuses(store) == []
+    if stop is not None:
+        assert stop.primary == STORY_ID
+
+
+def test_a_busy_turn_checkpoint_stops_the_walk_without_writing(
+    store, run_subtask, monkeypatch
+):
+    busy = _busy("save_checkpoint")
+    saves: list[str] = []
+    real_save = store.save_checkpoint
+
+    def save_checkpoint(card_id, **kwargs):
+        saves.append(kwargs["reason"])
+        if len(saves) == 2:
+            # The `BEFORE_TURN` save of `beta`'s turn, outside any phase.
+            raise busy
+        return real_save(card_id, **kwargs)
+
+    monkeypatch.setattr(store, "save_checkpoint", save_checkpoint)
+    calls: list[str] = []
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        return {}
+
+    workflow = _workflow(TWO_PHASES, {"step.alpha": alpha, "step.beta": beta})
+    stop = StopSignal()
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        run_subtask(
+            workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO, stop=stop
+        )
+
+    assert caught.value is busy
+    assert calls == ["alpha"]
+    assert saves == ["turn", "turn"]
+    assert _checkpoint_reasons(store) == ["turn"]
+    assert _journalled_phases(store) == [("alpha", "started"), ("alpha", "done")]
+    assert _subtask_journal_statuses(store) == []
+    assert stop.primary == STORY_ID
+
+
+def test_a_busy_parked_checkpoint_stops_the_walk_without_writing(
+    store, run_subtask, monkeypatch
+):
+    # Review Focus 4: a run already paused by a control when its `parked`
+    # save is the write that stays busy.
+    busy = _busy("save_checkpoint")
+    real_save = store.save_checkpoint
+
+    def save_checkpoint(card_id, **kwargs):
+        if kwargs["reason"] == "parked":
+            raise busy
+        return real_save(card_id, **kwargs)
+
+    monkeypatch.setattr(store, "save_checkpoint", save_checkpoint)
+    calls: list[str] = []
+
+    def alpha(card: str) -> dict[str, Any]:
+        calls.append("alpha")
+        return {}
+
+    def beta(card: str) -> dict[str, Any]:
+        calls.append("beta")
+        return {}
+
+    workflow = _workflow(TWO_PHASES, {"step.alpha": alpha, "step.beta": beta})
+    stop = StopSignal()
+    stop.request("pause")
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        run_subtask(
+            workflow, store, story_id=STORY_ID, subtask=_subtask(), repo_dir=REPO, stop=stop
+        )
+
+    assert caught.value is busy
+    assert calls == []
+    assert _checkpoint_reasons(store) == []
+    assert _projected_subtask_status(store) is None
+    assert stop.primary == STORY_ID
+
+
+def test_an_ordinary_step_error_still_escalates_and_never_triggers_the_stop(
+    store, run_subtask
+):
+    # Regression guard: only a `StoreBusyError` takes the new path.
+    def alpha(card: str) -> dict[str, Any]:
+        raise RuntimeError("not the store")
+
+    def beta(card: str) -> dict[str, Any]:
+        return {}
+
+    stop = StopSignal()
+    summary = run_subtask(
+        _workflow(TWO_PHASES, {"step.alpha": alpha, "step.beta": beta}),
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        stop=stop,
+    )
+
+    assert summary.status == "escalated"
+    assert summary.failed_phase == "alpha"
+    assert "RuntimeError: not the store" in summary.detail
+    assert _checkpoint_reasons(store) == ["turn", "escalated"]
+    assert _subtask_journal_statuses(store) == ["escalated"]
+    assert stop.triggered is False

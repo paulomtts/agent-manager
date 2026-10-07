@@ -41,7 +41,7 @@ from agent_manager.integration import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
-from agent_manager.store import Store
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 BASE = "main"
@@ -581,7 +581,7 @@ def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     assert subtask.base_branch == BASE
     assert subtask.worktree_path == repo.worktree
     assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
-    rebuilt = store.rebuild_from_journal(RUN_ID)
+    rebuilt = store.rebuild_from_events(RUN_ID)
     assert [s.card_id for s in rebuilt.stories] == ["integrate"]
     assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
     assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]

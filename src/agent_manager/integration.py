@@ -11,8 +11,8 @@ that worktree, and `verification_passed_gate` judges what it measured.
 A conflicting tip is handed to `workflow.integrate.INTEGRATE` (resolve, then
 verify) through `runtime.engine.run_subtask`, under a synthetic "Integrate" story with
 one synthetic subtask per conflicting story. Both are recorded before the
-engine journals any phase, because `store.rebuild_from_journal` refuses a phase
-whose story or subtask no earlier line created. A resolver that does not finish
+engine records any phase, because `store.rebuild_from_events` refuses a phase
+whose story or subtask no earlier event created. A resolver that does not finish
 stops the run with the merge left in progress for a human.
 
 Integrate never checks out, merges into, resets or pushes the base branch or a
@@ -32,7 +32,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
-from agent_manager.store import Store
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 PHASE = "integrate"

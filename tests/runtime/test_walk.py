@@ -17,7 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import models, paths, store as store_module
+from agent_manager import models, paths
+from agent_manager.store import db as store_db
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime import walk
 from agent_manager.steps import reducers, verify
 from agent_manager.runtime.errors import EngineError
@@ -67,7 +69,7 @@ FIXED = datetime(2026, 9, 30, tzinfo=timezone.utc)
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -120,6 +122,19 @@ def test_run_one_step_records_a_raising_gate_as_failed_with_the_error_text(store
         ("verify", "started", None),
         ("verify", "failed", "ValueError: gate blew up"),
     ]
+
+
+def test_run_one_step_lets_a_busy_store_error_from_the_step_propagate(store):
+    busy = store_db.StoreBusyError("record_phase", 5, 10.0)
+
+    def step() -> dict:
+        raise busy
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        _run(store, Step("verify", step))
+
+    assert caught.value is busy
+    assert _phase_rows(store) == [("verify", "started", None)]
 
 
 def test_run_one_step_records_a_non_mapping_gate_as_failed_engine_error(store):

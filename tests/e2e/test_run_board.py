@@ -38,8 +38,11 @@ from agent_manager import (
     models,
     orchestrate,
     paths,
-    store,
 )
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
 """Must equal the conftest's `VERIFY_COMMANDS`: a real, green command for this toy repo."""
@@ -128,9 +131,9 @@ def _entries(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
@@ -138,7 +141,7 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _run_ids(root: Path) -> list[str]:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [row["id"] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -184,18 +187,22 @@ def _plant_lease(root: Path, key: str) -> None:
 
     Live by C2: this process's pid, this host, a fresh heartbeat.
     """
-    now = datetime.now(timezone.utc).isoformat()
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    stamp = datetime.now(timezone.utc)
+    now = stamp.isoformat()
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        with store.immediate(conn):
+        with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, resolved, now=stamp)
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)",
-                (OTHER_RUN_ID, "other-life", os.getpid(), HERE, now, now),
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (project_id, OTHER_RUN_ID, "other-life", os.getpid(), HERE, now, now),
             )
             conn.execute(
-                "INSERT INTO run_claims (key, run_id, token, claimed_at) VALUES (?, ?, ?, ?)",
-                (key, OTHER_RUN_ID, "other-life", now),
+                "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (project_id, key, OTHER_RUN_ID, "other-life", now),
             )
     finally:
         conn.close()
@@ -242,7 +249,7 @@ def test_two_independent_milestones_both_finish(board_root):
     real_stories: dict[str, set[str]] = {}
     for milestone in (x, y):
         run_id = entries[milestone["id"]]["run_id"]
-        lines = store.Journal(run_id).read()
+        lines = store_journal.Journal(run_id).read()
         assert lines, run_id
         assert lines[0].event == "run_upsert", lines[0]
         assert lines[0].payload["milestone_id"] == milestone["id"]

@@ -595,7 +595,7 @@ am cancel 20260930T101500Z-bdc5838b
 
 Both take `--repo-dir` (default `.`, the repository the run belongs to) and `--pretty`, and both work on a `--milestone` run and on a `--card` run. There is no `--wait`: the command records the request and returns at once. The run's own report, or `am status <run-id>`, shows when it has landed.
 
-How the request reaches the run: it is a row in the repository's SQLite projection, the same database `am status` reads. There is no signal, socket or fifo. While a run is going, its process holds a lease on it, a row whose heartbeat it moves every 5 seconds, and it looks for new requests about once a second. A lease whose heartbeat is older than 30 seconds, or whose pid no longer exists on the same host, is dead, and a run with a dead lease cannot be asked anything.
+How the request reaches the run: it is a row in the repository's SQLite projection, the same database `am status` reads. There is no signal, socket or fifo. While a run is going, its process holds a lease on it, a row whose heartbeat it moves every 5 seconds, and it looks for new requests about once a second. A lease whose heartbeat is older than 30 seconds, or whose pid no longer exists on the same host, is dead, and a run with a dead lease cannot be asked anything. If the database stays busy through a write's whole retry budget, the run stops at that write with a `StoreBusyError` envelope (exit code 3) and writes nothing more for it; once its lease is stale, `am resume <run-id>` continues it from its last saved turn.
 
 A recorded request exits 0 and prints:
 
@@ -636,7 +636,7 @@ Which report you get when more than one thing happened:
 
 `am status <run-id>` always has a `control` key: `{"lease": {"pid", "host", "acquired_at", "heartbeat_at", "accepting", "live"} or null, "requests": [{"command", "requested_at", "handled_at"}], "claims": ["card:<id>", "branch:<name>", ...]}`. `claims` lists the keys the run's lease holds while it is live, and is empty otherwise (see [Several am processes](#several-am-processes)). `requests` lists the requests from every life of the run, in the order they were made, and `handled_at` is `null` until the run has acted on one. `live` is worked out when `am status` reads the lease; it is not stored. `accepting` turns `false` when the run is finishing.
 
-`am status <run-id>` also always has an `integrity` key: `{"checked", "reason", "mismatches"}`. It compares the run's journal, which `am` appends before every write, with the projection `am status` reads. The journal rebuilds only the run's tree (`runs`, `stories`, `subtasks`, `phases`, `attempts`); the six row-only tables (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`, `board_comments`) have no journal and are the projection's alone, so they are never compared. When no comparison was made, `checked` is `false` and `reason` says why: `"lease is live"` (a running process's writes in flight are not divergence), `"no journal"`, or `"journal unreadable: <error>"`. Otherwise `checked` is `true` and `reason` is `null`. Each entry of `mismatches` is `{"node", "field", "journal", "projection", "kind"}`: `node` is `{"story", "card", "phase", "attempt"}`, all `null` for the run itself; `field` is `"status"` when both sides have the node with different statuses and `null` when only one side has it; `journal` and `projection` are each side's status, `null` on the side that lacks the node. Only statuses and the tree's shape are compared. The check only reports: it writes nothing and never changes the exit code. A `stale` mismatch means the journal is ahead, and a resume or a rebuild moves the projection forward. A `foreign` mismatch means something other than `am` wrote this row.
+`am status <run-id>` also always has an `integrity` key: `{"checked", "reason", "mismatches"}`. It compares the run's events, which `am` records in the same transaction as every row it writes, with the projection `am status` reads; the run's `journal.jsonl` file is not read. The events rebuild only the run's tree (`runs`, `stories`, `subtasks`, `phases`, `attempts`); the six row-only tables (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`, `board_comments`) have no events and are the projection's alone, so they are never compared. When no comparison was made, `checked` is `false` and `reason` says why: `"lease is live"` (a running process's writes in flight are not divergence), `"no events"`, or `"events unreadable: <error>"`. Otherwise `checked` is `true` and `reason` is `null`. Each entry of `mismatches` is `{"node", "field", "journal", "projection", "kind"}`: `node` is `{"story", "card", "phase", "attempt"}`, all `null` for the run itself; `field` is `"status"` when both sides have the node with different statuses and `null` when only one side has it; `journal` is the status the run's events replay to and `projection` the projection's, each `null` on the side that lacks the node. Only statuses and the tree's shape are compared. The check only reports: it writes nothing and never changes the exit code. A `stale` mismatch means the events are ahead, and a resume or a rebuild moves the projection forward. A `foreign` mismatch means something other than `am` wrote this row.
 
 `am status <run-id>` also always has a `warnings` key: `[]`, or a list holding the run's isolation warning, `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`, when `--isolation auto` found neither `bwrap` nor `unshare` and the run went un-isolated (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
@@ -745,7 +745,7 @@ Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and not
 
 #### The journal line
 
-Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store.py`):
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`):
 
 ```
 {"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}
@@ -753,7 +753,7 @@ Every event, in the envelope's `events` and on the stream, is one journal line (
 
 | Field | What it holds |
 |---|---|
-| `seq` | the line's number in its run's journal, from 1, increasing |
+| `seq` | the line's number in its run's journal, increasing; a run's other events (lease and control) take numbers too, so the first line may be above 1 and numbers may skip |
 | `ts` | when the line was written, ISO 8601 in UTC |
 | `run_id` | the run |
 | `event` | which kind of node the line records, one of the five below |

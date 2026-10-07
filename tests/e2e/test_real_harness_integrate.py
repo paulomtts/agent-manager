@@ -41,7 +41,9 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, cli, dag, integration, orchestrate, store
+from agent_manager import board, cli, dag, integration, orchestrate
+from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 
 pytestmark = pytest.mark.e2e
 
@@ -359,9 +361,9 @@ def test_the_real_claude_resolves_a_real_merge_conflict_at_integrate(
         )
 
     # 10. The resolver's attempt is on record under the synthetic story.
-    conn = store.open_db(project)
+    conn = store_db.open_db(project)
     try:
-        run = store.load_run(conn, completed_run["run_id"])
+        run = store_queries.load_run(conn, completed_run["run_id"])
     finally:
         conn.close()
     assert run is not None, completed_run["run_id"]

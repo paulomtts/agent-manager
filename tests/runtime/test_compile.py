@@ -17,7 +17,8 @@ from typing import Any
 import pytest
 from pygents import Agent, ContextPool, ContextQueue, ToolRegistry
 
-from agent_manager import models, store as store_module
+from agent_manager import models
+from agent_manager.store import writer as store_writer
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import compile as C, context, state
@@ -34,7 +35,7 @@ _agent_names = itertools.count()
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 

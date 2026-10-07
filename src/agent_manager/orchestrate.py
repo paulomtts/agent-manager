@@ -83,7 +83,11 @@ from agent_manager import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Checkpoint, Store, load_run, open_db
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import Workflow
@@ -368,7 +372,7 @@ class Driver(Protocol):
         allow_no_verification: bool = False,
         runner_factory: runs.RunnerFactory | None = None,
         stop: StopSignal | None = None,
-        resume_from: Checkpoint | None = None,
+        resume_from: store_checkpoints.Checkpoint | None = None,
     ) -> cli.SubtaskDrive: ...
 
 
@@ -461,7 +465,7 @@ class SupervisorPlan:
     roots: dict[str, dag.RootPlan]
     tips: dict[str, str]
     rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
-    checkpoints: Mapping[str, Checkpoint] = field(default_factory=dict)
+    checkpoints: Mapping[str, store_checkpoints.Checkpoint] = field(default_factory=dict)
     resuming: bool = False
 
     @property
@@ -477,7 +481,7 @@ def supervisor_plan(
     *,
     branch_prefix: str,
     base_branch: str,
-    checkpoints: Mapping[str, Checkpoint] | None = None,
+    checkpoints: Mapping[str, store_checkpoints.Checkpoint] | None = None,
 ) -> SupervisorPlan:
     """Every census story's root and tip beside the pending waves and their rows.
 
@@ -593,12 +597,17 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
     `Store.open` would construct a `Journal`. Refused, in this order (live
-    control C9): an unknown run, a run of another workflow, then a run
-    canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
+    control C9): an unknown run (a run of another repository's project is
+    unknown), a run of another workflow, then a run canceled in either
+    spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
-    conn = open_db(root)
+    conn = store_db.open_db(root)
     try:
-        run = load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
+        if run is not None and store_queries.run_project_id(
+            conn, run_id
+        ) != store_projects.lookup(conn, root):
+            run = None
     finally:
         conn.close()
     if run is None:
@@ -677,7 +686,7 @@ def open_cards(
     return cards
 
 
-def _refuse_changed_workflow(checkpoint: Checkpoint, workflow: Workflow, run_id: str) -> None:
+def _refuse_changed_workflow(checkpoint: store_checkpoints.Checkpoint, workflow: Workflow, run_id: str) -> None:
     """`runs.CheckpointMismatchError` when `checkpoint` was saved under another digest.
 
     Worded like `cli.checkpoint_resume_phase`'s refusal, with the milestone
@@ -693,7 +702,7 @@ def _refuse_changed_workflow(checkpoint: Checkpoint, workflow: Workflow, run_id:
         )
 
 
-def resume_point(store: Store, card_id: str, workflow: Workflow) -> Checkpoint | None:
+def resume_point(store: Store, card_id: str, workflow: Workflow) -> store_checkpoints.Checkpoint | None:
     """The checkpoint a resume continues `card_id` from, None to start it fresh, or a refusal.
 
     The newest row of `card_id` in this store's run decides. None, or `done`
@@ -718,13 +727,13 @@ def resume_point(store: Store, card_id: str, workflow: Workflow) -> Checkpoint |
 
 def resume_checkpoints(
     store: Store, cards: Sequence[tuple[str, Workflow]]
-) -> dict[str, Checkpoint]:
+) -> dict[str, store_checkpoints.Checkpoint]:
     """`resume_point` for every open card, keyed by card id, only where there is one.
 
     Reads only, so a refusal on any card leaves everything as it was: the
     whole resume is refused (spec, Error paths).
     """
-    found: dict[str, Checkpoint] = {}
+    found: dict[str, store_checkpoints.Checkpoint] = {}
     for card_id, workflow in cards:
         checkpoint = resume_point(store, card_id, workflow)
         if checkpoint is not None:
@@ -849,7 +858,7 @@ async def build_merged_base(
     allow_no_verification: bool,
     runner_factory: runs.RunnerFactory | None,
     stop: StopSignal,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> None:
     """Await `bases.build` for one merged-root story (supervisor-tree §5).
 
@@ -1975,7 +1984,7 @@ class RecordedMilestoneRun:
     store: Store
     lease: control.Lease
     rows: dict[str, tuple[models.StoryRun, dict[str, models.SubtaskRun]]]
-    checkpoints: dict[str, Checkpoint] | None
+    checkpoints: dict[str, store_checkpoints.Checkpoint] | None
 
 
 @contextmanager
@@ -1995,7 +2004,7 @@ def recorded_milestone_run(pre: MilestonePreflight) -> Iterator[RecordedMileston
     """
     store = Store.open(pre.root, pre.run_id)
     try:
-        checkpoints: dict[str, Checkpoint] | None = None
+        checkpoints: dict[str, store_checkpoints.Checkpoint] | None = None
         cards: list[tuple[str, Workflow]] = []
         if pre.resumed is not None:
             cards = open_cards(

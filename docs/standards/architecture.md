@@ -36,8 +36,8 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 3 | Core | `prompt` | Resolves a phase's inputs and renders its prompt |
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
 | 5 | Adapters | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; re-exec with a neutral argv; the harness Protocol (with its optional `limit_hit`) and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
-| 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`* | Replay and divergence; read models; per-table row types and SQL (they never commit) |
-| 7 | Adapters | *`store.writer`* | `Store`: every write, under one lock and fence (§6.4) |
+| 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`*, *`store.projects`*, *`store.events`*, *`store.backup`* | Replay and divergence; read models; per-table row types and SQL; `projects` rows resolved or created by `repo_dir`; append-only `events` rows: insert, reads by `seq`, head (they never commit); an online copy of `am.db` through SQLite's backup API, read-only on the source |
+| 7 | Adapters | *`store.writer`*, *`store.legacy`* | `Store`: every write, as a job on one writer thread, under the fence (§6.4); legacy per-project databases read through a private copy and merged into `am.db`, their runs' journals imported into `events` in the same one transaction, marker last |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
 | 9 | Steps | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` | Deterministic steps |
 | 10 | Steps | `steps.docs_commit`, `steps.integrate` | Steps built on `steps.worktree` |
@@ -48,7 +48,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 15 | Runtime | `runtime.checkpoint`, `runtime.compile` | Checkpoint hooks; the workflow compiled into pygents tools |
 | 16 | Runtime | `runtime.engine` | One subtask, one agent, one loop |
 | 17 | Application | `runs`, `comments`, *`envelope`* | Run identity and the shared subtask driver; the comment outbox; the envelope and exit-code contract |
-| 18 | Application | *`handoff`*, *`resolver`*, *`reset`* | The generic detach hand-off; the one conflict resolver; `am reset` |
+| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `journal_check` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; the dual-write checker: `events` against each run's journal file |
 | 19 | Application | `bases`, `integration`, *`card_run`* | The merged base; Integrate; the `--card` run |
 | 20 | Application | *`milestone.plan`*, *`milestone.payloads`* | Pure story plan; lane outcome types and report shapes |
 | 21 | Application | *`milestone.lane`* | The per-story state machine |
@@ -72,19 +72,21 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 52 `.py` files (46 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 66 `.py` files (59 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
-| 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop`, `harness.limits` |
+| 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `store/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop`, `harness.limits` |
 | 1-4 | `census`, `results`, `roles.loader`, `steps.reducers`, `harness.claude_limits` (L1); `dag` (L2); `prompt` (L3); `workflow.phases` (L4) |
-| 5 | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude` |
-| 7 | `store` (splits into L5-L7) |
+| 5 | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, `store.db`, `store.journal` |
+| 6 | `store.replay`, `store.queries`, `store.leases`, `store.checkpoints`, `store.outbox`, `store.projects`, `store.events`, `store.backup` |
+| 7 | `store.writer`, `store.legacy` |
 | 8 | `board`, `control`, `harness.launcher`, `harness.registry` |
 | 9-10 | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` (L9); `steps.docs_commit`, `steps.integrate` (L10) |
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
 | 13-16 | `runtime.walk`, `runtime.bridge`, `runtime.state` (L13); `runtime.context`, `dispatch` (L14); `runtime.checkpoint`, `runtime.compile` (L15); `runtime.engine` (L16) |
 | 17 | `runs`, `comments` |
+| 18 | `migrate`, `journal_check` |
 | 19 | `bases`, `integration` |
 | 24 | `orchestrate` (splits into L19-L24) |
 | 29 | `cli` (splits into L17-L29) |
@@ -123,7 +125,7 @@ All 52 `.py` files (46 modules plus 6 `__init__.py`) appear here exactly once. `
 | 5.1 | `runtime/{checkpoint,compile,context,engine}.py` | `import pygents` | holds |
 | 5.2 | `milestone/schedule.py` (today `orchestrate.py`) | `import grafo` | holds (`orchestrate.py:59`) |
 | 5.3 | `cli/` | `import typer` | holds (`cli.py:34`) |
-| 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129`, `control.py:20,210,251` |
+| 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129` |
 | 5.5 | `board.py` | builds or runs a `brd` argv | holds (`board.py:44-135`) |
 | 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:150`) |
 | 5.7 | `steps/worktree.py` (`run_git`) | runs `git`. Everyone else calls `worktree.run_git`. | holds |
@@ -131,7 +133,7 @@ All 52 `.py` files (46 modules plus 6 `__init__.py`) appear here exactly once. `
 | 5.9 | `detach.py` | `os.fork`, `os.setsid` | holds (`detach.py:149,170`) |
 | 5.10 | `locks.py` | `fcntl` | holds |
 | 5.11 | `paths.py` | derives every path under `<data dir>`. Directories are created only by `paths.ensure`. | **violated:** `cli.py:2411` and `store.py:406` build paths by hand; `paths.py:18,33,57` call `mkdir` |
-| 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391` and `store.py:528` |
+| 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391`, `store.py:528` and `store/writer.py` `Store.open` |
 | 5.15 | `argv_guard.py` | `os.execve` | holds (`argv_guard.py:91`) |
 
 Other rules:
@@ -193,18 +195,22 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 | Target module | L | Takes | Note |
 |---|---|---|---|
-| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `BUSY_TIMEOUT_SECONDS`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
-| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, the `JournalError` family, `_RETIRED_ATTEMPT_KEYS` | the schema contract (§10.1) |
-| `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_walk` and its helpers | pure over journal lines and rows |
-| `store/queries.py` | 6 | `RunSummary`, `RunProgress`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
-| `store/leases.py` | 6 | `RunLease`, `LeaseRow`, `ClaimRow`, `ControlRow`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
+| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
+| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family; `read_verbatim`, `VerbatimJournal`, `VerbatimLine`, `UnimportableLineError`: a journal read as `am migrate` imports it, every value as the file holds it | the schema contract (§10.1) |
+| `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
+| `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
+| `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
 | `store/checkpoints.py` | 6 | `TurnFloor`, `Checkpoint`, readers, the SQL behind `save_checkpoint` | never commits |
 | `store/outbox.py` | 6 | `CommentRow`, `COMMENT_ATTEMPTS`, the SQL behind enqueue/pending/mark | never commits |
+| `store/projects.py` | 6 | `resolve`, `lookup`: the `projects` rows, resolved or created by `repo_dir` | never commits |
+| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_ids`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
+| `store/backup.py` | 6 | `backup`, `BackupResult`, `BackupRefusedError`, `BackupRefusal`: `am backup`'s online copy of `am.db` through SQLite's backup API, read-only on the source, built in a temporary file and put in place with `os.link`, never overwriting | opens `am.db` only through `store_db.open_reader`, never `open_db`; commits nothing to it |
 | `store/writer.py` | 7 | `Store` | §6.4 |
+| `store/legacy.py` | 7 | `LegacyFile`, `read_legacy`, `import_order`, `merge` and their errors: legacy per-project databases read through a private copy and merged into `am.db`; run journals imported into `events` in `import_order` in the same one merge transaction, marker last | commits only its one merge transaction; imports `store/events.py` and `store/journal.py`, both lower layers |
 
 ### 6.4 What stays in one piece
 
-- **`Store`** keeps every write method, together with its `RLock`, its bound lease token and `_fenced()`. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_journal`. Each `record_*` holds the lock and the fence across both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`).
+- **`Store`** keeps every write method, together with its writer thread and job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_events`. Each write is one job on the writer thread, one `BEGIN IMMEDIATE` transaction under the fence; heartbeat writes waiting together share one transaction, each in its own savepoint; each `record_*` job covers both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`), apart from `store.legacy.merge`'s one migration transaction. A forked child gets an inert copy of every `Store` the parent still had open: its every write and read raises `sqlite3.ProgrammingError`, and the child opens a `Store` of its own.
 - **`lane` and `StoryRecorder`.** The order in which story and subtask rows are recorded, and the escalation path through `stop.trigger`, form one state machine.
 - **`supervise`, `run_until_killed` and `build_dag_tree`.** These own the grafo executor's lifetime and the workarounds for its hangs.
 - **`control.Lease`** with its heartbeat, its watcher and `run_lease`. Token binding into `Store` happens here.
@@ -342,7 +348,6 @@ This list may only shrink. Each entry must disappear when the named step of §6.
 |---|---|---|
 | `cli.py:61-85` | `cli.X is runs.X` aliases (§4.5) | M9 |
 | `cli.py:24,3011,3062,3129` | `sqlite3` and a transaction outside `store` (5.4) | M5 |
-| `control.py:20,210,251` | catches `sqlite3.OperationalError` (5.4) | M5 |
 | 5.12 sites | wall clock outside `clock` | M3 |
 | `cli.py:2411`, `store.py:406`, `paths.py:18,33,57` | hand-joined data path; `mkdir` in derivation (5.11) | M13 |
 | `tests/e2e/test_live_control.py:181`, `test_milestone_resume.py:241`, `test_milestone_run.py:229,356`, `tests/test_cli.py:2254,7679` | patch `cli.run_direct` instead of injecting (5.14) | M6 |

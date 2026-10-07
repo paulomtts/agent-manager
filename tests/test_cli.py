@@ -55,8 +55,16 @@ from agent_manager import (
     paths,
     prompt,
     runs,
-    store as store_module,
 )
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
+from agent_manager.store import replay as store_replay
+from agent_manager.store import writer as store_writer
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness import launcher
 from agent_manager.runtime.errors import EngineError
@@ -1476,7 +1484,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 
     started_at = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
     run_id = cli.mint_run_id(first_id, started_at)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     try:
         store.record_run(
             models.Run(
@@ -1560,7 +1568,7 @@ def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards
     seen: list[tuple[str, dict[str, Any]]] = []
     stop = StopSignal()
     stop.trigger(parent.id)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     try:
         store.record_run(
             models.Run(
@@ -2071,14 +2079,14 @@ def test_the_run_id_is_minted_from_the_clock_the_caller_injected(project, cards)
 
     assert payload["run_id"] == cli.mint_run_id(cards["subtask"], frozen)
     assert payload["run_id"].startswith("20260923T140506Z-")
-    row = sqlite3.connect(paths.project_db_path(project)).execute(
+    row = sqlite3.connect(paths.db_path()).execute(
         "SELECT started_at FROM runs WHERE id = ?", (payload["run_id"],)
     ).fetchone()
     assert row[0].startswith("2026-09-23T14:05:06")
 
 
 @pytest.mark.git
-def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
+def test_the_run_story_and_subtask_rows_land_in_the_machine_db(project, cards):
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -2087,7 +2095,7 @@ def test_the_run_story_and_subtask_rows_land_in_the_project_db(project, cards):
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
-    conn = sqlite3.connect(paths.project_db_path(project))
+    conn = sqlite3.connect(paths.db_path())
     try:
         run_row = conn.execute(
             "SELECT status, base_branch, branch_prefix FROM runs WHERE id = ?",
@@ -2142,7 +2150,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
-    lines = store_module.Journal(payload["run_id"]).read()
+    lines = store_journal.Journal(payload["run_id"]).read()
     assert [line.event for line in lines[:3]] == [
         "run_upsert",
         "story_upsert",
@@ -2171,7 +2179,7 @@ def test_the_rows_exist_even_when_the_first_agent_phase_blows_up(project, cards)
 
     assert payload["status"] == "escalated"
     assert payload["failed_phase"] == "explore"
-    conn = sqlite3.connect(paths.project_db_path(project))
+    conn = sqlite3.connect(paths.db_path())
     try:
         assert conn.execute(
             "SELECT count(*) FROM runs WHERE id = ?", (payload["run_id"],)
@@ -3291,8 +3299,10 @@ def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeyp
         # Spec X7: another process held a project lock past its timeout before
         # the run started (e.g. `refresh_git`'s git lock).
         locks.LockTimeoutError(Path("/data/projects/abc.git.lock"), 600.0),
+        # Card 7ffee8c4: a write stayed busy through its whole retry budget.
+        store_db.StoreBusyError("beat", 5, 10.0),
     ],
-    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError"],
+    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError", "StoreBusyError"],
 )
 def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""
@@ -3490,7 +3500,7 @@ def _as_json(value: Any) -> Any:
 def _forbid_board_dry_run_writes(monkeypatch) -> None:
     """The board preview must open no Store, check no claims and run nothing."""
     _forbid_writes(monkeypatch)
-    monkeypatch.setattr(store_module, "Store", _Forbidden("store.Store"))
+    monkeypatch.setattr(store_writer, "Store", _Forbidden("store_writer.Store"))
     monkeypatch.setattr(cli, "refuse_claimed", _Forbidden("refuse_claimed"))
     monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
     monkeypatch.setattr(orchestrate, "run_board", _Forbidden("run_board"))
@@ -4457,7 +4467,7 @@ def _record(
     defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
     `milestone_id` for a milestone-shaped one, plus a `story_id` for a
     story-shaped one."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -5044,7 +5054,7 @@ RUNS_PROGRESS_CURRENT_KEYS = {"card", "phase", "attempt"}
 def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
     """`_record`'s `card-1` given a third phase, `implement`, still `started`,
     with `attempts` attempt rows numbered from 1."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_phase(
             "story-1",
@@ -5066,7 +5076,7 @@ def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
 
 def _record_bare_run(root: Path, run_id: str, *, started_at: datetime) -> None:
     """A run row with nothing below it: a run that never got past starting."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -5174,7 +5184,7 @@ def test_a_missing_repo_dir_is_an_envelope_for_both_read_commands(tmp_path, monk
 
 def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, monkeypatch):
     """`resolve_repo_dir` checks `is_dir`, not `exists`: a file that exists must
-    be refused before `paths.project_db_path` hashes it into a database name."""
+    be refused before the store records it as a project."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     not_a_dir = tmp_path / "README.md"
     not_a_dir.write_text("not a repo\n", encoding="utf-8")
@@ -5240,7 +5250,7 @@ def _record_for_logs(
     `logs --follow` test that needs the stream to keep polling passes
     `"started"`.
     """
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -5440,7 +5450,7 @@ def _runs_snapshot() -> dict[str, bytes]:
 
 
 def _attempt_rows(root: Path) -> list[tuple]:
-    conn = sqlite3.connect(paths.project_db_path(root))
+    conn = sqlite3.connect(paths.db_path())
     try:
         return conn.execute(
             "SELECT run_id, story_id, card_id, phase, n, status, prompt_path,"
@@ -6060,7 +6070,7 @@ def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
 
 def _record_review_without_stdout_path(root: Path) -> None:
     """Add an agent `review` phase whose one attempt recorded no stdout path."""
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_phase(
             "story-1", "card-1", models.PhaseRun(name="review", kind="agent", status="failed")
@@ -6278,7 +6288,7 @@ def _set_implement_status(root: Path, status: str) -> None:
     """Re-record `implement.1` with `status`, as the runner's terminal write
     does. Test-side only: it opens a `Store`, which `logs` must never do."""
     directory = paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1)
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_attempt(
             "story-1",
@@ -6300,7 +6310,7 @@ def _set_implement_status(root: Path, status: str) -> None:
 
 def _set_verify_status(root: Path, status: str) -> None:
     """Re-record the deterministic `verify` phase with `status`."""
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_phase(
             "story-1",
@@ -6522,7 +6532,7 @@ def test_logs_follow_relookup_lost_attempt_errors(projection, monkeypatch):
     _record_for_logs(projection, LOGS_RUN_ID, implement_status="started")
 
     def forget_the_run() -> None:
-        conn = sqlite3.connect(paths.project_db_path(projection))
+        conn = sqlite3.connect(paths.db_path())
         try:
             conn.execute("DELETE FROM runs WHERE id = ?", (LOGS_RUN_ID,))
             conn.commit()
@@ -6949,9 +6959,9 @@ def _checkpoint(
     digest: str | None = None,
     current: str | None = None,
     queue: tuple[str, ...] = (),
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """A hand-built checkpoint row of `TASK`: `current` is the turn in flight, `queue` the turns after it."""
-    return store_module.Checkpoint(
+    return store_checkpoints.Checkpoint(
         run_id="20260926T090000Z-02890d5d",
         card_id="card-1",
         seq=4,
@@ -7066,14 +7076,14 @@ def test_checkpoint_resume_phase_continues_an_escalated_row_that_still_holds_a_t
 
 
 def _saved(
-    opened: store_module.Store,
+    opened: store_writer.Store,
     card_id: str,
     reason: str,
     *,
     digest: str | None = None,
     queue: tuple[str, ...] = ("implement",),
     minute: int = 0,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     return opened.save_checkpoint(
         card_id,
         workflow=task_workflow.TASK.name,
@@ -7088,7 +7098,7 @@ def _saved(
 
 
 def test_continuable_checkpoint_is_the_open_matching_row_or_none(projection):
-    opened = store_module.Store.open(projection, "20260926T090000Z-02890d5d")
+    opened = store_writer.Store.open(projection, "20260926T090000Z-02890d5d")
     try:
         parked = _saved(opened, "card-parked", "parked")
         _saved(opened, "card-changed", "parked", digest="saved-under-another-task")
@@ -7175,7 +7185,7 @@ def _crash_pygents(
 
 
 def _checkpoint_rows(root: Path) -> list[tuple]:
-    conn = sqlite3.connect(paths.project_db_path(root))
+    conn = sqlite3.connect(paths.db_path())
     try:
         return conn.execute(
             "SELECT run_id, card_id, seq, reason, digest FROM checkpoints"
@@ -7195,16 +7205,16 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
     """Re-record the subtask `started`: what a crash between the engine's closing
     checkpoint and the caller's final status write leaves behind."""
     root = cli.resolve_repo_dir(project)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
     found = cli.find_subtask(run, card_id)
     assert found is not None
     story, subtask = found
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_subtask(story.card_id, subtask.model_copy(update={"status": "started"}))
     finally:
@@ -7213,7 +7223,7 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
 
 def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
     """A newer copy of the newest checkpoint, saved under a digest `TASK` does not have."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(card_id)
         assert newest is not None
@@ -7279,7 +7289,7 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
 
         return runner
 
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -7338,9 +7348,9 @@ def test_a_pygents_run_killed_in_plan_resumes_at_plan_from_its_checkpoint(projec
 
 def _resumable_subtask(project: Path, run_id: str, card_id: str) -> models.SubtaskRun:
     """The subtask row `run_id` recorded for `card_id`: its branch and worktree."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -7432,7 +7442,7 @@ def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
     run_id = _crash_pygents(project, cards, "plan")
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
     body = f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7472,7 +7482,7 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     run's leftover row is a warning leading the payload's, never a refusal."""
     run_id = _crash_pygents(project, cards, "plan")
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7597,7 +7607,7 @@ def test_the_kept_suite_warning_follows_the_flush_warnings(project, cards, monke
     """Spec T9 and Review Focus 4: B7's flush warnings lead, the kept suite is next."""
     run_id = _crash_pygents(project, cards, "plan", commands=("true",))
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7660,7 +7670,7 @@ def _plant_recorded_suite(project: Path, run_id: str, verify: list[str]) -> None
     """Re-record `run_id` with `verify` as its suite: what an earlier resume with
     a differing `--verify` leaves behind."""
     run = _loaded(project, run_id)
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.record_run(
             run.model_copy(update={"config": run.config.model_copy(update={"verify": verify})})
@@ -7750,7 +7760,7 @@ def test_a_task_resume_without_verify_hands_the_walk_the_recorded_suite(
 
 def _run_upserts(run_id: str) -> list[Any]:
     """Every `run_upsert` line of `run_id`'s journal, oldest first."""
-    return [line for line in store_module.Journal(run_id).read() if line.event == "run_upsert"]
+    return [line for line in store_journal.Journal(run_id).read() if line.event == "run_upsert"]
 
 
 @pytest.mark.git
@@ -8069,7 +8079,7 @@ def _escalate_milestone(project: Path, shape: dict[str, str]) -> str:
 
 def _plant_orphan(project: Path, run_id: str, story_id: str, card_id: str, phase: str) -> None:
     """An attempt left `started` by a kill mid-dispatch, as `dispatch.AgentRunner` records it."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.record_phase(
             story_id, card_id, models.PhaseRun(name=phase, kind="agent", status="started")
@@ -8085,7 +8095,7 @@ def _plant_orphan(project: Path, run_id: str, story_id: str, card_id: str, phase
 
 
 def _project_run_ids(project: Path) -> list[str]:
-    conn = sqlite3.connect(paths.project_db_path(project))
+    conn = sqlite3.connect(paths.db_path())
     try:
         return [row[0] for row in conn.execute("SELECT id FROM runs ORDER BY id")]
     finally:
@@ -8093,9 +8103,9 @@ def _project_run_ids(project: Path) -> list[str]:
 
 
 def _loaded(project: Path, run_id: str) -> models.Run:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -8113,7 +8123,7 @@ def _record_milestone(
     launcher: models.Launcher = "direct",
     isolation_warning: str | None = None,
 ) -> None:
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -8542,7 +8552,7 @@ def test_the_resume_command_reads_a_milestone_payloads_escalated_flag(
 #
 # Live control spec section 7 puts CLI refusals, idempotence, status and the
 # resume guard here. Runs, leases and requests are planted straight into the
-# projection through `store_module.open_db`, which is exactly how a second
+# projection through `store_db.open_db`, which is exactly how a second
 # `am` process reaches them. No sleeps: `cli._utcnow` is frozen and every
 # heartbeat is planted relative to it.
 
@@ -8588,20 +8598,23 @@ def _plant_lease(
 ) -> None:
     """A `run_leases` row and its `run_claims`, as another process's `Lease` would leave them.
 
-    Written over a second `open_db` connection inside `store.immediate`.
+    Written over a second `open_db` connection inside `store_db.immediate`.
     Defaults to this process on this host with a heartbeat at the frozen
     clock: live by C2.
     """
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, resolved, now=CONTROL_NOW)
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
                 " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
                 " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
                 (
+                    project_id,
                     run_id,
                     token,
                     os.getpid() if pid is None else pid,
@@ -8613,11 +8626,11 @@ def _plant_lease(
             )
             for key in claims:
                 conn.execute(
-                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                     " run_id=excluded.run_id, token=excluded.token,"
                     " claimed_at=excluded.claimed_at",
-                    (key, run_id, token, heartbeat_at.isoformat()),
+                    (project_id, key, run_id, token, heartbeat_at.isoformat()),
                 )
     finally:
         conn.close()
@@ -8629,7 +8642,7 @@ OTHER_RUN_ID = "20260930T080000Z-a1b2c3d4"
 
 def _claim_rows(root: Path) -> list[tuple[str, str, str]]:
     """Every `run_claims` row as `(key, run_id, token)`, in key order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [
             (row["key"], row["run_id"], row["token"])
@@ -8649,11 +8662,17 @@ def _plant_control(
     requested_at: datetime,
     handled_at: datetime | None = None,
 ) -> None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        with store_module.immediate(conn):
-            row = store_module.add_control(
-                conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
+        with store_db.immediate(conn):
+            row = store_leases.add_control(
+                conn,
+                CONTROL_RUN_ID,
+                project_id=store_projects.resolve(conn, resolved, now=CONTROL_NOW),
+                lease=lease,
+                command=command,
+                requested_at=requested_at,
             )
             if handled_at is not None:
                 conn.execute(
@@ -8666,20 +8685,20 @@ def _plant_control(
 
 def _controls(root: Path) -> list[tuple[str, str]]:
     """Every `run_controls` row of the run as `(lease, command)`, in seq order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [
             (row.lease, row.command)
-            for row in store_module.control_requests(conn, CONTROL_RUN_ID)
+            for row in store_leases.control_requests(conn, CONTROL_RUN_ID)
         ]
     finally:
         conn.close()
 
 
-def _lease(root: Path) -> store_module.LeaseRow | None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+def _lease(root: Path) -> store_leases.LeaseRow | None:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store_module.read_lease(conn, CONTROL_RUN_ID)
+        return store_leases.read_lease(conn, CONTROL_RUN_ID)
     finally:
         conn.close()
 
@@ -8858,6 +8877,46 @@ def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
     assert _controls(projection) == []
 
 
+def test_request_control_writes_the_projects_id(projection):
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(100))
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(110))
+
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
+    try:
+        run_project = conn.execute(
+            "SELECT project_id FROM runs WHERE id = ?", (CONTROL_RUN_ID,)
+        ).fetchone()[0]
+        control_projects = [
+            row[0]
+            for row in conn.execute(
+                "SELECT project_id FROM run_controls WHERE run_id = ?", (CONTROL_RUN_ID,)
+            )
+        ]
+        projects = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert control_projects == [run_project]
+    assert projects == 1
+
+
+def test_a_refused_request_control_creates_no_project_row(projection):
+    """Review Focus 5: the project is resolved only after `_controllable_lease`,
+    so a refusal leaves no `projects` row behind."""
+    with pytest.raises(cli.UnknownRunError):
+        cli.request_control(
+            "no-such-run", "pause", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
     """Spec test 6, first half."""
     _plant_run(projection)
@@ -8953,6 +9012,137 @@ def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
         ("life-1", "cancel"),
         ("life-2", "pause"),
     ]
+
+
+def _control_requested_events(root: Path) -> list[store_events.EventRow]:
+    """The run's committed `control_requested` events, in `seq` order."""
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            event
+            for event in store_events.read(conn, run_id=CONTROL_RUN_ID)
+            if event.kind == "control_requested"
+        ]
+    finally:
+        conn.close()
+
+
+def _run_project_id(root: Path) -> int:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return conn.execute(
+            "SELECT project_id FROM runs WHERE id = ?", (CONTROL_RUN_ID,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_recorded_pause_and_cancel_each_insert_one_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    cli.request_control(CONTROL_RUN_ID, "cancel", repo_dir=projection, clock=lambda: _at(1))
+
+    events = _control_requested_events(projection)
+    project_id = _run_project_id(projection)
+    assert [
+        (event.project_id, event.source, event.schema)
+        + (event.story_id, event.card_id, event.phase, event.attempt)
+        for event in events
+    ] == [(project_id, "live", 1, None, None, None, None)] * 2
+    # `ts` is the request's clock, the same instant as `requested_at`.
+    assert [event.ts for event in events] == [
+        store_journal.ts_text(CONTROL_NOW),
+        store_journal.ts_text(_at(1)),
+    ]
+    assert [event.payload for event in events] == [
+        {
+            "command": "pause",
+            "lease": "life-2",
+            "requested_at": CONTROL_NOW.isoformat(),
+            "control_seq": 0,
+        },
+        {
+            "command": "cancel",
+            "lease": "life-2",
+            "requested_at": _at(1).isoformat(),
+            "control_seq": 1,
+        },
+    ]
+    assert events[0].run_seq < events[1].run_seq
+
+
+def test_a_no_op_request_inserts_no_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    repeat = cli.request_control(
+        CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(5)
+    )
+
+    assert repeat["already_requested"] is True
+    assert [event.payload["control_seq"] for event in _control_requested_events(projection)] == [0]
+
+
+def _plant_refusal(root: Path, case: str) -> None:
+    """The projection state each refused-request case starts from."""
+    if case == "unknown-run":
+        return
+    if case == "not-started":
+        _plant_run(root, status="stopped")
+        _plant_lease(root)
+    elif case == "dead-lease":
+        _plant_run(root)
+        _plant_lease(root, heartbeat_at=_at(-31))
+    elif case == "window-closed":
+        _plant_run(root)
+        _plant_lease(root, accepting=False)
+    elif case == "unknown-command":
+        _plant_run(root)
+        _plant_lease(root)
+
+
+@pytest.mark.parametrize(
+    ("case", "command", "error"),
+    [
+        ("unknown-run", "pause", cli.UnknownRunError),
+        ("not-started", "pause", cli.NotRunningError),
+        ("dead-lease", "cancel", cli.DeadRunError),
+        ("window-closed", "cancel", cli.NotAcceptingError),
+        ("unknown-command", "resume", ValueError),
+    ],
+    ids=["unknown-run", "not-started", "dead-lease", "window-closed", "unknown-command"],
+)
+def test_a_refused_request_inserts_no_control_requested_event(projection, case, command, error):
+    _plant_refusal(projection, case)
+
+    with pytest.raises(error):
+        cli.request_control(
+            CONTROL_RUN_ID, command, repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _control_requested_events(projection) == []
+    assert _controls(projection) == []
+
+
+def test_a_failed_control_requested_insert_rolls_the_request_back(projection, monkeypatch):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    def failing(conn, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cli.store_events, "insert", failing)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        cli.request_control(
+            CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _controls(projection) == []
+    assert _control_requested_events(projection) == []
 
 
 def test_the_status_payload_defaults_to_an_empty_control():
@@ -9183,19 +9373,19 @@ def control_applied(monkeypatch) -> threading.Event:
     return applied
 
 
-def _card_lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+def _card_lease(project: Path, run_id: str) -> store_leases.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
 
-def _card_controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+def _card_controls(project: Path, run_id: str) -> list[store_leases.ControlRow]:
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.control_requests(conn, run_id)
+        return store_leases.control_requests(conn, run_id)
     finally:
         conn.close()
 
@@ -9222,7 +9412,7 @@ def _controlling_factory(
     at: str,
     seen: list[str],
     fail: bool = False,
-    leases: list[store_module.LeaseRow | None] | None = None,
+    leases: list[store_leases.LeaseRow | None] | None = None,
 ):
     """A `cli.RunnerFactory` whose runner, inside phase `at`, acts as a second process.
 
@@ -9446,7 +9636,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
 def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, cards):
     """Spec tests 4 and 6: the lease is held, window open, while a phase runs;
     it is gone afterwards; the payload is today's, key for key."""
-    leases: list[store_module.LeaseRow | None] = []
+    leases: list[store_leases.LeaseRow | None] = []
     factory = _controlling_factory(
         project, threading.Event(), command=None, at="explore", seen=[], leases=leases
     )
@@ -9487,7 +9677,7 @@ def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch)
     up, it is released on the way out, the error surfaces as is, and no final
     status row is written."""
     run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    held: list[store_module.LeaseRow | None] = []
+    held: list[store_leases.LeaseRow | None] = []
 
     async def exploding(*args, **kwargs):
         held.append(_card_lease(project, run_id))
@@ -9533,7 +9723,7 @@ def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
     `plan`, parks before the next phase, and gives its lease back."""
     run_id = _crash_pygents(project, cards, "plan")
     seen: list[str] = []
-    leases: list[store_module.LeaseRow | None] = []
+    leases: list[store_leases.LeaseRow | None] = []
     factory = _controlling_factory(
         project, control_applied, command="pause", at="plan", seen=seen, leases=leases
     )
@@ -9590,7 +9780,7 @@ def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monk
     """Error path on resume: the lease was held when the walk blew up and is
     released on the way out; the run stays `started` as it does today."""
     run_id = _crash_pygents(project, cards, "plan")
-    held: list[store_module.LeaseRow | None] = []
+    held: list[store_leases.LeaseRow | None] = []
 
     async def exploding(*args, **kwargs):
         held.append(_card_lease(project, run_id))
@@ -9653,6 +9843,40 @@ def test_refuse_claimed_passes_the_runs_own_claims_unclaimed_keys_and_dead_ones(
     cli.refuse_claimed(root, ["card:card-1"])
 
 
+def test_refuse_claimed_for_an_unseen_project_creates_no_project_row(projection, monkeypatch):
+    """B5: the preflight looks the project up and never creates it. With no row
+    there is no claim of this project's to conflict with, even when another
+    project in the same file holds the same key under a live lease."""
+    _freeze_clock(monkeypatch)
+    root = cli.resolve_repo_dir(projection)
+    conn = store_db.open_db(root)
+    try:
+        with store_db.immediate(conn):
+            elsewhere = store_projects.resolve(conn, root.parent / "elsewhere", now=CONTROL_NOW)
+            store_leases.take_lease(
+                conn,
+                OTHER_RUN_ID,
+                project_id=elsewhere,
+                token="other-life",
+                pid=os.getpid(),
+                host=HERE,
+                now=CONTROL_NOW,
+                is_live=lambda row: False,
+                claims=["card:card-1"],
+            )
+    finally:
+        conn.close()
+
+    cli.refuse_claimed(root, ["card:card-1"])
+
+    conn = store_db.open_db(root)
+    try:
+        assert store_projects.lookup(conn, root) is None
+        assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def test_run_lease_turns_a_held_claim_into_claimed_error_and_takes_nothing(
     projection, monkeypatch
 ):
@@ -9664,7 +9888,7 @@ def test_run_lease_turns_a_held_claim_into_claimed_error_and_takes_nothing(
         heartbeat_at=now - timedelta(seconds=7),
         claims=("card:card-1",),
     )
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(cli.ClaimedError) as caught:
             with cli.run_lease(opened, claims=["card:card-1"]):
@@ -9686,7 +9910,7 @@ def test_run_lease_turns_a_held_lease_into_c10s_run_is_live_error(projection, mo
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(projection, heartbeat_at=now - timedelta(seconds=5))
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(cli.RunIsLiveError) as caught:
             with cli.run_lease(opened, claims=["card:card-1"]):
@@ -9703,7 +9927,7 @@ def test_run_lease_turns_a_held_lease_into_c10s_run_is_live_error(projection, mo
 
 
 def test_run_lease_releases_its_claims_and_lease_when_the_body_raises(projection):
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(ValueError, match="the walk raised"):
             with cli.run_lease(opened, claims=["card:card-1"]) as lease:
@@ -9730,9 +9954,15 @@ def _run_dirs() -> list[Path]:
 
 
 def _recorded_run_ids(project: Path) -> list[str]:
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    root = cli.resolve_repo_dir(project)
+    conn = store_db.open_db(root)
     try:
-        return [summary.id for summary in store_module.list_runs(conn)]
+        return [
+            summary.id
+            for summary in store_queries.list_runs(
+                conn, project_id=store_projects.lookup(conn, root)
+            )
+        ]
     finally:
         conn.close()
 
@@ -9838,7 +10068,7 @@ def test_a_dead_claim_does_not_refuse(project, cards):
 
 @pytest.mark.git
 def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkeypatch):
-    real_record_run = store_module.Store.record_run
+    real_record_run = store_writer.Store.record_run
     first: list[tuple[str | None, list[str]]] = []
 
     def spy(self, run):
@@ -9849,13 +10079,13 @@ def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkey
                 if token is None
                 else [
                     claim.key
-                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                    for claim in store_leases.held_claims(self.connection, self.run_id, token)
                 ]
             )
             first.append((token, held))
         return real_record_run(self, run)
 
-    monkeypatch.setattr(store_module.Store, "record_run", spy)
+    monkeypatch.setattr(store_writer.Store, "record_run", spy)
 
     cli.run_card(
         cards["subtask"],
@@ -9926,7 +10156,7 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
 
         def runner(phase, context, rendered):
             if phase.name == "explore" and not taken:
-                thief = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+                thief = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
                 try:
                     thief.take_lease(
                         token="thief",
@@ -9961,6 +10191,80 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "thief"
     assert _loaded(project, run_id).status == "started"
+
+
+def _only_run_id(project: Path) -> str:
+    root = cli.resolve_repo_dir(project)
+    conn = store_db.open_db(root)
+    try:
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, root)
+        )
+    finally:
+        conn.close()
+    assert run_id is not None
+    return run_id
+
+
+@pytest.mark.git
+def test_a_busy_store_mid_walk_is_a_store_busy_envelope_at_exit_3(
+    project, cards, monkeypatch
+):
+    """The `worktree` step's `done` row stays busy through its retry budget: the
+    walk stops at that write and records no escalation, and the window close
+    and lease release, busy too, do not replace the error the envelope names."""
+    real_record_phase = store_writer.Store.record_phase
+
+    def record_phase(self, story_id, card_id, phase):
+        if (phase.name, phase.status) == ("worktree", "done"):
+            raise store_db.StoreBusyError("record_phase", 5, 10.0)
+        return real_record_phase(self, story_id, card_id, phase)
+
+    def busy_close_window(self, token):
+        raise store_db.StoreBusyError("close_window", 5, 10.0)
+
+    def busy_release_lease(self, token):
+        raise store_db.StoreBusyError("release_lease", 5, 10.0)
+
+    monkeypatch.setattr(store_writer.Store, "record_phase", record_phase)
+    monkeypatch.setattr(store_writer.Store, "close_window", busy_close_window)
+    monkeypatch.setattr(store_writer.Store, "release_lease", busy_release_lease)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "StoreBusyError"
+    assert envelope["error"]["message"].startswith("record_phase: ")
+    run_id = _only_run_id(project)
+    assert _loaded(project, run_id).status == "started"
+    # The busy release left the lease row behind to go stale; the claims went.
+    assert _card_lease(project, run_id) is not None
+    assert _claim_rows(project) == []
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
+    try:
+        phases = conn.execute(
+            "SELECT name, status FROM phases WHERE run_id = ? ORDER BY position", (run_id,)
+        ).fetchall()
+        subtasks = [
+            row[0]
+            for row in conn.execute(
+                "SELECT status FROM subtasks WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        ]
+        reasons = [
+            row[0]
+            for row in conn.execute(
+                "SELECT reason FROM checkpoints WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert [tuple(row) for row in phases] == [("worktree", "started")]
+    assert "escalated" not in subtasks
+    assert reasons == ["turn"]
 
 
 @pytest.mark.git
@@ -10042,7 +10346,7 @@ def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
         heartbeat_at=now - timedelta(seconds=7),
         claims=(key,),
     )
-    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _Forbidden("Store.open"))
 
     with pytest.raises(cli.ClaimedError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -10062,7 +10366,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(project, run_id=run_id, token="racer", heartbeat_at=now - timedelta(seconds=5))
-    before = (_attempt_rows(project), _checkpoint_rows(project), store_module.Journal(run_id).read())
+    before = (_attempt_rows(project), _checkpoint_rows(project), store_journal.Journal(run_id).read())
 
     with pytest.raises(cli.RunIsLiveError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -10075,7 +10379,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     assert (
         _attempt_rows(project),
         _checkpoint_rows(project),
-        store_module.Journal(run_id).read(),
+        store_journal.Journal(run_id).read(),
     ) == before
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "racer"
@@ -10126,7 +10430,7 @@ def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypa
 
         return refuse
 
-    monkeypatch.setattr(store_module.Store, "take_lease", forbidden("Store.take_lease"))
+    monkeypatch.setattr(store_writer.Store, "take_lease", forbidden("Store.take_lease"))
     monkeypatch.setattr(locks.ProcessLock, "acquire", forbidden("ProcessLock.acquire"))
     monkeypatch.setattr(cli, "run_lease", forbidden("cli.run_lease"))
 
@@ -10161,7 +10465,7 @@ def _card_comment_keys(project: Path, card_id: str) -> list[str]:
 
 def _card_outbox(project: Path) -> list[tuple[str, str]]:
     """Every outbox row as `(key, state)`, in insertion order."""
-    conn = store_module.open_db(cli.resolve_repo_dir(project))
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         return [
             (row["key"], row["state"])
@@ -10340,7 +10644,7 @@ def _write_watch_journal(
     run_dir = _watch_runs_dir(tmp_path) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     dumped = [
-        store_module.JournalLine(
+        store_journal.JournalLine(
             seq=seq,
             ts=WATCH_TS,
             run_id=run_id,
@@ -10353,7 +10657,7 @@ def _write_watch_journal(
         for seq in seqs
     ]
     text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    (run_dir / store_module.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
+    (run_dir / store_journal.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
     return dumped
 
 
@@ -10460,10 +10764,10 @@ def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
     _watch_runs_dir(tmp_path).mkdir(parents=True)
     escape = tmp_path / "xdg" / "agent-manager" / "escape"
     escape.mkdir(parents=True)
-    line = store_module.JournalLine(
+    line = store_journal.JournalLine(
         seq=1, ts=WATCH_TS, run_id="escape", event="run_upsert"
     ).model_dump(mode="json")
-    (escape / store_module.JOURNAL_NAME).write_text(
+    (escape / store_journal.JOURNAL_NAME).write_text(
         json.dumps(line) + "\n", encoding="utf-8"
     )
 
@@ -10569,7 +10873,7 @@ def test_watch_rejects_run_id_with_all_and_neither(tmp_path, monkeypatch):
 
 def _watch_line(run_id: str, seq: int) -> dict[str, Any]:
     """One journal line in the shape `_write_watch_journal` writes, JSON-mode."""
-    return store_module.JournalLine(
+    return store_journal.JournalLine(
         seq=seq,
         ts=WATCH_TS,
         run_id=run_id,
@@ -10589,7 +10893,7 @@ def _append_watch_journal(
     run_dir.mkdir(parents=True, exist_ok=True)
     dumped = [_watch_line(run_id, seq) for seq in seqs]
     text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    with (run_dir / store_module.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
+    with (run_dir / store_journal.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
         handle.write(text + tail)
     return dumped
 
@@ -10665,7 +10969,7 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch
     run_dir = _watch_runs_dir(tmp_path) / "run-old"
     run_dir.mkdir(parents=True)
     # As an `am` from before the spelling switch wrote it.
-    legacy = store_module.JournalLine(
+    legacy = store_journal.JournalLine(
         seq=1,
         ts=WATCH_TS,
         run_id="run-old",
@@ -10673,7 +10977,7 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch
         payload={"run_id": "run-old", "status": "cancelled"},
     ).model_dump(mode="json")
     after = _watch_line("run-old", 2)
-    journal = run_dir / store_module.JOURNAL_NAME
+    journal = run_dir / store_journal.JOURNAL_NAME
     journal.write_text(
         "".join(json.dumps(line, sort_keys=True) + "\n" for line in (legacy, after)),
         encoding="utf-8",
@@ -10781,19 +11085,18 @@ def test_watch_follow_observes_a_line_appended_after_start(tmp_path, monkeypatch
 
 def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    old_owner = store_module.Journal("run-t")
+    old_owner = store_journal.Journal("run-t")
     for _ in range(2):
         old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
-    # The new owner opens the journal now and caches seq 2, while the stuck
-    # old owner is still appending: only `reseek` keeps it from reusing seq 3.
-    new_owner = store_module.Journal("run-t")
 
     def old_owner_keeps_writing() -> None:
         for _ in range(2):
             old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
 
     def new_owner_takes_over() -> None:
-        new_owner.reseek()
+        # The new owner opens the journal once the old owner has stopped
+        # appending, so it numbers after the old owner's last line.
+        new_owner = store_journal.Journal("run-t")
         for _ in range(2):
             new_owner.append("phase_upsert", {"by": "new"}, card="card-1", phase="implement", attempt=1)
 
@@ -10831,7 +11134,7 @@ def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
         )
 
     def finish_the_torn_line() -> None:
-        journal = _watch_runs_dir(tmp_path) / "run-new" / store_module.JOURNAL_NAME
+        journal = _watch_runs_dir(tmp_path) / "run-new" / store_journal.JOURNAL_NAME
         with journal.open("a", encoding="utf-8") as handle:
             handle.write(third[20:] + "\n")
 
@@ -10851,7 +11154,7 @@ def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
 def test_watch_follow_tolerates_a_journal_that_disappears(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
     recreated: list[dict[str, Any]] = []
 
     def delete_journal() -> None:
@@ -10877,7 +11180,7 @@ def test_watch_follow_mid_stream_corruption_ends_stream_with_stderr_message(
 ):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_module.JOURNAL_NAME
+    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
     appended: list[dict[str, Any]] = []
 
     def append_second() -> None:
@@ -10986,14 +11289,14 @@ def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
     return runner.invoke(cli.app, ["reset", run_id, "--repo-dir", str(root), *extra])
 
 
-def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_module.JournalLine]:
-    return store_module.Journal(run_id).read()
+def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_journal.JournalLine]:
+    return store_journal.Journal(run_id).read()
 
 
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store_module.run_status(conn, run_id)
+        return store_queries.run_status(conn, run_id)
     finally:
         conn.close()
 
@@ -11165,7 +11468,7 @@ def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeyp
 
     def finish_the_torn_lines() -> None:
         for run_id, text in (("run-a", third_a), ("run-d", first_d)):
-            journal = _watch_runs_dir(tmp_path) / run_id / store_module.JOURNAL_NAME
+            journal = _watch_runs_dir(tmp_path) / run_id / store_journal.JOURNAL_NAME
             with journal.open("a", encoding="utf-8") as handle:
                 handle.write(text[20:] + "\n")
 
@@ -11401,7 +11704,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     close runs.
     """
     seen: list[tuple[int, int]] = []
-    real_close = store_module.Store.close
+    real_close = store_writer.Store.close
 
     def close(self) -> None:
         conn = self.connection
@@ -11414,7 +11717,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
         seen.append((claims, leases))
         real_close(self)
 
-    monkeypatch.setattr(store_module.Store, "close", close)
+    monkeypatch.setattr(store_writer.Store, "close", close)
     return seen
 
 
@@ -11875,7 +12178,7 @@ def test_the_detached_child_adopts_the_lease_reports_then_releases_before_closin
     root = _seam_root(tmp_path, monkeypatch)
     cards = _seam_cards(fake_board)
     pre, token = _handed_off_card_run(root, cards["subtask"])
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
     held_at_report: list[bool] = []
     real_write = detach.write_report
@@ -11984,7 +12287,7 @@ def _card_run_args(root: Path, card_id: str, *extra: str) -> list[str]:
 
 
 def _lease_pids(root: Path) -> list[int]:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         return [row["pid"] for row in conn.execute("SELECT pid FROM run_leases ORDER BY run_id")]
     finally:
@@ -12003,7 +12306,7 @@ def _plant_parked_checkpoint(
     """One checkpoint row, by default the open `parked` row of card-1 a paused
     walk leaves under the run. The keywords plant the other rows the `cards`
     tests need: another run's, another workflow's, an older or newer one."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(root), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         opened.save_checkpoint(
             card_id,
@@ -12020,8 +12323,8 @@ def _plant_parked_checkpoint(
         opened.close()
 
 
-def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
-    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+def _open_checkpoint(root: Path) -> store_checkpoints.Checkpoint | None:
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
     try:
         return opened.latest_open_checkpoint("card-1", task_workflow.TASK.name)
     finally:
@@ -12066,7 +12369,8 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert lines_after[: len(lines_before)] == lines_before
     (added,) = lines_after[len(lines_before) :]
     assert added.event == "run_upsert"
-    assert added.seq == lines_before[-1].seq + 1
+    # `am reset`'s own `lease_acquired` takes the number in between (card 1.2.7).
+    assert added.seq == lines_before[-1].seq + 2
     first = next(line for line in lines_before if line.event == "run_upsert")
     # The same write whether or not the worktree exists: only `status` moved.
     assert added.payload == {**first.payload, "status": "canceled"}
@@ -12074,9 +12378,9 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert _open_checkpoint(projection) is None
     assert worktree.exists() is worktree_present
     assert _lease(projection) is None
-    rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    rebuilt = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
-        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
+        assert rebuilt.rebuild_from_events(CONTROL_RUN_ID).status == "canceled"
     finally:
         rebuilt.close()
 
@@ -12382,7 +12686,7 @@ def test_reset_reports_open_in_null_when_its_own_row_is_the_newest(projection):
     _plant_other_run(projection)
     _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
     _plant_parked_checkpoint(projection, saved_at=_at(1))
-    reader = store_module.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
+    reader = store_writer.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
     try:
         before = runs.continuable_checkpoint(reader, "card-1")
         assert before is not None and before.run_id == CONTROL_RUN_ID
@@ -12456,7 +12760,7 @@ def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_run(projection, status="started")
-    holder = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    holder = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         holder.take_lease(
             token="holder", pid=os.getpid(), host=HERE, now=now, is_live=lambda row: True
@@ -12494,7 +12798,7 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
     `take_lease`. The read-only load is made to see `stopped`; the load
     under the lease sees the real `done` and refuses before writing."""
     _plant_run(projection, status="done")
-    real = store_module.load_run
+    real = store_queries.load_run
     calls: list[str] = []
 
     def stale_first(conn, run_id):
@@ -12504,7 +12808,7 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
             return loaded.model_copy(update={"status": "stopped"})
         return loaded
 
-    monkeypatch.setattr(store_module, "load_run", stale_first)
+    monkeypatch.setattr(store_queries, "load_run", stale_first)
     lines_before = _journal_lines()
 
     result = _invoke_reset(projection)
@@ -12523,7 +12827,7 @@ def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection
     non-JSON line in its middle is `CorruptJournalError` -- a refusal at
     exit 3, not a traceback."""
     _plant_run(projection, status="stopped")
-    path = store_module.Journal(CONTROL_RUN_ID).path
+    path = store_journal.Journal(CONTROL_RUN_ID).path
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
 
@@ -12541,9 +12845,15 @@ def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection
 def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
     """Only the torn-journal subclass is a refusal; a missing journal or
     any other `JournalError` stays a bug with its stack."""
-    assert isinstance(store_module.CorruptJournalError("torn"), cli.HANDLED)
-    assert not isinstance(store_module.MissingJournalError("gone"), cli.HANDLED)
-    assert not isinstance(store_module.JournalError("other"), cli.HANDLED)
+    assert isinstance(store_journal.CorruptJournalError("torn"), cli.HANDLED)
+    assert not isinstance(store_journal.MissingJournalError("gone"), cli.HANDLED)
+    assert not isinstance(store_journal.JournalError("other"), cli.HANDLED)
+
+
+def test_handled_takes_store_busy_error():
+    """A write that stayed busy through its whole retry budget is a refusal,
+    not a bug: it gets the exit-3 envelope, not a traceback."""
+    assert isinstance(store_db.StoreBusyError("beat", 5, 10.0), cli.HANDLED)
 
 
 @pytest.mark.parametrize(
@@ -12620,11 +12930,11 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
 
 # ── am status integrity (card f63036db) ─────────────────────────────────────
 #
-# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the journal
-# with the projection through `store.diverging` and reports it under an
-# always-present `integrity` key, at exit 0, writing nothing. Unit tier: the
-# projection fixture writes SQLite rows and journal files in `tmp_path`; no
-# subprocess.
+# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the run's
+# events with the projection through `store_replay.diverging` and reports it
+# under an always-present `integrity` key, at exit 0, writing nothing. Unit
+# tier: the projection fixture writes SQLite rows and journal files in
+# `tmp_path`; no subprocess.
 
 CLEAN_INTEGRITY = {"checked": True, "reason": None, "mismatches": []}
 
@@ -12642,16 +12952,81 @@ the hand-edited legacy spelling reads back as `canceled`."""
 def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
     """The run's journal file, located without `Journal(run_id)`, which would
     create the run directory."""
-    return paths.data_dir() / "runs" / run_id / store_module.JOURNAL_NAME
+    return paths.data_dir() / "runs" / run_id / store_journal.JOURNAL_NAME
 
 
 def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
     """Change the run's projected status behind the store's back, as a human
     with `sqlite3` would: no journal line records it."""
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+    finally:
+        conn.close()
+
+
+PLANTED_TS = "2026-09-29T09:00:00+00:00"
+
+
+def _plant_event(
+    root: Path,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_id: str = CONTROL_RUN_ID,
+    story: str | None = None,
+) -> None:
+    """One `events` row of `run_id` written behind the store's back, as a hand
+    `INSERT` would: no row and no journal line record it."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            store_events.insert(
+                conn,
+                project_id=store_projects.lookup(conn, resolved),
+                run_id=run_id,
+                ts=PLANTED_TS,
+                kind=kind,
+                payload=payload,
+                source="live",
+                story_id=story,
+            )
+    finally:
+        conn.close()
+
+
+def _plant_raw_payload(root: Path, kind: str, text: str, *, run_id: str = CONTROL_RUN_ID) -> int:
+    """An `events` row of `run_id` whose `payload` column is `text` verbatim,
+    which `store_events.insert` (it serialises) cannot write. Returns its `run_seq`."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            run_seq = conn.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) + 1 FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'live')",
+                (store_projects.lookup(conn, resolved), run_id, run_seq, PLANTED_TS, kind, text),
+            )
+    finally:
+        conn.close()
+    return run_seq
+
+
+def _drop_events(root: Path, run_id: str = CONTROL_RUN_ID) -> None:
+    """Delete every event of `run_id`, as a restored or foreign database may
+    lack them while keeping the run's rows. The append-only trigger is
+    dropped first so the rows can go."""
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        conn.execute("DROP TRIGGER events_no_delete")
+        conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -12666,7 +13041,7 @@ def _status_data(root: Path, *args: str) -> dict[str, Any]:
 
 def _projection_snapshot(root: Path) -> dict[str, list[str]]:
     """Every table's rows, order-insensitively, over a plain read connection."""
-    db = paths.project_db_path(cli.resolve_repo_dir(root))
+    db = paths.db_path()
     conn = sqlite3.connect(db)
     try:
         tables = [
@@ -12689,9 +13064,9 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     before this card."""
     _freeze_clock(monkeypatch)
     _record(projection, CONTROL_RUN_ID, started_at=RECORDED_AT, status="started")
-    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
     try:
-        run = store_module.load_run(conn, CONTROL_RUN_ID)
+        run = store_queries.load_run(conn, CONTROL_RUN_ID)
     finally:
         conn.close()
     before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))
@@ -12742,102 +13117,103 @@ def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monke
     assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
 
 
-def test_status_of_a_run_with_no_journal_says_so_and_creates_no_run_directory(
+def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
     projection, monkeypatch
 ):
-    """Spec test 5: `Journal._for_reading`, never the constructor that calls
-    `paths.run_dir` and would create the directory."""
+    """Spec test 16: the run's rows are there, its events are not."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
     shutil.rmtree(run_dir)
+    _drop_events(projection)
 
-    def forbidden(self, run_id):
-        raise AssertionError("status must not construct Journal(run_id)")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must not construct a Journal")
 
-    monkeypatch.setattr(store_module.Journal, "__init__", forbidden)
+    monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
+    monkeypatch.setattr(store_journal.Journal, "_for_reading", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
-    assert data["integrity"] == {"checked": False, "reason": "no journal", "mismatches": []}
+    assert data["integrity"] == {"checked": False, "reason": "no events", "mismatches": []}
     assert not run_dir.exists()
 
 
-def test_a_torn_final_journal_line_is_ignored_and_the_run_still_checked(
+def test_status_of_a_clean_run_with_its_journal_file_gone_is_still_checked_clean(
     projection, monkeypatch
 ):
-    """Spec test 6, first half: an append in flight, no trailing newline."""
+    """Spec test 17: the events, not the file, are compared."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 9999, "ts": "2026-')
+    shutil.rmtree(paths.data_dir() / "runs" / CONTROL_RUN_ID)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == CLEAN_INTEGRITY
 
 
-def test_a_newline_terminated_non_json_line_makes_the_journal_unreadable(
+def test_an_event_payload_that_is_not_json_makes_the_events_unreadable(
     projection, monkeypatch
 ):
-    """Spec test 6, second half: still `CorruptJournalError`, reported at exit 0."""
+    """Spec test 18; Review Focus 1: a hand INSERT is reported at exit 0."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    run_seq = _plant_raw_payload(projection, "story_upsert", "{not json")
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
-    assert "line is not JSON" in integrity["reason"]
+    assert integrity["reason"].startswith("events unreadable: ")
+    assert f"run_seq {run_seq}" in integrity["reason"]
+    assert "not JSON" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_empty_journal_is_unreadable_not_a_traceback(projection, monkeypatch):
-    """Review Focus: `read()` returns `[]`, and `replay` inside `diverging`
-    raises `JournalError` -- the try must cover `diverging` too."""
+def test_events_without_a_run_upsert_are_unreadable_not_a_traceback(projection, monkeypatch):
+    """Spec test 19: `run_lines` returns a story line only, and `replay` inside
+    `diverging` raises `JournalError` -- the try must cover `diverging` too."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    _journal_path().write_text("", encoding="utf-8")
+    _drop_events(projection)
+    _plant_event(
+        projection,
+        "story_upsert",
+        {"card_id": "story-1", "title": "The CLI", "level": 0, "status": "started", "tip_branch": None},
+        story="story-1",
+    )
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == {
         "checked": False,
-        "reason": "journal unreadable: journal contains no run_upsert line",
+        "reason": "events unreadable: journal line 1 is a story_upsert but no"
+        " run_upsert preceded it: the head of the journal is missing",
         "mismatches": [],
     }
 
 
-def test_a_journal_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
-    """Review Focus: the envelope is valid, the run payload is not, so
-    `diverging` raises a pydantic `ValidationError`."""
+def test_an_event_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
+    """Spec test 20: the event is valid JSON, the run payload is not a `Run`,
+    so `diverging` raises a pydantic `ValidationError`."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    path = _journal_path()
-    first, *rest = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    line = json.loads(first)
-    assert line["event"] == "run_upsert"
-    line["payload"]["status"] = "not-a-status"
-    path.write_text(json.dumps(line) + "\n" + "".join(rest), encoding="utf-8")
+    _plant_event(projection, "run_upsert", {"id": CONTROL_RUN_ID, "status": "not-a-status"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
+    assert integrity["reason"].startswith("events unreadable: ")
     assert "validation error" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_unknown_journal_event_kind_is_skipped_by_the_check(projection, monkeypatch):
-    """Review Focus: a line a newer `am` wrote is not divergence and does not raise."""
+def test_an_event_of_another_kind_is_skipped_by_the_check(projection, monkeypatch):
+    """Spec test 21; Review Focus 2: a lease or control event is not divergence."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"seq": 9999, "event": "from_the_future"}) + "\n")
+    _plant_event(projection, "from_the_future", {"anything": "at all"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -12873,19 +13249,20 @@ def test_a_live_lease_is_not_checked_and_a_stale_one_is(
     assert data["integrity"] == integrity
 
 
-def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
-    """Review Focus: the live-lease rule comes first, so even a corrupt
-    journal reads as `lease is live`, and `diverging` is never called."""
+def test_a_live_lease_never_reads_the_events(projection, monkeypatch):
+    """Review Focus: the live-lease rule comes first, so even an unreadable
+    event reads as `lease is live`, and neither `run_lines` nor `diverging`
+    is called."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    _plant_raw_payload(projection, "story_upsert", "{not json")
     _plant_lease(projection, heartbeat_at=CONTROL_NOW - timedelta(seconds=5))
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("a live run's journal must not be compared")
+        raise AssertionError("a live run's events must not be compared")
 
-    monkeypatch.setattr(store_module, "diverging", forbidden)
+    monkeypatch.setattr(store_events, "run_lines", forbidden)
+    monkeypatch.setattr(store_replay, "diverging", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -12968,7 +13345,7 @@ def test_the_detached_card_child_reports_the_foreground_payload_then_releases(
         return payload
 
     monkeypatch.setattr(cli, "run_card_engine", spying_engine)
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()
@@ -13095,7 +13472,7 @@ def test_a_failed_lease_pid_update_aborts_the_child_and_releases(
     def locked(self, token: str, *, pid: int, host: str) -> None:
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(store_module.Store, "set_lease_holder", locked)
+    monkeypatch.setattr(store_writer.Store, "set_lease_holder", locked)
 
     result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
 
@@ -14323,7 +14700,7 @@ def test_the_production_runner_factory_launches_through_the_recorded_mode(
     monkeypatch.setattr(
         cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
     )
-    opened = store_module.Store.open(projection, ISOLATION_RUN_ID)
+    opened = store_writer.Store.open(projection, ISOLATION_RUN_ID)
     try:
         built = cli.default_runner_factory(
             store=opened, run_id=ISOLATION_RUN_ID, story_id="story-1", card_id="card-1"
@@ -14339,7 +14716,7 @@ def test_the_production_runner_factory_launches_through_the_recorded_mode(
 def test_the_production_runner_factory_refuses_a_run_with_no_row(projection):
     """A5 B2: never a silent fallback to `direct`."""
     missing = "20260923T090000Z-deadbeef"
-    opened = store_module.Store.open(projection, missing)
+    opened = store_writer.Store.open(projection, missing)
     try:
         with pytest.raises(cli.UnknownRunError, match=missing):
             cli.default_runner_factory(
@@ -14359,9 +14736,9 @@ BWRAP_PROBE_FAILED = f"{' '.join(launcher.wrap_argv('bwrap', ['true'], Path('/')
 
 
 def _recorded_config(root: Path, run_id: str) -> models.RunConfig:
-    conn = store_module.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None
@@ -14688,9 +15065,9 @@ def test_a_resume_whose_recorded_mode_cannot_start_is_refused_and_writes_nothing
         len(_journal_lines(run_id)),
     )
     assert after == before
-    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
     try:
-        assert store_module.read_lease(conn, run_id) is None
+        assert store_leases.read_lease(conn, run_id) is None
     finally:
         conn.close()
 
@@ -15275,7 +15652,7 @@ def test_resume_refuses_a_bad_harness_timeout_with_exit_2_and_loads_nothing(
     tmp_path, monkeypatch, values
 ):
     monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
-    monkeypatch.setattr(cli.store_module, "open_db", _Forbidden("store.open_db"))
+    monkeypatch.setattr(store_db, "open_db", _Forbidden("store_db.open_db"))
 
     result = runner.invoke(
         cli.app,
@@ -15646,7 +16023,7 @@ def test_resume_run_refuses_a_phase_the_run_cannot_dispatch(projection, monkeypa
         )
     monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
     monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
-    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _Forbidden("Store.open"))
 
     with pytest.raises(typer.BadParameter) as caught:
         cli.resume_run(
@@ -15694,7 +16071,7 @@ def test_am_resume_of_a_task_run_refuses_resolve_with_exit_2_and_writes_nothing(
 ):
     _record(projection, TASK_RUN_ID, started_at=RECORDED_AT, status="started")
     monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
-    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _Forbidden("Store.open"))
     before = _runs_snapshot()
 
     result = runner.invoke(

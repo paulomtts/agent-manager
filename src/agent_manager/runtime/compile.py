@@ -41,6 +41,7 @@ from agent_manager.errors import AgentPhaseFailed, LimitWaitInterrupted
 from agent_manager.runtime import bridge, context, walk
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
+from agent_manager.store import db as store_db
 from agent_manager.workflow.phases import LAUNCHER_MARGIN, AgentPhase, Workflow
 
 STEP_TIMEOUT = 3600.0
@@ -208,6 +209,10 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 result = adopted.result
             else:
                 result = await bridge.call_agent(deps.agent_runner, p, table, rendered)
+        except store_db.StoreBusyError:
+            # A store write gave up after its retry budget: never an
+            # escalation or a loop back, both of which would write again.
+            raise
         except AgentPhaseFailed as failure:
             if p.on_fail is not None and loop < p.on_fail.max_loops:
                 yield ContextItem(

@@ -25,15 +25,18 @@ from typing import Any
 
 import pytest
 
-from agent_manager import board, cli, comments, store
+from agent_manager import board, cli, comments
+from agent_manager.store import db as store_db
+from agent_manager.store import outbox as store_outbox
+from agent_manager.store import queries as store_queries
 
 KEY_LINE = "am-key: "
 """How every outcome comment's last line starts (board-comments B5)."""
 
 def _run_status(root: Path, run_id: str) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
@@ -183,7 +186,7 @@ def _outbox(root: Path, run_id: str) -> dict[str, tuple[str, str, int]]:
     scenario reads it, to show what the board still owes; every other
     assertion reads the board itself.
     """
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         rows = conn.execute(
             "SELECT key, card_id, state, failed_attempts FROM board_comments"
@@ -233,10 +236,10 @@ def test_board_down_run_ends_done_with_warnings_and_next_life_flushes(
     assert len(warnings) == len(owed), warnings
     for key, (card, state, attempts) in owed.items():
         assert (state, attempts) == ("pending", 1), (key, state, attempts)
-        assert attempts < store.COMMENT_ATTEMPTS
+        assert attempts < store_outbox.COMMENT_ATTEMPTS
         named = [warning for warning in warnings if f"board comment {key} on card {card} " in warning]
         assert len(named) == 1, (key, warnings)
-        assert f"(attempt 1 of {store.COMMENT_ATTEMPTS})" in named[0], named[0]
+        assert f"(attempt 1 of {store_outbox.COMMENT_ATTEMPTS})" in named[0], named[0]
 
     # Same statuses as the clean run, and nothing on the board yet.
     for card in _all_cards(milestone_board):

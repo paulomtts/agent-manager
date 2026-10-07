@@ -6,6 +6,7 @@ found it, and still answer as they do for an unknown run.
 """
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,7 +14,9 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_manager import cli, models, paths
-from agent_manager import store as store_module
+from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
+from agent_manager.store import writer as store_writer
 
 runner = CliRunner()
 
@@ -27,8 +30,13 @@ def _tree(root: Path) -> set[str]:
     return {str(path.relative_to(root)) for path in root.rglob("*")}
 
 
-def _record(root: Path, run_id: str = RUN_ID) -> None:
-    opened = store_module.Store.open(root, run_id)
+def _record(
+    root: Path,
+    run_id: str = RUN_ID,
+    *,
+    started_at: datetime = datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+) -> None:
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -38,7 +46,7 @@ def _record(root: Path, run_id: str = RUN_ID) -> None:
                 base_branch="main",
                 branch_prefix="m1",
                 status="started",
-                started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+                started_at=started_at,
             )
         )
     finally:
@@ -170,7 +178,7 @@ def test_readers_see_a_run_while_a_writer_holds_a_write_transaction(
     root = tmp_path / "live"
     root.mkdir()
     _record(root)
-    held = store_module.open_db(root)
+    held = store_db.open_db(root)
     try:
         held.execute("BEGIN IMMEDIATE")
         held.execute("UPDATE runs SET status = 'done'")
@@ -194,4 +202,187 @@ def test_a_writer_still_creates_the_projection(tmp_path, monkeypatch):
 
     _record(root)
 
-    assert paths.project_db_location(root).is_file()
+    assert paths.db_path().is_file()
+    assert not (paths.data_path() / "projects").exists()
+
+
+def test_project_run_hides_a_run_another_project_recorded_in_the_same_file(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    _record(theirs)
+
+    # One connection on the file that holds `theirs`'s run, with a second
+    # project in it: the file is shared, the run is not.
+    conn = store_db.open_db(theirs)
+    try:
+        store_projects.resolve(conn, mine, now=datetime(2026, 10, 7, tzinfo=timezone.utc))
+        conn.commit()
+        found = cli._project_run(conn, theirs, RUN_ID)
+        assert found is not None and found.id == RUN_ID
+        assert cli._project_run(conn, mine, RUN_ID) is None
+        assert cli._project_run(conn, stranger, RUN_ID) is None
+        assert cli._project_run(conn, theirs, "no-such-run") is None
+    finally:
+        conn.close()
+
+
+A_RUN = "20260921T090000Z-aaaaaaaa"
+B_RUN = "20260922T090000Z-bbbbbbbb"
+
+
+@pytest.fixture
+def two_repos(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """Repos `a` and `b` sharing one data dir, one run each; `b`'s is newer."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    _record(a, A_RUN, started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(b, B_RUN, started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc))
+    return a, b
+
+
+def _row_counts() -> dict[str, int]:
+    """Every table of `am.db` with its row count, over a plain connection."""
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        return {
+            table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def test_runs_and_status_of_one_repo_never_show_another_repos_run(two_repos):
+    a, _ = two_repos
+
+    listed = runner.invoke(cli.app, ["runs", "--repo-dir", str(a)])
+    latest = runner.invoke(cli.app, ["status", "--repo-dir", str(a)])
+    dotted = runner.invoke(cli.app, ["runs", "--repo-dir", str(a / ".." / "a")])
+
+    assert paths.db_path().is_file()
+    assert listed.exit_code == 0, listed.output
+    assert [run["id"] for run in json.loads(listed.stdout)["data"]["runs"]] == [A_RUN]
+    assert latest.exit_code == 0, latest.output
+    assert json.loads(latest.stdout)["data"]["run"]["id"] == A_RUN
+    assert dotted.exit_code == 0, dotted.output
+    assert [run["id"] for run in json.loads(dotted.stdout)["data"]["runs"]] == [A_RUN]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", B_RUN],
+        ["logs", B_RUN, "card"],
+        ["resume", B_RUN],
+        ["reset", B_RUN],
+        ["cancel", B_RUN],
+        ["pause", B_RUN],
+    ],
+)
+def test_a_run_of_another_repo_is_an_unknown_run_and_nothing_is_written(two_repos, argv):
+    a, _ = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, [*argv, "--repo-dir", str(a)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert "UnknownRunError" in result.output
+    assert f"run {B_RUN!r} is not in the projection" in result.output
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_runs_on_a_newer_machine_database_is_a_store_schema_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = paths.db_path()
+    path.parent.mkdir(parents=True)
+    newer = sqlite3.connect(path)
+    newer.execute("CREATE TABLE sentinel (x)")
+    newer.execute(f"PRAGMA user_version = {store_db.SCHEMA_VERSION + 1}")
+    newer.commit()
+    newer.close()
+
+    result = _invoke_creating_nothing(tmp_path, ["runs", "--repo-dir", str(root)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "StoreSchemaError"
+    assert str(path) in envelope["error"]["message"]
+
+
+def _leave_a_legacy_database() -> None:
+    projects = paths.data_path() / "projects"
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / f"{'0' * 64}.db").write_bytes(b"")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["runs"],
+        ["status"],
+        ["status", RUN_ID],
+        ["logs", RUN_ID, "card"],
+        ["resume", RUN_ID],
+        ["reset", RUN_ID],
+        ["cancel", RUN_ID],
+        ["pause", RUN_ID],
+    ],
+)
+def test_every_store_command_refuses_an_unmigrated_machine_and_writes_nothing(
+    tmp_path, monkeypatch, argv
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, [*argv, "--repo-dir", str(root)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_journal_check_refuses_an_unmigrated_machine_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    # journal-check is machine-wide and takes no --repo-dir, so it cannot join
+    # the parametrization above, which appends one to every argv.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, ["journal-check", "--all"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()

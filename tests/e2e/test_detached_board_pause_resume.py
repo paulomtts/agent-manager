@@ -32,7 +32,10 @@ from typing import Any, get_args
 
 import pytest
 
-from agent_manager import cli, paths, store
+from agent_manager import cli, paths
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 
 VERIFY = "git rev-parse --verify HEAD"
 """Must equal the e2e conftest's `VERIFY_COMMANDS[0]`, as in test_detached_run.py."""
@@ -46,9 +49,9 @@ CONTROL_KEYS_NEVER_PRESENT = {"escalated", "failed_phase", "integrated", "done"}
 """A paused payload never escalates, never names a failed phase and never
 reaches Integrate (live control C6); as in test_live_control.py."""
 
-EVENT_KINDS = frozenset(get_args(store.EventKind))
+EVENT_KINDS = frozenset(get_args(store_journal.EventKind))
 
-JOURNAL_KEYS = frozenset(store.JournalLine.model_fields)
+JOURNAL_KEYS = frozenset(store_journal.JournalLine.model_fields)
 """Every key a JournalLine dumps; `am watch` prints `model_dump(mode="json")`."""
 
 
@@ -60,10 +63,10 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
         time.sleep(POLL)
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
@@ -333,9 +336,9 @@ def test_a_detached_board_is_watched_with_all_and_one_milestone_is_paused_and_re
     assert set(streamed) == set(expected), sorted(streamed)
     for run_id, events in expected.items():
         assert streamed[run_id] == events, run_id
-        assert [event["seq"] for event in streamed[run_id]] == list(
-            range(1, len(events) + 1)
-        ), run_id
+        seqs = [event["seq"] for event in streamed[run_id]]
+        # Strictly increasing: lease and control events take numbers the journal skips.
+        assert seqs == sorted(set(seqs)) and seqs[0] >= 1, (run_id, seqs)
     first_statuses = _collapse(_run_statuses(streamed[run_of[first]]))
     assert _is_subsequence(["started", "stopped", "started", "done"], first_statuses), (
         first_statuses
