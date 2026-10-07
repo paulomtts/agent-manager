@@ -2419,44 +2419,52 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     same connection and rendered by `control_view`, still without a write.
     The `integrity` key compares the run's events with the loaded tree through
     `integrity_view`, on the same connection, writing nothing either.
+
+    Every statement runs in one `store_db.read_snapshot`, and the first one
+    reads `store_events.head`: that is `as_of_seq`, and the payload reflects
+    every event up to it and none after it. Lease liveness is still judged at
+    read time, against `now`.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        wanted = run_id
-        if wanted is None:
-            wanted = store_queries.latest_run_id(
-                conn, project_id=store_projects.lookup(conn, root)
-            )
+        with store_db.read_snapshot(conn):
+            as_of_seq = store_events.head(conn)
+            wanted = run_id
             if wanted is None:
-                raise UnknownRunError(
-                    f"no run has been recorded for {root}, so there is no most recent"
-                    " run to report on; pass a run id or start one with `run --card`"
+                wanted = store_queries.latest_run_id(
+                    conn, project_id=store_projects.lookup(conn, root)
                 )
-        run = _project_run(conn, root, wanted)
-        if run is None:
-            raise UnknownRunError(
-                f"run {wanted!r} is not in the projection for {root}"
-                " (`agent-manager runs` lists the ones that are)"
+                if wanted is None:
+                    raise UnknownRunError(
+                        f"no run has been recorded for {root}, so there is no most recent"
+                        " run to report on; pass a run id or start one with `run --card`"
+                    )
+            run = _project_run(conn, root, wanted)
+            if run is None:
+                raise UnknownRunError(
+                    f"run {wanted!r} is not in the projection for {root}"
+                    " (`agent-manager runs` lists the ones that are)"
+                )
+            lease = store_leases.read_lease(conn, wanted)
+            now = _utcnow()
+            # Only a live lease's claims count (X5): a dead one's leftover rows
+            # are anyone's to take, so they are not shown as held.
+            claims = (
+                [claim.key for claim in store_leases.held_claims(conn, wanted, lease.token)]
+                if lease is not None and control.lease_is_live(lease, now=now)
+                else []
             )
-        lease = store_leases.read_lease(conn, wanted)
-        now = _utcnow()
-        # Only a live lease's claims count (X5): a dead one's leftover rows
-        # are anyone's to take, so they are not shown as held.
-        claims = (
-            [claim.key for claim in store_leases.held_claims(conn, wanted, lease.token)]
-            if lease is not None and control.lease_is_live(lease, now=now)
-            else []
-        )
-        state = control_view(
-            lease,
-            store_leases.control_requests(conn, wanted),
-            now=now,
-            claims=claims,
-        )
-        payload = status_payload(run, state)
-        payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
-        return payload
+            state = control_view(
+                lease,
+                store_leases.control_requests(conn, wanted),
+                now=now,
+                claims=claims,
+            )
+            payload = status_payload(run, state)
+            payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
+            payload["as_of_seq"] = as_of_seq
+            return payload
     finally:
         conn.close()
 

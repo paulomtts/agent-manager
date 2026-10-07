@@ -4603,6 +4603,172 @@ def test_status_with_no_run_id_against_a_project_with_no_runs_is_an_envelope(pro
     assert "most recent" in envelope["error"]["message"]
 
 
+SNAPSHOT_RUN_ID = "20260923T090000Z-cbe34d00"
+
+
+def _events_head(root: Path) -> int:
+    """`store_events.head` read on a connection of its own, outside any command."""
+    conn = store_db.open_db_for_reading(cli.resolve_repo_dir(root))
+    try:
+        return store_events.head(conn)
+    finally:
+        conn.close()
+
+
+def _write_once_after(monkeypatch, module, name: str, write) -> list[bool]:
+    """Patch `module.name` so it returns what it always did, and on its first
+    call only, after the original returned, runs `write`.
+
+    The returned list holds `True` once `write` has run, so a test can assert
+    the injection actually fired.
+    """
+    original = getattr(module, name)
+    fired: list[bool] = []
+
+    def wrapper(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            write()
+        return result
+
+    monkeypatch.setattr(module, name, wrapper)
+    return fired
+
+
+def test_status_as_of_seq_is_the_events_head(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    head = _events_head(projection)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert isinstance(payload["as_of_seq"], int)
+    assert payload["as_of_seq"] == head > 0
+    assert set(payload) == {
+        "run",
+        "stories",
+        "rows",
+        "control",
+        "warnings",
+        "integrity",
+        "as_of_seq",
+    }
+    argv = ["status", SNAPSHOT_RUN_ID, "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["as_of_seq"] == head
+
+
+def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
+    """The card's key test: a run and a phase change, each with its event,
+    commit right after `head` returns, while `status` is still reading."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        before = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+        head_before = _events_head(projection)
+
+        def fail_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+            writer.record_phase(
+                "story-1",
+                "card-1",
+                models.PhaseRun(name="verify", kind="deterministic", status="failed"),
+            )
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", fail_the_run)
+        during = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert during["run"]["status"] == "started"
+        assert during["stories"] == before["stories"]
+        assert during["rows"] == before["rows"]
+        assert during["integrity"] == before["integrity"]
+
+        after = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+        assert after["run"]["status"] == "failed"
+        assert ("story-1", "card-1", "verify", None, "failed") in [
+            (row["story"], row["subtask"], row["phase"], row["attempt"], row["state"])
+            for row in after["rows"]
+        ]
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_status_default_run_is_chosen_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 1: a run recorded after `head` must not become the run
+    `status` with no RUN reports."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+    newer_id = "20260930T090000Z-cbe34d00"
+    writer = store_writer.Store.open(projection, newer_id)
+    try:
+        head_before = _events_head(projection)
+
+        def start_a_newer_run() -> None:
+            writer.record_run(
+                models.Run(
+                    id=newer_id,
+                    workflow="task",
+                    repo_dir=projection,
+                    base_branch="main",
+                    branch_prefix="m1",
+                    status="started",
+                    started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+                )
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_events, "head", start_a_newer_run
+        )
+        during = cli.status_for(None, repo_dir=projection)
+
+        assert fired == [True]
+        assert during["run"]["id"] == SNAPSHOT_RUN_ID
+        assert during["as_of_seq"] == head_before
+        assert cli.status_for(None, repo_dir=projection)["run"]["id"] == newer_id
+    finally:
+        writer.close()
+
+
+def test_status_error_paths_are_unchanged_and_close_the_snapshot(projection, monkeypatch):
+    """Review Focus 2. A guard: the refusals predate this card and already
+    close their connection; this pins that the snapshot does not change that."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    other = projection.parent / "no-runs"
+    other.mkdir()
+    opened: list[sqlite3.Connection] = []
+    original = cli.store_db.open_db_for_reading
+
+    def capture(root):
+        conn = original(root)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture)
+
+    for argv in (
+        ["status", "no-such-run", "--repo-dir", str(projection)],
+        ["status", "--repo-dir", str(other)],
+    ):
+        result = runner.invoke(cli.app, argv)
+
+        assert result.exit_code == cli.EXIT_ERROR, result.output
+        envelope = json.loads(result.stdout)
+        assert set(envelope) == {"ok", "error"}
+        assert envelope["error"]["type"] == "UnknownRunError"
+        assert "as_of_seq" not in result.stdout
+    assert len(opened) == 2
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+
 def test_status_of_a_run_that_died_before_its_first_phase_is_ok_with_no_rows(projection):
     """`run_card` writes the run, story and subtask rows before the walk starts
     (cli.py:228-230) exactly so `status` can see a run that died on its first
@@ -13070,7 +13236,11 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     finally:
         conn.close()
     before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))
-    expected = cli.render(cli.ok_envelope({**before, "integrity": CLEAN_INTEGRITY}))
+    expected = cli.render(
+        cli.ok_envelope(
+            {**before, "integrity": CLEAN_INTEGRITY, "as_of_seq": _events_head(projection)}
+        )
+    )
 
     for args in (["status", CONTROL_RUN_ID], ["status"]):
         result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])
