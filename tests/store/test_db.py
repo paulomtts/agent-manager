@@ -164,6 +164,8 @@ _DB_NAMES = (
     "StoreSchemaError",
     "MigrationRequiredError",
     "_refuse_unmigrated",
+    "migration_marker",
+    "open_db_for_migration",
     "run_with_retry",
     "is_busy",
     "StoreBusyError",
@@ -196,6 +198,8 @@ def test_db_is_a_leaf_module_of_the_store_package():
         db.open_db_for_reading,
         db.store_id,
         db.run_with_retry,
+        db.migration_marker,
+        db.open_db_for_migration,
     ):
         assert callable(function)
         assert function.__module__ == "agent_manager.store.db"
@@ -1101,6 +1105,70 @@ def test_the_refusal_check_does_not_wait_for_a_writer_holding_a_transaction(repo
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_migration_marker_is_none_and_creates_nothing_without_an_am_db(repo):
+    assert db.migration_marker(paths.db_path()) is None
+    assert not paths.data_path().exists()
+
+
+def test_migration_marker_is_none_without_a_meta_table_or_without_its_row(repo):
+    path = paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bare = sqlite3.connect(path)
+    bare.execute("CREATE TABLE sentinel (x)")
+    bare.commit()
+    bare.close()
+    assert db.migration_marker(path) is None
+
+    path.unlink()
+    db.open_db(repo).close()
+    assert db.migration_marker(path) is None
+
+
+def test_migration_marker_reads_the_value_and_changes_nothing(repo):
+    db.open_db(repo).close()
+    _mark_migrated(paths.db_path())
+    _leave_legacy()
+    before = _data_tree()
+
+    assert db.migration_marker(paths.db_path()) == _STAMP
+    assert _data_tree() == before
+
+
+def test_open_db_for_migration_creates_the_full_schema_on_an_unmigrated_machine(repo):
+    legacy = _leave_legacy()
+
+    conn = db.open_db_for_migration()
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        minted = db.store_id(conn)
+        row_type = type(conn.execute("SELECT 1 AS one").fetchone())
+    finally:
+        conn.close()
+
+    assert {"projects", "meta", "events", *_PROJECT_TABLES} <= tables
+    assert mode == "wal"
+    assert minted is not None
+    assert row_type is sqlite3.Row
+    assert _user_version(paths.db_path()) == db.SCHEMA_VERSION
+    assert db.migration_marker(paths.db_path()) is None
+    assert legacy.read_bytes() == b"legacy bytes"
+
+
+def test_open_db_for_migration_refuses_a_newer_db_and_leaves_it_untouched(repo):
+    _leave_legacy()
+    path = paths.db_path()
+    before = _write_newer_db(path)
+
+    with pytest.raises(db.StoreSchemaError):
+        db.open_db_for_migration()
+
+    assert path.read_bytes() == before
 
 
 # -- run_with_retry ------------------------------------------------------------
