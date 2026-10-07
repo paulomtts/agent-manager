@@ -327,3 +327,85 @@ def test_a_foreign_hold_past_the_retry_budget_raises_store_busy_error_and_spends
     assert held_journal == [1]
     assert line.seq == 2
     assert events[-1].seq == head + 1
+
+CRASH_CHILD = textwrap.dedent(
+    """
+    import os, signal, sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from agent_manager import models
+    from agent_manager.store import writer as store_writer
+
+    repo, run_id = Path(sys.argv[1]), sys.argv[2]
+    st = store_writer.Store.open(repo, run_id)
+    st.record_run(models.Run(
+        id=run_id, workflow="milestone", repo_dir=repo, base_branch="main",
+        branch_prefix="m1/", status="started",
+        started_at=datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc),
+    ))
+
+    def killed_mid_job(conn, run_id_, story):
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id = ? AND kind = 'story_upsert'",
+            (run_id_,),
+        ).fetchone()[0]
+        print(f"inserted {count}", flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    st._write_story_row = killed_mid_job
+    st.record_story(models.StoryRun(card_id="story-a", title="Story A", level=0, status="started"))
+    print("survived", flush=True)
+    """
+)
+"""A child that commits `record_run`, then is `SIGKILL`ed inside `record_story`'s
+job, after `_insert_event` and before the row write (`writer.py` `_record`). It
+counts the run's `story_upsert` events on the job's own connection, which sees
+its uncommitted insert, and prints `inserted <count>` before the kill."""
+
+
+def test_a_writer_killed_between_event_insert_and_row_write_leaves_no_partial_write(
+    repo, monkeypatch
+):
+    # D:378-380. The raising-hook variant is test_writer.py's
+    # test_a_failed_row_write_leaves_no_event_and_consumes_no_run_seq.
+    child = subprocess.run(
+        [sys.executable, "-c", CRASH_CHILD, str(repo), RUN_A],
+        capture_output=True,
+        text=True,
+        timeout=WAIT,
+    )
+
+    assert child.stdout.split("\n") == ["inserted 1", ""], child.stderr
+    assert child.returncode == -signal.SIGKILL
+    conn = store_db.open_db(repo)
+    try:
+        events = _events(conn)
+        stories = conn.execute(
+            "SELECT COUNT(*) FROM stories WHERE run_id = ?", (RUN_A,)
+        ).fetchone()[0]
+        counter = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'events'"
+        ).fetchone()[0]
+        head = store_events.head(conn)
+    finally:
+        conn.close()
+    assert [(event.kind, event.run_seq) for event in events] == [("run_upsert", 1)]
+    assert stories == 0
+    assert counter == head
+    assert _journal_seqs() == [1]
+
+    # One attempt with a short timeout: a lock the dead child still held
+    # would raise StoreBusyError here instead of being waited out.
+    monkeypatch.setattr(store_db, "BUSY_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(store_db, "RETRY_ATTEMPTS", 1)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        replayed = st.replay_events(RUN_A)
+        loaded = st.load_run(RUN_A)
+        line = st.record_story(STORY)
+        after = _events(st.read_connection)
+    finally:
+        st.close()
+    assert replayed == loaded
+    assert line.seq == 2
+    assert after[-1].seq == head + 1
