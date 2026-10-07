@@ -486,6 +486,24 @@ def test_run_config_accepts_allow_no_verification_true():
     assert models.RunConfig.model_validate(dumped).allow_no_verification is True
 
 
+FALLBACK_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+def test_run_config_isolation_warning_defaults_to_none_and_round_trips():
+    """A5 spec test 1: defaulted, so a config recorded before the field validates."""
+    assert models.RunConfig().isolation_warning is None
+    legacy = models.RunConfig().model_dump(mode="json")
+    del legacy["isolation_warning"]
+    assert models.RunConfig.model_validate(legacy).isolation_warning is None
+
+    dumped = models.RunConfig(isolation_warning=FALLBACK_WARNING).model_dump(mode="json")
+
+    assert dumped["isolation_warning"] == FALLBACK_WARNING
+    assert models.RunConfig.model_validate(dumped).isolation_warning == FALLBACK_WARNING
+
+
 def test_story_rejects_a_negative_level():
     with pytest.raises(ValidationError) as excinfo:
         models.StoryRun(card_id="8831189b", title="Foundations", level=-1)

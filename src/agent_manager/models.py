@@ -192,6 +192,13 @@ class RunConfig(_Model):
     Resume reads it, and a resume's flag can only add it. Defaulted because
     journal lines written before it carry no such key.
     """
+    isolation_warning: str | None = None
+    """The warning `--isolation auto` gave when it fell back to `direct`; else `None`.
+
+    `am status` and `am resume` show it, so a detached run whose envelope is
+    gone still says it is un-isolated. Defaulted because journal lines
+    written before it carry no such key.
+    """
 
 
 class Run(_Model):

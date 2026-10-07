@@ -2346,6 +2346,32 @@ def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
     assert not (paths.data_dir() / "runs" / "run-that-never-was").exists()
 
 
+def test_run_config_reads_the_recorded_config_and_none_for_an_absent_run(repo):
+    """A5 spec test 2: the factory's reader, round-tripped through row and journal."""
+    warning = "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+    base = _run(repo)
+    run = base.model_copy(
+        update={
+            "config": base.config.model_copy(
+                update={"launcher": "bwrap", "isolation_warning": warning}
+            )
+        }
+    )
+    st = store.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(run)
+    finally:
+        st.close()
+
+    conn = store.open_db(repo)
+    try:
+        assert store.run_config(conn, RUN_ID) == run.config
+        assert store.run_config(conn, "run-never-recorded") is None
+    finally:
+        conn.close()
+    assert store.replay(store.Journal(RUN_ID).read()).config == run.config
+
+
 def _held_elsewhere(lock) -> bool:
     """True when a different thread cannot take `lock` right now.
 
