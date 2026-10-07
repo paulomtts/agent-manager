@@ -45,6 +45,7 @@ _STORE_LEAVES = (
     "checkpoints",
     "outbox",
     "projects",
+    "events",
 )
 
 _WRITER_MAY_IMPORT = frozenset(

@@ -5,14 +5,37 @@ Real SQLite files under `tmp_path` through the `repo` and `conns` fixtures of
 `tests/store/conftest.py`; nothing spawns a process, so these are unit tests.
 """
 
+import ast
+import inspect
+import json
 import sqlite3
+import sys
+import types
+from pathlib import Path
 
 import pytest
 
-from agent_manager import paths
+from agent_manager import paths, store
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 
 TS = "2026-10-07T12:00:00+00:00"
+
+
+def _insert(
+    conn: sqlite3.Connection, project_id: int, **overrides
+) -> store_events.EventRow:
+    """`store_events.insert` with every required field defaulted; does not commit."""
+    fields = {
+        "project_id": project_id,
+        "run_id": "run-a",
+        "ts": TS,
+        "kind": "phase_started",
+        "payload": {"n": 1},
+        "source": "live",
+    }
+    fields.update(overrides)
+    return store_events.insert(conn, **fields)
 
 
 def _raw_insert(
@@ -262,3 +285,398 @@ def test_open_db_for_reading_upgrades_an_am_db_without_events(repo):
 
     assert objects == _EVENTS_OBJECTS
     assert kept == ["/kept"]
+
+
+# ── store.events: where the module sits ──────────────────────────────────────
+
+
+def test_events_is_a_leaf_module_of_the_store_package():
+    for function in (store_events.insert, store_events.read, store_events.head):
+        assert function.__module__ == "agent_manager.store.events"
+    assert store_events.EventRow.__module__ == "agent_manager.store.events"
+    assert inspect.ismodule(store.events)
+    assert store.events is store_events
+    for name in ("insert", "read", "head", "EventRow"):
+        assert not hasattr(store, name)
+
+
+def test_events_imports_only_the_stdlib_and_store_db():
+    outside: list[str] = []
+    for node in ast.walk(ast.parse(Path(store_events.__file__).read_text())):
+        if isinstance(node, ast.Import):
+            outside.extend(
+                alias.name
+                for alias in node.names
+                if alias.name.split(".")[0] not in sys.stdlib_module_names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                outside.append("." * node.level + module)
+            elif module == "agent_manager.store":
+                outside.extend(
+                    f"agent_manager.store.{alias.name}"
+                    for alias in node.names
+                    if (alias.name, alias.asname) != ("db", "store_db")
+                )
+            elif module.split(".")[0] not in sys.stdlib_module_names:
+                outside.append(module)
+    assert outside == []
+
+
+_TRANSACTION_CALLS = frozenset({"commit", "rollback", "immediate", "open_db", "connect"})
+
+
+def test_events_never_commits_or_opens_a_transaction():
+    found: list[str] = []
+    for node in ast.walk(ast.parse(Path(store_events.__file__).read_text())):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _TRANSACTION_CALLS
+        ):
+            found.append(f"line {node.lineno}: .{node.func.attr}()")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "BEGIN" in node.value
+        ):
+            found.append(f"line {node.lineno}: {node.value!r}")
+    assert found == []
+
+
+# ── insert ───────────────────────────────────────────────────────────────────
+
+
+def test_insert_returns_the_stored_row(conns, project_id):
+    conn, _ = conns
+
+    minimal = _insert(conn, project_id)
+    full = store_events.insert(
+        conn,
+        project_id=project_id,
+        run_id="run-a",
+        ts=TS,
+        kind="attempt_finished",
+        payload={"exit_code": 0},
+        source="imported",
+        story_id="story-1",
+        card_id="card-1",
+        phase="plan",
+        attempt=2,
+        schema=3,
+    )
+
+    assert minimal == store_events.EventRow(
+        seq=minimal.seq,
+        project_id=project_id,
+        run_id="run-a",
+        run_seq=1,
+        ts=TS,
+        kind="phase_started",
+        story_id=None,
+        card_id=None,
+        phase=None,
+        attempt=None,
+        schema=1,
+        payload={"n": 1},
+        source="live",
+    )
+    assert full == store_events.EventRow(
+        seq=minimal.seq + 1,
+        project_id=project_id,
+        run_id="run-a",
+        run_seq=2,
+        ts=TS,
+        kind="attempt_finished",
+        story_id="story-1",
+        card_id="card-1",
+        phase="plan",
+        attempt=2,
+        schema=3,
+        payload={"exit_code": 0},
+        source="imported",
+    )
+    assert store_events.read(conn) == [minimal, full]
+
+
+def test_insert_stores_ts_verbatim(conns, project_id):
+    conn, _ = conns
+    stamps = ["2026-10-07T12:00:00.123456+00:00", "2026-10-07T12:00:00Z"]
+
+    for stamp in stamps:
+        _insert(conn, project_id, ts=stamp)
+
+    stored = [row["ts"] for row in conn.execute("SELECT ts FROM events ORDER BY seq")]
+    assert stored == stamps
+    assert [row.ts for row in store_events.read(conn)] == stamps
+
+
+def test_insert_stores_payload_with_sorted_keys(conns, project_id):
+    conn, _ = conns
+    payload = {"zeta": 1, "alpha": {"y": 2, "b": 3}, "mid": [3, 1]}
+
+    row = _insert(conn, project_id, payload=payload)
+
+    stored = conn.execute(
+        "SELECT payload FROM events WHERE seq = ?", (row.seq,)
+    ).fetchone()[0]
+    assert stored == json.dumps(payload, sort_keys=True)
+    assert stored.index('"alpha"') < stored.index('"mid"') < stored.index('"zeta"')
+    assert stored.index('"b"') < stored.index('"y"')
+    assert row.payload == payload
+
+
+def test_insert_accepts_any_mapping_payload(conns, project_id):
+    # Review Focus 2: the parameter is a Mapping, not only a dict.
+    conn, _ = conns
+
+    row = _insert(conn, project_id, payload=types.MappingProxyType({"b": 1, "a": 2}))
+
+    assert row.payload == {"a": 2, "b": 1}
+    assert conn.execute(
+        "SELECT payload FROM events WHERE seq = ?", (row.seq,)
+    ).fetchone()[0] == '{"a": 2, "b": 1}'
+
+
+def test_payload_round_trips_unicode_and_nesting(conns, project_id):
+    # Review Focus 3.
+    conn, _ = conns
+    payload = {"title": "café ✓ 事件", "items": [{"k": None}, [1, 2.5, True]]}
+
+    row = _insert(conn, project_id, payload=payload)
+
+    assert row.payload == payload
+    assert store_events.read(conn)[0].payload == payload
+
+
+def test_run_seq_counts_per_run_from_one(conns, project_id, other_project_id):
+    conn, _ = conns
+
+    order = [
+        ("run-a", project_id),
+        ("run-b", other_project_id),
+        ("run-a", project_id),
+        ("run-b", other_project_id),
+        ("run-a", project_id),
+    ]
+    rows = [_insert(conn, project, run_id=run) for run, project in order]
+
+    assert [(row.run_id, row.run_seq) for row in rows] == [
+        ("run-a", 1),
+        ("run-b", 1),
+        ("run-a", 2),
+        ("run-b", 2),
+        ("run-a", 3),
+    ]
+
+
+def test_explicit_run_seq_is_kept(conns, project_id):
+    conn, _ = conns
+
+    kept = _insert(conn, project_id, run_seq=7)
+    following = _insert(conn, project_id)
+
+    assert kept.run_seq == 7
+    assert following.run_seq == 8
+
+
+def test_duplicate_run_seq_is_refused(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id, run_id="run-a", run_seq=4)
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        _insert(conn, project_id, run_id="run-a", run_seq=4)
+    elsewhere = _insert(conn, project_id, run_id="run-b", run_seq=4)
+
+    assert elsewhere.run_seq == 4
+    assert [(row.run_id, row.run_seq) for row in store_events.read(conn)] == [
+        ("run-a", 4),
+        ("run-b", 4),
+    ]
+
+
+@pytest.mark.parametrize("field", ["project_id", "run_id", "ts", "kind"])
+def test_a_missing_required_value_is_refused(conns, project_id, field):
+    conn, _ = conns
+    fields = {
+        "project_id": project_id,
+        "run_id": "run-a",
+        "ts": TS,
+        "kind": "phase_started",
+        "payload": {"n": 1},
+        "source": "live",
+        field: None,
+    }
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL constraint failed"):
+        store_events.insert(conn, **fields)
+    conn.rollback()
+    assert store_events.head(conn) == 0
+
+
+def test_source_outside_live_and_imported_is_refused_by_insert(conns, project_id):
+    conn, _ = conns
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        _insert(conn, project_id, source="replayed")
+
+
+def test_seq_is_strictly_increasing_across_runs_and_projects(
+    conns, project_id, other_project_id
+):
+    conn, _ = conns
+    order = [
+        ("run-a", project_id),
+        ("run-c", other_project_id),
+        ("run-b", project_id),
+        ("run-c", other_project_id),
+        ("run-a", project_id),
+    ]
+
+    seqs = [_insert(conn, project, run_id=run).seq for run, project in order]
+
+    assert all(earlier < later for earlier, later in zip(seqs, seqs[1:]))
+
+
+def test_insert_does_not_commit(conns, project_id):
+    conn, other = conns
+
+    row = _insert(conn, project_id)
+
+    assert conn.in_transaction
+    assert store_events.head(other) == 0
+    assert store_events.read(other) == []
+    conn.commit()
+    assert store_events.head(other) == row.seq
+    assert store_events.read(other) == [row]
+
+
+def test_a_rolled_back_insert_consumes_no_seq(conns, project_id):
+    conn, _ = conns
+    first = _insert(conn, project_id)
+    conn.commit()
+    _insert(conn, project_id)
+    conn.rollback()
+
+    second = _insert(conn, project_id)
+    conn.commit()
+
+    assert second.seq == first.seq + 1
+    assert second.run_seq == first.run_seq + 1
+    assert conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'events'"
+    ).fetchone()[0] == second.seq
+
+
+def test_unserializable_payload_inserts_nothing(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id)
+    conn.commit()
+    before = store_events.head(conn)
+
+    with pytest.raises(TypeError):
+        _insert(conn, project_id, payload={"x": object()})
+
+    assert not conn.in_transaction
+    assert store_events.head(conn) == before
+
+
+# ── head ─────────────────────────────────────────────────────────────────────
+
+
+def test_head_of_an_empty_table_is_zero(conns):
+    conn, _ = conns
+    assert store_events.head(conn) == 0
+
+
+def test_head_is_the_largest_seq(conns, project_id, other_project_id):
+    conn, _ = conns
+    _insert(conn, project_id, run_id="run-a")
+    last = _insert(conn, other_project_id, run_id="run-b")
+
+    assert store_events.head(conn) == last.seq
+
+
+# ── read ─────────────────────────────────────────────────────────────────────
+
+
+def _five_rows(conn, project_id, other_project_id) -> list[store_events.EventRow]:
+    order = [
+        ("run-a", project_id),
+        ("run-b", project_id),
+        ("run-c", other_project_id),
+        ("run-a", project_id),
+        ("run-c", other_project_id),
+    ]
+    rows = [_insert(conn, project, run_id=run) for run, project in order]
+    conn.commit()
+    return rows
+
+
+def test_read_returns_rows_after_seq_in_order(conns, project_id, other_project_id):
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read(conn) == rows
+    assert store_events.read(conn, after_seq=rows[1].seq) == rows[2:]
+    assert store_events.read(conn, after_seq=rows[-1].seq) == []
+    assert store_events.read(conn, after_seq=rows[-1].seq + 10) == []
+
+
+def test_read_with_a_negative_after_seq_reads_everything(
+    conns, project_id, other_project_id
+):
+    # Review Focus 5.
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read(conn, after_seq=-5) == rows
+
+
+def test_read_limit_pages_without_gap_or_repeat(conns, project_id, other_project_id):
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    paged: list[store_events.EventRow] = []
+    after = 0
+    while page := store_events.read(conn, after_seq=after, limit=2):
+        assert len(page) <= 2
+        paged.extend(page)
+        after = page[-1].seq
+
+    assert paged == rows
+
+
+def test_read_filters_by_run_and_by_project(conns, project_id, other_project_id):
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read(conn, run_id="run-a") == [rows[0], rows[3]]
+    assert store_events.read(conn, project_id=other_project_id) == [rows[2], rows[4]]
+    assert store_events.read(conn, project_id=project_id) == [rows[0], rows[1], rows[3]]
+    assert store_events.read(conn, run_id="run-c", project_id=project_id) == []
+    assert store_events.read(conn, run_id="run-a", project_id=project_id) == [
+        rows[0],
+        rows[3],
+    ]
+    assert store_events.read(
+        conn, run_id="run-a", after_seq=rows[0].seq, limit=1
+    ) == [rows[3]]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_read_refuses_a_non_positive_limit(conns, limit):
+    conn, _ = conns
+    with pytest.raises(ValueError, match="limit"):
+        store_events.read(conn, limit=limit)
+
+
+def test_read_and_head_open_no_transaction(conns, project_id, other_project_id):
+    # Review Focus 4.
+    conn, _ = conns
+    _five_rows(conn, project_id, other_project_id)
+    assert not conn.in_transaction
+
+    store_events.read(conn, limit=2)
+    store_events.head(conn)
+
+    assert not conn.in_transaction
