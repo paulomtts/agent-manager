@@ -1252,10 +1252,20 @@ def _raise_integrity_error(conn: sqlite3.Connection, raised: list[BaseException]
         raise
 
 
+def _raise_operational_error(
+    conn: sqlite3.Connection, raised: list[BaseException]
+) -> None:
+    try:
+        conn.execute("SELECT * FROM no_such_table")  # not busy, so not retried
+    except sqlite3.OperationalError as error:
+        raised.append(error)
+        raise
+
+
 @pytest.mark.parametrize(
     "fail",
-    [_raise_value_error, _raise_integrity_error],
-    ids=["value-error", "integrity-error"],
+    [_raise_value_error, _raise_integrity_error, _raise_operational_error],
+    ids=["value-error", "integrity-error", "operational-error"],
 )
 def test_a_job_raising_in_a_batch_fails_only_its_own_caller(repo, fail):
     raised: list[BaseException] = []
