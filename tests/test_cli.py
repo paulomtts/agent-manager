@@ -5032,7 +5032,8 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_
     for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
         assert set(envelope) == {"ok", "data"}
         assert envelope["ok"] is True
-        assert set(envelope["data"]) == {"runs"}
+        assert set(envelope["data"]) == {"runs", "as_of_seq"}
+        assert isinstance(envelope["data"]["as_of_seq"], int)
         assert len(envelope["data"]["runs"]) == 3
         for entry in envelope["data"]["runs"]:
             assert set(entry) == RUNS_ENTRY_KEYS
@@ -5041,6 +5042,104 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_
             RUNS_STORY_ID,
             None,
         ]
+
+
+SNAPSHOT_OLDER_RUN_ID = "20260922T090000Z-cbe34d00"
+
+
+def _record_two_started_runs(root: Path) -> None:
+    _record(
+        root,
+        SNAPSHOT_OLDER_RUN_ID,
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+        status="started",
+    )
+    _record(root, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+
+
+def _statuses(payload: dict[str, Any]) -> dict[str, str]:
+    return {entry["id"]: entry["status"] for entry in payload["runs"]}
+
+
+def test_runs_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
+    """A run status change, with its event, commits right after `head` returns."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def fail_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", fail_the_run)
+        during = cli.runs_for(repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert _statuses(during) == {
+            SNAPSHOT_OLDER_RUN_ID: "started",
+            SNAPSHOT_RUN_ID: "started",
+        }
+        after = cli.runs_for(repo_dir=projection)
+        assert _statuses(after)[SNAPSHOT_RUN_ID] == "failed"
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_runs_reads_every_lease_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 4, the spec's second T11 variant: the write lands after
+    `list_runs` returned and before the first `read_lease`, so only a
+    `read_lease` outside the snapshot could see it."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def take_over_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+            writer.take_lease(
+                token="snapshot-life",
+                pid=os.getpid(),
+                host=socket.gethostname(),
+                now=datetime.now(timezone.utc),
+                is_live=lambda row: False,
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_queries, "list_runs", take_over_the_run
+        )
+        during = cli.runs_for(repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert _statuses(during) == {
+            SNAPSHOT_OLDER_RUN_ID: "started",
+            SNAPSHOT_RUN_ID: "started",
+        }
+        assert [entry["lease"] for entry in during["runs"]] == [None, None]
+        after = cli.runs_for(repo_dir=projection)
+        leases = {entry["id"]: entry["lease"] for entry in after["runs"]}
+        assert leases[SNAPSHOT_RUN_ID] is not None
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_runs_as_of_seq_on_an_empty_listing(projection):
+    assert cli.runs_for(repo_dir=projection) == {"runs": [], "as_of_seq": 0}
+
+    elsewhere = projection.parent / "elsewhere"
+    elsewhere.mkdir()
+    _record(elsewhere, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    head = _events_head(elsewhere)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert payload["runs"] == []
+    assert payload["as_of_seq"] == head > 0
 
 
 RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"

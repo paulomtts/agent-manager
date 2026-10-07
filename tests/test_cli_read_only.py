@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from agent_manager import cli, models, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 
@@ -84,7 +85,17 @@ def test_runs_on_an_unknown_repo_is_empty_and_creates_nothing(unknown_repo, tmp_
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"ok": True, "data": {"runs": []}}
+    head = 0
+    if paths.db_path().exists():
+        conn = store_db.open_db_for_reading(unknown_repo)
+        try:
+            head = store_events.head(conn)
+        finally:
+            conn.close()
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": head},
+    }
 
 
 def test_status_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(

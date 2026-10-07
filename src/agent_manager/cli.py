@@ -2504,23 +2504,30 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
 
     `progress` arrives already counted by `store_queries.list_runs`; `model_copy`
     keeps it and `model_dump` carries it into the entry unchanged.
+
+    Every statement runs in one `store_db.read_snapshot`, and the first one
+    reads `store_events.head`: that is `as_of_seq`, the machine-wide head (so
+    it can be above 0 on an empty listing), and the listing reflects every
+    event up to it and none after it.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        now = _utcnow()
-        entries = []
-        for summary in store_queries.list_runs(
-            conn, project_id=store_projects.lookup(conn, root)
-        ):
-            lease = store_leases.read_lease(conn, summary.id)
-            shown = (
-                None
-                if lease is None
-                else store_queries.RunLease(**_lease_fields(lease, now=now))
-            )
-            entries.append(summary.model_copy(update={"lease": shown}).model_dump())
-        return {"runs": entries}
+        with store_db.read_snapshot(conn):
+            as_of_seq = store_events.head(conn)
+            now = _utcnow()
+            entries = []
+            for summary in store_queries.list_runs(
+                conn, project_id=store_projects.lookup(conn, root)
+            ):
+                lease = store_leases.read_lease(conn, summary.id)
+                shown = (
+                    None
+                    if lease is None
+                    else store_queries.RunLease(**_lease_fields(lease, now=now))
+                )
+                entries.append(summary.model_copy(update={"lease": shown}).model_dump())
+            return {"runs": entries, "as_of_seq": as_of_seq}
     finally:
         conn.close()
 
