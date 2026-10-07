@@ -7,6 +7,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from agent_manager import paths
@@ -326,3 +327,8 @@ def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.rollback()
         raise
     conn.commit()
+
+
+def iso(value: datetime | None) -> str | None:
+    """The column encoding of a timestamp: ISO-8601 text; `None` stays `None`."""
+    return None if value is None else value.isoformat()

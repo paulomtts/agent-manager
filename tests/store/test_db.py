@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,15 @@ def test_db_is_a_leaf_module_of_the_store_package():
 
 def test_the_store_package_does_not_re_export_db_names():
     assert [name for name in _DB_NAMES if hasattr(store, name)] == []
+
+
+def test_iso_is_the_column_encoding_of_a_timestamp():
+    assert db.iso.__module__ == "agent_manager.store.db"
+    assert db.iso(None) is None
+    stamp = datetime(2026, 10, 7, 12, 30, tzinfo=timezone.utc)
+    assert db.iso(stamp) == "2026-10-07T12:30:00+00:00"
+    # The private copy in the package is gone: one encoding, one home.
+    assert not hasattr(store, "_iso")
 
 
 def test_db_imports_only_the_stdlib_and_paths():

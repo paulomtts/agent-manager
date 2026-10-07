@@ -30,10 +30,6 @@ from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
 
-def _iso(value: datetime | None) -> str | None:
-    return None if value is None else value.isoformat()
-
-
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
 
@@ -370,7 +366,7 @@ def add_control(
     conn.execute(
         "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
         " handled_at) VALUES (?, ?, ?, ?, ?, NULL)",
-        (run_id, seq, lease, command, _iso(requested_at)),
+        (run_id, seq, lease, command, store_db.iso(requested_at)),
     )
     return ControlRow(
         run_id=run_id,
@@ -573,7 +569,7 @@ class Store:
                 "base_branch": run.base_branch,
                 "branch_prefix": run.branch_prefix,
                 "status": run.status,
-                "started_at": _iso(run.started_at),
+                "started_at": store_db.iso(run.started_at),
                 "config": json.dumps(run.config.model_dump(mode="json"), sort_keys=True),
                 "milestone_id": run.milestone_id,
             },
@@ -658,8 +654,8 @@ class Store:
                 "name": phase.name,
                 "kind": phase.kind,
                 "status": phase.status,
-                "started_at": _iso(phase.started_at),
-                "ended_at": _iso(phase.ended_at),
+                "started_at": store_db.iso(phase.started_at),
+                "ended_at": store_db.iso(phase.ended_at),
                 "detail": phase.detail,
             },
         )
@@ -768,7 +764,7 @@ class Store:
                         digest,
                         reason,
                         text,
-                        _iso(saved_at),
+                        store_db.iso(saved_at),
                     ),
                 )
                 if floor is not None:
@@ -912,7 +908,7 @@ class Store:
                     " comment_id, failed_attempts, created_at, posted_at)"
                     " VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
                     " ON CONFLICT(key) DO NOTHING",
-                    (run_id, card_id, key, body, _iso(now)),
+                    (run_id, card_id, key, body, store_db.iso(now)),
                 )
                 self._commit()
             except sqlite3.Error:
@@ -962,7 +958,7 @@ class Store:
                 self._conn.execute(
                     "UPDATE board_comments SET state = 'posted', comment_id = ?,"
                     " posted_at = ? WHERE key = ?",
-                    (comment_id, _iso(now), key),
+                    (comment_id, store_db.iso(now), key),
                 )
                 self._commit()
             except sqlite3.Error:
@@ -1040,7 +1036,7 @@ class Store:
                     " token=excluded.token, pid=excluded.pid, host=excluded.host,"
                     " acquired_at=excluded.acquired_at,"
                     " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                    (self.run_id, token, pid, host, _iso(now), _iso(now)),
+                    (self.run_id, token, pid, host, store_db.iso(now), store_db.iso(now)),
                 )
                 for key in keys:
                     self._conn.execute(
@@ -1048,7 +1044,7 @@ class Store:
                         " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
                         " run_id=excluded.run_id, token=excluded.token,"
                         " claimed_at=excluded.claimed_at",
-                        (key, self.run_id, token, _iso(now)),
+                        (key, self.run_id, token, store_db.iso(now)),
                     )
             self.bind_lease(token)
             self._journal.reseek()
@@ -1084,7 +1080,7 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "UPDATE run_leases SET heartbeat_at = ? WHERE run_id = ? AND token = ?",
-                (_iso(now), self.run_id, token),
+                (store_db.iso(now), self.run_id, token),
             )
             self._conn.commit()
 
@@ -1153,7 +1149,7 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
-                (_iso(now), self.run_id, seq),
+                (store_db.iso(now), self.run_id, seq),
             )
             self._conn.commit()
 
