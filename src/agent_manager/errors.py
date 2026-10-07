@@ -64,3 +64,22 @@ class StoryBlockedError(ValueError):
             f'story "{story_title}" ({story_id}) is blocked by {named}'
             " — run them first, or run the milestone"
         )
+
+
+class IsolationUnavailableError(ValueError):
+    """An explicitly requested isolation mode cannot start on this host.
+
+    `mode` is `bwrap` or `unshare`; `detail` is the failed probe's reason, which
+    starts with the probe's exact argv, so the operator can rerun it by hand.
+    A `ValueError` for the same reason as `StoryNotFoundError`: `cli.HANDLED`
+    already turns it into an `ok: false` envelope and exit 3. Takes plain
+    strings because this module imports nothing from `agent_manager`.
+    """
+
+    def __init__(self, mode: str, detail: str) -> None:
+        self.mode = mode
+        self.detail = detail
+        super().__init__(
+            f"isolation {mode} is unavailable: {detail}"
+            " — pass --isolation none to run without it"
+        )
