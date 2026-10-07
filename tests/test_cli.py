@@ -9804,6 +9804,80 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
     assert _loaded(project, run_id).status == "started"
 
 
+def _only_run_id(project: Path) -> str:
+    root = cli.resolve_repo_dir(project)
+    conn = store_db.open_db(root)
+    try:
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, root)
+        )
+    finally:
+        conn.close()
+    assert run_id is not None
+    return run_id
+
+
+@pytest.mark.git
+def test_a_busy_store_mid_walk_is_a_store_busy_envelope_at_exit_3(
+    project, cards, monkeypatch
+):
+    """The `worktree` step's `done` row stays busy through its retry budget: the
+    walk stops at that write and records no escalation, and the window close
+    and lease release, busy too, do not replace the error the envelope names."""
+    real_record_phase = store_writer.Store.record_phase
+
+    def record_phase(self, story_id, card_id, phase):
+        if (phase.name, phase.status) == ("worktree", "done"):
+            raise store_db.StoreBusyError("record_phase", 5, 10.0)
+        return real_record_phase(self, story_id, card_id, phase)
+
+    def busy_close_window(self, token):
+        raise store_db.StoreBusyError("close_window", 5, 10.0)
+
+    def busy_release_lease(self, token):
+        raise store_db.StoreBusyError("release_lease", 5, 10.0)
+
+    monkeypatch.setattr(store_writer.Store, "record_phase", record_phase)
+    monkeypatch.setattr(store_writer.Store, "close_window", busy_close_window)
+    monkeypatch.setattr(store_writer.Store, "release_lease", busy_release_lease)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "StoreBusyError"
+    assert envelope["error"]["message"].startswith("record_phase: ")
+    run_id = _only_run_id(project)
+    assert _loaded(project, run_id).status == "started"
+    # The busy release left the lease row behind to go stale; the claims went.
+    assert _card_lease(project, run_id) is not None
+    assert _claim_rows(project) == []
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
+    try:
+        phases = conn.execute(
+            "SELECT name, status FROM phases WHERE run_id = ? ORDER BY position", (run_id,)
+        ).fetchall()
+        subtasks = [
+            row[0]
+            for row in conn.execute(
+                "SELECT status FROM subtasks WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        ]
+        reasons = [
+            row[0]
+            for row in conn.execute(
+                "SELECT reason FROM checkpoints WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert [tuple(row) for row in phases] == [("worktree", "started")]
+    assert "escalated" not in subtasks
+    assert reasons == ["turn"]
+
+
 @pytest.mark.git
 def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
     run_id = _crash_pygents(project, cards, "plan")
