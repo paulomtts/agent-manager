@@ -37,7 +37,7 @@ from typing import Any, Callable
 from pygents import ContextItem, ContextPool, ContextQueue, Turn, tool
 
 from agent_manager import prompt
-from agent_manager.errors import AgentPhaseFailed
+from agent_manager.errors import AgentPhaseFailed, LimitWaitInterrupted
 from agent_manager.runtime import bridge, context, walk
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.state import current_run
@@ -75,7 +75,9 @@ class Compiled:
     """The run's launcher seconds for an agent phase, by name (the contract of
     `dispatch.AgentRunner.timeout_for`); `None` keeps the declared timeouts."""
 
-    def turn_for(self, name: str, loop: int) -> Turn:
+    def turn_for(self, name: str, loop: int, allowance: float = 0.0) -> Turn:
+        """`name`'s turn; an agent turn's timeout grows by `allowance` seconds,
+        the time its runner may spend waiting out a usage limit."""
         p = self.workflow.phase(name)
         kwargs = {"phase": name, "loop": loop}
         if isinstance(p, AgentPhase):
@@ -86,16 +88,23 @@ class Compiled:
                 timeout = max(
                     timeout, self.launcher_timeout(name) + LAUNCHER_MARGIN.total_seconds()
                 )
-            return Turn(self.agent_phase, timeout=timeout, kwargs=kwargs)
+            # The usage-limit wait is spent inside the turn, on top of whichever
+            # of the two requirements is larger.
+            return Turn(self.agent_phase, timeout=timeout + allowance, kwargs=kwargs)
         return Turn(self.step_phase, timeout=STEP_TIMEOUT, kwargs=kwargs)
 
-    def first_turn(self) -> Turn:
-        return self.turn_for(self.workflow.phases[0].name, 0)
+    def first_turn(self, allowance: float = 0.0) -> Turn:
+        return self.turn_for(self.workflow.phases[0].name, 0, allowance)
 
-    def after(self, name: str, loop: int) -> Turn | None:
+    def after(self, name: str, loop: int, allowance: float = 0.0) -> Turn | None:
         names = self.workflow.phase_names
         i = names.index(name)
-        return self.turn_for(names[i + 1], loop) if i + 1 < len(names) else None
+        return self.turn_for(names[i + 1], loop, allowance) if i + 1 < len(names) else None
+
+
+def turn_allowance(runner: Any) -> float:
+    """Seconds `runner` declares it may wait inside one agent turn; 0 for a runner with none."""
+    return float(getattr(runner, "turn_allowance", 0.0) or 0.0)
 
 
 _CACHE: dict[tuple[str, str], Compiled] = {}
@@ -177,6 +186,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         # The resume checkpoint's floor, if it names this very turn
         # (exactly-once E8). Taken whether or not the runner can adopt, so no
         # adoption outlives the first turn after a resume.
+        allowance = turn_allowance(deps.agent_runner)
         adoption = deps.take_adoption(phase, loop)
         adopt = getattr(deps.agent_runner, "adopt", None)
         try:
@@ -203,15 +213,20 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
                 yield ContextItem(
                     content={"for": p.on_fail.phase, "from": phase, "detail": failure.detail}
                 )
-                yield compiled.turn_for(p.on_fail.phase, loop + 1)
+                yield compiled.turn_for(p.on_fail.phase, loop + 1, allowance)
                 return
             raise Escalated(phase, failure.detail, result=failure.result) from failure
+        except LimitWaitInterrupted:
+            # A stop arrived during a usage-limit wait: the same turn is queued
+            # again, so the paused agent parks before this phase.
+            yield compiled.turn_for(phase, loop, allowance)
+            return
         except Exception as error:
             # Total: an exception escaping the walk would leave the subtask
             # recorded `started` forever.
             raise Escalated(phase, walk._render_error(error)) from error
         yield ContextItem(id=phase, description=f"{phase} result", content=context.encode(result))
-        nxt = compiled.after(phase, 0 if phase in fresh_loop_after else loop)
+        nxt = compiled.after(phase, 0 if phase in fresh_loop_after else loop, allowance)
         if nxt is not None:
             yield nxt
 
@@ -219,6 +234,7 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
         deps = current_run.get()
         deps.running = phase
         compiled = deps.compiled or holder["compiled"]
+        allowance = turn_allowance(deps.agent_runner)
         # A step is never adopted and stays at-least-once (exactly-once E9);
         # taking the carried adoption here ends it at the first turn after
         # a resume, so no later agent phase can inherit it.
@@ -249,9 +265,9 @@ def _build(wf: Workflow, *, suffix: str) -> Compiled:
             if outcome.skip_to is not None:
                 names = compiled.workflow.phase_names
                 deps.skipped.extend(names[names.index(phase) + 1 : names.index(outcome.skip_to)])
-                yield compiled.turn_for(outcome.skip_to, loop)
+                yield compiled.turn_for(outcome.skip_to, loop, allowance)
                 return
-        nxt = compiled.after(phase, loop)
+        nxt = compiled.after(phase, loop, allowance)
         if nxt is not None:
             yield nxt
 

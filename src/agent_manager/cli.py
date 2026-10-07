@@ -76,6 +76,7 @@ from agent_manager.runs import (
     HarnessOverride,
     NotResumableError,
     RepoDirError,
+    BaseBranchError,
     RunnerFactory,
     UnknownRunError,
     compute_dry_run_plan,
@@ -83,6 +84,7 @@ from agent_manager.runs import (
     gate_context,
     mint_run_id,
     orphan_attempts,
+    resolve_base_branch,
     resolve_repo_dir,
     select_resumable,
     with_harness_override,
@@ -747,6 +749,7 @@ def default_runner_factory(
         card_id=card_id,
         harness_timeout=harness_timeout,
         harness_timeouts=dict(harness_timeouts or {}),
+        max_limit_wait_hours=config.max_limit_wait_hours,
     )
 
 
@@ -2053,6 +2056,17 @@ def run(
             "<stamp>-<digest>.report.json."
         ),
     ),
+    max_limit_wait: float = typer.Option(
+        models.DEFAULT_MAX_LIMIT_WAIT_HOURS,
+        "--max-limit-wait",
+        min=0,
+        help=(
+            "Hours a phase may wait for a harness usage limit to reset before it "
+            "escalates; a wait does not use up an attempt. The default 0 never "
+            "waits: a limit hit escalates at once, naming the reset time. "
+            "Recorded in the run and kept on resume."
+        ),
+    ),
     max_concurrent: int | None = typer.Option(
         None,
         "--max-concurrent",
@@ -2066,11 +2080,13 @@ def run(
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
     ),
-    base_branch: str = typer.Option(
-        "master",
+    base_branch: str | None = typer.Option(
+        None,
         "--base-branch",
         help=(
             "Where unblocked stories start (and --card's branch is cut from). "
+            "Must be an existing branch. Default: the repository's default "
+            "branch (origin/HEAD, else the checked-out branch, else `master`). "
             "Never modified."
         ),
     ),
@@ -2153,6 +2169,7 @@ def run(
         else {}
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
+    models.max_limit_wait_default.set(max_limit_wait)
     isolation_warning: str | None = None
     try:
         # A5 B1: first after the argument checks, before any board read,
@@ -2163,6 +2180,8 @@ def run(
         if not dry_run:
             resolved = launcher.resolve_isolation(isolation)
             mode, isolation_warning = resolved.mode, resolved.warning
+        # Before any run row, claim or worktree exists, and for --dry-run too.
+        base_branch = resolve_base_branch(repo_dir, base_branch)
         if whole_board and dry_run:
             payload = dry_run_board(
                 repo_dir=repo_dir,

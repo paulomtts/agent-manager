@@ -291,6 +291,21 @@ def test_launcher_timeout_is_resolved_per_phase():
     assert compiled.after("b", 0).timeout == 2100
 
 
+def test_launcher_timeout_and_limit_wait_allowance_combine_in_the_turn_timeout():
+    """The turn covers the larger of declared/launcher-derived, plus the wait allowance."""
+    compiled = C.compile_workflow(
+        _step_and_agents(),
+        launcher_timeout=lambda name: {"b": 7200.0}.get(name, 60.0),
+    )
+
+    assert compiled.turn_for("b", 0, 3600.0).timeout == 7500 + 3600
+    assert compiled.turn_for("c", 0, 3600.0).timeout == 2100 + 3600
+    assert compiled.after("a", 0, 3600.0).timeout == 7500 + 3600
+    assert compiled.after("b", 0, 3600.0).timeout == 2100 + 3600
+    assert compiled.turn_for("b", 0).timeout == 7500
+    assert compiled.turn_for("a", 0, 3600.0).timeout == C.STEP_TIMEOUT
+
+
 def test_without_a_launcher_timeout_the_declared_timeout_is_kept_as_is():
     # No hidden floor: a declared 60 s phase stays 60 s when no launcher is given.
     wf = Workflow("short", (AgentPhase("b", "explorer", (), None, timeout=timedelta(seconds=60)),))

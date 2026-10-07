@@ -790,3 +790,22 @@ def fake_board(monkeypatch: pytest.MonkeyPatch) -> FakeBoard:
     fake = FakeBoard()
     monkeypatch.setattr(board, "run_brd", fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def stubbed_base_branch(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`cli.resolve_base_branch` answers `requested or "master"` without a repository.
+
+    Most CLI tests drive `run` against a directory that is not a repository and
+    assert on later refusals or on what a mocked orchestrator received. A test
+    of the real resolution carries `real_base_branch`; the opt-in tiers always
+    see the real one.
+    """
+    names = {mark.name for mark in request.node.iter_markers()}
+    if names & {"real_base_branch", "e2e", "e2e_fake", "brd", "soak"}:
+        return
+    from agent_manager import cli
+
+    monkeypatch.setattr(
+        cli, "resolve_base_branch", lambda repo_dir, requested: requested or "master"
+    )

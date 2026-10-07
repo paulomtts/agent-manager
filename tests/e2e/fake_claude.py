@@ -26,7 +26,8 @@ still claiming `resolved`, so git has to catch the lie;
 `CRITIC_BLOCKS_ENV`, a budget file that makes a critic block a set number of
 times with a fixed reason; and the hold (`HOLD_DIR_ENV` / `HOLD_PHASE_ENV`),
 which only parks one phase of the card the brief's result path names until a
-release file appears. The resolve phase learns the tip and the
+release file appears; and `USAGE_LIMIT_ENV`, a table that makes a phase print the
+account's usage-limit line and exit 1 a set number of times. The resolve phase learns the tip and the
 conflicting files from the brief's `## merge_tip` and `## conflict_files` and
 nowhere else.
 
@@ -404,6 +405,33 @@ def hold(phase, result_path):
                 f"{release} was never written"
             )
         time.sleep(RENDEZVOUS_POLL)
+
+
+USAGE_LIMIT_ENV = "FAKE_CLAUDE_USAGE_LIMIT"
+"""Test scaffolding, never in a brief: the path of a JSON table of usage-limit hits.
+
+Unset or empty means the fake never reports one. Set, it names a file the test
+wrote, mapping a phase to `{"hits": n, "line": "<stdout line>"}`: while `hits`
+is above zero the fake spends one, writes the file back, prints `line` and
+exits 1 without a result, as the real CLI does when the account's limit is
+spent. The line comes from the file alone, so a test controls the reset time."""
+
+
+def usage_limit_line(phase):
+    """The limit line this launch must print, spending one hit, or `None`."""
+    raw = os.environ.get(USAGE_LIMIT_ENV, "")
+    if raw == "":
+        return None
+    path = Path(raw)
+    if not path.is_file():
+        raise FakeClaudeError(f"{USAGE_LIMIT_ENV} names {path}, which is not a file")
+    table = json.loads(path.read_text(encoding="utf-8"))
+    entry = table.get(phase)
+    if not entry or entry["hits"] <= 0:
+        return None
+    entry["hits"] -= 1
+    path.write_text(json.dumps(table, sort_keys=True), encoding="utf-8")
+    return entry["line"]
 
 
 CRITIC_BLOCKS_ENV = "FAKE_CLAUDE_CRITIC_BLOCKS"
@@ -847,11 +875,12 @@ def build_result(phase, payload, text, cwd):
         relative = _section(found, "plan_path", phase)
         base = _section(found, "base_branch", phase)
         branch = _section(found, "branch", phase)
+        recorded = _section(found, "plan_hash", phase)
         revisions = git(cwd, "rev-list", f"{base}..HEAD").split()
         tagged = [
             revision
             for revision in revisions
-            if "Plan-Hash:" in git(cwd, "show", "-s", "--format=%B", revision)
+            if f"Plan-Hash: {recorded}" in git(cwd, "show", "-s", "--format=%B", revision)
         ]
         if branch in review_fail_branches(cwd):
             # A review the production gates block. `review_blockers_gate`,
@@ -871,7 +900,7 @@ def build_result(phase, payload, text, cwd):
             porcelain=porcelain,
             commit_count=len(revisions),
             tagged_count=len(tagged),
-            plan_hash=plan_hash_of(Path(cwd) / relative),
+            plan_hash=recorded,
         )
     if phase == "resolve":
         # Everything is checked before anything is touched: the env switch, the
@@ -907,6 +936,10 @@ def main(argv):
     text = prompt_path_from_argv(argv).read_text(encoding="utf-8")
     phase = phase_of(text)
     result_path = result_path_of(text)
+    limit = usage_limit_line(phase)
+    if limit is not None:
+        print(limit)
+        return 1
     # Test scaffolding: park here, before any work, when the hold is armed.
     hold(phase, result_path)
     cwd = Path(os.getcwd())

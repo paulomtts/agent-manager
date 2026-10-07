@@ -712,6 +712,7 @@ def _review(worktree, branch=REVIEW_BRANCH):
         f"\n## branch\n{branch}\n"
         "\n## base_branch\nmain\n"
         f"\n## plan_path\n{PLAN_RELATIVE}\n"
+        f"\n## plan_hash\n{BRIEF_HASH}\n"
     )
     return fake_claude.build_result(
         "review", fake_claude.payload_from_schema(REVIEW_SCHEMA), text, worktree

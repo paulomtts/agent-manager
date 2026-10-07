@@ -1249,3 +1249,22 @@ def test_run_config_loads_a_payload_written_before_harness_timeouts():
     run = models.Run.model_validate(old_run)
     assert run.config.harness_timeout is None
     assert run.config.harness_timeouts == {}
+
+def test_run_config_max_limit_wait_defaults_to_never_waiting_and_is_bounded_below():
+    assert models.RunConfig().max_limit_wait_hours == 0.0
+    assert models.RunConfig(max_limit_wait_hours=0).max_limit_wait_hours == 0
+    with pytest.raises(ValidationError):
+        models.RunConfig(max_limit_wait_hours=-1)
+
+
+def test_a_new_run_config_records_the_cli_default_but_a_recorded_one_keeps_its_own():
+    token = models.max_limit_wait_default.set(2.5)
+    try:
+        assert models.RunConfig().max_limit_wait_hours == 2.5
+        assert models.RunConfig(max_limit_wait_hours=1).max_limit_wait_hours == 1
+        recorded = models.RunConfig.model_validate({"max_limit_wait_hours": 6})
+    finally:
+        models.max_limit_wait_default.reset(token)
+
+    assert recorded.max_limit_wait_hours == 6
+    assert models.RunConfig.model_validate({}).max_limit_wait_hours == 0.0

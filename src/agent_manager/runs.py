@@ -21,6 +21,7 @@ from typing import Any, Protocol
 from agent_manager import census, dag, models, store as store_module
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import AgentPhaseRunner
+from agent_manager.steps import worktree
 from agent_manager.store import Store
 from agent_manager.workflow import task as task_workflow
 
@@ -38,6 +39,10 @@ class CliError(RuntimeError):
 
 class RepoDirError(CliError):
     """`--repo-dir` does not name a directory this tool can work in."""
+
+
+class BaseBranchError(CliError):
+    """`--base-branch` names no branch of the repository, or no default branch could be derived."""
 
 
 class UnknownRunError(CliError):
@@ -85,6 +90,64 @@ def resolve_repo_dir(repo_dir: Path) -> Path:
             f"--repo-dir {str(repo_dir)!r} is not a directory (resolved to {resolved})"
         )
     return resolved
+
+
+def _git_out(root: Path, *argv: str) -> str | None:
+    """`git -C <root> <argv>` stripped stdout, or `None` when git exits non-zero."""
+    try:
+        return worktree.run_git(["-C", str(root), *argv]).strip()
+    except worktree.GitError:
+        return None
+
+
+def _branch_exists(root: Path, name: str) -> bool:
+    """A local branch, or `origin/<name>` -- the two `steps.worktree` can cut from."""
+    return any(
+        _git_out(root, "rev-parse", "--verify", "--quiet", ref) is not None
+        for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}")
+    )
+
+
+def _branch_candidates(root: Path) -> list[str]:
+    out = _git_out(root, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    return out.splitlines() if out else []
+
+
+def resolve_base_branch(repo_dir: Path, requested: str | None) -> str:
+    """The base branch a run starts from, or `BaseBranchError` naming the branches that exist.
+
+    A `requested` name must exist as a local branch or as `origin/<name>`.
+    With none requested the default is, in order: the branch
+    `refs/remotes/origin/HEAD` points at, the checked-out branch, `master`,
+    each taken only if it exists. Read-only; nothing is created.
+    """
+    root = resolve_repo_dir(repo_dir)
+    if requested is not None:
+        if _branch_exists(root, requested):
+            return requested
+        candidates = _branch_candidates(root)
+        listing = ", ".join(candidates) if candidates else "none"
+        raise BaseBranchError(
+            f"--base-branch {requested!r} is not a branch of {root}; "
+            f"existing branches: {listing}"
+        )
+    remote_head = _git_out(root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    current = _git_out(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    derived = (
+        remote_head.removeprefix("origin/") if remote_head else None,
+        current,
+        "master",
+    )
+    for name in derived:
+        if name and _branch_exists(root, name):
+            return name
+    candidates = _branch_candidates(root)
+    listing = ", ".join(candidates) if candidates else "none"
+    raise BaseBranchError(
+        f"no --base-branch given and {root} has no default branch to derive "
+        f"(no origin/HEAD, no commits on the checked-out branch, no `master`); "
+        f"pass --base-branch. Existing branches: {listing}"
+    )
 
 
 def mint_run_id(card_id: str, now: datetime) -> str:
