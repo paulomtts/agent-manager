@@ -1673,6 +1673,40 @@ def test_an_unexpected_error_mid_attempt_still_closes_the_phase(store, tmp_path,
     assert "OSError: the run directory went away" in detail
 
 
+@pytest.mark.parametrize("busy_write", ["record_phase", "record_attempt"])
+def test_a_busy_record_propagates_without_a_failed_phase_record(
+    store, tmp_path, worktree, monkeypatch, busy_write
+):
+    # A store write that gave up must not be followed by another write: the
+    # same error propagates and the phase is left `started` for resume.
+    busy = store_db.StoreBusyError(busy_write, 5, 10.0)
+    attempted: list[str] = []
+    real_record_phase = store.record_phase
+
+    def record_phase(story_id, card_id, phase):
+        attempted.append(phase.status)
+        if busy_write == "record_phase" and phase.status == "done":
+            raise busy
+        return real_record_phase(story_id, card_id, phase)
+
+    def record_attempt(story_id, card_id, phase_name, attempt):
+        raise busy
+
+    monkeypatch.setattr(store, "record_phase", record_phase)
+    if busy_write == "record_attempt":
+        monkeypatch.setattr(store, "record_attempt", record_attempt)
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    runner, _ = _runner(store, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree)
+
+    with pytest.raises(store_db.StoreBusyError) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value is busy
+    expected = ["started", "done"] if busy_write == "record_phase" else ["started"]
+    assert attempted == expected
+    assert _phase_statuses(store) == [("explore", "started")]
+
+
 # ── the production default, which no other test in this file can see ─────────
 # `_runner` always injects `result_models={"FakeResult": FakeResult}` and
 # `overrides` can only replace that key, never omit it -- so these two

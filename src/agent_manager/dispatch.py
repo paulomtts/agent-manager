@@ -38,6 +38,7 @@ from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.runtime import bridge
+from agent_manager.store import db as store_db
 from agent_manager.store.journal import JournalError
 from agent_manager.store.writer import Store
 from agent_manager.workflow import phases as phase_model
@@ -437,6 +438,11 @@ class AgentRunner:
                 # the whole brief from the base prompt every time, so re-feeding a
                 # composed brief would duplicate the result contract.
                 feedback.append(verdict.detail or verdict.status)
+        except store_db.StoreBusyError:
+            # A store write gave up after its retry budget: no `failed` record
+            # is attempted, so the walk stops at the write that failed and the
+            # phase stays `started` for a resume.
+            raise
         except Exception as error:
             # Symmetric with `walk.run_one_step`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for
