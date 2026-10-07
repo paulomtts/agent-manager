@@ -182,12 +182,14 @@ class Journal:
         newer `am`) is skipped rather than raising; see `_scan` for what is
         still an error and for `ignore_torn_tail`. Unknown keys inside a known
         line's `payload` pass through untouched: `replay` judges payloads.
+
+        Holds the append lock across the scan, so a line this journal is
+        appending is never met half-written. The lock is not re-entrant: never
+        call this while holding it.
         """
-        lines = [
-            line
-            for _, line in self._scan(ignore_torn_tail=ignore_torn_tail)
-            if line is not None
-        ]
+        with self._lock:
+            scanned = self._scan(ignore_torn_tail=ignore_torn_tail)
+        lines = [line for _, line in scanned if line is not None]
         lines.sort(key=lambda line: line.seq)
         return lines
 

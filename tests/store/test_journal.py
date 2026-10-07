@@ -689,3 +689,24 @@ def test_reseek_counts_a_skipped_line(repo):
     journal.reseek()
 
     assert journal.append("run_upsert", {"i": 1}).seq == 3
+
+
+def test_read_holds_the_append_lock_across_the_scan(repo, monkeypatch):
+    # Deterministic: check the lock is held at the moment the file is scanned,
+    # so an append on another thread can never be met half-written.
+    journal = store_journal.Journal(RUN_ID)
+    journal.append("run_upsert", {"i": 0})
+    held_during_scan: list[bool] = []
+    real_scan = journal._scan
+
+    def spying_scan(**kwargs):
+        held_during_scan.append(journal._lock.locked())
+        return real_scan(**kwargs)
+
+    monkeypatch.setattr(journal, "_scan", spying_scan)
+
+    lines = journal.read()
+
+    assert held_during_scan == [True]
+    assert journal._lock.locked() is False
+    assert [line.seq for line in lines] == [1]
