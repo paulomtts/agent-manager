@@ -37,7 +37,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
 | 5 | Adapters | `locks`, `detach`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; the harness Protocol and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
 | 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`*, *`store.projects`*, *`store.events`* | Replay and divergence; read models; per-table row types and SQL; `projects` rows resolved or created by `repo_dir`; append-only `events` rows: insert, reads by `seq`, head (they never commit) |
-| 7 | Adapters | *`store.writer`* | `Store`: every write, under one lock and fence (§6.4) |
+| 7 | Adapters | *`store.writer`* | `Store`: every write, as a job on one writer thread, under the fence (§6.4) |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
 | 9 | Steps | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` | Deterministic steps |
 | 10 | Steps | `steps.docs_commit`, `steps.integrate` | Steps built on `steps.worktree` |
@@ -206,7 +206,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 ### 6.4 What stays in one piece
 
-- **`Store`** keeps every write method, together with its `RLock`, its bound lease token and `_fenced()`. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_journal`. Each `record_*` holds the lock and the fence across both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`).
+- **`Store`** keeps every write method, together with its writer thread and job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_journal`. Each write is one job on the writer thread, one `BEGIN IMMEDIATE` transaction under the fence; each `record_*` job covers both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`).
 - **`lane` and `StoryRecorder`.** The order in which story and subtask rows are recorded, and the escalation path through `stop.trigger`, form one state machine.
 - **`supervise`, `run_until_killed` and `build_dag_tree`.** These own the grafo executor's lifetime and the workarounds for its hangs.
 - **`control.Lease`** with its heartbeat, its watcher and `run_lease`. Token binding into `Store` happens here.

@@ -846,3 +846,242 @@ def test_the_first_read_of_a_store_over_an_in_memory_connection_raises_value_err
             st.latest_checkpoint("card-a")
     finally:
         st.close()
+
+
+# -- writes as jobs ------------------------------------------------------------
+
+
+def _run(repo: Path) -> models.Run:
+    return models.Run(
+        id=RUN_A,
+        workflow="milestone",
+        repo_dir=repo,
+        base_branch="main",
+        branch_prefix="m1/",
+        status="started",
+        started_at=NOW,
+    )
+
+
+def _attempt(repo: Path, n: int) -> models.Attempt:
+    return models.Attempt(
+        n=n,
+        dispatch=models.Dispatch(
+            harness="claude",
+            model="sonnet",
+            role="coder",
+            cwd=repo,
+            prompt_path=repo / "prompt.txt",
+            result_path=repo / "result.json",
+        ),
+    )
+
+
+def _count(st: store_writer.Store, table: str) -> int:
+    return st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_no_writer_thread_exists_until_the_first_write(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.latest_checkpoint("card-a")
+        before = _writer_threads(RUN_A)
+        st.beat("t1", NOW)
+        after = _writer_threads(RUN_A)
+        alive = [thread.is_alive() for thread in after]
+    finally:
+        st.close()
+
+    assert before == []
+    assert alive == [True]
+
+
+def test_a_write_from_inside_a_job_raises_instead_of_deadlocking(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        call = _Caller(
+            st._submit, lambda conn: st.beat("t1", NOW), operation="nested"
+        ).wait()
+    finally:
+        st.close()
+
+    assert isinstance(call.error, RuntimeError)
+
+
+def test_after_commit_runs_on_the_writer_thread_before_the_next_job(repo):
+    def steal(conn):
+        conn.execute("DELETE FROM run_leases WHERE run_id = ?", (RUN_A,))
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            taking = _Caller(
+                st.take_lease, token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True
+            )
+            _wait_enqueued(st, 1)
+            stealing = _Caller(st._submit, steal, operation="steal")
+            _wait_enqueued(st, 2)
+            recording = _Caller(
+                st.record_story,
+                models.StoryRun(card_id="story-a", title="Story", level=0, status="started"),
+            )
+            _wait_enqueued(st, 3)
+        for caller in (taking, stealing, recording):
+            caller.wait()
+    finally:
+        st.close()
+
+    assert taking.error is None
+    assert stealing.error is None
+    # Fenced by "t1": the bind ran before the record's job started.
+    assert isinstance(recording.error, store_leases.LeaseLostError)
+
+
+def test_a_busy_re_run_of_a_record_appends_the_journal_line_once(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    st = store_writer.Store.open(repo, RUN_A)
+    real = st._write_run_row
+    calls: list[int] = []
+
+    def busy_once(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _busy()
+        return real(*args)
+
+    monkeypatch.setattr(st, "_write_run_row", busy_once)
+    try:
+        line = st.record_run(_run(repo))
+        lines = st.journal.read()
+        runs = _count(st, "runs")
+    finally:
+        st.close()
+
+    assert calls == [1, 1]
+    assert [journalled.event for journalled in lines] == ["run_upsert"]
+    assert lines[0] == line
+    assert runs == 1
+
+
+def test_a_lost_lease_writes_neither_line_nor_row(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.record_run(_run(repo))
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        thief = store_db.open_db(repo)
+        try:
+            thief.execute("DELETE FROM run_leases WHERE run_id = ?", (RUN_A,))
+            thief.commit()
+        finally:
+            thief.close()
+
+        with pytest.raises(store_leases.LeaseLostError):
+            st.record_story(
+                models.StoryRun(card_id="story-a", title="Story", level=0, status="started")
+            )
+        events = [line.event for line in st.journal.read()]
+        stories = _count(st, "stories")
+    finally:
+        st.close()
+
+    assert events == ["run_upsert"]
+    assert stories == 0
+
+
+def test_rebuild_from_journal_is_one_transaction_without_a_token(repo, monkeypatch):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _record_tree(st, repo)
+        before = store_queries.load_run(st.connection, RUN_A)
+
+        def exploding(*args):
+            raise RuntimeError("the rewrite fails after the delete")
+
+        monkeypatch.setattr(st, "_write_story_row", exploding)
+        with pytest.raises(RuntimeError, match="after the delete"):
+            st.rebuild_from_journal(RUN_A)
+        after = store_queries.load_run(st.connection, RUN_A)
+    finally:
+        st.close()
+
+    assert before is not None
+    assert after == before
+
+
+def test_concurrent_record_calls_all_land(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    start = threading.Barrier(4)
+
+    def record(worker: int) -> None:
+        start.wait(TIMEOUT)
+        for i in range(10):
+            st.record_attempt("story-a", "card-a", "implement", _attempt(repo, worker * 10 + i + 1))
+
+    try:
+        callers = [_Caller(record, worker) for worker in range(4)]
+        for caller in callers:
+            caller.wait()
+        lines = [line for line in st.journal.read() if line.event == "attempt_upsert"]
+        rows = _count(st, "attempts")
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None] * 4
+    assert len(lines) == 40
+    assert len({line.seq for line in lines}) == 40
+    assert rows == 40
+
+
+def test_a_busy_re_run_of_take_lease_still_claims_every_key(repo, monkeypatch):
+    # Review Focus 1: a generator of claims survives the job being re-run.
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    real = store_leases.take_lease
+    calls: list[int] = []
+
+    def busy_once(conn, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            list(kwargs["claims"])
+            raise _busy()
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(store_leases, "take_lease", busy_once)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(
+            token="t1",
+            pid=1,
+            host="h",
+            now=NOW,
+            is_live=lambda row: True,
+            claims=(key for key in ["card:a", "card:b"]),
+        )
+        claimed = sorted(row[0] for row in st.connection.execute("SELECT key FROM run_claims"))
+    finally:
+        st.close()
+
+    assert calls == [1, 1]
+    assert claimed == ["card:a", "card:b"]
+
+
+def test_an_after_commit_failure_reaches_the_caller_and_keeps_the_commit(repo, monkeypatch):
+    # Review Focus 4.
+    ran_on: list[str] = []
+    st = store_writer.Store.open(repo, RUN_A)
+
+    def failing_reseek():
+        ran_on.append(threading.current_thread().name)
+        raise OSError("journal unreadable")
+
+    monkeypatch.setattr(st.journal, "reseek", failing_reseek)
+    try:
+        with pytest.raises(OSError, match="journal unreadable"):
+            st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        lease = store_leases.read_lease(st.connection, RUN_A)
+        after = st._submit(lambda conn: "next", operation="next")
+    finally:
+        st.close()
+
+    assert ran_on == [f"am-store-writer-{RUN_A}"]
+    assert lease is not None and lease.token == "t1"
+    assert after == "next"

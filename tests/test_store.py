@@ -207,15 +207,25 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
     ]
 
 
+def _record_story_whose_row_write_fails(st: store_writer.Store) -> None:
+    """`record_story` as the writer runs it when SQLite fails the row write: the
+    journal line is appended, then the row write raises and nothing commits."""
+
+    def failing_row_write(*args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    st._write_story_row = failing_row_write
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        st.record_story(_story())
+
+
 def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
-    # §9 line 365: the journal is appended first. Closing the connection is a
-    # real SQLite failure -- no mock -- and the line must survive it.
+    # §9 line 365: the journal is appended first, so the line must survive a
+    # failed row write.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
+    _record_story_whose_row_write_fails(st)
     st.close()
-
-    with pytest.raises(sqlite3.Error):
-        st.record_story(_story())
 
     lines = store_journal.Journal(RUN_ID).read()
     assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
@@ -482,9 +492,8 @@ def test_rebuild_picks_up_a_journal_line_whose_row_never_landed(repo):
     # never produced is materialised by the rebuild.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
+    _record_story_whose_row_write_fails(st)
     st.close()
-    with pytest.raises(sqlite3.Error):
-        st.record_story(_story())
 
     reopened = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -1867,25 +1876,22 @@ def test_load_run_of_an_unknown_id_is_none_and_creates_no_run_directory(repo):
     assert not (paths.data_dir() / "runs" / "run-that-never-was").exists()
 
 
-def _held_elsewhere(lock) -> bool:
-    """True when a different thread cannot take `lock` right now.
+def _on_the_writer() -> bool:
+    """True when called on a `Store`'s writer thread."""
+    return threading.current_thread().name.startswith("am-store-writer-")
 
-    Probing from a second thread is what makes this meaningful for an RLock:
-    the owning thread could always re-acquire it. Deterministic (P7): a
-    non-blocking acquire either succeeds or it does not.
-    """
-    result: list[bool] = []
 
-    def probe() -> None:
-        acquired = lock.acquire(blocking=False)
-        if acquired:
-            lock.release()
-        result.append(not acquired)
-
-    prober = threading.Thread(target=probe)
-    prober.start()
-    prober.join()
-    return result[0]
+def _writer_serves(st: store_writer.Store) -> bool:
+    """True when `st`'s writer runs a fresh job to completion now: no earlier
+    job left it stuck or dead."""
+    done: list[object] = []
+    probe = threading.Thread(
+        target=lambda: done.append(st._submit(lambda conn: "served", operation="probe")),
+        daemon=True,
+    )
+    probe.start()
+    probe.join(5.0)
+    return done == ["served"]
 
 
 class _SpyingConnection:
@@ -1909,18 +1915,16 @@ class _SpyingConnection:
         return getattr(self._real, name)
 
 
-def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row_write(
-    repo, monkeypatch
-):
-    # P2: the journal append and the row write are one critical section, so
-    # journal order equals row order. Checked at the moment each happens.
+def test_every_record_appends_and_writes_its_row_on_the_writer_thread(repo, monkeypatch):
+    # P2: the journal append and the row write are one job, so journal order
+    # equals row order. Checked at the moment each happens.
     st = store_writer.Store.open(repo, RUN_ID)
     seen: list[tuple[str, bool]] = []
 
     real_append = st.journal.append
 
     def spying_append(*args, **kwargs):
-        seen.append(("journal", _held_elsewhere(st._lock)))
+        seen.append(("journal", _on_the_writer()))
         return real_append(*args, **kwargs)
 
     monkeypatch.setattr(st.journal, "append", spying_append)
@@ -1935,7 +1939,7 @@ def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row
         real_writer = getattr(st, writer)
 
         def spying_writer(*args, _real=real_writer, _name=writer, **kwargs):
-            seen.append((_name, _held_elsewhere(st._lock)))
+            seen.append((_name, _on_the_writer()))
             return _real(*args, **kwargs)
 
         monkeypatch.setattr(st, writer, spying_writer)
@@ -1948,7 +1952,6 @@ def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row
         st.record_attempt(
             "8831189b", "ef248597", "implement", models.Attempt(n=1, dispatch=_dispatch())
         )
-        assert _held_elsewhere(st._lock) is False
     finally:
         st.close()
 
@@ -1966,11 +1969,9 @@ def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row
     ]
 
 
-def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
-    repo, monkeypatch
-):
-    # Deliberate extension beyond the record_* methods: rebuild deletes and
-    # rewrites rows on the shared connection, and load_run reads on it.
+def test_rebuild_runs_on_the_writer_thread_and_load_run_on_the_caller(repo, monkeypatch):
+    # rebuild reads the journal, checks divergence, deletes and rewrites as one
+    # job on the writer thread; Store.load_run reads on the calling thread.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
@@ -1979,23 +1980,23 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
         real_read = st.journal.read
 
         def spying_read():
-            seen.append(("read", _held_elsewhere(st._lock)))
+            seen.append(("read", _on_the_writer()))
             return real_read()
 
         monkeypatch.setattr(st.journal, "read", spying_read)
 
         real_delete = st._delete_run
 
-        def spying_delete(run_id):
-            seen.append(("_delete_run", _held_elsewhere(st._lock)))
-            return real_delete(run_id)
+        def spying_delete(*args):
+            seen.append(("_delete_run", _on_the_writer()))
+            return real_delete(*args)
 
         monkeypatch.setattr(st, "_delete_run", spying_delete)
 
         real_attempt_writer = st._write_attempt_row
 
         def spying_attempt_writer(*args, **kwargs):
-            seen.append(("_write_attempt_row", _held_elsewhere(st._lock)))
+            seen.append(("_write_attempt_row", _on_the_writer()))
             return real_attempt_writer(*args, **kwargs)
 
         monkeypatch.setattr(st, "_write_attempt_row", spying_attempt_writer)
@@ -2003,21 +2004,19 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
         real_load_run = store_queries.load_run
 
         def spying_load_run(conn, run_id):
-            seen.append(("load_run", _held_elsewhere(st._lock)))
+            seen.append(("load_run", _on_the_writer()))
             return real_load_run(conn, run_id)
 
         monkeypatch.setattr(store_queries, "load_run", spying_load_run)
 
         rebuilt = st.rebuild_from_journal(RUN_ID)
         loaded = st.load_run(RUN_ID)
-        assert _held_elsewhere(st._lock) is False
     finally:
         st.close()
 
     assert rebuilt == loaded
     # The first `load_run` is the foreign-value check (divergence §3.6): it
-    # reads the projection under the same lock, before anything is deleted.
-    # The second is `Store.load_run`, a read: it takes no store lock.
+    # reads the projection inside the job, before anything is deleted.
     assert seen == [
         ("read", True),
         ("load_run", True),
@@ -2041,22 +2040,44 @@ def test_close_closes_the_connection_after_the_writer_has_stopped(repo):
     assert alive_at_close == [False]
 
 
-def test_a_failed_row_write_releases_the_store_lock(repo):
-    # §9: the journal line survives the failed row write, and the `with` block
-    # releases the lock so the next record is not deadlocked.
+def test_a_failed_row_write_keeps_its_journal_line_and_the_writer_serves_on(
+    repo, monkeypatch
+):
+    # §9: the journal line survives the failed row write, and the writer runs
+    # the next record as usual.
+    st = store_writer.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        real_story_writer = st._write_story_row
+
+        def failing_row_write(*args):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(st, "_write_story_row", failing_row_write)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            st.record_story(_story())
+        monkeypatch.setattr(st, "_write_story_row", real_story_writer)
+        st.record_subtask("8831189b", _subtask())
+    finally:
+        st.close()
+
+    lines = store_journal.Journal(RUN_ID).read()
+    assert [line.event for line in lines] == ["run_upsert", "story_upsert", "subtask_upsert"]
+
+
+def test_a_record_on_a_closed_store_raises_and_appends_nothing(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
 
-    with pytest.raises(sqlite3.Error):
+    with pytest.raises(sqlite3.ProgrammingError):
         st.record_story(_story())
 
-    assert _held_elsewhere(st._lock) is False
     lines = store_journal.Journal(RUN_ID).read()
-    assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
+    assert [line.event for line in lines] == ["run_upsert"]
 
 
-def test_a_failed_journal_append_releases_the_store_lock_and_writes_no_row(
+def test_a_failed_journal_append_writes_no_row_and_the_writer_serves_on(
     repo, monkeypatch
 ):
     # Review Focus 1: the journal is written first, so when it fails there is
@@ -2073,26 +2094,25 @@ def test_a_failed_journal_append_releases_the_store_lock_and_writes_no_row(
         with pytest.raises(OSError, match="disk full"):
             st.record_story(_story())
 
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
         assert st.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
     finally:
         st.close()
 
 
-def test_a_refused_record_run_releases_the_store_lock(repo):
-    # Review Focus 2: the run-id check now runs inside the lock.
+def test_a_refused_record_run_leaves_the_writer_serving(repo):
+    # Review Focus 2: the run-id check runs inside the job.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(ValueError):
             st.record_run(_run(repo, run_id="run-somewhere-else"))
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
     finally:
         st.close()
 
 
-def test_a_failed_rebuild_releases_the_store_lock(repo):
-    # Review Focus 3: a rebuild that raises must not leave every later record
-    # deadlocked behind it.
+def test_a_failed_rebuild_leaves_the_writer_serving(repo):
+    # Review Focus 3: a rebuild that raises must not leave every later record stuck behind it.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
@@ -2102,12 +2122,12 @@ def test_a_failed_rebuild_releases_the_store_lock(repo):
         with pytest.raises(store_journal.CorruptJournalError):
             st.rebuild_from_journal(RUN_ID)
 
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
     finally:
         st.close()
 
 
-def test_recording_on_a_store_closed_by_another_thread_raises_and_frees_the_lock(repo):
+def test_recording_on_a_store_closed_by_another_thread_raises_and_starts_no_writer(repo):
     # Review Focus 5: a worker that records after another thread closed the
     # store gets a sqlite3.Error, not a hang or a silent success.
     st = store_writer.Store.open(repo, RUN_ID)
@@ -2127,8 +2147,8 @@ def test_recording_on_a_store_closed_by_another_thread_raises_and_frees_the_lock
     worker.join()
 
     assert len(errors) == 1
-    assert isinstance(errors[0], sqlite3.Error)
-    assert _held_elsewhere(st._lock) is False
+    assert isinstance(errors[0], sqlite3.ProgrammingError)
+    assert not any(t.name == f"am-store-writer-{RUN_ID}" for t in threading.enumerate())
 
 
 STRESS_WORKERS = 8
@@ -3338,7 +3358,7 @@ def test_a_checkpoint_with_an_unknown_reason_is_refused_and_writes_nothing(repo)
         with pytest.raises(sqlite3.IntegrityError):
             _save_checkpoint(st, "card-a", reason="bogus")
 
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
         assert st.connection.in_transaction is False
         assert st.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
         # The refused save spent no seq.
@@ -3354,7 +3374,7 @@ def test_a_checkpoint_whose_agent_is_not_json_is_refused_and_writes_nothing(repo
         with pytest.raises(TypeError):
             _save_checkpoint(st, "card-a", agent={"when": _at(0)})
 
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
         assert st.connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
         assert _save_checkpoint(st, "card-a").seq == 0
     finally:
@@ -4908,7 +4928,7 @@ def test_a_negative_floor_is_refused_and_writes_nothing(repo):
         with pytest.raises(sqlite3.IntegrityError):
             _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1), saved_at=_at(1))
 
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
         assert st.connection.in_transaction is False
         assert _count(st, "checkpoints") == 1
         assert _count(st, "checkpoint_floors") == 0
@@ -4940,7 +4960,7 @@ def test_a_refused_floor_under_a_held_lease_writes_nothing_and_keeps_the_lease(s
     with pytest.raises(sqlite3.IntegrityError):
         _save_floored(st, floor=dataclasses.replace(FLOOR, floor=-1))
 
-    assert _held_elsewhere(st._lock) is False
+    assert _writer_serves(st)
     assert st.connection.in_transaction is False
     assert _count(st, "checkpoints") == 0
     assert _count(st, "checkpoint_floors") == 0
@@ -5467,7 +5487,7 @@ def test_a_refused_enqueue_rolls_back_and_writes_nothing(repo, stores):
     with pytest.raises(sqlite3.IntegrityError):
         _enqueue(st, "k1")
     assert st.connection.in_transaction is False
-    assert _held_elsewhere(st._lock) is False
+    assert _writer_serves(st)
     assert _comment_row(st.connection, "k1") is None
 
     st.connection.execute("DROP TRIGGER refuse_comments")
@@ -5943,12 +5963,11 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
 
 def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
     # The setup of test_rebuild_picks_up_a_journal_line_whose_row_never_landed:
-    # the journal line is appended, the row write fails on the closed connection.
+    # the journal line is appended, the row write fails.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
+    _record_story_whose_row_write_fails(st)
     st.close()
-    with pytest.raises(sqlite3.Error):
-        st.record_story(_story())
 
     assert _diverging_now(repo) == [
         store_replay.Mismatch(
@@ -6110,7 +6129,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
-        assert _held_elsewhere(st._lock) is False
+        assert _writer_serves(st)
         assert st.connection.in_transaction is False
     finally:
         st.close()
@@ -6261,7 +6280,7 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
         st.rebuild_from_journal(RUN_ID)
 
     assert st.connection.in_transaction is False
-    assert _held_elsewhere(st._lock) is False
+    assert _writer_serves(st)
     kept = store_leases.read_lease(st.connection, RUN_ID)
     assert kept is not None and kept.token == "t1"
     assert store_queries.run_status(st.connection, RUN_ID) == "canceled"
