@@ -11,6 +11,7 @@ import json
 import re
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import get_args
 
@@ -33,7 +34,10 @@ _JOURNAL_NAMES = (
     "CorruptJournalError",
     "JOURNAL_NAME",
     "_EVENT_KINDS",
+    "NODE_KINDS",
     "_UnknownEventLine",
+    "ts_text",
+    "_TS",
 )
 
 
@@ -55,8 +59,43 @@ def test_journal_is_a_leaf_module_of_the_store_package():
         "subtask_upsert",
         "phase_upsert",
         "attempt_upsert",
+        "control_requested",
+        "control_handled",
+        "lease_acquired",
+        "lease_taken_over",
+        "claim_conflict",
     }
     assert store_journal.JOURNAL_NAME == "journal.jsonl"
+
+
+def test_node_kinds_are_the_five_tree_upserts():
+    assert store_journal.NODE_KINDS == frozenset(
+        {"run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"}
+    )
+    assert store_journal.NODE_KINDS <= set(get_args(store_journal.EventKind))
+
+
+_LEASE_AND_CONTROL_KINDS = (
+    "control_requested",
+    "control_handled",
+    "lease_acquired",
+    "lease_taken_over",
+    "claim_conflict",
+)
+
+
+@pytest.mark.parametrize("kind", _LEASE_AND_CONTROL_KINDS)
+def test_a_journal_line_of_a_lease_or_control_kind_validates_and_is_no_node_kind(kind):
+    line = store_journal.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event=kind,
+        payload={"token": "t1"},
+    )
+
+    assert line.event == kind
+    assert kind not in store_journal.NODE_KINDS
 
 
 def test_the_store_package_does_not_re_export_journal_names():
@@ -680,12 +719,93 @@ def test_a_skipped_line_still_counts_toward_last_seq(repo):
     assert [line.seq for line in again.read()] == [1, 3]
 
 
-def test_reseek_counts_a_skipped_line(repo):
-    # Review Focus 5: a lease take-over re-reads the highest seq on disk.
+def test_read_holds_the_append_lock_across_the_scan(repo, monkeypatch):
+    # Deterministic: check the lock is held at the moment the file is scanned,
+    # so an append on another thread can never be met half-written.
     journal = store_journal.Journal(RUN_ID)
     journal.append("run_upsert", {"i": 0})
-    _append_raw(journal, _unrecognised_line(2))
+    held_during_scan: list[bool] = []
+    real_scan = journal._scan
 
-    journal.reseek()
+    def spying_scan(**kwargs):
+        held_during_scan.append(journal._lock.locked())
+        return real_scan(**kwargs)
 
-    assert journal.append("run_upsert", {"i": 1}).seq == 3
+    monkeypatch.setattr(journal, "_scan", spying_scan)
+
+    lines = journal.read()
+
+    assert held_during_scan == [True]
+    assert journal._lock.locked() is False
+    assert [line.seq for line in lines] == [1]
+
+
+# -- mirror: a line numbered elsewhere, written verbatim ------------------------
+
+
+def _mirrored_line(seq: int) -> store_journal.JournalLine:
+    return store_journal.JournalLine(
+        seq=seq,
+        ts=datetime(2026, 10, 7, 5, 48, 8, 123456, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event="attempt_upsert",
+        story="story-a",
+        card="card-a",
+        phase="implement",
+        attempt=1,
+        payload={"status": "started", "n": 1},
+    )
+
+
+def test_ts_text_is_how_a_journal_line_writes_its_ts():
+    # Review Focus 4: a whole-second reading has no fraction, and still round-trips.
+    for ts, text in (
+        (
+            datetime(2026, 10, 7, 5, 48, 8, 123456, tzinfo=timezone.utc),
+            "2026-10-07T05:48:08.123456Z",
+        ),
+        (datetime(2026, 10, 7, 5, 48, 8, tzinfo=timezone.utc), "2026-10-07T05:48:08Z"),
+    ):
+        line = store_journal.JournalLine(seq=1, ts=ts, run_id=RUN_ID, event="run_upsert")
+        assert store_journal.ts_text(ts) == text == line.model_dump(mode="json")["ts"]
+        assert (
+            store_journal.JournalLine(seq=1, ts=text, run_id=RUN_ID, event="run_upsert")
+            == line
+        )
+
+
+def test_mirror_writes_the_given_line_verbatim(repo):
+    journal = store_journal.Journal(RUN_ID)
+    line = _mirrored_line(7)
+
+    journal.mirror(line)
+
+    assert journal.path.read_text(encoding="utf-8") == (
+        json.dumps(line.model_dump(mode="json"), sort_keys=True) + "\n"
+    )
+    assert journal.read() == [line]
+
+
+def test_append_numbers_after_a_mirrored_line(repo):
+    journal = store_journal.Journal(RUN_ID)
+
+    journal.mirror(_mirrored_line(5))
+    assert journal.append("run_upsert", {"i": 0}).seq == 6
+
+    journal.mirror(_mirrored_line(3))
+    assert journal.append("run_upsert", {"i": 1}).seq == 7
+
+
+def test_a_failed_mirror_write_raises_and_releases_the_lock(repo, monkeypatch):
+    journal = store_journal.Journal(RUN_ID)
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(store_journal.os, "fsync", failing_fsync)
+
+    with pytest.raises(OSError, match="fsync failed"):
+        journal.mirror(_mirrored_line(4))
+
+    assert journal._lock.locked() is False
+    assert [line.seq for line in journal.read()] == [4]

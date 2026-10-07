@@ -7,17 +7,29 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from agent_manager import paths
 
 JOURNAL_NAME = "journal.jsonl"
 
 EventKind = Literal[
-    "run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"
+    "run_upsert",
+    "story_upsert",
+    "subtask_upsert",
+    "phase_upsert",
+    "attempt_upsert",
+    "control_requested",
+    "control_handled",
+    "lease_acquired",
+    "lease_taken_over",
+    "claim_conflict",
 ]
-"""Every event is an upsert of one node of the §9 tree: a status transition is
-the same node recorded again with a new status."""
+"""Every kind of event a run records. The five `*_upsert`s (`NODE_KINDS`) each
+record one node of the §9 tree: a status transition is the same node recorded
+again with a new status. The other five record lease and control facts in the
+`events` table only: no tree reader folds them, and none is ever written to a
+journal file."""
 
 
 class JournalError(RuntimeError):
@@ -52,7 +64,23 @@ class JournalLine(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+_TS: TypeAdapter[datetime] = TypeAdapter(datetime)
+
+
+def ts_text(ts: datetime) -> str:
+    """`ts` as a `JournalLine` writes it in JSON mode, e.g.
+    `2026-10-07T05:48:08.123456Z`; a `JournalLine` reads it back to `ts`."""
+    return _TS.dump_python(ts, mode="json")
+
+
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
+
+NODE_KINDS: frozenset[str] = frozenset(
+    {"run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"}
+)
+"""The event kinds that upsert one node of the §9 tree: the only events
+`replay` folds. Other kinds may be recorded for a run; no tree reader reads
+them."""
 
 
 class _UnknownEventLine(BaseModel):
@@ -70,13 +98,13 @@ class _UnknownEventLine(BaseModel):
 
 
 class Journal:
-    """Append-only JSONL log for one run: the truth the projection is built from.
+    """Append-only JSONL log for one run.
 
-    The threads of the process that holds a run's lease share one `Journal`.
-    The highest sequence number on disk is read when the journal is opened and
-    cached; a lock serialises appends from those threads. A process that takes
-    the lease over calls `reseek`, because the previous owner may have appended
-    after this journal was opened (multi-process X4).
+    The threads of the process that holds a run's lease share one `Journal`;
+    a lock serialises writes from those threads. Live lines arrive through
+    `mirror`, already numbered by the store from its `events` table. `append`
+    numbers a line itself, one past the highest `seq` this journal has seen:
+    on disk when it was opened, or written since through `append` or `mirror`.
     """
 
     def __init__(self, run_id: str) -> None:
@@ -111,16 +139,6 @@ class Journal:
         if not self.path.exists():
             return 0
         return max((seq for seq, _ in self._scan()), default=0)
-
-    def reseek(self) -> None:
-        """Re-read the highest `seq` on disk into the cache, under the append lock.
-
-        Called by `Store.take_lease` once the lease is this process's: a stuck
-        previous owner may have appended lines after `__init__` cached `_seq`,
-        and the new owner must number its first line after them.
-        """
-        with self._lock:
-            self._seq = self.last_seq()
 
     def _scan(
         self, *, ignore_torn_tail: bool = False
@@ -182,12 +200,14 @@ class Journal:
         newer `am`) is skipped rather than raising; see `_scan` for what is
         still an error and for `ignore_torn_tail`. Unknown keys inside a known
         line's `payload` pass through untouched: `replay` judges payloads.
+
+        Holds the append lock across the scan, so a line this journal is
+        appending is never met half-written. The lock is not re-entrant: never
+        call this while holding it.
         """
-        lines = [
-            line
-            for _, line in self._scan(ignore_torn_tail=ignore_torn_tail)
-            if line is not None
-        ]
+        with self._lock:
+            scanned = self._scan(ignore_torn_tail=ignore_torn_tail)
+        lines = [line for _, line in scanned if line is not None]
         lines.sort(key=lambda line: line.seq)
         return lines
 
@@ -203,17 +223,16 @@ class Journal:
     ) -> JournalLine:
         """Append one line, flushed and fsynced before returning.
 
-        Only the process holding the run's lease writes it: after a take-over
-        the new owner writes, and the old owner's writes are fenced out by the
-        lease token (multi-process X4). The sequence number is cached when the
-        journal is opened (and re-read by `reseek` on a take-over), not re-read
-        from disk on each append, and the lock is held from numbering the line
-        until it is fsynced, so the threads of that process never share a
-        number or interleave their bytes. The cached number
-        advances once the line has been written and flushed to the file; if
-        validation, the open or the write raises, the next append retries the
-        same number, and if only the fsync raises the number stays spent, so
-        no seq is ever repeated on disk. The lock is released either way.
+        The sequence number is one past the cached highest `seq` (read when
+        the journal is opened, and raised by every `append` and `mirror`
+        since), not re-read from disk on each append, and the lock is held
+        from numbering the line until it is fsynced, so the threads of this
+        process never share a number or interleave their bytes. The cached
+        number advances once the line has been written and flushed to the
+        file; if validation, the open or the write raises, the next append
+        retries the same number, and if only the fsync raises the number stays
+        spent, so no seq is ever repeated on disk by this journal. The lock is
+        released either way.
         """
         with self._lock:
             seq = self._seq + 1
@@ -237,3 +256,21 @@ class Journal:
                 self._seq = seq
                 os.fsync(handle.fileno())
             return line
+
+    def mirror(self, line: JournalLine) -> None:
+        """Append `line` exactly as given, flushed and fsynced before returning.
+
+        The bytes are those `append` writes for the same fields. `line.seq`
+        is written as given: nothing is numbered and the clock is not read.
+        Once the line is written and flushed, the cached highest `seq` becomes
+        the larger of itself and `line.seq`, so a later `append` numbers after
+        it. Whatever the open, the write, the flush or the fsync raises
+        propagates; the lock is released either way.
+        """
+        text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+                handle.flush()
+                self._seq = max(self._seq, line.seq)
+                os.fsync(handle.fileno())

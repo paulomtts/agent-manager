@@ -58,6 +58,7 @@ from agent_manager import (
 )
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
@@ -3298,8 +3299,10 @@ def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeyp
         # Spec X7: another process held a project lock past its timeout before
         # the run started (e.g. `refresh_git`'s git lock).
         locks.LockTimeoutError(Path("/data/projects/abc.git.lock"), 600.0),
+        # Card 7ffee8c4: a write stayed busy through its whole retry budget.
+        store_db.StoreBusyError("beat", 5, 10.0),
     ],
-    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError"],
+    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError", "StoreBusyError"],
 )
 def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""
@@ -9011,6 +9014,137 @@ def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
     ]
 
 
+def _control_requested_events(root: Path) -> list[store_events.EventRow]:
+    """The run's committed `control_requested` events, in `seq` order."""
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            event
+            for event in store_events.read(conn, run_id=CONTROL_RUN_ID)
+            if event.kind == "control_requested"
+        ]
+    finally:
+        conn.close()
+
+
+def _run_project_id(root: Path) -> int:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return conn.execute(
+            "SELECT project_id FROM runs WHERE id = ?", (CONTROL_RUN_ID,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_recorded_pause_and_cancel_each_insert_one_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    cli.request_control(CONTROL_RUN_ID, "cancel", repo_dir=projection, clock=lambda: _at(1))
+
+    events = _control_requested_events(projection)
+    project_id = _run_project_id(projection)
+    assert [
+        (event.project_id, event.source, event.schema)
+        + (event.story_id, event.card_id, event.phase, event.attempt)
+        for event in events
+    ] == [(project_id, "live", 1, None, None, None, None)] * 2
+    # `ts` is the request's clock, the same instant as `requested_at`.
+    assert [event.ts for event in events] == [
+        store_journal.ts_text(CONTROL_NOW),
+        store_journal.ts_text(_at(1)),
+    ]
+    assert [event.payload for event in events] == [
+        {
+            "command": "pause",
+            "lease": "life-2",
+            "requested_at": CONTROL_NOW.isoformat(),
+            "control_seq": 0,
+        },
+        {
+            "command": "cancel",
+            "lease": "life-2",
+            "requested_at": _at(1).isoformat(),
+            "control_seq": 1,
+        },
+    ]
+    assert events[0].run_seq < events[1].run_seq
+
+
+def test_a_no_op_request_inserts_no_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    repeat = cli.request_control(
+        CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(5)
+    )
+
+    assert repeat["already_requested"] is True
+    assert [event.payload["control_seq"] for event in _control_requested_events(projection)] == [0]
+
+
+def _plant_refusal(root: Path, case: str) -> None:
+    """The projection state each refused-request case starts from."""
+    if case == "unknown-run":
+        return
+    if case == "not-started":
+        _plant_run(root, status="stopped")
+        _plant_lease(root)
+    elif case == "dead-lease":
+        _plant_run(root)
+        _plant_lease(root, heartbeat_at=_at(-31))
+    elif case == "window-closed":
+        _plant_run(root)
+        _plant_lease(root, accepting=False)
+    elif case == "unknown-command":
+        _plant_run(root)
+        _plant_lease(root)
+
+
+@pytest.mark.parametrize(
+    ("case", "command", "error"),
+    [
+        ("unknown-run", "pause", cli.UnknownRunError),
+        ("not-started", "pause", cli.NotRunningError),
+        ("dead-lease", "cancel", cli.DeadRunError),
+        ("window-closed", "cancel", cli.NotAcceptingError),
+        ("unknown-command", "resume", ValueError),
+    ],
+    ids=["unknown-run", "not-started", "dead-lease", "window-closed", "unknown-command"],
+)
+def test_a_refused_request_inserts_no_control_requested_event(projection, case, command, error):
+    _plant_refusal(projection, case)
+
+    with pytest.raises(error):
+        cli.request_control(
+            CONTROL_RUN_ID, command, repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _control_requested_events(projection) == []
+    assert _controls(projection) == []
+
+
+def test_a_failed_control_requested_insert_rolls_the_request_back(projection, monkeypatch):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    def failing(conn, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cli.store_events, "insert", failing)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        cli.request_control(
+            CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _controls(projection) == []
+    assert _control_requested_events(projection) == []
+
+
 def test_the_status_payload_defaults_to_an_empty_control():
     assert cli.status_payload(_pure_run([]))["control"] == {
         "lease": None,
@@ -10059,6 +10193,80 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
     assert _loaded(project, run_id).status == "started"
 
 
+def _only_run_id(project: Path) -> str:
+    root = cli.resolve_repo_dir(project)
+    conn = store_db.open_db(root)
+    try:
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, root)
+        )
+    finally:
+        conn.close()
+    assert run_id is not None
+    return run_id
+
+
+@pytest.mark.git
+def test_a_busy_store_mid_walk_is_a_store_busy_envelope_at_exit_3(
+    project, cards, monkeypatch
+):
+    """The `worktree` step's `done` row stays busy through its retry budget: the
+    walk stops at that write and records no escalation, and the window close
+    and lease release, busy too, do not replace the error the envelope names."""
+    real_record_phase = store_writer.Store.record_phase
+
+    def record_phase(self, story_id, card_id, phase):
+        if (phase.name, phase.status) == ("worktree", "done"):
+            raise store_db.StoreBusyError("record_phase", 5, 10.0)
+        return real_record_phase(self, story_id, card_id, phase)
+
+    def busy_close_window(self, token):
+        raise store_db.StoreBusyError("close_window", 5, 10.0)
+
+    def busy_release_lease(self, token):
+        raise store_db.StoreBusyError("release_lease", 5, 10.0)
+
+    monkeypatch.setattr(store_writer.Store, "record_phase", record_phase)
+    monkeypatch.setattr(store_writer.Store, "close_window", busy_close_window)
+    monkeypatch.setattr(store_writer.Store, "release_lease", busy_release_lease)
+    monkeypatch.setattr(cli, "default_runner_factory", lambda **kwargs: fake_runner())
+
+    result = _invoke(project, cards["subtask"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "StoreBusyError"
+    assert envelope["error"]["message"].startswith("record_phase: ")
+    run_id = _only_run_id(project)
+    assert _loaded(project, run_id).status == "started"
+    # The busy release left the lease row behind to go stale; the claims went.
+    assert _card_lease(project, run_id) is not None
+    assert _claim_rows(project) == []
+    conn = store_db.open_db(cli.resolve_repo_dir(project))
+    try:
+        phases = conn.execute(
+            "SELECT name, status FROM phases WHERE run_id = ? ORDER BY position", (run_id,)
+        ).fetchall()
+        subtasks = [
+            row[0]
+            for row in conn.execute(
+                "SELECT status FROM subtasks WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        ]
+        reasons = [
+            row[0]
+            for row in conn.execute(
+                "SELECT reason FROM checkpoints WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert [tuple(row) for row in phases] == [("worktree", "started")]
+    assert "escalated" not in subtasks
+    assert reasons == ["turn"]
+
+
 @pytest.mark.git
 def test_resume_takes_over_a_dead_lease_and_says_so(project, cards):
     run_id = _crash_pygents(project, cards, "plan")
@@ -10880,16 +11088,15 @@ def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
     old_owner = store_journal.Journal("run-t")
     for _ in range(2):
         old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
-    # The new owner opens the journal now and caches seq 2, while the stuck
-    # old owner is still appending: only `reseek` keeps it from reusing seq 3.
-    new_owner = store_journal.Journal("run-t")
 
     def old_owner_keeps_writing() -> None:
         for _ in range(2):
             old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
 
     def new_owner_takes_over() -> None:
-        new_owner.reseek()
+        # The new owner opens the journal once the old owner has stopped
+        # appending, so it numbers after the old owner's last line.
+        new_owner = store_journal.Journal("run-t")
         for _ in range(2):
             new_owner.append("phase_upsert", {"by": "new"}, card="card-1", phase="implement", attempt=1)
 
@@ -12162,7 +12369,8 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert lines_after[: len(lines_before)] == lines_before
     (added,) = lines_after[len(lines_before) :]
     assert added.event == "run_upsert"
-    assert added.seq == lines_before[-1].seq + 1
+    # `am reset`'s own `lease_acquired` takes the number in between (card 1.2.7).
+    assert added.seq == lines_before[-1].seq + 2
     first = next(line for line in lines_before if line.event == "run_upsert")
     # The same write whether or not the worktree exists: only `status` moved.
     assert added.payload == {**first.payload, "status": "canceled"}
@@ -12172,7 +12380,7 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert _lease(projection) is None
     rebuilt = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
-        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
+        assert rebuilt.rebuild_from_events(CONTROL_RUN_ID).status == "canceled"
     finally:
         rebuilt.close()
 
@@ -12642,6 +12850,12 @@ def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
     assert not isinstance(store_journal.JournalError("other"), cli.HANDLED)
 
 
+def test_handled_takes_store_busy_error():
+    """A write that stayed busy through its whole retry budget is a refusal,
+    not a bug: it gets the exit-3 envelope, not a traceback."""
+    assert isinstance(store_db.StoreBusyError("beat", 5, 10.0), cli.HANDLED)
+
+
 @pytest.mark.parametrize(
     "lease",
     [None, {"heartbeat_at": CONTROL_NOW - timedelta(seconds=31)}],
@@ -12716,11 +12930,11 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
 
 # ── am status integrity (card f63036db) ─────────────────────────────────────
 #
-# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the journal
-# with the projection through `store_replay.diverging` and reports it under an
-# always-present `integrity` key, at exit 0, writing nothing. Unit tier: the
-# projection fixture writes SQLite rows and journal files in `tmp_path`; no
-# subprocess.
+# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the run's
+# events with the projection through `store_replay.diverging` and reports it
+# under an always-present `integrity` key, at exit 0, writing nothing. Unit
+# tier: the projection fixture writes SQLite rows and journal files in
+# `tmp_path`; no subprocess.
 
 CLEAN_INTEGRITY = {"checked": True, "reason": None, "mismatches": []}
 
@@ -12748,6 +12962,71 @@ def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID)
     try:
         with store_db.immediate(conn):
             conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+    finally:
+        conn.close()
+
+
+PLANTED_TS = "2026-09-29T09:00:00+00:00"
+
+
+def _plant_event(
+    root: Path,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_id: str = CONTROL_RUN_ID,
+    story: str | None = None,
+) -> None:
+    """One `events` row of `run_id` written behind the store's back, as a hand
+    `INSERT` would: no row and no journal line record it."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            store_events.insert(
+                conn,
+                project_id=store_projects.lookup(conn, resolved),
+                run_id=run_id,
+                ts=PLANTED_TS,
+                kind=kind,
+                payload=payload,
+                source="live",
+                story_id=story,
+            )
+    finally:
+        conn.close()
+
+
+def _plant_raw_payload(root: Path, kind: str, text: str, *, run_id: str = CONTROL_RUN_ID) -> int:
+    """An `events` row of `run_id` whose `payload` column is `text` verbatim,
+    which `store_events.insert` (it serialises) cannot write. Returns its `run_seq`."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            run_seq = conn.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) + 1 FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'live')",
+                (store_projects.lookup(conn, resolved), run_id, run_seq, PLANTED_TS, kind, text),
+            )
+    finally:
+        conn.close()
+    return run_seq
+
+
+def _drop_events(root: Path, run_id: str = CONTROL_RUN_ID) -> None:
+    """Delete every event of `run_id`, as a restored or foreign database may
+    lack them while keeping the run's rows. The append-only trigger is
+    dropped first so the rows can go."""
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        conn.execute("DROP TRIGGER events_no_delete")
+        conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -12838,102 +13117,103 @@ def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monke
     assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
 
 
-def test_status_of_a_run_with_no_journal_says_so_and_creates_no_run_directory(
+def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
     projection, monkeypatch
 ):
-    """Spec test 5: `Journal._for_reading`, never the constructor that calls
-    `paths.run_dir` and would create the directory."""
+    """Spec test 16: the run's rows are there, its events are not."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
     shutil.rmtree(run_dir)
+    _drop_events(projection)
 
-    def forbidden(self, run_id):
-        raise AssertionError("status must not construct Journal(run_id)")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must not construct a Journal")
 
     monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
+    monkeypatch.setattr(store_journal.Journal, "_for_reading", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
-    assert data["integrity"] == {"checked": False, "reason": "no journal", "mismatches": []}
+    assert data["integrity"] == {"checked": False, "reason": "no events", "mismatches": []}
     assert not run_dir.exists()
 
 
-def test_a_torn_final_journal_line_is_ignored_and_the_run_still_checked(
+def test_status_of_a_clean_run_with_its_journal_file_gone_is_still_checked_clean(
     projection, monkeypatch
 ):
-    """Spec test 6, first half: an append in flight, no trailing newline."""
+    """Spec test 17: the events, not the file, are compared."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 9999, "ts": "2026-')
+    shutil.rmtree(paths.data_dir() / "runs" / CONTROL_RUN_ID)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == CLEAN_INTEGRITY
 
 
-def test_a_newline_terminated_non_json_line_makes_the_journal_unreadable(
+def test_an_event_payload_that_is_not_json_makes_the_events_unreadable(
     projection, monkeypatch
 ):
-    """Spec test 6, second half: still `CorruptJournalError`, reported at exit 0."""
+    """Spec test 18; Review Focus 1: a hand INSERT is reported at exit 0."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    run_seq = _plant_raw_payload(projection, "story_upsert", "{not json")
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
-    assert "line is not JSON" in integrity["reason"]
+    assert integrity["reason"].startswith("events unreadable: ")
+    assert f"run_seq {run_seq}" in integrity["reason"]
+    assert "not JSON" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_empty_journal_is_unreadable_not_a_traceback(projection, monkeypatch):
-    """Review Focus: `read()` returns `[]`, and `replay` inside `diverging`
-    raises `JournalError` -- the try must cover `diverging` too."""
+def test_events_without_a_run_upsert_are_unreadable_not_a_traceback(projection, monkeypatch):
+    """Spec test 19: `run_lines` returns a story line only, and `replay` inside
+    `diverging` raises `JournalError` -- the try must cover `diverging` too."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    _journal_path().write_text("", encoding="utf-8")
+    _drop_events(projection)
+    _plant_event(
+        projection,
+        "story_upsert",
+        {"card_id": "story-1", "title": "The CLI", "level": 0, "status": "started", "tip_branch": None},
+        story="story-1",
+    )
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == {
         "checked": False,
-        "reason": "journal unreadable: journal contains no run_upsert line",
+        "reason": "events unreadable: journal line 1 is a story_upsert but no"
+        " run_upsert preceded it: the head of the journal is missing",
         "mismatches": [],
     }
 
 
-def test_a_journal_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
-    """Review Focus: the envelope is valid, the run payload is not, so
-    `diverging` raises a pydantic `ValidationError`."""
+def test_an_event_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
+    """Spec test 20: the event is valid JSON, the run payload is not a `Run`,
+    so `diverging` raises a pydantic `ValidationError`."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    path = _journal_path()
-    first, *rest = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    line = json.loads(first)
-    assert line["event"] == "run_upsert"
-    line["payload"]["status"] = "not-a-status"
-    path.write_text(json.dumps(line) + "\n" + "".join(rest), encoding="utf-8")
+    _plant_event(projection, "run_upsert", {"id": CONTROL_RUN_ID, "status": "not-a-status"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
+    assert integrity["reason"].startswith("events unreadable: ")
     assert "validation error" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_unknown_journal_event_kind_is_skipped_by_the_check(projection, monkeypatch):
-    """Review Focus: a line a newer `am` wrote is not divergence and does not raise."""
+def test_an_event_of_another_kind_is_skipped_by_the_check(projection, monkeypatch):
+    """Spec test 21; Review Focus 2: a lease or control event is not divergence."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"seq": 9999, "event": "from_the_future"}) + "\n")
+    _plant_event(projection, "from_the_future", {"anything": "at all"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -12969,18 +13249,19 @@ def test_a_live_lease_is_not_checked_and_a_stale_one_is(
     assert data["integrity"] == integrity
 
 
-def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
-    """Review Focus: the live-lease rule comes first, so even a corrupt
-    journal reads as `lease is live`, and `diverging` is never called."""
+def test_a_live_lease_never_reads_the_events(projection, monkeypatch):
+    """Review Focus: the live-lease rule comes first, so even an unreadable
+    event reads as `lease is live`, and neither `run_lines` nor `diverging`
+    is called."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    _plant_raw_payload(projection, "story_upsert", "{not json")
     _plant_lease(projection, heartbeat_at=CONTROL_NOW - timedelta(seconds=5))
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("a live run's journal must not be compared")
+        raise AssertionError("a live run's events must not be compared")
 
+    monkeypatch.setattr(store_events, "run_lines", forbidden)
     monkeypatch.setattr(store_replay, "diverging", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)

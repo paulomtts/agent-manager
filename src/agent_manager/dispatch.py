@@ -41,6 +41,7 @@ from agent_manager.harness.launcher import LauncherFn
 from agent_manager.harness.registry import DEFAULT_HARNESS, default_adapters
 from agent_manager.roles.loader import RoleBundle, load_role
 from agent_manager.runtime import bridge, state
+from agent_manager.store import db as store_db
 from agent_manager.store.journal import JournalError
 from agent_manager.store.writer import Store
 from agent_manager.workflow import phases as phase_model
@@ -529,6 +530,11 @@ class AgentRunner:
                 feedback.append(verdict.detail or verdict.status)
         except LimitWaitInterrupted:
             raise
+        except store_db.StoreBusyError:
+            # A store write gave up after its retry budget: no `failed` record
+            # is attempted, so the walk stops at the write that failed and the
+            # phase stays `started` for a resume.
+            raise
         except Exception as error:
             # Symmetric with `walk.run_one_step`, which records its own
             # phase `failed` when a step raises: §9's state tree has no edge for
@@ -784,7 +790,7 @@ class AgentRunner:
     ) -> Adopted | None:
         """Reuse `source_run`'s recorded `ok` attempt instead of dispatching.
 
-        Attempts are read from the source run's journal, never from the
+        Attempts are read from the source run's events, never from the
         `attempts` projection, and only attempts numbered above `floor` with
         status `ok` qualify: an orphaned `started` one, even with a valid
         file on disk, never does. The highest such attempt's result file is
@@ -795,11 +801,11 @@ class AgentRunner:
         """
         model = self._result_model(phase)
         try:
-            run = self.store.replay_journal(source_run)
+            run = self.store.replay_events(source_run)
         except (JournalError, ValidationError) as error:
             return self._decline(
                 phase, None, source_run,
-                f"its journal cannot be read: {walk._render_error(error)}",
+                f"its events cannot be read: {walk._render_error(error)}",
             )
         found = _recorded_phase(run, self.card_id, phase.name)
         if found is None:
@@ -844,7 +850,7 @@ class AgentRunner:
     ) -> None:
         """Warn that a recorded attempt is not reused; write nothing.
 
-        `n` is `None` when the journal could not be read, before any attempt
+        `n` is `None` when the events could not be read, before any attempt
         was found; the number is then shown as `?`.
         """
         shown = "?" if n is None else n

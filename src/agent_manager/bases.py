@@ -174,8 +174,8 @@ async def _resolve_conflict(
 
     Mirrors `integration._resolve_conflict`, awaited on the running loop and
     stop-aware. The synthetic subtask `base-<story id>` is recorded before the
-    engine journals its first phase, because `store.rebuild_from_journal`
-    refuses a phase whose subtask no earlier line created. The caller has
+    engine records its first phase, because `store.rebuild_from_events`
+    refuses a phase whose subtask no earlier event created. The caller has
     already recorded the `bases` story. `resume_from` continues the walk from
     a saved checkpoint (card 54e4ec29); the engine then binds from the
     checkpoint's pool, so `tip` and `files` only name it.

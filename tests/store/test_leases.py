@@ -445,6 +445,29 @@ def test_mark_control_handled_marks_only_this_runs_request_without_committing(co
     assert store_leases.control_requests(other, OTHER_RUN)[0].handled_at is None
 
 
+def test_mark_control_handled_reports_the_row_it_handled_and_only_once(conns, project_id):
+    conn, other = conns
+    _seed_control(conn, 0, project_id=project_id)
+
+    handled = store_leases.mark_control_handled(conn, RUN_ID, 0, LATER)
+    again = store_leases.mark_control_handled(conn, RUN_ID, 0, LATER + timedelta(minutes=1))
+    unknown = store_leases.mark_control_handled(conn, RUN_ID, 5, LATER)
+    conn.commit()
+
+    assert handled == store_leases.ControlRow(
+        run_id=RUN_ID,
+        seq=0,
+        lease="t1",
+        command="pause",
+        requested_at=NOW,
+        handled_at=LATER,
+    )
+    assert again is None
+    assert unknown is None
+    # First handling wins: the second mark left `handled_at` as it was.
+    assert [row.handled_at for row in store_leases.control_requests(other, RUN_ID)] == [LATER]
+
+
 def test_add_control_numbers_requests_without_committing(conns, project_id):
     conn, other = conns
 
@@ -614,6 +637,19 @@ _DELEGATIONS = [
 ]
 
 
+_READ_LEAVES = frozenset(
+    {
+        "pending_controls",
+        "latest_checkpoint",
+        "latest_turn_checkpoint",
+        "latest_open_checkpoint",
+        "checkpoint_cards",
+        "pending_comments",
+    }
+)
+"""The delegations that are reads: their leaf gets `Store.read_connection`."""
+
+
 @pytest.mark.parametrize(("leaf", "function", "setup", "drive"), _DELEGATIONS)
 def test_store_methods_call_the_leaf_through_the_module(
     repo, monkeypatch, leaf, function, setup, drive
@@ -632,8 +668,9 @@ def test_store_methods_call_the_leaf_through_the_module(
         setup(st)
         monkeypatch.setattr(leaf, function, spy)
         drive(st)
+        expected = st.read_connection if function in _READ_LEAVES else st.connection
         assert seen != []
-        assert all(conn is st.connection for conn in seen)
+        assert all(conn is expected for conn in seen)
     finally:
         st.close()
 

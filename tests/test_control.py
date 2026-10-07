@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import itertools
+import logging
 import os
 import socket
 import sqlite3
@@ -32,6 +33,7 @@ import pytest
 
 from agent_manager import control, models
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
@@ -107,6 +109,15 @@ def _requests(root: Path) -> list[store_leases.ControlRow]:
     conn = store_db.open_db(root)
     try:
         return store_leases.control_requests(conn, RUN_ID)
+    finally:
+        conn.close()
+
+
+def _events(root: Path) -> list[store_events.EventRow]:
+    """Every committed event of `RUN_ID`, in `seq` order."""
+    conn = store_db.open_db(root)
+    try:
+        return store_events.read(conn, run_id=RUN_ID)
     finally:
         conn.close()
 
@@ -202,6 +213,46 @@ class Wrapped:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
+
+
+def _control_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "agent_manager.control" and record.levelno == logging.WARNING
+    ]
+
+
+class _BusyCleanup(Wrapped):
+    """A real store whose window close and control mark stay busy, recording each attempt."""
+
+    def __init__(self, inner: store_writer.Store, events: list[str]) -> None:
+        super().__init__(inner)
+        self._events = events
+
+    def close_window(self, token: str) -> None:
+        self._events.append("close_window")
+        raise store_db.StoreBusyError("close_window", 5, 10.0)
+
+    def mark_control_handled(self, seq: int, now: datetime) -> None:
+        self._events.append("mark_control_handled")
+        raise store_db.StoreBusyError("mark_control_handled", 5, 10.0)
+
+
+class _BusyRelease(Wrapped):
+    """A real store whose claim and lease releases stay busy, recording each attempt."""
+
+    def __init__(self, inner: store_writer.Store, events: list[str]) -> None:
+        super().__init__(inner)
+        self._events = events
+
+    def release_claims(self, token: str) -> None:
+        self._events.append("release_claims")
+        raise store_db.StoreBusyError("release_claims", 5, 10.0)
+
+    def release_lease(self, token: str) -> None:
+        self._events.append("release_lease")
+        raise store_db.StoreBusyError("release_lease", 5, 10.0)
 
 
 # -- pid_alive and lease_is_live (C2) -----------------------------------------
@@ -302,6 +353,19 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
 
 
+def test_control_does_not_import_sqlite3():
+    # Architecture §5.4: `sqlite3` stays inside `store`; a busy store reaches
+    # this module as `store_db.StoreBusyError`.
+    tree = ast.parse(Path(control.__file__).read_text())
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            modules.add(node.module or "")
+    assert "sqlite3" not in modules
+
+
 # -- claim keys (multi-process X5) ---------------------------------------------
 
 
@@ -377,8 +441,9 @@ def test_lease_heartbeat_thread_beats_and_stops_on_exit(root, opened_store):
     assert _read_lease(root) is None
 
 
-def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
-    # Review Focus 3: a locked database must not kill the heartbeat thread.
+def test_lease_heartbeat_survives_a_store_busy_error(root, opened_store):
+    # Review Focus 3: a write whose retry budget ran out must not kill the
+    # heartbeat thread.
     recovered = threading.Event()
 
     class Flaky(Wrapped):
@@ -387,7 +452,7 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
         def beat(self, token: str, now: datetime) -> None:
             Flaky.calls += 1
             if Flaky.calls == 1:
-                raise sqlite3.OperationalError("database is locked")
+                raise store_db.StoreBusyError("beat", 5, 10.0)
             self._inner.beat(token, now)
             recovered.set()
 
@@ -395,6 +460,67 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
     with control.Lease(Flaky(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
+    assert _heartbeat_threads() == []
+
+
+def test_a_missed_heartbeat_is_logged_and_the_next_beat_moves_it(root, opened_store, caplog):
+    # Review Focus 1: two beats in a row stay busy; each one is logged once
+    # and the first beat that gets through moves the heartbeat.
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    recovered = threading.Event()
+
+    class Flaky(Wrapped):
+        calls = 0
+
+        def beat(self, token: str, now: datetime) -> None:
+            Flaky.calls += 1
+            if Flaky.calls <= 2:
+                raise store_db.StoreBusyError("beat", 5, 10.0)
+            self._inner.beat(token, now)
+            recovered.set()
+
+    ticks = itertools.count()
+    with control.Lease(
+        Flaky(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))
+    ) as lease:
+        assert recovered.wait(timeout=5.0)
+        assert _heartbeat_threads()[0].is_alive()
+        row = _read_lease(root)
+        token = lease.token
+
+    assert row is not None and row.heartbeat_at > row.acquired_at
+    missed = [record for record in caplog.records if record.name == "agent_manager.control"]
+    assert [record.levelno for record in missed] == [logging.WARNING, logging.WARNING]
+    for record in missed:
+        assert token in record.getMessage()
+        assert "beat: the database stayed busy" in record.getMessage()
+
+
+def test_lease_heartbeat_ends_on_a_raw_operational_error(root, opened_store, monkeypatch):
+    # Only `StoreBusyError` is swallowed: a raw `OperationalError` is not a
+    # spent retry budget, so it ends the thread through `threading.excepthook`.
+    locked = sqlite3.OperationalError("database is locked")
+    hooked = threading.Event()
+    seen: list[tuple[BaseException | None, threading.Thread | None]] = []
+
+    def record(args: threading.ExceptHookArgs) -> None:
+        seen.append((args.exc_value, args.thread))
+        hooked.set()
+
+    monkeypatch.setattr(threading, "excepthook", record)
+
+    class Locked(Wrapped):
+        def beat(self, token: str, now: datetime) -> None:
+            raise locked
+
+    ticks = itertools.count()
+    with control.Lease(Locked(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
+        assert hooked.wait(timeout=5.0)
+        [(error, thread)] = seen
+        assert error is locked
+        assert thread is not None and thread.name == HEARTBEAT_THREAD
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
     assert _heartbeat_threads() == []
 
 
@@ -548,6 +674,67 @@ def test_lease_exit_leaves_a_new_holders_lease_and_claims_alone(root, opened_sto
     assert _all_claims(root) == [("card:a", RUN_ID, "thief")]
 
 
+def test_busy_releases_on_a_failing_exit_are_logged_and_the_error_kept(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    with pytest.raises(RuntimeError, match="inside the run") as caught:
+        with control.Lease(
+            _BusyRelease(opened_store, events), claims=["card:a"], clock=lambda: _at(1)
+        ) as lease:
+            raise RuntimeError("inside the run")
+
+    assert type(caught.value) is RuntimeError
+    assert events == ["release_claims", "release_lease"]
+    assert opened_store._token is None
+    # The unreleased lease row stays behind and goes stale.
+    assert _read_lease(root) is not None
+    warnings = _control_warnings(caplog)
+    assert len(warnings) == 2
+    assert all(lease.token in record.getMessage() for record in warnings)
+    assert "release_claims: the database stayed busy" in warnings[0].getMessage()
+    assert "release_lease: the database stayed busy" in warnings[1].getMessage()
+
+
+def test_a_busy_release_on_a_clean_exit_still_raises(root, opened_store, caplog):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    with pytest.raises(store_db.StoreBusyError, match="release_lease"):
+        with control.Lease(_BusyRelease(opened_store, events), clock=lambda: _at(1)):
+            pass
+
+    assert events == ["release_claims", "release_lease"]
+    assert opened_store._token is None
+    assert _control_warnings(caplog) == []
+
+
+def test_a_non_busy_release_error_on_a_failing_exit_keeps_todays_behaviour(
+    root, opened_store
+):
+    # Review Focus 3: only `StoreBusyError` is logged and kept back.
+    events: list[str] = []
+
+    class Broken(Wrapped):
+        def release_claims(self, token: str) -> None:
+            events.append("release_claims")
+            raise sqlite3.IntegrityError("claims broke")
+
+        def release_lease(self, token: str) -> None:
+            events.append("release_lease")
+            self._inner.release_lease(token)
+
+    with pytest.raises(sqlite3.IntegrityError, match="claims broke"):
+        with control.Lease(Broken(opened_store), clock=lambda: _at(1)):
+            raise RuntimeError("inside the run")
+
+    assert events == ["release_claims", "release_lease"]
+    assert _read_lease(root) is None
+    assert opened_store._token is None
+
+
 # -- hand-off and adoption (am run --detach, card aff9fdbf) ---------------------
 
 
@@ -647,6 +834,15 @@ def test_apply_pending_requests_each_row_in_order_and_marks_handled(root, opened
         assert [row.handled_at for row in _requests(root)] == [_at(7)] * 3
         assert control.apply_pending(opened_store, stop, lease.token) == []
 
+    handled = [event for event in _events(root) if event.kind == "control_handled"]
+    # One event per applied row, in `seq` order; the second, empty poll adds none.
+    assert [event.payload for event in handled] == [
+        {"command": "pause", "control_seq": 0, "handled_at": _at(7).isoformat()},
+        {"command": "pause", "control_seq": 1, "handled_at": _at(7).isoformat()},
+        {"command": "cancel", "control_seq": 2, "handled_at": _at(7).isoformat()},
+    ]
+    assert [event.run_seq for event in handled] == sorted(event.run_seq for event in handled)
+
 
 def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store):
     stop = StopSignal()
@@ -664,25 +860,25 @@ def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store)
 # -- watch ---------------------------------------------------------------------
 
 
-async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_store):
-    class Locked(Wrapped):
+async def test_watch_swallows_store_busy_error_and_keeps_polling(root, opened_store):
+    class Busy(Wrapped):
         calls = 0
 
         def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
-            Locked.calls += 1
-            if Locked.calls <= 2:
-                raise sqlite3.OperationalError("database is locked")
+            Busy.calls += 1
+            if Busy.calls <= 2:
+                raise store_db.StoreBusyError("pending_controls", 5, 10.0)
             return self._inner.pending_controls(token)
 
     stop = StopSignal()
     _send(root, "t1", "pause")
-    task = asyncio.create_task(control.watch(Locked(opened_store), stop, "t1", interval=0))
+    task = asyncio.create_task(control.watch(Busy(opened_store), stop, "t1", interval=0))
     try:
         await _until(lambda: stop.requested == "pause")
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    assert Locked.calls >= 3
+    assert Busy.calls >= 3
     assert task.cancelled()
 
     class Broken(Wrapped):
@@ -691,6 +887,13 @@ async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_s
 
     with pytest.raises(RuntimeError, match="not a lock"):
         await _within(control.watch(Broken(opened_store), StopSignal(), "t1", interval=0))
+
+    class RawLocked(Wrapped):
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        await _within(control.watch(RawLocked(opened_store), StopSignal(), "t1", interval=0))
 
 
 # -- controlled ----------------------------------------------------------------
@@ -823,3 +1026,98 @@ async def test_controlled_cancels_work_on_exception_and_always_stops_the_watcher
                 control.controlled(failing(), store=opened_store, stop=stop, lease=lease, interval=0)
             )
         assert asyncio.all_tasks() == before
+
+
+async def test_busy_cleanup_writes_after_a_failed_work_are_logged_not_raised(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+    busy = _BusyCleanup(opened_store, events)
+    with control.Lease(busy) as lease:
+        # A pending row, so the final sweep has a mark to attempt.
+        _send(root, lease.token, "pause")
+
+        async def failing() -> str:
+            raise ValueError("work failed")
+
+        with pytest.raises(ValueError, match="work failed"):
+            await _within(
+                control.controlled(
+                    failing(), store=busy, stop=StopSignal(), lease=lease, interval=3600
+                )
+            )
+
+    # The watcher's first tick may have tried the mark too (and swallowed it);
+    # the close and then the final sweep are always attempted.
+    assert "close_window" in events
+    assert events[-1] == "mark_control_handled"
+    assert events.index("close_window") < len(events) - 1
+    warnings = _control_warnings(caplog)
+    assert len(warnings) == 2
+    assert all(lease.token in record.getMessage() for record in warnings)
+    assert "close_window: the database stayed busy" in warnings[0].getMessage()
+    assert "mark_control_handled: the database stayed busy" in warnings[1].getMessage()
+
+
+async def test_busy_cleanup_writes_never_replace_a_cancellation(root, opened_store, caplog):
+    # Review Focus 2: the task running `controlled` is cancelled from outside
+    # while both cleanup writes stay busy.
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+    busy = _BusyCleanup(opened_store, events)
+    with control.Lease(busy) as lease:
+        _send(root, lease.token, "cancel")
+        started, cancelled = asyncio.Event(), []
+        outer = asyncio.create_task(
+            control.controlled(
+                _blocked_forever(started, cancelled),
+                store=busy,
+                stop=StopSignal(),
+                lease=lease,
+                interval=3600,
+            )
+        )
+        await _within(started.wait())
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+
+    assert cancelled == [True]
+    assert "close_window" in events
+    assert events[-1] == "mark_control_handled"
+    assert len(_control_warnings(caplog)) == 2
+
+
+async def test_a_busy_final_sweep_after_work_returned_still_raises(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    class BusySweep(Wrapped):
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
+            events.append("pending")
+            return self._inner.pending_controls(token)
+
+        def mark_control_handled(self, seq: int, now: datetime) -> None:
+            raise store_db.StoreBusyError("mark_control_handled", 5, 10.0)
+
+    busy = BusySweep(opened_store)
+    with control.Lease(busy) as lease:
+
+        async def work() -> str:
+            # The watcher's first tick has run and it is parked on a long
+            # interval, so only the final sweep sees this request.
+            await _until(lambda: "pending" in events)
+            _send(root, lease.token, "pause")
+            return "done"
+
+        with pytest.raises(store_db.StoreBusyError, match="mark_control_handled"):
+            await _within(
+                control.controlled(
+                    work(), store=busy, stop=StopSignal(), lease=lease, interval=3600
+                )
+            )
+
+    assert _control_warnings(caplog) == []

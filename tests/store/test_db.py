@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pytest
 
 from agent_manager import paths, store
 from agent_manager.store import db
+from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 from agent_manager.store.writer import Store
 
@@ -162,6 +164,13 @@ _DB_NAMES = (
     "StoreSchemaError",
     "MigrationRequiredError",
     "_refuse_unmigrated",
+    "run_with_retry",
+    "is_busy",
+    "StoreBusyError",
+    "RETRY_ATTEMPTS",
+    "RETRY_DEADLINE_SECONDS",
+    "RETRY_FIRST_PAUSE",
+    "RETRY_PAUSE_CAP",
 )
 
 
@@ -181,17 +190,29 @@ def _hold_fresh_db_reserved() -> sqlite3.Connection:
 
 
 def test_db_is_a_leaf_module_of_the_store_package():
-    for function in (db.open_db, db.immediate, db.open_db_for_reading, db.store_id):
+    for function in (
+        db.open_db,
+        db.immediate,
+        db.open_db_for_reading,
+        db.store_id,
+        db.run_with_retry,
+    ):
         assert callable(function)
         assert function.__module__ == "agent_manager.store.db"
     assert db.BUSY_TIMEOUT_SECONDS == 30.0
     assert db.SCHEMA_VERSION == 1
     assert db.MIGRATED_KEY == "migrated_at"
     assert db.STORE_ID_KEY == "store_id"
+    assert db.RETRY_ATTEMPTS == 5
+    assert db.RETRY_DEADLINE_SECONDS == 10.0
+    assert db.RETRY_FIRST_PAUSE == 0.1
+    assert db.RETRY_PAUSE_CAP == 2.0
     assert db.StoreSchemaError.__module__ == "agent_manager.store.db"
     assert issubclass(db.StoreSchemaError, RuntimeError)
     assert db.MigrationRequiredError.__module__ == "agent_manager.store.db"
     assert issubclass(db.MigrationRequiredError, RuntimeError)
+    assert db.StoreBusyError.__module__ == "agent_manager.store.db"
+    assert issubclass(db.StoreBusyError, RuntimeError)
 
 
 def test_the_store_package_does_not_re_export_db_names():
@@ -1080,3 +1101,395 @@ def test_the_refusal_check_does_not_wait_for_a_writer_holding_a_transaction(repo
     finally:
         writer.rollback()
         writer.close()
+
+
+# -- run_with_retry ------------------------------------------------------------
+
+
+class _FakeClock:
+    """`clock` and `sleep` for `run_with_retry` that agree: a pause advances `now`."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.pauses: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds
+
+
+def _coded(code: int, message: str = "database is locked") -> sqlite3.OperationalError:
+    """An `OperationalError` carrying `sqlite_errorcode`, as SQLite's own errors do."""
+    error = sqlite3.OperationalError(message)
+    error.sqlite_errorcode = code
+    return error
+
+
+def _retry(job, fake: _FakeClock, *, rng: Callable[[], float] = lambda: 0.5):
+    return db.run_with_retry(
+        job, operation="beat", clock=fake.clock, sleep=fake.sleep, rng=rng
+    )
+
+
+def test_run_with_retry_returns_the_jobs_value_without_sleeping():
+    fake = _FakeClock()
+    draws: list[float] = []
+
+    def rng() -> float:
+        draws.append(0.5)
+        return 0.5
+
+    assert _retry(lambda: "written", fake, rng=rng) == "written"
+    assert fake.pauses == []
+    assert draws == []
+
+
+def test_run_with_retry_retries_busy_then_returns():
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> str:
+        calls.append(1)
+        if len(calls) <= 2:
+            raise _coded(sqlite3.SQLITE_BUSY)
+        return "written"
+
+    assert _retry(job, fake) == "written"
+    assert len(calls) == 3
+    # rng 0.5: each pause is 0.75 of its base (0.1, then 0.2).
+    assert fake.pauses == pytest.approx([0.075, 0.15])
+
+
+@pytest.mark.parametrize(
+    "code",
+    [sqlite3.SQLITE_LOCKED, 517, 773, 262],
+    ids=["LOCKED", "BUSY_SNAPSHOT", "BUSY_TIMEOUT", "LOCKED_SHAREDCACHE"],
+)
+def test_run_with_retry_retries_locked_and_extended_busy_codes(code):
+    # Review Focus 1: extended codes are masked with `& 0xFF`.
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            raise _coded(code)
+        return "written"
+
+    assert _retry(job, fake) == "written"
+    assert len(calls) == 2
+    assert len(fake.pauses) == 1
+
+
+def test_run_with_retry_gives_up_after_the_attempt_budget():
+    # Review Focus 3: exhaustion chains the last error, not the first.
+    fake = _FakeClock()
+    raised: list[sqlite3.OperationalError] = []
+
+    def job() -> None:
+        error = _coded(sqlite3.SQLITE_BUSY)
+        raised.append(error)
+        raise error
+
+    with pytest.raises(db.StoreBusyError) as caught:
+        _retry(job, fake)
+
+    assert len(raised) == db.RETRY_ATTEMPTS == 5
+    assert caught.value.__cause__ is raised[-1]
+    assert caught.value.__cause__ is not raised[0]
+    assert caught.value.operation == "beat"
+    assert caught.value.attempts == 5
+    assert caught.value.elapsed == pytest.approx(0.075 + 0.15 + 0.3 + 0.6)
+    message = str(caught.value)
+    assert "beat" in message
+    assert "5 attempt" in message
+    assert "10 s" in message
+    assert len(fake.pauses) == db.RETRY_ATTEMPTS - 1
+
+
+def test_run_with_retry_stops_at_the_deadline_before_the_attempt_budget():
+    # Review Focus 4: the deadline is checked before sleeping.
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        fake.now += 6.0  # blocked in `busy_timeout` before SQLite gave up
+        raise _coded(sqlite3.SQLITE_BUSY)
+
+    with pytest.raises(db.StoreBusyError) as caught:
+        _retry(job, fake)
+
+    assert len(calls) == 2
+    assert caught.value.attempts == 2
+    assert caught.value.elapsed == pytest.approx(12.075)
+    assert fake.pauses == pytest.approx([0.075])
+
+
+def test_run_with_retry_clamps_the_pause_to_the_time_left():
+    fake = _FakeClock()
+    start = fake.now
+    calls: list[int] = []
+
+    def job() -> str:
+        calls.append(1)
+        if len(calls) == 2:
+            fake.now = start + 9.95
+        if len(calls) <= 2:
+            raise _coded(sqlite3.SQLITE_BUSY)
+        return "written"
+
+    assert _retry(job, fake) == "written"
+    # The second jittered pause would be 0.15; only 0.05 s of budget is left.
+    assert fake.pauses == pytest.approx([0.075, 0.05])
+
+
+def test_run_with_retry_backoff_doubles_is_jittered_and_capped(monkeypatch):
+    monkeypatch.setattr(db, "RETRY_ATTEMPTS", 8)
+    monkeypatch.setattr(db, "RETRY_DEADLINE_SECONDS", 100.0)
+    bases = [0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0]
+
+    def always_busy() -> None:
+        raise _coded(sqlite3.SQLITE_BUSY)
+
+    low = _FakeClock()
+    with pytest.raises(db.StoreBusyError):
+        _retry(always_busy, low, rng=lambda: 0.0)
+    assert low.pauses == pytest.approx([0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0])
+
+    high = _FakeClock()
+    with pytest.raises(db.StoreBusyError):
+        _retry(always_busy, high, rng=lambda: 0.999999)
+    assert high.pauses == pytest.approx(bases, rel=1e-5)
+    assert all(pause < base for pause, base in zip(high.pauses, bases, strict=True))
+
+
+def test_run_with_retry_reads_the_budget_at_call_time(monkeypatch):
+    monkeypatch.setattr(db, "RETRY_ATTEMPTS", 2)
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        raise _coded(sqlite3.SQLITE_BUSY)
+
+    with pytest.raises(db.StoreBusyError) as caught:
+        _retry(job, fake)
+
+    assert len(calls) == 2
+    assert caught.value.attempts == 2
+    assert "2 attempts within" in str(caught.value)
+
+
+def _raises(error: BaseException) -> Callable[[], None]:
+    def action() -> None:
+        raise error
+
+    return action
+
+
+def _uncoded_none() -> sqlite3.OperationalError:
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = None
+    return error
+
+
+def _update_an_event() -> None:
+    """An `UPDATE` on `events`, refused by the append-only trigger."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(db._SCHEMA)
+        conn.execute(
+            "INSERT INTO projects (repo_dir, created_at) VALUES ('/repo', ?)", (_STAMP,)
+        )
+        conn.execute(
+            "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+            " VALUES (1, ?, 0, ?, 'run_started', '{}', 'live')",
+            (RUN_ID, _STAMP),
+        )
+        conn.execute("UPDATE events SET kind = 'changed'")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    [
+        (
+            _raises(_coded(sqlite3.SQLITE_READONLY, "attempt to write a readonly database")),
+            sqlite3.OperationalError,
+        ),
+        (_raises(_coded(sqlite3.SQLITE_ERROR, "no such table: nope")), sqlite3.OperationalError),
+        (_raises(sqlite3.OperationalError("database is locked")), sqlite3.OperationalError),
+        (_raises(_uncoded_none()), sqlite3.OperationalError),
+        (
+            _raises(sqlite3.IntegrityError("UNIQUE constraint failed: projects.repo_dir")),
+            sqlite3.IntegrityError,
+        ),
+        (_raises(db.StoreSchemaError(Path("/data/am.db"), 2)), db.StoreSchemaError),
+        (_raises(db.StoreBusyError("beat", 5, 10.0)), db.StoreBusyError),
+        (_raises(ValueError("not a card id")), ValueError),
+        (_update_an_event, sqlite3.IntegrityError),
+    ],
+    ids=[
+        "READONLY",
+        "ERROR",
+        "uncoded-locked",
+        "code-None",
+        "IntegrityError",
+        "StoreSchemaError",
+        "StoreBusyError",
+        "ValueError",
+        "append-only-trigger",
+    ],
+)
+def test_run_with_retry_does_not_retry_other_errors(action, kind):
+    # Review Focus 2: an uncoded "database is locked" is not retried, so no
+    # string match creeps back in.
+    fake = _FakeClock()
+    seen: list[BaseException] = []
+
+    def job() -> None:
+        try:
+            action()
+        except BaseException as error:
+            seen.append(error)
+            raise
+
+    with pytest.raises(kind) as caught:
+        _retry(job, fake)
+
+    assert type(caught.value) is kind
+    assert len(seen) == 1
+    assert caught.value is seen[0]
+    assert caught.value.__cause__ is None
+    assert fake.pauses == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [store_leases.LeaseLostError(RUN_ID, None), KeyboardInterrupt(), SystemExit(3)],
+    ids=["LeaseLostError", "KeyboardInterrupt", "SystemExit"],
+)
+def test_run_with_retry_lets_lease_lost_and_other_base_exceptions_through(error):
+    # Review Focus 5: identity, so no `except BaseException` and no `from`.
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        raise error
+
+    with pytest.raises(type(error)) as caught:
+        _retry(job, fake)
+
+    assert caught.value is error
+    assert caught.value.__cause__ is None
+    assert len(calls) == 1
+    assert fake.pauses == []
+
+
+def test_run_with_retry_lets_an_interrupt_during_a_pause_through():
+    interrupt = KeyboardInterrupt()
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        raise _coded(sqlite3.SQLITE_BUSY)
+
+    def sleep(seconds: float) -> None:
+        raise interrupt
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        db.run_with_retry(
+            job, operation="beat", clock=lambda: 0.0, sleep=sleep, rng=lambda: 0.5
+        )
+
+    assert caught.value is interrupt
+    assert len(calls) == 1
+
+
+def test_run_with_retry_with_no_time_left_raises_after_one_attempt_without_sleeping(
+    monkeypatch,
+):
+    monkeypatch.setattr(db, "RETRY_DEADLINE_SECONDS", 0.0)
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        raise _coded(sqlite3.SQLITE_BUSY)
+
+    with pytest.raises(db.StoreBusyError) as caught:
+        _retry(job, fake)
+
+    assert len(calls) == 1
+    assert caught.value.attempts == 1
+    assert fake.pauses == []
+
+
+@pytest.mark.parametrize("value", [None, 0, "", []], ids=["None", "zero", "empty-str", "empty-list"])
+def test_run_with_retry_returns_a_falsy_value_unchanged(value):
+    fake = _FakeClock()
+    calls: list[int] = []
+
+    def job():
+        calls.append(1)
+        return value
+
+    assert _retry(job, fake) is value
+    assert len(calls) == 1
+    assert fake.pauses == []
+
+
+def test_run_with_retry_reruns_an_immediate_write_refused_by_a_real_lock(tmp_path):
+    # A real `BEGIN IMMEDIATE` refused by another connection's lock carries
+    # `SQLITE_BUSY`; re-running the whole job leaves exactly one row.
+    path = tmp_path / "contended.db"
+    holder = sqlite3.connect(path, isolation_level=None, timeout=0)
+    holder.execute("CREATE TABLE t (x INTEGER)")
+    holder.execute("BEGIN IMMEDIATE")
+    writer = sqlite3.connect(path, timeout=0)
+    calls: list[int] = []
+
+    def job() -> None:
+        calls.append(1)
+        with db.immediate(writer):
+            writer.execute("INSERT INTO t VALUES (1)")
+
+    def release(seconds: float) -> None:
+        if holder.in_transaction:
+            holder.execute("ROLLBACK")
+
+    try:
+        db.run_with_retry(
+            job, operation="insert", clock=lambda: 0.0, sleep=release, rng=lambda: 0.5
+        )
+        assert len(calls) == 2
+        assert writer.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+    finally:
+        writer.close()
+        holder.close()
+
+
+def test_open_reader_is_read_only_and_sees_committed_rows(repo):
+    writer = db.open_db(repo)
+    reader = db.open_reader(paths.db_path())
+    try:
+        writer.execute("INSERT INTO meta (key, value) VALUES ('committed', 'v')")
+        writer.commit()
+        # Left open: an implicit transaction the reader must not see into.
+        writer.execute("INSERT INTO meta (key, value) VALUES ('uncommitted', 'v')")
+        keys = {row["key"] for row in reader.execute("SELECT key FROM meta")}
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("INSERT INTO meta (key, value) VALUES ('refused', 'v')")
+    finally:
+        writer.rollback()
+        reader.close()
+        writer.close()
+
+    assert "committed" in keys
+    assert "uncommitted" not in keys

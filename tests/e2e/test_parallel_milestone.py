@@ -176,7 +176,7 @@ def test_one_lane_runs_the_level_s_stories_one_after_the_other(
     assert a_end <= b_start, (a_start, a_end, b_start, b_end)
 
 
-def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection(
+def test_the_journal_of_a_two_lane_run_is_strictly_increasing_and_rebuilds_the_projection(
     parallel_board, rendezvous, run_milestone_cli
 ):
     """Spec test 3, on its own two-lane run (same shape as spec test 1)."""
@@ -189,8 +189,10 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
     run_id = _envelope(result)["run_id"]
     lines = store_journal.Journal(run_id).read()
     seqs = [line.seq for line in lines]
-    assert seqs == list(range(1, len(seqs) + 1))
-    # Non-vacuity: the two lanes' phase lines really interleave, so contiguity
+    # Strictly increasing, not contiguous: the run's lease and control events
+    # take `run_seq` numbers the journal file skips (card 1.2.7).
+    assert seqs == sorted(set(seqs)) and seqs[0] >= 1, seqs
+    # Non-vacuity: the two lanes' phase lines really interleave, so the order
     # was tested under concurrent appends and not a sequential run. Phase lines
     # only: `record_plan` journals every story `pending` up front, so story
     # lines would interleave even in a one-lane run.
@@ -202,7 +204,7 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
     st = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         projection = st.load_run(run_id)
-        rebuilt = st.rebuild_from_journal(run_id)
+        rebuilt = st.rebuild_from_events(run_id)
         after = st.load_run(run_id)
     finally:
         st.close()

@@ -18,12 +18,12 @@ def _describe_node(node: dict[str, str | int | None]) -> str:
 
 
 class ProjectionDivergedError(RuntimeError):
-    """The projection holds values no journal line recorded (divergence §3.6).
+    """The projection holds values no event of the run recorded (divergence §3.6).
 
-    Raised by `Store.rebuild_from_journal` before it deletes anything, when
+    Raised by `Store.rebuild_from_events` before it deletes anything, when
     `diverging` finds a `foreign` mismatch: rebuilding would overwrite what
-    something other than the store wrote. Not a `JournalError`: the journal is
-    fine. `mismatches` holds only the foreign ones, in tree-walk order.
+    something other than the store wrote. Not a `JournalError`: the events
+    are fine. `mismatches` holds only the foreign ones, in tree-walk order.
     """
 
     def __init__(self, run_id: str, mismatches: "list[Mismatch]") -> None:
@@ -33,9 +33,9 @@ class ProjectionDivergedError(RuntimeError):
             for mismatch in mismatches
         )
         super().__init__(
-            f"projection of run {run_id!r} holds values its journal never"
+            f"projection of run {run_id!r} holds values its events never"
             f" recorded: {details}. Nothing was changed;"
-            " rebuild_from_journal(..., force=True) overwrites them."
+            " rebuild_from_events(..., force=True) overwrites them."
         )
         self.run_id = run_id
         self.mismatches = mismatches

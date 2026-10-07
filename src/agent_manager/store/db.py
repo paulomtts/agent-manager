@@ -1,17 +1,21 @@
 """The machine-wide SQLite projection `<data dir>/am.db`: its DDL, opening and
-migrating it, and the write-transaction helper.
+migrating it, the write-transaction helper and the busy-retry primitive.
 """
 
 import functools
+import random
 import sqlite3
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 from uuid import uuid4
 
 from agent_manager import paths
+
+T = TypeVar("T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -164,6 +168,37 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    run_id     TEXT NOT NULL,
+    run_seq    INTEGER NOT NULL,
+    ts         TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    story_id   TEXT,
+    card_id    TEXT,
+    phase      TEXT,
+    attempt    INTEGER,
+    schema     INTEGER NOT NULL DEFAULT 1,
+    payload    TEXT NOT NULL,
+    source     TEXT NOT NULL CHECK (source IN ('live', 'imported')),
+    UNIQUE (run_id, run_seq)
+);
+
+CREATE INDEX IF NOT EXISTS events_run_seq ON events (run_id, seq);
+
+CREATE INDEX IF NOT EXISTS events_project_seq ON events (project_id, seq);
+
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
 """
 
 
@@ -189,6 +224,21 @@ STORE_ID_KEY = "store_id"
 lowercase hex id that `open_db` inserts when the row is missing and never
 changes afterwards. A replaced or restored-from-elsewhere `am.db` therefore
 carries a different value."""
+
+RETRY_ATTEMPTS = 5
+"""The most times `run_with_retry` calls its job."""
+
+RETRY_DEADLINE_SECONDS = 10.0
+"""No retry starts once this many seconds have passed since `run_with_retry`'s
+first attempt began. Checked before each retry, so the worst case is this plus
+one attempt blocked in `BUSY_TIMEOUT_SECONDS`."""
+
+RETRY_FIRST_PAUSE = 0.1
+"""The backoff base, in seconds, before `run_with_retry`'s first retry; each
+later base doubles."""
+
+RETRY_PAUSE_CAP = 2.0
+"""The largest backoff base `run_with_retry` uses, in seconds."""
 
 
 class StoreSchemaError(RuntimeError):
@@ -224,6 +274,27 @@ class MigrationRequiredError(RuntimeError):
             f" {paths.db_path()}; run `am migrate` first. Nothing has been changed"
         )
         self.legacy = tuple(legacy)
+
+
+class StoreBusyError(RuntimeError):
+    """A write stayed busy or locked through `run_with_retry`'s whole budget.
+
+    Raised by `run_with_retry` once the job has been called `RETRY_ATTEMPTS`
+    times or `RETRY_DEADLINE_SECONDS` have passed, chained (`__cause__`) to the
+    last busy `sqlite3.OperationalError`. Never retried itself. `operation`
+    names the write, `attempts` the calls made, `elapsed` the seconds since the
+    first attempt began.
+    """
+
+    def __init__(self, operation: str, attempts: int, elapsed: float) -> None:
+        super().__init__(
+            f"{operation}: the database stayed busy or locked through {attempts}"
+            f" attempt(s) over {elapsed:.1f} s (retry budget: {RETRY_ATTEMPTS}"
+            f" attempts within {RETRY_DEADLINE_SECONDS:g} s)"
+        )
+        self.operation = operation
+        self.attempts = attempts
+        self.elapsed = elapsed
 
 
 _WAL_RETRY_FIRST_PAUSE = 0.05
@@ -370,9 +441,9 @@ def open_db(root: Path) -> sqlite3.Connection:
     A missing `STORE_ID_KEY` row in `meta` is inserted with a fresh random id
     and committed with the schema; an existing one is never changed.
 
-    The connection may be used from any thread of the process that holds the
-    run's lease, so `check_same_thread` is off; `Store` serialises that use
-    behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
+    The connection is used from a thread other than the one that opened it,
+    so `check_same_thread` is off; a `Store` uses it only from its writer
+    thread. `BUSY_TIMEOUT_SECONDS` covers another process holding
     the database briefly; two processes never write one run, because every
     run write is fenced by the lease token (multi-process X4).
     """
@@ -497,6 +568,27 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
     return open_db(root)
 
 
+def open_reader(location: Path) -> sqlite3.Connection:
+    """A read-only connection on the existing database file `location`.
+
+    Opened `mode=ro`, never `immutable=1`: another connection of this process
+    holds the file open and writes it, and each statement here sees what was
+    committed when it began, never an open transaction's rows. Any write
+    through it raises `sqlite3.OperationalError`. Usable from any thread
+    (`check_same_thread` off); the caller serialises its use. Rows are
+    `sqlite3.Row`, and a lock held elsewhere is waited out for
+    `BUSY_TIMEOUT_SECONDS`.
+    """
+    conn = sqlite3.connect(
+        f"{location.absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 @contextmanager
 def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """One write transaction that holds the database write lock from `BEGIN`.
@@ -516,6 +608,62 @@ def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.rollback()
         raise
     conn.commit()
+
+
+def is_busy(error: sqlite3.OperationalError) -> bool:
+    """Whether `error` is SQLite reporting busy or locked, extended codes included.
+
+    Only the primary code counts (`sqlite_errorcode & 0xFF`), so
+    `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT` and `SQLITE_LOCKED_SHAREDCACHE`
+    are busy too. An error without an integer code (one built by hand) is not:
+    the message is never read.
+    """
+    code = getattr(error, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in (
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    )
+
+
+def run_with_retry(
+    job: Callable[[], T],
+    *,
+    operation: str,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], object] = time.sleep,
+    rng: Callable[[], float] = random.random,
+) -> T:
+    """Call `job` and return its value, re-running the whole job while SQLite is busy.
+
+    Only a `sqlite3.OperationalError` whose primary code is `SQLITE_BUSY` or
+    `SQLITE_LOCKED` is retried. Before each retry the budget is checked: once
+    the job has been called `RETRY_ATTEMPTS` times, or `RETRY_DEADLINE_SECONDS`
+    have passed since the first attempt began, `StoreBusyError` is raised from
+    the last busy error, without sleeping. Otherwise the k-th retry waits a
+    jittered `min(RETRY_FIRST_PAUSE * 2**(k-1), RETRY_PAUSE_CAP)` (between half
+    and all of it), clamped to the time left. All four constants are read now,
+    so tests can patch them. Anything else, `LeaseLostError` and every other
+    `BaseException` included, propagates on that attempt as the same object.
+
+    This opens and rolls back no transaction: the job does (under `immediate`,
+    a raise rolls back). So the job must be re-runnable: no hidden state, and
+    no side effect outside the database before its commit.
+    """
+    start = clock()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return job()
+        except sqlite3.OperationalError as error:
+            if not is_busy(error):
+                raise
+            elapsed = clock() - start
+            if attempts >= RETRY_ATTEMPTS or elapsed >= RETRY_DEADLINE_SECONDS:
+                raise StoreBusyError(operation, attempts, elapsed) from error
+            base = min(RETRY_FIRST_PAUSE * 2 ** (attempts - 1), RETRY_PAUSE_CAP)
+            pause = base * (0.5 + 0.5 * rng())
+            sleep(max(0.0, min(pause, RETRY_DEADLINE_SECONDS - elapsed)))
 
 
 def iso(value: datetime | None) -> str | None:

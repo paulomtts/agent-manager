@@ -336,9 +336,9 @@ def test_a_detached_board_is_watched_with_all_and_one_milestone_is_paused_and_re
     assert set(streamed) == set(expected), sorted(streamed)
     for run_id, events in expected.items():
         assert streamed[run_id] == events, run_id
-        assert [event["seq"] for event in streamed[run_id]] == list(
-            range(1, len(events) + 1)
-        ), run_id
+        seqs = [event["seq"] for event in streamed[run_id]]
+        # Strictly increasing: lease and control events take numbers the journal skips.
+        assert seqs == sorted(set(seqs)) and seqs[0] >= 1, (run_id, seqs)
     first_statuses = _collapse(_run_statuses(streamed[run_of[first]]))
     assert _is_subsequence(["started", "stopped", "started", "done"], first_statuses), (
         first_statuses

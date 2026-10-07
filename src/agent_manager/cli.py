@@ -59,6 +59,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
@@ -323,44 +324,45 @@ def control_view(
 
 
 def integrity_view(
+    conn: sqlite3.Connection,
     run_id: str,
     run: models.Run,
     lease: store_leases.LeaseRow | None,
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    """The `integrity` key of `status`: does the journal agree with `run`?
+    """The `integrity` key of `status`: do the run's events agree with `run`?
 
     Journal/DB divergence spec §3.3, §3.7. Always the three keys `checked`,
-    `reason` and `mismatches`, and never an error: a journal that cannot be
-    compared is `checked: false` with the reason why, so `status` keeps its
+    `reason` and `mismatches`, and never an error: events that cannot be
+    compared are `checked: false` with the reason why, so `status` keeps its
     exit code. Report-only (§3.4): nothing is written and no control request
     is filed.
 
-    The journal is opened through `Journal._for_reading`, never
-    `Journal(run_id)`, whose `paths.run_dir` would create a directory for a
-    run that has none, and a torn last line is an append in flight and is
-    skipped, as in `_journal_events`. The one `try` covers `diverging` as well
-    as `read`, because `replay` inside it raises `JournalError` or a pydantic
-    `ValidationError` of its own. Mismatches are `store_replay.diverging`'s, in its
-    tree-walk order: there is one definition of divergence.
+    The events are read on `conn` through `store_events.run_lines`; no
+    journal file is read and no run directory is created. A run with no node
+    event is `"no events"`. The one `try` covers `diverging` as well as
+    `run_lines`, because `replay` inside it raises `JournalError` or a
+    pydantic `ValidationError` of its own: either is
+    `"events unreadable: <error>"`. Mismatches are `store_replay.diverging`'s,
+    in its tree-walk order: there is one definition of divergence.
 
-    A live lease (§3.5) is `checked: false, reason: "lease is live"` before the
-    journal is opened: a running process's writes in flight are noise, not
+    A live lease (§3.5) is `checked: false, reason: "lease is live"` before any
+    event is read: a running process's writes in flight are noise, not
     divergence, even against a hand-edited projection. A dead lease, or none,
     is checked.
     """
     if lease is not None and control.lease_is_live(lease, now=now):
         return {"checked": False, "reason": "lease is live", "mismatches": []}
     try:
-        lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+        lines = store_events.run_lines(conn, run_id)
+        if not lines:
+            return {"checked": False, "reason": "no events", "mismatches": []}
         found = store_replay.diverging(lines, run)
-    except store_journal.MissingJournalError:
-        return {"checked": False, "reason": "no journal", "mismatches": []}
     except (store_journal.JournalError, ValidationError) as error:
         return {
             "checked": False,
-            "reason": f"journal unreadable: {error}",
+            "reason": f"events unreadable: {error}",
             "mismatches": [],
         }
     return {
@@ -1568,6 +1570,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     store_journal.CorruptJournalError,
     store_db.StoreSchemaError,
     store_db.MigrationRequiredError,
+    store_db.StoreBusyError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1587,7 +1590,10 @@ is a refusal naming the file and line, not a bug; only that subclass, not
 not a bug. `store_db.MigrationRequiredError` is in it because every command
 that opens the projection refuses, naming `am migrate`, on a machine whose
 per-project databases have not been migrated; it is raised before anything is
-written. Anything outside this tuple is a bug in this program
+written. `store_db.StoreBusyError` is in it because a write that stayed busy or
+locked through `store_db.run_with_retry`'s whole budget is a refusal naming the
+operation and the budget, not a bug: the lease goes stale and the run is
+resumable. Anything outside this tuple is a bug in this program
 and should crash loudly with its stack intact.
 """
 
@@ -2401,8 +2407,8 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     listing `runs` prints, so the two commands cannot disagree about which run is
     the most recent one. The lease and every control request are read on the
     same connection and rendered by `control_view`, still without a write.
-    The `integrity` key compares the run's journal with the loaded tree through
-    `integrity_view`, which reads the journal and writes nothing either.
+    The `integrity` key compares the run's events with the loaded tree through
+    `integrity_view`, on the same connection, writing nothing either.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
@@ -2439,7 +2445,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
             claims=claims,
         )
         payload = status_payload(run, state)
-        payload["integrity"] = integrity_view(wanted, run, lease, now=now)
+        payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
         return payload
     finally:
         conn.close()
@@ -3784,10 +3790,13 @@ def request_control(
     """Record `am pause` or `am cancel` for the process holding `run_id` (C8).
 
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
-    check and the insert, so two requesters cannot both insert and a refusal
-    leaves no row. The project is looked up, never created, so a
-    refusal creates no `projects` row either. The process holding the lease applies the request at its
-    next poll; this function only records it. SQLite is the only channel (C1).
+    check, the insert and its `control_requested` event (`ts` the request's
+    clock, never mirrored to a journal file), so two requesters cannot both
+    insert and a refusal or a failed event insert leaves no row. A no-op
+    request inserts neither. The project is looked up, never created, so a
+    refusal creates no `projects` row either. The process holding the lease
+    applies the request at its next poll; this function only records it.
+    SQLite is the only channel (C1).
     """
     if command not in CONTROL_COMMANDS:
         raise ValueError(
@@ -3806,6 +3815,21 @@ def request_control(
             row, already = _record_control(
                 conn, run_id, project_id=project_id, lease=lease, command=command, now=now
             )
+            if not already:
+                store_events.insert(
+                    conn,
+                    project_id=project_id,
+                    run_id=run_id,
+                    ts=store_journal.ts_text(now),
+                    kind="control_requested",
+                    payload={
+                        "command": row.command,
+                        "lease": row.lease,
+                        "requested_at": store_db.iso(row.requested_at),
+                        "control_seq": row.seq,
+                    },
+                    source="live",
+                )
             effective = _effective_command(
                 store_leases.control_requests(conn, run_id, lease=lease.token)
             )
