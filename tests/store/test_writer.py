@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 from agent_manager import (
     bases,
     cli,
@@ -24,6 +26,8 @@ from agent_manager import (
     store,
 )
 from agent_manager.runtime import walk as runtime_walk
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.store import writer as store_writer
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -172,3 +176,54 @@ def test_every_source_caller_binds_the_one_store_class():
     assert [
         module.__name__ for module in callers if module.Store is not store_writer.Store
     ] == []
+
+
+RUN_A = "run-2026-10-07-01"
+RUN_B = "run-2026-10-07-02"
+
+
+def test_store_open_resolves_the_project_once_per_repo(repo):
+    first = store_writer.Store.open(repo, RUN_A)
+    second = store_writer.Store.open(repo, RUN_B)
+    try:
+        ids = (first.project_id, second.project_id)
+    finally:
+        first.close()
+        second.close()
+
+    # A fresh connection sees the row: `Store.open` committed it.
+    observer = store_db.open_db(repo)
+    try:
+        rows = [tuple(row) for row in observer.execute("SELECT id, repo_dir FROM projects")]
+    finally:
+        observer.close()
+
+    assert ids[0] == ids[1]
+    assert rows == [(ids[0], str(repo.resolve()))]
+
+
+def test_store_open_through_a_symlink_is_the_same_project(repo):
+    # Review Focus 1: two spellings of one directory are one project.
+    link = repo.parent / "repo-link"
+    link.symlink_to(repo, target_is_directory=True)
+
+    direct = store_writer.Store.open(repo, RUN_A)
+    linked = store_writer.Store.open(link, RUN_B)
+    try:
+        assert linked.project_id == direct.project_id
+        count = direct.connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        direct.close()
+        linked.close()
+
+    assert count == 1
+
+
+def test_store_project_id_is_read_only_and_set_by_the_constructor(repo):
+    st = store_writer.Store(store_db.open_db(repo), store_journal.Journal(RUN_A), 7)
+    try:
+        assert st.project_id == 7
+        with pytest.raises(AttributeError):
+            st.project_id = 8  # type: ignore[misc]
+    finally:
+        st.close()

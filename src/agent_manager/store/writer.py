@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_manager import models
@@ -17,6 +17,7 @@ from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
@@ -49,16 +50,43 @@ class Store:
     only the append and the row write.
     """
 
-    def __init__(self, conn: sqlite3.Connection, journal: store_journal.Journal) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        journal: store_journal.Journal,
+        project_id: int,
+    ) -> None:
         self._conn = conn
         self._journal = journal
+        self._project_id = project_id
         self._lock = threading.RLock()
         self._token: str | None = None
         self._in_fence = False
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
-        return cls(store_db.open_db(root), store_journal.Journal(run_id))
+        """A store on `root`'s projection, bound to `root`'s `projects` row.
+
+        The row is resolved, or created on first sight, and committed before
+        the store exists, so every run of one project shares one id. The
+        wall clock is read here for the row's `created_at`, as
+        `Journal.append` reads it for a line's time.
+        """
+        conn = store_db.open_db(root)
+        try:
+            project_id = store_projects.resolve(
+                conn, root, now=datetime.now(timezone.utc)
+            )
+            conn.commit()
+        except BaseException:
+            conn.close()
+            raise
+        return cls(conn, store_journal.Journal(run_id), project_id)
+
+    @property
+    def project_id(self) -> int:
+        """The `projects.id` every row this store writes carries."""
+        return self._project_id
 
     @property
     def run_id(self) -> str:

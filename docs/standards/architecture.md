@@ -132,7 +132,7 @@ All 58 `.py` files (51 modules plus 7 `__init__.py`) appear here exactly once. `
 | 5.9 | `detach.py` | `os.fork`, `os.setsid` | holds (`detach.py:149,170`) |
 | 5.10 | `locks.py` | `fcntl` | holds |
 | 5.11 | `paths.py` | derives every path under `<data dir>`. Directories are created only by `paths.ensure`. | **violated:** `cli.py:2411` and `store.py:406` build paths by hand; `paths.py:18,33,57` call `mkdir` |
-| 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391` and `store.py:528` |
+| 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391`, `store.py:528` and `store/writer.py` `Store.open` |
 
 Other rules:
 
