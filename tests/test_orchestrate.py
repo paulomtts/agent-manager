@@ -51,6 +51,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
@@ -3681,7 +3682,7 @@ def _plant(
     digest: str | None = None,
     queue: tuple[str, ...] = ("implement",),
     minute: int = 0,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One checkpoint row of `TASK` for `card_id`, saved by an earlier run."""
     opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
@@ -3761,7 +3762,7 @@ FIRST_PHASE = "worktree"
 """`TASK`'s first phase: where a walk handed no `resume_from` begins."""
 
 
-def _continuable(project: Path, run_id: str, card_id: str) -> store_module.Checkpoint | None:
+def _continuable(project: Path, run_id: str, card_id: str) -> store_checkpoints.Checkpoint | None:
     """What a relaunch's lane would continue `card_id` from, read as the lane reads it."""
     opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
@@ -4568,7 +4569,7 @@ def _save(
     phase: str | None = None,
     workflow: Workflow = task_workflow.TASK,
     digest: str | None = None,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One checkpoint of `card_id`; `phase` is the turn in flight, None for a row holding no turn."""
     return store.save_checkpoint(
         card_id,
@@ -4882,7 +4883,7 @@ def _resume(project: Path, run_id: str, driver: Any, **overrides: Any) -> dict[s
 
 def _plant_integrate(
     project: Path, run_id: str, story_id: str, reason: str, *, digest: str | None = None
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """One `INTEGRATE` checkpoint of `story_id`'s resolver, saved by `run_id`."""
     opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
     try:

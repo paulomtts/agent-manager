@@ -47,7 +47,6 @@ from agent_manager import (
     orchestrate,
     paths,
     prompt,
-    store as store_module,
 )
 from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
@@ -57,6 +56,7 @@ from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
@@ -616,7 +616,7 @@ def step_logs_payload(
 
 
 def checkpoint_resume_phase(
-    checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
+    checkpoint: store_checkpoints.Checkpoint | None, *, card_id: str, run_id: str
 ) -> str:
     """The phase `resume` continues `card_id` at, or a refusal.
 
@@ -726,7 +726,7 @@ async def drive_subtask_async(
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
     stop: StopSignal | None = None,
-    resume_from: store_module.Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `workflow.task.TASK` on the caller's event loop.
 
@@ -780,7 +780,7 @@ def drive_subtask(
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
-    resume_from: store_module.Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `workflow.task.TASK` under a store the caller owns.
 

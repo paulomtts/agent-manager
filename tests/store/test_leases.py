@@ -18,6 +18,7 @@ import pytest
 
 from agent_manager import models, store
 from agent_manager.store import Store
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 
@@ -469,6 +470,12 @@ def _take(st: Store) -> None:
     )
 
 
+def _save_checkpoint(st: Store) -> None:
+    st.save_checkpoint(
+        "card-a", workflow="task", digest="d", reason="turn", agent={}, saved_at=NOW
+    )
+
+
 _DELEGATIONS = [
     pytest.param(store_leases, "take_lease", _no_setup, _take, id="leases.take_lease"),
     pytest.param(
@@ -522,6 +529,41 @@ _DELEGATIONS = [
         _take,
         lambda st: st.adopt_lease("t1"),
         id="leases.read_lease",
+    ),
+    pytest.param(
+        store_checkpoints,
+        "insert_checkpoint",
+        _no_setup,
+        _save_checkpoint,
+        id="checkpoints.insert_checkpoint",
+    ),
+    pytest.param(
+        store_checkpoints,
+        "latest_checkpoint",
+        _no_setup,
+        lambda st: st.latest_checkpoint("card-a"),
+        id="checkpoints.latest_checkpoint",
+    ),
+    pytest.param(
+        store_checkpoints,
+        "latest_turn_checkpoint",
+        _no_setup,
+        lambda st: st.latest_turn_checkpoint("card-a"),
+        id="checkpoints.latest_turn_checkpoint",
+    ),
+    pytest.param(
+        store_checkpoints,
+        "latest_open_checkpoint",
+        _no_setup,
+        lambda st: st.latest_open_checkpoint("card-a", "task"),
+        id="checkpoints.latest_open_checkpoint",
+    ),
+    pytest.param(
+        store_checkpoints,
+        "checkpoint_cards",
+        _no_setup,
+        lambda st: st.checkpoint_cards(RUN_ID),
+        id="checkpoints.checkpoint_cards",
     ),
 ]
 

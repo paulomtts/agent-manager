@@ -30,7 +30,7 @@ from agent_manager.workflow.phases import Workflow
 if TYPE_CHECKING:
     # Annotation only (the module has `from __future__ import annotations`);
     # the name `store` is taken by `run_subtask`'s parameter.
-    from agent_manager.store import Checkpoint
+    from agent_manager.store import checkpoints as store_checkpoints
 
 
 class CheckpointMismatch(Exception):
@@ -39,7 +39,7 @@ class CheckpointMismatch(Exception):
     is built, so nothing is run or recorded."""
 
 
-def pending_phase(checkpoint: Checkpoint) -> str | None:
+def pending_phase(checkpoint: store_checkpoints.Checkpoint) -> str | None:
     """The phase `checkpoint`'s agent would run next, or `None` if it holds no turn.
 
     Read-only: it reads the stored `Agent.to_dict()` and builds nothing, so a
@@ -55,7 +55,7 @@ def pending_phase(checkpoint: Checkpoint) -> str | None:
     return None if turn is None else turn["kwargs"]["phase"]
 
 
-def kept_commands(checkpoint: Checkpoint) -> list[str] | None:
+def kept_commands(checkpoint: store_checkpoints.Checkpoint) -> list[str] | None:
     """The verification commands `checkpoint`'s walk keeps, or `None` if it does not say.
 
     Read-only, as `pending_phase` is: it reads the `"subtask"` seed item out of
@@ -90,7 +90,7 @@ def run_subtask(
     clock: Callable[[], Any] = walk._utcnow,
     ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on pygents. One `asyncio.run`
     around `run_subtask_async`, which documents the parameters."""
@@ -129,7 +129,7 @@ async def run_subtask_async(
     clock: Callable[[], Any] = walk._utcnow,
     ensure_worktree: Callable[..., Mapping[str, object]] = worktree.ensure,
     stop: StopSignal | None = None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> walk.SubtaskSummary:
     """Walk `workflow`'s phases for one subtask on the running event loop.
 
@@ -246,7 +246,7 @@ async def run_subtask_async(
 
 
 async def _worktree_kept(
-    checkpoint: Checkpoint,
+    checkpoint: store_checkpoints.Checkpoint,
     subtask: Any,
     repo_dir: Path,
     ensure_worktree: Callable[..., Mapping[str, object]],

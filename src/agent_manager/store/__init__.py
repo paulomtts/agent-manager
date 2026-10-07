@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_manager import models
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
@@ -33,79 +34,6 @@ from agent_manager.store import replay as store_replay
 
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
-
-
-@dataclass(frozen=True)
-class TurnFloor:
-    """The turn identity saved beside an agent-phase checkpoint (exactly-once 1.1).
-
-    One row of `checkpoint_floors`, keyed like its `checkpoints` row. Row-only
-    and outside the journal: nothing journals it and `rebuild_from_journal`
-    leaves it alone. Computing it is the runtime's job, not the store's.
-    """
-
-    phase: str
-    loop: int
-    source_run: str
-    floor: int
-
-
-@dataclass(frozen=True)
-class Checkpoint:
-    """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
-
-    Internal state, so a plain dataclass rather than a pydantic model. It is not
-    part of the §9 tree: no journal line records it and `rebuild_from_journal`
-    neither writes nor deletes it. `agent` is the decoded JSON of the stored
-    text, never the dict the caller handed in.
-    """
-
-    run_id: str
-    card_id: str
-    seq: int
-    workflow: str
-    digest: str
-    reason: str
-    agent: dict
-    saved_at: datetime
-    floor: TurnFloor | None = None
-
-
-def _checkpoint_from_row(row: sqlite3.Row) -> Checkpoint:
-    """A `Checkpoint` from a `checkpoints` row, joined with its floor if selected.
-
-    A `sqlite3.Row` raises `IndexError` for a key it lacks, so a row selected
-    without the `floor_*` columns is checked for the key first and gives
-    `floor=None`, as does a joined row with no `checkpoint_floors` match.
-    """
-    floor = None
-    if "floor_phase" in row.keys() and row["floor_phase"] is not None:
-        floor = TurnFloor(
-            phase=row["floor_phase"],
-            loop=row["floor_loop"],
-            source_run=row["floor_source_run"],
-            floor=row["floor_floor"],
-        )
-    return Checkpoint(
-        run_id=row["run_id"],
-        card_id=row["card_id"],
-        seq=row["seq"],
-        workflow=row["workflow"],
-        digest=row["digest"],
-        reason=row["reason"],
-        agent=json.loads(row["agent"]),
-        saved_at=datetime.fromisoformat(row["saved_at"]),
-        floor=floor,
-    )
-
-
-_CHECKPOINT_SELECT = (
-    "SELECT c.*, f.phase AS floor_phase, f.loop AS floor_loop,"
-    " f.source_run AS floor_source_run, f.floor AS floor_floor"
-    " FROM checkpoints c LEFT JOIN checkpoint_floors f"
-    " ON f.run_id = c.run_id AND f.card_id = c.card_id AND f.seq = c.seq"
-)
-"""Every checkpoint reader's select: the row plus its floor, if it has one."""
 
 
 COMMENT_ATTEMPTS = 3
@@ -494,8 +422,8 @@ class Store:
         reason: str,
         agent: dict,
         saved_at: datetime,
-        floor: TurnFloor | None = None,
-    ) -> Checkpoint:
+        floor: store_checkpoints.TurnFloor | None = None,
+    ) -> store_checkpoints.Checkpoint:
         """Write the next checkpoint of `card_id` under this store's run.
 
         `seq` is 0 for the card's first row in this run and one past the
@@ -507,69 +435,30 @@ class Store:
         both rows and propagates unchanged, and no `seq` is spent.
         """
         with self._lock, self._fenced():
-            text = json.dumps(agent, sort_keys=True)
-            highest = self._conn.execute(
-                "SELECT MAX(seq) FROM checkpoints WHERE run_id = ? AND card_id = ?",
-                (self.run_id, card_id),
-            ).fetchone()[0]
-            seq = 0 if highest is None else highest + 1
             try:
-                self._conn.execute(
-                    "INSERT INTO checkpoints (run_id, card_id, seq, workflow, digest,"
-                    " reason, agent, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        self.run_id,
-                        card_id,
-                        seq,
-                        workflow,
-                        digest,
-                        reason,
-                        text,
-                        store_db.iso(saved_at),
-                    ),
+                checkpoint = store_checkpoints.insert_checkpoint(
+                    self._conn,
+                    self.run_id,
+                    card_id,
+                    workflow=workflow,
+                    digest=digest,
+                    reason=reason,
+                    agent=agent,
+                    saved_at=saved_at,
+                    floor=floor,
                 )
-                if floor is not None:
-                    self._conn.execute(
-                        "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase,"
-                        " loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            self.run_id,
-                            card_id,
-                            seq,
-                            floor.phase,
-                            floor.loop,
-                            floor.source_run,
-                            floor.floor,
-                        ),
-                    )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
                 raise
-            return Checkpoint(
-                run_id=self.run_id,
-                card_id=card_id,
-                seq=seq,
-                workflow=workflow,
-                digest=digest,
-                reason=reason,
-                agent=json.loads(text),
-                saved_at=saved_at,
-                floor=floor,
-            )
+            return checkpoint
 
-    def latest_checkpoint(self, card_id: str) -> Checkpoint | None:
+    def latest_checkpoint(self, card_id: str) -> store_checkpoints.Checkpoint | None:
         """The highest-`seq` checkpoint of `card_id` in this store's run, any reason."""
         with self._lock:
-            row = self._conn.execute(
-                _CHECKPOINT_SELECT
-                + " WHERE c.run_id = ? AND c.card_id = ?"
-                " ORDER BY c.seq DESC LIMIT 1",
-                (self.run_id, card_id),
-            ).fetchone()
-            return None if row is None else _checkpoint_from_row(row)
+            return store_checkpoints.latest_checkpoint(self._conn, self.run_id, card_id)
 
-    def latest_turn_checkpoint(self, card_id: str) -> Checkpoint | None:
+    def latest_turn_checkpoint(self, card_id: str) -> store_checkpoints.Checkpoint | None:
         """The highest-`seq` `turn` checkpoint of `card_id` in this store's run.
 
         A phase escalation's closing `escalated` row holds no turn
@@ -578,15 +467,13 @@ class Store:
         milestone resume rewinds to it (card 54e4ec29).
         """
         with self._lock:
-            row = self._conn.execute(
-                _CHECKPOINT_SELECT
-                + " WHERE c.run_id = ? AND c.card_id = ?"
-                " AND c.reason = 'turn' ORDER BY c.seq DESC LIMIT 1",
-                (self.run_id, card_id),
-            ).fetchone()
-            return None if row is None else _checkpoint_from_row(row)
+            return store_checkpoints.latest_turn_checkpoint(
+                self._conn, self.run_id, card_id
+            )
 
-    def latest_open_checkpoint(self, card_id: str, workflow: str) -> Checkpoint | None:
+    def latest_open_checkpoint(
+        self, card_id: str, workflow: str
+    ) -> store_checkpoints.Checkpoint | None:
         """The newest open checkpoint of `card_id` for `workflow`, across every run.
 
         The card's newest row in any run and any workflow decides first: if it
@@ -598,28 +485,7 @@ class Store:
         descending, then `seq` descending.
         """
         with self._lock:
-            newest = self._conn.execute(
-                "SELECT c.reason, r.status FROM checkpoints c"
-                " LEFT JOIN runs r ON r.id = c.run_id"
-                " WHERE c.card_id = ?"
-                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
-                (card_id,),
-            ).fetchone()
-            if (
-                newest is None
-                or newest["reason"] == "done"
-                or models.is_canceled(newest["status"])
-            ):
-                return None
-            row = self._conn.execute(
-                _CHECKPOINT_SELECT
-                + " WHERE c.card_id = ? AND c.workflow = ?"
-                " AND c.reason IN ('turn', 'parked', 'escalated')"
-                " AND c.run_id NOT IN (SELECT id FROM runs WHERE status IN (?, ?))"
-                " ORDER BY c.saved_at DESC, c.seq DESC LIMIT 1",
-                (card_id, workflow, models.CANCELED, models.LEGACY_CANCELED),
-            ).fetchone()
-            return None if row is None else _checkpoint_from_row(row)
+            return store_checkpoints.latest_open_checkpoint(self._conn, card_id, workflow)
 
     def checkpoint_cards(self, run_id: str) -> list[tuple[str, str]]:
         """Every distinct `(card_id, workflow)` with a checkpoint row under `run_id`.
@@ -630,12 +496,7 @@ class Store:
         (am-reset §3.5, card af52db54).
         """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT card_id, workflow FROM checkpoints"
-                " WHERE run_id = ? ORDER BY card_id, workflow",
-                (run_id,),
-            ).fetchall()
-            return [(row["card_id"], row["workflow"]) for row in rows]
+            return store_checkpoints.checkpoint_cards(self._conn, run_id)
 
     # -- board comment outbox ------------------------------------------------
     #

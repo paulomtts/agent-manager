@@ -107,7 +107,7 @@ def test_no_caller_reaches_a_query_name_through_the_store_package():
     assert _THROUGH_THE_PACKAGE.search("real = store_module.load_run")
     assert _THROUGH_THE_PACKAGE.search("assert set(store.RunSummary.model_fields)")
     assert _THROUGH_THE_PACKAGE.search(
-        "from agent_manager.store import Checkpoint, Store, load_run"
+        "from agent_manager.store import Store, load_run"
     )
     assert not _THROUGH_THE_PACKAGE.search("run = store.load_run(RUN_ID)")
     assert not _THROUGH_THE_PACKAGE.search("run = store_queries.load_run(conn, x)")

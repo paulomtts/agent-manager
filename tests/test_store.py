@@ -28,6 +28,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_manager import models, paths, store
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
@@ -3187,7 +3188,7 @@ def _save_checkpoint(
     digest: str = "sha256:aaa",
     agent: dict | None = None,
     saved_at: datetime | None = None,
-) -> store.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     return st.save_checkpoint(
         card_id,
         workflow=workflow,
@@ -3862,7 +3863,7 @@ def _checkpoint_in_run(
     reason: str,
     saved_at: datetime,
     workflow: str = "task",
-) -> store.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """Record `run_id` with `status`, then save one checkpoint of `card_id` under it."""
     st = store.Store.open(repo, run_id)
     try:
@@ -4698,7 +4699,7 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
 # same fenced transaction as its `checkpoints` row. Steps tier: real temp DB and
 # journal, no harness.
 
-FLOOR = store.TurnFloor(phase="implement", loop=2, source_run=OTHER_RUN_ID, floor=3)
+FLOOR = store_checkpoints.TurnFloor(phase="implement", loop=2, source_run=OTHER_RUN_ID, floor=3)
 
 
 def _count(st: store.Store, table: str) -> int:
@@ -4757,7 +4758,7 @@ def test_checkpoint_floors_refuses_a_negative_floor(repo):
 
 
 def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
-    assert [f.name for f in dataclasses.fields(store.TurnFloor)] == [
+    assert [f.name for f in dataclasses.fields(store_checkpoints.TurnFloor)] == [
         "phase",
         "loop",
         "source_run",
@@ -4766,8 +4767,8 @@ def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
     with pytest.raises(dataclasses.FrozenInstanceError):
         FLOOR.floor = 4  # type: ignore[misc]
 
-    assert dataclasses.fields(store.Checkpoint)[-1].name == "floor"
-    plain = store.Checkpoint(
+    assert dataclasses.fields(store_checkpoints.Checkpoint)[-1].name == "floor"
+    plain = store_checkpoints.Checkpoint(
         run_id=RUN_ID,
         card_id="card-a",
         seq=0,
@@ -4784,10 +4785,10 @@ def _save_floored(
     st: store.Store,
     card_id: str = "card-a",
     *,
-    floor: store.TurnFloor | None = FLOOR,
+    floor: store_checkpoints.TurnFloor | None = FLOOR,
     reason: str = "turn",
     saved_at: datetime | None = None,
-) -> store.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     return st.save_checkpoint(
         card_id,
         workflow="task",
@@ -4936,7 +4937,7 @@ def test_every_reader_returns_no_floor_for_a_floorless_row(repo):
 
 
 def test_floored_and_floorless_rows_of_one_card_read_back_per_seq(repo):
-    other_floor = store.TurnFloor(phase="review", loop=0, source_run=RUN_ID, floor=0)
+    other_floor = store_checkpoints.TurnFloor(phase="review", loop=0, source_run=RUN_ID, floor=0)
     st = store.Store.open(repo, RUN_ID)
     try:
         _save_floored(st, saved_at=_at(0))
@@ -5033,7 +5034,7 @@ def test_checkpoint_from_row_without_floor_columns_has_no_floor(repo):
     finally:
         st.close()
 
-    assert store._checkpoint_from_row(row).floor is None
+    assert store_checkpoints._checkpoint_from_row(row).floor is None
 
 
 # -- replaying a journal for adoption (exactly-once Task 2.1) ----------------

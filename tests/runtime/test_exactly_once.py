@@ -35,7 +35,7 @@ from agent_manager.runtime import bridge, walk
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
-from agent_manager.store import TurnFloor
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-10-01-01"
@@ -472,7 +472,7 @@ def test_w2_a_crash_after_the_dispatch_returned_adopts_on_resume(store, roles, m
 
     crashed = store.latest_checkpoint(CARD_ID)
     assert (crashed.reason, _head(crashed.agent)) == ("turn", "a")
-    assert crashed.floor == TurnFloor("a", 0, RUN_ID, 0)
+    assert crashed.floor == store_checkpoints.TurnFloor("a", 0, RUN_ID, 0)
     assert _dispatches(launcher) == {"a": 1}
 
     runner = _runner(store, launcher, roles)
@@ -520,7 +520,7 @@ def test_w2_at_the_last_agent_phase_adopts_and_the_subtask_completes(
 
     crashed = store.latest_checkpoint(CARD_ID)
     assert _head(crashed.agent) == "b"
-    assert crashed.floor == TurnFloor("b", 0, RUN_ID, 0)
+    assert crashed.floor == store_checkpoints.TurnFloor("b", 0, RUN_ID, 0)
     assert ran == ["w"]
 
     runner = _runner(store, launcher, roles)
@@ -553,7 +553,7 @@ def test_a_second_crash_before_the_adopted_phase_finishes_still_adopts(
     assert second.seq > crashed.seq
     assert (second.reason, _head(second.agent)) == ("turn", "a")
     # The resumed BEFORE_TURN re-saved the carried floor unchanged.
-    assert second.floor == TurnFloor("a", 0, RUN_ID, 0)
+    assert second.floor == store_checkpoints.TurnFloor("a", 0, RUN_ID, 0)
 
     runner = _runner(store, launcher, roles)
     summary = _go(wf, store, runner, resume_from=second)
@@ -678,7 +678,7 @@ def test_a_carried_adoption_does_not_outlive_a_step_head(store, roles, monkeypat
         # A floor naming `a`, carried into a resume whose head is the step
         # `w`: the step's turn is the first after resume, so it must end the
         # adoption, and `a` must dispatch rather than reuse run 1's result.
-        forged = dataclasses.replace(crashed, floor=TurnFloor("a", 0, RUN_ID, 0))
+        forged = dataclasses.replace(crashed, floor=store_checkpoints.TurnFloor("a", 0, RUN_ID, 0))
         runner = _runner(other, launcher, roles)
         summary = _go(_workflow(ran), other, runner, resume_from=forged)
     finally:
@@ -704,7 +704,7 @@ def test_w0_a_crash_mid_dispatch_dispatches_again(store, roles):
 
     assert (paths.attempt_dir(RUN_ID, CARD_ID, "a", 1) / dispatch.RESULT_NAME).is_file()
     crashed = store.latest_checkpoint(CARD_ID)
-    assert crashed.floor == TurnFloor("a", 0, RUN_ID, 0)
+    assert crashed.floor == store_checkpoints.TurnFloor("a", 0, RUN_ID, 0)
     _mark_orphans(store)
 
     runner = _runner(store, launcher, roles)
@@ -731,7 +731,7 @@ def test_a_goto_looped_phase_dispatches_every_iteration_and_is_never_adopted(sto
     assert _dispatches(launcher) == {"a": 2, "b": 1}
     crashed = store.latest_checkpoint(CARD_ID)
     assert _next_turn(crashed.agent)["kwargs"] == {"phase": "a", "loop": 1}
-    assert crashed.floor == TurnFloor("a", 1, RUN_ID, 1)
+    assert crashed.floor == store_checkpoints.TurnFloor("a", 1, RUN_ID, 1)
     _mark_orphans(store)
 
     runner = _runner(store, launcher, roles)
@@ -789,7 +789,7 @@ def test_a_parked_subtask_dispatches_the_next_phase_once(store, roles):
     assert parked_summary.detail == "stopped before b"
     parked = store.latest_checkpoint(CARD_ID)
     assert parked.reason == "parked"
-    assert parked.floor == TurnFloor("b", 0, RUN_ID, 0)
+    assert parked.floor == store_checkpoints.TurnFloor("b", 0, RUN_ID, 0)
     assert _dispatches(launcher) == {"a": 1}
 
     runner = _runner(store, launcher, roles)
@@ -811,7 +811,7 @@ def test_a_mismatched_adoption_is_discarded(store, roles, monkeypatch):
         _go(wf, store, _runner(store, launcher, roles))
     crashed = store.latest_checkpoint(CARD_ID)
     assert _head(crashed.agent) == "b"
-    forged = dataclasses.replace(crashed, floor=TurnFloor("a", 0, RUN_ID, 0))
+    forged = dataclasses.replace(crashed, floor=store_checkpoints.TurnFloor("a", 0, RUN_ID, 0))
 
     runner = _runner(store, launcher, roles)
     summary = _go(wf, store, runner, resume_from=forged)

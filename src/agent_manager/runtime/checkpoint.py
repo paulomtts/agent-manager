@@ -32,7 +32,7 @@ from pygents import AgentHook, hook
 from agent_manager import paths
 from agent_manager.runtime import walk
 from agent_manager.runtime.state import RunDeps, current_run
-from agent_manager.store import TurnFloor
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.workflow.phases import AgentPhase
 
 _FLOORED = ("turn", "parked")
@@ -63,7 +63,7 @@ def save(agent: Any, reason: str) -> None:
     )
 
 
-def _floor(deps: RunDeps, agent: Any, reason: str) -> TurnFloor | None:
+def _floor(deps: RunDeps, agent: Any, reason: str) -> store_checkpoints.TurnFloor | None:
     """The floor of the agent-phase turn `agent` would run next, or `None` (exactly-once 1.2).
 
     Only `turn` and `parked` rows name a turn still to run. The next turn is
@@ -89,8 +89,8 @@ def _floor(deps: RunDeps, agent: Any, reason: str) -> TurnFloor | None:
         return None
     carried = deps.adopt
     if carried is not None and (carried.phase, carried.loop) == (phase, loop):
-        return TurnFloor(**vars(carried))
-    return TurnFloor(
+        return store_checkpoints.TurnFloor(**vars(carried))
+    return store_checkpoints.TurnFloor(
         phase, loop, run_id, paths.highest_attempt(run_id, deps.subtask.card_id, phase)
     )
 

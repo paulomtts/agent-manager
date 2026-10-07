@@ -55,6 +55,7 @@ from agent_manager import (
     runs,
     store as store_module,
 )
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
@@ -6896,9 +6897,9 @@ def _checkpoint(
     digest: str | None = None,
     current: str | None = None,
     queue: tuple[str, ...] = (),
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     """A hand-built checkpoint row of `TASK`: `current` is the turn in flight, `queue` the turns after it."""
-    return store_module.Checkpoint(
+    return store_checkpoints.Checkpoint(
         run_id="20260926T090000Z-02890d5d",
         card_id="card-1",
         seq=4,
@@ -7020,7 +7021,7 @@ def _saved(
     digest: str | None = None,
     queue: tuple[str, ...] = ("implement",),
     minute: int = 0,
-) -> store_module.Checkpoint:
+) -> store_checkpoints.Checkpoint:
     return opened.save_checkpoint(
         card_id,
         workflow=task_workflow.TASK.name,
@@ -11528,7 +11529,7 @@ def _plant_parked_checkpoint(
         opened.close()
 
 
-def _open_checkpoint(root: Path) -> store_module.Checkpoint | None:
+def _open_checkpoint(root: Path) -> store_checkpoints.Checkpoint | None:
     opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
     try:
         return opened.latest_open_checkpoint("card-1", task_workflow.TASK.name)

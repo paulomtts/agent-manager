@@ -21,7 +21,7 @@ from agent_manager.runtime.stop import StopSignal
 class Adoption:
     """A turn a resumed run carries from its checkpoint's floor (exactly-once E4/E5).
 
-    Same fields as `store.TurnFloor`, so `Adoption(**vars(floor))` builds one.
+    Same fields as `store_checkpoints.TurnFloor`, so `Adoption(**vars(floor))` builds one.
     Plain values only: nothing here imports the store or pygents.
     """
 
