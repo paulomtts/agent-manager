@@ -31,6 +31,7 @@ from agent_manager.runtime import walk as runtime_walk
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -292,6 +293,14 @@ def _record_tree(st: store_writer.Store, repo: Path) -> None:
 
 
 def test_every_row_the_store_writes_carries_its_project_id(repo):
+    # Another project is seen first, so this store's id is not the first one
+    # a fresh table hands out: a hard-coded or defaulted id cannot pass.
+    seed = store_db.open_db(repo)
+    try:
+        elsewhere = store_projects.resolve(seed, repo.parent / "elsewhere", now=NOW)
+        seed.commit()
+    finally:
+        seed.close()
     st = store_writer.Store.open(repo, RUN_A)
     try:
         _record_tree(st, repo)
@@ -315,5 +324,6 @@ def test_every_row_the_store_writes_carries_its_project_id(repo):
     finally:
         st.close()
 
+    assert project_id != elsewhere
     assert written == {table: [project_id] for table in _STORE_WRITTEN_TABLES}
     assert rebuilt == {table: [project_id] for table in _TREE_TABLES}
