@@ -647,6 +647,17 @@ def test_a_bad_line_in_the_second_run_still_commits_nothing_of_the_first(repos):
     assert tree(paths.data_path() / "runs") == runs_before
 
 
+def test_of_several_bad_journals_the_lowest_run_id_is_reported(repos):
+    _two_runs(repos)
+    write_journal("run-b", [], tail="not json\n")
+    first = write_journal("run-a", [], tail="not json\n")
+
+    error = _refused()
+
+    assert error.paths == (first,)
+    assert error.run_ids == ("run-a",)
+
+
 @pytest.mark.parametrize("absence", ["no run directory", "journal is a directory"])
 def test_a_run_without_a_journal_is_reported_and_still_merged(repos, absence):
     _two_runs(repos)
