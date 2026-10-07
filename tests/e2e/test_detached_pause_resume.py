@@ -28,7 +28,7 @@ from typing import Any, get_args
 
 import pytest
 
-from agent_manager import cli, detach, paths, store
+from agent_manager import cli, detach, paths
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases

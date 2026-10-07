@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, detach, models, paths, store
+from agent_manager import board, cli, detach, models, paths
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries

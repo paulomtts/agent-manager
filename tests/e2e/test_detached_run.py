@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import cli, control, detach, paths, store
+from agent_manager import cli, control, detach, paths
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 
