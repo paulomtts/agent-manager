@@ -31,6 +31,7 @@ from typing import Any, Literal
 
 from agent_manager import models, paths, prompt
 from agent_manager.runtime.errors import EngineError
+from agent_manager.store import db as store_db
 from agent_manager.store.writer import Store
 from agent_manager.workflow import phases as phase_model
 
@@ -518,6 +519,10 @@ def run_one_step(
             store, story_id, subtask, phase, "failed", started_at, clock(), failure.detail
         )
         return _Outcome(ok=False, detail=failure.detail, warnings=warnings)
+    except store_db.StoreBusyError:
+        # A store write gave up after its retry budget: no `failed` record is
+        # attempted, so the walk stops at the write that failed.
+        raise
     except Exception as error:
         # Deliberately total. A step is other people's code -- GitError, OSError,
         # anything -- and an exception escaping the walk would leave the subtask
