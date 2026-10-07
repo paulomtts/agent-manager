@@ -32,6 +32,7 @@ import pytest
 
 from agent_manager import control, models, store
 from agent_manager.store import db as store_db
+from agent_manager.store import leases as store_leases
 from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
@@ -63,8 +64,8 @@ def _at(seconds: float) -> datetime:
     return datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=seconds)
 
 
-def _lease_row(*, heartbeat_at: datetime, pid: int = 4242, host: str = "build-box") -> store.LeaseRow:
-    return store.LeaseRow(
+def _lease_row(*, heartbeat_at: datetime, pid: int = 4242, host: str = "build-box") -> store_leases.LeaseRow:
+    return store_leases.LeaseRow(
         run_id=RUN_ID,
         token="t1",
         pid=pid,
@@ -75,30 +76,30 @@ def _lease_row(*, heartbeat_at: datetime, pid: int = 4242, host: str = "build-bo
     )
 
 
-def _send(root: Path, token: str, command: str, at: datetime | None = None) -> store.ControlRow:
+def _send(root: Path, token: str, command: str, at: datetime | None = None) -> store_leases.ControlRow:
     """Insert one request from a second connection, as `am pause` would."""
     conn = store_db.open_db(root)
     try:
         with store_db.immediate(conn):
-            return store.add_control(
+            return store_leases.add_control(
                 conn, RUN_ID, lease=token, command=command, requested_at=at or _at(0)
             )
     finally:
         conn.close()
 
 
-def _read_lease(root: Path) -> store.LeaseRow | None:
+def _read_lease(root: Path) -> store_leases.LeaseRow | None:
     conn = store_db.open_db(root)
     try:
-        return store.read_lease(conn, RUN_ID)
+        return store_leases.read_lease(conn, RUN_ID)
     finally:
         conn.close()
 
 
-def _requests(root: Path) -> list[store.ControlRow]:
+def _requests(root: Path) -> list[store_leases.ControlRow]:
     conn = store_db.open_db(root)
     try:
-        return store.control_requests(conn, RUN_ID)
+        return store_leases.control_requests(conn, RUN_ID)
     finally:
         conn.close()
 
@@ -141,7 +142,7 @@ def _plant(
 def _held(root: Path, token: str) -> list[str]:
     conn = store_db.open_db(root)
     try:
-        return [claim.key for claim in store.held_claims(conn, RUN_ID, token)]
+        return [claim.key for claim in store_leases.held_claims(conn, RUN_ID, token)]
     finally:
         conn.close()
 
@@ -305,7 +306,7 @@ def test_card_claim_and_branch_claim_name_their_keys():
 def test_lease_acquires_on_enter_and_releases_on_exit(root, opened_store):
     with control.Lease(opened_store, pid=4242, host="build-box", clock=lambda: _at(0)) as lease:
         assert len(lease.token) == 32 and int(lease.token, 16) >= 0
-        assert _read_lease(root) == store.LeaseRow(
+        assert _read_lease(root) == store_leases.LeaseRow(
             run_id=RUN_ID,
             token=lease.token,
             pid=4242,
@@ -404,7 +405,7 @@ def test_a_lease_fences_its_store_only_while_it_is_held(root, opened_store):
             )
         finally:
             thief.close()
-        with pytest.raises(store.LeaseLostError) as caught:
+        with pytest.raises(store_leases.LeaseLostError) as caught:
             opened_store.record_run(run.model_copy(update={"status": "done"}))
         assert caught.value.holder is not None and caught.value.holder.token == "thief"
 
@@ -443,7 +444,7 @@ def test_a_lease_refuses_a_live_holder_and_leaves_no_trace(root, opened_store):
     # the lease's own clock: proves `is_live` is `lease_is_live(now=clock())`.
     _plant(root, token="alive", host="other-box", heartbeat_at=_at(0))
 
-    with pytest.raises(store.LeaseHeldError) as caught:
+    with pytest.raises(store_leases.LeaseHeldError) as caught:
         with control.Lease(
             opened_store,
             claims=["card:a"],
@@ -468,7 +469,7 @@ def test_a_lease_refuses_a_key_another_live_run_claims(root, opened_store):
         claims=("card:a",),
     )
 
-    with pytest.raises(store.ClaimHeldError) as caught:
+    with pytest.raises(store_leases.ClaimHeldError) as caught:
         with control.Lease(opened_store, claims=["card:a"], clock=lambda: _at(1)):
             pytest.fail("entered a lease whose claim another live run holds")
 
@@ -599,7 +600,7 @@ def test_an_adopting_lease_keeps_the_token_and_claims_and_releases_both_on_exit(
 def test_an_adopting_lease_refuses_a_token_that_no_longer_holds_the_run(root, opened_store):
     _plant(root, token="someone-else", heartbeat_at=_at(0), claims=("card:a",))
 
-    with pytest.raises(store.LeaseLostError) as caught:
+    with pytest.raises(store_leases.LeaseLostError) as caught:
         with control.Lease(opened_store, adopt="handed-off"):
             pytest.fail("adopted a lease another process holds")
 
@@ -654,7 +655,7 @@ async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_s
     class Locked(Wrapped):
         calls = 0
 
-        def pending_controls(self, token: str) -> list[store.ControlRow]:
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
             Locked.calls += 1
             if Locked.calls <= 2:
                 raise sqlite3.OperationalError("database is locked")
@@ -672,7 +673,7 @@ async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_s
     assert task.cancelled()
 
     class Broken(Wrapped):
-        def pending_controls(self, token: str) -> list[store.ControlRow]:
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
             raise RuntimeError("not a lock")
 
     with pytest.raises(RuntimeError, match="not a lock"):
@@ -718,7 +719,7 @@ async def test_controlled_cancels_work_and_reraises_when_the_watcher_crashes(ope
     class Exploding(Wrapped):
         exploded = False
 
-        def pending_controls(self, token: str) -> list[store.ControlRow]:
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
             if started.is_set() and not Exploding.exploded:
                 Exploding.exploded = True
                 raise RuntimeError("boom")
@@ -742,7 +743,7 @@ async def test_controlled_closes_the_window_then_sweeps_once_on_exit(root, opene
     events: list[str] = []
 
     class Recording(Wrapped):
-        def pending_controls(self, token: str) -> list[store.ControlRow]:
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
             events.append("pending")
             return self._inner.pending_controls(token)
 

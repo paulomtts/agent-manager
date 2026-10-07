@@ -374,7 +374,7 @@ def enqueue(store: Store, comment: Comment, *, run_id: str, now: datetime) -> No
 
     A pass-through to `Store.enqueue_comment`: a key already queued, in any
     state, is left exactly as it was. Nothing is posted here; the caller
-    flushes. Nothing is caught: a lost lease raises `store.LeaseLostError`
+    flushes. Nothing is caught: a lost lease raises `store_leases.LeaseLostError`
     and writes no row.
     """
     store.enqueue_comment(

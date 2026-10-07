@@ -57,6 +57,7 @@ from agent_manager import (
 )
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.errors import AgentPhaseFailed
@@ -8267,7 +8268,7 @@ def _plant_control(
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
         with store_db.immediate(conn):
-            row = store_module.add_control(
+            row = store_leases.add_control(
                 conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
             )
             if handled_at is not None:
@@ -8285,16 +8286,16 @@ def _controls(root: Path) -> list[tuple[str, str]]:
     try:
         return [
             (row.lease, row.command)
-            for row in store_module.control_requests(conn, CONTROL_RUN_ID)
+            for row in store_leases.control_requests(conn, CONTROL_RUN_ID)
         ]
     finally:
         conn.close()
 
 
-def _lease(root: Path) -> store_module.LeaseRow | None:
+def _lease(root: Path) -> store_leases.LeaseRow | None:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store_module.read_lease(conn, CONTROL_RUN_ID)
+        return store_leases.read_lease(conn, CONTROL_RUN_ID)
     finally:
         conn.close()
 
@@ -8798,19 +8799,19 @@ def control_applied(monkeypatch) -> threading.Event:
     return applied
 
 
-def _card_lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+def _card_lease(project: Path, run_id: str) -> store_leases.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
 
-def _card_controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
+def _card_controls(project: Path, run_id: str) -> list[store_leases.ControlRow]:
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.control_requests(conn, run_id)
+        return store_leases.control_requests(conn, run_id)
     finally:
         conn.close()
 
@@ -8837,7 +8838,7 @@ def _controlling_factory(
     at: str,
     seen: list[str],
     fail: bool = False,
-    leases: list[store_module.LeaseRow | None] | None = None,
+    leases: list[store_leases.LeaseRow | None] | None = None,
 ):
     """A `cli.RunnerFactory` whose runner, inside phase `at`, acts as a second process.
 
@@ -9061,7 +9062,7 @@ def test_a_control_and_an_escalation_follow_c6_at_the_command(
 def test_an_uncontrolled_card_run_holds_its_lease_then_releases_it(project, cards):
     """Spec tests 4 and 6: the lease is held, window open, while a phase runs;
     it is gone afterwards; the payload is today's, key for key."""
-    leases: list[store_module.LeaseRow | None] = []
+    leases: list[store_leases.LeaseRow | None] = []
     factory = _controlling_factory(
         project, threading.Event(), command=None, at="explore", seen=[], leases=leases
     )
@@ -9102,7 +9103,7 @@ def test_a_card_walk_that_raises_releases_its_lease(project, cards, monkeypatch)
     up, it is released on the way out, the error surfaces as is, and no final
     status row is written."""
     run_id = cli.mint_run_id(cards["subtask"], CRASHED_AT)
-    held: list[store_module.LeaseRow | None] = []
+    held: list[store_leases.LeaseRow | None] = []
 
     async def exploding(*args, **kwargs):
         held.append(_card_lease(project, run_id))
@@ -9148,7 +9149,7 @@ def test_a_resumed_card_run_paused_mid_phase_parks_and_releases_its_lease(
     `plan`, parks before the next phase, and gives its lease back."""
     run_id = _crash_pygents(project, cards, "plan")
     seen: list[str] = []
-    leases: list[store_module.LeaseRow | None] = []
+    leases: list[store_leases.LeaseRow | None] = []
     factory = _controlling_factory(
         project, control_applied, command="pause", at="plan", seen=seen, leases=leases
     )
@@ -9205,7 +9206,7 @@ def test_a_resumed_card_walk_that_raises_releases_its_lease(project, cards, monk
     """Error path on resume: the lease was held when the walk blew up and is
     released on the way out; the run stays `started` as it does today."""
     run_id = _crash_pygents(project, cards, "plan")
-    held: list[store_module.LeaseRow | None] = []
+    held: list[store_leases.LeaseRow | None] = []
 
     async def exploding(*args, **kwargs):
         held.append(_card_lease(project, run_id))
@@ -9464,7 +9465,7 @@ def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkey
                 if token is None
                 else [
                     claim.key
-                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                    for claim in store_leases.held_claims(self.connection, self.run_id, token)
                 ]
             )
             first.append((token, held))

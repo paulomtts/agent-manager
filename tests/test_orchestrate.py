@@ -52,6 +52,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager import store as store_module
 from agent_manager.store import db as store_db
+from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import integrate as integrate_workflow
@@ -5166,11 +5167,11 @@ def test_a_fresh_run_without_a_prefix_is_refused_before_anything(tmp_path, monke
 # ── live control: pause and cancel (card 0e1edf31) ──────────────────────────
 
 
-def _lease(project: Path, run_id: str) -> store_module.LeaseRow | None:
+def _lease(project: Path, run_id: str) -> store_leases.LeaseRow | None:
     """The run's lease row, read over a second connection as `am status` would."""
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
@@ -5183,21 +5184,21 @@ def _send(project: Path, run_id: str, command: str, *, token: str | None = None)
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         if token is None:
-            lease = store_module.read_lease(conn, run_id)
+            lease = store_leases.read_lease(conn, run_id)
             assert lease is not None and lease.accepting, "no open lease to address the request to"
             token = lease.token
         with store_db.immediate(conn):
-            store_module.add_control(
+            store_leases.add_control(
                 conn, run_id, lease=token, command=command, requested_at=STARTED_AT
             )
     finally:
         conn.close()
 
 
-def _controls(project: Path, run_id: str) -> list[store_module.ControlRow]:
+def _controls(project: Path, run_id: str) -> list[store_leases.ControlRow]:
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        return store_module.control_requests(conn, run_id)
+        return store_leases.control_requests(conn, run_id)
     finally:
         conn.close()
 
@@ -5238,7 +5239,7 @@ def test_the_lease_is_released_and_its_window_closed_when_run_milestone_returns(
     `run_milestone` returns."""
     shape = _milestone(project, {"A": 1})
     run_id = cli.mint_run_id(shape["milestone"], STARTED_AT)
-    seen: list[store_module.LeaseRow | None] = []
+    seen: list[store_leases.LeaseRow | None] = []
 
     def integrate_reading_the_lease(**kwargs: Any) -> Any:
         seen.append(_lease(project, run_id))
@@ -5816,10 +5817,10 @@ def _held_keys(project: Path, run_id: str) -> list[str]:
     """The keys `run_id`'s current lease holds, in key order, read as `am status` would."""
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
-        lease = store_module.read_lease(conn, run_id)
+        lease = store_leases.read_lease(conn, run_id)
         if lease is None:
             return []
-        return [claim.key for claim in store_module.held_claims(conn, run_id, lease.token)]
+        return [claim.key for claim in store_leases.held_claims(conn, run_id, lease.token)]
     finally:
         conn.close()
 
@@ -6065,7 +6066,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
     (b1,) = shape["subtasks"]["B"]
     first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
     run_id = first["run_id"]
-    seen_by_git: list[store_module.LeaseRow | None] = []
+    seen_by_git: list[store_leases.LeaseRow | None] = []
     real_refresh = orchestrate.refresh_git
 
     def refresh_spy(root: Path) -> None:
@@ -6083,7 +6084,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
                 if token is None
                 else [
                     claim.key
-                    for claim in store_module.held_claims(self.connection, self.run_id, token)
+                    for claim in store_leases.held_claims(self.connection, self.run_id, token)
                 ]
             )
             first_write.append((token, held))

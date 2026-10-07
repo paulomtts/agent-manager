@@ -26,7 +26,8 @@ from typing import NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from agent_manager.runtime.stop import Command, StopSignal
-from agent_manager.store import ControlRow, LeaseRow, Store
+from agent_manager.store import Store
+from agent_manager.store import leases as store_leases
 
 CONTROL_POLL_SECONDS = 1.0
 """How often `watch` looks for new requests."""
@@ -63,7 +64,7 @@ def pid_alive(pid: int) -> bool:
 
 
 def lease_is_live(
-    lease: LeaseRow,
+    lease: store_leases.LeaseRow,
     *,
     now: datetime,
     host: str = socket.gethostname(),
@@ -92,7 +93,7 @@ class Lease:
     `__enter__` takes a fresh token and calls `Store.take_lease` with `claims`,
     `now = clock()` and `is_live` built on `lease_is_live` at that `now`, so a
     live holder of the run or of any key refuses the lease
-    (`store.LeaseHeldError`, `store.ClaimHeldError`) and a dead one is taken
+    (`store_leases.LeaseHeldError`, `store_leases.ClaimHeldError`) and a dead one is taken
     over and kept in `displaced`. Only then does it start a daemon heartbeat
     thread. That thread waits on a `threading.Event`, never `time.sleep`, so
     `__exit__` wakes it at once. `__exit__` stops and joins it, then releases
@@ -130,7 +131,7 @@ class Lease:
         self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
         self.token = ""
-        self.displaced: LeaseRow | None = None
+        self.displaced: store_leases.LeaseRow | None = None
 
     def __enter__(self) -> Lease:
         if self._adopt is None:
@@ -218,13 +219,13 @@ def apply_pending(
     token: str,
     *,
     clock: Callable[[], datetime] = _utcnow,
-) -> list[ControlRow]:
+) -> list[store_leases.ControlRow]:
     """Apply this lease's unhandled requests in `seq` order and mark each handled.
 
     Only rows addressed to `token` are read (C4), so a request sent to an
     earlier life of the run never reaches this one. Returns the rows applied.
     """
-    applied: list[ControlRow] = []
+    applied: list[store_leases.ControlRow] = []
     for row in store.pending_controls(token):
         stop.request(cast(Command, row.command))
         store.mark_control_handled(row.seq, clock())

@@ -30,6 +30,7 @@ from typer.testing import CliRunner
 
 from agent_manager import board, cli, detach, models, paths, store
 from agent_manager.store import db as store_db
+from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 
 PREFIX = "m3"
@@ -119,10 +120,10 @@ def _load_run(root: Path, run_id: str) -> models.Run:
     return run
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 

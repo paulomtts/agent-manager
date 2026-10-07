@@ -26,6 +26,7 @@ from pathlib import Path
 from agent_manager import models
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
@@ -107,208 +108,6 @@ _CHECKPOINT_SELECT = (
 """Every checkpoint reader's select: the row plus its floor, if it has one."""
 
 
-@dataclass(frozen=True)
-class LeaseRow:
-    """The running process's claim on a run: a row of `run_leases` (live control C2).
-
-    Row-only and outside the journal, like `Checkpoint`. `accepting` is a real
-    `bool`: once the control window closes it is `False` and a new request
-    must be refused by the requester.
-    """
-
-    run_id: str
-    token: str
-    pid: int
-    host: str
-    acquired_at: datetime
-    heartbeat_at: datetime
-    accepting: bool
-
-
-def _lease_from_row(row: sqlite3.Row) -> LeaseRow:
-    return LeaseRow(
-        run_id=row["run_id"],
-        token=row["token"],
-        pid=row["pid"],
-        host=row["host"],
-        acquired_at=datetime.fromisoformat(row["acquired_at"]),
-        heartbeat_at=datetime.fromisoformat(row["heartbeat_at"]),
-        accepting=bool(row["accepting"]),
-    )
-
-
-def read_lease(conn: sqlite3.Connection, run_id: str) -> LeaseRow | None:
-    """The lease row of `run_id`, or `None` if no process holds one.
-
-    A free function over a connection so a second process (`am pause`,
-    `am status`) can read it without a `Store`, as with `load_run`.
-    """
-    row = conn.execute(
-        "SELECT * FROM run_leases WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    return None if row is None else _lease_from_row(row)
-
-
-@dataclass(frozen=True)
-class ClaimRow:
-    """One key a run's lease owns: a row of `run_claims` (multi-process X5).
-
-    Row-only and outside the journal, like `LeaseRow`. A claim counts only
-    while the `run_leases` row of `run_id` still carries `token` and is live;
-    otherwise the next `Store.take_lease` naming the key overwrites it.
-    """
-
-    key: str
-    run_id: str
-    token: str
-    claimed_at: datetime
-
-
-def _claim_from_row(row: sqlite3.Row) -> ClaimRow:
-    return ClaimRow(
-        key=row["key"],
-        run_id=row["run_id"],
-        token=row["token"],
-        claimed_at=datetime.fromisoformat(row["claimed_at"]),
-    )
-
-
-@dataclass(frozen=True)
-class LeaseTake:
-    """What `Store.take_lease` took, and the earlier lease row it replaced, if any."""
-
-    lease: LeaseRow
-    displaced: LeaseRow | None
-
-
-class LeaseHeldError(RuntimeError):
-    """Another process holds this run's lease and it is live (multi-process X5)."""
-
-    def __init__(self, holder: LeaseRow) -> None:
-        super().__init__(
-            f"run {holder.run_id!r} is held by a live lease"
-            f" (pid {holder.pid} on {holder.host})"
-        )
-        self.holder = holder
-
-
-class ClaimHeldError(RuntimeError):
-    """A claim key belongs to another run whose lease is live (multi-process X5)."""
-
-    def __init__(self, key: str, holder: LeaseRow) -> None:
-        super().__init__(
-            f"{key!r} is claimed by run {holder.run_id!r}, whose lease is live"
-            f" (pid {holder.pid} on {holder.host})"
-        )
-        self.key = key
-        self.holder = holder
-
-
-class LeaseLostError(BaseException):
-    """A bound store's lease was taken over or deleted: it must write nothing (X4).
-
-    A `BaseException`, not an `Exception`, so no `except Exception` in the
-    engine can swallow it and carry on writing a run this process no longer
-    owns. `holder` is the lease row now in place, or `None` if there is none.
-    """
-
-    def __init__(self, run_id: str, holder: LeaseRow | None) -> None:
-        who = (
-            "no process holds it now"
-            if holder is None
-            else f"pid {holder.pid} on {holder.host} holds it now"
-        )
-        super().__init__(f"this process lost the lease of run {run_id!r}: {who}")
-        self.run_id = run_id
-        self.holder = holder
-
-
-def claim_conflicts(
-    conn: sqlite3.Connection,
-    keys: Iterable[str],
-    *,
-    is_live: Callable[[LeaseRow], bool],
-    run_id: str | None = None,
-) -> list[tuple[str, LeaseRow]]:
-    """The keys of `keys`, in order, that another run's live lease holds.
-
-    Read-only. A key conflicts when its `run_claims` row names a run other
-    than `run_id`, that run's `run_leases` row still carries the claim's
-    token, and `is_live` says that lease row is live. `is_live` is injected so
-    this module never imports `control`; it is asked only about a claim whose
-    token still matches its run's lease.
-    """
-    conflicts: list[tuple[str, LeaseRow]] = []
-    for key in keys:
-        claim = conn.execute(
-            "SELECT run_id, token FROM run_claims WHERE key = ?", (key,)
-        ).fetchone()
-        if claim is None or claim["run_id"] == run_id:
-            continue
-        lease = read_lease(conn, claim["run_id"])
-        if lease is None or lease.token != claim["token"] or not is_live(lease):
-            continue
-        conflicts.append((key, lease))
-    return conflicts
-
-
-def held_claims(conn: sqlite3.Connection, run_id: str, token: str) -> list[ClaimRow]:
-    """Every claim `run_id` holds under `token`, in key order."""
-    rows = conn.execute(
-        "SELECT * FROM run_claims WHERE run_id = ? AND token = ? ORDER BY key",
-        (run_id, token),
-    ).fetchall()
-    return [_claim_from_row(row) for row in rows]
-
-
-@dataclass(frozen=True)
-class ControlRow:
-    """One `am pause`/`am cancel` request: a row of `run_controls` (live control C1).
-
-    Row-only and outside the journal. `lease` is the token the request was
-    addressed to, so a row under an old lease never reaches a resumed run.
-    """
-
-    run_id: str
-    seq: int
-    lease: str
-    command: str
-    requested_at: datetime
-    handled_at: datetime | None
-
-
-def _control_from_row(row: sqlite3.Row) -> ControlRow:
-    handled = row["handled_at"]
-    return ControlRow(
-        run_id=row["run_id"],
-        seq=row["seq"],
-        lease=row["lease"],
-        command=row["command"],
-        requested_at=datetime.fromisoformat(row["requested_at"]),
-        handled_at=None if handled is None else datetime.fromisoformat(handled),
-    )
-
-
-def control_requests(
-    conn: sqlite3.Connection, run_id: str, *, lease: str | None = None
-) -> list[ControlRow]:
-    """Every control request of `run_id` in `seq` order, handled or not.
-
-    With `lease=None` every lease's rows are returned; otherwise only the rows
-    addressed to that token.
-    """
-    if lease is None:
-        rows = conn.execute(
-            "SELECT * FROM run_controls WHERE run_id = ? ORDER BY seq", (run_id,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM run_controls WHERE run_id = ? AND lease = ? ORDER BY seq",
-            (run_id, lease),
-        ).fetchall()
-    return [_control_from_row(row) for row in rows]
-
-
 COMMENT_ATTEMPTS = 3
 """Failed posts after which a `board_comments` row is `abandoned` (board-comments
 B7). The warning that names an abandoned row belongs to `comments.py`."""
@@ -341,40 +140,6 @@ def _comment_from_row(row: sqlite3.Row) -> CommentRow:
         state=row["state"],
         comment_id=row["comment_id"],
         failed_attempts=row["failed_attempts"],
-    )
-
-
-def add_control(
-    conn: sqlite3.Connection,
-    run_id: str,
-    *,
-    lease: str,
-    command: str,
-    requested_at: datetime,
-) -> ControlRow:
-    """Insert the next control request of `run_id`, addressed to `lease`.
-
-    `seq` is 0 for the run's first request and one past the highest after
-    that. Does not commit: run it inside `immediate` so the `MAX(seq)` read
-    and the insert are one locked write. An unknown `command` is refused by
-    the table's `CHECK` as `sqlite3.IntegrityError`; that is the only guard.
-    """
-    highest = conn.execute(
-        "SELECT MAX(seq) FROM run_controls WHERE run_id = ?", (run_id,)
-    ).fetchone()[0]
-    seq = 0 if highest is None else highest + 1
-    conn.execute(
-        "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
-        " handled_at) VALUES (?, ?, ?, ?, ?, NULL)",
-        (run_id, seq, lease, command, store_db.iso(requested_at)),
-    )
-    return ControlRow(
-        run_id=run_id,
-        seq=seq,
-        lease=lease,
-        command=command,
-        requested_at=requested_at,
-        handled_at=None,
     )
 
 
@@ -445,13 +210,9 @@ class Store:
             yield
             return
         with store_db.immediate(self._conn):
-            row = self._conn.execute(
-                "SELECT * FROM run_leases WHERE run_id = ?", (self.run_id,)
-            ).fetchone()
-            if row is None or row["token"] != self._token:
-                raise LeaseLostError(
-                    self.run_id, None if row is None else _lease_from_row(row)
-                )
+            current = store_leases.read_lease(self._conn, self.run_id)
+            if current is None or current.token != self._token:
+                raise store_leases.LeaseLostError(self.run_id, current)
             self._in_fence = True
             try:
                 yield
@@ -1004,9 +765,9 @@ class Store:
         pid: int,
         host: str,
         now: datetime,
-        is_live: Callable[[LeaseRow], bool],
+        is_live: Callable[[store_leases.LeaseRow], bool],
         claims: Iterable[str] = (),
-    ) -> LeaseTake:
+    ) -> store_leases.LeaseTake:
         """Take this run's lease under `token`, with every key of `claims`, atomically.
 
         One `BEGIN IMMEDIATE` transaction (X5, X9): a live lease under another
@@ -1017,49 +778,21 @@ class Store:
         back and leaves the bound token as it was. On success the store is
         bound to `token` and the journal re-reads its highest `seq`.
         """
-        keys = list(claims)
         with self._lock:
             with store_db.immediate(self._conn):
-                current = read_lease(self._conn, self.run_id)
-                if current is not None and current.token != token and is_live(current):
-                    raise LeaseHeldError(current)
-                conflicts = claim_conflicts(
-                    self._conn, keys, is_live=is_live, run_id=self.run_id
-                )
-                if conflicts:
-                    key, holder = conflicts[0]
-                    raise ClaimHeldError(key, holder)
-                self._conn.execute(
-                    "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                    " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
-                    " ON CONFLICT(run_id) DO UPDATE SET"
-                    " token=excluded.token, pid=excluded.pid, host=excluded.host,"
-                    " acquired_at=excluded.acquired_at,"
-                    " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                    (self.run_id, token, pid, host, store_db.iso(now), store_db.iso(now)),
-                )
-                for key in keys:
-                    self._conn.execute(
-                        "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                        " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
-                        " run_id=excluded.run_id, token=excluded.token,"
-                        " claimed_at=excluded.claimed_at",
-                        (key, self.run_id, token, store_db.iso(now)),
-                    )
-            self.bind_lease(token)
-            self._journal.reseek()
-            return LeaseTake(
-                lease=LeaseRow(
-                    run_id=self.run_id,
+                taken = store_leases.take_lease(
+                    self._conn,
+                    self.run_id,
                     token=token,
                     pid=pid,
                     host=host,
-                    acquired_at=now,
-                    heartbeat_at=now,
-                    accepting=True,
-                ),
-                displaced=current,
-            )
+                    now=now,
+                    is_live=is_live,
+                    claims=claims,
+                )
+            self.bind_lease(token)
+            self._journal.reseek()
+            return taken
 
     def bind_lease(self, token: str | None) -> None:
         """Fence this store's run writes to `token`, or stop fencing with `None`."""
@@ -1069,40 +802,28 @@ class Store:
     def release_claims(self, token: str) -> None:
         """Delete this run's claims held under `token`; any other row is untouched."""
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM run_claims WHERE run_id = ? AND token = ?",
-                (self.run_id, token),
-            )
+            store_leases.release_claims(self._conn, self.run_id, token)
             self._conn.commit()
 
     def beat(self, token: str, now: datetime) -> None:
         """Move the heartbeat of this run's lease, if `token` still holds it."""
         with self._lock:
-            self._conn.execute(
-                "UPDATE run_leases SET heartbeat_at = ? WHERE run_id = ? AND token = ?",
-                (store_db.iso(now), self.run_id, token),
-            )
+            store_leases.beat(self._conn, self.run_id, token, now)
             self._conn.commit()
 
     def close_window(self, token: str) -> None:
         """Stop accepting control requests under `token` (`accepting = 0`)."""
         with self._lock:
-            self._conn.execute(
-                "UPDATE run_leases SET accepting = 0 WHERE run_id = ? AND token = ?",
-                (self.run_id, token),
-            )
+            store_leases.close_window(self._conn, self.run_id, token)
             self._conn.commit()
 
     def release_lease(self, token: str) -> None:
         """Delete this run's lease, if `token` still holds it."""
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM run_leases WHERE run_id = ? AND token = ?",
-                (self.run_id, token),
-            )
+            store_leases.release_lease(self._conn, self.run_id, token)
             self._conn.commit()
 
-    def adopt_lease(self, token: str) -> LeaseRow:
+    def adopt_lease(self, token: str) -> store_leases.LeaseRow:
         """Bind this store to `token`, which already holds this run's lease (card aff9fdbf).
 
         For the detached child of `am run --detach`: the parent took the lease
@@ -1113,9 +834,9 @@ class Store:
         `take_lease` does, since the parent appended after this store opened.
         """
         with self._lock:
-            current = read_lease(self._conn, self.run_id)
+            current = store_leases.read_lease(self._conn, self.run_id)
             if current is None or current.token != token:
-                raise LeaseLostError(self.run_id, current)
+                raise store_leases.LeaseLostError(self.run_id, current)
             self.bind_lease(token)
             self._journal.reseek()
             return current
@@ -1128,29 +849,20 @@ class Store:
         other token is a silent no-op, like `beat` and `close_window`.
         """
         with self._lock:
-            self._conn.execute(
-                "UPDATE run_leases SET pid = ?, host = ? WHERE run_id = ? AND token = ?",
-                (pid, host, self.run_id, token),
+            store_leases.set_lease_holder(
+                self._conn, self.run_id, token, pid=pid, host=host
             )
             self._conn.commit()
 
-    def pending_controls(self, token: str) -> list[ControlRow]:
+    def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
         """This run's unhandled requests addressed to `token`, in `seq` order."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM run_controls WHERE run_id = ? AND lease = ?"
-                " AND handled_at IS NULL ORDER BY seq",
-                (self.run_id, token),
-            ).fetchall()
-            return [_control_from_row(row) for row in rows]
+            return store_leases.pending_controls(self._conn, self.run_id, token)
 
     def mark_control_handled(self, seq: int, now: datetime) -> None:
         """Record that this run's request `seq` has been applied."""
         with self._lock:
-            self._conn.execute(
-                "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
-                (store_db.iso(now), self.run_id, seq),
-            )
+            store_leases.mark_control_handled(self._conn, self.run_id, seq, now)
             self._conn.commit()
 
     # -- rebuild -------------------------------------------------------------

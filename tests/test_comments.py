@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from agent_manager import board, comments, locks, store
+from agent_manager.store import leases as store_leases
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -795,11 +796,11 @@ def _at(minute: int) -> datetime:
     return datetime(2026, 9, 30, 12, minute, tzinfo=timezone.utc)
 
 
-def _alive(row: store.LeaseRow) -> bool:
+def _alive(row: store_leases.LeaseRow) -> bool:
     return True
 
 
-def _dead(row: store.LeaseRow) -> bool:
+def _dead(row: store_leases.LeaseRow) -> bool:
     return False
 
 
@@ -871,7 +872,7 @@ def test_enqueue_on_a_taken_over_store_raises_and_writes_no_row(stores):
     b.take_lease(token="t2", pid=2, host="h", now=_at(1), is_live=_dead)
     comment = _comment("card-a", "done")
 
-    with pytest.raises(store.LeaseLostError) as caught:
+    with pytest.raises(store_leases.LeaseLostError) as caught:
         comments.enqueue(a, comment, run_id=RUN, now=_at(2))
 
     assert caught.value.holder is not None and caught.value.holder.token == "t2"
@@ -1197,9 +1198,9 @@ def test_a_lost_lease_while_marking_propagates_and_counts_no_failure(stores, roo
     st = stores()
     comment = _queue(st, "card-a", "done")
     fake = FakeBoard()
-    losing = CrashOnFirstMark(st, store.LeaseLostError(RUN, None))
+    losing = CrashOnFirstMark(st, store_leases.LeaseLostError(RUN, None))
 
-    with pytest.raises(store.LeaseLostError):
+    with pytest.raises(store_leases.LeaseLostError):
         comments.flush(losing, root, board_api=fake)
 
     row = _row(st, comment.key)

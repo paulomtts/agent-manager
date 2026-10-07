@@ -31,6 +31,7 @@ import pytest
 from agent_manager import cli, detach, paths, store
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 
 PREFIX = "m3"
 """The `--branch-prefix` of this scenario; equals the e2e conftest's `MILESTONE_PREFIX`."""
@@ -61,10 +62,10 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
         time.sleep(POLL)
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
     conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 
