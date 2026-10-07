@@ -266,6 +266,17 @@ def plan_hash_gate(recorded: object, reported: object) -> dict[str, str] | None:
     return None if detail is None else {"warn": detail}
 
 
+def stale_branch_gate(result: object) -> dict[str, str] | None:
+    """``{"warn": ...}`` naming the preserved ref when `docs_commit` retired a stale branch."""
+    preserved = _field(result, "preserved_ref")
+    if not preserved:
+        return None
+    return {
+        "warn": f"branch held only commits of an older plan; preserved at {preserved} "
+        "and recreated from the base"
+    }
+
+
 def exploration_output_gate(
     explore: object,
     provided_verification: object,

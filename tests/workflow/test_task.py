@@ -65,6 +65,7 @@ def test_the_worktree_phase_is_the_real_worktree_step() -> None:
     phase = TASK.phase("worktree")
     assert isinstance(phase, Step)
     assert phase.run is worktree.ensure
+    assert dict(phase.args) == {"fast_forward": True}
 
 
 def test_no_agent_phase_precedes_the_worktree_phase() -> None:
@@ -105,7 +106,8 @@ def test_docs_commit_sits_between_the_marker_and_the_coder() -> None:
     # worktree and base_branch from the context by parameter name. Not best-effort and not
     # gated: an uncommitted or untagged pair of documents must escalate.
     assert dict(phase.args) == {}
-    assert phase.gates == ()
+    # Only a warning gate: it names a preserved stale branch and never blocks.
+    assert phase.gates == (reducers.stale_branch_gate,)
     assert phase.best_effort is False
     assert phase.when is None
     assert phase.skip_to is None
@@ -452,6 +454,7 @@ def test_the_workflow_still_holds_exactly_the_gates_this_suite_covers() -> None:
         ("explore", reducers.verification_gate),
         ("validate_spec", reducers.critic_blockers_gate),
         ("validate_plan", reducers.critic_blockers_gate),
+        ("docs_commit", reducers.stale_branch_gate),
         ("implement", reducers.implement_blocked_gate),
         ("review", reducers.review_blockers_gate),
         ("review", reducers.review_gate),
