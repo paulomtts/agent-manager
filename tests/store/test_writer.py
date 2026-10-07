@@ -1428,6 +1428,157 @@ def test_a_fenced_job_in_a_batch_is_fenced_in_its_own_savepoint(repo):
     assert keys == ["fence-a", "fence-c"]
 
 
+LATER = datetime(2026, 10, 7, 12, 5, tzinfo=timezone.utc)
+LATEST = datetime(2026, 10, 7, 12, 10, tzinfo=timezone.utc)
+
+
+def _take_t1(st: store_writer.Store) -> None:
+    st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+
+
+def test_heartbeat_writes_waiting_together_share_one_transaction(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _take_t1(st)
+        statements = _traced(st)
+        with _Gate(st):
+            statements.clear()
+            callers = _enqueue_in_order(
+                st,
+                [
+                    lambda: st.beat("t1", LATER),
+                    lambda: st.close_window("t1"),
+                    lambda: st.set_lease_holder("t1", pid=2, host="h2"),
+                ],
+            )
+        _wait_all(callers)
+        lease = store_leases.read_lease(st.connection, RUN_A)
+    finally:
+        st.close()
+
+    assert [(caller.value, caller.error) for caller in callers] == [(None, None)] * 3
+    assert lease is not None
+    assert (lease.heartbeat_at, lease.accepting, lease.pid, lease.host) == (
+        LATER,
+        False,
+        2,
+        "h2",
+    )
+    assert _begins(statements) == 1
+
+
+def test_record_jobs_never_batch(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.record_run(_run(repo))
+        _take_t1(st)
+        statements = _traced(st)
+        with _Gate(st):
+            statements.clear()
+            callers = _enqueue_in_order(
+                st,
+                [
+                    lambda: st.beat("t1", LATER),
+                    lambda: st.record_story(
+                        models.StoryRun(
+                            card_id="story-a", title="Story", level=0, status="started"
+                        )
+                    ),
+                    lambda: st.beat("t1", LATEST),
+                ],
+            )
+        _wait_all(callers)
+        stories = [line.event for line in st.journal.read() if line.event == "story_upsert"]
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None] * 3
+    assert _begins(statements) == 3
+    assert stories == ["story_upsert"]
+
+
+def test_two_beats_in_one_batch_leave_the_later_heartbeat(repo):
+    # Review Focus 3: rows are written in queue order.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _take_t1(st)
+        statements = _traced(st)
+        with _Gate(st):
+            statements.clear()
+            callers = _enqueue_in_order(
+                st, [lambda: st.beat("t1", LATER), lambda: st.beat("t1", LATEST)]
+            )
+        _wait_all(callers)
+        lease = store_leases.read_lease(st.connection, RUN_A)
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None, None]
+    assert lease is not None and lease.heartbeat_at == LATEST
+    assert _begins(statements) == 1
+
+
+def test_a_stale_token_heartbeat_in_a_batch_changes_nothing_and_fails_no_one(repo):
+    # Review Focus 4: a heartbeat thread still running after a takeover.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _take_t1(st)
+        statements = _traced(st)
+        with _Gate(st):
+            statements.clear()
+            callers = _enqueue_in_order(
+                st,
+                [
+                    lambda: st.close_window("stale"),
+                    lambda: st.beat("t1", LATER),
+                    lambda: st.set_lease_holder("stale", pid=9, host="other"),
+                ],
+            )
+        _wait_all(callers)
+        lease = store_leases.read_lease(st.connection, RUN_A)
+    finally:
+        st.close()
+
+    assert [(caller.value, caller.error) for caller in callers] == [(None, None)] * 3
+    assert lease is not None
+    assert (lease.token, lease.heartbeat_at, lease.accepting, lease.pid, lease.host) == (
+        "t1",
+        LATER,
+        True,
+        1,
+        "h",
+    )
+    assert _begins(statements) == 1
+
+
+def test_heartbeats_racing_records_all_land(repo):
+    # Review Focus 2: the lease heartbeat beats while lanes record.
+    st = store_writer.Store.open(repo, RUN_A)
+    start = threading.Barrier(4)
+
+    def work(worker: int) -> None:
+        start.wait(TIMEOUT)
+        for i in range(10):
+            st.beat("t1", NOW)
+            st.record_attempt(
+                "story-a", "card-a", "implement", _attempt(repo, worker * 10 + i + 1)
+            )
+
+    try:
+        _take_t1(st)
+        callers = [_Caller(work, worker) for worker in range(4)]
+        _wait_all(callers)
+        lines = [line for line in st.journal.read() if line.event == "attempt_upsert"]
+        rows = _count(st, "attempts")
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None] * 4
+    assert len(lines) == 40
+    assert len({line.seq for line in lines}) == 40
+    assert rows == 40
+
+
 def test_a_lost_lease_writes_neither_line_nor_row(repo):
     st = store_writer.Store.open(repo, RUN_A)
     try:

@@ -922,17 +922,27 @@ class Store:
         )
 
     def beat(self, token: str, now: datetime) -> None:
-        """Move the heartbeat of this run's lease, if `token` still holds it."""
+        """Move the heartbeat of this run's lease, if `token` still holds it.
+
+        May share one transaction with other heartbeat writes waiting in the
+        queue together, inside a savepoint of its own.
+        """
         self._submit(
             lambda conn: store_leases.beat(conn, self.run_id, token, now),
             operation="beat",
+            coalesce=True,
         )
 
     def close_window(self, token: str) -> None:
-        """Stop accepting control requests under `token` (`accepting = 0`)."""
+        """Stop accepting control requests under `token` (`accepting = 0`).
+
+        May share one transaction with other heartbeat writes waiting in the
+        queue together, inside a savepoint of its own.
+        """
         self._submit(
             lambda conn: store_leases.close_window(conn, self.run_id, token),
             operation="close_window",
+            coalesce=True,
         )
 
     def release_lease(self, token: str) -> None:
@@ -965,13 +975,16 @@ class Store:
 
         The parent of `am run --detach` points the row at its child before it
         prints, so `am runs` and `am status` judge the child's liveness. Any
-        other token is a silent no-op, like `beat` and `close_window`.
+        other token is a silent no-op, like `beat` and `close_window`. May share
+        one transaction with other heartbeat writes waiting in the queue
+        together, inside a savepoint of its own.
         """
         self._submit(
             lambda conn: store_leases.set_lease_holder(
                 conn, self.run_id, token, pid=pid, host=host
             ),
             operation="set_lease_holder",
+            coalesce=True,
         )
 
     def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
