@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from agent_manager import dispatch, models, prompt
-from agent_manager import store as store_module
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.harness.base import Outcome
@@ -290,7 +290,7 @@ def _run(
         else extra_context
     )
     adapter = _FakeAdapter()
-    store = store_module.Store.open(scene.repo, RUN_ID)
+    store = store_writer.Store.open(scene.repo, RUN_ID)
     try:
         store.record_story(
             models.StoryRun(card_id=STORY_ID, title="Integrate", level=0, status="started")

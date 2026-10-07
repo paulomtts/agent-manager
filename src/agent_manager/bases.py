@@ -39,7 +39,8 @@ from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, _ref_exists, merge_tip
 from agent_manager.steps.worktree import GitError, ensure, run_git
-from agent_manager.store import Checkpoint, Store
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 BASES_STORY_ID = "bases"
@@ -167,7 +168,7 @@ async def _resolve_conflict(
     run_id: str,
     runner_factory: runs.RunnerFactory,
     stop: StopSignal | None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskSummary:
     """Walk `workflow.integrate.INTEGRATE` once for one conflicting tip.
 
@@ -255,7 +256,7 @@ async def build(
     story_id: str | None,
     runner_factory: runs.RunnerFactory | None,
     stop: StopSignal | None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> BaseResult:
     """Cut `root.branch` from `tips[0]`, merge every other tip, verify once.
 

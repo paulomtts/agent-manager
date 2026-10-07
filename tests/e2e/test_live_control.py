@@ -8,7 +8,7 @@ the fake `claude` first on `PATH`.
 
 The milestone runs in a worker thread. A one-shot hold (`_hold`) blocks a1's
 `plan` launch on a `threading.Event` before the real launch. While it is held,
-the test thread reads the run id on a second `store.open_db` connection, which
+the test thread reads the run id on a second `store_db.open_db` connection, which
 stands for another process and is also `am pause`'s real path, and records the
 control through the CLI. It then waits until the running process has applied
 the request (`_signal_when_applied`, a pass-through wrapper on
@@ -31,7 +31,9 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import cli, control, store
+from agent_manager import cli, control
+from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 from agent_manager.harness import launcher
 
 VERIFY = "git rev-parse --verify HEAD"
@@ -90,9 +92,9 @@ def _error(result) -> dict:
 
 def _latest_run_id(root: Path) -> str:
     """The run id, read on a second connection: the "other process" of spec §7."""
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run_id = store.latest_run_id(conn)
+        run_id = store_queries.latest_run_id(conn)
     finally:
         conn.close()
     assert run_id is not None
@@ -398,9 +400,9 @@ def test_a_cancelled_milestone_is_refused_by_resume_and_relaunched_from_scratch(
 
 def _subtask_of(root: Path, run_id: str, card_id: str):
     """`card_id`'s recorded `SubtaskRun` in `run_id`, phases in the order the walk recorded them."""
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id

@@ -20,7 +20,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, models, orchestrate, store
+from agent_manager import board, cli, models, orchestrate
+from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 from agent_manager.harness import launcher
 from agent_manager.runtime.stop import StopSignal
 
@@ -67,9 +69,9 @@ def _branches(root: Path) -> list[str]:
 
 
 def _load_run(root: Path, run_id: str) -> models.Run:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
@@ -195,9 +197,9 @@ def _attempt_of(stdout_path: Path) -> tuple[str, str]:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run_id = store.latest_run_id(conn)
+        run_id = store_queries.latest_run_id(conn)
     finally:
         conn.close()
     assert run_id is not None

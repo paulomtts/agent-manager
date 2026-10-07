@@ -745,7 +745,7 @@ Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and not
 
 #### The journal line
 
-Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store.py`):
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`):
 
 ```
 {"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}

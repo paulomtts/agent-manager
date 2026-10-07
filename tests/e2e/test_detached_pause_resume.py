@@ -28,7 +28,10 @@ from typing import Any, get_args
 
 import pytest
 
-from agent_manager import cli, detach, paths, store
+from agent_manager import cli, detach, paths
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
 
 PREFIX = "m3"
 """The `--branch-prefix` of this scenario; equals the e2e conftest's `MILESTONE_PREFIX`."""
@@ -45,9 +48,9 @@ CONTROL_KEYS_NEVER_PRESENT = {"escalated", "failed_phase", "integrated", "done"}
 """A paused payload never escalates, never names a failed phase and never
 reaches Integrate (live control C6); as in test_live_control.py."""
 
-EVENT_KINDS = frozenset(get_args(store.EventKind))
+EVENT_KINDS = frozenset(get_args(store_journal.EventKind))
 
-JOURNAL_KEYS = frozenset(store.JournalLine.model_fields)
+JOURNAL_KEYS = frozenset(store_journal.JournalLine.model_fields)
 """Every key a JournalLine dumps; `am watch` prints `model_dump(mode="json")`."""
 
 
@@ -59,10 +62,10 @@ def _until(predicate: Callable[[], bool], what: str, timeout: float = DEADLINE) 
         time.sleep(POLL)
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 

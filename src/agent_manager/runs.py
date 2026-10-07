@@ -18,11 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent_manager import census, dag, models, store as store_module
+from agent_manager import census, dag, models
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import AgentPhaseRunner
 from agent_manager.steps import worktree
-from agent_manager.store import Store
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store.writer import Store
 from agent_manager.workflow import task as task_workflow
 
 RUN_ID_TIME_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -300,7 +301,7 @@ def orphan_attempts(
 
 def continuable_checkpoint(
     store: Store, card_id: str
-) -> store_module.Checkpoint | None:
+) -> store_checkpoints.Checkpoint | None:
     """The open checkpoint a pygents relaunch continues `card_id` from, or `None`.
 
     `Store.latest_open_checkpoint` across every run, for `TASK`'s name. A row

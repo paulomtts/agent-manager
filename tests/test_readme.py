@@ -1,7 +1,7 @@
 """README contract checks for the plugin-facing surface (card 9f0d5c8c).
 
 Pure file reading plus pure builders from `cli` and the Pydantic models in
-`store`: no subprocess, no git, brd or claude, so every test here is unit
+`store.queries`: no subprocess, no git, brd or claude, so every test here is unit
 tier and carries no marker.
 """
 
@@ -26,9 +26,9 @@ from agent_manager import (
     orchestrate,
     prompt,
     runs,
-    store,
 )
 from agent_manager.harness import launcher
+from agent_manager.store import queries as store_queries
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
@@ -152,14 +152,14 @@ def test_usage_names_both_streaming_commands():
 def test_runs_section_documents_new_keys():
     section = _section("Listing runs")
     new_keys = ("milestone_id", "card_id", "story_id", "lease", "progress")
-    assert set(new_keys) <= set(store.RunSummary.model_fields)
+    assert set(new_keys) <= set(store_queries.RunSummary.model_fields)
     for key in new_keys:
         assert f"`{key}`" in section, key
     for model in (
-        store.RunLease,
-        store.RunProgress,
-        store.ProgressCount,
-        store.ProgressCurrent,
+        store_queries.RunLease,
+        store_queries.RunProgress,
+        store_queries.ProgressCount,
+        store_queries.ProgressCurrent,
     ):
         for field in model.model_fields:
             assert re.search(rf"\b{field}\b", section), f"{model.__name__}.{field}"

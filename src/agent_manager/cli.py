@@ -49,7 +49,6 @@ from agent_manager import (
     orchestrate,
     paths,
     prompt,
-    store as store_module,
 )
 from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
@@ -58,7 +57,13 @@ from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness import launcher
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
-from agent_manager.store import Store
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
+from agent_manager.store import queries as store_queries
+from agent_manager.store import replay as store_replay
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import AgentPhase, Workflow
@@ -267,7 +272,7 @@ def status_rows(run: models.Run) -> list[dict[str, Any]]:
     return rows
 
 
-def _lease_fields(lease: store_module.LeaseRow, *, now: datetime) -> dict[str, Any]:
+def _lease_fields(lease: store_leases.LeaseRow, *, now: datetime) -> dict[str, Any]:
     """The lease fields `am status` and `am runs` both show.
 
     One function so the two commands cannot drift: `control_view` adds
@@ -285,8 +290,8 @@ def _lease_fields(lease: store_module.LeaseRow, *, now: datetime) -> dict[str, A
 
 
 def control_view(
-    lease: store_module.LeaseRow | None,
-    requests: Sequence[store_module.ControlRow],
+    lease: store_leases.LeaseRow | None,
+    requests: Sequence[store_leases.ControlRow],
     *,
     now: datetime,
     claims: Sequence[str] = (),
@@ -319,7 +324,7 @@ def control_view(
 def integrity_view(
     run_id: str,
     run: models.Run,
-    lease: store_module.LeaseRow | None,
+    lease: store_leases.LeaseRow | None,
     *,
     now: datetime,
 ) -> dict[str, Any]:
@@ -336,7 +341,7 @@ def integrity_view(
     run that has none, and a torn last line is an append in flight and is
     skipped, as in `_journal_events`. The one `try` covers `diverging` as well
     as `read`, because `replay` inside it raises `JournalError` or a pydantic
-    `ValidationError` of its own. Mismatches are `store.diverging`'s, in its
+    `ValidationError` of its own. Mismatches are `store_replay.diverging`'s, in its
     tree-walk order: there is one definition of divergence.
 
     A live lease (§3.5) is `checked: false, reason: "lease is live"` before the
@@ -347,11 +352,11 @@ def integrity_view(
     if lease is not None and control.lease_is_live(lease, now=now):
         return {"checked": False, "reason": "lease is live", "mismatches": []}
     try:
-        lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
-        found = store_module.diverging(lines, run)
-    except store_module.MissingJournalError:
+        lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+        found = store_replay.diverging(lines, run)
+    except store_journal.MissingJournalError:
         return {"checked": False, "reason": "no journal", "mismatches": []}
-    except (store_module.JournalError, ValidationError) as error:
+    except (store_journal.JournalError, ValidationError) as error:
         return {
             "checked": False,
             "reason": f"journal unreadable: {error}",
@@ -623,7 +628,7 @@ def step_logs_payload(
 
 
 def checkpoint_resume_phase(
-    checkpoint: store_module.Checkpoint | None, *, card_id: str, run_id: str
+    checkpoint: store_checkpoints.Checkpoint | None, *, card_id: str, run_id: str
 ) -> str:
     """The phase `resume` continues `card_id` at, or a refusal.
 
@@ -735,7 +740,7 @@ def default_runner_factory(
     `RunConfig` values (card eee43099); `runner_factory_for` is what passes
     them. Without them every attempt gets `dispatch.DEFAULT_TIMEOUT`.
     """
-    config = store_module.run_config(store.connection, run_id)
+    config = store_queries.run_config(store.connection, run_id)
     if config is None:
         raise UnknownRunError(
             f"run {run_id!r} has no row in the projection, so the launcher it was"
@@ -809,7 +814,7 @@ async def drive_subtask_async(
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
     stop: StopSignal | None = None,
-    resume_from: store_module.Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `workflow.task.TASK` on the caller's event loop.
 
@@ -863,7 +868,7 @@ def drive_subtask(
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
     runner_factory: RunnerFactory | None = None,
-    resume_from: store_module.Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> SubtaskDrive:
     """Walk one subtask through `workflow.task.TASK` under a store the caller owns.
 
@@ -911,7 +916,7 @@ def card_run_status(summary: SubtaskSummary, stop: StopSignal) -> str:
     return summary.status
 
 
-def _run_is_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+def _run_is_live_error(lease: store_leases.LeaseRow, now: datetime) -> RunIsLiveError:
     """C10's refusal of a run another live process holds, worded once for every caller."""
     return RunIsLiveError(
         f"run {lease.run_id} is still running in pid {lease.pid} on {lease.host}"
@@ -920,7 +925,7 @@ def _run_is_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLive
     )
 
 
-def _claimed_error(key: str, holder: store_module.LeaseRow, now: datetime) -> ClaimedError:
+def _claimed_error(key: str, holder: store_leases.LeaseRow, now: datetime) -> ClaimedError:
     """X11's refusal of a claimed key. The kind and name come from the key itself,
     split on its first `:`, so a `branch:` claim reads as a branch."""
     kind, _, name = key.partition(":")
@@ -944,9 +949,9 @@ def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None
     live conflict raises `ClaimedError`; `take_lease` re-checks atomically.
     """
     now = _utcnow()
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        conflicts = store_module.claim_conflicts(
+        conflicts = store_leases.claim_conflicts(
             conn,
             keys,
             is_live=lambda row: control.lease_is_live(row, now=now),
@@ -963,17 +968,17 @@ def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None
 def run_lease(store: Store, *, claims: Sequence[str] = ()) -> Iterator[control.Lease]:
     """Hold `control.Lease(store, claims=claims)` for the block, with CLI refusals.
 
-    A thin wrapper: only entering is translated -- `store.LeaseHeldError`
-    becomes C10's `RunIsLiveError`, `store.ClaimHeldError` becomes
+    A thin wrapper: only entering is translated -- `store_leases.LeaseHeldError`
+    becomes C10's `RunIsLiveError`, `store_leases.ClaimHeldError` becomes
     `ClaimedError` -- and the block's exit, an exception included, is
     `Lease.__exit__`'s, which releases the claims then the lease.
     """
     stack = ExitStack()
     try:
         lease = stack.enter_context(control.Lease(store, claims=claims))
-    except store_module.LeaseHeldError as error:
+    except store_leases.LeaseHeldError as error:
         raise _run_is_live_error(error.holder, _utcnow()) from error
-    except store_module.ClaimHeldError as error:
+    except store_leases.ClaimHeldError as error:
         raise _claimed_error(error.key, error.holder, _utcnow()) from error
     with stack:
         yield lease
@@ -1550,8 +1555,8 @@ HANDLED: tuple[type[BaseException], ...] = (
     EngineError,
     ValueError,
     locks.LockTimeoutError,
-    store_module.LeaseLostError,
-    store_module.CorruptJournalError,
+    store_leases.LeaseLostError,
+    store_journal.CorruptJournalError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1559,11 +1564,11 @@ HANDLED: tuple[type[BaseException], ...] = (
 bare one for a card id that is not a UUID, and a typed `--card` must not come
 back as a traceback. `locks.LockTimeoutError` is in it because a start refused
 while another `am` process held a project lock past its timeout (spec X7) is a
-refusal, not a bug; nothing below the CLI catches it. `store_module.LeaseLostError`
+refusal, not a bug; nothing below the CLI catches it. `store_leases.LeaseLostError`
 is in it because another process took this run's lease over mid-walk (spec X4):
 the fence stopped every write, and the operator gets the envelope naming the new
 holder. It is a `BaseException`, so it has to be listed by name.
-`store_module.CorruptJournalError` is in it because a crashed run can leave a
+`store_journal.CorruptJournalError` is in it because a crashed run can leave a
 torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
 is a refusal naming the file and line, not a bug; only that subclass, not
 `JournalError` as a whole. Anything outside this tuple is a bug in this program
@@ -2360,7 +2365,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
 
     Read-only: no `record_*` is called, and the connection is closed on every
     path including the refusals, the way `run_card` closes its store. The default
-    run id comes from `store_module.latest_run_id`, which is the head of the very
+    run id comes from `store_queries.latest_run_id`, which is the head of the very
     listing `runs` prints, so the two commands cannot disagree about which run is
     the most recent one. The lease and every control request are read on the
     same connection and rendered by `control_view`, still without a write.
@@ -2368,34 +2373,34 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     `integrity_view`, which reads the journal and writes nothing either.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         wanted = run_id
         if wanted is None:
-            wanted = store_module.latest_run_id(conn)
+            wanted = store_queries.latest_run_id(conn)
             if wanted is None:
                 raise UnknownRunError(
                     f"no run has been recorded for {root}, so there is no most recent"
                     " run to report on; pass a run id or start one with `run --card`"
                 )
-        run = store_module.load_run(conn, wanted)
+        run = store_queries.load_run(conn, wanted)
         if run is None:
             raise UnknownRunError(
                 f"run {wanted!r} is not in the projection for {root}"
                 " (`agent-manager runs` lists the ones that are)"
             )
-        lease = store_module.read_lease(conn, wanted)
+        lease = store_leases.read_lease(conn, wanted)
         now = _utcnow()
         # Only a live lease's claims count (X5): a dead one's leftover rows
         # are anyone's to take, so they are not shown as held.
         claims = (
-            [claim.key for claim in store_module.held_claims(conn, wanted, lease.token)]
+            [claim.key for claim in store_leases.held_claims(conn, wanted, lease.token)]
             if lease is not None and control.lease_is_live(lease, now=now)
             else []
         )
         state = control_view(
             lease,
-            store_module.control_requests(conn, wanted),
+            store_leases.control_requests(conn, wanted),
             now=now,
             claims=claims,
         )
@@ -2433,26 +2438,26 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
 
-    `lease` is filled here, not in `store.list_runs`: `live` needs `control`,
+    `lease` is filled here, not in `store_queries.list_runs`: `live` needs `control`,
     which `store` must not import. Each run's `run_leases` row is read on the
     same connection and shaped by `_lease_fields`, the helper `control_view`
     uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
     `None` when the run has no lease row. One `now` judges the whole listing.
 
-    `progress` arrives already counted by `store.list_runs`; `model_copy`
+    `progress` arrives already counted by `store_queries.list_runs`; `model_copy`
     keeps it and `model_dump` carries it into the entry unchanged.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
         now = _utcnow()
         entries = []
-        for summary in store_module.list_runs(conn):
-            lease = store_module.read_lease(conn, summary.id)
+        for summary in store_queries.list_runs(conn):
+            lease = store_leases.read_lease(conn, summary.id)
             shown = (
                 None
                 if lease is None
-                else store_module.RunLease(**_lease_fields(lease, now=now))
+                else store_queries.RunLease(**_lease_fields(lease, now=now))
             )
             entries.append(summary.model_copy(update={"lease": shown}).model_dump())
         return {"runs": entries}
@@ -2545,9 +2550,9 @@ def select_logs(
     e1b1e7d5). With no `--phase`, only recorded `Attempt` rows count.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -2674,9 +2679,9 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     card = selection.subtask.card_id
     name = selection.phase.name
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db_for_reading(root)
+    conn = store_db.open_db_for_reading(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     if run is None:
@@ -2781,7 +2786,7 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_module.JournalError)
+WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_journal.JournalError)
 """`HANDLED` plus `JournalError`, for `watch` only.
 
 A corrupt journal is a refusal for a reader, so `watch` turns it into an
@@ -2813,7 +2818,7 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
     that does not exist (am-watch design 3.7). A torn last line is an append in
     flight and is skipped. Raises `MissingJournalError` when there is no journal.
     """
-    lines = store_module.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+    lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
     return [line.model_dump(mode="json") for line in lines if line.seq > since]
 
 
@@ -2861,7 +2866,7 @@ def watch_for(
         _check_watch_run_id(run_id)
         try:
             return {"events": _journal_events(run_id, since=since)}
-        except store_module.MissingJournalError as error:
+        except store_journal.MissingJournalError as error:
             raise UnknownRunError(
                 f"run {run_id!r} has no journal under the data directory"
                 " (`agent-manager watch --all` reads every run there is)"
@@ -2870,7 +2875,7 @@ def watch_for(
     for each in paths.list_run_ids():
         try:
             events.extend(_journal_events(each, since=since))
-        except store_module.MissingJournalError:
+        except store_journal.MissingJournalError:
             continue
     return {"events": events}
 
@@ -2932,7 +2937,7 @@ def _poll_watch(
     for each in run_ids:
         try:
             events = _journal_events(each, since=cursors.get(each, since))
-        except store_module.MissingJournalError:
+        except store_journal.MissingJournalError:
             continue
         for event in events:
             cursors[each] = event["seq"]
@@ -3434,9 +3439,9 @@ def resume_run(
     raised after the refusals above and before `Store.open`.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -3448,7 +3453,7 @@ def resume_run(
             raise NotResumableError(
                 f"run {run.id} was canceled; start new work with `am run --milestone`"
             )
-        lease = store_module.read_lease(conn, run.id)
+        lease = store_leases.read_lease(conn, run.id)
         now = _utcnow()
         if lease is not None and control.lease_is_live(lease, now=now):
             raise _run_is_live_error(lease, now)
@@ -3619,21 +3624,21 @@ CONTROL_COMMANDS: tuple[str, ...] = ("pause", "cancel")
 """What `am pause` and `am cancel` record, weakest first (live control C6)."""
 
 
-def _heartbeat_age(lease: store_module.LeaseRow, now: datetime) -> int:
+def _heartbeat_age(lease: store_leases.LeaseRow, now: datetime) -> int:
     """Whole seconds since `lease` last beat, for a refusal message."""
     return int((now - lease.heartbeat_at).total_seconds())
 
 
 def _controllable_lease(
     conn: sqlite3.Connection, run_id: str, *, command: str, now: datetime
-) -> store_module.LeaseRow:
+) -> store_leases.LeaseRow:
     """The lease a request to `run_id` is addressed to, or C8's refusal.
 
     The order is C8's: unknown run, not `started`, no live lease, window
     closed. Runs inside `request_control`'s transaction, so a refusal rolls
     back and leaves no row.
     """
-    status = store_module.run_status(conn, run_id)
+    status = store_queries.run_status(conn, run_id)
     if status is None:
         raise UnknownRunError(
             f"run {run_id!r} is not in the projection"
@@ -3645,7 +3650,7 @@ def _controllable_lease(
             f" `am status {run_id}` shows it, and `am resume {run_id}` continues a"
             " stopped or escalated run"
         )
-    lease = store_module.read_lease(conn, run_id)
+    lease = store_leases.read_lease(conn, run_id)
     if lease is None:
         raise DeadRunError(
             f"run {run_id} is recorded started but no process holds its lease;"
@@ -3679,26 +3684,26 @@ def _record_control(
     conn: sqlite3.Connection,
     run_id: str,
     *,
-    lease: store_module.LeaseRow,
+    lease: store_leases.LeaseRow,
     command: str,
     now: datetime,
-) -> tuple[store_module.ControlRow, bool]:
+) -> tuple[store_leases.ControlRow, bool]:
     """Record `command` for this life of the run; the flag says it was already there.
 
     Only rows addressed to `lease.token` count, so a request sent to an
     earlier life never makes one to a resumed run a no-op. A no-op returns
     the first row that covers it, whose time is reported as `requested_at`.
     """
-    for row in store_module.control_requests(conn, run_id, lease=lease.token):
+    for row in store_leases.control_requests(conn, run_id, lease=lease.token):
         if row.command in CONTROL_SUBSUMES[command]:
             return row, True
-    row = store_module.add_control(
+    row = store_leases.add_control(
         conn, run_id, lease=lease.token, command=command, requested_at=now
     )
     return row, False
 
 
-def _effective_command(rows: Sequence[store_module.ControlRow]) -> str:
+def _effective_command(rows: Sequence[store_leases.ControlRow]) -> str:
     """The strongest command recorded for one life: `cancel` beats `pause` (C6)."""
     return "cancel" if any(row.command == "cancel" for row in rows) else "pause"
 
@@ -3741,15 +3746,15 @@ def request_control(
         )
     root = resolve_repo_dir(repo_dir)
     now = clock()
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        with store_module.immediate(conn):
+        with store_db.immediate(conn):
             lease = _controllable_lease(conn, run_id, command=command, now=now)
             row, already = _record_control(
                 conn, run_id, lease=lease, command=command, now=now
             )
             effective = _effective_command(
-                store_module.control_requests(conn, run_id, lease=lease.token)
+                store_leases.control_requests(conn, run_id, lease=lease.token)
             )
     finally:
         conn.close()
@@ -3801,7 +3806,7 @@ def cancel(
     _control("cancel", run_id, repo_dir=repo_dir, pretty=pretty)
 
 
-def _reset_live_error(lease: store_module.LeaseRow, now: datetime) -> RunIsLiveError:
+def _reset_live_error(lease: store_leases.LeaseRow, now: datetime) -> RunIsLiveError:
     """`am reset`'s read-only refusal of a run a live process holds (am-reset §3.4).
 
     `_run_is_live_error`'s pid, host and heartbeat age, but pointing at
@@ -3854,9 +3859,9 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     A displaced dead holder is reported under `took_over`.
     """
     root = resolve_repo_dir(repo_dir)
-    conn = store_module.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        run = store_module.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -3864,7 +3869,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
             )
         # Unknown, live, done: read-only and before `Store.open`, which would
         # mint a run directory, so a refusal leaves nothing behind (§3.4).
-        lease = store_module.read_lease(conn, run.id)
+        lease = store_leases.read_lease(conn, run.id)
         now = _utcnow()
         if lease is not None and control.lease_is_live(lease, now=now):
             raise _reset_live_error(lease, now)

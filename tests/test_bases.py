@@ -34,7 +34,8 @@ from agent_manager import bases, dispatch, models
 from agent_manager.dag import RootPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime.stop import StopSignal
-from agent_manager.store import Checkpoint, Store
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store.writer import Store
 
 BASE = "m7/base-cccccccc"
 ROOT = RootPlan("merged", BASE, ("A", "B"))
@@ -475,7 +476,7 @@ async def _resolve_build(
     run_id: str | None = RUN_ID,
     commands: tuple[str, ...] | list[str] = ("true",),
     stop: StopSignal | None = None,
-    resume_from: Checkpoint | None = None,
+    resume_from: store_checkpoints.Checkpoint | None = None,
 ) -> bases.BaseResult:
     """`bases.build` with the resolver parameters filled in. `resume_from` is
     passed only when given, so every earlier call is made exactly as before."""

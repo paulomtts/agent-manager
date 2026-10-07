@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_manager import board, locks, models
-from agent_manager.store import COMMENT_ATTEMPTS
+from agent_manager.store import outbox as store_outbox
 
 if TYPE_CHECKING:
     from agent_manager.runtime.walk import SubtaskSummary
-    from agent_manager.store import CommentRow, Store
+    from agent_manager.store.writer import Store
 
 CAP = 1500
 """Hard cap on one comment body, in characters (B4)."""
@@ -374,7 +374,7 @@ def enqueue(store: Store, comment: Comment, *, run_id: str, now: datetime) -> No
 
     A pass-through to `Store.enqueue_comment`: a key already queued, in any
     state, is left exactly as it was. Nothing is posted here; the caller
-    flushes. Nothing is caught: a lost lease raises `store.LeaseLostError`
+    flushes. Nothing is caught: a lost lease raises `store_leases.LeaseLostError`
     and writes no row.
     """
     store.enqueue_comment(
@@ -386,7 +386,7 @@ def enqueue(store: Store, comment: Comment, *, run_id: str, now: datetime) -> No
     )
 
 
-def _post_one(store: Store, row: CommentRow, root: Path, board_api: Any) -> None:
+def _post_one(store: Store, row: store_outbox.CommentRow, root: Path, board_api: Any) -> None:
     """Put `row` on its card unless its `am-key:` line is already there, then mark it.
 
     Called with the board write lock held. A comment whose body (trailing
@@ -404,16 +404,16 @@ def _post_one(store: Store, row: CommentRow, root: Path, board_api: Any) -> None
     store.mark_comment_posted(row.key, comment_id, datetime.now(timezone.utc))
 
 
-def _warning(row: CommentRow, attempts: int, error: Exception) -> str:
+def _warning(row: store_outbox.CommentRow, attempts: int, error: Exception) -> str:
     """The one report warning for a row whose post failed (B7, B8).
 
     `attempts` is `Store.record_comment_failure`'s new count; at
-    `COMMENT_ATTEMPTS` the store has already marked the row `abandoned`.
+    `store_outbox.COMMENT_ATTEMPTS` the store has already marked the row `abandoned`.
     """
     where = f"board comment {row.key} on card {row.card_id}"
-    if attempts >= COMMENT_ATTEMPTS:
+    if attempts >= store_outbox.COMMENT_ATTEMPTS:
         return f"{where} abandoned after {attempts} failed attempts: {error}"
-    return f"{where} not posted (attempt {attempts} of {COMMENT_ATTEMPTS}), will retry: {error}"
+    return f"{where} not posted (attempt {attempts} of {store_outbox.COMMENT_ATTEMPTS}), will retry: {error}"
 
 
 def flush(

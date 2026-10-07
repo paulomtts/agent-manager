@@ -31,7 +31,7 @@ from typing import Any, Literal
 
 from agent_manager import models, paths, prompt
 from agent_manager.runtime.errors import EngineError
-from agent_manager.store import Store
+from agent_manager.store.writer import Store
 from agent_manager.workflow import phases as phase_model
 
 _EMPTY = inspect.Parameter.empty

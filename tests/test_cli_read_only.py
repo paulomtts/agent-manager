@@ -13,7 +13,8 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_manager import cli, models, paths
-from agent_manager import store as store_module
+from agent_manager.store import db as store_db
+from agent_manager.store import writer as store_writer
 
 runner = CliRunner()
 
@@ -28,7 +29,7 @@ def _tree(root: Path) -> set[str]:
 
 
 def _record(root: Path, run_id: str = RUN_ID) -> None:
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -170,7 +171,7 @@ def test_readers_see_a_run_while_a_writer_holds_a_write_transaction(
     root = tmp_path / "live"
     root.mkdir()
     _record(root)
-    held = store_module.open_db(root)
+    held = store_db.open_db(root)
     try:
         held.execute("BEGIN IMMEDIATE")
         held.execute("UPDATE runs SET status = 'done'")

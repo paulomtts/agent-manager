@@ -35,8 +35,11 @@ from typing import Any
 import pytest
 from conftest import missing_binary
 
-from agent_manager import argv_guard, cli, detach, paths, store
+from agent_manager import argv_guard, cli, detach, paths
 from agent_manager.harness import launcher
+from agent_manager.store import db as store_db
+from agent_manager.store import leases as store_leases
+from agent_manager.store import queries as store_queries
 
 PREFIX = "m3"
 """Must equal the conftest's `MILESTONE_PREFIX`: the board fixture derives its branches with it."""
@@ -125,9 +128,9 @@ def _assert_neutral(pid: int, verify: str) -> None:
 
 
 def _recorded_launcher(root: Path, run_id: str) -> str:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        run = store.load_run(conn, run_id)
+        run = store_queries.load_run(conn, run_id)
     finally:
         conn.close()
     assert run is not None, run_id
@@ -240,10 +243,10 @@ def test_under_bwrap_an_agents_pkill_reaches_neither_the_engine_nor_the_stand_in
     ]
 
 
-def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
-    conn = store.open_db(cli.resolve_repo_dir(root))
+def _lease(root: Path, run_id: str) -> store_leases.LeaseRow | None:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
     try:
-        return store.read_lease(conn, run_id)
+        return store_leases.read_lease(conn, run_id)
     finally:
         conn.close()
 

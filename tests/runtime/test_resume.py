@@ -23,14 +23,15 @@ import pytest
 from pygents import Agent, AgentRegistry, ToolRegistry
 from pygents.errors import UnregisteredAgentError
 
-from agent_manager import models, paths, store as store_module
+from agent_manager import models, paths
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.steps.worktree import GitError
-from agent_manager.store import TurnFloor
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import writer as store_writer
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
@@ -50,7 +51,7 @@ class _Crash(BaseException):
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -471,7 +472,7 @@ def test_pending_phase_reads_a_parked_checkpoint(store):
 
 
 def test_pending_phase_prefers_the_turn_in_flight_over_the_queue():
-    checkpoint = store_module.Checkpoint(
+    checkpoint = store_checkpoints.Checkpoint(
         run_id=RUN_ID,
         card_id=CARD_ID,
         seq=0,
@@ -496,8 +497,8 @@ def test_a_done_checkpoint_has_no_pending_phase(store):
     assert runtime_engine.pending_phase(done) is None
 
 
-def _checkpoint_with(agent: dict) -> store_module.Checkpoint:
-    return store_module.Checkpoint(
+def _checkpoint_with(agent: dict) -> store_checkpoints.Checkpoint:
+    return store_checkpoints.Checkpoint(
         run_id=RUN_ID,
         card_id=CARD_ID,
         seq=0,
@@ -696,7 +697,7 @@ def _critic_fails_recording(seen: list[tuple[str, Adoption | None]]):
     return runner
 
 
-def _floors(opened) -> list[tuple[str, TurnFloor | None]]:
+def _floors(opened) -> list[tuple[str, store_checkpoints.TurnFloor | None]]:
     """Every checkpoint row's reason and floor, oldest first."""
     rows = opened.connection.execute(
         "SELECT c.reason, f.phase, f.loop, f.source_run, f.floor"
@@ -705,7 +706,7 @@ def _floors(opened) -> list[tuple[str, TurnFloor | None]]:
         " ORDER BY c.card_id, c.seq"
     ).fetchall()
     return [
-        (row[0], None if row[1] is None else TurnFloor(row[1], row[2], row[3], row[4]))
+        (row[0], None if row[1] is None else store_checkpoints.TurnFloor(row[1], row[2], row[3], row[4]))
         for row in rows
     ]
 
@@ -723,10 +724,10 @@ def test_a_carried_floor_survives_a_resume(store, monkeypatch):
     wf, crashed = _crash_in_the_loop(store)
     # The first run floored the turn it died in under its own id.
     assert crashed.reason == "turn"
-    assert crashed.floor == TurnFloor("spec", 1, RUN_ID, 0)
+    assert crashed.floor == store_checkpoints.TurnFloor("spec", 1, RUN_ID, 0)
     # As if that row had itself been carried from an earlier run: the resume
     # must keep the earlier run's id and number, not recompute its own.
-    carried = TurnFloor("spec", 1, "run-earlier", 7)
+    carried = store_checkpoints.TurnFloor("spec", 1, "run-earlier", 7)
     seen: list[tuple[str, Adoption | None]] = []
     taken: list[Adoption | None] = []
     take = RunDeps.take_adoption
@@ -752,7 +753,7 @@ def test_a_carried_floor_survives_a_resume(store, monkeypatch):
     assert summary.status == "escalated"
     assert _floors(store)[crashed.seq + 1:] == [
         ("turn", carried),
-        ("turn", TurnFloor("validate_spec", 1, RUN_ID, 0)),
+        ("turn", store_checkpoints.TurnFloor("validate_spec", 1, RUN_ID, 0)),
         ("escalated", None),
     ]
 
@@ -771,7 +772,7 @@ def test_a_floorless_row_resumes_with_a_fresh_floor(store):
     )
 
     assert seen[0] == ("spec", None)
-    assert _floors(store)[crashed.seq + 1] == ("turn", TurnFloor("spec", 1, RUN_ID, 2))
+    assert _floors(store)[crashed.seq + 1] == ("turn", store_checkpoints.TurnFloor("spec", 1, RUN_ID, 2))
 
 
 # ── a resume re-ensures a missing worktree (card f76af5b2) ───────────────────
@@ -911,7 +912,7 @@ def test_a_deleted_worktree_whose_branch_survives_is_re_added_and_resumed(
     """Spec test 2: the checkpoint is kept, and so is its carried floor."""
     ran, wf, crashed = _crash_in_c(store)
     assert _next_turn(crashed.agent)["kwargs"] == {"phase": "c", "loop": 0}
-    carried = TurnFloor("c", 0, "run-earlier", 7)
+    carried = store_checkpoints.TurnFloor("c", 0, "run-earlier", 7)
     worktree_dir.rmdir()
     fake = _FakeEnsure(KEPT)
     adoptions = _record_adoptions(monkeypatch)
@@ -947,7 +948,7 @@ def test_a_deleted_worktree_whose_branch_is_gone_starts_over(store, worktree_dir
         wf,
         store,
         # A floor on the declined row must not be carried into the fresh walk.
-        resume_from=dataclasses.replace(crashed, floor=TurnFloor("c", 0, "run-earlier", 7)),
+        resume_from=dataclasses.replace(crashed, floor=store_checkpoints.TurnFloor("c", 0, "run-earlier", 7)),
         ensure_worktree=fake,
     )
 

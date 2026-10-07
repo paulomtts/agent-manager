@@ -17,9 +17,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, dispatch, prompt, store
+from agent_manager import board, cli, dispatch, prompt
 from agent_manager.harness.launcher import run_direct
 from agent_manager.steps import docs_commit
+from agent_manager.store import db as store_db
+from agent_manager.store import queries as store_queries
 from agent_manager.workflow import task as task_workflow
 
 AGENT_PHASES = (
@@ -486,9 +488,9 @@ def test_a_usage_limit_far_away_escalates_naming_the_reset_time(
     assert "--max-limit-wait 6h" in data["detail"], data["detail"]
     assert json.loads(armed.read_text(encoding="utf-8"))["explore"]["hits"] == 0
     assert read_fake_log(data["run_id"]) == []
-    conn = store.open_db(root)
+    conn = store_db.open_db(root)
     try:
-        assert store.load_run(conn, data["run_id"]).config.max_limit_wait_hours == 6
+        assert store_queries.load_run(conn, data["run_id"]).config.max_limit_wait_hours == 6
     finally:
         conn.close()
 

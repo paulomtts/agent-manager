@@ -72,14 +72,15 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 52 `.py` files (46 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 60 `.py` files (53 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
-| 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop`, `harness.limits` |
+| 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `store/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop`, `harness.limits` |
 | 1-4 | `census`, `results`, `roles.loader`, `steps.reducers`, `harness.claude_limits` (L1); `dag` (L2); `prompt` (L3); `workflow.phases` (L4) |
-| 5 | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude` |
-| 7 | `store` (splits into L5-L7) |
+| 5 | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, `store.db`, `store.journal` |
+| 6 | `store.replay`, `store.queries`, `store.leases`, `store.checkpoints`, `store.outbox` |
+| 7 | `store.writer` |
 | 8 | `board`, `control`, `harness.launcher`, `harness.registry` |
 | 9-10 | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` (L9); `steps.docs_commit`, `steps.integrate` (L10) |
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
@@ -193,11 +194,11 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 | Target module | L | Takes | Note |
 |---|---|---|---|
-| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `BUSY_TIMEOUT_SECONDS`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
-| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, the `JournalError` family, `_RETIRED_ATTEMPT_KEYS` | the schema contract (§10.1) |
-| `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_walk` and its helpers | pure over journal lines and rows |
-| `store/queries.py` | 6 | `RunSummary`, `RunProgress`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
-| `store/leases.py` | 6 | `RunLease`, `LeaseRow`, `ClaimRow`, `ControlRow`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
+| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
+| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, the `JournalError` family | the schema contract (§10.1) |
+| `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
+| `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
+| `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
 | `store/checkpoints.py` | 6 | `TurnFloor`, `Checkpoint`, readers, the SQL behind `save_checkpoint` | never commits |
 | `store/outbox.py` | 6 | `CommentRow`, `COMMENT_ATTEMPTS`, the SQL behind enqueue/pending/mark | never commits |
 | `store/writer.py` | 7 | `Store` | §6.4 |

@@ -17,7 +17,9 @@ from typing import Any
 import pytest
 from pygents import Agent, Turn, tool
 
-from agent_manager import models, paths, store as store_module
+from agent_manager import models, paths
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime import checkpoint
 from agent_manager.runtime import engine as runtime_engine
@@ -36,7 +38,7 @@ FIXED = datetime(2026, 9, 26, tzinfo=timezone.utc)
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -444,7 +446,7 @@ def _seed_attempts(phase: str, count: int) -> None:
         paths.attempt_dir(RUN_ID, CARD_ID, phase, attempt)
 
 
-def _saved_floor(opened) -> store_module.TurnFloor | None:
+def _saved_floor(opened) -> store_checkpoints.TurnFloor | None:
     return opened.latest_checkpoint(CARD_ID).floor
 
 
@@ -453,13 +455,13 @@ def test_an_agent_turn_records_the_highest_attempt_on_disk(store):
 
     _save(_deps(store), _Stored(current=_turn("explore", 0)), "turn")
 
-    assert _saved_floor(store) == store_module.TurnFloor("explore", 0, RUN_ID, 2)
+    assert _saved_floor(store) == store_checkpoints.TurnFloor("explore", 0, RUN_ID, 2)
 
 
 def test_an_agent_turn_with_no_attempts_records_floor_zero(store):
     _save(_deps(store), _Stored(current=_turn("explore", 0)), "turn")
 
-    assert _saved_floor(store) == store_module.TurnFloor("explore", 0, RUN_ID, 0)
+    assert _saved_floor(store) == store_checkpoints.TurnFloor("explore", 0, RUN_ID, 0)
 
 
 def test_a_parked_row_records_the_floor_of_its_queue_head(store):
@@ -467,7 +469,7 @@ def test_a_parked_row_records_the_floor_of_its_queue_head(store):
 
     _save(_deps(store), _Stored(queue=(_turn("explore", 1), _turn("commit", 1))), "parked")
 
-    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, RUN_ID, 1)
+    assert _saved_floor(store) == store_checkpoints.TurnFloor("explore", 1, RUN_ID, 1)
 
 
 def test_the_turn_in_flight_wins_over_the_queue_head(store):
@@ -531,7 +533,7 @@ def test_a_matching_adoption_is_carried_unchanged(store):
 
     _save(deps, _Stored(current=_turn("explore", 1)), "turn")
 
-    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, "run-earlier", 7)
+    assert _saved_floor(store) == store_checkpoints.TurnFloor("explore", 1, "run-earlier", 7)
     assert deps.adopt == adoption  # save reads the adoption, never consumes it
 
 
@@ -547,4 +549,4 @@ def test_a_non_matching_adoption_is_recomputed(store, adoption):
 
     _save(_deps(store, adopt=adoption), _Stored(current=_turn("explore", 1)), "turn")
 
-    assert _saved_floor(store) == store_module.TurnFloor("explore", 1, RUN_ID, 2)
+    assert _saved_floor(store) == store_checkpoints.TurnFloor("explore", 1, RUN_ID, 2)
