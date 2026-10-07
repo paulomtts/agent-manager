@@ -30,6 +30,7 @@ from agent_manager import (
 )
 from agent_manager.errors import AgentPhaseFailed, LimitWaitInterrupted
 from agent_manager.runtime.errors import EngineError
+from agent_manager.harness import limits
 from agent_manager.harness.base import Outcome
 from agent_manager.roles.loader import load_role
 from agent_manager.runtime import bridge, state as run_state, walk
@@ -2515,10 +2516,10 @@ def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
 
 # -- usage-limit waits ---------------------------------------------------------
 
-LIMIT_SESSION = "You've hit your session limit · resets 2:30pm (America/Sao_Paulo)\n"
-LIMIT_WEEKLY = "You've hit your weekly limit · resets Oct 9, 8pm (America/Sao_Paulo)\n"
-LIMIT_LATER = "You've hit your session limit · resets 5pm (America/Sao_Paulo)\n"
-LIMIT_UNKNOWN = "You've hit your session limit\n"
+LIMIT_SESSION = "LIMIT session 2026-10-07T17:30:00+00:00\n"
+LIMIT_WEEKLY = "LIMIT weekly 2026-10-09T23:00:00+00:00\n"
+LIMIT_LATER = "LIMIT session 2026-10-07T20:00:00+00:00\n"
+LIMIT_UNKNOWN = "LIMIT session none\n"
 PLAIN_FAILURE = "something broke\n"
 SUCCEEDS = "ok"
 NOW = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
@@ -2564,10 +2565,25 @@ class ScriptedLauncher:
         )
 
 
+class LimitAdapter(FakeAdapter):
+    """A fake adapter that reports a limit hit from a generic `LIMIT <kind> <ISO|none>` line."""
+
+    def limit_hit(self, stdout_path, now):
+        for line in stdout_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("LIMIT "):
+                _, kind, reset = line.split()
+                return limits.LimitHit(
+                    kind, None if reset == "none" else datetime.fromisoformat(reset), line
+                )
+        return None
+
+
 def _limit_runner(store, script, tmp_path, worktree, **overrides):
     clock = FakeClock()
     launcher = ScriptedLauncher(script)
     overrides.setdefault("sleeper", clock.sleep)
+    overrides.setdefault("max_limit_wait_hours", 8)
+    overrides.setdefault("adapter", LimitAdapter())
     runner, _ = _runner(store, launcher, tmp_path, worktree, clock=clock, **overrides)
     return runner, launcher, clock
 
@@ -2738,12 +2754,50 @@ def test_only_a_failing_exit_can_be_a_limit_hit(tmp_path):
     log = tmp_path / "stdout.log"
     log.write_text(LIMIT_SESSION, encoding="utf-8")
 
-    failing = dispatch.classify(Outcome(["x"], 1, False, 1.0, log), None, None, lambda: NOW)
-    clean = dispatch.classify(Outcome(["x"], 0, False, 1.0, log), None, None, lambda: NOW)
+    adapter = LimitAdapter()
+    failing = dispatch.classify(Outcome(["x"], 1, False, 1.0, log), None, None, lambda: NOW, adapter)
+    clean = dispatch.classify(Outcome(["x"], 0, False, 1.0, log), None, None, lambda: NOW, adapter)
+    blind = dispatch.classify(
+        Outcome(["x"], 1, False, 1.0, log), None, None, lambda: NOW, FakeAdapter()
+    )
 
     assert failing.status == "harness_error"
     assert failing.limit.kind == "session"
     assert clean == dispatch.Verdict("ok")
+    assert blind.status == "harness_error"
+    assert blind.limit is None
+
+
+def test_by_default_a_limit_hit_escalates_at_once_without_spending_any_budget(
+    store, tmp_path, worktree
+):
+    runner, launcher, clock = _limit_runner(
+        store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree, max_limit_wait_hours=0
+    )
+    default = dispatch.AgentRunner.__dataclass_fields__["max_limit_wait_hours"].default
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        _explore(runner, worktree)
+
+    assert default == 0
+    assert caught.value.outcome == "harness_error"
+    assert caught.value.detail.startswith(
+        "usage limit hit (session, resets at 2026-10-07T17:30:00+00:00)"
+    )
+    assert "harness exited" not in caught.value.detail
+    assert launcher.calls == 1
+    assert clock.sleeps == []
+
+
+def test_a_harness_without_limit_reporting_keeps_the_ordinary_harness_error_path(
+    store, tmp_path, worktree
+):
+    runner, launcher, _ = _limit_runner(
+        store, [LIMIT_SESSION, SUCCEEDS], tmp_path, worktree, adapter=FakeAdapter()
+    )
+
+    assert _explore(runner, worktree) == {"summary": "explored the tree", "ok": True}
+    assert any("dispatching once more" in warning for warning in runner.warnings)
 
 
 def test_the_default_runner_factory_restores_the_runs_recorded_limit_wait(store, tmp_path):

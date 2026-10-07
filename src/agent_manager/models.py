@@ -172,8 +172,8 @@ class HarnessAssignment(_Model):
     model: str = Field(min_length=1)
 
 
-DEFAULT_MAX_LIMIT_WAIT_HOURS = 8.0
-"""The longest usage-limit wait a run accepts before escalating (`--max-limit-wait`)."""
+DEFAULT_MAX_LIMIT_WAIT_HOURS = 0.0
+"""The longest usage-limit wait a run accepts before escalating (`--max-limit-wait`); 0 never waits."""
 
 max_limit_wait_default: ContextVar[float] = ContextVar(
     "max_limit_wait_default", default=DEFAULT_MAX_LIMIT_WAIT_HOURS

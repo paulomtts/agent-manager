@@ -12,8 +12,8 @@ Three rules shape everything here, and none of them is negotiable:
   `LauncherFn`, which is what keeps `bwrap` a later swap and every test above
   the launcher process-free. `subprocess` is deliberately not imported.
 - D4 / §6 step 5: the contract is `result.json`. `stdout.log` is captured as a
-  log; the engine reads its tail only after a non-zero exit, to recognise a
-  usage-limit hit (`harness/limits.py`), never as a result.
+  log; after a non-zero exit the adapter may read its tail to report a usage-limit
+  hit (`HarnessAdapter.limit_hit`), never as a result.
 - §6 step 3: the attempt directory comes from `paths.attempt_dir`, which is
   rooted under `paths.data_dir()` and therefore outside every worktree -- a
   result file written inside the worktree would fail the verify step's
@@ -229,6 +229,7 @@ def classify(
     result_path: Path | None,
     model: type[BaseModel] | None,
     clock: Callable[[], datetime] | None = None,
+    adapter: Any = None,
 ) -> Verdict:
     """One attempt's outcome, from the launcher's report and the result file.
 
@@ -244,9 +245,9 @@ def classify(
     file the harness wrote anyway is not adopted as a result. `result_path` is
     never dereferenced on that path, so `None` is accepted and it never raises.
 
-    A non-zero exit whose log ends in a usage-limit line is still a
-    `harness_error`, with `limit` set; `clock` anchors a reset time that names
-    no date.
+    A non-zero exit that `adapter.limit_hit` (when it has one) reports as a
+    usage-limit hit is still a `harness_error`, with `limit` set; `clock`
+    anchors a reset time the harness states without a date.
 
     A verdict of `ok` here means "the result file is good"; the gates run after
     and may still turn it into `gate_failed`.
@@ -263,7 +264,8 @@ def classify(
             timed_out=True,
         )
     if outcome.exit_code != 0:
-        hit = limits.read_limit(outcome.stdout_path, clock or _utcnow)
+        reporter = getattr(adapter, "limit_hit", None)
+        hit = None if reporter is None else reporter(outcome.stdout_path, (clock or _utcnow)())
         return Verdict(
             "harness_error", detail=f"the harness exited {outcome.exit_code}", limit=hit
         )
@@ -407,7 +409,7 @@ class AgentRunner:
     clock: Clock = _utcnow
     warnings: list[str] = field(default_factory=list)
     max_limit_wait_hours: float = models.DEFAULT_MAX_LIMIT_WAIT_HOURS
-    """Longest wait for a usage-limit reset; a later reset escalates, 0 never waits."""
+    """Longest wait for a usage-limit reset; a later reset escalates, 0 (the default) never waits."""
     sleeper: Callable[[float], None] = time.sleep
     limit_margin: float = LIMIT_MARGIN
     unknown_reset_backoff: float = UNKNOWN_RESET_BACKOFF
@@ -651,6 +653,7 @@ class AgentRunner:
             None if model is None else dispatch_record.result_path,
             model,
             self.clock,
+            target.adapter,
         )
         if verdict.status == "ok":
             # The one evaluator both phase kinds share (S3). `pass` and `warn`

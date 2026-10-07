@@ -321,14 +321,19 @@ Limits, stated plainly:
 
 #### Usage limits
 
-A Claude account's usage limit is shared by every `claude` process on the machine, so a run that hits it is not failing: it is out of quota until the limit resets. When an attempt exits non-zero and its `stdout.log` ends in a line like `You've hit your session limit · resets 2:30pm (America/Sao_Paulo)` (or `You've hit your weekly limit · resets Oct 9, 8pm (America/Sao_Paulo)`), `am` waits the limit out instead of retrying at once or escalating:
+An account's usage limit is shared by every harness process on the machine, so a run that hits it is not failing: it is out of quota until the limit resets. A harness adapter can recognise this on a failed exit (the `claude` adapter does; an adapter that cannot says nothing, and its failures stay ordinary `harness_error`s). A recognised hit has a kind (`session`, `weekly` or `other`) and, when the harness states it, a reset time.
 
-- The attempt is not counted. It uses up neither the phase's retry budget nor the one free redispatch of a `harness_error`, and the phase dispatches again, with the same brief, once the reset time plus a 60 second margin has passed. The failed dispatch stays recorded as an attempt with status `harness_error`, and the next dispatch is the next attempt number.
-- While it waits, the phase is recorded `started` with `detail` `waiting for usage limit reset at <ISO time> (<session|weekly> limit)` (a `phase_upsert` line, see [The journal line](#the-journal-line)), and `detail` is cleared when the wait ends. The run's lease keeps its heartbeat, so `am status` shows it live. `am pause` and `am cancel` are noticed within a few seconds: the run parks before that phase and `am resume` dispatches it again. A wait adds one line to `data.warnings`; the envelopes have no other new key.
-- `--max-limit-wait HOURS` (default 8) is the longest wait a run accepts. A reset further away escalates the phase as a `harness_error`, with a `detail` that names the reset time, for example `usage limit hit (weekly, resets at 2026-10-09T23:00:00+00:00): ... that is 51.0h away, over --max-limit-wait 8h`. `--max-limit-wait 0` never waits. The value is recorded in the run's config as `max_limit_wait_hours` and a resume reuses it; it is an option of `am run`, not of `am resume`.
-- A hit whose reset time cannot be read (no time, or a timezone this machine does not know) is waited out for a fixed 15 minutes, at most 4 times per phase run. More than 6 waits in one phase run escalate too.
+By default a hit escalates the phase at once. It is not retried, and it uses up neither the phase's retry budget nor the one free redispatch of a `harness_error`. Its `detail` names the kind and the reset time, for example `usage limit hit (session, resets at 2026-10-07T17:30:00+00:00): ...; waiting is disabled (--max-limit-wait 0)`, instead of `the harness exited 1`. The attempt is still recorded with status `harness_error`.
 
-What `am` does not know: the wording of limit messages other than the two above. A line must start with `You've hit your ... limit` to be recognised; anything else is still an ordinary `harness_error`. Only `claude` is parsed. `--max-limit-wait` raises the phase's turn timeout by the time the waits can take, so a wait is never cut short by the engine.
+`--max-limit-wait HOURS` (default 0, which never waits) opts in to waiting it out:
+
+- The phase waits until the reset time plus a 60 second margin and dispatches again, with the same brief. The failed dispatch stays recorded as a `harness_error` attempt, and the next dispatch is the next attempt number. Nothing is counted against the phase.
+- A reset further away than HOURS escalates the phase with a `detail` that names the reset time, for example `usage limit hit (weekly, resets at 2026-10-09T23:00:00+00:00): ...; that is 51.0h away, over --max-limit-wait 8h`.
+- While it waits, the phase is recorded `started` with `detail` `waiting for usage limit reset at <ISO time> (<kind> limit)` (a `phase_upsert` line, see [The journal line](#the-journal-line)), and `detail` is cleared when the wait ends. The run's lease keeps its heartbeat, so `am status` shows it live. `am pause` and `am cancel` are noticed within a few seconds: the run parks before that phase and `am resume` dispatches it again. A wait adds one line to `data.warnings`; the envelopes have no other new key.
+- A hit with no reset time is waited out for a fixed 15 minutes, at most 4 times per phase run. More than 6 waits in one phase run escalate too.
+- The phase's turn timeout grows by the time the waits can take, so the engine never cuts a wait short.
+
+The value is recorded in the run's config as `max_limit_wait_hours` and a resume reuses it; it is an option of `am run`, not of `am resume`, and must not be negative. What `am` does not know is how each harness words its limit messages: an unrecognised message is an ordinary `harness_error`.
 
 #### Parallel runs
 

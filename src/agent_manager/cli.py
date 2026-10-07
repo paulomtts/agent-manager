@@ -1786,9 +1786,10 @@ def run(
         "--max-limit-wait",
         min=0,
         help=(
-            "Hours a phase may wait for a Claude usage limit (session or weekly) "
-            "to reset before it escalates; the wait does not use up an attempt. "
-            "0 never waits. Recorded in the run and kept on resume."
+            "Hours a phase may wait for a harness usage limit to reset before it "
+            "escalates; a wait does not use up an attempt. The default 0 never "
+            "waits: a limit hit escalates at once, naming the reset time. "
+            "Recorded in the run and kept on resume."
         ),
     ),
     max_concurrent: int | None = typer.Option(

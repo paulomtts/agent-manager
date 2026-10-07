@@ -20,9 +20,11 @@ file -- to the engine.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from agent_manager.harness.limits import LimitHit
 from agent_manager.models import Dispatch
 
 
@@ -71,3 +73,19 @@ class HarnessAdapter(Protocol):
     capabilities: frozenset[str]
 
     def build_command(self, d: Dispatch) -> list[str]: ...
+
+
+class LimitReporting(Protocol):
+    """The optional capability of an adapter that can tell a usage-limit hit.
+
+    An adapter that cannot simply omits `limit_hit`; the engine then treats
+    every failed exit as an ordinary `harness_error`. The format of whatever
+    the harness prints is the adapter's alone.
+    """
+
+    def limit_hit(self, stdout_path: Path, now: datetime) -> LimitHit | None:
+        """The hit the log at `stdout_path` reports after a failed exit, else `None`.
+
+        `now` anchors a reset time the harness states without a date.
+        """
+        ...

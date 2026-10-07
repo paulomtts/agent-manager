@@ -1097,8 +1097,8 @@ def test_attempt_status_does_not_pick_up_cancelled(status):
         models.Attempt(n=1, dispatch=_dispatch(), status=status)
 
 
-def test_run_config_max_limit_wait_defaults_to_eight_hours_and_is_bounded_below():
-    assert models.RunConfig().max_limit_wait_hours == 8.0
+def test_run_config_max_limit_wait_defaults_to_never_waiting_and_is_bounded_below():
+    assert models.RunConfig().max_limit_wait_hours == 0.0
     assert models.RunConfig(max_limit_wait_hours=0).max_limit_wait_hours == 0
     with pytest.raises(ValidationError):
         models.RunConfig(max_limit_wait_hours=-1)
@@ -1114,4 +1114,4 @@ def test_a_new_run_config_records_the_cli_default_but_a_recorded_one_keeps_its_o
         models.max_limit_wait_default.reset(token)
 
     assert recorded.max_limit_wait_hours == 6
-    assert models.RunConfig.model_validate({}).max_limit_wait_hours == 8.0
+    assert models.RunConfig.model_validate({}).max_limit_wait_hours == 0.0

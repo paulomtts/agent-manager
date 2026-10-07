@@ -518,6 +518,7 @@ def test_a_usage_limit_hit_is_waited_out_and_the_same_phase_dispatches_again(
             card_id=card_id,
             clock=lambda: clock["now"],
             sleeper=sleep,
+            max_limit_wait_hours=8,
         )
 
     line = "You've hit your session limit · resets 5pm (UTC)"

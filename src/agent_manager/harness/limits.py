@@ -1,46 +1,28 @@
-"""Recognising a Claude usage-limit failure in a harness log.
+"""What a harness adapter reports when its account's usage limit is spent.
 
-The account's limit is shared by every process on the machine, so a hit is not
-a fault of the attempt that met it. `parse_limit` reads the one line the CLI
-prints, `You've hit your <kind> limit · resets <when> (<tz>)`, and nothing
-else: prose that merely mentions a limit never matches, because the line must
-start with the phrase.
+The limit is shared by every process on the machine, so a hit says nothing
+about the attempt that met it. An adapter that can recognise one implements
+`HarnessAdapter.limit_hit` and returns a `LimitHit`; the message format is
+the adapter's alone, and nothing outside the adapter reads it.
 """
 
-import re
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-LimitKind = Literal["session", "weekly"]
+LimitKind = Literal["session", "weekly", "other"]
 
 TAIL_BYTES = 16384
-"""How much of a log's end `read_limit` looks at; the limit line is the last thing printed."""
-
-_LINE = re.compile(
-    r"^\s*You(?:'|’)ve hit your (?P<kind>.*?) limit\b(?P<rest>.*)$", re.IGNORECASE
-)
-_RESETS = re.compile(r"\bresets\s+(?P<when>[^()]*?)\s*(?:\((?P<tz>[^()]+)\))?\s*$", re.IGNORECASE)
-_TIME = re.compile(r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>[ap]m)\b", re.IGNORECASE)
-_DATE = re.compile(r"(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})\b")
-_MONTHS = {
-    name: number
-    for number, name in enumerate(
-        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1
-    )
-}
+"""How much of a log's end `read_tail` returns."""
 
 
 @dataclass(frozen=True)
 class LimitHit:
-    """A parsed usage-limit line.
+    """A usage-limit hit.
 
-    `resets_at` is timezone-aware (UTC), or `None` when the line names no
-    reset, an unparseable one or a timezone this machine cannot resolve. `raw`
-    is the matched line, stripped.
+    `resets_at` is timezone-aware, or `None` when the adapter could not tell
+    when the limit resets. `raw` is the adapter's own text for the hit.
     """
 
     kind: LimitKind
@@ -48,70 +30,12 @@ class LimitHit:
     raw: str
 
 
-def parse_limit(text: str, now: datetime) -> LimitHit | None:
-    """The limit hit `text` reports, or `None`; `now` anchors a reset that names no date.
-
-    A bare time resets at its next occurrence after `now` in the named zone; a
-    `<Mon> <d>` date resets this year, or next year when that has passed. The
-    last matching line wins.
-    """
-    found: LimitHit | None = None
-    for line in text.splitlines():
-        match = _LINE.match(line)
-        if match is None:
-            continue
-        kind: LimitKind = "weekly" if "week" in match["kind"].lower() else "session"
-        found = LimitHit(kind, _resets_at(match["rest"], now), line.strip())
-    return found
-
-
-def _resets_at(rest: str, now: datetime) -> datetime | None:
-    resets = _RESETS.search(rest)
-    if resets is None or resets["tz"] is None:
-        return None
-    try:
-        zone = ZoneInfo(resets["tz"].strip())
-    except (ZoneInfoNotFoundError, ValueError, OSError):
-        return None
-    when = resets["when"]
-    time = _TIME.search(when)
-    if time is None:
-        return None
-    hour, minute = int(time["hour"]), int(time["minute"] or 0)
-    if not 1 <= hour <= 12 or minute > 59:
-        return None
-    hour = hour % 12 + (12 if time["meridiem"].lower() == "pm" else 0)
-    local_now = now.astimezone(zone)
-    named = _DATE.search(when[: time.start()])
-    try:
-        if named is None:
-            candidate = _wall(local_now.date(), hour, minute, zone)
-            if candidate <= local_now:
-                candidate = _wall(local_now.date() + timedelta(days=1), hour, minute, zone)
-        else:
-            month = _MONTHS.get(named["month"][:3].lower())
-            if month is None:
-                return None
-            day = int(named["day"])
-            candidate = datetime(local_now.year, month, day, hour, minute, tzinfo=zone)
-            if candidate <= local_now:
-                candidate = datetime(local_now.year + 1, month, day, hour, minute, tzinfo=zone)
-    except ValueError:
-        return None
-    return candidate.astimezone(timezone.utc)
-
-
-def _wall(day: date, hour: int, minute: int, zone: ZoneInfo) -> datetime:
-    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
-
-
-def read_limit(path: Path, clock: Callable[[], datetime]) -> LimitHit | None:
-    """`parse_limit` over the tail of the log at `path`; `None` when it cannot be read."""
+def read_tail(path: Path) -> str | None:
+    """The last `TAIL_BYTES` of the log at `path` as text, or `None` when it cannot be read."""
     try:
         with path.open("rb") as log:
             log.seek(0, 2)
             log.seek(max(0, log.tell() - TAIL_BYTES))
-            text = log.read().decode("utf-8", errors="replace")
+            return log.read().decode("utf-8", errors="replace")
     except OSError:
         return None
-    return parse_limit(text, clock())

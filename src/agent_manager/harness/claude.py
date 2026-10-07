@@ -11,10 +11,16 @@ want.
 Two rules shape everything here. `build_command` is pure: it reads no file,
 starts no process and consults no clock, so `launcher.py` (injected by the
 engine, §14 line 485) stays the only thing in the program that runs anything.
-And the adapter reads nothing back: D4 makes the harness's stdout a log rather
-than a channel, so once the argv is built the adapter's job is done.
+And the adapter reads nothing back for results: D4 makes the harness's stdout
+a log rather than a channel. The one exception is `limit_hit`, which only tells
+the engine that a failed exit was a usage limit.
 """
 
+from datetime import datetime
+from pathlib import Path
+
+from agent_manager.harness.claude_limits import read_limit
+from agent_manager.harness.limits import LimitHit
 from agent_manager.models import Dispatch
 
 COMMAND = "claude"
@@ -53,6 +59,10 @@ class ClaudeAdapter:
     Claiming less than the truth refuses a phase early, which is the safe
     direction. Methodology is never listed -- D6 makes it vendored prompt text.
     """
+
+    def limit_hit(self, stdout_path: Path, now: datetime) -> LimitHit | None:
+        """The usage-limit hit the `claude` log reports, else `None` (`harness.claude_limits`)."""
+        return read_limit(stdout_path, lambda: now)
 
     def build_command(self, d: Dispatch) -> list[str]:
         """The argv for one attempt. Pure: no disk, no clock, no process.
