@@ -48,7 +48,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 15 | Runtime | `runtime.checkpoint`, `runtime.compile` | Checkpoint hooks; the workflow compiled into pygents tools |
 | 16 | Runtime | `runtime.engine` | One subtask, one agent, one loop |
 | 17 | Application | `runs`, `comments`, *`envelope`* | Run identity and the shared subtask driver; the comment outbox; the envelope and exit-code contract |
-| 18 | Application | *`handoff`*, *`resolver`*, *`reset`* | The generic detach hand-off; the one conflict resolver; `am reset` |
+| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases into `am.db` |
 | 19 | Application | `bases`, `integration`, *`card_run`* | The merged base; Integrate; the `--card` run |
 | 20 | Application | *`milestone.plan`*, *`milestone.payloads`* | Pure story plan; lane outcome types and report shapes |
 | 21 | Application | *`milestone.lane`* | The per-story state machine |
@@ -72,7 +72,7 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 60 `.py` files (53 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 61 `.py` files (54 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
@@ -86,6 +86,7 @@ All 60 `.py` files (53 modules plus 7 `__init__.py`) appear here exactly once. `
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
 | 13-16 | `runtime.walk`, `runtime.bridge`, `runtime.state` (L13); `runtime.context`, `dispatch` (L14); `runtime.checkpoint`, `runtime.compile` (L15); `runtime.engine` (L16) |
 | 17 | `runs`, `comments` |
+| 18 | `migrate` |
 | 19 | `bases`, `integration` |
 | 24 | `orchestrate` (splits into L19-L24) |
 | 29 | `cli` (splits into L17-L29) |
