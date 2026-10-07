@@ -37,7 +37,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
 | 5 | Adapters | `locks`, `detach`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; the harness Protocol and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
 | 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`*, *`store.projects`*, *`store.events`* | Replay and divergence; read models; per-table row types and SQL; `projects` rows resolved or created by `repo_dir`; append-only `events` rows: insert, reads by `seq`, head (they never commit) |
-| 7 | Adapters | *`store.writer`*, *`store.legacy`* | `Store`: every write, as a job on one writer thread, under the fence (§6.4); legacy per-project databases read through a private copy and merged into `am.db` in one transaction |
+| 7 | Adapters | *`store.writer`*, *`store.legacy`* | `Store`: every write, as a job on one writer thread, under the fence (§6.4); legacy per-project databases read through a private copy and merged into `am.db`, their runs' journals imported into `events` in the same one transaction, marker last |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
 | 9 | Steps | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` | Deterministic steps |
 | 10 | Steps | `steps.docs_commit`, `steps.integrate` | Steps built on `steps.worktree` |
@@ -204,7 +204,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | `store/projects.py` | 6 | `resolve`, `lookup`: the `projects` rows, resolved or created by `repo_dir` | never commits |
 | `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
 | `store/writer.py` | 7 | `Store` | §6.4 |
-| `store/legacy.py` | 7 | `LegacyFile`, `read_legacy`, `merge` and their errors: legacy per-project databases read through a private copy and merged into `am.db` | commits only its one merge transaction |
+| `store/legacy.py` | 7 | `LegacyFile`, `read_legacy`, `import_order`, `merge` and their errors: legacy per-project databases read through a private copy and merged into `am.db`; run journals imported into `events` in `import_order` in the same one merge transaction, marker last | commits only its one merge transaction; imports `store/events.py` and `store/journal.py`, both lower layers |
 
 ### 6.4 What stays in one piece
 

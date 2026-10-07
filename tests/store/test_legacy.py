@@ -406,3 +406,141 @@ def test_import_order_compares_instants_not_text():
 
 def test_import_order_of_no_journals_is_empty():
     assert store_legacy.import_order([]) == []
+
+
+# -- merge(journals=...): journal lines become imported events (1.3.2 D1) -----
+
+
+def _journal_file(run_id: str, lines: list[dict[str, object]]) -> store_journal.VerbatimJournal:
+    return store_journal.read_verbatim(write_journal(run_id, lines), run_id)
+
+
+def test_merge_inserts_journal_lines_as_imported_events_in_import_order(tmp_path, am):
+    first = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    second = _legacy(tmp_path, "b.db", full_rows("run-b", tmp_path / "beta"))
+    run_a = _journal_file(
+        "run-a",
+        [
+            journal_line("run-a", 1, "2026-10-07T12:00:01+00:00"),
+            journal_line(
+                "run-a", 2, "2026-10-07T12:00:03.5+00:00", "story_upsert",
+                {"status": "done"}, story="s1",
+            ),
+        ],
+    )
+    run_b = _journal_file("run-b", [journal_line("run-b", 1, "2026-10-07T12:00:02Z")])
+
+    outcome = store_legacy.merge(am, [first, second], now=NOW, journals=[run_b, run_a])
+
+    assert outcome.events == {"run-a": 2, "run-b": 1}
+    project = {merged.path: merged.project_id for merged in outcome.merged}
+    rows = _observe("SELECT * FROM events ORDER BY seq")
+    assert [(row["run_id"], row["run_seq"], row["ts"]) for row in rows] == [
+        ("run-a", 1, "2026-10-07T12:00:01+00:00"),
+        ("run-b", 1, "2026-10-07T12:00:02Z"),
+        ("run-a", 2, "2026-10-07T12:00:03.5+00:00"),
+    ]
+    assert [row["project_id"] for row in rows] == [
+        project[first.path], project[second.path], project[first.path],
+    ]
+    assert {row["source"] for row in rows} == {"imported"}
+    assert (rows[2]["kind"], rows[2]["story_id"]) == ("story_upsert", "s1")
+    assert json.loads(rows[2]["payload"]) == {"status": "done"}
+    marker = _observe("SELECT value FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,))
+    assert [row["value"] for row in marker] == [store_db.iso(NOW)]
+
+
+def test_merge_counts_an_empty_journal_as_zero_events(tmp_path, am):
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    empty = _journal_file("run-a", [])
+
+    outcome = store_legacy.merge(am, [legacy], now=NOW, journals=[empty])
+
+    assert outcome.events == {"run-a": 0}
+    assert _observe("SELECT * FROM events") == []
+
+
+def test_merge_writes_the_marker_after_the_events_in_the_same_transaction(
+    tmp_path, am, monkeypatch
+):
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    journal = _journal_file(
+        "run-a", [journal_line("run-a", 1, STAMP), journal_line("run-a", 2, STAMP)]
+    )
+    real_insert = store_events.insert
+    calls: list[int] = []
+
+    def spy(conn, **kwargs):
+        marker = conn.execute(
+            "SELECT 1 FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)
+        ).fetchone()
+        assert marker is None, "the marker was written before an event"
+        calls.append(kwargs["run_seq"])
+        if len(calls) == 2:
+            raise RuntimeError("disk gone")
+        return real_insert(conn, **kwargs)
+
+    monkeypatch.setattr(store_events, "insert", spy)
+
+    with pytest.raises(RuntimeError, match="disk gone"):
+        store_legacy.merge(am, [legacy], now=NOW, journals=[journal])
+
+    assert calls == [1, 2]
+    assert not am.in_transaction
+    assert _observe("SELECT * FROM events") == []
+    assert _observe("SELECT * FROM projects") == []
+    assert _observe("SELECT * FROM runs") == []
+    assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
+
+
+def test_merge_reports_an_event_clash_as_a_row_clash_and_rolls_back(tmp_path, am):
+    with store_db.immediate(am):
+        other = store_projects.resolve(am, tmp_path / "other", now=NOW)
+        store_events.insert(
+            am, project_id=other, run_id="run-a", ts=STAMP, kind="run_upsert",
+            payload={}, source="live", run_seq=1,
+        )
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    journal = _journal_file("run-a", [journal_line("run-a", 1, STAMP)])
+
+    with pytest.raises(store_legacy.LegacyRowClashError) as raised:
+        store_legacy.merge(am, [legacy], now=NOW, journals=[journal])
+
+    assert raised.value.table == "events"
+    assert raised.value.path == journal.path
+    assert "events" in str(raised.value)
+    assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+    assert not am.in_transaction
+    assert len(_observe("SELECT * FROM projects")) == 1
+    assert _observe("SELECT * FROM runs") == []
+    assert len(_observe("SELECT * FROM events")) == 1
+    assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
+
+
+def test_merge_refuses_a_journal_of_no_merged_run_before_writing(tmp_path, am):
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    stray = _journal_file("run-z", [journal_line("run-z", 1, STAMP)])
+
+    with pytest.raises(ValueError, match="run-z"):
+        store_legacy.merge(am, [legacy], now=NOW, journals=[stray])
+
+    assert not am.in_transaction
+    assert _observe("SELECT * FROM projects") == []
+    assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
+
+
+def test_merge_with_the_marker_present_inserts_no_events(tmp_path, am):
+    with store_db.immediate(am):
+        am.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)", (store_db.MIGRATED_KEY, STAMP)
+        )
+    legacy = _legacy(tmp_path, "a.db", full_rows("run-a", tmp_path / "alpha"))
+    journal = _journal_file("run-a", [journal_line("run-a", 1, STAMP)])
+
+    outcome = store_legacy.merge(am, [legacy], now=NOW, journals=[journal])
+
+    assert outcome == store_legacy.MergeOutcome(
+        migrated_at=STAMP, already_migrated=True, merged=()
+    )
+    assert outcome.events == {}
+    assert _observe("SELECT * FROM events") == []

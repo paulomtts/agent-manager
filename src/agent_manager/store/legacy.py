@@ -1,24 +1,27 @@
 """Per-project databases from an older `am`: each read through a private copy
 that leaves the file and its sidecars untouched, and all of them merged into
-`am.db` in one write transaction."""
+`am.db`, with their runs' journals imported as events, in one write
+transaction."""
 
 import heapq
 import shutil
 import sqlite3
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 
 _NOT_COPIED = frozenset({"projects", "meta", "events"})
-"""`am.db` tables no legacy row is copied into: `merge` writes the project row
-and the marker itself, and no legacy row becomes an event."""
+"""`am.db` tables no legacy row is copied into: `merge` writes the project
+row, the imported events and the marker itself, and no legacy row becomes an
+event."""
 
 
 @dataclass(frozen=True)
@@ -167,13 +170,15 @@ class MergedFile:
 
 @dataclass(frozen=True)
 class MergeOutcome:
-    """What `merge` did. `migrated_at` is the marker's value. With
-    `already_migrated`, the marker was already there, so nothing was written
-    and `merged` is empty."""
+    """What `merge` did. `migrated_at` is the marker's value. `events` is the
+    rows inserted per run, one key per journal given, 0 included. With
+    `already_migrated`, the marker was already there, so nothing was written,
+    `merged` is empty and `events` is `{}`."""
 
     migrated_at: str
     already_migrated: bool
     merged: tuple[MergedFile, ...]
+    events: dict[str, int] = field(default_factory=dict)
 
 
 class LegacyRunClashError(RuntimeError):
@@ -234,21 +239,72 @@ def _copy(
     return len(source.rows)
 
 
-def merge(
-    conn: sqlite3.Connection, files: Sequence[LegacyFile], *, now: datetime
-) -> MergeOutcome:
-    """Merge `files` into `am.db` through `conn` in one `immediate` transaction.
+def _import(
+    conn: sqlite3.Connection,
+    journals: Sequence[store_journal.VerbatimJournal],
+    project_of: dict[str, int],
+) -> dict[str, int]:
+    """Insert every line of `journals`, in `import_order`, as an `imported`
+    event of its run's project in `project_of`; the rows inserted per run.
 
-    Each file must have exactly one `repo_dirs` value. Inside the transaction:
-    a `MIGRATED_KEY` row already in `meta` returns it as `already_migrated`
-    with nothing written; a run id of a file already in `runs` raises
-    `LegacyRunClashError`; then each file, in order, gets its project through
-    `store_projects.resolve` (an existing row is adopted) and its rows copied
-    into every `am.db` table but `projects`, `meta`, `events` and `sqlite_*`,
-    values verbatim; an `IntegrityError` there raises `LegacyRowClashError`;
-    last, `MIGRATED_KEY` is written as `store_db.iso(now)` and everything is
-    committed. Any raise rolls the whole transaction back.
+    `ts`, `run_seq` (the line's `seq`), the coordinates and the payload are
+    the line's own. An `IntegrityError` raises `LegacyRowClashError` naming
+    `events` and the journal's path.
     """
+    counts = {journal.run_id: 0 for journal in sorted(journals, key=lambda j: j.run_id)}
+    for journal, line in import_order(journals):
+        try:
+            store_events.insert(
+                conn,
+                project_id=project_of[journal.run_id],
+                run_id=journal.run_id,
+                ts=line.ts,
+                kind=line.kind,
+                payload=line.payload,
+                source="imported",
+                story_id=line.story_id,
+                card_id=line.card_id,
+                phase=line.phase,
+                attempt=line.attempt,
+                run_seq=line.run_seq,
+            )
+        except sqlite3.IntegrityError as error:
+            raise LegacyRowClashError("events", journal.path, str(error)) from error
+        counts[journal.run_id] += 1
+    return counts
+
+
+def merge(
+    conn: sqlite3.Connection,
+    files: Sequence[LegacyFile],
+    *,
+    now: datetime,
+    journals: Sequence[store_journal.VerbatimJournal] = (),
+) -> MergeOutcome:
+    """Merge `files` and `journals` into `am.db` through `conn` in one
+    `immediate` transaction.
+
+    Each file must have exactly one `repo_dirs` value, and each journal's
+    `run_id` must be in some file's `run_ids`: a journal of no file's run
+    raises `ValueError` before the transaction begins. Inside the
+    transaction: a `MIGRATED_KEY` row already in `meta` returns it as
+    `already_migrated` with nothing written; a run id of a file already in
+    `runs` raises `LegacyRunClashError`; then each file, in order, gets its
+    project through `store_projects.resolve` (an existing row is adopted) and
+    its rows copied into every `am.db` table but `projects`, `meta`, `events`
+    and `sqlite_*`, values verbatim; an `IntegrityError` there raises
+    `LegacyRowClashError`; then every journal line is inserted into `events`
+    by `_import`, under its run's project; last, `MIGRATED_KEY` is written as
+    `store_db.iso(now)` and everything is committed. Any raise rolls the
+    whole transaction back.
+    """
+    owned = {run_id for legacy in files for run_id in legacy.run_ids}
+    for journal in journals:
+        if journal.run_id not in owned:
+            raise ValueError(
+                f"journal {journal.path} is of run {journal.run_id!r},"
+                " which none of the files being merged has"
+            )
     with store_db.immediate(conn):
         found = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)
@@ -261,6 +317,7 @@ def merge(
                     raise LegacyRunClashError(run_id, legacy.path)
         targets = _copied_tables(conn)
         merged: list[MergedFile] = []
+        project_of: dict[str, int] = {}
         for legacy in files:
             (repo_dir,) = legacy.repo_dirs
             project_id = store_projects.resolve(conn, Path(repo_dir), now=now)
@@ -280,9 +337,16 @@ def merge(
                     ignored_tables=tuple(sorted(set(legacy.tables) - set(targets))),
                 )
             )
+            project_of.update(dict.fromkeys(legacy.run_ids, project_id))
+        events = _import(conn, journals, project_of)
         migrated_at = store_db.iso(now)
         conn.execute(
             "INSERT INTO meta (key, value) VALUES (?, ?)",
             (store_db.MIGRATED_KEY, migrated_at),
         )
-    return MergeOutcome(migrated_at=migrated_at, already_migrated=False, merged=tuple(merged))
+    return MergeOutcome(
+        migrated_at=migrated_at,
+        already_migrated=False,
+        merged=tuple(merged),
+        events=events,
+    )
