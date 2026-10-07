@@ -2298,13 +2298,14 @@ def test_an_engine_error_escaping_the_walk_reaches_the_operator(project, cards, 
 @pytest.mark.git
 def test_no_harness_is_ever_launched(project, cards, monkeypatch):
     """§14's adapter rule at the CLI seam: the launcher is injected, so a test
-    that gets as far as launching one has already failed. `run_direct` is the
-    only thing `default_runner_factory` would hand to a real `AgentRunner`."""
+    that gets as far as launching one has already failed. `launcher.get_launcher` is
+    the only source of what `default_runner_factory` would hand to a real
+    `AgentRunner`."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("the CLI launched a harness process")
 
-    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.launcher, "get_launcher", lambda kind: forbidden)
     monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
     payload = cli.run_card(
         cards["subtask"],
@@ -7935,7 +7936,7 @@ def test_resume_launches_no_harness(project, cards, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("resume launched a harness process")
 
-    monkeypatch.setattr(cli, "run_direct", forbidden)
+    monkeypatch.setattr(cli.launcher, "get_launcher", lambda kind: forbidden)
     monkeypatch.setattr(cli.dispatch, "AgentRunner", forbidden)
 
     payload = cli.resume_run(run_id, repo_dir=project, runner_factory=_resume_factory())
@@ -14277,3 +14278,59 @@ def test_verify_from_env_reaches_every_run_branch(tmp_path, monkeypatch, target,
 
     assert result.exit_code == 0, result.output
     assert seen == [(seam, ["a b", "c"])]
+
+
+# ── A5: --isolation, the recorded launcher, resume restore (card 97d4b709) ───
+
+ISOLATION_RUN_ID = "20260923T090000Z-cbe34d00"
+
+
+def test_the_production_runner_factory_launches_through_the_recorded_mode(
+    projection, monkeypatch
+):
+    """A5 spec test 11: the recorded `RunConfig.launcher` picks the launcher; no probe."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    asked: list[str] = []
+
+    def chosen(argv, *, cwd, timeout, stdout_path):
+        raise AssertionError("the factory launched a harness process")
+
+    def fake_get_launcher(kind):
+        asked.append(kind)
+        return chosen
+
+    monkeypatch.setattr(cli.launcher, "get_launcher", fake_get_launcher)
+    monkeypatch.setattr(
+        cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+    )
+    opened = store_module.Store.open(projection, ISOLATION_RUN_ID)
+    try:
+        built = cli.default_runner_factory(
+            store=opened, run_id=ISOLATION_RUN_ID, story_id="story-1", card_id="card-1"
+        )
+    finally:
+        opened.close()
+
+    assert asked == ["bwrap"]
+    assert isinstance(built, dispatch.AgentRunner)
+    assert built.launcher is chosen
+
+
+def test_the_production_runner_factory_refuses_a_run_with_no_row(projection):
+    """A5 B2: never a silent fallback to `direct`."""
+    missing = "20260923T090000Z-deadbeef"
+    opened = store_module.Store.open(projection, missing)
+    try:
+        with pytest.raises(cli.UnknownRunError, match=missing):
+            cli.default_runner_factory(
+                store=opened, run_id=missing, story_id="story-1", card_id="card-1"
+            )
+    finally:
+        opened.close()
+
+
+def test_cli_imports_the_launcher_module_and_not_run_direct():
+    assert cli.launcher.__name__ == "agent_manager.harness.launcher"
+    assert not hasattr(cli, "run_direct")

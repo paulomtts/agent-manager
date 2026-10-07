@@ -313,8 +313,8 @@ def get_launcher(kind: Launcher) -> LauncherFn:
 
     Never probes: whether this host can run `bwrap` or `unshare` is decided
     once, at run start, by `resolve_isolation`, and the mode it returns is the
-    one passed here. Not wired to a caller yet (`cli.py` still injects
-    `run_direct` by name). Failing here means failing before a single worktree
+    one passed here. `cli.default_runner_factory` calls it with the run's
+    recorded `RunConfig.launcher`. Failing here means failing before a single worktree
     is created, which is why `container` is named rather than omitted.
     """
     if kind not in LAUNCHERS:

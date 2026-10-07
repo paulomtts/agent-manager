@@ -54,7 +54,7 @@ from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
-from agent_manager.harness.launcher import run_direct
+from agent_manager.harness import launcher
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
@@ -708,16 +708,29 @@ def default_runner_factory(
     story_id: str,
     card_id: str,
 ) -> AgentPhaseRunner:
-    """The production runner: real adapters, real roles, the direct launcher.
+    """The production runner: real adapters, real roles, the run's recorded launcher.
+
+    The launcher mode is the run's `RunConfig.launcher`, read from the
+    projection on every call (A5 B2), so subtask phases, both conflict
+    resolvers, a detached child and a resumed run all launch the way the run
+    was recorded. It never probes: that happened at run or resume start. A
+    run with no row is `UnknownRunError`, never a silent `direct`.
+    `launcher.get_launcher` is read at call time so a test can patch it.
 
     `adapters` and `result_models` keep `AgentRunner`'s own defaults and
     `harness_map` stays empty, so every role falls back to `DEFAULT_HARNESS` and
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
     """
+    config = store_module.run_config(store.connection, run_id)
+    if config is None:
+        raise UnknownRunError(
+            f"run {run_id!r} has no row in the projection, so the launcher it was"
+            " recorded with is unknown; no agent is launched for it"
+        )
     return dispatch.AgentRunner(
         store=store,
-        launcher=run_direct,
+        launcher=launcher.get_launcher(config.launcher),
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,

@@ -208,7 +208,7 @@ def _kill_after(monkeypatch, card_id: str, phase: str) -> None:
     """Kill the manager once, right after `card_id`'s `phase` launch returns.
 
     Test scaffolding in the manager process: `cli.default_runner_factory`
-    reads `cli.run_direct` at call time, so the real launcher still spawns the
+    reads `launcher.get_launcher` at call time, so the real `run_direct` still spawns the
     real fake, which writes its result and logs the phase as always. Raising
     after it returns and before the dispatcher records the outcome leaves the
     attempt and the phase `started`, the crash signature a real kill leaves.
@@ -226,7 +226,7 @@ def _kill_after(monkeypatch, card_id: str, phase: str) -> None:
             raise _Killed(f"killed after the {phase} launch of {card_id} returned")
         return outcome
 
-    monkeypatch.setattr(cli, "run_direct", killing)
+    monkeypatch.setattr(launcher, "get_launcher", lambda kind: killing)
 
 
 def test_a_pygents_run_killed_in_plan_resumes_without_redispatching_explore_or_spec(
@@ -353,7 +353,7 @@ def _hold_b1_in_plan_until_a1_escalates(monkeypatch, board_shape) -> dict[str, b
             argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path, on_spawn=on_spawn
         )
 
-    monkeypatch.setattr(cli, "run_direct", held)
+    monkeypatch.setattr(launcher, "get_launcher", lambda kind: held)
     return hold
 
 
