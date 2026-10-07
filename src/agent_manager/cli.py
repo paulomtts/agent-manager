@@ -688,12 +688,18 @@ def default_runner_factory(
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
     """
+    recorded = store.load_run(run_id)
     return dispatch.AgentRunner(
         store=store,
         launcher=run_direct,
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,
+        max_limit_wait_hours=(
+            models.DEFAULT_MAX_LIMIT_WAIT_HOURS
+            if recorded is None
+            else recorded.config.max_limit_wait_hours
+        ),
     )
 
 
@@ -1775,6 +1781,16 @@ def run(
             "<stamp>-<digest>.report.json."
         ),
     ),
+    max_limit_wait: float = typer.Option(
+        models.DEFAULT_MAX_LIMIT_WAIT_HOURS,
+        "--max-limit-wait",
+        min=0,
+        help=(
+            "Hours a phase may wait for a Claude usage limit (session or weekly) "
+            "to reset before it escalates; the wait does not use up an attempt. "
+            "0 never waits. Recorded in the run and kept on resume."
+        ),
+    ),
     max_concurrent: int | None = typer.Option(
         None,
         "--max-concurrent",
@@ -1832,6 +1848,7 @@ def run(
         story=story,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
+    models.max_limit_wait_default.set(max_limit_wait)
     try:
         if whole_board and dry_run:
             payload = dry_run_board(

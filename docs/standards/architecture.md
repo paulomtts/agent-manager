@@ -35,7 +35,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 2 | Core | `dag` | Card identity, branch names, levels, stacking, `merge_order` |
 | 3 | Core | `prompt` | Resolves a phase's inputs and renders its prompt |
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
-| 5 | Adapters | `locks`, `detach`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; the harness Protocol and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
+| 5 | Adapters | `locks`, `detach`, `harness.base`, `harness.claude`, `harness.limits`, *`store.db`*, *`store.journal`* | File locks; process fork; the harness Protocol and Claude argv; the usage-limit line parser; the SQLite connection and DDL; the journal (schema 1) |
 | 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`* | Replay and divergence; read models; per-table row types and SQL (they never commit) |
 | 7 | Adapters | *`store.writer`* | `Store`: every write, under one lock and fence (§6.4) |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
@@ -72,13 +72,13 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 49 `.py` files (43 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 50 `.py` files (44 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
 | 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop` |
 | 1-4 | `census`, `results`, `roles.loader`, `steps.reducers` (L1); `dag` (L2); `prompt` (L3); `workflow.phases` (L4) |
-| 5 | `locks`, `detach`, `harness.base`, `harness.claude` |
+| 5 | `locks`, `detach`, `harness.base`, `harness.claude`, `harness.limits` |
 | 7 | `store` (splits into L5-L7) |
 | 8 | `board`, `control`, `harness.launcher`, `harness.registry` |
 | 9-10 | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` (L9); `steps.docs_commit`, `steps.integrate` (L10) |

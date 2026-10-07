@@ -218,7 +218,7 @@ async def run_subtask_async(
     try:
         if resume_from is None:
             await agent.context_pool.add(context.seed_item(binding))
-            await agent.put(compiled.first_turn())
+            await agent.put(compiled.first_turn(C.turn_allowance(agent_runner)))
         # The resume checkpoint's floor is carried as the run's adoption, so a
         # re-save of that turn writes it unchanged (exactly-once E4/E5). A fresh
         # run, or a row saved with no floor, starts with none.

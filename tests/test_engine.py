@@ -25,6 +25,7 @@ from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as new_engine
+from agent_manager.errors import LimitWaitInterrupted
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import (
     docs_commit,
@@ -2723,3 +2724,56 @@ def test_an_error_no_phase_handles_escalates_at_the_phase_that_was_running(
     assert summary.results == {"alpha": {"phase": "alpha"}}
     assert _projected_phases(store) == [("alpha", "done")]
     assert _subtask_journal_statuses(store) == ["escalated"]
+
+
+async def test_a_stop_during_a_usage_limit_wait_parks_before_the_same_phase(store):
+    """The runner reports an interrupted wait: the phase is neither escalated nor
+    done, it is queued again, and the paused agent parks before it."""
+    stop = _StepStop(asyncio.get_running_loop())
+    calls: list[str] = []
+
+    def prepare(card: str) -> dict[str, Any]:
+        return {}
+
+    def finish(card: str) -> dict[str, Any]:
+        raise AssertionError("no phase after the stop may start")
+
+    def agent_runner(phase, context, rendered):
+        calls.append(phase.name)
+        stop.fire()
+        raise LimitWaitInterrupted(phase.name)
+
+    workflow = _workflow(STOP_MIXED, {"step.prepare": prepare, "step.finish": finish})
+
+    summary = await new_engine.run_subtask_async(
+        workflow,
+        store,
+        story_id=STORY_ID,
+        subtask=_subtask(),
+        repo_dir=REPO,
+        agent_runner=agent_runner,
+        stop=stop.signal,
+    )
+
+    assert calls == ["explore"]
+    assert summary.status == "stopped"
+    assert summary.failed_phase is None
+    assert summary.detail == "stopped before explore"
+    assert _projected_subtask_status(store) == "stopped"
+
+
+def test_an_agent_turn_timeout_grows_by_the_runners_limit_wait_allowance():
+    from agent_manager.runtime import compile as turns
+
+    workflow = _workflow(STOP_MIXED, {"step.prepare": print, "step.finish": print})
+    compiled = turns.compile_workflow(workflow)
+
+    class Waiting:
+        turn_allowance = 7200.0
+
+    assert turns.turn_allowance(Waiting()) == 7200.0
+    assert turns.turn_allowance(lambda *args: None) == 0.0
+    assert turns.turn_allowance(None) == 0.0
+    plain = compiled.turn_for("explore", 0).timeout
+    assert compiled.turn_for("explore", 0, 7200.0).timeout == plain + 7200.0
+    assert compiled.turn_for("prepare", 0, 7200.0).timeout == turns.STEP_TIMEOUT

@@ -11,12 +11,14 @@ is sibling 34d3388b's job (spec "Suite placement").
 import hashlib
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, prompt
+from agent_manager import board, cli, dispatch, prompt, store
+from agent_manager.harness.launcher import run_direct
 from agent_manager.steps import docs_commit
 from agent_manager.workflow import task as task_workflow
 
@@ -442,3 +444,98 @@ def test_a_repo_that_ignores_the_documents_finishes_done_without_committing_them
         message = _git(worktree, "show", "-s", "--format=%B", revision)
         assert "Plan-Hash:" in message
         assert not message.startswith(subject)
+
+
+USAGE_LIMIT_ENV = "FAKE_CLAUDE_USAGE_LIMIT"
+"""Must equal `fake_claude.USAGE_LIMIT_ENV`."""
+
+
+def _arm_usage_limit(tmp_path: Path, monkeypatch, table: dict[str, dict]) -> Path:
+    """Write the fake's limit table beside the repo and point the env var at it."""
+    path = tmp_path / "usage-limit.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+    monkeypatch.setenv(USAGE_LIMIT_ENV, str(path))
+    return path
+
+
+def test_a_usage_limit_far_away_escalates_naming_the_reset_time(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """Real child, real `stdout.log`, real `--max-limit-wait`: a weekly reset days
+    away is not waited for, and the escalation says when it resets."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    reset = datetime.now(timezone.utc) + timedelta(days=3)
+    line = f"You've hit your weekly limit · resets {reset:%b} {reset.day}, 8pm (UTC)"
+    armed = _arm_usage_limit(tmp_path, monkeypatch, {"explore": {"hits": 1, "line": line}})
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run", "--card", card, "--repo-dir", str(root), "--base-branch", "main",
+            "--branch-prefix", "m1", "--verify", VERIFY, "--max-limit-wait", "6",
+        ],
+    )
+
+    assert result.exit_code == cli.EXIT_ESCALATED == 1, (result.output, result.exception)
+    data = _envelope(result)
+    assert data["status"] == "escalated"
+    assert data["failed_phase"] == "explore"
+    assert "usage limit hit (weekly" in data["detail"], data["detail"]
+    assert f"{reset:%Y-%m-%d}T20:00:00+00:00" in data["detail"], data["detail"]
+    assert "--max-limit-wait 6h" in data["detail"], data["detail"]
+    assert json.loads(armed.read_text(encoding="utf-8"))["explore"]["hits"] == 0
+    assert read_fake_log(data["run_id"]) == []
+    conn = store.open_db(root)
+    try:
+        assert store.load_run(conn, data["run_id"]).config.max_limit_wait_hours == 6
+    finally:
+        conn.close()
+
+
+def test_a_usage_limit_hit_is_waited_out_and_the_same_phase_dispatches_again(
+    milestone_board, fake_claude_bin, read_fake_log, tmp_path, monkeypatch
+):
+    """The production runner, launcher, adapter and engine; only the clock and the
+    sleeper are fakes, so the run waits for a reset in no real time. The first
+    explore dispatch hits the limit, the run waits, and the second one succeeds."""
+    root = milestone_board["root"]
+    card = milestone_board["subtasks"]["A"][0]
+    now = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
+    slept: list[float] = []
+    clock = {"now": now}
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += timedelta(seconds=seconds)
+
+    def factory(*, store, run_id, story_id, card_id):
+        return dispatch.AgentRunner(
+            store=store,
+            launcher=run_direct,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            clock=lambda: clock["now"],
+            sleeper=sleep,
+        )
+
+    line = "You've hit your session limit · resets 5pm (UTC)"
+    armed = _arm_usage_limit(tmp_path, monkeypatch, {"explore": {"hits": 1, "line": line}})
+
+    data = cli.run_card(
+        card,
+        repo_dir=root,
+        base_branch="main",
+        branch_prefix="m1",
+        commands=[VERIFY],
+        runner_factory=factory,
+    )
+
+    assert data["status"] == "done", (data["failed_phase"], data["detail"])
+    assert json.loads(armed.read_text(encoding="utf-8"))["explore"]["hits"] == 0
+    assert sum(slept) == 3600 + dispatch.LIMIT_MARGIN
+    explores = [e for e in read_fake_log(data["run_id"]) if e["phase"] == "explore"]
+    assert [Path(e["result_path"]).parent.name for e in explores] == ["explore.2"]
+    attempts = Path(explores[0]["result_path"]).parent.parent
+    assert "hit your session limit" in (attempts / "explore.1" / "stdout.log").read_text(encoding="utf-8")

@@ -40,6 +40,18 @@ class AgentPhaseFailed(RuntimeError):
         super().__init__(f"phase {phase!r} ended {outcome}: {detail}")
 
 
+class LimitWaitInterrupted(RuntimeError):
+    """A stop was requested while an agent phase waited out a usage limit.
+
+    The phase is neither failed nor done: the walk re-queues it so the run
+    parks before it, and a resume dispatches it again.
+    """
+
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(f"phase {phase!r}: the usage-limit wait was interrupted by a stop")
+
+
 class StoryNotFoundError(ValueError):
     """No story card, or more than one, matches what the caller typed, or the
     card it names is not a story."""

@@ -16,6 +16,7 @@ recorded as `started` with no exit code or duration, and resume has to load that
 row back before discarding it and re-running the phase.
 """
 
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -171,6 +172,20 @@ class HarnessAssignment(_Model):
     model: str = Field(min_length=1)
 
 
+DEFAULT_MAX_LIMIT_WAIT_HOURS = 8.0
+"""The longest usage-limit wait a run accepts before escalating (`--max-limit-wait`)."""
+
+max_limit_wait_default: ContextVar[float] = ContextVar(
+    "max_limit_wait_default", default=DEFAULT_MAX_LIMIT_WAIT_HOURS
+)
+"""What a new `RunConfig` records; the CLI sets it from `--max-limit-wait` so every
+run kind records the flag without threading it through each entry point."""
+
+
+def _default_max_limit_wait() -> float:
+    return max_limit_wait_default.get()
+
+
 class RunConfig(_Model):
     """The knobs a run was started with, recorded so resume reuses them."""
 
@@ -180,6 +195,10 @@ class RunConfig(_Model):
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)
     story_id: str | None = None
     """The story card a run is restricted to; `None` when the run is not a story run."""
+    max_limit_wait_hours: float = Field(
+        default_factory=_default_max_limit_wait, ge=0, allow_inf_nan=False
+    )
+    """The longest wait for a usage-limit reset before the phase escalates; 0 never waits."""
 
 
 class Run(_Model):
