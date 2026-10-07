@@ -32,6 +32,7 @@ import pytest
 
 from agent_manager import control, models
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
@@ -107,6 +108,15 @@ def _requests(root: Path) -> list[store_leases.ControlRow]:
     conn = store_db.open_db(root)
     try:
         return store_leases.control_requests(conn, RUN_ID)
+    finally:
+        conn.close()
+
+
+def _events(root: Path) -> list[store_events.EventRow]:
+    """Every committed event of `RUN_ID`, in `seq` order."""
+    conn = store_db.open_db(root)
+    try:
+        return store_events.read(conn, run_id=RUN_ID)
     finally:
         conn.close()
 
@@ -688,6 +698,15 @@ def test_apply_pending_requests_each_row_in_order_and_marks_handled(root, opened
         assert agent.paused == 3
         assert [row.handled_at for row in _requests(root)] == [_at(7)] * 3
         assert control.apply_pending(opened_store, stop, lease.token) == []
+
+    handled = [event for event in _events(root) if event.kind == "control_handled"]
+    # One event per applied row, in `seq` order; the second, empty poll adds none.
+    assert [event.payload for event in handled] == [
+        {"command": "pause", "control_seq": 0, "handled_at": _at(7).isoformat()},
+        {"command": "pause", "control_seq": 1, "handled_at": _at(7).isoformat()},
+        {"command": "cancel", "control_seq": 2, "handled_at": _at(7).isoformat()},
+    ]
+    assert [event.run_seq for event in handled] == sorted(event.run_seq for event in handled)
 
 
 def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store):

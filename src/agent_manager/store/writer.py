@@ -407,6 +407,38 @@ class Store:
     # committed, so no `run_seq` is spent. After the commit the event is
     # mirrored to the journal file (`_mirror`).
 
+    def _insert_event(
+        self,
+        conn: sqlite3.Connection,
+        kind: store_journal.EventKind,
+        payload: dict,
+        *,
+        story_id: str | None = None,
+        card_id: str | None = None,
+        phase: str | None = None,
+        attempt: int | None = None,
+    ) -> store_events.EventRow:
+        """Insert `kind`'s live event of this store's run on `conn`, inside the
+        job's transaction.
+
+        Numbered one past the run's highest `run_seq`; `ts` is the wall clock
+        read now, inside the job, so a busy re-run reads it again. Nothing is
+        mirrored here: only `_record` mirrors, after its commit.
+        """
+        return store_events.insert(
+            conn,
+            project_id=self._project_id,
+            run_id=self.run_id,
+            ts=store_journal.ts_text(datetime.now(timezone.utc)),
+            kind=kind,
+            payload=payload,
+            source="live",
+            story_id=story_id,
+            card_id=card_id,
+            phase=phase,
+            attempt=attempt,
+        )
+
     def _record(
         self,
         operation: str,
@@ -429,14 +461,10 @@ class Store:
         committed: list[store_journal.JournalLine] = []
 
         def job(conn: sqlite3.Connection) -> store_journal.JournalLine:
-            event = store_events.insert(
+            event = self._insert_event(
                 conn,
-                project_id=self._project_id,
-                run_id=self.run_id,
-                ts=store_journal.ts_text(datetime.now(timezone.utc)),
-                kind=kind,
-                payload=payload,
-                source="live",
+                kind,
+                payload,
                 story_id=story_id,
                 card_id=card_id,
                 phase=phase,
@@ -1034,11 +1062,30 @@ class Store:
         )
 
     def mark_control_handled(self, seq: int, now: datetime) -> None:
-        """Record that this run's request `seq` has been applied."""
-        self._submit(
-            lambda conn: store_leases.mark_control_handled(conn, self.run_id, seq, now),
-            operation="mark_control_handled",
-        )
+        """Record that this run's request `seq` has been applied, and its
+        `control_handled` event, in one transaction.
+
+        Only a pending request is marked: an unknown `seq`, or one already
+        handled, changes nothing and records nothing, so the first handling's
+        `handled_at` stands. The payload's `handled_at` is `now`; the event's
+        `ts` is the wall clock read inside the job. Unfenced. If the event
+        insert raises, the mark is rolled back with it.
+        """
+
+        def job(conn: sqlite3.Connection) -> None:
+            handled = store_leases.mark_control_handled(conn, self.run_id, seq, now)
+            if handled is not None:
+                self._insert_event(
+                    conn,
+                    "control_handled",
+                    {
+                        "command": handled.command,
+                        "control_seq": handled.seq,
+                        "handled_at": store_db.iso(now),
+                    },
+                )
+
+        self._submit(job, operation="mark_control_handled")
 
     # -- rebuild -------------------------------------------------------------
 

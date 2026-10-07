@@ -4,7 +4,7 @@ an open connection and never commits."""
 
 import sqlite3
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from agent_manager.store import db as store_db
@@ -368,9 +368,20 @@ def pending_controls(conn: sqlite3.Connection, run_id: str, token: str) -> list[
 
 def mark_control_handled(
     conn: sqlite3.Connection, run_id: str, seq: int, now: datetime
-) -> None:
-    """Record that `run_id`'s request `seq` was applied at `now`."""
+) -> ControlRow | None:
+    """Record that `run_id`'s pending request `seq` was applied at `now`.
+
+    Returns the row as it now stands. An unknown `seq`, or one already
+    handled, is left exactly as it is and gives `None`: the first handling's
+    `handled_at` stands.
+    """
+    row = conn.execute(
+        "SELECT * FROM run_controls WHERE run_id = ? AND seq = ?", (run_id, seq)
+    ).fetchone()
+    if row is None or row["handled_at"] is not None:
+        return None
     conn.execute(
         "UPDATE run_controls SET handled_at = ? WHERE run_id = ? AND seq = ?",
         (store_db.iso(now), run_id, seq),
     )
+    return replace(_control_from_row(row), handled_at=now)

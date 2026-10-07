@@ -2064,3 +2064,174 @@ def test_taking_or_adopting_a_lease_never_reads_the_journal(repo, monkeypatch):
     assert held.token == "t1"
     assert line.seq == 1
     assert not hasattr(store_journal.Journal, "reseek")
+
+
+# -- lease and control events (card 1.2.7) -----------------------------------
+#
+# Each is a live event of the run, with no node coordinates, numbered by the
+# events table alongside the node upserts and never mirrored to the file.
+
+_NO_COORDINATES = (None, None, None, None)
+
+
+def _plant_holder(
+    repo: Path,
+    *,
+    run_id: str = RUN_A,
+    token: str = "t0",
+    pid: int = 7,
+    host: str = "other-box",
+    heartbeat_at: datetime = NOW,
+) -> None:
+    """A `run_leases` row of `run_id`, written on a second connection as
+    another process's take would have left it."""
+    conn = store_db.open_db(repo)
+    try:
+        with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, repo, now=NOW)
+            conn.execute(
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (
+                    project_id,
+                    run_id,
+                    token,
+                    pid,
+                    host,
+                    store_db.iso(heartbeat_at),
+                    store_db.iso(heartbeat_at),
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def _plant_control(
+    repo: Path, command: str = "pause", *, lease: str = "t1"
+) -> store_leases.ControlRow:
+    """One pending request of `RUN_A`, inserted on a second connection as `am pause` would."""
+    conn = store_db.open_db(repo)
+    try:
+        with store_db.immediate(conn):
+            return store_leases.add_control(
+                conn,
+                RUN_A,
+                project_id=store_projects.resolve(conn, repo, now=NOW),
+                lease=lease,
+                command=command,
+                requested_at=NOW,
+            )
+    finally:
+        conn.close()
+
+
+def _claims(st: store_writer.Store) -> list[tuple[str, str]]:
+    """Every committed `run_claims` row as `(key, run_id)`, in key order."""
+    return [
+        (row[0], row[1])
+        for row in st.read_connection.execute(
+            "SELECT key, run_id FROM run_claims ORDER BY key"
+        )
+    ]
+
+
+def _stamped_between(
+    event: store_events.EventRow, before: datetime, after: datetime
+) -> bool:
+    """Whether `event.ts` is a UTC instant read between `before` and `after`."""
+    stamped = datetime.fromisoformat(event.ts)
+    return stamped.utcoffset() == timedelta(0) and before <= stamped <= after
+
+
+def _failing_insert_for(kind: str, error: BaseException):
+    """`store_events.insert`, except that an insert of `kind` raises `error`."""
+    real = store_events.insert
+
+    def insert(conn, **kwargs):
+        if kwargs["kind"] == kind:
+            raise error
+        return real(conn, **kwargs)
+
+    return insert
+
+
+def test_mark_control_handled_writes_one_control_handled_event_with_the_row(repo):
+    _plant_control(repo, "cancel")
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        before = datetime.now(timezone.utc)
+        st.mark_control_handled(0, LATER)
+        after = datetime.now(timezone.utc)
+        requests = store_leases.control_requests(st.read_connection, RUN_A)
+        events = _events(st)
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    (event,) = events
+    assert (event.kind, event.source, event.project_id, event.schema, event.run_seq) == (
+        "control_handled",
+        "live",
+        project_id,
+        1,
+        1,
+    )
+    assert (event.story_id, event.card_id, event.phase, event.attempt) == _NO_COORDINATES
+    assert event.payload == {
+        "command": "cancel",
+        "control_seq": 0,
+        "handled_at": LATER.isoformat(),
+    }
+    assert _stamped_between(event, before, after)
+    assert [row.handled_at for row in requests] == [LATER]
+
+
+def test_mark_control_handled_of_an_unknown_seq_changes_nothing(repo):
+    _plant_control(repo)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.mark_control_handled(5, LATER)
+        requests = store_leases.control_requests(st.read_connection, RUN_A)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert events == []
+    assert [row.handled_at for row in requests] == [None]
+
+
+def test_a_second_mark_control_handled_keeps_the_first_and_writes_no_event(repo):
+    _plant_control(repo)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.mark_control_handled(0, LATER)
+        st.mark_control_handled(0, LATEST)
+        requests = store_leases.control_requests(st.read_connection, RUN_A)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert [row.handled_at for row in requests] == [LATER]
+    assert [(event.kind, event.payload["handled_at"]) for event in events] == [
+        ("control_handled", LATER.isoformat())
+    ]
+
+
+def test_a_failed_control_handled_insert_leaves_the_request_pending(repo, monkeypatch):
+    _plant_control(repo)
+    monkeypatch.setattr(
+        store_events,
+        "insert",
+        _failing_insert_for("control_handled", sqlite3.OperationalError("disk I/O error")),
+    )
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            st.mark_control_handled(0, LATER)
+        requests = store_leases.control_requests(st.read_connection, RUN_A)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert [row.handled_at for row in requests] == [None]
+    assert events == []
