@@ -2427,3 +2427,137 @@ def test_the_other_lease_writes_record_no_event(repo):
         st.close()
 
     assert [event.kind for event in events] == ["lease_acquired"]
+
+
+def _recording_take_lease(monkeypatch) -> list[BaseException]:
+    """Wrap `store_leases.take_lease` to keep every exception it raises."""
+    real = store_leases.take_lease
+    raised: list[BaseException] = []
+
+    def recording(conn, *args, **kwargs):
+        try:
+            return real(conn, *args, **kwargs)
+        except BaseException as error:  # kept for the test, then re-raised
+            raised.append(error)
+            raise
+
+    monkeypatch.setattr(store_leases, "take_lease", recording)
+    return raised
+
+
+def test_a_take_refused_by_a_live_lease_records_one_claim_conflict(repo, monkeypatch):
+    _plant_holder(repo, token="t0", pid=7, host="other-box")
+    raised = _recording_take_lease(monkeypatch)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(store_leases.LeaseHeldError) as caught:
+            st.take_lease(
+                token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True, claims=["card:a"]
+            )
+        lease = store_leases.read_lease(st.read_connection, RUN_A)
+        claims = _claims(st)
+        events = _events(st)
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    # The very object the take raised, so `control.Lease` and `cli.run_lease`
+    # translate it as before.
+    assert len(raised) == 1 and caught.value is raised[0]
+    assert lease is not None and (lease.token, lease.pid, lease.host) == ("t0", 7, "other-box")
+    assert claims == []
+    (event,) = events
+    assert (event.kind, event.source, event.project_id, event.schema, event.run_seq) == (
+        "claim_conflict",
+        "live",
+        project_id,
+        1,
+        1,
+    )
+    assert (event.story_id, event.card_id, event.phase, event.attempt) == _NO_COORDINATES
+    assert event.payload == {
+        "key": None,
+        "holder_run": RUN_A,
+        "holder_pid": 7,
+        "holder_host": "other-box",
+    }
+
+
+def test_a_take_refused_by_a_held_claim_records_its_key_and_holder(repo):
+    other = store_writer.Store.open(repo, RUN_B)
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        other.take_lease(
+            token="tb", pid=2, host="h2", now=NOW, is_live=lambda row: True, claims=["card:a"]
+        )
+        with pytest.raises(store_leases.ClaimHeldError) as caught:
+            st.take_lease(
+                token="t1",
+                pid=1,
+                host="h",
+                now=NOW,
+                is_live=lambda row: True,
+                claims=["card:z", "card:a"],
+            )
+        lease = store_leases.read_lease(st.read_connection, RUN_A)
+        claims = _claims(st)
+        events = _events(st)
+    finally:
+        st.close()
+        other.close()
+
+    assert caught.value.key == "card:a"
+    assert lease is None
+    assert claims == [("card:a", RUN_B)]
+    (event,) = events
+    assert event.kind == "claim_conflict"
+    assert event.payload == {
+        "key": "card:a",
+        "holder_run": RUN_B,
+        "holder_pid": 2,
+        "holder_host": "h2",
+    }
+
+
+def test_a_failed_claim_conflict_write_is_logged_and_the_refusal_still_raised(
+    repo, monkeypatch, caplog
+):
+    # Review Focus 2.
+    caplog.set_level(logging.WARNING, logger="agent_manager.store.writer")
+    _plant_holder(repo, token="t0", pid=7, host="other-box")
+    raised = _recording_take_lease(monkeypatch)
+    monkeypatch.setattr(
+        store_events,
+        "insert",
+        _failing_insert_for("claim_conflict", sqlite3.OperationalError("disk I/O error")),
+    )
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(store_leases.LeaseHeldError) as caught:
+            st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert caught.value is raised[0]
+    assert events == []
+    warnings = [record for record in caplog.records if record.name == "agent_manager.store.writer"]
+    (warning,) = warnings
+    assert warning.levelno == logging.WARNING
+    assert RUN_A in warning.getMessage() and "disk I/O error" in warning.getMessage()
+    assert warning.exc_info is not None
+    assert isinstance(warning.exc_info[1], sqlite3.OperationalError)
+
+
+def test_a_base_exception_from_the_claim_conflict_job_propagates(repo, monkeypatch):
+    # Only `Exception`s are swallowed.
+    _plant_holder(repo, token="t0", pid=7, host="other-box")
+    monkeypatch.setattr(
+        store_events, "insert", _failing_insert_for("claim_conflict", KeyboardInterrupt())
+    )
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+    finally:
+        st.close()

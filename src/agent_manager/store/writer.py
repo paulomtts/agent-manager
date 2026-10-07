@@ -957,7 +957,9 @@ class Store:
         even under the same token. Any raise rolls all of it back and leaves
         the bound token as it was. On success, after the commit and before any
         other job runs, the store is bound to `token`. The event is never
-        mirrored to the journal file.
+        mirrored to the journal file. A refusal is recorded as a
+        `claim_conflict` event by a second job (`_record_claim_conflict`), then
+        the same exception object is raised.
         """
         keys = tuple(claims)
 
@@ -997,9 +999,48 @@ class Store:
                 )
             return taken
 
-        return self._submit(
-            job, operation="take_lease", after_commit=lambda: self.bind_lease(token)
-        )
+        try:
+            return self._submit(
+                job, operation="take_lease", after_commit=lambda: self.bind_lease(token)
+            )
+        except (store_leases.LeaseHeldError, store_leases.ClaimHeldError) as refusal:
+            self._record_claim_conflict(refusal)
+            raise
+
+    def _record_claim_conflict(
+        self, refusal: store_leases.LeaseHeldError | store_leases.ClaimHeldError
+    ) -> None:
+        """Record a refused take as this run's `claim_conflict` event, in a job
+        of its own after the take's transaction rolled back.
+
+        Unfenced. `key` is the refused claim key, or `None` when the refusal is
+        a live lease on this run; `holder_*` name the holder's lease row. Best
+        effort: an `Exception` from the job (`StoreBusyError` after its retry
+        budget, say) is logged as a warning naming the run and the failure and
+        is not raised, so `take_lease` still raises its refusal. Anything else
+        that is a `BaseException` propagates.
+        """
+        key = refusal.key if isinstance(refusal, store_leases.ClaimHeldError) else None
+        holder = refusal.holder
+        payload = {
+            "key": key,
+            "holder_run": holder.run_id,
+            "holder_pid": holder.pid,
+            "holder_host": holder.host,
+        }
+        try:
+            self._submit(
+                lambda conn: self._insert_event(conn, "claim_conflict", payload),
+                operation="claim_conflict",
+            )
+        except Exception as failure:
+            _log.warning(
+                "run %s: take_lease was refused but its claim_conflict event was"
+                " not recorded: %s",
+                self.run_id,
+                failure,
+                exc_info=True,
+            )
 
     def bind_lease(self, token: str | None) -> None:
         """Fence this store's run writes to `token`, or stop fencing with `None`.
