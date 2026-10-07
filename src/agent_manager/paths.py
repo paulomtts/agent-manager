@@ -8,6 +8,7 @@ or be swept into a commit.
 
 import hashlib
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -31,6 +32,18 @@ def db_path() -> Path:
     creates the directory first.
     """
     return data_path() / "am.db"
+
+
+def default_backup_path(now: datetime) -> Path:
+    """Where `am backup` writes without `--out`: `backups/am-<stamp>.db`; creates `backups`.
+
+    The stamp is `now` in UTC as `YYYYMMDDTHHMMSSZ`, the run directories'
+    format. Creates the data directory and `backups`, not the file.
+    """
+    result = data_dir() / "backups"
+    result.mkdir(parents=True, exist_ok=True)
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return result / f"am-{stamp}.db"
 
 
 def project_digest(root: Path) -> str:

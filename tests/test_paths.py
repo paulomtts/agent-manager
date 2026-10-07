@@ -1,4 +1,5 @@
 import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -585,3 +586,24 @@ def test_legacy_project_dbs_follows_xdg_data_home_at_call_time(monkeypatch, tmp_
     assert paths.legacy_project_dbs() == [first / "one.db"]
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "second"))
     assert paths.legacy_project_dbs() == [second / "two.db"]
+
+
+def test_default_backup_path_is_stamped_under_data_dir_backups(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    now = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
+
+    result = paths.default_backup_path(now)
+
+    backups = tmp_path / "data" / "agent-manager" / "backups"
+    assert result == backups / "am-20261007T090000Z.db"
+    assert backups.is_dir()
+    assert not result.exists()
+
+
+def test_default_backup_path_stamps_in_utc(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    now = datetime(2026, 10, 7, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    result = paths.default_backup_path(now)
+
+    assert result.name == "am-20261007T090000Z.db"
