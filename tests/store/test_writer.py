@@ -1182,6 +1182,58 @@ def test_the_mirror_runs_after_the_commit_on_the_writer_thread(repo, monkeypatch
     assert seen == [(f"am-store-writer-{RUN_A}", [1])]
 
 
+def test_a_failed_file_mirror_does_not_fail_the_record(repo, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="agent_manager.store.writer")
+    st = store_writer.Store.open(repo, RUN_A)
+    real = st.journal.mirror
+
+    def full_disk(line):
+        raise OSError("disk full")
+
+    try:
+        monkeypatch.setattr(st.journal, "mirror", full_disk)
+        line = st.record_run(_run(repo))
+        events = _events(st)
+        runs = _count(st, "runs")
+        texts = _file_texts(st)
+        monkeypatch.setattr(st.journal, "mirror", real)
+        story_line = st.record_story(_STORY)
+    finally:
+        st.close()
+
+    assert (line.seq, line.event) == (1, "run_upsert")
+    assert [event.run_seq for event in events] == [1]
+    assert runs == 1
+    assert texts == []
+    warnings = [record for record in caplog.records if record.name == "agent_manager.store.writer"]
+    assert [record.levelno for record in warnings] == [logging.WARNING]
+    (warning,) = warnings
+    assert warning.args == (RUN_A, 1, "run_upsert")
+    assert RUN_A in warning.getMessage() and "run_upsert" in warning.getMessage()
+    assert warning.exc_info is not None and isinstance(warning.exc_info[1], OSError)
+    assert story_line.seq == 2
+
+
+def test_a_base_exception_from_the_mirror_reaches_the_caller_and_keeps_the_commit(
+    repo, monkeypatch
+):
+    # Review Focus 1: only `Exception`s are swallowed.
+    st = store_writer.Store.open(repo, RUN_A)
+
+    def interrupted(line):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(st.journal, "mirror", interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            st.record_run(_run(repo))
+        events = _events(st)
+    finally:
+        st.close()
+
+    assert [event.kind for event in events] == ["run_upsert"]
+
+
 def test_a_canceled_status_is_stored_and_mirrored_verbatim(repo):
     st = store_writer.Store.open(repo, RUN_A)
     try:

@@ -463,8 +463,24 @@ class Store:
 
     def _mirror(self, line: store_journal.JournalLine) -> None:
         """Append `line` to the run's journal file: the `after_commit` of every
-        `record_*`, run once its event and row are committed."""
-        self._journal.mirror(line)
+        `record_*`, run once its event and row are committed.
+
+        Best-effort: an `Exception` from the append is logged as a warning
+        naming the run, the line's `seq` and its event, and is not raised, so
+        the file lacks that `seq`. Anything else that is a `BaseException`
+        propagates.
+        """
+        try:
+            self._journal.mirror(line)
+        except Exception:
+            _log.warning(
+                "run %s: event %d (%s) is committed but its journal file line"
+                " was not written",
+                line.run_id,
+                line.seq,
+                line.event,
+                exc_info=True,
+            )
 
     def record_run(self, run: models.Run) -> store_journal.JournalLine:
         def write_row(conn: sqlite3.Connection) -> None:
