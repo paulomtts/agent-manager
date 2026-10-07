@@ -7,6 +7,7 @@ stay unit tier.
 """
 
 import hashlib
+import json
 import shutil
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -351,3 +352,41 @@ def tree(directory: Path) -> dict[str, str]:
         for entry in sorted(directory.rglob("*"))
         if entry.is_file()
     }
+
+
+_COORDS = ("story", "card", "phase", "attempt")
+
+
+def journal_line(
+    run_id: str,
+    seq: int,
+    ts: str,
+    event: str = "run_upsert",
+    payload: Mapping[str, object] | None = None,
+    **coords: object,
+) -> dict[str, object]:
+    """One journal line as `am` wrote it: every envelope key, with `story`,
+    `card`, `phase` and `attempt` taken from `coords` and null otherwise."""
+    unknown = set(coords) - set(_COORDS)
+    assert not unknown, unknown
+    return {
+        "seq": seq,
+        "ts": ts,
+        "run_id": run_id,
+        "event": event,
+        **{key: coords.get(key) for key in _COORDS},
+        "payload": dict(payload or {}),
+    }
+
+
+def write_journal(
+    run_id: str, lines: Sequence[Mapping[str, object]], *, tail: str | None = None
+) -> Path:
+    """`<data dir>/runs/<run_id>/journal.jsonl`, overwritten with one
+    `json.dumps(line, sort_keys=True)` and a newline per line, then `tail`
+    verbatim when given."""
+    path = paths.data_path() / "runs" / run_id / "journal.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in lines)
+    path.write_bytes((text + (tail or "")).encode("utf-8"))
+    return path

@@ -195,7 +195,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | Target module | L | Takes | Note |
 |---|---|---|---|
 | `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
-| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family | the schema contract (§10.1) |
+| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family; `read_verbatim`, `VerbatimJournal`, `VerbatimLine`, `UnimportableLineError`: a journal read as `am migrate` imports it, every value as the file holds it | the schema contract (§10.1) |
 | `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
 | `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
 | `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |

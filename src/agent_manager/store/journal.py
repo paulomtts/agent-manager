@@ -1,10 +1,12 @@
-"""A run's append-only JSONL journal: the line envelope, its event kinds, and
-appending and reading the file."""
+"""A run's append-only JSONL journal: the line envelope, its event kinds,
+appending and reading the file, and reading it verbatim for `am migrate`."""
 
 import json
 import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -274,3 +276,151 @@ class Journal:
                 handle.flush()
                 self._seq = max(self._seq, line.seq)
                 os.fsync(handle.fileno())
+
+
+_ENVELOPE_KEYS: frozenset[str] = frozenset(JournalLine.model_fields)
+"""Every key a journal line may carry: an `events` row has a column for each."""
+
+
+@dataclass(frozen=True)
+class VerbatimLine:
+    """One journal line as `read_verbatim` read it: `ts` and `payload` exactly
+    as the file holds them, `kind` the line's `event` whatever its value,
+    `run_seq` its `seq`, and `line` its 1-based number in the file."""
+
+    line: int
+    run_seq: int
+    ts: str
+    kind: str
+    story_id: str | None
+    card_id: str | None
+    phase: str | None
+    attempt: int | None
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class VerbatimJournal:
+    """Every importable line of the journal of `run_id` at `path`, ascending
+    by `run_seq`. `torn_line` is the number of the unparseable final line
+    that was skipped, `None` when there was none."""
+
+    run_id: str
+    path: Path
+    lines: tuple[VerbatimLine, ...]
+    torn_line: int | None
+
+
+class UnimportableLineError(JournalError):
+    """Line `line` (1-based) of the journal at `path` cannot be imported as it is."""
+
+    def __init__(self, path: Path, line: int, why: str) -> None:
+        super().__init__(f"{path}:{line}: {why}")
+        self.path = path
+        self.line = line
+
+
+def _is_int(value: object) -> bool:
+    """A JSON integer: `bool` is an `int` in Python, and is not one here."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _verbatim(record: object, run_id: str, number: int) -> VerbatimLine:
+    """`record`, decoded from line `number` of `run_id`'s journal, as a
+    `VerbatimLine`. Raises `ValueError` naming the first rule it breaks."""
+    if not isinstance(record, dict):
+        raise ValueError("line is not a JSON object")
+    unknown = sorted(set(record) - _ENVELOPE_KEYS)
+    if unknown:
+        raise ValueError(f"unknown key {unknown[0]!r}")
+    for key in ("seq", "ts", "run_id", "event"):
+        if key not in record:
+            raise ValueError(f"{key} is missing")
+    seq, ts, event = record["seq"], record["ts"], record["event"]
+    if not _is_int(seq) or seq <= 0:
+        raise ValueError(f"seq is {seq!r}, expected a positive integer")
+    if not isinstance(ts, str):
+        raise ValueError(f"ts is {ts!r}, expected a string")
+    try:
+        instant = datetime.fromisoformat(ts)
+    except ValueError:
+        raise ValueError(f"ts {ts!r} is not an ISO-8601 timestamp") from None
+    if instant.utcoffset() is None:
+        raise ValueError(f"ts {ts!r} has no UTC offset")
+    if record["run_id"] != run_id:
+        raise ValueError(f"run_id is {record['run_id']!r}, expected {run_id!r}")
+    if not isinstance(event, str) or not event:
+        raise ValueError(f"event is {event!r}, expected a non-empty string")
+    for key in ("story", "card", "phase"):
+        value = record.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} is {value!r}, expected a string or null")
+    attempt = record.get("attempt")
+    if attempt is not None and not _is_int(attempt):
+        raise ValueError(f"attempt is {attempt!r}, expected an integer or null")
+    payload = record.get("payload", {})
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload is a {type(payload).__name__}, expected a JSON object")
+    return VerbatimLine(
+        line=number,
+        run_seq=seq,
+        ts=ts,
+        kind=event,
+        story_id=record.get("story"),
+        card_id=record.get("card"),
+        phase=record.get("phase"),
+        attempt=attempt,
+        payload=payload,
+    )
+
+
+def read_verbatim(path: Path, run_id: str) -> VerbatimJournal:
+    """The journal of `run_id` at `path` as `am migrate` imports it, every
+    value as the file holds it.
+
+    Reads `path` once, as bytes, and creates nothing. Lines are split on
+    `\\n`; a blank one is skipped. A final line with no `\\n` that is not
+    UTF-8 JSON is a torn tail: skipped, its number kept as `torn_line`. Any
+    other line that is not UTF-8 JSON, whose envelope `_verbatim` refuses,
+    or whose `seq` an earlier line already used, raises
+    `UnimportableLineError`. Any `event` string is kept, known to
+    `EventKind` or not. No file at `path` raises `MissingJournalError`; any
+    other `OSError` propagates.
+    """
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as error:
+        raise MissingJournalError(f"no journal for run {run_id!r} at {path}") from error
+    segments = data.split(b"\n")
+    if segments[-1] == b"":
+        segments.pop()
+    torn: int | None = None
+    lines: list[VerbatimLine] = []
+    first_seen: dict[int, int] = {}
+    for number, segment in enumerate(segments, start=1):
+        if not segment.strip():
+            continue
+        try:
+            record = json.loads(segment.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            if number == len(segments) and not data.endswith(b"\n"):
+                torn = number
+                continue
+            why = (
+                "line is not UTF-8"
+                if isinstance(error, UnicodeDecodeError)
+                else f"line is not JSON: {error}"
+            )
+            raise UnimportableLineError(path, number, why) from error
+        try:
+            line = _verbatim(record, run_id, number)
+        except ValueError as error:
+            raise UnimportableLineError(path, number, str(error)) from error
+        if line.run_seq in first_seen:
+            raise UnimportableLineError(
+                path, number, f"seq {line.run_seq} repeats line {first_seen[line.run_seq]}"
+            )
+        first_seen[line.run_seq] = number
+        lines.append(line)
+    lines.sort(key=lambda line: line.run_seq)
+    return VerbatimJournal(run_id=run_id, path=path, lines=tuple(lines), torn_line=torn)
