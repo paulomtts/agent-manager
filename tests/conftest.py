@@ -427,17 +427,23 @@ BINARY_TIERS = ("git", "brd")
 
 
 def missing_binary(
-    markers: Iterable[str], which: Callable[[str], str | None] | None = None
+    markers: Iterable[str],
+    which: Callable[[str], str | None] | None = None,
+    *,
+    among: Sequence[str] = BINARY_TIERS,
 ) -> str | None:
-    """The first of `git`, `brd` that `markers` names and `which` cannot find, or None.
+    """The first name of `among` that `markers` names and `which` cannot find, or None.
 
     `markers` is every marker name on the item's chain. `which` defaults to
-    `shutil.which`, looked up at call time. Items with neither marker are never
-    reported, whatever `which` says.
+    `shutil.which`, looked up at call time. `among` defaults to `BINARY_TIERS`
+    (`git`, then `brd`), so the setup hook and the e2e `toolchain` gate never
+    report anything else; a caller that needs a binary that is not a tier (the
+    agent-signal proofs' `bwrap`, card 4a3e0414) names it there. Names outside
+    `among` are never reported, whatever `which` says.
     """
     names = set(markers)
     lookup = shutil.which if which is None else which
-    for name in BINARY_TIERS:
+    for name in among:
         if name in names and lookup(name) is None:
             return name
     return None
