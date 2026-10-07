@@ -56,6 +56,7 @@ from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
+from agent_manager.store import backup as store_backup
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import events as store_events
@@ -1457,6 +1458,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     store_db.MigrationRequiredError,
     store_db.StoreBusyError,
     migrate.MigrationRefusedError,
+    store_backup.BackupRefusedError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1481,8 +1483,11 @@ locked through `store_db.run_with_retry`'s whole budget is a refusal naming the
 operation and the budget, not a bug: the lease goes stale and the run is
 resumable. `migrate.MigrationRefusedError` is in it because a merge that cannot
 be done safely is a refusal naming the reason and the files or runs, raised
-before anything is committed, not a bug. Anything outside this tuple is a bug
-in this program and should crash loudly with its stack intact.
+before anything is committed, not a bug. `store_backup.BackupRefusedError` is
+in it because a backup with no `am.db` to copy, a target that already exists or
+a target directory that does not is a refusal naming the reason and the path,
+with nothing written, not a bug. Anything outside this tuple is a bug in this
+program and should crash loudly with its stack intact.
 """
 
 
@@ -3545,3 +3550,22 @@ def migrate_command(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(render(ok_envelope(asdict(report)), pretty=pretty))
+
+
+@app.command("backup")
+def backup_command(
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help="The file to create; default <data dir>/backups/am-<UTC stamp>.db.",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Copy `am.db` to a new file through SQLite's online-backup API: safe
+    while runs are live, never overwriting an existing file."""
+    try:
+        result = store_backup.backup(out, now=_utcnow())
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(asdict(result)), pretty=pretty))
