@@ -10930,7 +10930,7 @@ def test_a_detached_story_run_records_and_leases_the_plan_and_drives_nothing_her
     run = _load(root, run_id)
     assert run.milestone_id == shape["milestone"]
     assert run.config == models.RunConfig(
-        max_concurrent_stories=1, story_id=story, allow_no_verification=True
+        max_concurrent_stories=1, story_id=story, allow_no_verification=True, launcher="bwrap"
     )
     assert _statuses(run) == {"run": "started", story: "pending", a1: "pending", a2: "pending"}
     lease = _lease(root, run_id)
