@@ -15,6 +15,7 @@ module imports only `store`, `runtime.stop` and the stdlib; never `cli`,
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import threading
@@ -39,6 +40,8 @@ LEASE_STALE_SECONDS = 30.0
 """A lease whose heartbeat is older than this is dead (C2)."""
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -96,7 +99,9 @@ class Lease:
     (`store_leases.LeaseHeldError`, `store_leases.ClaimHeldError`) and a dead one is taken
     over and kept in `displaced`. Only then does it start a daemon heartbeat
     thread. That thread waits on a `threading.Event`, never `time.sleep`, so
-    `__exit__` wakes it at once. `__exit__` stops and joins it, then releases
+    `__exit__` wakes it at once. A beat whose write stays busy through its
+    retry budget is logged as a `WARNING` on `agent_manager.control`, and the
+    next beat tries again. `__exit__` stops and joins it, then releases
     this token's claims, then this token's lease, on any exit, and never
     swallows the exception. A process that took the lease over keeps its rows.
 
@@ -208,9 +213,9 @@ class Lease:
         while not self._stopped.wait(self._heartbeat):
             try:
                 self.beat()
-            except store_db.StoreBusyError:
+            except store_db.StoreBusyError as error:
                 # The write's retry budget ran out; the next beat tries again.
-                continue
+                _log.warning("lease %s missed a heartbeat: %s", self.token, error)
 
 
 def apply_pending(

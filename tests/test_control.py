@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import itertools
+import logging
 import os
 import socket
 import sqlite3
@@ -420,6 +421,39 @@ def test_lease_heartbeat_survives_a_store_busy_error(root, opened_store):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
     assert _heartbeat_threads() == []
+
+
+def test_a_missed_heartbeat_is_logged_and_the_next_beat_moves_it(root, opened_store, caplog):
+    # Review Focus 1: two beats in a row stay busy; each one is logged once
+    # and the first beat that gets through moves the heartbeat.
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    recovered = threading.Event()
+
+    class Flaky(Wrapped):
+        calls = 0
+
+        def beat(self, token: str, now: datetime) -> None:
+            Flaky.calls += 1
+            if Flaky.calls <= 2:
+                raise store_db.StoreBusyError("beat", 5, 10.0)
+            self._inner.beat(token, now)
+            recovered.set()
+
+    ticks = itertools.count()
+    with control.Lease(
+        Flaky(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))
+    ) as lease:
+        assert recovered.wait(timeout=5.0)
+        assert _heartbeat_threads()[0].is_alive()
+        row = _read_lease(root)
+        token = lease.token
+
+    assert row is not None and row.heartbeat_at > row.acquired_at
+    missed = [record for record in caplog.records if record.name == "agent_manager.control"]
+    assert [record.levelno for record in missed] == [logging.WARNING, logging.WARNING]
+    for record in missed:
+        assert token in record.getMessage()
+        assert "beat: the database stayed busy" in record.getMessage()
 
 
 def test_lease_heartbeat_ends_on_a_raw_operational_error(root, opened_store, monkeypatch):
