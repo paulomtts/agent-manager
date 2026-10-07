@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from agent_manager import paths
 
@@ -50,6 +50,15 @@ class JournalLine(BaseModel):
     phase: str | None = None
     attempt: int | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+_TS: TypeAdapter[datetime] = TypeAdapter(datetime)
+
+
+def ts_text(ts: datetime) -> str:
+    """`ts` as a `JournalLine` writes it in JSON mode, e.g.
+    `2026-10-07T05:48:08.123456Z`; a `JournalLine` reads it back to `ts`."""
+    return _TS.dump_python(ts, mode="json")
 
 
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
@@ -239,3 +248,21 @@ class Journal:
                 self._seq = seq
                 os.fsync(handle.fileno())
             return line
+
+    def mirror(self, line: JournalLine) -> None:
+        """Append `line` exactly as given, flushed and fsynced before returning.
+
+        The bytes are those `append` writes for the same fields. `line.seq`
+        is written as given: nothing is numbered and the clock is not read.
+        Once the line is written and flushed, the cached highest `seq` becomes
+        the larger of itself and `line.seq`, so a later `append` numbers after
+        it. Whatever the open, the write, the flush or the fsync raises
+        propagates; the lock is released either way.
+        """
+        text = json.dumps(line.model_dump(mode="json"), sort_keys=True)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+                handle.flush()
+                self._seq = max(self._seq, line.seq)
+                os.fsync(handle.fileno())
