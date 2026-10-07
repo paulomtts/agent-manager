@@ -13927,7 +13927,6 @@ def test_the_harness_timeout_help_texts():
     )
 
 
-
 # ── recorded harness timeouts reach the runner (card eee43099) ──────────────
 #
 # Unit tier: an `AgentRunner` is built but never called, so nothing launches.
