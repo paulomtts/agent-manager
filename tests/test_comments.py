@@ -10,9 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import board, comments, locks, store
+from agent_manager import board, comments, locks
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store import writer as store_writer
 from agent_manager.results import (
     CriticResult,
     ImplementResult,
@@ -776,15 +777,15 @@ def root(tmp_path) -> Path:
 
 
 @pytest.fixture
-def stores(root) -> Iterator[Callable[..., store.Store]]:
+def stores(root) -> Iterator[Callable[..., store_writer.Store]]:
     """Open any number of `Store`s on `root`, each on its own connection; close them all.
 
     A local copy of `tests/test_store.py`'s `stores` fixture (M10 takeover pattern).
     """
-    opened: list[store.Store] = []
+    opened: list[store_writer.Store] = []
 
-    def open_store(run_id: str = RUN) -> store.Store:
-        st = store.Store.open(root, run_id)
+    def open_store(run_id: str = RUN) -> store_writer.Store:
+        st = store_writer.Store.open(root, run_id)
         opened.append(st)
         return st
 
@@ -811,7 +812,7 @@ def _comment(card_id: str, event: str, *, run_id: str = RUN) -> comments.Comment
     return comments.Comment(card_id=card_id, key=comment_key, body=body)
 
 
-def _row(st: store.Store, key: str):
+def _row(st: store_writer.Store, key: str):
     return st.connection.execute(
         "SELECT * FROM board_comments WHERE key = ?", (key,)
     ).fetchone()
@@ -939,7 +940,7 @@ class _Crash(Exception):
 class CrashOnFirstMark:
     """A `Store` whose first `mark_comment_posted` raises `error`; everything else delegates."""
 
-    def __init__(self, inner: store.Store, error: BaseException) -> None:
+    def __init__(self, inner: store_writer.Store, error: BaseException) -> None:
         self._inner = inner
         self._error = error
         self.marks = 0

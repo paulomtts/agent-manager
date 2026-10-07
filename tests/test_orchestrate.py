@@ -50,11 +50,11 @@ from agent_manager import bases, board, census, cli, comments, control, dag, det
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import SubtaskSummary
-from agent_manager import store as store_module
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.steps import rollup, worktree
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
@@ -1559,7 +1559,7 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
         "integrated": _integrated(root, [story_a, story_b]),
     }
     (integrate_call,) = integrate_recorder.calls
-    assert isinstance(integrate_call.pop("store"), store_module.Store)
+    assert isinstance(integrate_call.pop("store"), store_writer.Store)
     assert integrate_call == {
         "stories": [story_a, story_b],
         "repo_dir": root,
@@ -2460,7 +2460,7 @@ def test_at_most_max_concurrent_lanes_run(project):
 
 def _supervised_run(
     project: Path, milestone: str
-) -> tuple[store_module.Store, str, orchestrate.SupervisorPlan]:
+) -> tuple[store_writer.Store, str, orchestrate.SupervisorPlan]:
     """What `run_milestone` sets up before it calls `supervise`, without the
     lease, the git refresh or Integrate: a recorded run, its planned rows, and
     the plan built from them. The caller closes the store."""
@@ -2468,7 +2468,7 @@ def _supervised_run(
     stories = census.flatten_milestone(board.tree(milestone, repo_dir=root)).stories
     levels = orchestrate.plan_levels(stories, branch_prefix=PREFIX, base_branch="main")
     run_id = cli.mint_run_id(milestone, STARTED_AT)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     store.record_run(
         models.Run(
             id=run_id,
@@ -2491,7 +2491,7 @@ def _supervised_run(
 
 async def _supervise_shared(
     project: Path,
-    store: store_module.Store,
+    store: store_writer.Store,
     run_id: str,
     plan: orchestrate.SupervisorPlan,
     driver: Any,
@@ -3630,7 +3630,7 @@ def test_an_escalation_parks_running_lanes_and_blocks_new_ones(project, fresh_py
         story_c: "pending",
         c1: "pending",
     }
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(b1)
     finally:
@@ -3684,7 +3684,7 @@ def _plant(
     minute: int = 0,
 ) -> store_checkpoints.Checkpoint:
     """One checkpoint row of `TASK` for `card_id`, saved by an earlier run."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return opened.save_checkpoint(
             card_id,
@@ -3764,7 +3764,7 @@ FIRST_PHASE = "worktree"
 
 def _continuable(project: Path, run_id: str, card_id: str) -> store_checkpoints.Checkpoint | None:
     """What a relaunch's lane would continue `card_id` from, read as the lane reads it."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return runs.continuable_checkpoint(opened, card_id)
     finally:
@@ -4544,7 +4544,7 @@ def _record_resume_run(
     status: str = "escalated",
     base_branch: str = "main",
 ) -> None:
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -4562,7 +4562,7 @@ def _record_resume_run(
 
 
 def _save(
-    store: store_module.Store,
+    store: store_writer.Store,
     card_id: str,
     reason: str,
     *,
@@ -4742,7 +4742,7 @@ def test_each_open_card_resumes_from_its_newest_row_or_the_turn_it_failed_in(
     its parked INTEGRATE row."""
     root = _resume_root(tmp_path, monkeypatch)
     base_c = bases.resolver_card_id(_plan_id(3))
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(12), "turn", phase="implement")
         failed = _save(opened, _plan_id(12), "turn", phase="review")
@@ -4766,7 +4766,7 @@ def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_dig
     tmp_path, monkeypatch
 ):
     root = _resume_root(tmp_path, monkeypatch)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(13), "parked", phase="plan", digest="saved-under-another-task")
         cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
@@ -4786,7 +4786,7 @@ def test_a_subtask_saved_under_another_task_refuses_naming_the_card_and_both_dig
 def test_a_resolver_is_judged_against_integrate_not_task(tmp_path, monkeypatch):
     root = _resume_root(tmp_path, monkeypatch)
     base_c = bases.resolver_card_id(_plan_id(3))
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, base_c, "parked", phase="verify", workflow=task_workflow.TASK)
         cards = orchestrate.open_cards(_resume_stories(), branch_prefix=PREFIX, base_branch="main")
@@ -4805,7 +4805,7 @@ def test_an_escalation_with_no_turn_row_left_starts_the_card_fresh(tmp_path, mon
     rewind to, the card is started fresh rather than handed a checkpoint
     that names no phase to continue."""
     root = _resume_root(tmp_path, monkeypatch)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, _plan_id(31), "escalated")
 
@@ -4838,7 +4838,7 @@ def test_reopening_marks_orphans_harness_error_and_open_rows_started(tmp_path, m
         "closed": "escalated",
     }
     _record_resume_run(root)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         opened.record_story(models.StoryRun(card_id="story-a", title="A", level=0, status="escalated"))
         for card, status in statuses.items():
@@ -4885,7 +4885,7 @@ def _plant_integrate(
     project: Path, run_id: str, story_id: str, reason: str, *, digest: str | None = None
 ) -> store_checkpoints.Checkpoint:
     """One `INTEGRATE` checkpoint of `story_id`'s resolver, saved by `run_id`."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         return opened.save_checkpoint(
             bases.resolver_card_id(story_id),
@@ -5313,7 +5313,7 @@ def test_resuming_a_run_recorded_before_milestone_id_stamps_it(project):
     first = _run(project, shape["milestone"], FakeDriver(outcomes={a1: ("review", "boom")}))
     assert first["escalated"] is True, first
     run_id = first["run_id"]
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.record_run(_load(project, run_id).model_copy(update={"milestone_id": None}))
     finally:
@@ -5738,7 +5738,7 @@ def test_a_pause_lets_the_running_phase_finish_and_parks_before_the_next(
         a1: "stopped",
     }
     assert integrate_recorder.calls == []
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(a1)
     finally:
@@ -6045,7 +6045,7 @@ def test_a_milestone_resume_is_refused_before_the_store_opens_while_a_live_run_c
         heartbeat_at=datetime.now(timezone.utc),
         claims=(key,),
     )
-    monkeypatch.setattr(store_module.Store, "open", _forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _forbidden("Store.open"))
     monkeypatch.setattr(orchestrate, "refresh_git", _forbidden("refresh_git"))
     driver = FakeDriver()
 
@@ -6075,7 +6075,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
         real_refresh(root)
 
     first_write: list[tuple[str | None, list[str]]] = []
-    real_record_run = store_module.Store.record_run
+    real_record_run = store_writer.Store.record_run
 
     def record_spy(self, run):
         if not first_write:
@@ -6092,7 +6092,7 @@ def test_refresh_git_and_first_write_run_inside_the_lease_on_resume(project, mon
         return real_record_run(self, run)
 
     monkeypatch.setattr(orchestrate, "refresh_git", refresh_spy)
-    monkeypatch.setattr(store_module.Store, "record_run", record_spy)
+    monkeypatch.setattr(store_writer.Store, "record_run", record_spy)
 
     result = _resume(project, run_id, FakeDriver())
 
@@ -9264,7 +9264,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     close runs.
     """
     seen: list[tuple[int, int]] = []
-    real_close = store_module.Store.close
+    real_close = store_writer.Store.close
 
     def close(self) -> None:
         conn = self.connection
@@ -9277,7 +9277,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
         seen.append((claims, leases))
         real_close(self)
 
-    monkeypatch.setattr(store_module.Store, "close", close)
+    monkeypatch.setattr(store_writer.Store, "close", close)
     return seen
 
 
@@ -9392,7 +9392,7 @@ def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
     root = _resume_root(tmp_path, monkeypatch)
     _milestone_id, _story, subtask = _seam_resume_board(fake_board)
     _record_resume_run(root)
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         _save(opened, subtask, "parked", phase="plan", digest="saved-under-another-task")
     finally:
@@ -9685,7 +9685,7 @@ def test_the_detached_milestone_child_drives_the_recorded_plan_and_reports_it(
     run_id = data["run_id"]
     assert run_id == runs.mint_run_id(shape["milestone"], STARTED_AT)
     assert driver.calls == []
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()
@@ -10227,7 +10227,7 @@ def _record_story_run(
     root: Path, milestone: str, story: str, *, status: str = "escalated"
 ) -> None:
     """A story run of `story` under `milestone`, recorded as `preflight_story` records one."""
-    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    opened = store_writer.Store.open(root, RESUME_RUN_ID)
     try:
         opened.record_run(
             models.Run(
@@ -10541,7 +10541,7 @@ def test_the_detached_story_child_drives_only_the_story_and_reports_no_integrate
     assert _load(root, run_id).config == models.RunConfig(
         max_concurrent_stories=1, story_id=story
     )
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()

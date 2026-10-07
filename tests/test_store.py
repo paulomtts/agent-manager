@@ -35,6 +35,7 @@ from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
+from agent_manager.store import writer as store_writer
 
 RUN_ID = "run-2026-09-23-01"
 
@@ -79,13 +80,13 @@ def _run(repo: Path, run_id: str = RUN_ID) -> models.Run:
 def test_a_resumed_store_continues_the_journal_sequence(repo):
     # Review Focus 5: `Store.open` builds the journal, so a resumed run
     # numbers its next record after the last line already on disk.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
     finally:
         st.close()
 
-    reopened = store.Store.open(repo, RUN_ID)
+    reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
     finally:
@@ -116,7 +117,7 @@ def _subtask(card_id: str = "ef248597", base: str = "main") -> models.SubtaskRun
 
 
 def test_record_run_writes_the_journal_line_and_the_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         line = st.record_run(_run(repo))
         assert line.event == "run_upsert"
@@ -137,7 +138,7 @@ def test_record_run_writes_the_journal_line_and_the_row(repo):
 
 
 def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -189,7 +190,7 @@ def test_record_story_subtask_phase_and_attempt_write_their_rows(repo):
 def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
     # §9 line 365: the journal is appended first. Closing the connection is a
     # real SQLite failure -- no mock -- and the line must survive it.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
 
@@ -200,7 +201,7 @@ def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
     assert [line.event for line in lines] == ["run_upsert", "story_upsert"]
     assert lines[1].story == "8831189b"
 
-    reopened = store.Store.open(repo, RUN_ID)
+    reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         assert reopened.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
     finally:
@@ -209,7 +210,7 @@ def test_a_failed_sqlite_write_still_leaves_the_journal_line(repo):
 
 def test_recording_a_node_again_updates_it_without_duplicating_or_reordering(repo):
     # Review Focus 5: pending -> started -> done is the same node three times.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -236,7 +237,7 @@ def test_recording_a_node_again_updates_it_without_duplicating_or_reordering(rep
 
 
 def test_run_status_transitions_replace_the_single_run_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         run = _run(repo)
         st.record_run(run)
@@ -252,7 +253,7 @@ def test_run_status_transitions_replace_the_single_run_row(repo):
 def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
     # D5 and §4: the two stores are independent of the board and of the
     # worktree. Nothing agent-manager writes may land in the repo.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -269,7 +270,7 @@ def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
     assert store_journal.Journal(RUN_ID).path.is_relative_to(tmp_path / "data")
 
 
-def _record_full_run(st: store.Store, repo: Path) -> None:
+def _record_full_run(st: store_writer.Store, repo: Path) -> None:
     """One run, two subtasks, three phases, a finished and an in-flight attempt."""
     st.record_run(_run(repo))
     st.record_story(_story())
@@ -333,7 +334,7 @@ def _record_full_run(st: store.Store, repo: Path) -> None:
 
 
 def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         loaded = st.load_run(RUN_ID)
@@ -365,7 +366,7 @@ def test_load_run_rebuilds_the_tree_in_recorded_order(repo):
 
 
 def test_load_run_returns_none_for_an_unknown_run(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         assert st.load_run("run-never-started") is None
     finally:
@@ -386,7 +387,7 @@ def _truncate_db(repo: Path) -> Path:
 
 
 def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     _record_full_run(st, repo)
     before = st.load_run(RUN_ID)
     st.close()
@@ -394,7 +395,7 @@ def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
     db_path = _truncate_db(repo)
     assert db_path.stat().st_size == 0
 
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         assert rebuilt.load_run(RUN_ID) is None
         returned = rebuilt.rebuild_from_journal(RUN_ID)
@@ -407,7 +408,7 @@ def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
 
 
 def test_rebuilding_twice_changes_nothing_and_duplicates_nothing(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         once = st.rebuild_from_journal(RUN_ID)
@@ -429,12 +430,12 @@ def test_rebuilding_twice_changes_nothing_and_duplicates_nothing(repo):
 def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     # §9 lines 370-373: the store preserves `started` with nothing terminal.
     # Discarding it is the engine's job, not the store's.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     _record_full_run(st, repo)
     st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         run = rebuilt.rebuild_from_journal(RUN_ID)
         row = rebuilt.connection.execute(
@@ -458,13 +459,13 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
 def test_rebuild_picks_up_a_journal_line_whose_row_never_landed(repo):
     # The other half of the ordering guarantee: the row the failed SQLite write
     # never produced is materialised by the rebuild.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
     with pytest.raises(sqlite3.Error):
         st.record_story(_story())
 
-    reopened = store.Store.open(repo, RUN_ID)
+    reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         run = reopened.rebuild_from_journal(RUN_ID)
         row = reopened.connection.execute("SELECT * FROM stories").fetchone()
@@ -482,7 +483,7 @@ def _append_raw(journal: store_journal.Journal, record: dict) -> None:
 
 
 def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         journal = st.journal
@@ -550,7 +551,7 @@ def _append_old_attempt(journal: store_journal.Journal, extra: dict) -> None:
 
 @pytest.mark.parametrize("retired", [_RETIRED_NULL, _RETIRED_SET], ids=["null", "non_null"])
 def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, retired):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         _append_old_attempt(st.journal, retired)
@@ -582,7 +583,7 @@ def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, ret
 def test_an_attempt_line_with_any_other_unknown_key_still_raises_naming_only_it(
     repo, read
 ):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         _append_old_attempt(st.journal, {**_RETIRED_NULL, "operator": "x"})
@@ -620,7 +621,7 @@ def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
             ),
         ),
     }[event]
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         _append_raw(
@@ -643,7 +644,7 @@ def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
 
 
 def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         journal = st.journal
@@ -677,7 +678,7 @@ def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
 
 
 def test_a_corrupt_line_raises_out_of_rebuild_naming_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         with st.journal.path.open("a", encoding="utf-8") as handle:
@@ -691,7 +692,7 @@ def test_a_corrupt_line_raises_out_of_rebuild_naming_the_journal(repo):
 
 
 def test_rebuilding_a_run_with_no_journal_raises(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.MissingJournalError) as excinfo:
             st.rebuild_from_journal("run-never-started")
@@ -710,7 +711,7 @@ def test_a_journal_whose_head_is_missing_raises_a_journal_error(repo):
         _story().model_dump(mode="json", exclude={"subtasks"}),
         story="8831189b",
     )
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
             st.rebuild_from_journal(RUN_ID)
@@ -728,7 +729,7 @@ def test_a_line_naming_an_unknown_parent_raises_a_journal_error(repo):
         story="never-recorded",
         card="ef248597",
     )
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
             st.rebuild_from_journal(RUN_ID)
@@ -740,13 +741,13 @@ def test_a_line_naming_an_unknown_parent_raises_a_journal_error(repo):
 def test_rebuilding_one_run_leaves_another_runs_rows_alone(repo):
     # Review Focus 4: one project DB holds every run. A rebuild is scoped.
     other_id = "run-2026-09-22-07"
-    first = store.Store.open(repo, RUN_ID)
+    first = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(first, repo)
     finally:
         first.close()
 
-    second = store.Store.open(repo, other_id)
+    second = store_writer.Store.open(repo, other_id)
     try:
         second.record_run(_run(repo, run_id=other_id))
         second.record_story(_story())
@@ -755,7 +756,7 @@ def test_rebuilding_one_run_leaves_another_runs_rows_alone(repo):
     finally:
         second.close()
 
-    rebuilding = store.Store.open(repo, RUN_ID)
+    rebuilding = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilding.rebuild_from_journal(RUN_ID)
         assert rebuilding.load_run(other_id) == untouched
@@ -768,7 +769,7 @@ def test_a_status_transition_on_a_parent_keeps_the_children_recorded_before_it(r
     # §9: a transition is the same node journalled again. Replaying the later
     # line must not drop the phases and attempts that were journalled between
     # the two, or a rebuild would silently amputate the in-flight subtask.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         st.record_story(_story().model_copy(update={"status": "done"}))
@@ -839,7 +840,7 @@ def test_read_returns_lines_in_sequence_order_not_file_order(repo):
 
     assert [line.seq for line in journal.read()] == [1, 2, 3]
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         run = st.rebuild_from_journal(RUN_ID)
     finally:
@@ -851,7 +852,7 @@ def test_recording_a_run_whose_id_is_not_the_stores_run_id_is_refused(repo):
     # The row is keyed by the store's run id while the journal payload carries
     # the model's own. Letting the two differ makes `rebuild_from_journal`
     # return a run that `load_run` can never equal, so it is refused outright.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(ValueError) as excinfo:
             st.record_run(_run(repo, run_id="run-somewhere-else"))
@@ -873,7 +874,7 @@ def test_a_journal_whose_run_upsert_names_another_run_raises(repo):
             mode="json", exclude={"stories"}
         ),
     )
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
             st.rebuild_from_journal(RUN_ID)
@@ -897,7 +898,7 @@ def _record_summary(
     """One run row in `root`'s projection, plus, when `subtask_cards` is given,
     one story holding those subtasks in that order. The defaults write the run
     row alone, as every older caller expects."""
-    opened = store.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             _run(root, run_id).model_copy(
@@ -1087,7 +1088,7 @@ def test_list_runs_breaks_a_subtask_position_tie_with_the_lowest_card_id(repo):
     """Positions count per story, so a `task` run holding subtasks under two
     stories has two rows at position 0; the lower card id must win, whatever
     order the stories sort in."""
-    opened = store.Store.open(repo, "run-t")
+    opened = store_writer.Store.open(repo, "run-t")
     try:
         opened.record_run(
             _run(repo, "run-t").model_copy(update={"started_at": None, "workflow": "task"})
@@ -1362,10 +1363,10 @@ def _progress_run(
     workflow: str = "milestone",
     status: str = "started",
     started_at: datetime | None = None,
-) -> store.Store:
+) -> store_writer.Store:
     """An open store for `run_id` holding its run row and nothing below it.
     The caller records the tree and closes the store."""
-    opened = store.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     opened.record_run(
         _run(root, run_id).model_copy(
             update={"workflow": workflow, "status": status, "started_at": started_at}
@@ -1808,7 +1809,7 @@ def test_load_run_reads_the_tree_from_a_bare_connection(repo):
     """`status` has no run id until it has read the database, so it cannot use
     `Store.open(root, run_id)` -- and must not, since a `Journal` mkdirs a run
     directory for a run that may not exist."""
-    opened = store.Store.open(repo, RUN_ID)
+    opened = store_writer.Store.open(repo, RUN_ID)
     try:
         opened.record_run(_run(repo))
         opened.record_story(
@@ -1892,7 +1893,7 @@ def test_every_record_holds_the_store_lock_across_the_journal_append_and_the_row
 ):
     # P2: the journal append and the row write are one critical section, so
     # journal order equals row order. Checked at the moment each happens.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     seen: list[tuple[str, bool]] = []
 
     real_append = st.journal.append
@@ -1949,7 +1950,7 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
 ):
     # Deliberate extension beyond the record_* methods: rebuild deletes and
     # rewrites rows on the shared connection, and load_run reads on it.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         seen: list[tuple[str, bool]] = []
@@ -2007,7 +2008,7 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
 
 def test_close_holds_the_store_lock(repo):
     # The connection is never closed under an in-flight record.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     held: list[bool] = []
     st._conn = _SpyingConnection(st._conn, lambda: held.append(_held_elsewhere(st._lock)))
 
@@ -2020,7 +2021,7 @@ def test_close_holds_the_store_lock(repo):
 def test_a_failed_row_write_releases_the_store_lock(repo):
     # §9: the journal line survives the failed row write, and the `with` block
     # releases the lock so the next record is not deadlocked.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
 
@@ -2037,7 +2038,7 @@ def test_a_failed_journal_append_releases_the_store_lock_and_writes_no_row(
 ):
     # Review Focus 1: the journal is written first, so when it fails there is
     # no row, the same exception propagates, and the lock is free.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
 
@@ -2057,7 +2058,7 @@ def test_a_failed_journal_append_releases_the_store_lock_and_writes_no_row(
 
 def test_a_refused_record_run_releases_the_store_lock(repo):
     # Review Focus 2: the run-id check now runs inside the lock.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(ValueError):
             st.record_run(_run(repo, run_id="run-somewhere-else"))
@@ -2069,7 +2070,7 @@ def test_a_refused_record_run_releases_the_store_lock(repo):
 def test_a_failed_rebuild_releases_the_store_lock(repo):
     # Review Focus 3: a rebuild that raises must not leave every later record
     # deadlocked behind it.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         with st.journal.path.open("a", encoding="utf-8") as handle:
@@ -2086,7 +2087,7 @@ def test_a_failed_rebuild_releases_the_store_lock(repo):
 def test_recording_on_a_store_closed_by_another_thread_raises_and_frees_the_lock(repo):
     # Review Focus 5: a worker that records after another thread closed the
     # store gets a sqlite3.Error, not a hang or a silent success.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
 
@@ -2114,7 +2115,7 @@ STRESS_PHASES = ("explore", "implement")
 STRESS_ATTEMPTS_PER_PHASE = 2
 
 
-def _record_one_subtask(st: store.Store, story_id: str, card_id: str) -> int:
+def _record_one_subtask(st: store_writer.Store, story_id: str, card_id: str) -> int:
     """Record one subtask's whole life, each parent before its children.
 
     Returns how many `record_*` calls it made, so the caller can check the
@@ -2152,7 +2153,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
     # P2: the threads of one process share one Store. Deterministic (P7): the
     # assertions are on results only -- the journal's numbering and the tree
     # the rows and the journal each produce -- never on timing.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     story_ids = [f"story-{i}" for i in range(STRESS_STORIES)]
     try:
         # A child needs its parent: the run and every story exist before any
@@ -2233,7 +2234,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
         st.close()
 
 
-def _record_stopped_run(st: store.Store, repo: Path) -> None:
+def _record_stopped_run(st: store_writer.Store, repo: Path) -> None:
     """One run stopped cleanly mid-subtask: `stopped` at every level that uses `Status`."""
     st.record_run(models.Run.model_validate({**_run(repo).model_dump(), "status": "stopped"}))
     st.record_story(
@@ -2274,7 +2275,7 @@ def _stopped_levels(run: models.Run) -> tuple[str, str, str, str]:
 
 
 def test_a_stopped_run_loads_back_as_stopped_from_the_rows(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_stopped_run(st, repo)
         loaded = st.load_run(RUN_ID)
@@ -2286,12 +2287,12 @@ def test_a_stopped_run_loads_back_as_stopped_from_the_rows(repo):
 
 
 def test_a_stopped_run_survives_a_rebuild_from_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     _record_stopped_run(st, repo)
     st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         returned = rebuilt.rebuild_from_journal(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
@@ -2336,7 +2337,7 @@ migrated database only agree if the schema puts it there too."""
 
 
 def _record_failed_phase(
-    st: store.Store, repo: Path, detail: str | None = FAILURE_DETAIL
+    st: store_writer.Store, repo: Path, detail: str | None = FAILURE_DETAIL
 ) -> None:
     """One subtask with a finished `implement` (no detail) and a failed `verify`."""
     st.record_run(_run(repo))
@@ -2394,7 +2395,7 @@ def test_a_fresh_phases_table_carries_detail_as_its_last_column(repo):
 
 
 def test_a_failed_phase_detail_round_trips_through_load_run(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_failed_phase(st, repo)
         via_store = st.load_run(RUN_ID)
@@ -2407,14 +2408,14 @@ def test_a_failed_phase_detail_round_trips_through_load_run(repo):
 
 
 def test_a_failed_phase_detail_survives_a_rebuild_from_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_failed_phase(st, repo)
     finally:
         st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         returned = rebuilt.rebuild_from_journal(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
@@ -2428,7 +2429,7 @@ def test_a_failed_phase_detail_survives_a_rebuild_from_the_journal(repo):
 def test_re_recording_a_phase_overwrites_its_detail(repo):
     # The upsert must assign the new value, including NULL: a retry that
     # passes must not keep the old failure reason.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_failed_phase(st, repo, detail="first reason")
         verify = models.PhaseRun(
@@ -2486,7 +2487,7 @@ VALUES ('run-2026-09-23-01', '8831189b', 'ef248597', 'verify', 'deterministic',
 
 def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it(repo):
     # The journal already carries the reason; only the projection lost it.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_failed_phase(st, repo)
     finally:
@@ -2525,7 +2526,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
         again.close()
     assert reopened_columns == PHASE_COLUMNS
 
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
@@ -2612,7 +2613,7 @@ def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
     legacy.commit()
     legacy.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         columns = _attempt_columns(st.connection)
         _record_full_run(st, repo)
@@ -2691,7 +2692,7 @@ def test_a_fresh_runs_table_carries_milestone_id_as_its_last_column(repo):
 def test_a_runs_milestone_id_round_trips_through_load_run_and_is_overwritten(repo):
     # A resume re-records an existing run row to stamp it, so the upsert's
     # conflict clause must assign the new value, not keep the old NULL.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         unstamped = st.load_run(RUN_ID)
@@ -2819,14 +2820,14 @@ def test_an_old_runs_row_lists_with_zero_progress(repo):
 
 
 def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo).model_copy(update={"milestone_id": MILESTONE_ID}))
     finally:
         st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         returned = rebuilt.rebuild_from_journal(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
@@ -2848,7 +2849,7 @@ def _with_story(run: models.Run, story_id: str | None) -> models.Run:
 
 
 def test_a_runs_config_story_id_round_trips_through_the_row_and_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_with_story(_run(repo), STORY_ID))
         via_store = st.load_run(RUN_ID)
@@ -2873,7 +2874,7 @@ def test_a_runs_config_story_id_round_trips_through_the_row_and_the_journal(repo
 
 
 def test_a_runs_row_whose_config_has_no_story_id_loads_with_none(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.connection.execute(
@@ -2893,7 +2894,7 @@ def test_a_runs_row_whose_config_has_no_story_id_loads_with_none(repo):
 def test_list_runs_gives_a_story_run_its_story_id_and_its_parent_milestone_id(repo):
     """A story run is a `milestone` run holding subtask rows, so it lists with
     the parent milestone's id and no `card_id`."""
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(
             _with_story(_run(repo), STORY_ID).model_copy(
@@ -2934,7 +2935,7 @@ def test_list_runs_gives_a_milestone_run_and_a_task_run_a_null_story_id(repo):
 
 
 def test_list_runs_gives_a_row_whose_config_has_no_story_id_a_null_story_id(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.connection.execute(
@@ -2962,7 +2963,7 @@ def test_list_runs_gives_a_row_whose_config_has_no_story_id_a_null_story_id(repo
 )
 def test_list_runs_refuses_a_config_it_cannot_read_a_story_id_from(repo, config, error):
     """A `story_id` that cannot be read is an error, never a `null`."""
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.connection.execute("UPDATE runs SET config = ? WHERE id = ?", (config, RUN_ID))
@@ -2975,14 +2976,14 @@ def test_list_runs_refuses_a_config_it_cannot_read_a_story_id_from(repo, config,
 
 
 def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_with_story(_run(repo), STORY_ID))
     finally:
         st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         returned = rebuilt.rebuild_from_journal(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
@@ -2995,7 +2996,7 @@ def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
 
 
 def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
     finally:
@@ -3010,7 +3011,7 @@ def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
     journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         returned = rebuilt.rebuild_from_journal(RUN_ID)
     finally:
@@ -3043,7 +3044,7 @@ def test_a_story_runs_journal_names_its_story_and_milestone_at_the_head(repo):
     run = _with_story(_run(repo), STORY_ID).model_copy(
         update={"milestone_id": MILESTONE_ID}
     )
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(run)
         st.record_story(_story())
@@ -3090,7 +3091,7 @@ def test_a_milestone_runs_journal_names_its_milestone_once_at_the_head(repo):
         card_id=integration.INTEGRATE_STORY_ID, title="Integrate", level=1, status="started"
     )
     run = _run(repo).model_copy(update={"milestone_id": MILESTONE_ID})
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(run)
         st.record_story(story)
@@ -3143,7 +3144,7 @@ def test_a_run_upsert_line_from_before_milestone_id_rebuilds_to_none(repo):
     # all (not `null`): it must still validate, and project a NULL column.
     payload = _run(repo).model_dump(mode="json", exclude={"stories", "milestone_id"})
     assert "milestone_id" not in payload
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _append_raw(
             st.journal,
@@ -3181,7 +3182,7 @@ def _at(minute: int) -> datetime:
 
 
 def _save_checkpoint(
-    st: store.Store,
+    st: store_writer.Store,
     card_id: str = "ef248597",
     *,
     reason: str = "turn",
@@ -3222,7 +3223,7 @@ def test_open_db_creates_the_checkpoints_table(repo):
 
 
 def test_save_checkpoint_numbers_each_cards_rows_from_zero(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         seqs = [_save_checkpoint(st, "card-a", saved_at=_at(i)).seq for i in range(3)]
         other = _save_checkpoint(st, "card-b", saved_at=_at(3))
@@ -3244,14 +3245,14 @@ def test_save_checkpoint_numbers_each_cards_rows_from_zero(repo):
 
 
 def test_latest_checkpoint_is_the_highest_seq_of_this_stores_run(repo):
-    other = store.Store.open(repo, OTHER_RUN_ID)
+    other = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         for i in range(5):
             _save_checkpoint(other, "card-a", digest="sha256:other", saved_at=_at(i))
     finally:
         other.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(10))
         newest = _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(11))
@@ -3273,13 +3274,13 @@ def test_latest_checkpoint_is_the_highest_seq_of_this_stores_run(repo):
 def test_latest_turn_checkpoint_is_the_newest_turn_row_of_this_stores_run(repo):
     """Card 54e4ec29: a phase escalation's newest row holds no turn, so a
     milestone resume rewinds to the turn the failing phase ran in."""
-    other = store.Store.open(repo, OTHER_RUN_ID)
+    other = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(other, "card-a", reason="turn", saved_at=_at(20))
     finally:
         other.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
         wanted = _save_checkpoint(st, "card-a", reason="turn", agent={"turn": 1}, saved_at=_at(1))
@@ -3298,7 +3299,7 @@ def test_latest_turn_checkpoint_is_the_newest_turn_row_of_this_stores_run(repo):
 
 
 def test_a_checkpoint_with_an_unknown_reason_is_refused_and_writes_nothing(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             _save_checkpoint(st, "card-a", reason="bogus")
@@ -3314,7 +3315,7 @@ def test_a_checkpoint_with_an_unknown_reason_is_refused_and_writes_nothing(repo)
 
 def test_a_checkpoint_whose_agent_is_not_json_is_refused_and_writes_nothing(repo):
     # Review Focus 4: the agent dict is encoded before anything is written.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(TypeError):
             _save_checkpoint(st, "card-a", agent={"when": _at(0)})
@@ -3332,7 +3333,7 @@ def test_a_checkpoints_agent_round_trips_byte_equal(repo):
         "alpha": {"nested": {"y": None, "x": "é"}},
         "count": 7,
     }
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         saved = _save_checkpoint(st, "card-a", agent=agent)
         stored = st.connection.execute(
@@ -3360,7 +3361,7 @@ def test_a_checkpoints_agent_round_trips_byte_equal(repo):
 
 def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
     # G10: checkpoints are not part of the journaled tree.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         before = [line.seq for line in st.journal.read()]
@@ -3383,7 +3384,7 @@ def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
 
 
 def test_latest_open_checkpoint_finds_an_older_runs_parked_row(repo):
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(old, "card-a", reason="turn", saved_at=_at(0))
         parked = _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(1))
@@ -3392,7 +3393,7 @@ def test_latest_open_checkpoint_finds_an_older_runs_parked_row(repo):
     finally:
         old.close()
 
-    new = store.Store.open(repo, RUN_ID)
+    new = store_writer.Store.open(repo, RUN_ID)
     try:
         found = new.latest_open_checkpoint("card-a", "task")
         own = new.latest_checkpoint("card-a")
@@ -3412,14 +3413,14 @@ def test_latest_open_checkpoint_finds_an_older_runs_parked_row(repo):
 
 
 def test_latest_open_checkpoint_is_none_when_the_newest_row_is_done(repo):
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(old, "card-a", reason="turn", saved_at=_at(0))
         _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(1))
     finally:
         old.close()
 
-    new = store.Store.open(repo, RUN_ID)
+    new = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(new, "card-a", reason="done", saved_at=_at(2))
         assert new.latest_open_checkpoint("card-a", "task") is None
@@ -3429,13 +3430,13 @@ def test_latest_open_checkpoint_is_none_when_the_newest_row_is_done(repo):
 
 def test_latest_open_checkpoint_is_none_when_a_done_row_of_another_workflow_is_newest(repo):
     # Review Focus 2: the newest row "in any run and with any workflow" decides.
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(old, "card-a", reason="parked", saved_at=_at(0))
     finally:
         old.close()
 
-    new = store.Store.open(repo, RUN_ID)
+    new = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(new, "card-a", reason="done", workflow="integrate", saved_at=_at(1))
         assert new.latest_open_checkpoint("card-a", "task") is None
@@ -3445,13 +3446,13 @@ def test_latest_open_checkpoint_is_none_when_a_done_row_of_another_workflow_is_n
 
 def test_latest_open_checkpoint_returns_a_later_runs_row_after_an_earlier_done(repo):
     # Review Focus 1: a card finished in one run and reopened in a later one.
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(old, "card-a", reason="done", saved_at=_at(0))
     finally:
         old.close()
 
-    new = store.Store.open(repo, RUN_ID)
+    new = store_writer.Store.open(repo, RUN_ID)
     try:
         reopened = _save_checkpoint(new, "card-a", reason="turn", saved_at=_at(1))
         found = new.latest_open_checkpoint("card-a", "task")
@@ -3464,7 +3465,7 @@ def test_latest_open_checkpoint_returns_a_later_runs_row_after_an_earlier_done(r
 
 
 def test_latest_open_checkpoint_returns_an_escalated_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
         escalated = _save_checkpoint(st, "card-a", reason="escalated", saved_at=_at(1))
@@ -3475,7 +3476,7 @@ def test_latest_open_checkpoint_returns_an_escalated_row(repo):
 
 def test_latest_open_checkpoint_breaks_a_saved_at_tie_with_seq(repo):
     # Review Focus 3: equal timestamps are ordered by seq.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(5))
         parked = _save_checkpoint(st, "card-a", reason="parked", saved_at=_at(5))
@@ -3494,7 +3495,7 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
     # The newest row overall is open (another workflow), so the card is not
     # closed; the answer is then the newest *open* row of `workflow`, never its
     # newer `done` row.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         opened = _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(0))
         _save_checkpoint(st, "card-a", reason="done", saved_at=_at(1))
@@ -3507,7 +3508,7 @@ def test_latest_open_checkpoint_skips_a_done_row_of_its_workflow_when_another_is
 def test_checkpoint_cards_lists_this_runs_distinct_pairs_in_order(repo):
     """af52db54: `am reset` reports every `(card_id, workflow)` the run
     checkpointed, whatever the reason, and nothing another run saved."""
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-b", reason="turn", saved_at=_at(0))
         _save_checkpoint(st, "card-a", reason="turn", saved_at=_at(1))
@@ -3517,7 +3518,7 @@ def test_checkpoint_cards_lists_this_runs_distinct_pairs_in_order(repo):
     finally:
         st.close()
 
-    other = store.Store.open(repo, OTHER_RUN_ID)
+    other = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         _save_checkpoint(other, "card-c", reason="turn", saved_at=_at(5))
         _save_checkpoint(other, "card-a", reason="parked", workflow="bases", saved_at=_at(6))
@@ -3589,7 +3590,7 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
 
 
 def test_a_lease_is_touched_only_through_its_own_token(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         lease = st.take_lease(
             token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
@@ -3633,7 +3634,7 @@ def test_a_lease_is_touched_only_through_its_own_token(repo):
 
 
 def test_set_lease_holder_moves_pid_and_host_only_for_its_own_token(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         lease = st.take_lease(
             token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
@@ -3652,8 +3653,8 @@ def test_set_lease_holder_moves_pid_and_host_only_for_its_own_token(repo):
 
 
 def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
-    first = store.Store.open(repo, RUN_ID)
-    second = store.Store.open(repo, RUN_ID)
+    first = store_writer.Store.open(repo, RUN_ID)
+    second = store_writer.Store.open(repo, RUN_ID)
     try:
         first.take_lease(token="t1", pid=1, host="h", now=_at(0), is_live=lambda row: False)
         assert first.record_run(_run(repo)).seq == 1
@@ -3664,7 +3665,7 @@ def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
         assert held.token == "t1"
         # Opened before line 1 was written: only the reseek numbers this line 2.
         assert second.record_run(_run(repo)).seq == 2
-        thief = store.Store.open(repo, RUN_ID)
+        thief = store_writer.Store.open(repo, RUN_ID)
         try:
             thief.take_lease(token="thief", pid=9, host="h", now=_at(1), is_live=lambda row: False)
         finally:
@@ -3677,7 +3678,7 @@ def test_adopt_lease_binds_the_held_token_and_numbers_after_the_last_line(repo):
 
 
 def test_adopt_lease_refuses_a_token_that_does_not_hold_the_run(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_leases.LeaseLostError) as missing:
             st.adopt_lease("t1")
@@ -3698,8 +3699,8 @@ def test_adopt_lease_refuses_a_token_that_does_not_hold_the_run(repo):
 def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched(repo):
     # Review Focus 3: a resumed run takes a new token; the old one is dead, and
     # a token string shared with another run never reaches that run's row.
-    other = store.Store.open(repo, OTHER_RUN_ID)
-    st = store.Store.open(repo, RUN_ID)
+    other = store_writer.Store.open(repo, OTHER_RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         theirs = other.take_lease(
             token="new", pid=7, host="h", now=_at(0), is_live=lambda row: False
@@ -3731,7 +3732,7 @@ def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched
 
 
 def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     other = store_db.open_db(repo)
     try:
         with store_db.immediate(other):
@@ -3779,7 +3780,7 @@ def test_control_seqs_are_numbered_and_handled_per_run(repo):
             c = store_leases.add_control(conn, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
         assert (a.seq, b.seq, c.seq) == (0, 0, 1)
 
-        st = store.Store.open(repo, RUN_ID)
+        st = store_writer.Store.open(repo, RUN_ID)
         try:
             st.mark_control_handled(0, _at(2))
         finally:
@@ -3866,7 +3867,7 @@ def _checkpoint_in_run(
     workflow: str = "task",
 ) -> store_checkpoints.Checkpoint:
     """Record `run_id` with `status`, then save one checkpoint of `card_id` under it."""
-    st = store.Store.open(repo, run_id)
+    st = store_writer.Store.open(repo, run_id)
     try:
         st.record_run(_run_with_status(repo, run_id, status))
         return _save_checkpoint(st, card_id, reason=reason, workflow=workflow, saved_at=saved_at)
@@ -3882,7 +3883,7 @@ def test_a_cancelled_runs_checkpoints_are_never_open(repo):
         repo, "run-r3", "stopped", "c2", reason="parked", saved_at=_at(0)
     )
 
-    st = store.Store.open(repo, "run-r4")
+    st = store_writer.Store.open(repo, "run-r4")
     try:
         closed = st.latest_open_checkpoint("c1", "task")
         found = st.latest_open_checkpoint("c2", "task")
@@ -3903,7 +3904,7 @@ def test_latest_open_checkpoint_skips_a_cancelled_runs_row_when_it_is_not_newest
         repo, "run-r3", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(2)
     )
 
-    st = store.Store.open(repo, "run-r4")
+    st = store_writer.Store.open(repo, "run-r4")
     try:
         found = st.latest_open_checkpoint("c3", "task")
     finally:
@@ -3935,13 +3936,13 @@ def test_latest_open_checkpoint_closes_card_of_run_in_either_spelling(repo, stat
     unrelated = _checkpoint_in_run(
         repo, "run-r6", "stopped", "c2", reason="parked", saved_at=_at(0)
     )
-    unrecorded_run = store.Store.open(repo, "run-r7")
+    unrecorded_run = store_writer.Store.open(repo, "run-r7")
     try:
         unrecorded = _save_checkpoint(unrecorded_run, "c4", reason="parked", saved_at=_at(0))
     finally:
         unrecorded_run.close()
 
-    st = store.Store.open(repo, "run-r8")
+    st = store_writer.Store.open(repo, "run-r8")
     try:
         closed = st.latest_open_checkpoint("c1", "task")
         filtered = st.latest_open_checkpoint("c3", "task")
@@ -3973,7 +3974,7 @@ def test_latest_open_checkpoint_with_both_spellings_present(repo):
         repo, "run-r7", "stopped", "c3", reason="turn", workflow="integrate", saved_at=_at(3)
     )
 
-    st = store.Store.open(repo, "run-r8")
+    st = store_writer.Store.open(repo, "run-r8")
     try:
         closed = st.latest_open_checkpoint("c1", "task")
         filtered = st.latest_open_checkpoint("c3", "task")
@@ -3995,7 +3996,7 @@ def test_latest_open_checkpoint_ignores_a_near_miss_cancel_status(repo, near_mis
     finally:
         conn.close()
 
-    st = store.Store.open(repo, "run-r2")
+    st = store_writer.Store.open(repo, "run-r2")
     try:
         found = st.latest_open_checkpoint("c1", "task")
     finally:
@@ -4011,7 +4012,7 @@ def test_latest_open_checkpoint_returns_rows_of_runs_in_any_other_status(repo, s
     _checkpoint_in_run(repo, "run-r1", "stopped", "c1", reason="turn", saved_at=_at(0))
     parked = _checkpoint_in_run(repo, "run-r2", status, "c1", reason="parked", saved_at=_at(1))
 
-    st = store.Store.open(repo, "run-r3")
+    st = store_writer.Store.open(repo, "run-r3")
     try:
         found = st.latest_open_checkpoint("c1", "task")
     finally:
@@ -4021,7 +4022,7 @@ def test_latest_open_checkpoint_returns_rows_of_runs_in_any_other_status(repo, s
 
 
 def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     other = store_db.open_db(repo)
     try:
         st.record_run(_run_with_status(repo, RUN_ID, "cancelled"))
@@ -4049,7 +4050,7 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
 
     # From the journal alone: a wiped projection replays `canceled`.
     _truncate_db(repo)
-    replayed = store.Store.open(repo, RUN_ID)
+    replayed = store_writer.Store.open(repo, RUN_ID)
     try:
         replayed.rebuild_from_journal(RUN_ID)
         summaries = store_queries.list_runs(replayed.connection)
@@ -4062,7 +4063,7 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
 
 
 def test_run_status_normalises_legacy_cancelled(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
     finally:
@@ -4083,7 +4084,7 @@ def test_run_status_normalises_legacy_cancelled(repo):
 
 
 def test_replay_old_journal_with_legacy_cancelled(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
     finally:
@@ -4099,7 +4100,7 @@ def test_replay_old_journal_with_legacy_cancelled(repo):
     journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
     finally:
@@ -4111,14 +4112,14 @@ def test_replay_old_journal_with_legacy_cancelled(repo):
 
 @CANCEL_SPELLINGS
 def test_rebuild_from_journal_with_either_spelling(repo, status):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run_with_status(repo, RUN_ID, status))
     finally:
         st.close()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
         loaded = rebuilt.load_run(RUN_ID)
@@ -4300,12 +4301,12 @@ def test_held_claims_lists_one_tokens_keys_in_key_order(repo):
 
 
 @pytest.fixture
-def stores(repo) -> Iterator[Callable[..., store.Store]]:
+def stores(repo) -> Iterator[Callable[..., store_writer.Store]]:
     """Open any number of `Store`s on `repo`, each on its own connection; close them all."""
-    opened: list[store.Store] = []
+    opened: list[store_writer.Store] = []
 
-    def open_store(run_id: str = RUN_ID) -> store.Store:
-        st = store.Store.open(repo, run_id)
+    def open_store(run_id: str = RUN_ID) -> store_writer.Store:
+        st = store_writer.Store.open(repo, run_id)
         opened.append(st)
         return st
 
@@ -4455,11 +4456,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_manager import store
 from agent_manager.store import leases as store_leases
+from agent_manager.store import writer as store_writer
 
 root, run_id, token = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-st = store.Store.open(root, run_id)
+st = store_writer.Store.open(root, run_id)
 try:
     print("ready", flush=True)
     if sys.stdin.readline().strip() != "go":
@@ -4703,7 +4704,7 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
 FLOOR = store_checkpoints.TurnFloor(phase="implement", loop=2, source_run=OTHER_RUN_ID, floor=3)
 
 
-def _count(st: store.Store, table: str) -> int:
+def _count(st: store_writer.Store, table: str) -> int:
     return st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
@@ -4783,7 +4784,7 @@ def test_turn_floor_is_frozen_and_checkpoint_floor_defaults_to_none():
 
 
 def _save_floored(
-    st: store.Store,
+    st: store_writer.Store,
     card_id: str = "card-a",
     *,
     floor: store_checkpoints.TurnFloor | None = FLOOR,
@@ -4802,7 +4803,7 @@ def _save_floored(
 
 
 def test_save_checkpoint_writes_the_floor_row_with_the_checkpoint(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         saved = _save_floored(st)
         plain = _save_floored(st, floor=None, saved_at=_at(1))
@@ -4827,7 +4828,7 @@ def test_save_checkpoint_writes_the_floor_row_with_the_checkpoint(repo):
 
 
 def test_a_zero_floor_is_accepted(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         zero = dataclasses.replace(FLOOR, floor=0)
         saved = _save_floored(st, floor=zero)
@@ -4839,7 +4840,7 @@ def test_a_zero_floor_is_accepted(repo):
 
 
 def test_a_negative_floor_is_refused_and_writes_nothing(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         kept = _save_floored(st, floor=None)
         with pytest.raises(sqlite3.IntegrityError):
@@ -4857,7 +4858,7 @@ def test_a_negative_floor_is_refused_and_writes_nothing(repo):
 
 
 def test_an_unknown_reason_with_a_floor_writes_no_floor_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             _save_floored(st, reason="bogus")
@@ -4905,7 +4906,7 @@ def test_a_taken_over_store_saves_neither_row_with_a_floor(stores):
 
 
 def test_every_reader_returns_the_saved_floor(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         saved = _save_floored(st)
         latest = st.latest_checkpoint("card-a")
@@ -4921,7 +4922,7 @@ def test_every_reader_returns_the_saved_floor(repo):
 
 
 def test_every_reader_returns_no_floor_for_a_floorless_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_checkpoint(st, "card-a", reason="turn")
         reads = [
@@ -4939,7 +4940,7 @@ def test_every_reader_returns_no_floor_for_a_floorless_row(repo):
 
 def test_floored_and_floorless_rows_of_one_card_read_back_per_seq(repo):
     other_floor = store_checkpoints.TurnFloor(phase="review", loop=0, source_run=RUN_ID, floor=0)
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_floored(st, saved_at=_at(0))
         assert st.latest_checkpoint("card-a").floor == FLOOR
@@ -4960,13 +4961,13 @@ def test_floored_and_floorless_rows_of_one_card_read_back_per_seq(repo):
 
 
 def test_a_floor_never_attaches_to_another_runs_or_cards_row(repo):
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         old_saved = _save_floored(old, "card-a", saved_at=_at(0))
     finally:
         old.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         floored_b = _save_floored(st, "card-b", saved_at=_at(0))
         own = _save_floored(st, "card-a", floor=None, saved_at=_at(1))
@@ -4987,13 +4988,13 @@ def test_a_floor_never_attaches_to_another_runs_or_cards_row(repo):
 
 
 def test_latest_open_checkpoint_returns_an_older_runs_floor(repo):
-    old = store.Store.open(repo, OTHER_RUN_ID)
+    old = store_writer.Store.open(repo, OTHER_RUN_ID)
     try:
         parked = _save_floored(old, "card-a", reason="parked", saved_at=_at(0))
     finally:
         old.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         found = st.latest_open_checkpoint("card-a", "task")
     finally:
@@ -5004,7 +5005,7 @@ def test_latest_open_checkpoint_returns_an_older_runs_floor(repo):
 
 
 def test_a_rebuild_keeps_checkpoint_floors(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         before = [line.seq for line in st.journal.read()]
@@ -5025,7 +5026,7 @@ def test_a_rebuild_keeps_checkpoint_floors(repo):
 def test_checkpoint_from_row_without_floor_columns_has_no_floor(repo):
     # Regression guard: passes before this task's change and must keep passing
     # once _checkpoint_from_row reads the joined floor_* keys.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _save_floored(st)
         row = st.connection.execute(
@@ -5044,7 +5045,7 @@ ADOPTING_RUN_ID = "run-2"
 
 
 def test_replay_journal_of_another_run_ignores_a_torn_tail(repo):
-    other = store.Store.open(repo, ADOPTING_RUN_ID)
+    other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
     try:
         other.record_run(_run(repo, ADOPTING_RUN_ID))
         other.record_story(_story())
@@ -5054,7 +5055,7 @@ def test_replay_journal_of_another_run_ignores_a_torn_tail(repo):
     with torn.open("a", encoding="utf-8") as handle:
         handle.write('{"seq": 9')
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         replayed = st.replay_journal(ADOPTING_RUN_ID)
 
@@ -5075,7 +5076,7 @@ def test_replay_journal_of_another_run_ignores_a_torn_tail(repo):
 def test_replay_journal_of_its_own_run_never_ignores_a_torn_tail(repo):
     # Review Focus 4: only another run, which may be live elsewhere, gets the
     # benefit of the doubt. The own journal is this process's to write.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         with st.journal.path.open("a", encoding="utf-8") as handle:
@@ -5087,7 +5088,7 @@ def test_replay_journal_of_its_own_run_never_ignores_a_torn_tail(repo):
 
 
 def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         replayed = st.replay_journal(RUN_ID)
@@ -5099,7 +5100,7 @@ def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
 
 
 def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -5133,7 +5134,7 @@ def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
 
 
 def test_replay_journal_writes_nothing(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         before = st.journal.path.read_bytes()
@@ -5173,7 +5174,7 @@ def _unrecognised_line(seq: int, run_id: str = RUN_ID, **extra: object) -> dict:
 
 
 def test_replay_and_rebuild_of_its_own_run_skip_an_unrecognised_event(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         before = st.replay_journal(RUN_ID)
@@ -5190,7 +5191,7 @@ def test_replay_and_rebuild_of_its_own_run_skip_an_unrecognised_event(repo):
 
 
 def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
-    other = store.Store.open(repo, ADOPTING_RUN_ID)
+    other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
     try:
         other.record_run(_run(repo, ADOPTING_RUN_ID))
         other.record_story(_story())
@@ -5198,7 +5199,7 @@ def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
     finally:
         other.close()
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         before = st.replay_journal(ADOPTING_RUN_ID)
         path = paths.run_dir(ADOPTING_RUN_ID) / store_journal.JOURNAL_NAME
@@ -5216,14 +5217,14 @@ def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
 
 def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
     # Review Focus 5: `Store.open` builds the journal from `last_seq`.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
     finally:
         st.close()
 
-    reopened = store.Store.open(repo, RUN_ID)
+    reopened = store_writer.Store.open(repo, RUN_ID)
     try:
         line = reopened.record_run(_run(repo).model_copy(update={"status": "done"}))
     finally:
@@ -5307,7 +5308,7 @@ def test_a_board_comment_with_an_unknown_state_is_refused(repo):
 
 
 def _enqueue(
-    st: store.Store,
+    st: store_writer.Store,
     key: str,
     *,
     card_id: str = "card-a",
@@ -5330,7 +5331,7 @@ def _comment_row(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
 
 def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
     body = "## Done\n\nmerged `m12/x` — é\n"
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         first = _enqueue(st, "k1", body=body, now=_at(1))
         again = _enqueue(
@@ -5409,7 +5410,7 @@ def test_a_refused_enqueue_rolls_back_and_writes_nothing(repo, stores):
 
 def test_an_enqueue_with_no_body_is_refused_not_ignored(repo):
     # Review Focus 5: only a key collision is ignored; NOT NULL still raises.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             _enqueue(st, "k1", body=None)  # type: ignore[arg-type]
@@ -5421,7 +5422,7 @@ def test_an_enqueue_with_no_body_is_refused_not_ignored(repo):
 
 
 def test_pending_comments_filters_by_run_and_cards_oldest_first(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k1", card_id="card-a", run_id=RUN_ID, body="one", now=_at(2))
         _enqueue(st, "k2", card_id="card-b", run_id=RUN_ID, body="two", now=_at(1))
@@ -5463,7 +5464,7 @@ def test_pending_comments_filters_by_run_and_cards_oldest_first(repo):
 
 def test_pending_comments_breaks_a_created_at_tie_by_insertion_order(repo):
     # Review Focus 3: one tick composes several bodies with the same `now`.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k-b", now=_at(5))
         _enqueue(st, "k-a", now=_at(5))
@@ -5475,7 +5476,7 @@ def test_pending_comments_breaks_a_created_at_tie_by_insertion_order(repo):
 
 
 def test_mark_comment_posted_moves_the_row_out_of_pending(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k1", now=_at(0))
         _enqueue(st, "k2", now=_at(1))
@@ -5497,7 +5498,7 @@ def test_mark_comment_posted_moves_the_row_out_of_pending(repo):
 
 
 def test_record_comment_failure_abandons_the_row_on_the_third_failure(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k1")
         counts = []
@@ -5518,7 +5519,7 @@ def test_record_comment_failure_abandons_the_row_on_the_third_failure(repo):
 
 
 def test_an_unknown_comment_key_is_left_alone(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.mark_comment_posted("k-never", "c-1", _at(0))
         failures = st.record_comment_failure("k-never")
@@ -5535,7 +5536,7 @@ def test_an_unknown_comment_key_is_left_alone(repo):
 def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
     # B9: a resumed phase enqueues the same key again after the first run's
     # flush already settled it; the row must not go back to `pending`.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k-posted", body="first")
         st.mark_comment_posted("k-posted", "c-101", _at(1))
@@ -5570,7 +5571,7 @@ def test_a_replayed_enqueue_never_revives_a_posted_or_abandoned_comment(repo):
 
 def test_a_failure_on_a_posted_comment_never_abandons_it(repo):
     # Review Focus 1: a late failure must not undo a comment the board has.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _enqueue(st, "k1")
         st.mark_comment_posted("k1", "c-101", _at(1))
@@ -5656,7 +5657,7 @@ def _diverging_now(repo: Path) -> list[store_replay.Mismatch]:
 
 
 def test_diverging_finds_nothing_in_a_run_recorded_only_through_the_store(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         resumed = _subtask("ef248597", base="m1/task-fdebc746")
@@ -5681,7 +5682,7 @@ def test_diverging_finds_nothing_in_a_run_recorded_only_through_the_store(repo):
 
 
 def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
@@ -5706,7 +5707,7 @@ def test_diverging_reports_the_2026_10_03_incident_as_a_foreign_run_status(repo)
     ids=["journal-cancelled-row-canceled", "journal-canceled-row-cancelled"],
 )
 def test_diverging_treats_spellings_as_equal(repo, journaled, hand_set):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         # `model_copy` does not validate, so a legacy writer's spelling reaches the journal.
@@ -5719,7 +5720,7 @@ def test_diverging_treats_spellings_as_equal(repo, journaled, hand_set):
 
 
 def test_diverging_treats_spellings_as_equal_across_a_mixed_tree(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -5734,7 +5735,7 @@ def test_diverging_treats_spellings_as_equal_across_a_mixed_tree(repo):
 
 
 def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story().model_copy(update={"status": models.LEGACY_CANCELED}))
@@ -5744,7 +5745,7 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
     journal_before = store_journal.Journal(RUN_ID).path.read_bytes()
 
     _truncate_db(repo)
-    rebuilt = store.Store.open(repo, RUN_ID)
+    rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
     finally:
@@ -5766,7 +5767,7 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
 
 def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_stale(repo):
     # Pinned decision (§3.2 known limit): indistinguishable from a crash.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -5788,7 +5789,7 @@ def test_diverging_classifies_a_status_set_back_to_an_earlier_journaled_value_st
 
 def test_diverging_classifies_against_the_nodes_own_history_at_attempt_level(repo):
     # `ok` was journaled for the explore attempt, never for the implement one.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
     finally:
@@ -5807,7 +5808,7 @@ def test_diverging_classifies_against_the_nodes_own_history_at_attempt_level(rep
 
 
 def test_diverging_ignores_every_field_but_status(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
     finally:
@@ -5851,7 +5852,7 @@ def test_diverging_lets_replays_errors_through_unchanged(repo):
 
 
 def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
     finally:
@@ -5876,7 +5877,7 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
 def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
     # The setup of test_rebuild_picks_up_a_journal_line_whose_row_never_landed:
     # the journal line is appended, the row write fails on the closed connection.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     st.close()
     with pytest.raises(sqlite3.Error):
@@ -5894,7 +5895,7 @@ def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(
 
 
 def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -5921,7 +5922,7 @@ def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
 def test_diverging_reports_a_missing_subtree_once_at_its_root(repo):
     # The subtask row goes; its phase and attempt rows are left orphaned, so
     # load_run never reaches them. One mismatch, not one per descendant.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
     finally:
@@ -5940,7 +5941,7 @@ def test_diverging_reports_a_missing_subtree_once_at_its_root(repo):
 
 
 def test_diverging_reports_mismatches_in_tree_walk_order(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -6021,7 +6022,7 @@ def _hand_cancel_an_escalated_run(repo: Path) -> None:
     A full tree and a checkpoint ride along so the no-row-touched snapshot
     covers tree rows and row-only rows alike.
     """
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         st.record_run(_run(repo).model_copy(update={"status": "escalated"}))
@@ -6035,7 +6036,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     _hand_cancel_an_escalated_run(repo)
     before = _all_rows(repo)
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
@@ -6068,7 +6069,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
 def test_rebuild_with_force_overwrites_a_hand_edited_run_status(repo):
     _hand_cancel_an_escalated_run(repo)
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
         loaded = st.load_run(RUN_ID)
@@ -6083,7 +6084,7 @@ def test_rebuild_with_force_overwrites_a_hand_edited_run_status(repo):
 
 
 def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -6097,7 +6098,7 @@ def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
     )
     before = _all_rows(repo)
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
@@ -6123,7 +6124,7 @@ def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
 def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(repo):
     # `stale` (§3.2): the journal recorded `started` for this story, so the
     # projection is merely behind and the rebuild goes ahead without `force`.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -6132,7 +6133,7 @@ def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(r
         st.close()
     _raw_sql(repo, "UPDATE stories SET status = 'started' WHERE card_id = '8831189b'")
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         rebuilt = st.rebuild_from_journal(RUN_ID)
         loaded = st.load_run(RUN_ID)
@@ -6144,7 +6145,7 @@ def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(r
 
 
 def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
@@ -6155,7 +6156,7 @@ def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
     before = _all_rows(repo)
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
             st.rebuild_from_journal(RUN_ID)
@@ -6199,7 +6200,7 @@ def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
 
     # Open first: `Store.open` scans the journal (`Journal.__init__` ->
     # `last_seq`), so the line is corrupted afterwards to reach the rebuild.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with store_journal.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
             handle.write("{not json at all\n")
@@ -6217,7 +6218,7 @@ def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
 def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
     # A value the models cannot validate is certainly not one `am` wrote: the
     # projection read raises before anything is deleted. `force` skips the read.
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
     finally:
@@ -6225,7 +6226,7 @@ def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
     _raw_sql(repo, "UPDATE runs SET status = 'bogus' WHERE id = ?", (RUN_ID,))
     before = _all_rows(repo)
 
-    st = store.Store.open(repo, RUN_ID)
+    st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(ValidationError):
             st.rebuild_from_journal(RUN_ID)
@@ -6263,7 +6264,7 @@ def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
 
 
 def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo):
-    writer = store.Store.open(repo, RUN_ID)
+    writer = store_writer.Store.open(repo, RUN_ID)
     writer.record_run(_run(repo))
     writer.close()
 
@@ -6278,7 +6279,7 @@ def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo
 
 
 def test_open_db_for_reading_reads_while_a_writer_holds_a_write_transaction(repo):
-    writer = store.Store.open(repo, RUN_ID)
+    writer = store_writer.Store.open(repo, RUN_ID)
     writer.record_run(_run(repo))
     held = store_db.open_db(repo)
     try:
@@ -6302,7 +6303,7 @@ def test_open_db_for_reading_reads_while_a_writer_holds_a_write_transaction(repo
 
 
 def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
-    writer = store.Store.open(repo, RUN_ID)
+    writer = store_writer.Store.open(repo, RUN_ID)
     writer.record_run(_run(repo))
     writer.close()
     old = sqlite3.connect(paths.project_db_path(repo))

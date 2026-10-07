@@ -26,8 +26,8 @@ from typing import NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from agent_manager.runtime.stop import Command, StopSignal
-from agent_manager.store import Store
 from agent_manager.store import leases as store_leases
+from agent_manager.store.writer import Store
 
 CONTROL_POLL_SECONDS = 1.0
 """How often `watch` looks for new requests."""

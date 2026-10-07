@@ -55,13 +55,13 @@ from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
 from agent_manager.harness.launcher import run_direct
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
-from agent_manager.store import Store
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
+from agent_manager.store.writer import Store
 from agent_manager.workflow import task as task_workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,

@@ -83,10 +83,10 @@ from agent_manager import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
-from agent_manager.store import Store
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import queries as store_queries
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
 from agent_manager.workflow.phases import Workflow

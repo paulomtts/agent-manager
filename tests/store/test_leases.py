@@ -17,11 +17,11 @@ from pathlib import Path
 import pytest
 
 from agent_manager import models, store
-from agent_manager.store import Store
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store.writer import Store
 
 _REPO = Path(__file__).resolve().parents[2]
 

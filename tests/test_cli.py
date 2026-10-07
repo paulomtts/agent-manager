@@ -53,7 +53,6 @@ from agent_manager import (
     paths,
     prompt,
     runs,
-    store as store_module,
 )
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
@@ -61,6 +60,7 @@ from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
+from agent_manager.store import writer as store_writer
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
@@ -1454,7 +1454,7 @@ def test_drive_subtask_drives_two_subtasks_under_one_store_and_run(project):
 
     started_at = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
     run_id = cli.mint_run_id(first_id, started_at)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     try:
         store.record_run(
             models.Run(
@@ -1538,7 +1538,7 @@ def test_drive_subtask_async_hands_a_triggered_stop_to_the_engine(project, cards
     seen: list[tuple[str, dict[str, Any]]] = []
     stop = StopSignal()
     stop.trigger(parent.id)
-    store = store_module.Store.open(root, run_id)
+    store = store_writer.Store.open(root, run_id)
     try:
         store.record_run(
             models.Run(
@@ -3465,7 +3465,7 @@ def _as_json(value: Any) -> Any:
 def _forbid_board_dry_run_writes(monkeypatch) -> None:
     """The board preview must open no Store, check no claims and run nothing."""
     _forbid_writes(monkeypatch)
-    monkeypatch.setattr(store_module, "Store", _Forbidden("store.Store"))
+    monkeypatch.setattr(store_writer, "Store", _Forbidden("store_writer.Store"))
     monkeypatch.setattr(cli, "refuse_claimed", _Forbidden("refuse_claimed"))
     monkeypatch.setattr(cli, "dry_run_milestone", _Forbidden("dry_run_milestone"))
     monkeypatch.setattr(orchestrate, "run_board", _Forbidden("run_board"))
@@ -4426,7 +4426,7 @@ def _record(
     defaults are a `--card`-shaped run; pass `workflow="milestone"` and a
     `milestone_id` for a milestone-shaped one, plus a `story_id` for a
     story-shaped one."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -4992,7 +4992,7 @@ RUNS_PROGRESS_CURRENT_KEYS = {"card", "phase", "attempt"}
 def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
     """`_record`'s `card-1` given a third phase, `implement`, still `started`,
     with `attempts` attempt rows numbered from 1."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_phase(
             "story-1",
@@ -5014,7 +5014,7 @@ def _record_started_phase(root: Path, run_id: str, *, attempts: int) -> None:
 
 def _record_bare_run(root: Path, run_id: str, *, started_at: datetime) -> None:
     """A run row with nothing below it: a run that never got past starting."""
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -5188,7 +5188,7 @@ def _record_for_logs(
     `logs --follow` test that needs the stream to keep polling passes
     `"started"`.
     """
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -6008,7 +6008,7 @@ def test_logs_follow_invalid_bytes_keep_byte_offsets(projection, monkeypatch):
 
 def _record_review_without_stdout_path(root: Path) -> None:
     """Add an agent `review` phase whose one attempt recorded no stdout path."""
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_phase(
             "story-1", "card-1", models.PhaseRun(name="review", kind="agent", status="failed")
@@ -6226,7 +6226,7 @@ def _set_implement_status(root: Path, status: str) -> None:
     """Re-record `implement.1` with `status`, as the runner's terminal write
     does. Test-side only: it opens a `Store`, which `logs` must never do."""
     directory = paths.attempt_path(LOGS_RUN_ID, "card-1", "implement", 1)
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_attempt(
             "story-1",
@@ -6248,7 +6248,7 @@ def _set_implement_status(root: Path, status: str) -> None:
 
 def _set_verify_status(root: Path, status: str) -> None:
     """Re-record the deterministic `verify` phase with `status`."""
-    opened = store_module.Store.open(root, LOGS_RUN_ID)
+    opened = store_writer.Store.open(root, LOGS_RUN_ID)
     try:
         opened.record_phase(
             "story-1",
@@ -7014,7 +7014,7 @@ def test_checkpoint_resume_phase_continues_an_escalated_row_that_still_holds_a_t
 
 
 def _saved(
-    opened: store_module.Store,
+    opened: store_writer.Store,
     card_id: str,
     reason: str,
     *,
@@ -7036,7 +7036,7 @@ def _saved(
 
 
 def test_continuable_checkpoint_is_the_open_matching_row_or_none(projection):
-    opened = store_module.Store.open(projection, "20260926T090000Z-02890d5d")
+    opened = store_writer.Store.open(projection, "20260926T090000Z-02890d5d")
     try:
         parked = _saved(opened, "card-parked", "parked")
         _saved(opened, "card-changed", "parked", digest="saved-under-another-task")
@@ -7152,7 +7152,7 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
     found = cli.find_subtask(run, card_id)
     assert found is not None
     story, subtask = found
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_subtask(story.card_id, subtask.model_copy(update={"status": "started"}))
     finally:
@@ -7161,7 +7161,7 @@ def _force_started(project: Path, run_id: str, card_id: str) -> None:
 
 def _plant_changed_digest(project: Path, run_id: str, card_id: str) -> None:
     """A newer copy of the newest checkpoint, saved under a digest `TASK` does not have."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         newest = opened.latest_checkpoint(card_id)
         assert newest is not None
@@ -7227,7 +7227,7 @@ def _park_pygents(project: Path, cards: dict[str, str]) -> str:
 
         return runner
 
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -7380,7 +7380,7 @@ def test_a_task_resume_posts_its_runs_pending_comments_before_the_walk_goes_on(
     run_id = _crash_pygents(project, cards, "plan")
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
     body = f"am · escalated · run {run_id}\nphase: plan\nam-key: {key}"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7420,7 +7420,7 @@ def test_a_task_resume_whose_start_flush_fails_warns_and_still_walks(
     run's leftover row is a warning leading the payload's, never a refusal."""
     run_id = _crash_pygents(project, cards, "plan")
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7545,7 +7545,7 @@ def test_the_kept_suite_warning_follows_the_flush_warnings(project, cards, monke
     """Spec T9 and Review Focus 4: B7's flush warnings lead, the kept suite is next."""
     run_id = _crash_pygents(project, cards, "plan", commands=("true",))
     key = f"{run_id}/{cards['subtask']}/escalated:an-earlier-life"
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.enqueue_comment(
             run_id=run_id,
@@ -7892,7 +7892,7 @@ def _escalate_milestone(project: Path, shape: dict[str, str]) -> str:
 
 def _plant_orphan(project: Path, run_id: str, story_id: str, card_id: str, phase: str) -> None:
     """An attempt left `started` by a kill mid-dispatch, as `dispatch.AgentRunner` records it."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
     try:
         opened.record_phase(
             story_id, card_id, models.PhaseRun(name=phase, kind="agent", status="started")
@@ -7926,7 +7926,7 @@ def _loaded(project: Path, run_id: str) -> models.Run:
 
 
 def _record_milestone(root: Path, run_id: str, *, status: str, workflow: str = "milestone") -> None:
-    opened = store_module.Store.open(root, run_id)
+    opened = store_writer.Store.open(root, run_id)
     try:
         opened.record_run(
             models.Run(
@@ -9281,7 +9281,7 @@ def test_run_lease_turns_a_held_claim_into_claimed_error_and_takes_nothing(
         heartbeat_at=now - timedelta(seconds=7),
         claims=("card:card-1",),
     )
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(cli.ClaimedError) as caught:
             with cli.run_lease(opened, claims=["card:card-1"]):
@@ -9303,7 +9303,7 @@ def test_run_lease_turns_a_held_lease_into_c10s_run_is_live_error(projection, mo
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(projection, heartbeat_at=now - timedelta(seconds=5))
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(cli.RunIsLiveError) as caught:
             with cli.run_lease(opened, claims=["card:card-1"]):
@@ -9320,7 +9320,7 @@ def test_run_lease_turns_a_held_lease_into_c10s_run_is_live_error(projection, mo
 
 
 def test_run_lease_releases_its_claims_and_lease_when_the_body_raises(projection):
-    opened = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         with pytest.raises(ValueError, match="the walk raised"):
             with cli.run_lease(opened, claims=["card:card-1"]) as lease:
@@ -9455,7 +9455,7 @@ def test_a_dead_claim_does_not_refuse(project, cards):
 
 @pytest.mark.git
 def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkeypatch):
-    real_record_run = store_module.Store.record_run
+    real_record_run = store_writer.Store.record_run
     first: list[tuple[str | None, list[str]]] = []
 
     def spy(self, run):
@@ -9472,7 +9472,7 @@ def test_the_lease_is_bound_before_the_first_journal_line(project, cards, monkey
             first.append((token, held))
         return real_record_run(self, run)
 
-    monkeypatch.setattr(store_module.Store, "record_run", spy)
+    monkeypatch.setattr(store_writer.Store, "record_run", spy)
 
     cli.run_card(
         cards["subtask"],
@@ -9543,7 +9543,7 @@ def test_a_lease_lost_mid_walk_is_an_envelope_at_exit_3(project, cards, monkeypa
 
         def runner(phase, context, rendered):
             if phase.name == "explore" and not taken:
-                thief = store_module.Store.open(cli.resolve_repo_dir(project), run_id)
+                thief = store_writer.Store.open(cli.resolve_repo_dir(project), run_id)
                 try:
                     thief.take_lease(
                         token="thief",
@@ -9659,7 +9659,7 @@ def test_a_resume_refuses_a_claimed_card_before_opening_the_store(
         heartbeat_at=now - timedelta(seconds=7),
         claims=(key,),
     )
-    monkeypatch.setattr(store_module.Store, "open", _Forbidden("Store.open"))
+    monkeypatch.setattr(store_writer.Store, "open", _Forbidden("Store.open"))
 
     with pytest.raises(cli.ClaimedError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -9743,7 +9743,7 @@ def test_readers_never_take_a_lease_or_a_lock(project, milestone_board, monkeypa
 
         return refuse
 
-    monkeypatch.setattr(store_module.Store, "take_lease", forbidden("Store.take_lease"))
+    monkeypatch.setattr(store_writer.Store, "take_lease", forbidden("Store.take_lease"))
     monkeypatch.setattr(locks.ProcessLock, "acquire", forbidden("ProcessLock.acquire"))
     monkeypatch.setattr(cli, "run_lease", forbidden("cli.run_lease"))
 
@@ -10912,7 +10912,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
     close runs.
     """
     seen: list[tuple[int, int]] = []
-    real_close = store_module.Store.close
+    real_close = store_writer.Store.close
 
     def close(self) -> None:
         conn = self.connection
@@ -10925,7 +10925,7 @@ def _close_snapshots(monkeypatch) -> list[tuple[int, int]]:
         seen.append((claims, leases))
         real_close(self)
 
-    monkeypatch.setattr(store_module.Store, "close", close)
+    monkeypatch.setattr(store_writer.Store, "close", close)
     return seen
 
 
@@ -11384,7 +11384,7 @@ def test_the_detached_child_adopts_the_lease_reports_then_releases_before_closin
     root = _seam_root(tmp_path, monkeypatch)
     cards = _seam_cards(fake_board)
     pre, token = _handed_off_card_run(root, cards["subtask"])
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
     held_at_report: list[bool] = []
     real_write = detach.write_report
@@ -11512,7 +11512,7 @@ def _plant_parked_checkpoint(
     """One checkpoint row, by default the open `parked` row of card-1 a paused
     walk leaves under the run. The keywords plant the other rows the `cards`
     tests need: another run's, another workflow's, an older or newer one."""
-    opened = store_module.Store.open(cli.resolve_repo_dir(root), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         opened.save_checkpoint(
             card_id,
@@ -11530,7 +11530,7 @@ def _plant_parked_checkpoint(
 
 
 def _open_checkpoint(root: Path) -> store_checkpoints.Checkpoint | None:
-    opened = store_module.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), CONTROL_RUN_ID)
     try:
         return opened.latest_open_checkpoint("card-1", task_workflow.TASK.name)
     finally:
@@ -11583,7 +11583,7 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert _open_checkpoint(projection) is None
     assert worktree.exists() is worktree_present
     assert _lease(projection) is None
-    rebuilt = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    rebuilt = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
     finally:
@@ -11891,7 +11891,7 @@ def test_reset_reports_open_in_null_when_its_own_row_is_the_newest(projection):
     _plant_other_run(projection)
     _plant_parked_checkpoint(projection, run_id=OTHER_RUN_ID, saved_at=_at(0))
     _plant_parked_checkpoint(projection, saved_at=_at(1))
-    reader = store_module.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
+    reader = store_writer.Store.open(cli.resolve_repo_dir(projection), OTHER_RUN_ID)
     try:
         before = runs.continuable_checkpoint(reader, "card-1")
         assert before is not None and before.run_id == CONTROL_RUN_ID
@@ -11965,7 +11965,7 @@ def test_reset_is_refused_at_take_lease_when_a_live_holder_slips_past_the_check(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_run(projection, status="started")
-    holder = store_module.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
+    holder = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
         holder.take_lease(
             token="holder", pid=os.getpid(), host=HERE, now=now, is_live=lambda row: True
@@ -12477,7 +12477,7 @@ def test_the_detached_card_child_reports_the_foreground_payload_then_releases(
         return payload
 
     monkeypatch.setattr(cli, "run_card_engine", spying_engine)
-    monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
+    monkeypatch.setattr(store_writer.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
 
     fake.body()
@@ -12604,7 +12604,7 @@ def test_a_failed_lease_pid_update_aborts_the_child_and_releases(
     def locked(self, token: str, *, pid: int, host: str) -> None:
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(store_module.Store, "set_lease_holder", locked)
+    monkeypatch.setattr(store_writer.Store, "set_lease_holder", locked)
 
     result = runner.invoke(cli.app, _card_run_args(root, cards["subtask"], "--detach"))
 

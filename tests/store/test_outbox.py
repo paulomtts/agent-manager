@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 
 from agent_manager import store
-from agent_manager.store import Store
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store.writer import Store
 
 _REPO = Path(__file__).resolve().parents[2]
 

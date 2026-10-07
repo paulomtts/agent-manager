@@ -26,9 +26,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import board, cli, models, paths, store
+from agent_manager import board, cli, models, paths
 from agent_manager.store import db as store_db
 from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.harness import launcher
 from agent_manager.workflow import task as task_workflow
 
@@ -366,7 +367,7 @@ def _plant_stale_checkpoint(root: Path, run_id: str, card_id: str) -> None:
     is the card's highest `seq`, so it is the row `orchestrate.resume_point`
     judges first.
     """
-    opened = store.Store.open(cli.resolve_repo_dir(root), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         opened.save_checkpoint(
             card_id,

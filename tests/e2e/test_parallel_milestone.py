@@ -24,10 +24,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import board, cli, models, store
+from agent_manager import board, cli, models
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime.stop import StopSignal
 
 
@@ -198,7 +199,7 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
     last_a = max(line.seq for line in phase_lines if line.story == stories["A"])
     assert first_b < last_a, (first_b, last_a)
 
-    st = store.Store.open(cli.resolve_repo_dir(root), run_id)
+    st = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         projection = st.load_run(run_id)
         rebuilt = st.rebuild_from_journal(run_id)

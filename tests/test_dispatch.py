@@ -26,8 +26,8 @@ from agent_manager import (
     paths,
     prompt,
     results,
-    store as store_module,
 )
+from agent_manager.store import writer as store_writer
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
 from agent_manager.harness.base import Outcome
@@ -546,7 +546,7 @@ STORY_ID = "2143808b"
 @pytest.fixture
 def store(data_home, tmp_path):
     """A real temp projection plus a real temp journal, writing nowhere real."""
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -1590,7 +1590,7 @@ def test_the_journal_holds_the_edge_even_when_the_row_write_fails(
     data_home, tmp_path, worktree
 ):
     # Spec test 16 (§9 line 365: journal first, row second, journal is truth).
-    class ExplodingStore(store_module.Store):
+    class ExplodingStore(store_writer.Store):
         def _write_attempt_row(self, *args, **kwargs):
             raise RuntimeError("the projection is on fire")
 
@@ -2321,7 +2321,7 @@ def test_adopt_reads_the_journal_not_the_projection(store, tmp_path, worktree):
 
 def test_adopt_reads_another_runs_journal(store, tmp_path, worktree):
     _succeed_once(store, tmp_path, worktree)
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         launcher = FakeLauncher(results=[VALID_RESULT])
         runner, _ = _runner(other, launcher, tmp_path, worktree, run_id=OTHER_RUN_ID)
@@ -2348,7 +2348,7 @@ def test_adopt_reads_another_runs_journal(store, tmp_path, worktree):
 def test_adopt_finds_the_card_under_any_story_of_the_source_run(store, tmp_path, worktree):
     # Review Focus 2: the source run's story structure is not assumed to match.
     _succeed_once(store, tmp_path, worktree, story_id="5f0c1a2e")
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         runner, _ = _runner(
             other, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree,
@@ -2437,7 +2437,7 @@ def test_a_phase_without_a_result_model_adopts_none(store, tmp_path, worktree):
 def test_a_source_journal_that_fails_validation_declines(store, tmp_path, worktree):
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
     lines = len(store.journal.read())
-    broken = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    broken = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         # Valid JSON, but no `models.Run`: replay raises pydantic's
         # ValidationError, which is a decline, never an exception out of resume.
@@ -2473,7 +2473,7 @@ def test_a_source_run_whose_ok_attempt_carries_retired_usage_keys_is_still_adopt
         phase="explore",
         attempt=1,
     )
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         launcher = FakeLauncher(results=[VALID_RESULT])
         runner, _ = _runner(other, launcher, tmp_path, worktree, run_id=OTHER_RUN_ID)
@@ -2493,7 +2493,7 @@ def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
     _succeed_once(store, tmp_path, worktree)
     recorded = store.replay_journal(RUN_ID).stories[0].subtasks[0].phases[0]
     later = recorded.started_at + timedelta(days=1)
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         runner, _ = _runner(
             other, FakeLauncher(results=[VALID_RESULT]), tmp_path, worktree,

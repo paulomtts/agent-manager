@@ -29,10 +29,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from agent_manager import cli, models, store
+from agent_manager import cli, models
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import queries as store_queries
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as runtime_engine
 
@@ -101,7 +102,7 @@ def _latest_run_id(root: Path) -> str:
 
 
 def _latest_checkpoint(root: Path, run_id: str, card_id: str) -> store_checkpoints.Checkpoint:
-    opened = store.Store.open(cli.resolve_repo_dir(root), run_id)
+    opened = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         checkpoint = opened.latest_checkpoint(card_id)
     finally:

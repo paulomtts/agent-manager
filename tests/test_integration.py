@@ -41,7 +41,7 @@ from agent_manager.integration import (
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps.integrate import merge_tip
 from agent_manager.steps.worktree import GitError
-from agent_manager.store import Store
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 BASE = "main"

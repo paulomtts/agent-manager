@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 
-from agent_manager import dispatch, models, results, store as store_module
+from agent_manager import dispatch, models, results
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime import walk
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.harness.base import Outcome
@@ -331,7 +332,7 @@ def store(monkeypatch, tmp_path):
     """A real temp projection plus a real temp journal, writing nowhere real."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 
@@ -2069,7 +2070,7 @@ def test_extra_context_reaches_a_deterministic_phase_binding(tmp_path: Path, run
         return {"ok": True}
 
     workflow = phase_model.Workflow("one", (Step("only", step),))
-    store = store_module.Store.open(tmp_path, "run-extra-1")
+    store = store_writer.Store.open(tmp_path, "run-extra-1")
 
     summary = run_subtask(
         workflow,
@@ -2089,7 +2090,7 @@ def test_extra_context_may_not_redefine_a_reserved_key(tmp_path: Path, run_subta
     overwrite one would point every later step at a path the engine never chose.
     """
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
-    store = store_module.Store.open(tmp_path, "run-extra-2")
+    store = store_writer.Store.open(tmp_path, "run-extra-2")
 
     with pytest.raises(walk.EngineError) as caught:
         run_subtask(
@@ -2108,7 +2109,7 @@ def test_extra_context_may_not_redefine_the_base_branch_alias(tmp_path: Path, ru
     """A caller that could set `base_branch` would point `review_gate` at a base
     the engine never derived, while every step still used the real one."""
     workflow = phase_model.Workflow("one", (Step("only", lambda: {"ok": True}),))
-    store = store_module.Store.open(tmp_path, "run-extra-3")
+    store = store_writer.Store.open(tmp_path, "run-extra-3")
 
     with pytest.raises(walk.EngineError) as caught:
         run_subtask(

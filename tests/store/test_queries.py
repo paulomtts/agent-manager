@@ -18,8 +18,8 @@ from typing import get_args
 import pytest
 
 from agent_manager import store
-from agent_manager.store import Store
 from agent_manager.store import queries as store_queries
+from agent_manager.store.writer import Store
 
 _REPO = Path(__file__).resolve().parents[2]
 

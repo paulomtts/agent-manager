@@ -27,7 +27,7 @@ from agent_manager.store import outbox as store_outbox
 
 if TYPE_CHECKING:
     from agent_manager.runtime.walk import SubtaskSummary
-    from agent_manager.store import Store
+    from agent_manager.store.writer import Store
 
 CAP = 1500
 """Hard cap on one comment body, in characters (B4)."""

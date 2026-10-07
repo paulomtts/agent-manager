@@ -29,13 +29,14 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 from pygents import AgentRegistry, ToolRegistry
 
-from agent_manager import cli, dispatch, models, paths, store as store_module
+from agent_manager import cli, dispatch, models, paths
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime import bridge, walk
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import writer as store_writer
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-10-01-01"
@@ -232,7 +233,7 @@ def _seed(opened, run_id: str = RUN_ID) -> None:
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     _seed(opened)
     yield opened
     opened.close()
@@ -571,7 +572,7 @@ def test_a_relaunch_adopts_once_from_the_earlier_run(store, roles, monkeypatch, 
     crashed = store.latest_checkpoint(CARD_ID)
 
     _new_process()
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         _seed(other, OTHER_RUN_ID)
         runner = _runner(other, launcher, roles)
@@ -667,7 +668,7 @@ def test_a_carried_adoption_does_not_outlive_a_step_head(store, roles, monkeypat
     assert _go(_workflow(ran), store, _runner(store, launcher, roles)).status == "done"
     assert _dispatches(launcher) == {"a": 1, "b": 1}
 
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         _seed(other, OTHER_RUN_ID)
         _crash_after_step(monkeypatch, "w")
@@ -832,7 +833,7 @@ def test_a_relaunch_whose_source_journal_is_gone_dispatches_again(
     store.journal.path.unlink()
 
     _new_process()
-    other = store_module.Store.open(tmp_path / "repo", OTHER_RUN_ID)
+    other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:
         _seed(other, OTHER_RUN_ID)
         runner = _runner(other, launcher, roles)

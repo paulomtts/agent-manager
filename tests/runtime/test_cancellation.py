@@ -29,7 +29,8 @@ import pytest
 from pygents import Agent, AgentRegistry, HookRegistry, StopReason, TurnHook, hook
 from pygents.errors import UnregisteredAgentError
 
-from agent_manager import models, store as store_module
+from agent_manager import models
+from agent_manager.store import writer as store_writer
 from agent_manager.harness import launcher
 from agent_manager.runtime import bridge
 from agent_manager.runtime import engine as runtime_engine
@@ -50,7 +51,7 @@ SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 

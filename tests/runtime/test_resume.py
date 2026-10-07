@@ -23,7 +23,7 @@ import pytest
 from pygents import Agent, AgentRegistry, ToolRegistry
 from pygents.errors import UnregisteredAgentError
 
-from agent_manager import models, paths, store as store_module
+from agent_manager import models, paths
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime import compile as compile_mod
 from agent_manager.runtime import engine as runtime_engine
@@ -31,6 +31,7 @@ from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.steps.worktree import GitError
 from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import writer as store_writer
 from agent_manager.workflow.phases import AgentPhase, Goto, Step, Workflow
 
 RUN_ID = "run-2026-09-26-04"
@@ -50,7 +51,7 @@ class _Crash(BaseException):
 def store(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    opened = store_module.Store.open(tmp_path / "repo", RUN_ID)
+    opened = store_writer.Store.open(tmp_path / "repo", RUN_ID)
     yield opened
     opened.close()
 

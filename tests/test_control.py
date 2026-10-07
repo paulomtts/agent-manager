@@ -1,7 +1,7 @@
 """Live control's lease, heartbeat and request watcher (live-control spec C1-C4).
 
 Steps tier of spec §14: a real temporary SQLite database and journal opened
-through `store.Store.open`, no network, no harness dispatch, so these run in
+through `store_writer.Store.open`, no network, no harness dispatch, so these run in
 the default `uv run pytest` suite and not under `tests/e2e/`. A "second
 process" is a second `store_db.open_db` connection.
 
@@ -30,9 +30,10 @@ from typing import Any, Iterator, TypeVar
 
 import pytest
 
-from agent_manager import control, models, store
+from agent_manager import control, models
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
+from agent_manager.store import writer as store_writer
 from agent_manager.runtime.stop import StopSignal
 
 RUN_ID = "run-2026-09-27-01"
@@ -52,8 +53,8 @@ def root(monkeypatch, tmp_path) -> Path:
 
 
 @pytest.fixture
-def opened_store(root) -> Iterator[store.Store]:
-    st = store.Store.open(root, RUN_ID)
+def opened_store(root) -> Iterator[store_writer.Store]:
+    st = store_writer.Store.open(root, RUN_ID)
     try:
         yield st
     finally:
@@ -188,7 +189,7 @@ class FakeAgent:
 class Wrapped:
     """A real `Store` with some methods overridden; everything else passes through."""
 
-    def __init__(self, inner: store.Store) -> None:
+    def __init__(self, inner: store_writer.Store) -> None:
         self._inner = inner
 
     def __getattr__(self, name: str) -> Any:
@@ -285,7 +286,11 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
                 modules.add(base)
     ours = {name for name in modules if name.split(".")[0] == "agent_manager"}
     theirs = {name.split(".")[0] for name in modules} - {"agent_manager"}
-    assert ours <= {"agent_manager.store", "agent_manager.runtime.stop"}
+    assert ours <= {
+        "agent_manager.store",
+        "agent_manager.store.writer",
+        "agent_manager.runtime.stop",
+    }
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
 
 
@@ -398,7 +403,7 @@ def test_a_lease_fences_its_store_only_while_it_is_held(root, opened_store):
     )
     with control.Lease(opened_store):
         opened_store.record_run(run)
-        thief = store.Store.open(root, RUN_ID)
+        thief = store_writer.Store.open(root, RUN_ID)
         try:
             thief.take_lease(
                 token="thief", pid=1, host="elsewhere", now=_at(0), is_live=lambda row: False
@@ -517,7 +522,7 @@ def test_lease_exit_releases_claims_then_lease_even_on_exception(root, opened_st
 def test_lease_exit_leaves_a_new_holders_lease_and_claims_alone(root, opened_store):
     # Review Focus 4: taken over mid-block, this lease releases only its own token.
     with control.Lease(opened_store, claims=["card:a"], clock=lambda: _at(0)):
-        thief = store.Store.open(root, RUN_ID)
+        thief = store_writer.Store.open(root, RUN_ID)
         try:
             thief.take_lease(
                 token="thief",
@@ -556,7 +561,7 @@ def test_a_handed_off_lease_stops_beating_unbinds_and_releases_nothing(root, ope
     row = _read_lease(root)
     assert row is not None and row.token == token
     assert _held(root, token) == ["card:a"]
-    thief = store.Store.open(root, RUN_ID)
+    thief = store_writer.Store.open(root, RUN_ID)
     try:
         thief.take_lease(
             token="thief", pid=1, host="elsewhere", now=_at(0), is_live=lambda row: False
@@ -579,7 +584,7 @@ def test_an_adopting_lease_keeps_the_token_and_claims_and_releases_both_on_exit(
         def take_lease(self, **kwargs: Any) -> Any:
             pytest.fail("an adopting lease took a new lease")
 
-    child = store.Store.open(root, RUN_ID)
+    child = store_writer.Store.open(root, RUN_ID)
     try:
         with control.Lease(NoTake(child), adopt=token, clock=lambda: _at(100)) as adopted:
             assert adopted.token == token

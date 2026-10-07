@@ -32,7 +32,7 @@ from agent_manager.runtime import engine as runtime_engine
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps import reducers, verify
 from agent_manager.steps.integrate import MergeInProgressError, merge_tip
-from agent_manager.store import Store
+from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
 
 PHASE = "integrate"

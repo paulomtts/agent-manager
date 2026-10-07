@@ -34,8 +34,8 @@ from agent_manager import bases, dispatch, models
 from agent_manager.dag import RootPlan
 from agent_manager.harness.base import Outcome
 from agent_manager.runtime.stop import StopSignal
-from agent_manager.store import Store
 from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store.writer import Store
 
 BASE = "m7/base-cccccccc"
 ROOT = RootPlan("merged", BASE, ("A", "B"))
