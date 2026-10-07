@@ -15,7 +15,34 @@ See `docs/superpowers/specs/2026-09-23-agent-manager-design.md` for the design.
 uv tool install agent-manager     # or: pipx install agent-manager
 ```
 
-To work on agent-manager itself, clone the repository and run `uv sync`.
+To work on agent-manager itself, clone the repository and run `uv sync`. It builds the project venv that `uv run am` and the tests use; it does not touch the installed `am`.
+
+### Installing `am` from a checkout
+
+Runs execute the installed `am`, so install it as a regular, non-editable `uv tool` install of a built copy, never with `uv tool install -e` or `--editable`. An editable install points at the checkout, so merging, checking out or saving a file there changes the `am` that live runs execute.
+
+From a clean checkout of the verified commit, reinstall with:
+
+```bash
+uv tool install --reinstall .
+```
+
+Or build a wheel and install that:
+
+```bash
+uv build
+uv tool install --reinstall dist/*.whl
+```
+
+Afterwards the tool receipt must not mention `editable`, so this must print nothing:
+
+```bash
+grep editable "$(uv tool dir)/agent-manager/uv-receipt.toml"
+```
+
+Once it prints nothing, editing the checkout no longer changes what the installed `am` does.
+
+Reinstalling replaces the tool's virtual environment, so never do it while any `am` run is live. Run `am runs` first in each repository `am` drives: no run may show `lease.live` `true`.
 
 ## Requires
 

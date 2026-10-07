@@ -119,7 +119,7 @@ together.
 | core | `src/agent_manager/__init__.py` `src/agent_manager/models.py` `src/agent_manager/errors.py` `src/agent_manager/paths.py` `src/agent_manager/census.py` `src/agent_manager/results.py` `src/agent_manager/dag.py` `src/agent_manager/prompt.py` `src/agent_manager/roles/__init__.py` `src/agent_manager/roles/loader.py` `src/agent_manager/workflow` `tests/test_models.py` `tests/test_errors.py` `tests/test_paths.py` `tests/test_census.py` `tests/test_results.py` `tests/test_dag.py` `tests/test_prompt.py` `tests/test_package.py` `tests/test_integrate_workflow.py` `tests/roles` `tests/workflow` |
 | steps | `src/agent_manager/steps` `tests/steps` |
 | adapters | `src/agent_manager/board.py` `src/agent_manager/detach.py` `src/agent_manager/argv_guard.py` `src/agent_manager/harness` `tests/test_board.py` `tests/test_fake_board.py` `tests/test_detach.py` `tests/test_argv_guard.py` `tests/harness` |
-| suite | `tests/conftest.py` `tests/test_conftest_tiers.py` `tests/test_tier_guards.py` `tests/test_readme.py` `tests/test_audit_suite.py` `tests/test_spelling.py` `tests/e2e` `README.md` `CLAUDE.md` `docs/standards` |
+| suite | `tests/conftest.py` `tests/test_conftest_tiers.py` `tests/test_tier_guards.py` `tests/test_readme.py` `tests/test_claude_md.py` `tests/test_audit_suite.py` `tests/test_spelling.py` `tests/e2e` `README.md` `CLAUDE.md` `docs/standards` |
 
 ## Step 2: Gather the git facts
 

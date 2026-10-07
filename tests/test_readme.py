@@ -43,6 +43,18 @@ STORY_SHAPE = (
 ISOLATION_TITLE = "Isolating agents with `--isolation`"
 ARGV_TITLE = "Verification commands stay out of `ps`"
 
+CHECKOUT_TITLE = "Installing `am` from a checkout"
+INSTALL_PINNED = (
+    "uv tool install --reinstall .",
+    "uv build",
+    "uv tool install --reinstall dist/*.whl",
+    "clean checkout of the verified commit",
+    "non-editable",
+    'grep editable "$(uv tool dir)/agent-manager/uv-receipt.toml"',
+    "am runs",
+)
+LIVE_RUN = "while any `am` run is live"
+
 
 def _lines() -> list[str]:
     return README.read_text(encoding="utf-8").splitlines()
@@ -797,3 +809,40 @@ def test_resume_text_keeps_or_replaces_the_harness_timeouts():
     assert "takes only the `--harness-timeout` values given to it" in _section(
         "Relaunching resumes"
     )
+
+
+def test_install_documents_the_non_editable_checkout_install():
+    """Card b78f7935: the checkout-install subsection states the five P1 rules."""
+    section = _section(CHECKOUT_TITLE)
+    for pinned in INSTALL_PINNED:
+        assert pinned in section, f"README.md {CHECKOUT_TITLE!r} lacks {pinned!r}"
+    paragraphs = section.split("\n\n")
+    assert any("never" in p and LIVE_RUN in p for p in paragraphs), (
+        f"README.md {CHECKOUT_TITLE!r}: no paragraph says never ... {LIVE_RUN!r}"
+    )
+    assert "it prints nothing" in section or "must print nothing" in section
+    install = _section("Install")
+    assert "run `uv sync`" in install
+    assert "it does not touch the installed `am`" in install
+
+
+def test_checkout_install_sits_under_install():
+    heads = [head for head in _headings() if head[2] == CHECKOUT_TITLE]
+    assert len(heads) == 1
+    assert heads[0][1] == 3
+    assert f"### {CHECKOUT_TITLE}" in _section("Install")
+
+
+def test_checkout_install_never_shows_an_editable_command():
+    fenced_lines: list[str] = []
+    fenced = False
+    for line in _section("Install").splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            fenced_lines.append(line)
+    assert "uv tool install --reinstall ." in fenced_lines
+    for line in fenced_lines:
+        assert "-e " not in line, line
+        assert "--editable" not in line, line
