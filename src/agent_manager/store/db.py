@@ -441,9 +441,9 @@ def open_db(root: Path) -> sqlite3.Connection:
     A missing `STORE_ID_KEY` row in `meta` is inserted with a fresh random id
     and committed with the schema; an existing one is never changed.
 
-    The connection may be used from any thread of the process that holds the
-    run's lease, so `check_same_thread` is off; `Store` serialises that use
-    behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
+    The connection is used from a thread other than the one that opened it,
+    so `check_same_thread` is off; a `Store` uses it only from its writer
+    thread. `BUSY_TIMEOUT_SECONDS` covers another process holding
     the database briefly; two processes never write one run, because every
     run write is fenced by the lease token (multi-process X4).
     """
@@ -566,6 +566,27 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
         return conn
     conn.close()
     return open_db(root)
+
+
+def open_reader(location: Path) -> sqlite3.Connection:
+    """A read-only connection on the existing database file `location`.
+
+    Opened `mode=ro`, never `immutable=1`: another connection of this process
+    holds the file open and writes it, and each statement here sees what was
+    committed when it began, never an open transaction's rows. Any write
+    through it raises `sqlite3.OperationalError`. Usable from any thread
+    (`check_same_thread` off); the caller serialises its use. Rows are
+    `sqlite3.Row`, and a lock held elsewhere is waited out for
+    `BUSY_TIMEOUT_SECONDS`.
+    """
+    conn = sqlite3.connect(
+        f"{location.absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 @contextmanager

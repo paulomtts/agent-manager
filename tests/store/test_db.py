@@ -1473,3 +1473,23 @@ def test_run_with_retry_reruns_an_immediate_write_refused_by_a_real_lock(tmp_pat
     finally:
         writer.close()
         holder.close()
+
+
+def test_open_reader_is_read_only_and_sees_committed_rows(repo):
+    writer = db.open_db(repo)
+    reader = db.open_reader(paths.db_path())
+    try:
+        writer.execute("INSERT INTO meta (key, value) VALUES ('committed', 'v')")
+        writer.commit()
+        # Left open: an implicit transaction the reader must not see into.
+        writer.execute("INSERT INTO meta (key, value) VALUES ('uncommitted', 'v')")
+        keys = {row["key"] for row in reader.execute("SELECT key FROM meta")}
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("INSERT INTO meta (key, value) VALUES ('refused', 'v')")
+    finally:
+        writer.rollback()
+        reader.close()
+        writer.close()
+
+    assert "committed" in keys
+    assert "uncommitted" not in keys
