@@ -339,8 +339,8 @@ class Store:
                     self._check_fence(conn, job)
                     value = job.body(conn)
                 except BaseException as error:  # handed to the job's caller
-                    busy = isinstance(error, sqlite3.OperationalError)
-                    if busy and store_db.is_busy(error):
+                    operational = isinstance(error, sqlite3.OperationalError)
+                    if operational and store_db.is_busy(error):
                         raise
                     conn.execute(f"ROLLBACK TO {savepoint}")
                     conn.execute(f"RELEASE {savepoint}")
