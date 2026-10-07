@@ -212,7 +212,7 @@ def _workflow(ran: list[str], *, critic: bool = False) -> Workflow:
 
 
 def _seed(opened, run_id: str = RUN_ID) -> None:
-    """The run, story and subtask lines `Store.replay_journal` needs above any phase line."""
+    """The run, story and subtask lines `Store.replay_events` needs above any phase line."""
     opened.record_run(
         models.Run(
             id=run_id,
@@ -323,7 +323,7 @@ def _phase_rows(opened, phase: str) -> list[str]:
 
 def _attempt_statuses(opened, phase: str) -> list[tuple[int, str]]:
     """`phase`'s attempts as the journal last records them: `(n, status)`."""
-    run = opened.replay_journal(opened.run_id)
+    run = opened.replay_events(opened.run_id)
     return [
         (attempt.n, attempt.status)
         for story in run.stories
@@ -347,7 +347,7 @@ def _head(agent: dict) -> str:
 def _mark_orphans(opened) -> None:
     """What a real resume does first (cli.py, before `drive_subtask_async`):
     every attempt left `started` is recorded `harness_error`."""
-    run = opened.replay_journal(opened.run_id)
+    run = opened.replay_events(opened.run_id)
     for story in run.stories:
         for subtask in story.subtasks:
             for phase, attempt in cli.orphan_attempts(subtask):
@@ -822,9 +822,10 @@ def test_a_mismatched_adoption_is_discarded(store, roles, monkeypatch):
     assert runner.warnings == []
 
 
-def test_a_relaunch_whose_source_journal_is_gone_dispatches_again(
+def test_a_relaunch_whose_source_journal_file_is_gone_still_adopts_from_its_events(
     store, roles, monkeypatch, tmp_path
 ):
+    # Spec test 15: adoption never reads the journal file.
     launcher = FakeLauncher()
     _crash_after_call_agent(monkeypatch, "a")
     with pytest.raises(_Crash):
@@ -842,10 +843,7 @@ def test_a_relaunch_whose_source_journal_is_gone_dispatches_again(
         other.close()
 
     assert summary.status == "done"
-    assert _dispatches(launcher) == {"a": 2, "b": 1}
-    [warning] = runner.warnings
-    assert warning.startswith(
-        f"phase 'a': attempt ? of run {RUN_ID} was not reused (its journal cannot be read: "
-    )
-    assert "MissingJournalError" in warning
-    assert warning.endswith("); dispatching again")
+    assert _dispatches(launcher) == {"a": 1, "b": 1}
+    assert runner.warnings == [_reused("a", 1, RUN_ID)]
+
+

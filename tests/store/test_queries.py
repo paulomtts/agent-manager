@@ -129,7 +129,7 @@ def test_no_caller_reaches_a_query_name_through_the_store_package():
 
 
 def test_store_load_run_reads_through_the_queries_module(repo, monkeypatch):
-    # `Store.load_run` and `rebuild_from_journal` must look `load_run` up on
+    # `Store.load_run` and `rebuild_from_events` must look `load_run` up on
     # `store_queries` at call time, or a patch of it would never be seen.
     loaded = object()
     seen: list[tuple[object, str]] = []

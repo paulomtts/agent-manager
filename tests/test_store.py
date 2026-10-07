@@ -14,6 +14,7 @@ writes nowhere real.
 import ast
 import dataclasses
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -415,33 +416,88 @@ def test_load_run_returns_none_for_an_unknown_run(repo):
         st.close()
 
 
-def _truncate_db(repo: Path) -> Path:
-    """Wipe the projection the way a crashed or corrupted disk would.
-
-    The WAL sidecars are removed too: zeroing the main file while a populated
-    `-wal` survives would not actually lose the rows. `repo` is the project
-    whose store wrote it; the file is the machine one.
-    """
-    db_path = paths.db_path()
-    db_path.write_bytes(b"")
-    for suffix in ("-wal", "-shm"):
-        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
-    return db_path
+PLANTED_TS = "2026-09-23T10:20:00+00:00"
 
 
-def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
+def _wipe_tree_rows(repo: Path) -> None:
+    """Lose every run's projection, the way a restored backup or a bad
+    migration would, keeping the `events` that explain it: every row of the
+    five tree tables is deleted behind the store's back."""
+    for table in ("attempts", "phases", "subtasks", "stories", "runs"):
+        _raw_sql(repo, f"DELETE FROM {table}")
+
+
+def _plant_event(
+    repo: Path,
+    kind: str,
+    payload: dict,
+    *,
+    run_id: str = RUN_ID,
+    story: str | None = None,
+    card: str | None = None,
+    phase: str | None = None,
+    attempt: int | None = None,
+    run_seq: int | None = None,
+) -> store_events.EventRow:
+    """One `events` row written behind the store's back, as a hand `INSERT`
+    or an older `am` would leave it: no row and no journal line record it.
+    `run_seq=None` numbers it after the run's last event."""
+    conn = store_db.open_db(repo)
+    try:
+        with store_db.immediate(conn):
+            return store_events.insert(
+                conn,
+                project_id=_project_id(conn, repo),
+                run_id=run_id,
+                ts=PLANTED_TS,
+                kind=kind,
+                payload=payload,
+                source="live",
+                story_id=story,
+                card_id=card,
+                phase=phase,
+                attempt=attempt,
+                run_seq=run_seq,
+            )
+    finally:
+        conn.close()
+
+
+def _plant_raw_payload(repo: Path, kind: str, text: str, *, run_id: str = RUN_ID) -> int:
+    """An `events` row of `run_id` whose `payload` column is `text` verbatim,
+    numbered after the run's last event: what `store_events.insert`, which
+    serialises, cannot write. Returns its `run_seq`."""
+    conn = store_db.open_db(repo)
+    try:
+        with store_db.immediate(conn):
+            run_seq = conn.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) + 1 FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'live')",
+                (_project_id(conn, repo), run_id, run_seq, PLANTED_TS, kind, text),
+            )
+    finally:
+        conn.close()
+    return run_seq
+
+
+def test_a_projection_lost_mid_run_is_rebuilt_from_its_events_without_its_journal_file(repo):
+    # Spec test 6: the journal file is gone too, so only the events can say.
     st = store_writer.Store.open(repo, RUN_ID)
     _record_full_run(st, repo)
     before = st.load_run(RUN_ID)
     st.close()
 
-    db_path = _truncate_db(repo)
-    assert db_path.stat().st_size == 0
+    _wipe_tree_rows(repo)
+    (paths.run_dir(RUN_ID) / store_journal.JOURNAL_NAME).unlink()
 
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
         assert rebuilt.load_run(RUN_ID) is None
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
     finally:
         rebuilt.close()
@@ -450,13 +506,75 @@ def test_a_db_truncated_mid_run_is_rebuilt_from_its_journal(repo):
     assert returned == before
 
 
+def test_a_journal_file_line_that_no_event_holds_is_not_rebuilt(repo):
+    # Spec test 7, the inverse proof: the file is not read.
+    st = store_writer.Store.open(repo, RUN_ID)
+    st.record_run(_run(repo))
+    _journal_a_story_whose_row_never_landed(st)
+    st.close()
+
+    reopened = store_writer.Store.open(repo, RUN_ID)
+    try:
+        run = reopened.rebuild_from_events(RUN_ID)
+        stories = reopened.connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+    finally:
+        reopened.close()
+
+    assert run.stories == []
+    assert stories == 0
+
+
+def test_rebuilding_a_run_with_no_events_raises_and_writes_nothing(repo):
+    # Spec test 8.
+    st = store_writer.Store.open(repo, RUN_ID)
+    try:
+        before = _all_rows(repo)
+        with pytest.raises(store_journal.JournalError) as excinfo:
+            st.rebuild_from_events("run-never-started")
+        assert st.load_run("run-never-started") is None
+        after = _all_rows(repo)
+    finally:
+        st.close()
+
+    assert not isinstance(excinfo.value, store_journal.MissingJournalError)
+    assert "'run-never-started'" in str(excinfo.value)
+    assert "no events" in str(excinfo.value)
+    assert after == before
+
+
+def test_rebuilding_another_run_reads_that_runs_events(repo):
+    # Review Focus 4: the store's own run is RUN_ID; the rebuilt one is not.
+    other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
+    try:
+        other.record_run(_run(repo, ADOPTING_RUN_ID))
+        other.record_story(_story())
+        recorded = other.load_run(ADOPTING_RUN_ID)
+    finally:
+        other.close()
+    _raw_sql(repo, "DELETE FROM stories WHERE run_id = ?", (ADOPTING_RUN_ID,))
+
+    st = store_writer.Store.open(repo, RUN_ID)
+    try:
+        _record_full_run(st, repo)
+        mine = st.load_run(RUN_ID)
+        rebuilt = st.rebuild_from_events(ADOPTING_RUN_ID)
+        after = st.load_run(ADOPTING_RUN_ID)
+        mine_after = st.load_run(RUN_ID)
+    finally:
+        st.close()
+
+    assert rebuilt == recorded
+    assert after == recorded
+    assert mine_after == mine
+
+
 def test_rebuilding_twice_changes_nothing_and_duplicates_nothing(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        once = st.rebuild_from_journal(RUN_ID)
+        once = st.rebuild_from_events(RUN_ID)
         first = st.load_run(RUN_ID)
-        twice = st.rebuild_from_journal(RUN_ID)
+        twice = st.rebuild_from_events(RUN_ID)
         second = st.load_run(RUN_ID)
         counts = {
             table: st.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -477,10 +595,10 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     _record_full_run(st, repo)
     st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        run = rebuilt.rebuild_from_journal(RUN_ID)
+        run = rebuilt.rebuild_from_events(RUN_ID)
         row = rebuilt.connection.execute(
             "SELECT * FROM attempts WHERE phase = 'implement'"
         ).fetchone()
@@ -499,17 +617,19 @@ def test_an_in_flight_attempt_survives_the_rebuild_as_started(repo):
     assert terminal.exit_code == 0
 
 
-def test_rebuild_picks_up_a_journal_line_whose_row_never_landed(repo):
-    # The rebuild materialises a row the journal file records and the
-    # projection lacks.
+def test_rebuild_picks_up_an_event_whose_row_never_landed(repo):
+    # The rebuild materialises a row an event records and the projection lacks.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
-    _journal_a_story_whose_row_never_landed(st)
     st.close()
+    _plant_event(
+        repo, "story_upsert", _story().model_dump(mode="json", exclude={"subtasks"}),
+        story="8831189b",
+    )
 
     reopened = store_writer.Store.open(repo, RUN_ID)
     try:
-        run = reopened.rebuild_from_journal(RUN_ID)
+        run = reopened.rebuild_from_events(RUN_ID)
         row = reopened.connection.execute("SELECT * FROM stories").fetchone()
     finally:
         reopened.close()
@@ -524,31 +644,21 @@ def _append_raw(journal: store_journal.Journal, record: dict) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def test_a_line_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
+def test_an_event_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        journal = st.journal
-        _append_raw(
-            journal,
-            {
-                "seq": journal.last_seq() + 1,
-                "ts": "2026-09-23T10:20:00+00:00",
-                "run_id": RUN_ID,
-                "event": "attempt_upsert",
-                "story": "8831189b",
-                "card": "ef248597",
-                "phase": "implement",
-                "attempt": 1,
-                "payload": {
-                    "n": 1,
-                    "dispatch": _dispatch().model_dump(mode="json"),
-                    "tokens": 10,
-                },
-            },
+        _plant_event(
+            repo,
+            "attempt_upsert",
+            {"n": 1, "dispatch": _dispatch().model_dump(mode="json"), "tokens": 10},
+            story="8831189b",
+            card="ef248597",
+            phase="implement",
+            attempt=1,
         )
         with pytest.raises(ValidationError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
     assert "tokens" in str(excinfo.value)
@@ -565,9 +675,9 @@ _RETIRED_NULL = {"tokens_in": None, "tokens_out": None, "cost": None}
 _RETIRED_SET = {"tokens_in": 8000, "tokens_out": 1500, "cost": 0.31}
 
 
-def _append_old_attempt(journal: store_journal.Journal, extra: dict) -> None:
+def _plant_old_attempt(repo: Path, extra: dict) -> None:
     """Re-record implement attempt 1 as `ok`, the way an `am` from before
-    2026-10-03 wrote it: today's payload plus `extra`."""
+    2026-10-03 recorded it: today's payload plus `extra`."""
     payload = models.Attempt(
         n=1,
         dispatch=_dispatch(card="ef248597", phase="implement"),
@@ -575,19 +685,14 @@ def _append_old_attempt(journal: store_journal.Journal, extra: dict) -> None:
         exit_code=0,
         duration=12.5,
     ).model_dump(mode="json")
-    _append_raw(
-        journal,
-        {
-            "seq": journal.last_seq() + 1,
-            "ts": "2026-09-23T10:20:00+00:00",
-            "run_id": RUN_ID,
-            "event": "attempt_upsert",
-            "story": "8831189b",
-            "card": "ef248597",
-            "phase": "implement",
-            "attempt": 1,
-            "payload": {**payload, **extra},
-        },
+    _plant_event(
+        repo,
+        "attempt_upsert",
+        {**payload, **extra},
+        story="8831189b",
+        card="ef248597",
+        phase="implement",
+        attempt=1,
     )
 
 
@@ -596,14 +701,14 @@ def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, ret
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        _append_old_attempt(st.journal, retired)
-        replayed = st.replay_journal(RUN_ID)
+        _plant_old_attempt(repo, retired)
+        replayed = st.replay_events(RUN_ID)
         # The projection already holds this run, so the rebuild runs its
         # `diverging` pre-check over the same old lines first.
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
         loaded = st.load_run(RUN_ID)
         assert loaded is not None
-        mismatches = store_replay.diverging(st.journal.read(), loaded)
+        mismatches = store_replay.diverging(store_events.run_lines(st.read_connection, RUN_ID), loaded)
     finally:
         st.close()
 
@@ -621,14 +726,14 @@ def test_an_attempt_line_carrying_the_retired_usage_keys_still_replays(repo, ret
     assert mismatches == []
 
 
-@pytest.mark.parametrize("read", ["replay_journal", "rebuild_from_journal"])
+@pytest.mark.parametrize("read", ["replay_events", "rebuild_from_events"])
 def test_an_attempt_line_with_any_other_unknown_key_still_raises_naming_only_it(
     repo, read
 ):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        _append_old_attempt(st.journal, {**_RETIRED_NULL, "operator": "x"})
+        _plant_old_attempt(repo, {**_RETIRED_NULL, "operator": "x"})
         with pytest.raises(ValidationError) as excinfo:
             getattr(st, read)(RUN_ID)
     finally:
@@ -666,19 +771,9 @@ def test_only_attempt_lines_shed_the_retired_usage_keys(repo, event):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        _append_raw(
-            st.journal,
-            {
-                "seq": st.journal.last_seq() + 1,
-                "ts": "2026-09-23T10:20:00+00:00",
-                "run_id": RUN_ID,
-                "event": event,
-                **coordinates,
-                "payload": {**payload, "cost": None},
-            },
-        )
+        _plant_event(repo, event, {**payload, "cost": None}, **coordinates)
         with pytest.raises(ValidationError) as excinfo:
-            st.replay_journal(RUN_ID)
+            st.replay_events(RUN_ID)
     finally:
         st.close()
 
@@ -689,29 +784,20 @@ def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        journal = st.journal
-        _append_raw(
-            journal,
+        _plant_event(
+            repo,
+            "story_upsert",
             {
-                "seq": journal.last_seq() + 1,
-                "ts": "2026-09-23T10:20:00+00:00",
-                "run_id": RUN_ID,
-                "event": "story_upsert",
-                "story": "8831189b",
-                "card": None,
-                "phase": None,
-                "attempt": None,
-                "payload": {
-                    "card_id": "8831189b",
-                    "title": "Foundations",
-                    "level": 0,
-                    "status": "finished",
-                    "tip_branch": None,
-                },
+                "card_id": "8831189b",
+                "title": "Foundations",
+                "level": 0,
+                "status": "finished",
+                "tip_branch": None,
             },
+            story="8831189b",
         )
         with pytest.raises(ValidationError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
     message = str(excinfo.value)
@@ -719,53 +805,26 @@ def test_a_line_with_an_invalid_status_raises_out_of_rebuild(repo):
         assert allowed in message
 
 
-def test_a_corrupt_line_raises_out_of_rebuild_naming_the_journal(repo):
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        _record_full_run(st, repo)
-        with st.journal.path.open("a", encoding="utf-8") as handle:
-            handle.write("{not json at all\n")
-        with pytest.raises(store_journal.CorruptJournalError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
-        message = str(excinfo.value)
-        assert str(st.journal.path) in message
-    finally:
-        st.close()
-
-
-def test_rebuilding_a_run_with_no_journal_raises(repo):
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        with pytest.raises(store_journal.MissingJournalError) as excinfo:
-            st.rebuild_from_journal("run-never-started")
-        assert st.load_run("run-never-started") is None
-    finally:
-        st.close()
-    assert "run-never-started" in str(excinfo.value)
-
-
-def test_a_journal_whose_head_is_missing_raises_a_journal_error(repo):
+def test_events_whose_head_is_missing_raise_a_journal_error(repo):
     # Review Focus 1: a story event with no run_upsert before it must name the
     # problem, not fail with an AttributeError on None.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append(
-        "story_upsert",
-        _story().model_dump(mode="json", exclude={"subtasks"}),
+    _plant_event(
+        repo, "story_upsert", _story().model_dump(mode="json", exclude={"subtasks"}),
         story="8831189b",
     )
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
     assert "run_upsert" in str(excinfo.value)
 
 
-def test_a_line_naming_an_unknown_parent_raises_a_journal_error(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}))
-    journal.append(
+def test_an_event_naming_an_unknown_parent_raises_a_journal_error(repo):
+    _plant_event(repo, "run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}))
+    _plant_event(
+        repo,
         "subtask_upsert",
         _subtask().model_dump(mode="json", exclude={"phases"}),
         story="never-recorded",
@@ -774,7 +833,7 @@ def test_a_line_naming_an_unknown_parent_raises_a_journal_error(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
     assert "never-recorded" in str(excinfo.value)
@@ -800,7 +859,7 @@ def test_rebuilding_one_run_leaves_another_runs_rows_alone(repo):
 
     rebuilding = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilding.rebuild_from_journal(RUN_ID)
+        rebuilding.rebuild_from_events(RUN_ID)
         assert rebuilding.load_run(other_id) == untouched
         assert rebuilding.load_run(RUN_ID) is not None
     finally:
@@ -832,7 +891,7 @@ def test_a_status_transition_on_a_parent_keeps_the_children_recorded_before_it(r
                 ended_at=datetime(2026, 9, 23, 10, 30, tzinfo=timezone.utc),
             ),
         )
-        run = st.rebuild_from_journal(RUN_ID)
+        run = st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
 
@@ -882,9 +941,18 @@ def test_read_returns_lines_in_sequence_order_not_file_order(repo):
 
     assert [line.seq for line in journal.read()] == [1, 2, 3]
 
+
+def test_rebuild_folds_events_in_run_seq_order_not_insert_order(repo):
+    # `run_seq` is the ordering: an event numbered 3 inserted before the one
+    # numbered 2 still folds after it.
+    story = _story().model_dump(mode="json", exclude={"subtasks"})
+    _plant_event(repo, "run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}), run_seq=1)
+    _plant_event(repo, "story_upsert", story | {"status": "done"}, story="8831189b", run_seq=3)
+    _plant_event(repo, "story_upsert", story | {"status": "started"}, story="8831189b", run_seq=2)
+
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        run = st.rebuild_from_journal(RUN_ID)
+        run = st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
     assert run.stories[0].status == "done"
@@ -892,7 +960,7 @@ def test_read_returns_lines_in_sequence_order_not_file_order(repo):
 
 def test_recording_a_run_whose_id_is_not_the_stores_run_id_is_refused(repo):
     # The row is keyed by the store's run id while the journal payload carries
-    # the model's own. Letting the two differ makes `rebuild_from_journal`
+    # the model's own. Letting the two differ makes `rebuild_from_events`
     # return a run that `load_run` can never equal, so it is refused outright.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -908,18 +976,16 @@ def test_recording_a_run_whose_id_is_not_the_stores_run_id_is_refused(repo):
         store_journal.Journal(RUN_ID).read()
 
 
-def test_a_journal_whose_run_upsert_names_another_run_raises(repo):
-    journal = store_journal.Journal(RUN_ID)
-    journal.append(
+def test_events_whose_run_upsert_names_another_run_raise(repo):
+    _plant_event(
+        repo,
         "run_upsert",
-        _run(repo, run_id="run-somewhere-else").model_dump(
-            mode="json", exclude={"stories"}
-        ),
+        _run(repo, run_id="run-somewhere-else").model_dump(mode="json", exclude={"stories"}),
     )
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_journal.JournalError) as excinfo:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
         assert st.load_run(RUN_ID) is None
     finally:
         st.close()
@@ -1997,20 +2063,20 @@ def test_every_record_inserts_its_event_writes_its_row_then_mirrors_on_the_write
 
 
 def test_rebuild_runs_on_the_writer_thread_and_load_run_on_the_caller(repo, monkeypatch):
-    # rebuild reads the journal, checks divergence, deletes and rewrites as one
+    # rebuild reads the run's events, checks divergence, deletes and rewrites as one
     # job on the writer thread; Store.load_run reads on the calling thread.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         seen: list[tuple[str, bool]] = []
 
-        real_read = st.journal.read
+        real_run_lines = store_events.run_lines
 
-        def spying_read():
-            seen.append(("read", _on_the_writer()))
-            return real_read()
+        def spying_run_lines(conn, run_id):
+            seen.append(("run_lines", _on_the_writer()))
+            return real_run_lines(conn, run_id)
 
-        monkeypatch.setattr(st.journal, "read", spying_read)
+        monkeypatch.setattr(store_events, "run_lines", spying_run_lines)
 
         real_delete = st._delete_run
 
@@ -2036,7 +2102,7 @@ def test_rebuild_runs_on_the_writer_thread_and_load_run_on_the_caller(repo, monk
 
         monkeypatch.setattr(store_queries, "load_run", spying_load_run)
 
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
         loaded = st.load_run(RUN_ID)
     finally:
         st.close()
@@ -2045,7 +2111,7 @@ def test_rebuild_runs_on_the_writer_thread_and_load_run_on_the_caller(repo, monk
     # The first `load_run` is the foreign-value check (divergence §3.6): it
     # reads the projection inside the job, before anything is deleted.
     assert seen == [
-        ("read", True),
+        ("run_lines", True),
         ("load_run", True),
         ("_delete_run", True),
         ("_write_attempt_row", True),
@@ -2119,11 +2185,10 @@ def test_a_failed_rebuild_leaves_the_writer_serving(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        with st.journal.path.open("a", encoding="utf-8") as handle:
-            handle.write("{not json at all\n")
+        _plant_raw_payload(repo, "story_upsert", "{not json at all")
 
-        with pytest.raises(store_journal.CorruptJournalError):
-            st.rebuild_from_journal(RUN_ID)
+        with pytest.raises(store_journal.JournalError):
+            st.rebuild_from_events(RUN_ID)
 
         assert _writer_serves(st)
     finally:
@@ -2274,7 +2339,7 @@ def test_eight_threads_recording_through_one_store_agree_with_the_rebuilt_journa
         finally:
             reader.close()
 
-        assert st.rebuild_from_journal(RUN_ID) == before
+        assert st.rebuild_from_events(RUN_ID) == before
         assert st.load_run(RUN_ID) == before
     finally:
         st.close()
@@ -2337,10 +2402,10 @@ def test_a_stopped_run_survives_a_rebuild_from_the_journal(repo):
     _record_stopped_run(st, repo)
     st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
         row = rebuilt.connection.execute(
             "SELECT status FROM subtasks WHERE run_id = ?", (RUN_ID,)
@@ -2461,10 +2526,10 @@ def test_a_failed_phase_detail_survives_a_rebuild_from_the_journal(repo):
     finally:
         st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
     finally:
         rebuilt.close()
@@ -2577,7 +2642,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
 
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt.rebuild_from_journal(RUN_ID)
+        rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
     finally:
         rebuilt.close()
@@ -2688,7 +2753,7 @@ def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
             ).fetchall()
         ]
         loaded = st.load_run(RUN_ID)
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
         after = st.load_run(RUN_ID)
     finally:
         st.close()
@@ -2882,10 +2947,10 @@ def test_a_runs_milestone_id_survives_a_rebuild_from_the_journal(repo):
     finally:
         st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
     finally:
         rebuilt.close()
@@ -3038,10 +3103,10 @@ def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
     finally:
         st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
         after = rebuilt.load_run(RUN_ID)
     finally:
         rebuilt.close()
@@ -3051,25 +3116,14 @@ def test_a_runs_config_story_id_survives_a_rebuild_from_the_journal(repo):
     assert after == returned
 
 
-def test_a_run_upsert_line_without_story_id_rebuilds_to_none(repo):
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        st.record_run(_run(repo))
-    finally:
-        st.close()
+def test_a_run_upsert_event_without_story_id_rebuilds_to_none(repo):
+    payload = _run(repo).model_dump(mode="json", exclude={"stories"})
+    del payload["config"]["story_id"]
+    _plant_event(repo, "run_upsert", payload)
 
-    journal_path = store_journal.Journal(RUN_ID).path
-    records = [json.loads(text) for text in journal_path.read_text().splitlines()]
-    upserts = [record for record in records if record["event"] == "run_upsert"]
-    assert upserts
-    for record in upserts:
-        del record["payload"]["config"]["story_id"]
-    journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
-
-    _truncate_db(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        returned = rebuilt.rebuild_from_journal(RUN_ID)
+        returned = rebuilt.rebuild_from_events(RUN_ID)
     finally:
         rebuilt.close()
 
@@ -3202,17 +3256,8 @@ def test_a_run_upsert_line_from_before_milestone_id_rebuilds_to_none(repo):
     assert "milestone_id" not in payload
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        _append_raw(
-            st.journal,
-            {
-                "seq": 1,
-                "ts": "2026-09-23T10:00:00+00:00",
-                "run_id": RUN_ID,
-                "event": "run_upsert",
-                "payload": payload,
-            },
-        )
-        returned = st.rebuild_from_journal(RUN_ID)
+        _plant_event(repo, "run_upsert", payload)
+        returned = st.rebuild_from_events(RUN_ID)
         after = st.load_run(RUN_ID)
         row = st.connection.execute(
             "SELECT milestone_id FROM runs WHERE id = ?", (RUN_ID,)
@@ -3424,7 +3469,7 @@ def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
         before = [line.seq for line in st.journal.read()]
         saved = _save_checkpoint(st, "ef248597", reason="parked")
         after = [line.seq for line in st.journal.read()]
-        st.rebuild_from_journal(RUN_ID)
+        st.rebuild_from_events(RUN_ID)
         kept = st.latest_checkpoint("ef248597")
     finally:
         st.close()
@@ -4115,7 +4160,7 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
         controls = store_leases.control_requests(other, RUN_ID)
         journal_before = [line.event for line in st.journal.read()]
 
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
 
         # Nothing journals the control tables, and the rebuild leaves them alone.
         assert [line.event for line in st.journal.read()] == journal_before
@@ -4130,10 +4175,10 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
         st.close()
 
     # From the journal alone: a wiped projection replays `canceled`.
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     replayed = store_writer.Store.open(repo, RUN_ID)
     try:
-        replayed.rebuild_from_journal(RUN_ID)
+        replayed.rebuild_from_events(RUN_ID)
         summaries = store_queries.list_runs(replayed.connection, project_id=replayed.project_id)
         status = store_queries.run_status(replayed.connection, RUN_ID)
     finally:
@@ -4164,45 +4209,34 @@ def test_run_status_normalises_legacy_cancelled(repo):
             conn.close()
 
 
-def test_replay_old_journal_with_legacy_cancelled(repo):
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        st.record_run(_run(repo))
-    finally:
-        st.close()
+def test_replay_old_events_with_legacy_cancelled(repo):
+    # The run_upsert an old `am` recorded for a run it canceled.
+    payload = _run(repo).model_dump(mode="json", exclude={"stories"})
+    _plant_event(repo, "run_upsert", payload | {"status": models.LEGACY_CANCELED})
 
-    # The journal an old `am` wrote for a run it canceled.
-    journal_path = store_journal.Journal(RUN_ID).path
-    records = [json.loads(text) for text in journal_path.read_text().splitlines()]
-    upserts = [record for record in records if record["event"] == "run_upsert"]
-    assert upserts
-    for record in upserts:
-        record["payload"]["status"] = models.LEGACY_CANCELED
-    journal_path.write_text("".join(json.dumps(record) + "\n" for record in records))
-
-    _truncate_db(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt.rebuild_from_journal(RUN_ID)
+        rebuilt.rebuild_from_events(RUN_ID)
+        replayed = rebuilt.replay_events(RUN_ID)
     finally:
         rebuilt.close()
 
-    assert models.is_canceled(store_replay.replay(store_journal.Journal(RUN_ID).read()).status)
+    assert models.is_canceled(replayed.status)
     assert _diverging_now(repo) == []
 
 
 @CANCEL_SPELLINGS
-def test_rebuild_from_journal_with_either_spelling(repo, status):
+def test_rebuild_from_events_with_either_spelling(repo, status):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run_with_status(repo, RUN_ID, status))
     finally:
         st.close()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt.rebuild_from_journal(RUN_ID)
+        rebuilt.rebuild_from_events(RUN_ID)
         loaded = rebuilt.load_run(RUN_ID)
         summaries = store_queries.list_runs(rebuilt.connection, project_id=rebuilt.project_id)
     finally:
@@ -4655,7 +4689,7 @@ def test_a_taken_over_store_writes_nothing(repo, stores):
             models.Attempt(n=1, dispatch=_dispatch(phase="explore")),
         ),
         lambda: _save_checkpoint(a, "ef248597", saved_at=_at(2)),
-        lambda: a.rebuild_from_journal(RUN_ID),
+        lambda: a.rebuild_from_events(RUN_ID),
     ]
     for write in writes:
         with pytest.raises(store_leases.LeaseLostError) as caught:
@@ -4690,7 +4724,7 @@ def test_an_unbound_store_writes_as_before(repo, stores):
     # Neither the refused take nor the foreign live lease binds or fences `st`.
     _record_full_run(st, repo)
     _save_checkpoint(st, "ef248597", saved_at=_at(1))
-    st.rebuild_from_journal(RUN_ID)
+    st.rebuild_from_events(RUN_ID)
     assert st.connection.in_transaction is False
 
     reader = store_db.open_db(repo)
@@ -4719,7 +4753,7 @@ def test_a_bound_store_commits_each_write_inside_its_fence(repo, stores):
         _save_checkpoint(st, "ef248597", reason="bogus", saved_at=_at(2))
     assert st.connection.in_transaction is False
     second = _save_checkpoint(st, "ef248597", saved_at=_at(3))
-    st.rebuild_from_journal(RUN_ID)
+    st.rebuild_from_events(RUN_ID)
     assert st.connection.in_transaction is False
 
     # Another connection sees every write: each fence committed its own work.
@@ -4762,7 +4796,7 @@ def test_a_bound_rebuild_that_fails_midway_leaves_the_projection_whole(repo, sto
         saboteur.close()
 
     with pytest.raises(sqlite3.IntegrityError):
-        st.rebuild_from_journal(RUN_ID)
+        st.rebuild_from_events(RUN_ID)
     assert st.connection.in_transaction is False
 
     reader = store_db.open_db(repo)
@@ -5096,7 +5130,7 @@ def test_a_rebuild_keeps_checkpoint_floors(repo):
         before = [line.seq for line in st.journal.read()]
         saved = _save_floored(st, "ef248597")
         after = [line.seq for line in st.journal.read()]
-        st.rebuild_from_journal(RUN_ID)
+        st.rebuild_from_events(RUN_ID)
         kept = st.latest_checkpoint("ef248597")
         floors = _count(st, "checkpoint_floors")
     finally:
@@ -5124,59 +5158,92 @@ def test_checkpoint_from_row_without_floor_columns_has_no_floor(repo):
     assert store_checkpoints._checkpoint_from_row(row).floor is None
 
 
-# -- replaying a journal for adoption (exactly-once Task 2.1) ----------------
+# -- replaying a run's events for adoption (exactly-once Task 2.1) -----------
 
 ADOPTING_RUN_ID = "run-2"
 
 
-def test_replay_journal_of_another_run_ignores_a_torn_tail(repo):
+def test_replay_events_of_another_run_reads_its_events_with_its_journal_file_gone(repo):
+    # Spec test 11: no row, no event, no file and no run directory is written.
     other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
     try:
         other.record_run(_run(repo, ADOPTING_RUN_ID))
         other.record_story(_story())
     finally:
         other.close()
-    torn = paths.run_dir(ADOPTING_RUN_ID) / store_journal.JOURNAL_NAME
-    with torn.open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 9')
+    shutil.rmtree(paths.data_dir() / "runs" / ADOPTING_RUN_ID)
 
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        replayed = st.replay_journal(ADOPTING_RUN_ID)
-
-        # The same bytes, now newline-terminated, are a finished line that is
-        # not JSON: that is corruption, not an append in flight.
-        with torn.open("a", encoding="utf-8") as handle:
-            handle.write("\n")
-        with pytest.raises(store_journal.CorruptJournalError) as excinfo:
-            st.replay_journal(ADOPTING_RUN_ID)
+        before = _all_rows(repo)
+        replayed = st.replay_events(ADOPTING_RUN_ID)
+        after = _all_rows(repo)
     finally:
         st.close()
 
     assert replayed.id == ADOPTING_RUN_ID
     assert [story.card_id for story in replayed.stories] == ["8831189b"]
-    assert ":3:" in str(excinfo.value)
+    assert after == before
+    assert not (paths.data_dir() / "runs" / ADOPTING_RUN_ID).exists()
 
 
-def test_replay_journal_of_its_own_run_never_ignores_a_torn_tail(repo):
-    # Review Focus 4: only another run, which may be live elsewhere, gets the
-    # benefit of the doubt. The own journal is this process's to write.
+def test_replay_events_of_a_run_with_no_events_raises(repo):
+    # Spec test 12.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        st.record_run(_run(repo))
-        with st.journal.path.open("a", encoding="utf-8") as handle:
-            handle.write('{"seq": 9')
-        with pytest.raises(store_journal.CorruptJournalError):
-            st.replay_journal(RUN_ID)
+        with pytest.raises(store_journal.JournalError) as caught:
+            st.replay_events("run-never-started")
     finally:
         st.close()
 
+    assert not isinstance(caught.value, store_journal.MissingJournalError)
+    assert "'run-never-started'" in str(caught.value)
+    assert "no events" in str(caught.value)
+    assert not (paths.data_dir() / "runs" / "run-never-started").exists()
 
-def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
+
+def test_replay_events_of_its_own_run_sees_a_record_that_just_returned(repo):
+    # Review Focus 5: the read connection sees the committed event at once.
+    st = store_writer.Store.open(repo, RUN_ID)
+    try:
+        st.record_run(_run(repo))
+        st.record_story(_story())
+        first = st.replay_events(RUN_ID)
+        st.record_subtask("8831189b", _subtask())
+        second = st.replay_events(RUN_ID)
+    finally:
+        st.close()
+
+    assert first.stories[0].subtasks == []
+    assert [subtask.card_id for subtask in second.stories[0].subtasks] == ["ef248597"]
+
+
+def test_replay_events_of_another_run_skips_an_event_of_another_kind_even_its_first(repo):
+    # Review Focus 2: card 1.2.7's lease and control events may come first.
+    _plant_event(repo, "lease_acquired", {"token": "t1"}, run_id=ADOPTING_RUN_ID)
+    other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
+    try:
+        other.record_run(_run(repo, ADOPTING_RUN_ID))
+        other.record_story(_story())
+    finally:
+        other.close()
+    _plant_event(repo, UNRECOGNISED_EVENT, {"anything": "at all"}, run_id=ADOPTING_RUN_ID)
+
+    st = store_writer.Store.open(repo, RUN_ID)
+    try:
+        replayed = st.replay_events(ADOPTING_RUN_ID)
+    finally:
+        st.close()
+
+    assert replayed.id == ADOPTING_RUN_ID
+    assert [story.card_id for story in replayed.stories] == ["8831189b"]
+
+
+def test_replay_events_of_its_own_run_returns_the_recorded_tree(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        replayed = st.replay_journal(RUN_ID)
+        replayed = st.replay_events(RUN_ID)
         loaded = st.load_run(RUN_ID)
     finally:
         st.close()
@@ -5184,47 +5251,14 @@ def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
     assert replayed == loaded
 
 
-def test_replay_journal_reads_under_the_journal_append_lock(repo, monkeypatch):
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        st.record_run(_run(repo))
-        st.record_story(_story())
-        real_scan = st.journal._scan
-        seen: list[bool] = []
-        writers: list[threading.Thread] = []
-
-        def interleaving_scan(**kwargs):
-            # A record_* started from another thread mid-scan must wait for
-            # the scan: if its line could land now, this scan would include it.
-            writer = threading.Thread(
-                target=st.record_subtask, args=("8831189b", _subtask())
-            )
-            writers.append(writer)
-            writer.start()
-            writer.join(timeout=0.2)
-            seen.append(writer.is_alive())
-            return real_scan(**kwargs)
-
-        monkeypatch.setattr(st.journal, "_scan", interleaving_scan)
-        replayed = st.replay_journal(RUN_ID)
-        writers[0].join()
-        after = store_replay.replay(store_journal.Journal(RUN_ID).read())
-    finally:
-        st.close()
-
-    assert seen == [True]
-    assert replayed.stories[0].subtasks == []
-    assert [subtask.card_id for subtask in after.stories[0].subtasks] == ["ef248597"]
-
-
-def test_replay_journal_writes_nothing(repo):
+def test_replay_events_writes_nothing(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
         before = st.journal.path.read_bytes()
         st.connection.execute("DELETE FROM attempts")
         st.connection.commit()
-        st.replay_journal(RUN_ID)
+        st.replay_events(RUN_ID)
         attempts = st.connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
         after = st.journal.path.read_bytes()
     finally:
@@ -5257,14 +5291,14 @@ def _unrecognised_line(seq: int, run_id: str = RUN_ID, **extra: object) -> dict:
     return record
 
 
-def test_replay_and_rebuild_of_its_own_run_skip_an_unrecognised_event(repo):
+def test_replay_and_rebuild_of_its_own_run_skip_an_event_of_another_kind(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         _record_full_run(st, repo)
-        before = st.replay_journal(RUN_ID)
-        _append_raw(st.journal, _unrecognised_line(st.journal.last_seq() + 1))
-        replayed = st.replay_journal(RUN_ID)
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        before = st.replay_events(RUN_ID)
+        _plant_event(repo, UNRECOGNISED_EVENT, {"anything": "at all"})
+        replayed = st.replay_events(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
         loaded = st.load_run(RUN_ID)
     finally:
         st.close()
@@ -5272,31 +5306,6 @@ def test_replay_and_rebuild_of_its_own_run_skip_an_unrecognised_event(repo):
     assert replayed == before
     assert rebuilt == before
     assert loaded == before
-
-
-def test_replay_journal_of_another_run_skips_an_unrecognised_event(repo):
-    other = store_writer.Store.open(repo, ADOPTING_RUN_ID)
-    try:
-        other.record_run(_run(repo, ADOPTING_RUN_ID))
-        other.record_story(_story())
-        next_seq = other.journal.last_seq() + 1
-    finally:
-        other.close()
-
-    st = store_writer.Store.open(repo, RUN_ID)
-    try:
-        before = st.replay_journal(ADOPTING_RUN_ID)
-        path = paths.run_dir(ADOPTING_RUN_ID) / store_journal.JOURNAL_NAME
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_unrecognised_line(next_seq, ADOPTING_RUN_ID)) + "\n")
-            handle.write('{"seq": 99')
-        after = st.replay_journal(ADOPTING_RUN_ID)
-    finally:
-        st.close()
-
-    assert after == before
-    assert after.id == ADOPTING_RUN_ID
-    assert [story.card_id for story in after.stories] == ["8831189b"]
 
 
 def test_a_resumed_store_numbers_its_next_record_from_the_events_table(repo):
@@ -5739,10 +5748,10 @@ def _raw_sql(repo: Path, sql: str, params: tuple = ()) -> None:
 
 
 def _diverging_now(repo: Path) -> list[store_replay.Mismatch]:
-    """Load the journal and the projection the way a caller would, and compare."""
-    lines = store_journal.Journal(RUN_ID).read()
+    """Load the run's events and the projection the way a caller would, and compare."""
     conn = store_db.open_db(repo)
     try:
+        lines = store_events.run_lines(conn, RUN_ID)
         projection = store_queries.load_run(conn, RUN_ID)
     finally:
         conn.close()
@@ -5838,10 +5847,10 @@ def test_rebuild_over_a_legacy_journal_writes_canceled_rows_and_still_agrees(rep
         st.close()
     journal_before = store_journal.Journal(RUN_ID).path.read_bytes()
 
-    _truncate_db(repo)
+    _wipe_tree_rows(repo)
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt.rebuild_from_journal(RUN_ID)
+        rebuilt.rebuild_from_events(RUN_ID)
     finally:
         rebuilt.close()
 
@@ -5968,12 +5977,15 @@ def test_diverging_mutates_neither_its_lines_nor_its_projection(repo):
     assert projection == projection_before
 
 
-def test_diverging_reports_a_journal_line_whose_row_never_landed_as_stale_shape(repo):
-    # A story line in the journal file with no row behind it.
+def test_diverging_reports_an_event_whose_row_never_landed_as_stale_shape(repo):
+    # A story event with no row behind it.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
-    _journal_a_story_whose_row_never_landed(st)
     st.close()
+    _plant_event(
+        repo, "story_upsert", _story().model_dump(mode="json", exclude={"subtasks"}),
+        story="8831189b",
+    )
 
     assert _diverging_now(repo) == [
         store_replay.Mismatch(
@@ -6079,9 +6091,9 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
     ]
 
 
-# -- rebuild_from_journal's foreign-value rail (journal/DB divergence §3.6) ---
+# -- rebuild_from_events's foreign-value rail (journal/DB divergence §3.6) ---
 #
-# Unit tier: real sqlite and journal files under tmp_path, no subprocess.
+# Unit tier: real sqlite under tmp_path, no subprocess.
 
 
 def _all_rows(repo: Path) -> dict[str, list[tuple]]:
@@ -6134,7 +6146,7 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
         assert _writer_serves(st)
         assert st.connection.in_transaction is False
     finally:
@@ -6157,6 +6169,8 @@ def test_rebuild_refuses_a_hand_edited_run_status_and_touches_no_row(repo):
     assert RUN_ID in message
     assert "run status: journal 'escalated', projection 'canceled'" in message
     assert "force=True" in message
+    assert "holds values its events never recorded" in message
+    assert "rebuild_from_events(..., force=True)" in message
     assert _projected_run_status(repo) == "canceled"
     assert _all_rows(repo) == before
 
@@ -6166,7 +6180,7 @@ def test_rebuild_with_force_overwrites_a_hand_edited_run_status(repo):
 
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+        rebuilt = st.rebuild_from_events(RUN_ID, force=True)
         loaded = st.load_run(RUN_ID)
         kept = st.latest_checkpoint("ef248597")
     finally:
@@ -6198,7 +6212,7 @@ def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
 
@@ -6232,7 +6246,7 @@ def test_rebuild_still_repairs_a_status_set_back_to_an_earlier_journaled_value(r
 
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        rebuilt = st.rebuild_from_journal(RUN_ID)
+        rebuilt = st.rebuild_from_events(RUN_ID)
         loaded = st.load_run(RUN_ID)
     finally:
         st.close()
@@ -6256,7 +6270,7 @@ def test_rebuild_refusal_names_only_the_foreign_mismatches(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(store_replay.ProjectionDivergedError) as caught:
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
     finally:
         st.close()
 
@@ -6283,7 +6297,7 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
     _raw_sql(repo, "UPDATE runs SET status = 'cancelled' WHERE id = ?", (RUN_ID,))
 
     with pytest.raises(store_replay.ProjectionDivergedError):
-        st.rebuild_from_journal(RUN_ID)
+        st.rebuild_from_events(RUN_ID)
 
     assert st.connection.in_transaction is False
     assert _writer_serves(st)
@@ -6292,23 +6306,24 @@ def test_a_bound_store_refusing_a_rebuild_leaves_no_transaction_open_and_keeps_i
     assert store_queries.run_status(st.connection, RUN_ID) == "canceled"
 
 
-def test_a_corrupt_journal_raises_before_the_foreign_value_check(repo):
+def test_an_event_payload_that_is_not_json_raises_before_the_foreign_value_check(repo):
+    # Spec test 9: a hand `INSERT` the triggers cannot stop.
     _hand_cancel_an_escalated_run(repo)
+    run_seq = _plant_raw_payload(repo, "story_upsert", "{not json at all")
+    before = _all_rows(repo)
 
-    # Open first: `Store.open` scans the journal (`Journal.__init__` ->
-    # `last_seq`), so the line is corrupted afterwards to reach the rebuild.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
-        with store_journal.Journal(RUN_ID).path.open("a", encoding="utf-8") as handle:
-            handle.write("{not json at all\n")
-        before = _all_rows(repo)
-
-        with pytest.raises(store_journal.CorruptJournalError):
-            st.rebuild_from_journal(RUN_ID)
+        with pytest.raises(store_journal.JournalError) as caught:
+            st.rebuild_from_events(RUN_ID)
         assert st.connection.in_transaction is False
+        assert _writer_serves(st)
     finally:
         st.close()
 
+    message = str(caught.value)
+    assert repr(RUN_ID) in message
+    assert f"run_seq {run_seq}" in message
     assert _all_rows(repo) == before
 
 
@@ -6326,9 +6341,9 @@ def test_rebuild_of_an_unloadable_projection_refuses_and_force_repairs_it(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         with pytest.raises(ValidationError):
-            st.rebuild_from_journal(RUN_ID)
+            st.rebuild_from_events(RUN_ID)
         assert _all_rows(repo) == before
-        rebuilt = st.rebuild_from_journal(RUN_ID, force=True)
+        rebuilt = st.rebuild_from_events(RUN_ID, force=True)
     finally:
         st.close()
 

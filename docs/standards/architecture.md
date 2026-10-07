@@ -206,7 +206,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 ### 6.4 What stays in one piece
 
-- **`Store`** keeps every write method, together with its writer thread and job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_journal`. Each write is one job on the writer thread, one `BEGIN IMMEDIATE` transaction under the fence; heartbeat writes waiting together share one transaction, each in its own savepoint; each `record_*` job covers both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`).
+- **`Store`** keeps every write method, together with its writer thread and job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_events`. Each write is one job on the writer thread, one `BEGIN IMMEDIATE` transaction under the fence; heartbeat writes waiting together share one transaction, each in its own savepoint; each `record_*` job covers both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`).
 - **`lane` and `StoryRecorder`.** The order in which story and subtask rows are recorded, and the escalation path through `stop.trigger`, form one state machine.
 - **`supervise`, `run_until_killed` and `build_dag_tree`.** These own the grafo executor's lifetime and the workarounds for its hangs.
 - **`control.Lease`** with its heartbeat, its watcher and `run_lease`. Token binding into `Store` happens here.

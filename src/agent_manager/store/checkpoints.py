@@ -15,7 +15,7 @@ class TurnFloor:
     """The turn identity saved beside an agent-phase checkpoint (exactly-once 1.1).
 
     One row of `checkpoint_floors`, keyed like its `checkpoints` row. Row-only
-    and outside the journal: nothing journals it and `rebuild_from_journal`
+    and outside the journal: nothing journals it and `rebuild_from_events`
     leaves it alone. Computing it is the runtime's job, not the store's.
     """
 
@@ -30,7 +30,7 @@ class Checkpoint:
     """One saved turn of a subtask's agent: a row of `checkpoints` (pygents spec §6).
 
     Internal state, so a plain dataclass rather than a pydantic model. It is not
-    part of the §9 tree: no journal line records it and `rebuild_from_journal`
+    part of the §9 tree: no journal line records it and `rebuild_from_events`
     neither writes nor deletes it. `agent` is the decoded JSON of the stored
     text, never the dict the caller handed in.
     """

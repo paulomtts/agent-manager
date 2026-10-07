@@ -38,6 +38,15 @@ def _text(value: Path | None) -> str | None:
 _log = logging.getLogger(__name__)
 
 
+def _node_lines(conn: sqlite3.Connection, run_id: str) -> list[store_journal.JournalLine]:
+    """`store_events.run_lines` of `run_id` on `conn`, refusing a run that has
+    none with `JournalError` naming it."""
+    lines = store_events.run_lines(conn, run_id)
+    if not lines:
+        raise store_journal.JournalError(f"run {run_id!r} has no events to replay")
+    return lines
+
+
 T = TypeVar("T")
 
 _CLOSED = "Cannot operate on a closed database."
@@ -91,7 +100,7 @@ class Store:
     `board_comments` (board-comments B6): the six row-only tables, which have
     no journal and are the projection's alone. Every row this store writes
     carries its `project_id`. Their methods write rows and never touch the
-    journal, and `rebuild_from_journal` leaves those rows alone.
+    journal, and `rebuild_from_events` leaves those rows alone.
 
     The threads of the process holding a run's lease share one `Store`. Every
     write is one job on the store's single writer thread, run in the order it
@@ -808,7 +817,7 @@ class Store:
     # -- board comment outbox ------------------------------------------------
     #
     # A row-only table outside the journal (board-comments B6, B9): nothing
-    # here calls `self._journal`, and `rebuild_from_journal` leaves the rows
+    # here calls `self._journal`, and `rebuild_from_events` leaves the rows
     # alone. Every writer is one fenced job, like `save_checkpoint`. Posting
     # to the board is not this module's job: `comments.py` drains the outbox
     # through `board.py`.
@@ -893,7 +902,7 @@ class Store:
     # -- leases, claims and control requests -----------------------------------
     #
     # Row-only tables outside the journal (live control C2, multi-process X5):
-    # nothing here calls `self._journal`, and `rebuild_from_journal` leaves the
+    # nothing here calls `self._journal`, and `rebuild_from_events` leaves the
     # rows alone. `take_lease` is the only check-and-set; every other method
     # touches only the rows whose token matches, and any other token is a
     # silent no-op.
@@ -1033,35 +1042,34 @@ class Store:
 
     # -- rebuild -------------------------------------------------------------
 
-    def rebuild_from_journal(self, run_id: str, *, force: bool = False) -> models.Run:
-        """Replace this run's projection with what its journal says (D5).
+    def rebuild_from_events(self, run_id: str, *, force: bool = False) -> models.Run:
+        """Replace this run's projection with what its events say (D5).
 
-        The journal wins: every row of the run's §9 tree (`runs`, `stories`,
+        The events win: every row of the run's §9 tree (`runs`, `stories`,
         `subtasks`, `phases`, `attempts`) for `run_id` is deleted and rewritten
-        from the replayed tree, so the result is the same whether the projection
-        was stale, truncated or already correct. The six row-only tables
-        (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`,
-        `run_claims`, `board_comments`) have no journal and are left alone.
+        from the tree `store_replay.replay` folds from `store_events.run_lines`,
+        so the result is the same whether the projection was stale, truncated
+        or already correct. The six row-only tables (`checkpoints`,
+        `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`,
+        `board_comments`) have no events and are left alone. No journal file
+        is opened. A run with no node event raises `JournalError` naming it.
 
         The exception (journal/DB divergence §3.6): a projection holding a value
-        no journal line ever recorded for that node, a `foreign` mismatch in
+        no event ever recorded for that node, a `foreign` mismatch in
         `diverging`'s terms, is refused with `ProjectionDivergedError` before
         any row is touched, unless `force=True`. The check compares the same
-        journal lines the rebuild replays. `stale` mismatches never refuse, and
-        a projection with no `runs` row for `run_id` has nothing foreign in it.
+        lines the rebuild replays. `stale` mismatches never refuse, and a
+        projection with no `runs` row for `run_id` has nothing foreign in it.
 
-        The journal read, the divergence check, the delete and every rewrite
-        are one fenced job, one transaction, whether or not a token is bound:
-        no `record_*` lands between the delete and the rewrite, a raise
-        anywhere leaves every row as it was, and a store that lost its lease
-        touches no row.
+        The events read, the divergence check, the delete and every rewrite
+        are one fenced job, one transaction on the job's connection, whether
+        or not a token is bound: no `record_*` lands between the delete and
+        the rewrite, a raise anywhere leaves every row as it was, and a store
+        that lost its lease touches no row.
         """
 
         def job(conn: sqlite3.Connection) -> models.Run:
-            journal = (
-                self._journal if self._journal.run_id == run_id else store_journal.Journal(run_id)
-            )
-            lines = journal.read()
+            lines = _node_lines(conn, run_id)
             run = store_replay.replay(lines)
             if run.id != run_id:
                 raise store_journal.JournalError(
@@ -1097,22 +1105,18 @@ class Store:
                             )
             return run
 
-        return self._submit(job, operation="rebuild_from_journal", fenced=True)
+        return self._submit(job, operation="rebuild_from_events", fenced=True)
 
-    def replay_journal(self, run_id: str) -> models.Run:
-        """The §9 tree `run_id`'s journal records, without touching any row.
+    def replay_events(self, run_id: str) -> models.Run:
+        """The §9 tree `run_id`'s events record, without writing anything.
 
         Adoption reads attempts here and never from the `attempts` projection.
-        Takes no store lock: `Journal.read` holds this run's journal append
-        lock across its scan, so it never meets half a line this store is
-        appending. Another run's journal may be live in another process, so
-        only there is a torn final line ignored.
+        Any run's events, this store's own or another's, read on the read
+        connection: only committed events are seen, and no journal file is
+        opened. A run with no node event raises `JournalError` naming it;
+        `run_lines`' and `replay`'s own errors propagate unchanged.
         """
-        if run_id == self.run_id:
-            lines = self._journal.read()
-        else:
-            lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
-        return store_replay.replay(lines)
+        return store_replay.replay(self._read(lambda conn: _node_lines(conn, run_id)))
 
     def _delete_run(self, conn: sqlite3.Connection, run_id: str) -> None:
         conn.execute("DELETE FROM attempts WHERE run_id = ?", (run_id,))

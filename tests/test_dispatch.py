@@ -27,6 +27,9 @@ from agent_manager import (
     prompt,
     results,
 )
+from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
+from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 from agent_manager.errors import AgentPhaseFailed
 from agent_manager.runtime.errors import EngineError
@@ -2147,6 +2150,43 @@ def _declines(runner) -> list[str]:
     return [warning for warning in runner.warnings if "was not reused" in warning]
 
 
+def _plant_event(root: Path, run_id: str, kind: str, payload: dict, **coordinates) -> None:
+    """One `events` row of `run_id` written behind the store's back: no row and
+    no journal line record it. `coordinates` are `store_events.insert`'s
+    `story_id`, `card_id`, `phase` and `attempt`."""
+    conn = store_db.open_db(root)
+    try:
+        with store_db.immediate(conn):
+            store_events.insert(
+                conn,
+                project_id=store_projects.lookup(conn, root),
+                run_id=run_id,
+                ts="2026-10-01T00:00:00+00:00",
+                kind=kind,
+                payload=payload,
+                source="live",
+                **coordinates,
+            )
+    finally:
+        conn.close()
+
+
+def _plant_raw_payload(root: Path, run_id: str, kind: str, text: str) -> None:
+    """An `events` row of `run_id` whose `payload` column is `text` verbatim,
+    which `store_events.insert` (it serialises) cannot write."""
+    conn = store_db.open_db(root)
+    try:
+        with store_db.immediate(conn):
+            conn.execute(
+                "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+                " VALUES (?, ?, (SELECT COALESCE(MAX(run_seq), 0) + 1 FROM events"
+                " WHERE run_id = ?), '2026-10-01T00:00:00+00:00', ?, ?, 'live')",
+                (store_projects.lookup(conn, root), run_id, run_id, kind, text),
+            )
+    finally:
+        conn.close()
+
+
 def _seed(opened, run_id: str = RUN_ID, story_id: str = STORY_ID) -> None:
     """The run, story and subtask lines `replay` needs above any phase line."""
     opened.record_run(
@@ -2403,7 +2443,8 @@ def test_the_highest_ok_attempt_above_the_floor_is_adopted(store, tmp_path, work
     assert len(launcher.calls) == 2
 
 
-def test_a_missing_source_journal_declines(store, tmp_path, worktree):
+def test_a_source_run_with_no_events_declines(store, tmp_path, worktree):
+    # Spec test 13.
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
     lines = len(store.journal.read())
 
@@ -2412,8 +2453,9 @@ def test_a_missing_source_journal_declines(store, tmp_path, worktree):
     [warning] = _declines(runner)
     assert warning.startswith(
         "phase 'explore': attempt ? of run never-ran was not reused ("
-        "its journal cannot be read: MissingJournalError: "
+        "its events cannot be read: JournalError: "
     )
+    assert "no events" in warning
     assert warning.endswith("); dispatching again")
     assert len(store.journal.read()) == lines
     assert len(launcher.calls) == 1
@@ -2435,25 +2477,38 @@ def test_a_phase_without_a_result_model_adopts_none(store, tmp_path, worktree):
     assert len(launcher.calls) == 1
 
 
-def test_a_source_journal_that_fails_validation_declines(store, tmp_path, worktree):
+def test_a_source_event_that_fails_validation_declines(store, tmp_path, worktree):
+    # Spec test 14.
     runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
     lines = len(store.journal.read())
-    broken = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
-    try:
-        # Valid JSON, but no `models.Run`: replay raises pydantic's
-        # ValidationError, which is a decline, never an exception out of resume.
-        broken.journal.append("run_upsert", {"not": "a run"})
-    finally:
-        broken.close()
+    # Valid JSON, but no `models.Run`: replay raises pydantic's
+    # ValidationError, which is a decline, never an exception out of resume.
+    _plant_event(tmp_path / "repo", OTHER_RUN_ID, "run_upsert", {"not": "a run"})
 
     assert runner.adopt(phase, _context(worktree), source_run=OTHER_RUN_ID, floor=0) is None
 
     [warning] = _declines(runner)
     assert warning.startswith(
         f"phase 'explore': attempt ? of run {OTHER_RUN_ID} was not reused ("
-        "its journal cannot be read: ValidationError"
+        "its events cannot be read: ValidationError"
     )
     assert len(store.journal.read()) == lines
+    assert len(launcher.calls) == 1
+
+
+def test_a_source_event_whose_payload_is_not_json_declines(store, tmp_path, worktree):
+    # Review Focus 1: a hand INSERT never crashes a resume.
+    runner, launcher, phase = _succeed_once(store, tmp_path, worktree)
+    _plant_raw_payload(tmp_path / "repo", OTHER_RUN_ID, "run_upsert", "{not json")
+
+    assert runner.adopt(phase, _context(worktree), source_run=OTHER_RUN_ID, floor=0) is None
+
+    [warning] = _declines(runner)
+    assert warning.startswith(
+        f"phase 'explore': attempt ? of run {OTHER_RUN_ID} was not reused ("
+        "its events cannot be read: JournalError: "
+    )
+    assert "not JSON" in warning
     assert len(launcher.calls) == 1
 
 
@@ -2466,11 +2521,13 @@ def test_a_source_run_whose_ok_attempt_carries_retired_usage_keys_is_still_adopt
     # without the replay shim every old run would quietly redispatch.
     _succeed_once(store, tmp_path, worktree)
     [ok] = _terminal_attempts(store)
-    store.journal.append(
+    _plant_event(
+        tmp_path / "repo",
+        RUN_ID,
         "attempt_upsert",
         {**ok, **dict.fromkeys(_USAGE_KEYS)},
-        story=STORY_ID,
-        card=CARD,
+        story_id=STORY_ID,
+        card_id=CARD,
         phase="explore",
         attempt=1,
     )
@@ -2492,7 +2549,7 @@ def test_a_source_run_whose_ok_attempt_carries_retired_usage_keys_is_still_adopt
 
 def test_an_adopted_phase_keeps_the_recorded_start(store, tmp_path, worktree):
     _succeed_once(store, tmp_path, worktree)
-    recorded = store.replay_journal(RUN_ID).stories[0].subtasks[0].phases[0]
+    recorded = store.replay_events(RUN_ID).stories[0].subtasks[0].phases[0]
     later = recorded.started_at + timedelta(days=1)
     other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)
     try:

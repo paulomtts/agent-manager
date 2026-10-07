@@ -11676,7 +11676,7 @@ def test_reset_records_a_stopped_run_canceled_through_one_journal_line(
     assert _lease(projection) is None
     rebuilt = store_writer.Store.open(cli.resolve_repo_dir(projection), CONTROL_RUN_ID)
     try:
-        assert rebuilt.rebuild_from_journal(CONTROL_RUN_ID).status == "canceled"
+        assert rebuilt.rebuild_from_events(CONTROL_RUN_ID).status == "canceled"
     finally:
         rebuilt.close()
 

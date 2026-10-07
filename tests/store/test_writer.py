@@ -331,7 +331,7 @@ def test_every_row_the_store_writes_carries_its_project_id(repo):
             token="t1", pid=1, host="h", now=NOW, is_live=lambda row: False, claims=["card:card-a"]
         )
         written = {table: _project_ids(st.connection, table) for table in _STORE_WRITTEN_TABLES}
-        st.rebuild_from_journal(RUN_A)
+        st.rebuild_from_events(RUN_A)
         rebuilt = {table: _project_ids(st.connection, table) for table in _TREE_TABLES}
         project_id = st.project_id
     finally:
@@ -1945,7 +1945,7 @@ def test_a_lost_lease_writes_no_line_no_event_and_no_row(repo):
     assert stories == 0
 
 
-def test_rebuild_from_journal_is_one_transaction_without_a_token(repo, monkeypatch):
+def test_rebuild_from_events_is_one_transaction_without_a_token(repo, monkeypatch):
     st = store_writer.Store.open(repo, RUN_A)
     try:
         _record_tree(st, repo)
@@ -1956,7 +1956,7 @@ def test_rebuild_from_journal_is_one_transaction_without_a_token(repo, monkeypat
 
         monkeypatch.setattr(st, "_write_story_row", exploding)
         with pytest.raises(RuntimeError, match="after the delete"):
-            st.rebuild_from_journal(RUN_A)
+            st.rebuild_from_events(RUN_A)
         after = store_queries.load_run(st.connection, RUN_A)
     finally:
         st.close()

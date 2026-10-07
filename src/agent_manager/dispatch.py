@@ -626,7 +626,7 @@ class AgentRunner:
     ) -> Adopted | None:
         """Reuse `source_run`'s recorded `ok` attempt instead of dispatching.
 
-        Attempts are read from the source run's journal, never from the
+        Attempts are read from the source run's events, never from the
         `attempts` projection, and only attempts numbered above `floor` with
         status `ok` qualify: an orphaned `started` one, even with a valid
         file on disk, never does. The highest such attempt's result file is
@@ -637,11 +637,11 @@ class AgentRunner:
         """
         model = self._result_model(phase)
         try:
-            run = self.store.replay_journal(source_run)
+            run = self.store.replay_events(source_run)
         except (JournalError, ValidationError) as error:
             return self._decline(
                 phase, None, source_run,
-                f"its journal cannot be read: {walk._render_error(error)}",
+                f"its events cannot be read: {walk._render_error(error)}",
             )
         found = _recorded_phase(run, self.card_id, phase.name)
         if found is None:
@@ -686,7 +686,7 @@ class AgentRunner:
     ) -> None:
         """Warn that a recorded attempt is not reused; write nothing.
 
-        `n` is `None` when the journal could not be read, before any attempt
+        `n` is `None` when the events could not be read, before any attempt
         was found; the number is then shown as `?`.
         """
         shown = "?" if n is None else n

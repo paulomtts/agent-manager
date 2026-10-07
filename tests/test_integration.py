@@ -581,7 +581,7 @@ def test_a_conflict_resolves_the_same_way_on_the_pygents_engine(
     assert subtask.base_branch == BASE
     assert subtask.worktree_path == repo.worktree
     assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
-    rebuilt = store.rebuild_from_journal(RUN_ID)
+    rebuilt = store.rebuild_from_events(RUN_ID)
     assert [s.card_id for s in rebuilt.stories] == ["integrate"]
     assert [(s.card_id, s.status) for s in rebuilt.stories[0].subtasks] == [(STORY_B, "done")]
     assert [p.name for p in rebuilt.stories[0].subtasks[0].phases] == ["resolve", "verify"]

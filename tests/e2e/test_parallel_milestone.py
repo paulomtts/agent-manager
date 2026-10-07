@@ -202,7 +202,7 @@ def test_the_journal_of_a_two_lane_run_is_contiguous_and_rebuilds_the_projection
     st = store_writer.Store.open(cli.resolve_repo_dir(root), run_id)
     try:
         projection = st.load_run(run_id)
-        rebuilt = st.rebuild_from_journal(run_id)
+        rebuilt = st.rebuild_from_events(run_id)
         after = st.load_run(run_id)
     finally:
         st.close()
