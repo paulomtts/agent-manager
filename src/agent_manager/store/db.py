@@ -9,6 +9,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from agent_manager import paths
 
@@ -182,6 +183,12 @@ MIGRATED_KEY = "migrated_at"
 """The `meta` key `am migrate` writes once its merge has committed; the value
 is that commit's ISO time. Its presence is what lets the store open on a
 machine that still has per-project databases."""
+
+STORE_ID_KEY = "store_id"
+"""The `meta` key holding this database's identity: a random 32-character
+lowercase hex id that `open_db` inserts when the row is missing and never
+changes afterwards. A replaced or restored-from-elsewhere `am.db` therefore
+carries a different value."""
 
 
 class StoreSchemaError(RuntimeError):
@@ -360,6 +367,9 @@ def open_db(root: Path) -> sqlite3.Connection:
     leaving the file as it was. A lower value (0 on a new or unstamped file)
     is set to `SCHEMA_VERSION` after the schema and columns are applied.
 
+    A missing `STORE_ID_KEY` row in `meta` is inserted with a fresh random id
+    and committed with the schema; an existing one is never changed.
+
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
     behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
@@ -382,6 +392,10 @@ def open_db(root: Path) -> sqlite3.Connection:
         _enable_wal(conn)
         conn.executescript(_SCHEMA)
         _add_missing_columns(conn)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+            (STORE_ID_KEY, uuid4().hex),
+        )
         if found < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
@@ -389,6 +403,20 @@ def open_db(root: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def store_id(conn: sqlite3.Connection) -> str | None:
+    """This database's `STORE_ID_KEY` value from `meta`, or `None` when there is
+    no such row.
+
+    `None` only on an `open_db_for_reading` connection no `open_db` has touched:
+    the in-memory empty projection, or an existing current-schema file not yet
+    back-filled. Never writes, commits or mints; any row factory works.
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (STORE_ID_KEY,)
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 def _table_columns(conn: sqlite3.Connection) -> dict[str, set[str]]:

@@ -157,6 +157,8 @@ _DB_NAMES = (
     "_enable_wal",
     "SCHEMA_VERSION",
     "MIGRATED_KEY",
+    "STORE_ID_KEY",
+    "store_id",
     "StoreSchemaError",
     "MigrationRequiredError",
     "_refuse_unmigrated",
@@ -179,12 +181,13 @@ def _hold_fresh_db_reserved() -> sqlite3.Connection:
 
 
 def test_db_is_a_leaf_module_of_the_store_package():
-    for function in (db.open_db, db.immediate, db.open_db_for_reading):
+    for function in (db.open_db, db.immediate, db.open_db_for_reading, db.store_id):
         assert callable(function)
         assert function.__module__ == "agent_manager.store.db"
     assert db.BUSY_TIMEOUT_SECONDS == 30.0
     assert db.SCHEMA_VERSION == 1
     assert db.MIGRATED_KEY == "migrated_at"
+    assert db.STORE_ID_KEY == "store_id"
     assert db.StoreSchemaError.__module__ == "agent_manager.store.db"
     assert issubclass(db.StoreSchemaError, RuntimeError)
     assert db.MigrationRequiredError.__module__ == "agent_manager.store.db"
@@ -693,6 +696,209 @@ def test_open_db_creates_the_meta_table(repo):
     assert (by_name["value"]["type"], by_name["value"]["notnull"]) == ("TEXT", 1)
 
 
+_HEX_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _store_id_rows(path: Path) -> list[str]:
+    """Every `meta` value stored under `STORE_ID_KEY`, read on a fresh connection."""
+    conn = sqlite3.connect(path)
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (db.STORE_ID_KEY,)
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _write_stamped_db_without_a_store_id(path: Path) -> None:
+    """A current-schema `am.db` at `SCHEMA_VERSION`, as 1.1.3 left it: no
+    `store_id` row, rollback-journal mode, no sidecars."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    try:
+        built.executescript(db._SCHEMA)
+        built.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION}")
+        built.commit()
+    finally:
+        built.close()
+
+
+def _read_store_id(opener) -> str | None:
+    conn = opener(paths.data_path())
+    try:
+        return db.store_id(conn)
+    finally:
+        conn.close()
+
+
+def test_open_db_mints_a_store_id(repo):
+    conn = db.open_db(repo)
+    try:
+        minted = db.store_id(conn)
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+    assert minted is not None
+    assert _HEX_ID.fullmatch(minted)
+    assert _store_id_rows(paths.db_path()) == [minted]
+
+
+def test_store_id_is_stable_across_reopen(repo):
+    first = _read_store_id(db.open_db)
+    second = _read_store_id(db.open_db)
+    third = _read_store_id(db.open_db)
+
+    assert first is not None
+    assert first == second == third
+    assert _store_id_rows(paths.db_path()) == [first]
+
+
+def test_store_id_differs_across_fresh_databases(repo, tmp_path, monkeypatch):
+    first_path = paths.db_path()
+    first = _read_store_id(db.open_db)
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "other"))
+    second_path = paths.db_path()
+    second = _read_store_id(db.open_db)
+
+    assert first_path != second_path
+    assert first_path.is_file() and second_path.is_file()
+    assert first is not None and second is not None
+    assert first != second
+
+
+def test_racing_first_opens_agree_on_one_store_id(repo):
+    racers = 4
+    barrier = threading.Barrier(racers)
+    lock = threading.Lock()
+    seen: list[str | None] = []
+    errors: list[BaseException] = []
+
+    def first_open() -> None:
+        try:
+            barrier.wait(timeout=10)
+            conn = db.open_db(repo)
+            try:
+                value = db.store_id(conn)
+            finally:
+                conn.close()
+            with lock:
+                seen.append(value)
+        except BaseException as error:  # surfaced by the assertion below
+            with lock:
+                errors.append(error)
+
+    assert not paths.db_path().exists()
+    threads = [threading.Thread(target=first_open) for _ in range(racers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert len(seen) == racers
+    assert len(set(seen)) == 1
+    assert seen[0] is not None
+    assert _store_id_rows(paths.db_path()) == [seen[0]]
+
+
+def test_open_db_backfills_a_store_id_into_a_stamped_db_without_one(repo):
+    path = paths.db_path()
+    _write_stamped_db_without_a_store_id(path)
+    assert _store_id_rows(path) == []
+
+    minted = _read_store_id(db.open_db)
+
+    assert minted is not None
+    assert _HEX_ID.fullmatch(minted)
+    assert _store_id_rows(path) == [minted]
+    assert _user_version(path) == db.SCHEMA_VERSION == 1
+
+
+def test_store_id_is_none_on_an_in_memory_read_projection(repo):
+    assert not paths.data_path().exists()
+
+    assert _read_store_id(db.open_db_for_reading) is None
+
+    assert not paths.data_path().exists()
+
+
+def test_open_db_for_reading_reads_the_store_id_open_db_minted(repo):
+    minted = _read_store_id(db.open_db)
+
+    assert _read_store_id(db.open_db_for_reading) == minted
+
+
+def test_open_db_for_reading_does_not_mint_into_an_existing_db(repo):
+    path = paths.db_path()
+    _write_stamped_db_without_a_store_id(path)
+    before = _data_tree()
+
+    assert _read_store_id(db.open_db_for_reading) is None
+
+    assert _data_tree() == before
+    assert _store_id_rows(path) == []
+
+
+def test_store_id_reads_the_same_with_a_tuple_row_factory(repo):
+    conn = db.open_db(repo)
+    try:
+        with_rows = db.store_id(conn)
+        conn.row_factory = None
+        with_tuples = db.store_id(conn)
+    finally:
+        conn.close()
+
+    assert with_rows is not None
+    assert with_tuples == with_rows
+
+
+def test_open_db_for_reading_mints_when_it_falls_through_to_open_db(repo):
+    # An unstamped file is "an older schema": open_db_for_reading hands it to
+    # open_db, which stamps it and mints in the same pass.
+    path = paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    built.executescript(db._SCHEMA)
+    built.commit()
+    built.close()
+    assert _user_version(path) == 0
+
+    read = _read_store_id(db.open_db_for_reading)
+
+    assert read is not None
+    assert _store_id_rows(path) == [read]
+    assert _user_version(path) == db.SCHEMA_VERSION
+
+
+def test_open_db_never_changes_an_existing_store_id(repo):
+    path = paths.db_path()
+    _write_stamped_db_without_a_store_id(path)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?)", (db.STORE_ID_KEY, "kept-as-is")
+    )
+    conn.commit()
+    conn.close()
+
+    assert _read_store_id(db.open_db) == "kept-as-is"
+    assert _read_store_id(db.open_db) == "kept-as-is"
+    assert _store_id_rows(path) == ["kept-as-is"]
+
+
+def test_the_minted_store_id_is_committed_before_open_db_returns(repo):
+    conn = db.open_db(repo)
+    try:
+        assert not conn.in_transaction
+        assert _store_id_rows(paths.db_path()) == [db.store_id(conn)]
+    finally:
+        conn.close()
+
+
 def test_open_db_for_reading_stamps_an_unstamped_db_and_reads_its_rows(repo):
     # Review Focus 3: the current tables at user_version 0 fall through to
     # `open_db`, which stamps the file; the rows are still read.
@@ -801,6 +1007,24 @@ def test_legacy_dbs_and_the_marker_open_normally(repo, opener):
         conn.close()
     assert marker == _STAMP
     assert legacy.read_bytes() == b"legacy bytes"
+
+
+def test_the_migrated_marker_and_the_store_id_coexist(repo):
+    minted = _read_store_id(db.open_db)
+    _mark_migrated(paths.db_path())
+    _leave_legacy()
+
+    conn = db.open_db(repo)
+    try:
+        again = db.store_id(conn)
+        marker = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (db.MIGRATED_KEY,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert again == minted
+    assert marker == _STAMP
 
 
 def test_lock_files_sidecars_and_directories_under_projects_never_refuse(repo):
