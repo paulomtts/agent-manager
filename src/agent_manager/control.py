@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
@@ -26,6 +25,7 @@ from typing import NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from agent_manager.runtime.stop import Command, StopSignal
+from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
 from agent_manager.store.writer import Store
 
@@ -208,8 +208,8 @@ class Lease:
         while not self._stopped.wait(self._heartbeat):
             try:
                 self.beat()
-            except sqlite3.OperationalError:
-                # A second process holds the database; the next beat retries.
+            except store_db.StoreBusyError:
+                # The write's retry budget ran out; the next beat tries again.
                 continue
 
 
@@ -243,13 +243,13 @@ async def watch(
 ) -> NoReturn:
     """Apply this lease's requests every `interval` seconds, forever.
 
-    A `sqlite3.OperationalError` (a second process holding the database) is
-    swallowed and retried on the next tick; any other error ends the watcher.
+    A `StoreBusyError` (the write's retry budget ran out) is swallowed and
+    retried on the next tick; any other error ends the watcher.
     """
     while True:
         try:
             apply_pending(store, stop, token, clock=clock)
-        except sqlite3.OperationalError:
+        except store_db.StoreBusyError:
             pass
         await asyncio.sleep(interval)
 

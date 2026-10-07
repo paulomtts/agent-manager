@@ -124,7 +124,7 @@ All 59 `.py` files (52 modules plus 7 `__init__.py`) appear here exactly once. `
 | 5.1 | `runtime/{checkpoint,compile,context,engine}.py` | `import pygents` | holds |
 | 5.2 | `milestone/schedule.py` (today `orchestrate.py`) | `import grafo` | holds (`orchestrate.py:59`) |
 | 5.3 | `cli/` | `import typer` | holds (`cli.py:34`) |
-| 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129`, `control.py:20,210,251` |
+| 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129` |
 | 5.5 | `board.py` | builds or runs a `brd` argv | holds (`board.py:44-135`) |
 | 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:146`) |
 | 5.7 | `steps/worktree.py` (`run_git`) | runs `git`. Everyone else calls `worktree.run_git`. | holds |
@@ -193,7 +193,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 | Target module | L | Takes | Note |
 |---|---|---|---|
-| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
+| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
 | `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, the `JournalError` family | the schema contract (§10.1) |
 | `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
 | `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
@@ -344,7 +344,6 @@ This list may only shrink. Each entry must disappear when the named step of §6.
 |---|---|---|
 | `cli.py:61-85` | `cli.X is runs.X` aliases (§4.5) | M9 |
 | `cli.py:24,3011,3062,3129` | `sqlite3` and a transaction outside `store` (5.4) | M5 |
-| `control.py:20,210,251` | catches `sqlite3.OperationalError` (5.4) | M5 |
 | 5.12 sites | wall clock outside `clock` | M3 |
 | `cli.py:2411`, `store.py:406`, `paths.py:18,33,57` | hand-joined data path; `mkdir` in derivation (5.11) | M13 |
 | `tests/e2e/test_live_control.py:181`, `test_milestone_resume.py:241`, `test_milestone_run.py:229,356`, `tests/test_cli.py:2254,7679` | patch `cli.run_direct` instead of injecting (5.14) | M6 |

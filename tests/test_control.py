@@ -302,6 +302,19 @@ def test_control_module_imports_no_cli_orchestrate_or_grafo():
     assert theirs <= set(sys.stdlib_module_names) | {"__future__"}
 
 
+def test_control_does_not_import_sqlite3():
+    # Architecture §5.4: `sqlite3` stays inside `store`; a busy store reaches
+    # this module as `store_db.StoreBusyError`.
+    tree = ast.parse(Path(control.__file__).read_text())
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            modules.add(node.module or "")
+    assert "sqlite3" not in modules
+
+
 # -- claim keys (multi-process X5) ---------------------------------------------
 
 
@@ -377,8 +390,9 @@ def test_lease_heartbeat_thread_beats_and_stops_on_exit(root, opened_store):
     assert _read_lease(root) is None
 
 
-def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
-    # Review Focus 3: a locked database must not kill the heartbeat thread.
+def test_lease_heartbeat_survives_a_store_busy_error(root, opened_store):
+    # Review Focus 3: a write whose retry budget ran out must not kill the
+    # heartbeat thread.
     recovered = threading.Event()
 
     class Flaky(Wrapped):
@@ -387,7 +401,7 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
         def beat(self, token: str, now: datetime) -> None:
             Flaky.calls += 1
             if Flaky.calls == 1:
-                raise sqlite3.OperationalError("database is locked")
+                raise store_db.StoreBusyError("beat", 5, 10.0)
             self._inner.beat(token, now)
             recovered.set()
 
@@ -395,6 +409,34 @@ def test_lease_heartbeat_survives_an_operational_error(root, opened_store):
     with control.Lease(Flaky(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
         assert recovered.wait(timeout=5.0)
         assert _heartbeat_threads()[0].is_alive()
+    assert _heartbeat_threads() == []
+
+
+def test_lease_heartbeat_ends_on_a_raw_operational_error(root, opened_store, monkeypatch):
+    # Only `StoreBusyError` is swallowed: a raw `OperationalError` is not a
+    # spent retry budget, so it ends the thread through `threading.excepthook`.
+    locked = sqlite3.OperationalError("database is locked")
+    hooked = threading.Event()
+    seen: list[tuple[BaseException | None, threading.Thread | None]] = []
+
+    def record(args: threading.ExceptHookArgs) -> None:
+        seen.append((args.exc_value, args.thread))
+        hooked.set()
+
+    monkeypatch.setattr(threading, "excepthook", record)
+
+    class Locked(Wrapped):
+        def beat(self, token: str, now: datetime) -> None:
+            raise locked
+
+    ticks = itertools.count()
+    with control.Lease(Locked(opened_store), heartbeat=0.001, clock=lambda: _at(next(ticks))):
+        assert hooked.wait(timeout=5.0)
+        [(error, thread)] = seen
+        assert error is locked
+        assert thread is not None and thread.name == HEARTBEAT_THREAD
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
     assert _heartbeat_threads() == []
 
 
@@ -664,25 +706,25 @@ def test_a_request_under_an_old_lease_token_is_never_applied(root, opened_store)
 # -- watch ---------------------------------------------------------------------
 
 
-async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_store):
-    class Locked(Wrapped):
+async def test_watch_swallows_store_busy_error_and_keeps_polling(root, opened_store):
+    class Busy(Wrapped):
         calls = 0
 
         def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
-            Locked.calls += 1
-            if Locked.calls <= 2:
-                raise sqlite3.OperationalError("database is locked")
+            Busy.calls += 1
+            if Busy.calls <= 2:
+                raise store_db.StoreBusyError("pending_controls", 5, 10.0)
             return self._inner.pending_controls(token)
 
     stop = StopSignal()
     _send(root, "t1", "pause")
-    task = asyncio.create_task(control.watch(Locked(opened_store), stop, "t1", interval=0))
+    task = asyncio.create_task(control.watch(Busy(opened_store), stop, "t1", interval=0))
     try:
         await _until(lambda: stop.requested == "pause")
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    assert Locked.calls >= 3
+    assert Busy.calls >= 3
     assert task.cancelled()
 
     class Broken(Wrapped):
@@ -691,6 +733,13 @@ async def test_watch_swallows_operational_error_and_keeps_polling(root, opened_s
 
     with pytest.raises(RuntimeError, match="not a lock"):
         await _within(control.watch(Broken(opened_store), StopSignal(), "t1", interval=0))
+
+    class RawLocked(Wrapped):
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        await _within(control.watch(RawLocked(opened_store), StopSignal(), "t1", interval=0))
 
 
 # -- controlled ----------------------------------------------------------------
