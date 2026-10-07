@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE TABLE IF NOT EXISTS runs (
+    project_id    INTEGER NOT NULL REFERENCES projects(id),
     id            TEXT PRIMARY KEY,
     workflow      TEXT NOT NULL,
     repo_dir      TEXT NOT NULL,
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS stories (
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     run_id     TEXT NOT NULL,
     card_id    TEXT NOT NULL,
     title      TEXT NOT NULL,
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS stories (
 );
 
 CREATE TABLE IF NOT EXISTS subtasks (
+    project_id    INTEGER NOT NULL REFERENCES projects(id),
     run_id        TEXT NOT NULL,
     story_id      TEXT NOT NULL,
     card_id       TEXT NOT NULL,
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS subtasks (
 );
 
 CREATE TABLE IF NOT EXISTS phases (
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     run_id     TEXT NOT NULL,
     story_id   TEXT NOT NULL,
     card_id    TEXT NOT NULL,
@@ -69,6 +73,7 @@ CREATE TABLE IF NOT EXISTS phases (
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
     run_id       TEXT NOT NULL,
     story_id     TEXT NOT NULL,
     card_id      TEXT NOT NULL,
@@ -85,18 +90,20 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
-    run_id    TEXT NOT NULL,
-    card_id   TEXT NOT NULL,
-    seq       INTEGER NOT NULL,
-    workflow  TEXT NOT NULL,
-    digest    TEXT NOT NULL,
-    reason    TEXT NOT NULL CHECK (reason IN ('turn', 'parked', 'done', 'escalated')),
-    agent     TEXT NOT NULL,
-    saved_at  TEXT NOT NULL,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    run_id     TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    workflow   TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    reason     TEXT NOT NULL CHECK (reason IN ('turn', 'parked', 'done', 'escalated')),
+    agent      TEXT NOT NULL,
+    saved_at   TEXT NOT NULL,
     PRIMARY KEY (run_id, card_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS checkpoint_floors (
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     run_id     TEXT NOT NULL,
     card_id    TEXT NOT NULL,
     seq        INTEGER NOT NULL,
@@ -108,6 +115,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_floors (
 );
 
 CREATE TABLE IF NOT EXISTS run_controls (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
     run_id       TEXT NOT NULL,
     seq          INTEGER NOT NULL,
     lease        TEXT NOT NULL,
@@ -118,6 +126,7 @@ CREATE TABLE IF NOT EXISTS run_controls (
 );
 
 CREATE TABLE IF NOT EXISTS run_leases (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
     run_id       TEXT PRIMARY KEY,
     token        TEXT NOT NULL,
     pid          INTEGER NOT NULL,
@@ -128,22 +137,26 @@ CREATE TABLE IF NOT EXISTS run_leases (
 );
 
 CREATE TABLE IF NOT EXISTS run_claims (
-    key        TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    key        TEXT NOT NULL,
     run_id     TEXT NOT NULL,
     token      TEXT NOT NULL,
-    claimed_at TEXT NOT NULL
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS board_comments (
+    project_id      INTEGER NOT NULL REFERENCES projects(id),
     run_id          TEXT NOT NULL,
     card_id         TEXT NOT NULL,
-    key             TEXT PRIMARY KEY,
+    key             TEXT NOT NULL,
     body            TEXT NOT NULL,
     state           TEXT NOT NULL CHECK (state IN ('pending', 'posted', 'abandoned')),
     comment_id      TEXT,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
-    posted_at       TEXT
+    posted_at       TEXT,
+    PRIMARY KEY (project_id, key)
 );
 """
 
@@ -201,7 +214,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
 `CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a database
 created before one of these columns existed would never get it. Each column
 must also appear, last, in that table's `CREATE` in `_SCHEMA`, so a fresh and a
-migrated database end up with the same column order."""
+migrated database end up with the same column order. `project_id` is first in
+every table for the same reason: it never moves an added column off the end."""
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:

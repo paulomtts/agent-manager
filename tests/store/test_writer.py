@@ -11,6 +11,7 @@ import ast
 import inspect
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -21,11 +22,13 @@ from agent_manager import (
     control,
     dispatch,
     integration,
+    models,
     orchestrate,
     runs,
     store,
 )
 from agent_manager.runtime import walk as runtime_walk
+from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import writer as store_writer
@@ -227,3 +230,90 @@ def test_store_project_id_is_read_only_and_set_by_the_constructor(repo):
             st.project_id = 8  # type: ignore[misc]
     finally:
         st.close()
+
+
+NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+
+_TREE_TABLES = ("runs", "stories", "subtasks", "phases", "attempts")
+_STORE_WRITTEN_TABLES = (
+    *_TREE_TABLES,
+    "checkpoints",
+    "checkpoint_floors",
+    "run_leases",
+    "run_claims",
+    "board_comments",
+)
+
+
+def _project_ids(conn, table: str) -> list[int]:
+    return [row[0] for row in conn.execute(f"SELECT project_id FROM {table}")]
+
+
+def _record_tree(st: store_writer.Store, repo: Path) -> None:
+    st.record_run(
+        models.Run(
+            id=RUN_A,
+            workflow="milestone",
+            repo_dir=repo,
+            base_branch="main",
+            branch_prefix="m1/",
+            status="started",
+            started_at=NOW,
+        )
+    )
+    st.record_story(models.StoryRun(card_id="story-a", title="Story", level=0, status="started"))
+    st.record_subtask(
+        "story-a",
+        models.SubtaskRun(
+            card_id="card-a", branch="m1/task-card-a", base_branch="main", status="started"
+        ),
+    )
+    st.record_phase(
+        "story-a",
+        "card-a",
+        models.PhaseRun(name="implement", kind="agent", status="started", started_at=NOW),
+    )
+    st.record_attempt(
+        "story-a",
+        "card-a",
+        "implement",
+        models.Attempt(
+            n=1,
+            dispatch=models.Dispatch(
+                harness="claude",
+                model="sonnet",
+                role="coder",
+                cwd=repo,
+                prompt_path=repo / "prompt.txt",
+                result_path=repo / "result.json",
+            ),
+        ),
+    )
+
+
+def test_every_row_the_store_writes_carries_its_project_id(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _record_tree(st, repo)
+        st.save_checkpoint(
+            "card-a",
+            workflow="task",
+            digest="d",
+            reason="turn",
+            agent={},
+            saved_at=NOW,
+            floor=store_checkpoints.TurnFloor(phase="implement", loop=0, source_run=RUN_A, floor=0),
+        )
+        st.enqueue_comment(run_id=RUN_A, card_id="card-a", key="k1", body="b", now=NOW)
+        st.take_lease(
+            token="t1", pid=1, host="h", now=NOW, is_live=lambda row: False, claims=["card:card-a"]
+        )
+        written = {table: _project_ids(st.connection, table) for table in _STORE_WRITTEN_TABLES}
+        st.rebuild_from_journal(RUN_A)
+        rebuilt = {table: _project_ids(st.connection, table) for table in _TREE_TABLES}
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    assert written == {table: [project_id] for table in _STORE_WRITTEN_TABLES}
+    assert rebuilt == {table: [project_id] for table in _TREE_TABLES}

@@ -169,6 +169,7 @@ def _save(
     run_id: str,
     card_id: str,
     *,
+    project_id: int,
     reason: str,
     saved_at: datetime,
 ) -> store_checkpoints.Checkpoint:
@@ -176,6 +177,7 @@ def _save(
         conn,
         run_id,
         card_id,
+        project_id=project_id,
         workflow="task",
         digest="d",
         reason=reason,
@@ -186,7 +188,7 @@ def _save(
     return checkpoint
 
 
-def test_insert_checkpoint_numbers_rows_per_card_and_writes_a_floor_only_when_given(conns):
+def test_insert_checkpoint_numbers_rows_per_card_and_writes_a_floor_only_when_given(conns, project_id):
     conn, other = conns
 
     first = store_checkpoints.insert_checkpoint(
@@ -198,6 +200,7 @@ def test_insert_checkpoint_numbers_rows_per_card_and_writes_a_floor_only_when_gi
         reason="turn",
         agent={"b": 1, "a": [2]},
         saved_at=NOW,
+        project_id=project_id,
     )
 
     assert conn.in_transaction
@@ -212,6 +215,7 @@ def test_insert_checkpoint_numbers_rows_per_card_and_writes_a_floor_only_when_gi
         agent={},
         saved_at=LATER,
         floor=FLOOR,
+        project_id=project_id,
     )
     conn.commit()
 
@@ -232,7 +236,7 @@ def test_insert_checkpoint_numbers_rows_per_card_and_writes_a_floor_only_when_gi
     assert store_checkpoints.latest_checkpoint(other, RUN_ID, "card-a") == second
 
 
-def test_insert_checkpoint_leaves_a_refused_row_for_the_caller_to_roll_back(conns):
+def test_insert_checkpoint_leaves_a_refused_row_for_the_caller_to_roll_back(conns, project_id):
     conn, other = conns
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -245,6 +249,7 @@ def test_insert_checkpoint_leaves_a_refused_row_for_the_caller_to_roll_back(conn
             reason="bogus",
             agent={},
             saved_at=NOW,
+            project_id=project_id,
         )
     conn.rollback()
     with pytest.raises(sqlite3.IntegrityError):
@@ -258,6 +263,7 @@ def test_insert_checkpoint_leaves_a_refused_row_for_the_caller_to_roll_back(conn
             agent={},
             saved_at=NOW,
             floor=store_checkpoints.TurnFloor("spec", 1, RUN_ID, -1),
+            project_id=project_id,
         )
     # The `checkpoints` row went in before the floor was refused; it is still
     # uncommitted, so the caller's rollback takes it back.
@@ -266,14 +272,14 @@ def test_insert_checkpoint_leaves_a_refused_row_for_the_caller_to_roll_back(conn
 
     assert (_count(conn, "checkpoints"), _count(conn, "checkpoint_floors")) == (0, 0)
     assert _count(other, "checkpoints") == 0
-    assert _save(conn, RUN_ID, "card-a", reason="turn", saved_at=NOW).seq == 0
+    assert _save(conn, RUN_ID, "card-a", reason="turn", saved_at=NOW, project_id=project_id).seq == 0
 
 
-def test_checkpoint_readers_match_the_store_methods(repo, conns):
+def test_checkpoint_readers_match_the_store_methods(repo, conns, project_id):
     conn, _ = conns
-    turn = _save(conn, RUN_ID, "card-a", reason="turn", saved_at=NOW)
-    escalated = _save(conn, RUN_ID, "card-a", reason="escalated", saved_at=LATER)
-    _save(conn, OTHER_RUN, "card-b", reason="done", saved_at=LATER)
+    turn = _save(conn, RUN_ID, "card-a", reason="turn", saved_at=NOW, project_id=project_id)
+    escalated = _save(conn, RUN_ID, "card-a", reason="escalated", saved_at=LATER, project_id=project_id)
+    _save(conn, OTHER_RUN, "card-b", reason="done", saved_at=LATER, project_id=project_id)
 
     assert store_checkpoints.latest_checkpoint(conn, RUN_ID, "card-a") == escalated
     assert store_checkpoints.latest_turn_checkpoint(conn, RUN_ID, "card-a") == turn
@@ -291,3 +297,28 @@ def test_checkpoint_readers_match_the_store_methods(repo, conns):
         assert st.checkpoint_cards(OTHER_RUN) == [("card-b", "task")]
     finally:
         st.close()
+
+
+def test_insert_checkpoint_writes_project_id_on_checkpoint_and_floor(conns, project_id):
+    conn, other = conns
+
+    store_checkpoints.insert_checkpoint(
+        conn,
+        RUN_ID,
+        "card-a",
+        project_id=project_id,
+        workflow="task",
+        digest="d",
+        reason="turn",
+        agent={},
+        saved_at=NOW,
+        floor=FLOOR,
+    )
+    conn.commit()
+
+    assert [row[0] for row in other.execute("SELECT project_id FROM checkpoints")] == [
+        project_id
+    ]
+    assert [
+        row[0] for row in other.execute("SELECT project_id FROM checkpoint_floors")
+    ] == [project_id]

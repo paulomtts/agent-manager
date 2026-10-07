@@ -41,6 +41,7 @@ from agent_manager import (
 )
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 
 VERIFY_COMMANDS = ("git rev-parse --verify HEAD",)
@@ -186,18 +187,22 @@ def _plant_lease(root: Path, key: str) -> None:
 
     Live by C2: this process's pid, this host, a fresh heartbeat.
     """
-    now = datetime.now(timezone.utc).isoformat()
-    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    stamp = datetime.now(timezone.utc)
+    now = stamp.isoformat()
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
         with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, resolved, now=stamp)
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)",
-                (OTHER_RUN_ID, "other-life", os.getpid(), HERE, now, now),
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (project_id, OTHER_RUN_ID, "other-life", os.getpid(), HERE, now, now),
             )
             conn.execute(
-                "INSERT INTO run_claims (key, run_id, token, claimed_at) VALUES (?, ?, ?, ?)",
-                (key, OTHER_RUN_ID, "other-life", now),
+                "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (project_id, key, OTHER_RUN_ID, "other-life", now),
             )
     finally:
         conn.close()

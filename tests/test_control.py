@@ -33,6 +33,7 @@ import pytest
 from agent_manager import control, models
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 from agent_manager.runtime.stop import StopSignal
 
@@ -83,7 +84,12 @@ def _send(root: Path, token: str, command: str, at: datetime | None = None) -> s
     try:
         with store_db.immediate(conn):
             return store_leases.add_control(
-                conn, RUN_ID, lease=token, command=command, requested_at=at or _at(0)
+                conn,
+                RUN_ID,
+                project_id=store_projects.resolve(conn, root, now=_at(0)),
+                lease=token,
+                command=command,
+                requested_at=at or _at(0),
             )
     finally:
         conn.close()
@@ -119,22 +125,24 @@ def _plant(
     conn = store_db.open_db(root)
     try:
         with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, root, now=_at(0))
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
                 " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
                 " pid=excluded.pid, host=excluded.host,"
                 " acquired_at=excluded.acquired_at,"
                 " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                (run_id, token, pid, host, _at(0).isoformat(), heartbeat_at.isoformat()),
+                (project_id, run_id, token, pid, host, _at(0).isoformat(),
+                 heartbeat_at.isoformat()),
             )
             for key in claims:
                 conn.execute(
-                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                     " run_id=excluded.run_id, token=excluded.token,"
                     " claimed_at=excluded.claimed_at",
-                    (key, run_id, token, _at(0).isoformat()),
+                    (project_id, key, run_id, token, _at(0).isoformat()),
                 )
     finally:
         conn.close()

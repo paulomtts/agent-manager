@@ -18,8 +18,131 @@ import pytest
 
 from agent_manager import paths, store
 from agent_manager.store import db
+from agent_manager.store import projects as store_projects
 
 RUN_ID = "run-2026-09-23-01"
+
+NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+
+_PROJECT_TABLES = (
+    "runs",
+    "stories",
+    "subtasks",
+    "phases",
+    "attempts",
+    "checkpoints",
+    "checkpoint_floors",
+    "run_controls",
+    "run_leases",
+    "run_claims",
+    "board_comments",
+)
+"""Every table whose rows belong to one project."""
+
+_STAMP = "2026-10-07T12:00:00+00:00"
+
+_MINIMAL_ROWS: dict[str, dict[str, object]] = {
+    "runs": {
+        "id": RUN_ID,
+        "workflow": "milestone",
+        "repo_dir": "/repo",
+        "base_branch": "main",
+        "branch_prefix": "m1/",
+        "status": "started",
+        "config": "{}",
+    },
+    "stories": {
+        "run_id": RUN_ID,
+        "card_id": "c1",
+        "title": "t",
+        "level": 0,
+        "status": "pending",
+        "position": 0,
+    },
+    "subtasks": {
+        "run_id": RUN_ID,
+        "story_id": "s1",
+        "card_id": "c1",
+        "branch": "b",
+        "base_branch": "main",
+        "status": "pending",
+        "position": 0,
+    },
+    "phases": {
+        "run_id": RUN_ID,
+        "story_id": "s1",
+        "card_id": "c1",
+        "name": "spec",
+        "kind": "agent",
+        "status": "pending",
+        "position": 0,
+    },
+    "attempts": {
+        "run_id": RUN_ID,
+        "story_id": "s1",
+        "card_id": "c1",
+        "phase": "spec",
+        "n": 1,
+        "status": "started",
+        "dispatch": "{}",
+    },
+    "checkpoints": {
+        "run_id": RUN_ID,
+        "card_id": "c1",
+        "seq": 0,
+        "workflow": "task",
+        "digest": "d",
+        "reason": "turn",
+        "agent": "{}",
+        "saved_at": _STAMP,
+    },
+    "checkpoint_floors": {
+        "run_id": RUN_ID,
+        "card_id": "c1",
+        "seq": 0,
+        "phase": "spec",
+        "loop": 0,
+        "source_run": RUN_ID,
+        "floor": 0,
+    },
+    "run_controls": {
+        "run_id": RUN_ID,
+        "seq": 0,
+        "lease": "t1",
+        "command": "pause",
+        "requested_at": _STAMP,
+    },
+    "run_leases": {
+        "run_id": RUN_ID,
+        "token": "t1",
+        "pid": 1,
+        "host": "h",
+        "acquired_at": _STAMP,
+        "heartbeat_at": _STAMP,
+        "accepting": 1,
+    },
+    "run_claims": {
+        "key": "card:c1",
+        "run_id": RUN_ID,
+        "token": "t1",
+        "claimed_at": _STAMP,
+    },
+    "board_comments": {
+        "run_id": RUN_ID,
+        "card_id": "c1",
+        "key": "k1",
+        "body": "b",
+        "state": "pending",
+        "created_at": _STAMP,
+    },
+}
+"""One row each table accepts: every NOT NULL column but `project_id` filled."""
+
+
+def _insert(conn: sqlite3.Connection, table: str, row: dict[str, object]) -> None:
+    columns = ", ".join(row)
+    marks = ", ".join("?" for _ in row)
+    conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({marks})", tuple(row.values()))
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -318,20 +441,22 @@ def test_projects_repo_dir_is_unique(repo):
 
 def test_reopening_an_existing_db_keeps_its_rows(repo):
     first = db.open_db(repo)
+    project_id = store_projects.resolve(first, repo, now=NOW)
     first.execute(
-        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
-        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (RUN_ID, "milestone", str(repo), "main", "m1/", "started", None, "{}"),
+        "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+        " branch_prefix, status, started_at, config)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (project_id, RUN_ID, "milestone", str(repo), "main", "m1/", "started", None, "{}"),
     )
     first.commit()
     first.close()
 
     second = db.open_db(repo)
     try:
-        rows = second.execute("SELECT id, workflow FROM runs").fetchall()
+        rows = second.execute("SELECT project_id, id, workflow FROM runs").fetchall()
     finally:
         second.close()
-    assert [(row["id"], row["workflow"]) for row in rows] == [(RUN_ID, "milestone")]
+    assert [tuple(row) for row in rows] == [(project_id, RUN_ID, "milestone")]
 
 
 def test_immediate_holds_the_write_lock_from_begin(repo):
@@ -348,3 +473,71 @@ def test_immediate_holds_the_write_lock_from_begin(repo):
     finally:
         blocker.close()
         conn.close()
+
+
+@pytest.mark.parametrize("table", _PROJECT_TABLES)
+def test_every_project_table_has_a_not_null_project_id_first(repo, table):
+    conn = db.open_db(repo)
+    try:
+        first = conn.execute(f"PRAGMA table_info({table})").fetchall()[0]
+        references = [
+            (row["from"], row["table"], row["to"])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+    finally:
+        conn.close()
+    assert (first["name"], first["type"], first["notnull"]) == ("project_id", "INTEGER", 1)
+    assert references == [("project_id", "projects", "id")]
+
+
+@pytest.mark.parametrize("table", _PROJECT_TABLES)
+def test_a_row_without_project_id_is_refused(repo, table):
+    conn = db.open_db(repo)
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError, match=f"NOT NULL constraint failed: {table}.project_id"
+        ):
+            _insert(conn, table, _MINIMAL_ROWS[table])
+        # Non-vacuity: the same row with a project id goes in.
+        project_id = store_projects.resolve(conn, repo, now=NOW)
+        _insert(conn, table, {"project_id": project_id, **_MINIMAL_ROWS[table]})
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.rollback()
+        conn.close()
+    assert count == 1
+
+
+@pytest.mark.parametrize("table", ["run_claims", "board_comments"])
+def test_claims_and_comments_are_keyed_by_project_and_key(repo, table):
+    conn = db.open_db(repo)
+    try:
+        key_columns = {
+            row["name"]: row["pk"]
+            for row in conn.execute(f"PRAGMA table_info({table})")
+            if row["pk"]
+        }
+        mine = store_projects.resolve(conn, repo, now=NOW)
+        theirs = store_projects.resolve(conn, repo.parent / "other-repo", now=NOW)
+        _insert(conn, table, {"project_id": mine, **_MINIMAL_ROWS[table]})
+        _insert(conn, table, {"project_id": theirs, **_MINIMAL_ROWS[table]})
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            _insert(conn, table, {"project_id": mine, **_MINIMAL_ROWS[table]})
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.rollback()
+        conn.close()
+    assert key_columns == {"project_id": 1, "key": 2}
+    assert count == 2
+
+
+def test_added_columns_stay_last(repo):
+    conn = db.open_db(repo)
+    try:
+        last = {
+            table: conn.execute(f"PRAGMA table_info({table})").fetchall()[-1]["name"]
+            for table, _, _ in db._ADDED_COLUMNS
+        }
+    finally:
+        conn.close()
+    assert last == {"phases": "detail", "runs": "milestone_id"}

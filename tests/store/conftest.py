@@ -2,11 +2,13 @@
 
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
 
 
 @pytest.fixture
@@ -34,3 +36,26 @@ def conns(repo) -> Iterator[tuple[sqlite3.Connection, sqlite3.Connection]]:
     finally:
         conn.close()
         other.close()
+
+
+PROJECT_SEEN_AT = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def project_id(conns, repo) -> int:
+    """`repo`'s `projects.id`, created and committed on the writing connection."""
+    conn, _ = conns
+    resolved = store_projects.resolve(conn, repo, now=PROJECT_SEEN_AT)
+    conn.commit()
+    return resolved
+
+
+@pytest.fixture
+def other_project_id(conns, repo) -> int:
+    """A second project in the same file: a sibling directory of `repo`."""
+    conn, _ = conns
+    other = repo.parent / "other-repo"
+    other.mkdir(exist_ok=True)
+    resolved = store_projects.resolve(conn, other, now=PROJECT_SEEN_AT)
+    conn.commit()
+    return resolved

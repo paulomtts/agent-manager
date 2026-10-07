@@ -130,21 +130,24 @@ def claim_conflicts(
     conn: sqlite3.Connection,
     keys: Iterable[str],
     *,
+    project_id: int,
     is_live: Callable[[LeaseRow], bool],
     run_id: str | None = None,
 ) -> list[tuple[str, LeaseRow]]:
-    """The keys of `keys`, in order, that another run's live lease holds.
+    """The keys of `keys`, in order, that another run's live lease holds in `project_id`.
 
-    Read-only. A key conflicts when its `run_claims` row names a run other
-    than `run_id`, that run's `run_leases` row still carries the claim's
-    token, and `is_live` says that lease row is live. `is_live` is injected so
-    this module never imports `control`; it is asked only about a claim whose
-    token still matches its run's lease.
+    Read-only. A key conflicts when its `run_claims` row in `project_id`
+    names a run other than `run_id`, that run's `run_leases` row still
+    carries the claim's token, and `is_live` says that lease row is live. A
+    claim on the same key in another project is never a conflict. `is_live`
+    is injected so this module never imports `control`; it is asked only
+    about a claim whose token still matches its run's lease.
     """
     conflicts: list[tuple[str, LeaseRow]] = []
     for key in keys:
         claim = conn.execute(
-            "SELECT run_id, token FROM run_claims WHERE key = ?", (key,)
+            "SELECT run_id, token FROM run_claims WHERE project_id = ? AND key = ?",
+            (project_id, key),
         ).fetchone()
         if claim is None or claim["run_id"] == run_id:
             continue
@@ -216,6 +219,7 @@ def add_control(
     conn: sqlite3.Connection,
     run_id: str,
     *,
+    project_id: int,
     lease: str,
     command: str,
     requested_at: datetime,
@@ -223,18 +227,19 @@ def add_control(
     """Insert the next control request of `run_id`, addressed to `lease`.
 
     `seq` is 0 for the run's first request and one past the highest after
-    that. Does not commit: run it inside `immediate` so the `MAX(seq)` read
-    and the insert are one locked write. An unknown `command` is refused by
-    the table's `CHECK` as `sqlite3.IntegrityError`; that is the only guard.
+    that; the row carries `project_id`. Does not commit: run it inside
+    `immediate` so the `MAX(seq)` read and the insert are one locked write.
+    An unknown `command` is refused by the table's `CHECK` as
+    `sqlite3.IntegrityError`; that is the only guard.
     """
     highest = conn.execute(
         "SELECT MAX(seq) FROM run_controls WHERE run_id = ?", (run_id,)
     ).fetchone()[0]
     seq = 0 if highest is None else highest + 1
     conn.execute(
-        "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
-        " handled_at) VALUES (?, ?, ?, ?, ?, NULL)",
-        (run_id, seq, lease, command, store_db.iso(requested_at)),
+        "INSERT INTO run_controls (project_id, run_id, seq, lease, command,"
+        " requested_at, handled_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (project_id, run_id, seq, lease, command, store_db.iso(requested_at)),
     )
     return ControlRow(
         run_id=run_id,
@@ -250,6 +255,7 @@ def take_lease(
     conn: sqlite3.Connection,
     run_id: str,
     *,
+    project_id: int,
     token: str,
     pid: int,
     host: str,
@@ -257,39 +263,42 @@ def take_lease(
     is_live: Callable[[LeaseRow], bool],
     claims: Iterable[str] = (),
 ) -> LeaseTake:
-    """Take `run_id`'s lease under `token`, with every key of `claims`.
+    """Take `run_id`'s lease under `token`, with every key of `claims` in `project_id`.
 
     Does not commit: run it inside `store_db.immediate` so the checks and the
     upserts are one locked write. A live lease under another token raises
     `LeaseHeldError`; otherwise that row, or `None`, is the `displaced` one.
-    Then the first key another run holds under a live lease raises
-    `ClaimHeldError`. Only then are the lease (window open) and every claim
-    upserted.
+    Then the first key another run of `project_id` holds under a live lease
+    raises `ClaimHeldError`. Only then are the lease (window open) and every
+    claim upserted, each row carrying `project_id`; a claim is keyed
+    `(project_id, key)`, so the same key in another project is untouched.
     """
     keys = list(claims)
     current = read_lease(conn, run_id)
     if current is not None and current.token != token and is_live(current):
         raise LeaseHeldError(current)
-    conflicts = claim_conflicts(conn, keys, is_live=is_live, run_id=run_id)
+    conflicts = claim_conflicts(
+        conn, keys, project_id=project_id, is_live=is_live, run_id=run_id
+    )
     if conflicts:
         key, holder = conflicts[0]
         raise ClaimHeldError(key, holder)
     conn.execute(
-        "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-        " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+        "INSERT INTO run_leases (project_id, run_id, token, pid, host, acquired_at,"
+        " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
         " ON CONFLICT(run_id) DO UPDATE SET"
         " token=excluded.token, pid=excluded.pid, host=excluded.host,"
         " acquired_at=excluded.acquired_at,"
         " heartbeat_at=excluded.heartbeat_at, accepting=1",
-        (run_id, token, pid, host, store_db.iso(now), store_db.iso(now)),
+        (project_id, run_id, token, pid, host, store_db.iso(now), store_db.iso(now)),
     )
     for key in keys:
         conn.execute(
-            "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-            " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+            "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
             " run_id=excluded.run_id, token=excluded.token,"
             " claimed_at=excluded.claimed_at",
-            (key, run_id, token, store_db.iso(now)),
+            (project_id, key, run_id, token, store_db.iso(now)),
         )
     return LeaseTake(
         lease=LeaseRow(

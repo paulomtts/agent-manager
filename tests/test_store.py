@@ -33,6 +33,7 @@ from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.store import writer as store_writer
@@ -48,6 +49,25 @@ def repo(monkeypatch, tmp_path) -> Path:
     project = tmp_path / "repo"
     project.mkdir()
     return project
+
+
+PROJECT_SEEN_AT = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
+
+
+def _project_id(conn: sqlite3.Connection, repo: Path) -> int:
+    """`repo`'s `projects.id` on `conn`, created if new; the caller commits."""
+    return store_projects.resolve(conn, repo, now=PROJECT_SEEN_AT)
+
+
+def _project_id_of(repo: Path) -> int:
+    """`repo`'s `projects.id`, resolved and committed over its own connection."""
+    conn = store_db.open_db(repo)
+    try:
+        project_id = _project_id(conn, repo)
+        conn.commit()
+        return project_id
+    finally:
+        conn.close()
 
 
 def _dispatch(card: str = "ef248597", phase: str = "implement", n: int = 1) -> models.Dispatch:
@@ -2321,6 +2341,7 @@ FAILURE_DETAIL = (
 """Multi-line and non-ASCII, the way a real failure reason arrives."""
 
 PHASE_COLUMNS = [
+    "project_id",
     "run_id",
     "story_id",
     "card_id",
@@ -2466,6 +2487,7 @@ def test_re_recording_a_phase_overwrites_its_detail(repo):
 _LEGACY_PHASES = """
 DROP TABLE phases;
 CREATE TABLE phases (
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     run_id     TEXT NOT NULL,
     story_id   TEXT NOT NULL,
     card_id    TEXT NOT NULL,
@@ -2477,12 +2499,13 @@ CREATE TABLE phases (
     position   INTEGER NOT NULL,
     PRIMARY KEY (run_id, story_id, card_id, name)
 );
-INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
+INSERT INTO phases (project_id, run_id, story_id, card_id, name, kind, status,
                     started_at, ended_at, position)
-VALUES ('run-2026-09-23-01', '8831189b', 'ef248597', 'verify', 'deterministic',
-        'failed', NULL, NULL, 0);
+VALUES ({project_id}, 'run-2026-09-23-01', '8831189b', 'ef248597', 'verify',
+        'deterministic', 'failed', NULL, NULL, 0);
 """
-"""The `phases` table exactly as it shipped before `detail`, with one row."""
+"""The `phases` table as it shipped before `detail` (with today's `project_id`), with
+one row; `.format(project_id=...)` fills the row's project."""
 
 
 def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it(repo):
@@ -2494,7 +2517,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
         st.close()
 
     legacy = store_db.open_db(repo)
-    legacy.executescript(_LEGACY_PHASES)
+    legacy.executescript(_LEGACY_PHASES.format(project_id=_project_id(legacy, repo)))
     legacy.commit()
     legacy.close()
 
@@ -2544,6 +2567,7 @@ def test_a_phases_table_from_before_detail_gains_the_column_and_rebuild_fills_it
 # journal, no subprocess.
 
 ATTEMPT_COLUMNS = [
+    "project_id",
     "run_id",
     "story_id",
     "card_id",
@@ -2559,11 +2583,11 @@ ATTEMPT_COLUMNS = [
 ]
 
 LEGACY_ATTEMPT_COLUMNS = [
-    *ATTEMPT_COLUMNS[:8],
+    *ATTEMPT_COLUMNS[:9],
     "tokens_in",
     "tokens_out",
     "cost",
-    *ATTEMPT_COLUMNS[8:],
+    *ATTEMPT_COLUMNS[9:],
 ]
 """The `attempts` columns as they shipped before 2026-10-03, in table order."""
 
@@ -2580,12 +2604,13 @@ def test_a_fresh_attempts_table_has_no_usage_columns(repo):
         conn.close()
 
     assert columns == ATTEMPT_COLUMNS
-    assert len(columns) == 12
+    assert len(columns) == 13
 
 
 _LEGACY_ATTEMPTS = """
 DROP TABLE attempts;
 CREATE TABLE attempts (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
     run_id       TEXT NOT NULL,
     story_id     TEXT NOT NULL,
     card_id      TEXT NOT NULL,
@@ -2661,6 +2686,7 @@ def test_an_attempts_table_that_still_has_the_usage_columns_keeps_working(repo):
 MILESTONE_ID = "9c44c2fb-0000-4000-8000-000000000000"
 
 RUN_COLUMNS = [
+    "project_id",
     "id",
     "workflow",
     "repo_dir",
@@ -2712,6 +2738,7 @@ def test_a_runs_milestone_id_round_trips_through_load_run_and_is_overwritten(rep
 _LEGACY_RUNS = """
 DROP TABLE runs;
 CREATE TABLE runs (
+    project_id    INTEGER NOT NULL REFERENCES projects(id),
     id            TEXT PRIMARY KEY,
     workflow      TEXT NOT NULL,
     repo_dir      TEXT NOT NULL,
@@ -2721,19 +2748,20 @@ CREATE TABLE runs (
     started_at    TEXT,
     config        TEXT NOT NULL
 );
-INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix, status,
-                  started_at, config)
-VALUES ('run-2026-09-23-01', 'milestone', '/repo', 'main', 'm1/', 'escalated',
-        NULL, '{}');
+INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch, branch_prefix,
+                  status, started_at, config)
+VALUES ({project_id}, 'run-2026-09-23-01', 'milestone', '/repo', 'main', 'm1/',
+        'escalated', NULL, '{{}}');
 """
-"""The `runs` table exactly as it shipped before `milestone_id`, with one row."""
+"""The `runs` table as it shipped before `milestone_id` (with today's `project_id`),
+with one row; `.format(project_id=...)` fills the row's project."""
 
 
 def test_a_runs_table_from_before_milestone_id_gains_the_column_and_keeps_its_row(repo):
     fresh = store_db.open_db(repo)
     try:
         fresh_columns = _run_columns(fresh)
-        fresh.executescript(_LEGACY_RUNS)
+        fresh.executescript(_LEGACY_RUNS.format(project_id=_project_id(fresh, repo)))
         fresh.commit()
     finally:
         fresh.close()
@@ -2768,7 +2796,9 @@ def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store_queries.RunS
     second `open_db` then migrates; the migrated projection's listing."""
     fresh = store_db.open_db(repo)
     try:
-        fresh.executescript(_LEGACY_RUNS + extra_sql)
+        fresh.executescript(
+            (_LEGACY_RUNS + extra_sql).format(project_id=_project_id(fresh, repo))
+        )
         fresh.commit()
     finally:
         fresh.close()
@@ -2798,10 +2828,10 @@ def test_an_old_task_run_lists_its_card_id_after_the_milestone_id_migration(repo
         repo,
         """
         UPDATE runs SET workflow = 'task' WHERE id = 'run-2026-09-23-01';
-        INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,
-                              status, worktree_path, position)
-        VALUES ('run-2026-09-23-01', '8831189b', 'ef248597', 'm1/task-ef248597',
-                'main', 'escalated', NULL, 0);
+        INSERT INTO subtasks (project_id, run_id, story_id, card_id, branch,
+                              base_branch, status, worktree_path, position)
+        VALUES ({project_id}, 'run-2026-09-23-01', '8831189b', 'ef248597',
+                'm1/task-ef248597', 'main', 'escalated', NULL, 0);
         """,
     )
 
@@ -3211,6 +3241,7 @@ def test_open_db_creates_the_checkpoints_table(repo):
     finally:
         conn.close()
     assert columns == [
+        "project_id",
         "run_id",
         "card_id",
         "seq",
@@ -3550,9 +3581,11 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
     first.execute("DROP TABLE IF EXISTS run_controls")
     first.execute("DROP TABLE IF EXISTS run_leases")
     first.execute(
-        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
-        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+        "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+        " branch_prefix, status, started_at, config)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (_project_id(first, repo), RUN_ID, "milestone", str(repo), "main", "m1/",
+         "stopped", None, "{}"),
     )
     first.commit()
     first.close()
@@ -3576,8 +3609,17 @@ def test_the_control_tables_appear_on_an_existing_database(repo):
         conn.close()
 
     assert {"run_controls", "run_leases"} <= names
-    assert controls == ["run_id", "seq", "lease", "command", "requested_at", "handled_at"]
+    assert controls == [
+        "project_id",
+        "run_id",
+        "seq",
+        "lease",
+        "command",
+        "requested_at",
+        "handled_at",
+    ]
     assert leases == [
+        "project_id",
         "run_id",
         "token",
         "pid",
@@ -3732,15 +3774,18 @@ def test_reacquiring_a_lease_replaces_the_old_token_and_other_runs_are_untouched
 
 
 def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
+    project_id = _project_id_of(repo)
     st = store_writer.Store.open(repo, RUN_ID)
     other = store_db.open_db(repo)
     try:
         with store_db.immediate(other):
             first = store_leases.add_control(
-                other, RUN_ID, lease="t1", command="pause", requested_at=_at(0)
+                other, RUN_ID, lease="t1", command="pause", requested_at=_at(0),
+                project_id=project_id,
             )
             second = store_leases.add_control(
-                other, RUN_ID, lease="old", command="cancel", requested_at=_at(0)
+                other, RUN_ID, lease="old", command="cancel", requested_at=_at(0),
+                project_id=project_id,
             )
         assert first == store_leases.ControlRow(
             run_id=RUN_ID,
@@ -3770,14 +3815,16 @@ def test_a_request_from_another_connection_is_pending_for_its_lease_only(repo):
 
 def test_control_seqs_are_numbered_and_handled_per_run(repo):
     # Review Focus 4.
+    project_id = _project_id_of(repo)
     conn = store_db.open_db(repo)
     try:
         with store_db.immediate(conn):
-            a = store_leases.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+            a = store_leases.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0), project_id=project_id)
             b = store_leases.add_control(
-                conn, OTHER_RUN_ID, lease="t9", command="cancel", requested_at=_at(0)
+                conn, OTHER_RUN_ID, lease="t9", command="cancel", requested_at=_at(0),
+                project_id=project_id,
             )
-            c = store_leases.add_control(conn, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+            c = store_leases.add_control(conn, RUN_ID, lease="t1", command="cancel", requested_at=_at(1), project_id=project_id)
         assert (a.seq, b.seq, c.seq) == (0, 0, 1)
 
         st = store_writer.Store.open(repo, RUN_ID)
@@ -3793,11 +3840,12 @@ def test_control_seqs_are_numbered_and_handled_per_run(repo):
 
 
 def test_immediate_rolls_back_on_error(repo):
+    project_id = _project_id_of(repo)
     conn = store_db.open_db(repo)
     try:
         with pytest.raises(RuntimeError, match="boom"):
             with store_db.immediate(conn):
-                store_leases.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+                store_leases.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0), project_id=project_id)
                 raise RuntimeError("boom")
 
         assert conn.in_transaction is False
@@ -3805,7 +3853,8 @@ def test_immediate_rolls_back_on_error(repo):
         # Nothing was spent: the next request is still seq 0.
         with store_db.immediate(conn):
             again = store_leases.add_control(
-                conn, RUN_ID, lease="t1", command="pause", requested_at=_at(1)
+                conn, RUN_ID, lease="t1", command="pause", requested_at=_at(1),
+                project_id=project_id,
             )
         assert again.seq == 0
         assert len(store_leases.control_requests(conn, RUN_ID)) == 1
@@ -3814,12 +3863,14 @@ def test_immediate_rolls_back_on_error(repo):
 
 
 def test_an_unknown_command_is_refused_by_the_check(repo):
+    project_id = _project_id_of(repo)
     conn = store_db.open_db(repo)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             with store_db.immediate(conn):
                 store_leases.add_control(
-                    conn, RUN_ID, lease="t1", command="resume", requested_at=_at(0)
+                    conn, RUN_ID, lease="t1", command="resume", requested_at=_at(0),
+                    project_id=project_id,
                 )
         assert conn.in_transaction is False
         assert store_leases.control_requests(conn, RUN_ID) == []
@@ -3830,16 +3881,20 @@ def test_an_unknown_command_is_refused_by_the_check(repo):
 def test_immediate_commits_an_implicit_transaction_first(repo):
     # Review Focus 1: Python's legacy sqlite3 mode opens an implicit
     # transaction on the first INSERT; `immediate` must not trip over it.
+    project_id = _project_id_of(repo)
     conn = store_db.open_db(repo)
     try:
         conn.execute(
-            "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
-            " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (RUN_ID, "milestone", str(repo), "main", "m9/", "started", None, "{}"),
+            "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+            " branch_prefix, status, started_at, config)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (project_id, RUN_ID, "milestone", str(repo), "main", "m9/", "started", None, "{}"),
         )
         assert conn.in_transaction is True
         with store_db.immediate(conn):
-            store_leases.add_control(conn, RUN_ID, lease="t1", command="pause", requested_at=_at(0))
+            store_leases.add_control(
+                conn, RUN_ID, project_id=project_id, lease="t1", command="pause", requested_at=_at(0)
+            )
         assert conn.in_transaction is False
     finally:
         conn.close()
@@ -4030,7 +4085,7 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
             token="t1", pid=42, host="h", now=_at(0), is_live=lambda row: False
         ).lease
         with store_db.immediate(other):
-            store_leases.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1))
+            store_leases.add_control(other, RUN_ID, lease="t1", command="cancel", requested_at=_at(1), project_id=st.project_id)
         controls = store_leases.control_requests(other, RUN_ID)
         journal_before = [line.event for line in st.journal.read()]
 
@@ -4155,10 +4210,10 @@ def _plant_lease(repo: Path, run_id: str, *, token: str) -> store_leases.LeaseRo
     try:
         with store_db.immediate(conn):
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, 1, 'h', ?, ?, 1)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, 1, 'h', ?, ?, 1)"
                 " ON CONFLICT(run_id) DO UPDATE SET token = excluded.token",
-                (run_id, token, _at(0).isoformat(), _at(0).isoformat()),
+                (_project_id(conn, repo), run_id, token, _at(0).isoformat(), _at(0).isoformat()),
             )
         row = store_leases.read_lease(conn, run_id)
     finally:
@@ -4173,10 +4228,10 @@ def _plant_claim(repo: Path, key: str, *, run_id: str, token: str) -> None:
     try:
         with store_db.immediate(conn):
             conn.execute(
-                "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                 " run_id = excluded.run_id, token = excluded.token",
-                (key, run_id, token, _at(0).isoformat()),
+                (_project_id(conn, repo), key, run_id, token, _at(0).isoformat()),
             )
     finally:
         conn.close()
@@ -4200,9 +4255,10 @@ def test_the_claims_table_appears_on_an_existing_database(repo):
     finally:
         conn.close()
 
-    assert claims == ["key", "run_id", "token", "claimed_at"]
+    assert claims == ["project_id", "key", "run_id", "token", "claimed_at"]
     # No existing table gains a column.
     assert leases == [
+        "project_id",
         "run_id",
         "token",
         "pid",
@@ -4245,6 +4301,7 @@ def test_lease_errors_name_their_holder_and_a_lost_lease_is_not_an_exception():
 
 
 def test_claim_conflicts_is_read_only_and_ignores_the_runs_own(repo):
+    project_id = _project_id_of(repo)
     holder = _plant_lease(repo, "run-a", token="ta")
     _plant_claim(repo, "card:x", run_id="run-a", token="ta")
     # run-c's lease has moved on to a new token: its old claim is dead.
@@ -4263,15 +4320,15 @@ def test_claim_conflicts_is_read_only_and_ignores_the_runs_own(repo):
     conn = store_db.open_db(repo)
     try:
         changes = conn.total_changes
-        assert store_leases.claim_conflicts(conn, keys, is_live=live, run_id="run-b") == [
+        assert store_leases.claim_conflicts(conn, keys, is_live=live, run_id="run-b", project_id=project_id) == [
             ("card:x", holder)
         ]
         # Liveness is asked only of a claim whose run's lease still carries its token.
         assert seen == [holder]
-        assert store_leases.claim_conflicts(conn, keys, is_live=_alive) == [("card:x", holder)]
-        assert store_leases.claim_conflicts(conn, keys, is_live=_alive, run_id="run-a") == []
-        assert store_leases.claim_conflicts(conn, keys, is_live=_dead, run_id="run-b") == []
-        assert store_leases.claim_conflicts(conn, [], is_live=_alive) == []
+        assert store_leases.claim_conflicts(conn, keys, is_live=_alive, project_id=project_id) == [("card:x", holder)]
+        assert store_leases.claim_conflicts(conn, keys, is_live=_alive, run_id="run-a", project_id=project_id) == []
+        assert store_leases.claim_conflicts(conn, keys, is_live=_dead, run_id="run-b", project_id=project_id) == []
+        assert store_leases.claim_conflicts(conn, [], is_live=_alive, project_id=project_id) == []
         assert conn.total_changes == changes
         assert conn.in_transaction is False
     finally:
@@ -4719,6 +4776,7 @@ def test_open_db_creates_the_checkpoint_floors_table(repo):
         conn.close()
 
     assert [row["name"] for row in info] == [
+        "project_id",
         "run_id",
         "card_id",
         "seq",
@@ -4734,6 +4792,7 @@ def test_open_db_creates_the_checkpoint_floors_table(repo):
     ]
     # M9 C1: the existing table is untouched.
     assert checkpoint_columns == [
+        "project_id",
         "run_id",
         "card_id",
         "seq",
@@ -4748,11 +4807,11 @@ def test_open_db_creates_the_checkpoint_floors_table(repo):
 def test_checkpoint_floors_refuses_a_negative_floor(repo):
     conn = store_db.open_db(repo)
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             conn.execute(
-                "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase, loop,"
-                " source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (RUN_ID, "card-a", 0, "implement", 0, RUN_ID, -1),
+                "INSERT INTO checkpoint_floors (project_id, run_id, card_id, seq, phase,"
+                " loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_project_id(conn, repo), RUN_ID, "card-a", 0, "implement", 0, RUN_ID, -1),
             )
         conn.rollback()
     finally:
@@ -5241,6 +5300,7 @@ def test_a_resumed_store_numbers_its_next_record_after_a_skipped_line(repo):
 # harness, no brd. The fake-board flush tests belong to `comments.py`.
 
 _COMMENT_COLUMNS = [
+    "project_id",
     "run_id",
     "card_id",
     "key",
@@ -5270,9 +5330,11 @@ def test_the_board_comments_table_appears_on_an_existing_database(repo):
     first = store_db.open_db(repo)
     first.execute("DROP TABLE IF EXISTS board_comments")
     first.execute(
-        "INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,"
-        " status, started_at, config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (RUN_ID, "milestone", str(repo), "main", "m1/", "stopped", None, "{}"),
+        "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+        " branch_prefix, status, started_at, config)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (_project_id(first, repo), RUN_ID, "milestone", str(repo), "main", "m1/",
+         "stopped", None, "{}"),
     )
     first.commit()
     first.close()
@@ -5294,11 +5356,12 @@ def test_the_board_comments_table_appears_on_an_existing_database(repo):
 def test_a_board_comment_with_an_unknown_state_is_refused(repo):
     conn = store_db.open_db(repo)
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             conn.execute(
-                "INSERT INTO board_comments (run_id, card_id, key, body, state,"
-                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (RUN_ID, "card-a", "k-bogus", "body", "bogus", _at(0).isoformat()),
+                "INSERT INTO board_comments (project_id, run_id, card_id, key, body,"
+                " state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_project_id(conn, repo), RUN_ID, "card-a", "k-bogus", "body", "bogus",
+                 _at(0).isoformat()),
             )
         conn.rollback()
         count = conn.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
@@ -5340,6 +5403,7 @@ def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
         row = _comment_row(st.connection, "k1")
         count = st.connection.execute("SELECT COUNT(*) FROM board_comments").fetchone()[0]
         journal_exists = st.journal.path.exists()
+        project_id = st.project_id
     finally:
         st.close()
 
@@ -5348,6 +5412,7 @@ def test_enqueue_comment_inserts_once_and_never_overwrites(repo):
     assert count == 1
     assert row is not None
     assert dict(row) == {
+        "project_id": project_id,
         "run_id": RUN_ID,
         "card_id": "card-a",
         "key": "k1",
@@ -5903,9 +5968,11 @@ def test_diverging_reports_a_hand_inserted_subtask_as_foreign_shape(repo):
         st.close()
     _raw_sql(
         repo,
-        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
-        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+        "INSERT INTO subtasks (project_id, run_id, story_id, card_id, branch,"
+        " base_branch, status, worktree_path, position)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        (_project_id_of(repo), RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef",
+         "main", "done", 0),
     )
 
     assert _diverging_now(repo) == [
@@ -5959,9 +6026,10 @@ def test_diverging_reports_mismatches_in_tree_walk_order(repo):
     # siblings still come after every journal sibling.
     _raw_sql(
         repo,
-        "INSERT INTO stories (run_id, card_id, title, level, status, tip_branch,"
-        " position) VALUES (?, 'feedface', 'Hand-made', 0, 'pending', NULL, -1)",
-        (RUN_ID,),
+        "INSERT INTO stories (project_id, run_id, card_id, title, level, status,"
+        " tip_branch, position) VALUES (?, ?, 'feedface', 'Hand-made', 0, 'pending',"
+        " NULL, -1)",
+        (_project_id_of(repo), RUN_ID),
     )
 
     assert _diverging_now(repo) == [
@@ -6092,9 +6160,11 @@ def test_rebuild_refuses_a_hand_inserted_subtask_and_touches_no_row(repo):
         st.close()
     _raw_sql(
         repo,
-        "INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,"
-        " status, worktree_path, position) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-        (RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef", "main", "done", 0),
+        "INSERT INTO subtasks (project_id, run_id, story_id, card_id, branch,"
+        " base_branch, status, worktree_path, position)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        (_project_id_of(repo), RUN_ID, "8831189b", "deadbeef", "m1/task-deadbeef",
+         "main", "done", 0),
     )
     before = _all_rows(repo)
 

@@ -58,6 +58,7 @@ from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.store import writer as store_writer
@@ -8209,16 +8210,19 @@ def _plant_lease(
     Defaults to this process on this host with a heartbeat at the frozen
     clock: live by C2.
     """
-    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
         with store_db.immediate(conn):
+            project_id = store_projects.resolve(conn, resolved, now=CONTROL_NOW)
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
                 " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
                 " heartbeat_at=excluded.heartbeat_at, accepting=excluded.accepting",
                 (
+                    project_id,
                     run_id,
                     token,
                     os.getpid() if pid is None else pid,
@@ -8230,11 +8234,11 @@ def _plant_lease(
             )
             for key in claims:
                 conn.execute(
-                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                     " run_id=excluded.run_id, token=excluded.token,"
                     " claimed_at=excluded.claimed_at",
-                    (key, run_id, token, heartbeat_at.isoformat()),
+                    (project_id, key, run_id, token, heartbeat_at.isoformat()),
                 )
     finally:
         conn.close()
@@ -8266,11 +8270,17 @@ def _plant_control(
     requested_at: datetime,
     handled_at: datetime | None = None,
 ) -> None:
-    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
         with store_db.immediate(conn):
             row = store_leases.add_control(
-                conn, CONTROL_RUN_ID, lease=lease, command=command, requested_at=requested_at
+                conn,
+                CONTROL_RUN_ID,
+                project_id=store_projects.resolve(conn, resolved, now=CONTROL_NOW),
+                lease=lease,
+                command=command,
+                requested_at=requested_at,
             )
             if handled_at is not None:
                 conn.execute(
@@ -8473,6 +8483,46 @@ def test_request_control_refuses_a_command_it_does_not_know_and_records_nothing(
         )
 
     assert _controls(projection) == []
+
+
+def test_request_control_writes_the_projects_id(projection):
+    _plant_run(projection)
+    _plant_lease(projection, heartbeat_at=_at(100))
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(110))
+
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
+    try:
+        run_project = conn.execute(
+            "SELECT project_id FROM runs WHERE id = ?", (CONTROL_RUN_ID,)
+        ).fetchone()[0]
+        control_projects = [
+            row[0]
+            for row in conn.execute(
+                "SELECT project_id FROM run_controls WHERE run_id = ?", (CONTROL_RUN_ID,)
+            )
+        ]
+        projects = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert control_projects == [run_project]
+    assert projects == 1
+
+
+def test_a_refused_request_control_creates_no_project_row(projection):
+    """Review Focus 5: the project is resolved only after `_controllable_lease`,
+    so a refusal leaves no `projects` row behind."""
+    with pytest.raises(cli.UnknownRunError):
+        cli.request_control(
+            "no-such-run", "pause", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    conn = store_db.open_db(cli.resolve_repo_dir(projection))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_a_repeated_pause_is_a_no_op_that_reports_the_first_request(projection, monkeypatch):
@@ -9268,6 +9318,40 @@ def test_refuse_claimed_passes_the_runs_own_claims_unclaimed_keys_and_dead_ones(
 
     _plant_lease(projection, heartbeat_at=_at(-31), claims=("card:card-1",))
     cli.refuse_claimed(root, ["card:card-1"])
+
+
+def test_refuse_claimed_for_an_unseen_project_creates_no_project_row(projection, monkeypatch):
+    """B5: the preflight looks the project up and never creates it. With no row
+    there is no claim of this project's to conflict with, even when another
+    project in the same file holds the same key under a live lease."""
+    _freeze_clock(monkeypatch)
+    root = cli.resolve_repo_dir(projection)
+    conn = store_db.open_db(root)
+    try:
+        with store_db.immediate(conn):
+            elsewhere = store_projects.resolve(conn, root.parent / "elsewhere", now=CONTROL_NOW)
+            store_leases.take_lease(
+                conn,
+                OTHER_RUN_ID,
+                project_id=elsewhere,
+                token="other-life",
+                pid=os.getpid(),
+                host=HERE,
+                now=CONTROL_NOW,
+                is_live=lambda row: False,
+                claims=["card:card-1"],
+            )
+    finally:
+        conn.close()
+
+    cli.refuse_claimed(root, ["card:card-1"])
+
+    conn = store_db.open_db(root)
+    try:
+        assert store_projects.lookup(conn, root) is None
+        assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_run_lease_turns_a_held_claim_into_claimed_error_and_takes_nothing(

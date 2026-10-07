@@ -59,6 +59,7 @@ from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 from agent_manager.store.writer import Store
@@ -854,20 +855,28 @@ def _claimed_error(key: str, holder: store_leases.LeaseRow, now: datetime) -> Cl
 def refuse_claimed(root: Path, keys: Sequence[str], *, run_id: str | None = None) -> None:
     """Refuse, before any write, a run whose keys another live run already claims.
 
-    Read-only preflight (X5): one `open_db` connection, `claim_conflicts`
-    judged by `control.lease_is_live` at `_utcnow()`, closed on every path.
-    It takes no lease, claim or lock, so a refusal here leaves no run
-    directory. `run_id` excludes that run's own rows (a resume). The first
-    live conflict raises `ClaimedError`; `take_lease` re-checks atomically.
+    Read-only preflight (X5): one `open_db` connection, the project looked up
+    (never created) with `store_projects.lookup`, `claim_conflicts` judged by
+    `control.lease_is_live` at `_utcnow()` within that project, closed on
+    every path. A project with no row has no claim to conflict with. It takes
+    no lease, claim or lock, so a refusal here leaves no run directory.
+    `run_id` excludes that run's own rows (a resume). The first live conflict
+    raises `ClaimedError`; `take_lease` re-checks atomically.
     """
     now = _utcnow()
     conn = store_db.open_db(root)
     try:
-        conflicts = store_leases.claim_conflicts(
-            conn,
-            keys,
-            is_live=lambda row: control.lease_is_live(row, now=now),
-            run_id=run_id,
+        project_id = store_projects.lookup(conn, root)
+        conflicts = (
+            []
+            if project_id is None
+            else store_leases.claim_conflicts(
+                conn,
+                keys,
+                project_id=project_id,
+                is_live=lambda row: control.lease_is_live(row, now=now),
+                run_id=run_id,
+            )
         )
     finally:
         conn.close()
@@ -3184,6 +3193,7 @@ def _record_control(
     conn: sqlite3.Connection,
     run_id: str,
     *,
+    project_id: int,
     lease: store_leases.LeaseRow,
     command: str,
     now: datetime,
@@ -3192,13 +3202,19 @@ def _record_control(
 
     Only rows addressed to `lease.token` count, so a request sent to an
     earlier life never makes one to a resumed run a no-op. A no-op returns
-    the first row that covers it, whose time is reported as `requested_at`.
+    the first row that covers it, whose time is reported as `requested_at`,
+    and inserts nothing; a new row carries `project_id`.
     """
     for row in store_leases.control_requests(conn, run_id, lease=lease.token):
         if row.command in CONTROL_SUBSUMES[command]:
             return row, True
     row = store_leases.add_control(
-        conn, run_id, lease=lease.token, command=command, requested_at=now
+        conn,
+        run_id,
+        project_id=project_id,
+        lease=lease.token,
+        command=command,
+        requested_at=now,
     )
     return row, False
 
@@ -3236,7 +3252,8 @@ def request_control(
 
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
     check and the insert, so two requesters cannot both insert and a refusal
-    leaves no row. The process holding the lease applies the request at its
+    leaves no row. The project is resolved only after the refusals, so a
+    refusal creates no `projects` row either. The process holding the lease applies the request at its
     next poll; this function only records it. SQLite is the only channel (C1).
     """
     if command not in CONTROL_COMMANDS:
@@ -3250,8 +3267,9 @@ def request_control(
     try:
         with store_db.immediate(conn):
             lease = _controllable_lease(conn, run_id, command=command, now=now)
+            project_id = store_projects.resolve(conn, root, now=now)
             row, already = _record_control(
-                conn, run_id, lease=lease, command=command, now=now
+                conn, run_id, project_id=project_id, lease=lease, command=command, now=now
             )
             effective = _effective_command(
                 store_leases.control_requests(conn, run_id, lease=lease.token)
