@@ -26,12 +26,12 @@ from datetime import timedelta
 
 from agent_manager import dispatch, results
 from agent_manager.steps import docs_commit, plan_check, reducers, rollup, verify, worktree
-from agent_manager.workflow.phases import AgentPhase, Goto, Retry, Step, Workflow
+from agent_manager.workflow.phases import LAUNCHER_MARGIN, AgentPhase, Goto, Retry, Step, Workflow
 
 LAUNCHER_TIMEOUT = timedelta(seconds=dispatch.DEFAULT_TIMEOUT)
 """How long the launcher lets one `claude -p` run before killing it (1800 s)."""
 
-AGENT_TIMEOUT_FLOOR = LAUNCHER_TIMEOUT + timedelta(minutes=5)
+AGENT_TIMEOUT_FLOOR = LAUNCHER_TIMEOUT + LAUNCHER_MARGIN
 """The lowest agent-phase timeout: strictly above `LAUNCHER_TIMEOUT` (G2)."""
 
 

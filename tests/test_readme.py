@@ -7,12 +7,28 @@ tier and carries no marker.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import typing
+from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_manager import cli, detach, errors, models, orchestrate, runs, store
+import typer
+
+from agent_manager import (
+    argv_guard,
+    cli,
+    detach,
+    dispatch,
+    errors,
+    models,
+    orchestrate,
+    prompt,
+    runs,
+    store,
+)
+from agent_manager.harness import launcher
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 IGNORE_UNKNOWN = "Consumers should ignore any key they do not recognize."
@@ -24,6 +40,20 @@ STORY_SHAPE = (
     " [--verify CMD ...] [--allow-no-verification] [--dry-run] [--detach]"
     " [--repo-dir D]`."
 )
+ISOLATION_TITLE = "Isolating agents with `--isolation`"
+ARGV_TITLE = "Verification commands stay out of `ps`"
+
+CHECKOUT_TITLE = "Installing `am` from a checkout"
+INSTALL_PINNED = (
+    "uv tool install --reinstall .",
+    "uv build",
+    "uv tool install --reinstall dist/*.whl",
+    "clean checkout of the verified commit",
+    "non-editable",
+    'grep editable "$(uv tool dir)/agent-manager/uv-receipt.toml"',
+    "am runs",
+)
+LIVE_RUN = "while any `am` run is live"
 
 
 def _lines() -> list[str]:
@@ -77,6 +107,28 @@ def _fenced_json_lines(section: str) -> list[tuple[str, dict]]:
         if fenced and line.startswith("{"):
             found.append((line, json.loads(line)))
     return found
+
+
+def _assert_anchors_resolve(text: str) -> list[str]:
+    """Every `](#anchor)` in `text`, each asserted to be some heading's slug."""
+    anchors = re.findall(r"\]\(#([^)]+)\)", text)
+    slugs = {_slug(title) for _, _, title in _headings()}
+    assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
+    return anchors
+
+
+def _command_param(command: str, name: str):
+    """The Click parameter `name` of the `am` subcommand `command`, introspected in-process."""
+    group = typer.main.get_command(cli.app)
+    return next(param for param in group.commands[command].params if param.name == name)
+
+
+def _paragraph(opening: str) -> str:
+    """The README paragraph that starts at the first occurrence of `opening`."""
+    text = README.read_text(encoding="utf-8")
+    start = text.index(opening)
+    end = text.find("\n\n", start)
+    return text[start : len(text) if end == -1 else end]
 
 
 def _usage_paragraph() -> str:
@@ -483,3 +535,314 @@ def test_readme_spells_canceled_outside_legacy_sites():
         assert "`cancelled`" in line, line
         assert any(marker in line for marker in legacy_markers), line
     assert "already_cancelled" not in README.read_text(encoding="utf-8")
+
+
+def test_requires_names_bwrap_and_unshare():
+    section = _section("Requires")
+    assert "`bwrap`" in section
+    assert "`unshare`" in section
+    assert "un-isolated with a warning" in section
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(section)
+
+
+def test_isolation_section_names_every_mode():
+    section = _section(ISOLATION_TITLE)
+    values = typing.get_args(launcher.IsolationRequest)
+    for value in values:
+        assert f"`{value}`" in section, value
+    assert "`auto` (the default)" in section
+    for form in ("`--card`", "`--milestone`", "`--story`", "`--board`", "`--detach`"):
+        assert form in section, form
+    assert "It is ignored with `--dry-run`" in section
+    assert "am run --milestone" in section and "--isolation bwrap" in section
+
+    option = _command_param("run", "isolation")
+    assert option.default == "auto"
+    assert list(option.type.choices) == list(values)
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert (
+        titles.index("Running detached with `--detach`")
+        < titles.index(ISOLATION_TITLE)
+        < titles.index("Preview with `--dry-run`")
+    )
+    position = titles.index(ISOLATION_TITLE)
+    assert heads[position][1] == 4
+    parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
+    assert parent[1:] == (3, "Milestone runs")
+    assert _slug(ISOLATION_TITLE) == "isolating-agents-with---isolation"
+
+
+def test_isolation_section_quotes_the_warning_and_refusal():
+    section = _section(ISOLATION_TITLE)
+    tail = "pass --isolation none to run without it"
+    assert tail in str(errors.IsolationUnavailableError("bwrap", "x"))
+    assert launcher.ISOLATION_NONE_WARNING in section
+    assert f"`{errors.IsolationUnavailableError.__name__}`" in section
+    assert "exit code 3" in section
+    assert "before anything is written" in section
+    assert f"isolation <mode> is unavailable: <reason> — {tail}" in section
+    assert "starts with the exact command the probe ran" in section
+    assert f"timed out after {launcher.PROBE_TIMEOUT:g}s" in section
+    assert f"{launcher.PROBE_TIMEOUT:g}-second timeout" in section
+    assert "at most once per process" in section
+    assert "`auto` never refuses" in section
+    assert "there is no fallback" in section
+
+
+def test_isolation_section_names_where_the_mode_is_recorded():
+    section = _section(ISOLATION_TITLE)
+    assert {"launcher", "isolation_warning"} <= set(models.RunConfig.model_fields)
+    assert {"direct", "bwrap", "unshare"} <= set(typing.get_args(models.Launcher))
+    for phrase in (
+        "`config.launcher`",
+        "`config.isolation_warning`",
+        "`direct`",
+        "`payload.config`",
+        "`data.warnings`",
+        "`am status <run-id>` always has a `warnings` key",
+    ):
+        assert phrase in section, phrase
+
+
+def test_isolation_section_describes_each_mode():
+    section = _section(ISOLATION_TITLE)
+    bwrap = launcher.wrap_argv("bwrap", ["true"], Path("/"))
+    unshare = launcher.wrap_argv("unshare", ["true"], Path("/"))
+    assert "--unshare-pid" in bwrap
+    assert "--map-root-user" in unshare
+    # The full prefixes, quoted, so the docs cannot outlive a flag.
+    assert f"`{' '.join(bwrap[:-1])}`" in section
+    assert f"`{' '.join(unshare[:-1])}`" in section
+    assert "PID namespace" in section
+    assert "uid 0" in section
+    assert "read-write" in section
+    assert "the network is untouched" in section
+    assert "not a filesystem or network sandbox" in section
+
+    assert prompt.PROCESS_SAFETY_BLOCK.startswith("## Process safety")
+    assert '"Process safety" block' in section
+    for command in ("`pkill -f`", "`killall`", "`kill -1`"):
+        assert command in prompt.PROCESS_SAFETY_BLOCK
+        assert command in section, command
+    assert "isolation is the guarantee" in section
+    assert "advice" in section
+    _assert_anchors_resolve(section)
+
+
+def test_neutral_argv_section():
+    section = _section(ARGV_TITLE)
+    assert argv_guard.COMMANDS == ("run", "resume")
+    for text in (
+        f"`{argv_guard.FROM_ENV_FLAG}`",
+        f"`{argv_guard.VERIFY_ENV}`",
+        argv_guard.ARGV_VISIBLE_WARNING,
+        "`am run`",
+        "`am resume`",
+        "`--detach`",
+        "`--milestone`",
+        "`--story`",
+        "`--branch-prefix`",
+        "`--verify=X`",
+        "exit code 2",
+    ):
+        assert text in section, text
+    assert "matches command lines, never environments" in section
+    assert "removes it from its own environment" in section
+    assert "not an option to type" in section
+    for reason in (
+        "combined with `--verify`",
+        "when `AM_VERIFY_JSON` is unset",
+        "not a JSON list of strings",
+    ):
+        assert reason in section, reason
+    assert "never echoed" in section
+    assert "`data.warnings` ends with" in section
+    for command in ("run", "resume"):
+        assert _command_param(command, "verify_from_env").hidden is True
+
+    titles = [title for _, _, title in _headings()]
+    assert titles.index(ARGV_TITLE) == titles.index(ISOLATION_TITLE) + 1
+    assert _slug(ARGV_TITLE) == "verification-commands-stay-out-of-ps"
+    _assert_anchors_resolve(section)
+
+
+RESUME_OPENING = "Pick a run back up where it was interrupted"
+REPLACED = "verification: replaced in run record:"
+
+
+def test_resume_documents_the_recorded_suite():
+    assert REPLACED in inspect.getsource(cli.resume_run)
+    assert {"verify", "allow_no_verification"} <= set(models.RunConfig.model_fields)
+
+    text = README.read_text(encoding="utf-8")
+    assert "The verification suite is not recorded" not in text
+    assert "the suite is not recorded" not in text
+    assert "pass your `--verify` commands again" not in text.lower()
+    assert "pass the same `--verify` commands" not in text
+
+    usage = _paragraph(RESUME_OPENING)
+    assert usage in _section("Usage")
+    assert "So are the verification suite and the opt-out." in usage
+    assert f"`{REPLACED} [...]`" in usage
+    assert "can only add the opt-out" in usage
+    assert "verification: kept from checkpoint: [...]" in usage
+    assert (
+        "with the run's recorded suite (or the `--verify` passed now, which replaces it)"
+        in usage
+    )
+
+    relaunch = _section("Relaunching resumes")
+    assert f"`{REPLACED} [...]`" in relaunch
+    assert "The run's recorded suite is restored" in relaunch
+
+    story = _section(STORY_TITLE)
+    assert (
+        "the recorded suite is restored; a `--verify` passed now replaces it,"
+        " as on a milestone run" in story
+    )
+    assert STORY_SHAPE in story
+
+
+RESUME_ISOLATION_OPENING = "`am resume` restores the run's recorded isolation mode"
+STATUS_WARNINGS_OPENING = "`am status <run-id>` also always has a `warnings` key"
+
+
+def test_resume_documents_isolation():
+    section = _section("Relaunching resumes")
+    paragraph = _paragraph(RESUME_ISOLATION_OPENING)
+    assert paragraph in section
+    for phrase in (
+        "accepts only `none`",
+        "usage error (exit 2)",
+        f"`{errors.IsolationUnavailableError.__name__}`",
+        "exit code 3, nothing written",
+        "never silently resumes un-isolated",
+        "keeps its recorded warning",
+        "`--isolation none`",
+        "nothing is probed, there is no warning",
+        "`config.launcher` is `direct`",
+        "before any `verification: replaced in run record: [...]` entry",
+    ):
+        assert phrase in paragraph, phrase
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(paragraph)
+
+    name = errors.IsolationUnavailableError.__name__
+    bullets = [
+        line for line in section.splitlines() if line.startswith("- ") and name in line
+    ]
+    assert len(bullets) == 2, bullets
+    assert all("`--isolation none`" in line for line in bullets)
+
+    option = _command_param("resume", "isolation")
+    assert list(option.type.choices) == ["none"]
+    assert option.default is None
+
+
+def test_status_documents_warnings():
+    paragraph = _paragraph(STATUS_WARNINGS_OPENING)
+    assert paragraph in _section("Pausing and cancelling a run")
+    assert "`[]`" in paragraph
+    assert launcher.ISOLATION_NONE_WARNING in paragraph
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(paragraph)
+
+    run = models.Run(
+        id="20260923T140506Z-cbe34d00",
+        workflow="task",
+        repo_dir=Path("/repo"),
+        base_branch="main",
+        branch_prefix="m1",
+        status="started",
+        started_at=datetime(2026, 9, 23, 14, 5, 6, tzinfo=timezone.utc),
+        stories=[],
+    )
+    assert cli.status_payload(run)["warnings"] == []
+    run.config = models.RunConfig(isolation_warning=launcher.ISOLATION_NONE_WARNING)
+    assert cli.status_payload(run)["warnings"] == [launcher.ISOLATION_NONE_WARNING]
+
+
+def test_isolation_and_resume_passages_link_only_to_headings():
+    for text in (
+        _section("Requires"),
+        _section(ISOLATION_TITLE),
+        _section(ARGV_TITLE),
+        _section(STORY_TITLE),
+        _section("Relaunching resumes"),
+        _paragraph(RESUME_OPENING),
+        _paragraph(STATUS_WARNINGS_OPENING),
+    ):
+        _assert_anchors_resolve(text)
+    assert "relaunching-resumes" in _assert_anchors_resolve(_section(ISOLATION_TITLE))
+    assert "resuming-what-runs-again" in _assert_anchors_resolve(_paragraph(RESUME_OPENING))
+
+
+HARNESS_FLAG = "`--harness-timeout [PHASE=]SECONDS`"
+KEEPS_TIMEOUTS = "keeps the harness timeouts the run recorded"
+REPLACES_BOTH = "replaces both the recorded default and the recorded per-phase overrides"
+
+
+def test_usage_documents_the_harness_timeout_flag():
+    usage = _section("Usage")
+    assert HARNESS_FLAG in usage
+    assert f"{cli.HARNESS_TIMEOUT_MIN} to {cli.HARNESS_TIMEOUT_MAX}" in usage
+    assert f"{dispatch.DEFAULT_TIMEOUT:.0f}" in usage
+    task_phases = ", ".join(f"`{phase}`" for phase in cli.TASK_AGENT_PHASES)
+    assert task_phases in usage
+    assert "`resolve`" in usage
+    assert "exit 2" in usage
+    assert "`--dry-run`" in usage
+    assert "`harness_error`" in usage
+
+
+def test_resume_text_keeps_or_replaces_the_harness_timeouts():
+    for text in (_paragraph(RESUME_OPENING), _section("Relaunching resumes")):
+        assert KEEPS_TIMEOUTS in text
+        assert REPLACES_BOTH in text
+        assert "not merged" in text
+        assert "`resolve`" in text
+        assert "exit 2" in text
+    assert (
+        "There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here"
+        in _paragraph(RESUME_OPENING)
+    )
+    assert "takes only the `--harness-timeout` values given to it" in _section(
+        "Relaunching resumes"
+    )
+
+
+def test_install_documents_the_non_editable_checkout_install():
+    """Card b78f7935: the checkout-install subsection states the five P1 rules."""
+    section = _section(CHECKOUT_TITLE)
+    for pinned in INSTALL_PINNED:
+        assert pinned in section, f"README.md {CHECKOUT_TITLE!r} lacks {pinned!r}"
+    paragraphs = section.split("\n\n")
+    assert any("never" in p and LIVE_RUN in p for p in paragraphs), (
+        f"README.md {CHECKOUT_TITLE!r}: no paragraph says never ... {LIVE_RUN!r}"
+    )
+    assert "it prints nothing" in section or "must print nothing" in section
+    install = _section("Install")
+    assert "run `uv sync`" in install
+    assert "it does not touch the installed `am`" in install
+
+
+def test_checkout_install_sits_under_install():
+    heads = [head for head in _headings() if head[2] == CHECKOUT_TITLE]
+    assert len(heads) == 1
+    assert heads[0][1] == 3
+    assert f"### {CHECKOUT_TITLE}" in _section("Install")
+
+
+def test_checkout_install_never_shows_an_editable_command():
+    fenced_lines: list[str] = []
+    fenced = False
+    for line in _section("Install").splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            fenced_lines.append(line)
+    assert "uv tool install --reinstall ." in fenced_lines
+    for line in fenced_lines:
+        assert "-e " not in line, line
+        assert "--editable" not in line, line

@@ -41,6 +41,25 @@ not by the directory it lives in. `tests/conftest.py` auto-marks unmarked items
 under `tests/steps/` as `git` and under `tests/e2e/` as `e2e_fake`, but only as a
 default — mark the test explicitly when what it spawns says otherwise.
 
+## Installed `am`
+
+- `am` is a regular, non-editable `uv tool` install of a built copy — never
+  `uv tool install -e` / `--editable`, which makes every edit, checkout or
+  merge in the checkout change what live runs execute.
+- Reinstall from a clean checkout of the verified commit:
+  `uv tool install --reinstall .` — or `uv build`, then
+  `uv tool install --reinstall dist/*.whl`.
+- Afterwards
+  `grep editable "$(uv tool dir)/agent-manager/uv-receipt.toml"` prints
+  nothing, and editing the checkout no longer changes what the installed `am`
+  does.
+- Reinstalling replaces the tool venv: never do it while any `am` run is live.
+  Check `am runs` first in each repository `am` drives; no run may show
+  `lease.live` `true`.
+- Working in this repo uses `uv run am` / `uv run pytest` from the worktree's
+  own venv, never the installed `am`. An agent must not run `uv tool install`
+  or modify `~/.local` itself: the switch is an operator step.
+
 ## Conventions
 
 - Source lives under `src/agent_manager/`, tests mirror it under `tests/`.

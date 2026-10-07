@@ -427,6 +427,24 @@ cannot drift (addendum R2 §2).
 """
 
 
+PROCESS_SAFETY_BLOCK = """\
+## Process safety
+
+Other processes on this machine are not yours, and some of them are running
+you. Never use `pkill -f`, `pkill` by name, `killall`, `kill -1`, or
+`kill` with a pattern: a pattern can match the process that dispatched you and
+end the whole run. Only signal a PID that you started and recorded yourself.
+Stop a stuck test with `timeout` (for example `timeout 300 uv run pytest ...`)
+or by the PID you recorded for it."""
+"""The one rule every agent gets against broad process kills.
+
+An agent stopping a stuck test with `pkill -f <pattern>` can match the engine's
+own process and end the run. One constant appended by `compose_brief` for every
+role, rather than a line in each `system.md`, so the rule cannot drift per role.
+It is advice, not a guarantee: the guarantee is launcher isolation.
+"""
+
+
 def compose_brief(
     role: RoleBundle,
     rendered: RenderedPrompt,
@@ -437,16 +455,18 @@ def compose_brief(
 ) -> str:
     """The whole brief for one dispatch, as one document (addendum R2 §2).
 
-    Order is fixed: the role's standing instructions, its methodology, the
-    phase's rendered inputs, the result contract, the feedback. Feedback comes
-    last and is only ever appended, so the brief without it is a prefix of the
-    brief with it and a retry can append rather than recompose.
+    Order is fixed: the role's standing instructions, the shared
+    `PROCESS_SAFETY_BLOCK`, its methodology, the phase's rendered inputs, the
+    result contract, the feedback. Feedback comes last and is only ever
+    appended, so the brief without it is a prefix of the brief with it and a
+    retry can append rather than recompose.
 
     Pure: no disk, no clock, no randomness, no process. The result model is
     handed in rather than looked up in `results.RESULT_MODELS`, which is what
     keeps this function testable without the engine's registry.
     """
-    parts: list[str] = [role.system]
+    parts: list[str] = [role.system] if role.system.strip("\n") else []
+    parts.append(PROCESS_SAFETY_BLOCK)
     for filename, body in role.methodology.items():
         heading = f"{METHODOLOGY_HEADING_PREFIX}{filename}"
         parts.append(heading + "\n" + body.strip("\n"))

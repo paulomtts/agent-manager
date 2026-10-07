@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_manager import dispatch
 from agent_manager.workflow import integrate as integrate_module
 from agent_manager.workflow import task as task_module
+from agent_manager.workflow import phases
 from agent_manager.workflow.phases import AgentPhase, Goto
 from agent_manager.workflow.task import TASK, LAUNCHER_TIMEOUT
 from agent_manager.workflow.integrate import INTEGRATE
@@ -49,6 +50,15 @@ def test_task_timeouts_are_the_chosen_values_floored_above_the_launcher():
     assert task_module.AGENT_TIMEOUT_FLOOR == LAUNCHER_TIMEOUT + timedelta(minutes=5)
     assert task_module.agent_timeout(20) == task_module.AGENT_TIMEOUT_FLOOR
     assert task_module.agent_timeout(90) == timedelta(minutes=90)
+
+
+def test_the_floor_is_the_launcher_timeout_plus_the_one_margin():
+    # T9: the 5 min margin has one source, `phases.LAUNCHER_MARGIN`, which the
+    # compiler's turn-timeout derivation (D3) reads too.
+    assert phases.LAUNCHER_MARGIN == timedelta(minutes=5)
+    assert task_module.AGENT_TIMEOUT_FLOOR == LAUNCHER_TIMEOUT + phases.LAUNCHER_MARGIN
+    assert task_module.AGENT_TIMEOUT_FLOOR == timedelta(seconds=2100)
+    assert "minutes=5" not in Path(task_module.__file__).read_text(encoding="utf-8")
 
 
 def test_integrate_timeout_is_floored_above_the_launcher():

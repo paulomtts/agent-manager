@@ -3,7 +3,7 @@
 Live-control spec §7 "End to end". `am run --milestone`, `am pause`,
 `am cancel`, `am status` and `am resume` run through `CliRunner` on the real
 `cli.app` with no `runner_factory`, so every launch goes through
-`cli.default_runner_factory`, the real `ClaudeAdapter` and `cli.run_direct` to
+`cli.default_runner_factory`, the real `ClaudeAdapter` and `launcher.get_launcher` to
 the fake `claude` first on `PATH`.
 
 The milestone runs in a worker thread. A one-shot hold (`_hold`) blocks a1's
@@ -159,7 +159,7 @@ def _hold(
     """Hold `card`'s `phase` launch once: announce it, wait for `release`, then launch.
 
     Test scaffolding in the manager process: `cli.default_runner_factory`
-    reads `cli.run_direct` at call time. The launch runs in a `to_thread`
+    reads `launcher.get_launcher` at call time. The launch runs in a `to_thread`
     worker, so blocking here leaves the event loop, and so the control
     watcher, free. One-shot: the first matching launch disarms it, and every
     other launch (`am resume`'s and the relaunch's included) passes straight
@@ -178,7 +178,7 @@ def _hold(
             argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path, on_spawn=on_spawn
         )
 
-    monkeypatch.setattr(cli, "run_direct", holding)
+    monkeypatch.setattr(launcher, "get_launcher", lambda kind: holding)
 
 
 def _signal_when_applied(monkeypatch, applied: threading.Event) -> None:

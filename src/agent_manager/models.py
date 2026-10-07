@@ -75,8 +75,15 @@ AttemptStatus = Literal[
 """`started` (no terminal event yet, §9 resume) plus §6's four journalled
 outcomes."""
 
-Launcher = Literal["direct", "bwrap", "container"]
+Launcher = Literal["direct", "bwrap", "unshare", "container"]
 """§4: how a harness process is contained when it runs."""
+
+HarnessSeconds = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+"""A recorded harness timeout in seconds: finite and positive, nothing more.
+
+The CLI's 60..86400 bounds are the CLI's (card 33dc5549): a test records a
+2 s timeout directly, so the model must not enforce them.
+"""
 
 
 class _Model(BaseModel):
@@ -195,6 +202,42 @@ class RunConfig(_Model):
     harness_map: dict[str, HarnessAssignment] = Field(default_factory=dict)
     story_id: str | None = None
     """The story card a run is restricted to; `None` when the run is not a story run."""
+    verify: list[str] = Field(default_factory=list)
+    """The verification suite the run was started with, verbatim; `[]` when none.
+
+    Resume reads it when `--verify` is omitted. Defaulted because journal
+    lines written before it carry no such key.
+    """
+    allow_no_verification: bool = False
+    """Whether the run was started opted out of verification.
+
+    Resume reads it, and a resume's flag can only add it. Defaulted because
+    journal lines written before it carry no such key.
+    """
+    isolation_warning: str | None = None
+    """The warning `--isolation auto` gave when it fell back to `direct`; else `None`.
+
+    `am status` and `am resume` show it, so a detached run whose envelope is
+    gone still says it is un-isolated. Defaulted because journal lines
+    written before it carry no such key.
+    """
+
+    harness_timeout: HarnessSeconds | None = None
+    """The run's default harness timeout in seconds, as `--harness-timeout` gave it.
+
+    `None` means the 1800 s default. It is stored as `None` and never
+    resolved here. Defaulted because journal lines written before it carry
+    no such key.
+    """
+
+    harness_timeouts: dict[Annotated[str, Field(min_length=1)], HarnessSeconds] = Field(
+        default_factory=dict
+    )
+    """Per-agent-phase overrides of `harness_timeout`, keyed by phase name.
+
+    The keys are not checked against any workflow: this module knows none.
+    """
+
     max_limit_wait_hours: float = Field(
         default_factory=_default_max_limit_wait, ge=0, allow_inf_nan=False
     )

@@ -51,6 +51,10 @@ class RunDeps:
     adopt: Adoption | None = None
     """The floor carried from the resume checkpoint, until `take_adoption`
     consumes it. `checkpoint.save` reads it but never clears it."""
+    compiled: Any = None
+    """The run's own `compile.Compiled`, whose turns carry the run's derived
+    timeouts (G2); the tools build every turn they yield from it. `None` -- a
+    hand-built `RunDeps` -- falls back to the workflow's shared compilation."""
 
     def take_adoption(self, phase: str, loop: int) -> Adoption | None:
         """The carried adoption if it is for `(phase, loop)`, else `None`.

@@ -624,6 +624,20 @@ def test_missing_binary_defaults_to_shutil_which_at_call_time(monkeypatch):
     assert missing_binary({"git"}) is None
 
 
+def test_missing_binary_can_be_asked_about_a_binary_outside_the_tiers():
+    """Card 4a3e0414: the agent-signal proofs need `bwrap`, which is not a tier."""
+    assert missing_binary({"bwrap"}, which=_nothing_installed, among=("bwrap",)) == "bwrap"
+    assert missing_binary({"bwrap"}, which=_everything_installed, among=("bwrap",)) is None
+    assert missing_binary(set(), which=_nothing_installed, among=("bwrap",)) is None
+
+
+def test_by_default_a_name_outside_the_tiers_is_never_reported():
+    """The default `among` is `BINARY_TIERS`: the setup hook and the e2e
+    `toolchain` gate keep asking about git and brd only."""
+    assert missing_binary({"bwrap", "git"}, which=_nothing_installed) == "git"
+    assert missing_binary({"bwrap"}, which=_nothing_installed) is None
+
+
 def test_the_hook_skips_a_brd_item_when_brd_is_missing(monkeypatch):
     monkeypatch.setattr(shutil, "which", _nothing_installed)
     with pytest.raises(pytest.skip.Exception, match="the brd CLI must be installed for the brd tier"):

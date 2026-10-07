@@ -1203,6 +1203,17 @@ def run_status(conn: sqlite3.Connection, run_id: str) -> str | None:
     return None if row is None else models.canonical_status(row["status"])
 
 
+def run_config(conn: sqlite3.Connection, run_id: str) -> models.RunConfig | None:
+    """`runs.config` of `run_id`, validated, or `None` if the run was never recorded.
+
+    A free function over a connection, like `run_status`, for a reader that
+    needs the config alone: the production runner factory reads the run's
+    recorded launcher here.
+    """
+    row = conn.execute("SELECT config FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return None if row is None else models.RunConfig.model_validate_json(row["config"])
+
+
 @dataclass(frozen=True)
 class TurnFloor:
     """The turn identity saved beside an agent-phase checkpoint (exactly-once 1.1).

@@ -28,6 +28,7 @@ import os
 import shlex
 import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1570,7 +1571,9 @@ def test_subtasks_run_in_order_each_stacked_on_the_one_before(project, integrate
 
     run = _load(project, run_id)
     assert run.workflow == "milestone"
-    assert run.config == models.RunConfig(max_concurrent_stories=1)
+    assert run.config == models.RunConfig(
+        max_concurrent_stories=1, verify=["uv run pytest"], allow_no_verification=True
+    )
     assert (run.base_branch, run.branch_prefix, run.repo_dir) == ("main", PREFIX, root)
     assert _statuses(run) == {
         "run": "done",
@@ -4539,6 +4542,9 @@ def _record_resume_run(
     workflow: str = "milestone",
     status: str = "escalated",
     base_branch: str = "main",
+    verify: tuple[str, ...] = (),
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
 ) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4550,7 +4556,12 @@ def _record_resume_run(
                 base_branch=base_branch,
                 branch_prefix=PREFIX,
                 status=status,
-                config=models.RunConfig(max_concurrent_stories=3),
+                config=models.RunConfig(
+                    max_concurrent_stories=3,
+                    verify=list(verify),
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
+                ),
             )
         )
     finally:
@@ -8576,6 +8587,24 @@ def test_a_fresh_milestone_preflight_refreshes_git_once_after_every_refusal(
     assert _run_ids(root) == []
 
 
+def test_preflight_milestone_records_the_suite_and_the_opt_out(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_milestone(
+        root, shape["milestone"], commands=("x",), allow_no_verification=True
+    )
+    default = _preflight_milestone(root, shape["milestone"])
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, verify=["x"], allow_no_verification=True
+    )
+    assert default.run_record.config == models.RunConfig(max_concurrent_stories=1)
+
+
 # ── story pre-flight (card 371a79c9) ────────────────────────────────────────
 #
 # Unit tier, as the milestone pre-flight above: the FakeBoard answers every
@@ -8679,6 +8708,226 @@ def test_preflight_story_selects_a_story_by_exact_id_under_its_milestone(
     assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
     assert pre.drive is driver
     assert driver.calls == []
+
+
+def test_preflight_story_records_the_suite_and_the_opt_out(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story, commands=("x",), allow_no_verification=True)
+    default = _preflight_story(root, story)
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story, verify=["x"], allow_no_verification=True
+    )
+    assert default.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story
+    )
+
+
+class _PreflightReached(Exception):
+    """Raised by a patched pre-flight once it has captured its arguments."""
+
+
+@pytest.mark.parametrize(
+    "entry", ["run_milestone", "detach_milestone", "board", "run_story", "detach_story"]
+)
+def test_every_fresh_milestone_story_and_board_entry_hands_the_suite_to_its_preflight(
+    tmp_path, monkeypatch, entry
+):
+    """`board` is `_run_milestone_async`, the call every board milestone goes through."""
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "commands": ["x", "y"],
+        "allow_no_verification": True,
+    }
+    entries: dict[str, tuple[str, Callable[[], Any]]] = {
+        "run_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.run_milestone("M", **common),
+        ),
+        "detach_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.detach_milestone("M", detacher=_FakeDetacher(), **common),
+        ),
+        "board": (
+            "preflight_milestone",
+            lambda: asyncio.run(orchestrate._run_milestone_async("M", **common)),
+        ),
+        "run_story": ("preflight_story", lambda: orchestrate.run_story("S", **common)),
+        "detach_story": (
+            "preflight_story",
+            lambda: orchestrate.detach_story("S", detacher=_FakeDetacher(), **common),
+        ),
+    }
+    name, call = entries[entry]
+    seen: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached(name)
+
+    monkeypatch.setattr(orchestrate, name, capture)
+
+    with pytest.raises(_PreflightReached):
+        call()
+
+    [kwargs] = seen
+    assert kwargs["commands"] == ["x", "y"]
+    assert kwargs["allow_no_verification"] is True
+
+
+FALLBACK_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+def test_preflight_milestone_records_the_launcher_and_its_warning(
+    tmp_path, monkeypatch, fake_board
+):
+    """A5 spec test 17, fresh run: omitted records `direct` and no warning."""
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    fallback = _preflight_milestone(
+        root, shape["milestone"], launcher="direct", isolation_warning=FALLBACK_WARNING
+    )
+    isolated = _preflight_milestone(root, shape["milestone"], launcher="bwrap")
+    default = _preflight_milestone(root, shape["milestone"])
+
+    assert fallback.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, launcher="direct", isolation_warning=FALLBACK_WARNING
+    )
+    assert isolated.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, launcher="bwrap"
+    )
+    assert default.run_record.config == models.RunConfig(max_concurrent_stories=1)
+
+
+def test_a_resumed_milestone_preflight_applies_a_passed_launcher_and_keeps_the_record_otherwise(
+    tmp_path, monkeypatch, fake_board
+):
+    """A5 spec test 17, resume branch: `None` keeps the recorded mode and warning."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _seam_resume_board(fake_board)
+    _record_resume_run(root, launcher="direct", isolation_warning=FALLBACK_WARNING)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    kept = orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+    replaced = orchestrate.preflight_milestone(
+        None,
+        repo_dir=root,
+        resume_run_id=RESUME_RUN_ID,
+        launcher="unshare",
+        isolation_warning=None,
+    )
+
+    assert (kept.run_record.config.launcher, kept.run_record.config.isolation_warning) == (
+        "direct",
+        FALLBACK_WARNING,
+    )
+    assert replaced.run_record.config == models.RunConfig(
+        max_concurrent_stories=3, launcher="unshare"
+    )
+
+
+def test_preflight_story_records_the_launcher_and_its_warning(tmp_path, monkeypatch, fake_board):
+    """A5 spec test 18."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story, launcher="direct", isolation_warning=FALLBACK_WARNING)
+    default = _preflight_story(root, story)
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=1,
+        story_id=story,
+        launcher="direct",
+        isolation_warning=FALLBACK_WARNING,
+    )
+    assert default.run_record.config == models.RunConfig(max_concurrent_stories=1, story_id=story)
+
+
+@pytest.mark.parametrize(
+    "entry", ["run_milestone", "detach_milestone", "board", "run_story", "detach_story"]
+)
+def test_every_fresh_entry_hands_the_launcher_and_its_warning_to_its_preflight(
+    tmp_path, monkeypatch, entry
+):
+    """`board` is `_run_milestone_async`, the call every board milestone goes through."""
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "launcher": "direct",
+        "isolation_warning": FALLBACK_WARNING,
+    }
+    entries: dict[str, tuple[str, Callable[[], Any]]] = {
+        "run_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.run_milestone("M", **common),
+        ),
+        "detach_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.detach_milestone("M", detacher=_FakeDetacher(), **common),
+        ),
+        "board": (
+            "preflight_milestone",
+            lambda: asyncio.run(orchestrate._run_milestone_async("M", **common)),
+        ),
+        "run_story": ("preflight_story", lambda: orchestrate.run_story("S", **common)),
+        "detach_story": (
+            "preflight_story",
+            lambda: orchestrate.detach_story("S", detacher=_FakeDetacher(), **common),
+        ),
+    }
+    name, call = entries[entry]
+    seen: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached(name)
+
+    monkeypatch.setattr(orchestrate, name, capture)
+
+    with pytest.raises(_PreflightReached):
+        call()
+
+    [kwargs] = seen
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", FALLBACK_WARNING)
+
+
+def test_a_resumed_run_milestone_hands_the_launcher_to_its_preflight(tmp_path, monkeypatch):
+    seen: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached("preflight_milestone")
+
+    monkeypatch.setattr(orchestrate, "preflight_milestone", capture)
+
+    with pytest.raises(_PreflightReached):
+        orchestrate.run_milestone(
+            None,
+            repo_dir=tmp_path,
+            launcher="direct",
+            isolation_warning=None,
+            resume_run_id=RESUME_RUN_ID,
+        )
+
+    [kwargs] = seen
+    assert (kwargs["launcher"], kwargs["isolation_warning"], kwargs["resume_run_id"]) == (
+        "direct",
+        None,
+        RESUME_RUN_ID,
+    )
 
 
 def test_preflight_story_selects_a_story_by_title_piece_with_the_default_driver(
@@ -9380,6 +9629,28 @@ def test_a_resumed_milestone_keeps_its_recorded_stacked_base(tmp_path, monkeypat
     )
 
     assert pre.base_branch == "pstack-integrate"
+
+
+def test_a_resumed_milestone_preflight_writes_the_passed_suite_into_the_record(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    _seam_resume_board(fake_board)
+    _record_resume_run(root, verify=("old",))
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    pre = orchestrate.preflight_milestone(
+        None,
+        repo_dir=root,
+        resume_run_id=RESUME_RUN_ID,
+        commands=("new",),
+        allow_no_verification=True,
+    )
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=3, verify=["new"], allow_no_verification=True
+    )
+    assert pre.max_concurrent == 3
 
 
 def test_a_resume_checkpoint_under_another_digest_is_refused_before_the_lease(
@@ -10220,7 +10491,12 @@ def test_a_cancelled_story_run_records_cancelled_skips_integrate_and_is_not_resu
 
 
 def _record_story_run(
-    root: Path, milestone: str, story: str, *, status: str = "escalated"
+    root: Path,
+    milestone: str,
+    story: str,
+    *,
+    status: str = "escalated",
+    verify: tuple[str, ...] = (),
 ) -> None:
     """A story run of `story` under `milestone`, recorded as `preflight_story` records one."""
     opened = store_module.Store.open(root, RESUME_RUN_ID)
@@ -10233,7 +10509,9 @@ def _record_story_run(
                 base_branch="main",
                 branch_prefix=PREFIX,
                 status=status,
-                config=models.RunConfig(max_concurrent_stories=1, story_id=story),
+                config=models.RunConfig(
+                    max_concurrent_stories=1, story_id=story, verify=list(verify)
+                ),
                 milestone_id=milestone,
             )
         )
@@ -10279,6 +10557,29 @@ def test_a_resumed_story_run_cuts_its_plan_to_the_recorded_story(
     assert pre.run_record.config.story_id == story
     assert (pre.run_record.status, pre.run_record.milestone_id) == ("started", milestone)
     assert (pre.base_branch, pre.branch_prefix, pre.max_concurrent) == ("main", PREFIX, 1)
+
+
+def test_a_resumed_story_preflight_writes_the_passed_suite_and_keeps_its_story(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story S: cols")
+    _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_story_run(root, milestone, story, verify=("old",))
+
+    pre = orchestrate.preflight_milestone(
+        None,
+        repo_dir=root,
+        resume_run_id=RESUME_RUN_ID,
+        commands=["new"],
+        allow_no_verification=False,
+    )
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story, verify=["new"]
+    )
 
 
 def test_a_resumed_story_run_roots_on_the_base_when_its_blockers_tip_is_gone(
@@ -10535,7 +10836,7 @@ def test_the_detached_story_child_drives_only_the_story_and_reports_no_integrate
     assert fake.events == ["go"]
     assert driver.calls == []
     assert _load(root, run_id).config == models.RunConfig(
-        max_concurrent_stories=1, story_id=story
+        max_concurrent_stories=1, story_id=story, allow_no_verification=True
     )
     monkeypatch.setattr(store_module.Store, "take_lease", _no_take_lease)
     closes = _close_snapshots(monkeypatch)
@@ -10629,7 +10930,9 @@ def test_a_detached_story_run_records_and_leases_the_plan_and_drives_nothing_her
     assert _run_ids(root) == [run_id]
     run = _load(root, run_id)
     assert run.milestone_id == shape["milestone"]
-    assert run.config == models.RunConfig(max_concurrent_stories=1, story_id=story)
+    assert run.config == models.RunConfig(
+        max_concurrent_stories=1, story_id=story, allow_no_verification=True, launcher="bwrap"
+    )
     assert _statuses(run) == {"run": "started", story: "pending", a1: "pending", a2: "pending"}
     lease = _lease(root, run_id)
     assert lease is not None and lease.pid == FAKE_CHILD_PID
@@ -10674,3 +10977,353 @@ def test_a_refused_detached_story_run_forks_nothing(
     assert fake.calls == []
     assert _run_dirs() == []
     assert _run_ids(root) == []
+
+
+@pytest.mark.parametrize("form", ["run_board", "detach_board"])
+def test_a_board_run_hands_the_launcher_and_its_warning_to_every_milestone(board_seams, form):
+    """A5 B1: one resolution for the whole board, recorded on every milestone run."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+    isolation: dict[str, Any] = {"launcher": "direct", "isolation_warning": FALLBACK_WARNING}
+
+    if form == "run_board":
+        _board(board_seams, **isolation)
+    else:
+        fake = _FakeDetacher()
+        _detach_board(board_seams, fake, **isolation)
+        fake.body()
+
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", FALLBACK_WARNING)
+
+
+# ── harness timeouts reach every fresh run's RunConfig (card 33dc5549) ──────
+#
+# Unit tier: FakeBoard, `refresh_git` patched, `board_seams` for the board;
+# a recording preflight stops the wrappers before any store or git.
+
+TIMEOUTS = {"harness_timeout": 900.0, "harness_timeouts": {"implement": 3600.0}}
+
+
+def test_preflight_milestone_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_milestone(
+        root,
+        shape["milestone"],
+        driver=FakeDriver(),
+        harness_timeout=900.0,
+        harness_timeouts={"resolve": 1200.0, "implement": 3600.0},
+    )
+    default = _preflight_milestone(root, shape["milestone"], driver=FakeDriver())
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"resolve": 1200.0, "implement": 3600.0}
+    assert pre.run_record.config.max_concurrent_stories == 1
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+def test_preflight_story_records_the_harness_timeouts(tmp_path, monkeypatch, fake_board):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story, driver=FakeDriver(), **TIMEOUTS)
+    default = _preflight_story(root, story, driver=FakeDriver())
+
+    assert pre.run_record.config.harness_timeout == 900.0
+    assert pre.run_record.config.harness_timeouts == {"implement": 3600.0}
+    assert pre.run_record.config.story_id == story
+    assert default.run_record.config.harness_timeout is None
+    assert default.run_record.config.harness_timeouts == {}
+
+
+class _HaltAtPreflight(Exception):
+    """Raised by a recording preflight, so the run under test stops there."""
+
+
+def _halting_preflight(monkeypatch, name: str) -> list[dict[str, Any]]:
+    seen: list[dict[str, Any]] = []
+
+    def preflight(target, **kwargs):
+        seen.append(kwargs)
+        raise _HaltAtPreflight
+
+    monkeypatch.setattr(orchestrate, name, preflight)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("entry", "preflight", "detached"),
+    [
+        ("run_milestone", "preflight_milestone", False),
+        ("detach_milestone", "preflight_milestone", True),
+        ("run_story", "preflight_story", False),
+        ("detach_story", "preflight_story", True),
+    ],
+)
+def test_milestone_and_story_entry_points_forward_harness_timeouts_to_their_preflight(
+    tmp_path, monkeypatch, entry, preflight, detached
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    seen = _halting_preflight(monkeypatch, preflight)
+    extra = {"detacher": _FakeDetacher()} if detached else {}
+
+    with pytest.raises(_HaltAtPreflight):
+        getattr(orchestrate, entry)(
+            "M",
+            repo_dir=tmp_path,
+            base_branch="main",
+            branch_prefix=PREFIX,
+            **TIMEOUTS,
+            **extra,
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_timeout"] == 900.0
+    assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+def test_run_board_forwards_harness_timeouts_to_each_milestone(board_seams):
+    first = _board_milestone(1)
+    second = _board_milestone(2, blocked_by=(1,))
+    board_seams.cards = [first, second]
+
+    _board(board_seams, **TIMEOUTS)
+
+    assert board_seams.runs.called() == [first.id, second.id]
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert kwargs["harness_timeout"] == 900.0
+        assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+def test_run_board_without_harness_timeouts_forwards_none(board_seams):
+    board_seams.cards = [_board_milestone(1)]
+
+    _board(board_seams)
+
+    ((_milestone_id, kwargs),) = board_seams.runs.calls
+    assert kwargs["harness_timeout"] is None
+    assert kwargs["harness_timeouts"] is None
+
+
+def test_the_detached_board_child_forwards_harness_timeouts_to_each_milestone(board_seams):
+    first = _board_milestone(1)
+    second = _board_milestone(2)
+    board_seams.cards = [first, second]
+    fake = _FakeDetacher()
+    _detach_board(board_seams, fake, **TIMEOUTS)
+
+    fake.body()
+
+    assert sorted(board_seams.runs.called()) == sorted([first.id, second.id])
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert kwargs["harness_timeout"] == 900.0
+        assert kwargs["harness_timeouts"] == {"implement": 3600.0}
+
+
+# ── recorded harness timeouts reach the runner; resume keeps or replaces them
+#    (card eee43099) ─────────────────────────────────────────────────────────
+#
+# Unit tier: FakeBoard, FakeDriver, the autouse `integrate_recorder`, and
+# `refresh_git` patched; an `AgentRunner` is built but never called.
+
+TIMED_CONFIG = {"harness_timeout": 900.0, "harness_timeouts": {"implement": 3600.0}}
+
+
+def _record_timed_resume_run(
+    root: Path, milestone: str, *, story_id: str | None = None
+) -> None:
+    """An escalated milestone (or, with `story_id`, story) run recorded with `TIMED_CONFIG`."""
+    opened = store_module.Store.open(root, RESUME_RUN_ID)
+    try:
+        opened.record_run(
+            models.Run(
+                id=RESUME_RUN_ID,
+                workflow="milestone",
+                repo_dir=root,
+                base_branch="main",
+                branch_prefix=PREFIX,
+                status="escalated",
+                config=models.RunConfig(
+                    max_concurrent_stories=1, story_id=story_id, **TIMED_CONFIG
+                ),
+                milestone_id=milestone,
+            )
+        )
+    finally:
+        opened.close()
+
+
+def _timeouts(pre: Any) -> tuple[float | None, dict[str, float]]:
+    config = pre.run_record.config
+    return config.harness_timeout, config.harness_timeouts
+
+
+def _resume_preflight_with(root: Path, **extra: Any) -> Any:
+    return orchestrate.preflight_milestone(
+        None, repo_dir=root, resume_run_id=RESUME_RUN_ID, **extra
+    )
+
+
+def test_a_resumed_milestone_preflight_keeps_or_replaces_the_harness_timeouts(
+    tmp_path, monkeypatch, fake_board
+):
+    """Review Focus 3: an override replaces both values, never merged."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone, _story, _subtask = _seam_resume_board(fake_board)
+    _record_timed_resume_run(root, milestone)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    kept = _resume_preflight_with(root)
+    replaced = _resume_preflight_with(root, harness_override=(600.0, {"resolve": 900.0}))
+    bare = _resume_preflight_with(root, harness_override=(600.0, {}))
+    per_phase = _resume_preflight_with(root, harness_override=(None, {"plan": 120.0}))
+
+    assert _timeouts(kept) == (900.0, {"implement": 3600.0})
+    assert _timeouts(replaced) == (600.0, {"resolve": 900.0})
+    assert _timeouts(bare) == (600.0, {})
+    assert _timeouts(per_phase) == (None, {"plan": 120.0})
+    assert (replaced.run_record.status, replaced.run_record.milestone_id) == (
+        "started",
+        milestone,
+    )
+    assert replaced.run_record.config.max_concurrent_stories == 1
+
+
+def test_a_resumed_story_preflight_keeps_or_replaces_the_harness_timeouts(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story S: cols")
+    _branches(monkeypatch)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+    _record_timed_resume_run(root, milestone, story_id=story)
+
+    kept = _resume_preflight_with(root)
+    replaced = _resume_preflight_with(root, harness_override=(None, {"plan": 120.0}))
+
+    assert _timeouts(kept) == (900.0, {"implement": 3600.0})
+    assert _timeouts(replaced) == (None, {"plan": 120.0})
+    assert replaced.run_record.config.story_id == story
+
+
+def test_a_fresh_milestone_preflight_ignores_harness_override(
+    tmp_path, monkeypatch, fake_board
+):
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_milestone(
+        root,
+        shape["milestone"],
+        driver=FakeDriver(),
+        harness_timeout=900.0,
+        harness_override=(60.0, {"resolve": 61.0}),
+    )
+
+    assert _timeouts(pre) == (900.0, {})
+
+
+def test_run_milestone_forwards_harness_override_to_preflight(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    seen = _halting_preflight(monkeypatch, "preflight_milestone")
+
+    with pytest.raises(_HaltAtPreflight):
+        orchestrate.run_milestone(
+            None,
+            repo_dir=tmp_path,
+            resume_run_id=RESUME_RUN_ID,
+            harness_override=(600.0, {"plan": 120.0}),
+        )
+
+    (kwargs,) = seen
+    assert kwargs["harness_override"] == (600.0, {"plan": 120.0})
+    assert kwargs["resume_run_id"] == RESUME_RUN_ID
+
+
+def _engine_factories(
+    root: Path, monkeypatch, integrate_recorder, **kwargs: Any
+) -> tuple[Any, Any]:
+    """Drive a one-subtask milestone through `run_milestone_engine` and return
+    the factory the driver got and the one Integrate got. `kwargs` go to the
+    preflight, except `runner_factory`, which goes to the engine."""
+    injected = kwargs.pop("runner_factory", None)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+    driver = FakeDriver()
+    pre = _preflight_milestone(root, shape["milestone"], driver=driver, **kwargs)
+    with orchestrate.recorded_milestone_run(pre) as recorded:
+        asyncio.run(orchestrate.run_milestone_engine(pre, recorded, runner_factory=injected))
+    (call,) = driver.calls
+    (integrated,) = integrate_recorder.calls
+    return call["runner_factory"], integrated["runner_factory"]
+
+
+def _bound(factory: Any) -> Any:
+    """The runner `factory` builds over a stand-in store whose projection holds
+    only `RESUME_RUN_ID`'s config, recorded `direct`: all
+    `default_runner_factory` reads to pick the launcher."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, config TEXT NOT NULL)")
+    conn.execute(
+        "INSERT INTO runs (id, config) VALUES (?, ?)",
+        (RESUME_RUN_ID, models.RunConfig().model_dump_json()),
+    )
+    store = SimpleNamespace(connection=conn)
+    return factory(store=store, run_id=RESUME_RUN_ID, story_id="story", card_id="card")
+
+
+def test_the_milestone_engine_hands_on_no_factory_when_no_timeout_is_recorded(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+
+    lane, integrate = _engine_factories(root, monkeypatch, integrate_recorder)
+
+    assert lane is None
+    assert integrate is cli.default_runner_factory
+
+
+def test_the_milestone_engine_binds_the_recorded_timeouts_for_lanes_and_integrate(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    root = _resume_root(tmp_path, monkeypatch)
+
+    lane, integrate = _engine_factories(
+        root,
+        monkeypatch,
+        integrate_recorder,
+        harness_timeout=2.0,
+        harness_timeouts={"resolve": 5.0},
+    )
+
+    for factory in (lane, integrate):
+        runner = _bound(factory)
+        assert runner.timeout_for("explore") == 2.0
+        assert runner.timeout_for("resolve") == 5.0
+
+
+def test_the_milestone_engine_hands_an_injected_factory_on_unchanged(
+    tmp_path, monkeypatch, fake_board, integrate_recorder
+):
+    """Review Focus 2: the test seam wins over a recorded timeout."""
+    root = _resume_root(tmp_path, monkeypatch)
+
+    def injected(*, store: Any, run_id: str, story_id: str, card_id: str) -> Any:
+        return None
+
+    lane, integrate = _engine_factories(
+        root, monkeypatch, integrate_recorder, harness_timeout=2.0, runner_factory=injected
+    )
+
+    assert lane is injected
+    assert integrate is injected

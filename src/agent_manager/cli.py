@@ -19,6 +19,7 @@ Typer's own usage errors.
 
 import asyncio
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -29,12 +30,13 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from pydantic import ValidationError
 
 from agent_manager import (
+    argv_guard,
     board,
     census,
     comments,
@@ -53,11 +55,13 @@ from agent_manager import __version__
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.runtime.walk import AgentPhaseRunner, SubtaskSummary
-from agent_manager.harness.launcher import run_direct
+from agent_manager.harness import launcher
 from agent_manager.runtime import engine as runtime_engine
 from agent_manager.steps import verify as verify_step
 from agent_manager.store import Store
+from agent_manager.workflow import integrate as integrate_workflow
 from agent_manager.workflow import task as task_workflow
+from agent_manager.workflow.phases import AgentPhase, Workflow
 
 # The run helpers S1 moved to `runs` (card 61a0d9be finished the move: bases,
 # integration and orchestrate read them off `runs`). This module uses some by
@@ -69,6 +73,7 @@ from agent_manager.runs import (
     CheckpointMismatchError,
     CliError,
     DryRunPlan,
+    HarnessOverride,
     NotResumableError,
     RepoDirError,
     BaseBranchError,
@@ -82,6 +87,7 @@ from agent_manager.runs import (
     resolve_base_branch,
     resolve_repo_dir,
     select_resumable,
+    with_harness_override,
     worktree_for,
 )
 
@@ -368,7 +374,8 @@ def status_payload(
     once, at the edge, the same way `run_card`'s `worktree` is handled. Field
     names are `models.py`'s and are not renamed for display. `control` is
     `control_view`'s result; `None` renders as no lease and no requests, so
-    the key is always present (C12).
+    the key is always present (C12). `warnings` lists the run's recorded
+    `isolation_warning`, or is empty (A5).
     """
     tree = run.model_dump()
     return {
@@ -381,6 +388,9 @@ def status_payload(
         "control": {"lease": None, "requests": [], "claims": []}
         if control is None
         else control,
+        "warnings": []
+        if run.config.isolation_warning is None
+        else [run.config.isolation_warning],
     }
 
 
@@ -672,6 +682,28 @@ def main() -> None:
     """
 
 
+def entry() -> None:
+    """The `am` console script: `argv_guard` first, then the app.
+
+    `argv_guard.reexec_neutral` replaces the process when `run` or `resume`
+    has a `--verify`; when it returns, the app runs with the warnings it
+    returned (none, or `ARGV_VISIBLE_WARNING`) as `ctx.obj["argv_warnings"]`.
+    """
+    warning = argv_guard.reexec_neutral(sys.argv)
+    app(obj={"argv_warnings": [] if warning is None else [warning]})
+
+
+def add_argv_warnings(ctx: typer.Context, payload: dict[str, Any]) -> None:
+    """Append `entry`'s argv warnings to an ok payload's `warnings`, creating the list.
+
+    No warnings, or no `ctx.obj` (a `CliRunner` that passes none), leaves the
+    payload as it is.
+    """
+    warnings = (ctx.obj or {}).get("argv_warnings", [])
+    if warnings:
+        payload.setdefault("warnings", []).extend(warnings)
+
+
 WORKFLOW_NAME = "task"
 """The only document `run --card` drives. `--workflow` is §10's, not this card's."""
 
@@ -682,27 +714,75 @@ def default_runner_factory(
     run_id: str,
     story_id: str,
     card_id: str,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> AgentPhaseRunner:
-    """The production runner: real adapters, real roles, the direct launcher.
+    """The production runner: real adapters, real roles, the run's recorded launcher.
+
+    The launcher mode is the run's `RunConfig.launcher`, read from the
+    projection on every call (A5 B2), so subtask phases, both conflict
+    resolvers, a detached child and a resumed run all launch the way the run
+    was recorded. It never probes: that happened at run or resume start. A
+    run with no row is `UnknownRunError`, never a silent `direct`.
+    `launcher.get_launcher` is read at call time so a test can patch it.
 
     `adapters` and `result_models` keep `AgentRunner`'s own defaults and
     `harness_map` stays empty, so every role falls back to `DEFAULT_HARNESS` and
     to the model its own `policy.toml` names (D6). Choosing a harness per role is
     `--harness`'s job, and `--harness` is not this card's.
+
+    `harness_timeout` and `harness_timeouts` are the run's recorded
+    `RunConfig` values (card eee43099); `runner_factory_for` is what passes
+    them. Without them every attempt gets `dispatch.DEFAULT_TIMEOUT`.
     """
-    recorded = store.load_run(run_id)
+    config = store_module.run_config(store.connection, run_id)
+    if config is None:
+        raise UnknownRunError(
+            f"run {run_id!r} has no row in the projection, so the launcher it was"
+            " recorded with is unknown; no agent is launched for it"
+        )
     return dispatch.AgentRunner(
         store=store,
-        launcher=run_direct,
+        launcher=launcher.get_launcher(config.launcher),
         run_id=run_id,
         story_id=story_id,
         card_id=card_id,
-        max_limit_wait_hours=(
-            models.DEFAULT_MAX_LIMIT_WAIT_HOURS
-            if recorded is None
-            else recorded.config.max_limit_wait_hours
-        ),
+        harness_timeout=harness_timeout,
+        harness_timeouts=dict(harness_timeouts or {}),
+        max_limit_wait_hours=config.max_limit_wait_hours,
     )
+
+
+def runner_factory_for(
+    config: models.RunConfig, runner_factory: RunnerFactory | None
+) -> RunnerFactory | None:
+    """The runner factory a run's engine hands on, given its recorded `config` (card eee43099).
+
+    An injected `runner_factory` (the §14 test seam) wins and is returned as
+    is, so it is still called with the four `RunnerFactory` keywords only. A
+    config with no timeout gives `None`, exactly what was handed on before
+    timeouts were recorded. Otherwise a factory that calls
+    `default_runner_factory` -- looked up at call time, so a test that patches
+    it is honored -- with the config's two values added.
+    """
+    if runner_factory is not None:
+        return runner_factory
+    if config.harness_timeout is None and not config.harness_timeouts:
+        return None
+    harness_timeout = config.harness_timeout
+    harness_timeouts = dict(config.harness_timeouts)
+
+    def bound(*, store: Store, run_id: str, story_id: str, card_id: str) -> AgentPhaseRunner:
+        return default_runner_factory(
+            store=store,
+            run_id=run_id,
+            story_id=story_id,
+            card_id=card_id,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
+        )
+
+    return bound
 
 
 @dataclass(frozen=True)
@@ -970,7 +1050,13 @@ def preflight_card(
     repo_dir: Path,
     branch_prefix: str,
     base_branch: str = "master",
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
 
@@ -978,7 +1064,10 @@ def preflight_card(
     and worktree, then `refuse_claimed` over the `card:<id>` claim, read-only
     and before any store exists, so a refused card leaves no run directory
     (X5). Only then is the clock read and the run id minted, and the
-    `started` run, story and subtask records built. Nothing is written.
+    `started` run, story and subtask records built; the run's config records
+    `commands` as its `verify` suite, `allow_no_verification`, and the resolved
+    `launcher` (`None` recording `direct`) with its `isolation_warning`. Nothing
+    is written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -1014,7 +1103,14 @@ def preflight_card(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(),
+            config=models.RunConfig(
+                verify=list(commands),
+                allow_no_verification=allow_no_verification,
+                launcher="direct" if launcher is None else launcher,
+                isolation_warning=isolation_warning,
+                harness_timeout=harness_timeout,
+                harness_timeouts=dict(harness_timeouts or {}),
+            ),
         ),
         story=models.StoryRun(
             card_id=parent.id,
@@ -1087,6 +1183,8 @@ async def run_card_engine(
     recorded and, still under the lease, the card gets at most one comment
     (`card_outcome_comment`, keyed by `lease.token`); a flush's warnings join
     the payload's `warnings`. The caller owns the store and the lease.
+    The walk's runner gets the run's recorded harness timeouts
+    (`runner_factory_for`, card eee43099).
     """
     store, lease, run_id = recorded.store, recorded.lease, recorded.run_id
     stop = StopSignal()
@@ -1102,7 +1200,7 @@ async def run_card_engine(
             repo_dir=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
-            runner_factory=runner_factory,
+            runner_factory=runner_factory_for(pre.run_record.config, runner_factory),
             stop=stop,
         ),
         store=store,
@@ -1158,10 +1256,14 @@ def run_card(
     branch_prefix: str,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive one subtask card through `workflow.task.TASK` once, and report.
 
@@ -1196,7 +1298,13 @@ def run_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         return asyncio.run(
@@ -1562,10 +1670,14 @@ def detach_card(
     detacher: detach.Detacher,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --card --detach`: stages 1 and 2 here, stage 3 in a detached child.
 
@@ -1580,7 +1692,13 @@ def detach_card(
         repo_dir=repo_dir,
         branch_prefix=branch_prefix,
         base_branch=base_branch,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_card_run(pre) as recorded:
         log = detach.create_run_log(pre.run_id)
@@ -1601,6 +1719,160 @@ def detach_card(
     return hand_off_to_child(
         root=pre.root, run_id=pre.run_id, token=token, log=log, engine=engine, detacher=detacher
     )
+
+
+def verify_commands(verify: Sequence[str], *, from_env: bool) -> list[str]:
+    """The verification commands `run` and `resume` drive, from `--verify` or `AM_VERIFY_JSON`.
+
+    `AM_VERIFY_JSON` is popped from `os.environ` on every call, with or
+    without `from_env`, so no process the run spawns inherits it; its value
+    is read only under `--verify-from-env`, the flag `argv_guard` puts in
+    place of every `--verify`. Without the flag the commands are `verify`.
+    With it they are the variable's JSON list of strings, the empty list
+    included. The flag with any `--verify`, with the variable unset, or with
+    a value that is not a JSON list of strings is a usage error (exit 2)
+    whose message never echoes the value.
+    """
+    raw = os.environ.pop(argv_guard.VERIFY_ENV, None)
+    if not from_env:
+        return list(verify)
+    if verify:
+        raise typer.BadParameter(
+            "--verify and --verify-from-env are exclusive",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    if raw is None:
+        raise typer.BadParameter(
+            f"--verify-from-env needs {argv_guard.VERIFY_ENV}, and it is unset",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise typer.BadParameter(
+            f"{argv_guard.VERIFY_ENV} is not a JSON list of strings",
+            param_hint=argv_guard.FROM_ENV_FLAG,
+        )
+    return value
+
+
+def agent_phase_names(*workflows: Workflow) -> tuple[str, ...]:
+    """The `AgentPhase` names of `workflows`, in declared order, each once."""
+    return tuple(
+        dict.fromkeys(
+            phase.name
+            for workflow in workflows
+            for phase in workflow.phases
+            if isinstance(phase, AgentPhase)
+        )
+    )
+
+
+TASK_AGENT_PHASES = agent_phase_names(task_workflow.TASK)
+"""The phases `--harness-timeout PHASE=` may name on `run --card` and `run --story`,
+which dispatch only `task` phases."""
+
+MILESTONE_AGENT_PHASES = agent_phase_names(task_workflow.TASK, integrate_workflow.INTEGRATE)
+"""The phases `--harness-timeout PHASE=` may name on `run --milestone`, `run --board`
+and `resume`: a milestone run ends in Integrate."""
+
+HARNESS_TIMEOUT_MIN = 60
+"""The smallest `--harness-timeout` in seconds. The CLI's bound, not the model's."""
+
+HARNESS_TIMEOUT_MAX = 86400
+"""The largest `--harness-timeout` in seconds."""
+
+
+def _harness_timeout_error(message: str) -> typer.BadParameter:
+    return typer.BadParameter(message, param_hint="'--harness-timeout'")
+
+
+def _harness_seconds(text: str, given: str) -> float:
+    """`text` as seconds in bounds, or the usage error naming `given`, the whole value."""
+    if not text:
+        raise _harness_timeout_error(f"{given!r} has an empty value; expected [PHASE=]SECONDS")
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a number of seconds") from None
+    if not math.isfinite(seconds):
+        raise _harness_timeout_error(f"{given!r}: {text!r} is not a finite number of seconds")
+    if not HARNESS_TIMEOUT_MIN <= seconds <= HARNESS_TIMEOUT_MAX:
+        raise _harness_timeout_error(
+            f"{given!r}: seconds must be from {HARNESS_TIMEOUT_MIN} to"
+            f" {HARNESS_TIMEOUT_MAX} inclusive"
+        )
+    return seconds
+
+
+def parse_harness_timeouts(
+    values: Sequence[str], *, phases: Sequence[str]
+) -> tuple[float | None, dict[str, float]]:
+    """Every `--harness-timeout` value, parsed to `(run default, per-phase map)` (card 33dc5549).
+
+    A bare `SECONDS` is the run default. `PHASE=SECONDS` is split on the
+    first `=`, and `PHASE` must be one of `phases`, matched exactly. Each
+    `SECONDS` is a finite `float()` from `HARNESS_TIMEOUT_MIN` to
+    `HARNESS_TIMEOUT_MAX` inclusive. The run default or one phase given twice
+    is refused rather than last-wins, so a typo cannot hide. Every refusal is
+    `typer.BadParameter`, Typer's exit 2. Order does not matter, and no
+    values give `(None, {})`.
+    """
+    default: float | None = None
+    per_phase: dict[str, float] = {}
+    for value in values:
+        name, separator, text = value.partition("=")
+        if not separator:
+            seconds = _harness_seconds(value, value)
+            if default is not None:
+                raise _harness_timeout_error(
+                    "the run default is given twice; give one bare SECONDS"
+                )
+            default = seconds
+            continue
+        if not name:
+            raise _harness_timeout_error(
+                f"{value!r} has an empty phase name; expected PHASE=SECONDS"
+            )
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"{value!r}: unknown phase {name!r}; the agent phases are: {', '.join(phases)}"
+            )
+        seconds = _harness_seconds(text, value)
+        if name in per_phase:
+            raise _harness_timeout_error(f"phase {name!r} is given twice")
+        per_phase[name] = seconds
+    return default, per_phase
+
+
+def run_agent_phases(run: models.Run) -> tuple[str, ...]:
+    """The agent phases a recorded `run` can dispatch (card eee43099).
+
+    A `task` run and a story run (`config.story_id` set) never reach
+    Integrate, so only the `task` phases; a milestone run also `resolve`.
+    """
+    if run.workflow == WORKFLOW_NAME or run.config.story_id is not None:
+        return TASK_AGENT_PHASES
+    return MILESTONE_AGENT_PHASES
+
+
+def refuse_undispatchable_harness_phases(
+    run: models.Run, per_phase: Mapping[str, float]
+) -> None:
+    """`--harness-timeout`'s usage error for a phase `run` cannot dispatch.
+
+    `resume` validates against `MILESTONE_AGENT_PHASES` before anything is
+    loaded; this is the second check, once the run's shape is known.
+    """
+    phases = run_agent_phases(run)
+    for name in per_phase:
+        if name not in phases:
+            raise _harness_timeout_error(
+                f"run {run.id} cannot dispatch phase {name!r}; its agent phases are:"
+                f" {', '.join(phases)}"
+            )
 
 
 def _check_run_targets(
@@ -1727,6 +1999,7 @@ Examples:
 
 @app.command("run", epilog=RUN_EXAMPLES)
 def run(
+    ctx: typer.Context,
     card: str | None = typer.Option(
         None,
         "--card",
@@ -1839,9 +2112,33 @@ def run(
             "and in the order given; the engine runs them in sequence."
         ),
     ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
+    isolation: launcher.IsolationRequest = typer.Option(
+        "auto",
+        "--isolation",
+        help=(
+            "Run every agent in a PID namespace of its own, so it cannot signal "
+            "the engine: `bwrap`, `unshare`, `auto` (bwrap, then unshare, else "
+            "none with a warning) or `none`. A named mode this host cannot start "
+            "is refused before anything is written. Ignored with --dry-run."
+        ),
+    ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Recorded with the run. "
+            "Ignored with --dry-run."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
+    commands = verify_commands(verify, from_env=verify_from_env)
     _check_run_targets(
         card=card,
         milestone=milestone,
@@ -1852,9 +2149,37 @@ def run(
         detach=detach_run,
         story=story,
     )
+    # After the target checks and before the `HANDLED` block (card 33dc5549):
+    # a bad value reads no board, opens no store and creates no run directory.
+    # A card or story run dispatches only `task` phases; a milestone or board
+    # run ends in Integrate.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values,
+        phases=(
+            TASK_AGENT_PHASES
+            if card is not None or story is not None
+            else MILESTONE_AGENT_PHASES
+        ),
+    )
+    # Passed only when given, so a run without the flag calls exactly as before.
+    # The dry-run previews never receive them.
+    timeouts: dict[str, Any] = (
+        {"harness_timeout": default_timeout, "harness_timeouts": phase_timeouts}
+        if harness_timeout_values
+        else {}
+    )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
     models.max_limit_wait_default.set(max_limit_wait)
+    isolation_warning: str | None = None
     try:
+        # A5 B1: first after the argument checks, before any board read,
+        # `refresh_git`, store, lease or fork, so a refused mode writes
+        # nothing. A dry run launches nothing and probes nothing. Read as
+        # `launcher.resolve_isolation` so a test can patch it.
+        mode: models.Launcher | None = None
+        if not dry_run:
+            resolved = launcher.resolve_isolation(isolation)
+            mode, isolation_warning = resolved.mode, resolved.warning
         # Before any run row, claim or worktree exists, and for --dry-run too.
         base_branch = resolve_base_branch(repo_dir, base_branch)
         if whole_board and dry_run:
@@ -1871,10 +2196,13 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif whole_board:
             # Read as `orchestrate.run_board` so a test can patch it there.
@@ -1884,9 +2212,12 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix_of=board_prefix_of(branch_prefix),
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif milestone is not None and dry_run:
             payload = dry_run_milestone(
@@ -1904,10 +2235,13 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif milestone is not None:
             # Read as `orchestrate.run_milestone` so a test can patch it there.
@@ -1918,9 +2252,12 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
+                **timeouts,
             )
         elif story is not None and dry_run:
             payload = dry_run_story(
@@ -1937,9 +2274,12 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         elif story is not None:
             # Read as `orchestrate.run_story` so a test can patch it there.
@@ -1949,8 +2289,11 @@ def run(
                 repo_dir=repo_dir,
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
-                commands=list(verify),
+                commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
+                **timeouts,
             )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
@@ -1960,8 +2303,11 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                launcher=mode,
+                isolation_warning=isolation_warning,
+                commands=commands,
                 detacher=detach.fork_detacher,
+                **timeouts,
             )
         else:
             payload = run_card(
@@ -1970,11 +2316,19 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
-                commands=list(verify),
+                launcher=mode,
+                isolation_warning=isolation_warning,
+                commands=commands,
+                **timeouts,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if isolation_warning is not None:
+        # Once, at the top level (a board's milestone entries never carry
+        # it), before `argv_guard`'s warning.
+        payload.setdefault("warnings", []).append(isolation_warning)
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     if detach_run:
         # A handed-off run's outcome is in its report.json, not this exit code.
@@ -2870,6 +3224,7 @@ def _resume_from_checkpoint(
     commands: Sequence[str],
     runner_factory: RunnerFactory | None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Continue a `task` run's one in-flight subtask from its newest checkpoint.
 
@@ -2895,7 +3250,18 @@ def _resume_from_checkpoint(
     comes, when a passed `commands` differs from the suite the checkpoint
     keeps (`runtime_engine.kept_commands`), one `verification: kept from
     checkpoint: [...]` warning naming the kept suite (card 5b19aa93).
+    `commands` is the passed `--verify` and is read for that warning only:
+    the walk is driven with `run.config.verify` and `allow_no_verification`,
+    and both `record_run` calls write `run`'s config back.
+
+    Harness timeouts (card eee43099): `harness_override`, when given,
+    replaces both of the run's recorded values before anything is read or
+    written (`with_harness_override`), so every run record this life writes
+    carries it and a later resume keeps it. Without it the recorded values
+    stay. Either way the walk's runner launches with them
+    (`runner_factory_for`).
     """
+    run = with_harness_override(run, harness_override)
     story, subtask = select_resumable(run)
     card = board.show(subtask.card_id, repo_dir=root)
     parent = board.show(story.card_id, repo_dir=root)
@@ -2953,9 +3319,9 @@ def _resume_from_checkpoint(
                         parent=parent,
                         subtask=resumed,
                         repo_dir=root,
-                        commands=commands,
+                        commands=run.config.verify,
                         allow_no_verification=allow_no_verification,
-                        runner_factory=runner_factory,
+                        runner_factory=runner_factory_for(run.config, runner_factory),
                         stop=stop,
                         resume_from=checkpoint,
                     ),
@@ -3012,6 +3378,8 @@ def resume_run(
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
+    isolation: Literal["none"] | None = None,
+    harness_override: HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
 
@@ -3029,18 +3397,41 @@ def resume_run(
 
     Branch, base branch and worktree come from the recorded run and never
     from a flag: §9's "the run records what it was started with" is the
-    reason the record exists. The two knobs the record does *not* carry --
-    `models.RunConfig` has no suite commands and no `allow_no_verification` --
-    are still taken as arguments. A walk continued from a checkpoint never
-    reads them: its binding comes from the checkpoint's pool, and a `task`
-    resume whose `commands` differ from that pool's adds a `verification:
-    kept from checkpoint: [...]` warning. On a milestone
-    they also reach what starts afresh -- subtasks with no checkpoint, merged
-    bases and Integrate.
+    reason the record exists. So do the suite and the opt-out
+    (`RunConfig.verify`, `RunConfig.allow_no_verification`): a non-empty
+    `commands` replaces the recorded suite, `allow_no_verification` can only
+    add the opt-out, and the result is written back to the record by the
+    resume's first `record_run`, so a refused resume still writes nothing.
+    A walk continued from a checkpoint keeps the checkpoint's pool instead,
+    and a `task` resume whose passed `commands` differ from it adds a
+    `verification: kept from checkpoint: [...]` warning. On a milestone the
+    resulting suite and opt-out reach what starts afresh -- subtasks with no
+    checkpoint, merged bases and Integrate. When a passed `commands` differs
+    from the recorded suite, the payload's last warning is `verification:
+    replaced in run record: [...]`, naming the suite it replaced.
 
     A run canceled in either spelling is refused for both workflows (live
     control C9), and so is a run whose lease is still live (C10): both
     refusals read only the connection that loaded the run.
+
+    The launcher mode (A5 B3) is decided after those read-only refusals and
+    before anything is written. `isolation="none"` runs it `direct` with no
+    warning and probes nothing. Otherwise a run recorded `bwrap` or
+    `unshare` is re-probed (`launcher.resolve_isolation`) and refused with
+    `IsolationUnavailableError` if this host can no longer start it; a run
+    recorded `direct` keeps `direct` and its recorded `isolation_warning`
+    with no probe. The pair goes into the same config copy as the suite, so
+    a refused resume writes nothing, and a warning is placed in `warnings`
+    before the `verification: replaced` entry.
+
+    Harness timeouts (card eee43099) are recorded on the run, so a resume
+    keeps them: without `harness_override` both workflows are called exactly
+    as before and launch with the recorded values. A `harness_override`
+    `(default, per-phase map)` replaces both recorded values, never merged,
+    and is recorded by the first run record the resume writes. A per-phase
+    name the loaded run cannot dispatch (`run_agent_phases`: `resolve` on a
+    `task` or story run) is `--harness-timeout`'s usage error, exit 2,
+    raised after the refusals above and before `Store.open`.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3063,32 +3454,78 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    if run.workflow not in (WORKFLOW_NAME, orchestrate.MILESTONE_WORKFLOW):
+        raise NotResumableError(
+            f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
+            f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
+        )
+    # Passed only when given, so a resume without the flag calls exactly as before.
+    override: dict[str, Any] = {}
+    if harness_override is not None:
+        refuse_undispatchable_harness_phases(run, harness_override[1])
+        override["harness_override"] = harness_override
+    # A5 B3: after every read-only refusal, before anything is written.
+    if isolation == "none":
+        mode: models.Launcher = "direct"
+        isolation_warning: str | None = None
+    elif run.config.launcher in ("bwrap", "unshare"):
+        # Read as `launcher.resolve_isolation` so a test can patch it.
+        restored = launcher.resolve_isolation(run.config.launcher)
+        mode, isolation_warning = restored.mode, restored.warning
+    else:
+        mode, isolation_warning = run.config.launcher, run.config.isolation_warning
+    explicit = list(commands)
+    recorded = run.config.verify
+    run = run.model_copy(
+        update={
+            "config": run.config.model_copy(
+                update={
+                    "verify": explicit or list(recorded),
+                    "allow_no_verification": allow_no_verification
+                    or run.config.allow_no_verification,
+                    "launcher": mode,
+                    "isolation_warning": isolation_warning,
+                }
+            )
+        }
+    )
+    replaced = (
+        f"verification: replaced in run record: {recorded!r}"
+        if explicit and explicit != recorded
+        else None
+    )
     if run.workflow == WORKFLOW_NAME:
-        return _resume_from_checkpoint(
+        payload = _resume_from_checkpoint(
             run,
             root=root,
-            allow_no_verification=allow_no_verification,
+            allow_no_verification=run.config.allow_no_verification,
             commands=commands,
             runner_factory=runner_factory,
+            **override,
         )
-    # Read as `orchestrate.run_milestone` so a test can patch it there.
-    if run.workflow == orchestrate.MILESTONE_WORKFLOW:
-        return orchestrate.run_milestone(
+    else:
+        # Read as `orchestrate.run_milestone` so a test can patch it there.
+        payload = orchestrate.run_milestone(
             None,
             repo_dir=root,
-            commands=list(commands),
-            allow_no_verification=allow_no_verification,
+            commands=list(run.config.verify),
+            allow_no_verification=run.config.allow_no_verification,
+            launcher=mode,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             resume_run_id=run.id,
+            **override,
         )
-    raise NotResumableError(
-        f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
-        f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
-    )
+    if isolation_warning is not None:
+        payload.setdefault("warnings", []).append(isolation_warning)
+    if replaced is not None:
+        payload.setdefault("warnings", []).append(replaced)
+    return payload
 
 
 @app.command("resume")
 def resume(
+    ctx: typer.Context,
     run_id: str = typer.Argument(..., metavar="RUN_ID", help="The run to pick back up."),
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository and brd board to work in."
@@ -3097,19 +3534,40 @@ def resume(
         False,
         "--allow-no-verification",
         help=(
-            "A walk continued from a checkpoint keeps the opt-out the run started "
-            "with. On a milestone run, this applies to what starts afresh: "
-            "subtasks with no checkpoint, merged bases and Integrate."
+            "A run started with the opt-out keeps it. Passed, this adds the "
+            "opt-out to a run that lacked it, and the run records it."
         ),
     ),
     verify: list[str] = typer.Option(
         [],
         "--verify",
         help=(
-            "A walk continued from a checkpoint keeps the suite the run started "
-            "with, and says so in `warnings` when it differs. On a milestone run, "
-            "this is the suite for what starts afresh: subtasks with no "
-            "checkpoint, merged bases and Integrate."
+            "Omitted, the run's recorded suite is used. Passed, it replaces the "
+            "recorded suite for what starts afresh and is recorded. A walk "
+            "continued from a checkpoint still keeps the checkpoint's suite, "
+            "and says so in `warnings` when a passed one differs."
+        ),
+    ),
+    verify_from_env: bool = typer.Option(
+        False, argv_guard.FROM_ENV_FLAG, hidden=True
+    ),
+    isolation: Literal["none"] | None = typer.Option(
+        None,
+        "--isolation",
+        help=(
+            "Omitted, the run's recorded launcher is restored and re-probed, and a "
+            "run recorded isolated is refused if this host can no longer start it. "
+            "`none` runs the rest of it without isolation, on purpose, and records that."
+        ),
+    ),
+    harness_timeout_values: list[str] = typer.Option(
+        [],
+        "--harness-timeout",
+        metavar="[PHASE=]SECONDS",
+        help=(
+            "The harness timeout in seconds (60 to 86400), repeatable: a bare value is the "
+            "run's default, PHASE=SECONDS overrides one agent phase. Replaces both recorded "
+            "values and is recorded; without it the run keeps the timeouts it was started with."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
@@ -3120,16 +3578,34 @@ def resume(
     started and are recorded. A `task` run continues its one subtask; a
     `milestone` run continues the whole milestone under the same run id.
     """
+    commands = verify_commands(verify, from_env=verify_from_env)
+    # Before anything is loaded (card 33dc5549): the run's workflow is known
+    # only once it is, so every agent phase a `task` or `milestone` run can
+    # dispatch is accepted here, and `resume_run` refuses a phase the loaded
+    # run cannot dispatch (card eee43099). Given, the pair replaces both
+    # recorded values and is recorded; passed only when given, so a resume
+    # without the flag calls exactly as before and keeps the recorded values.
+    default_timeout, phase_timeouts = parse_harness_timeouts(
+        harness_timeout_values, phases=MILESTONE_AGENT_PHASES
+    )
+    override: dict[str, Any] = (
+        {"harness_override": (default_timeout, phase_timeouts)}
+        if harness_timeout_values
+        else {}
+    )
     try:
         payload = resume_run(
             run_id,
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
-            commands=list(verify),
+            commands=commands,
+            isolation=isolation,
+            **override,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     # A task payload reports `status`; a milestone payload has none and
     # carries `escalated: true` only when it stopped, as for `run`. Both

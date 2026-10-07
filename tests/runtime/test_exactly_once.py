@@ -260,7 +260,7 @@ def _runner(opened, launcher: FakeLauncher, roles: Path) -> dispatch.AgentRunner
             "explorer": models.HarnessAssignment(harness=adapter.name, model="fake-model")
         },
         role_root=roles,
-        timeout=45.0,
+        harness_timeout=45.0,
     )
 
 

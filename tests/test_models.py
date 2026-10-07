@@ -410,8 +410,16 @@ def test_run_config_rejects_an_unknown_launcher():
     with pytest.raises(ValidationError) as excinfo:
         models.RunConfig(launcher="docker")
     message = str(excinfo.value)
-    for allowed in ("direct", "bwrap", "container"):
+    for allowed in ("direct", "bwrap", "unshare", "container"):
         assert allowed in message
+
+
+def test_run_config_accepts_and_round_trips_the_unshare_launcher():
+    config = models.RunConfig(launcher="unshare")
+    assert config.launcher == "unshare"
+    restored = models.RunConfig.model_validate_json(config.model_dump_json())
+    assert restored.launcher == "unshare"
+    assert restored == config
 
 
 def test_run_config_rejects_a_harness_map_entry_missing_its_model():
@@ -444,6 +452,56 @@ def test_run_config_rejects_a_non_string_story_id(value):
     with pytest.raises(ValidationError) as excinfo:
         models.RunConfig(story_id=value)
     assert "story_id" in str(excinfo.value)
+
+
+def test_run_config_verify_defaults_to_an_empty_list_and_the_opt_out_to_false():
+    first, second = models.RunConfig(), models.RunConfig()
+
+    assert first.verify == []
+    assert first.allow_no_verification is False
+    first.verify.append("uv run pytest")
+    assert second.verify == []
+
+
+def test_run_config_keeps_a_verify_list_verbatim():
+    suite = ["b", "a", "a", " x ", ""]
+
+    dumped = models.RunConfig(verify=suite).model_dump(mode="json")
+
+    assert dumped["verify"] == suite
+    assert models.RunConfig.model_validate(dumped).verify == suite
+
+
+@pytest.mark.parametrize("value", ["true", [1], None])
+def test_run_config_rejects_a_non_list_verify(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(verify=value)
+    assert "verify" in str(excinfo.value)
+
+
+def test_run_config_accepts_allow_no_verification_true():
+    dumped = models.RunConfig(allow_no_verification=True).model_dump(mode="json")
+
+    assert dumped["allow_no_verification"] is True
+    assert models.RunConfig.model_validate(dumped).allow_no_verification is True
+
+
+FALLBACK_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+def test_run_config_isolation_warning_defaults_to_none_and_round_trips():
+    """A5 spec test 1: defaulted, so a config recorded before the field validates."""
+    assert models.RunConfig().isolation_warning is None
+    legacy = models.RunConfig().model_dump(mode="json")
+    del legacy["isolation_warning"]
+    assert models.RunConfig.model_validate(legacy).isolation_warning is None
+
+    dumped = models.RunConfig(isolation_warning=FALLBACK_WARNING).model_dump(mode="json")
+
+    assert dumped["isolation_warning"] == FALLBACK_WARNING
+    assert models.RunConfig.model_validate(dumped).isolation_warning == FALLBACK_WARNING
 
 
 def test_story_rejects_a_negative_level():
@@ -1096,6 +1154,101 @@ def test_attempt_status_does_not_pick_up_cancelled(status):
     with pytest.raises(ValidationError):
         models.Attempt(n=1, dispatch=_dispatch(), status=status)
 
+
+# ── RunConfig harness timeouts (card 33dc5549) ──────────────────────────────
+
+
+def _bare_run(**overrides) -> models.Run:
+    fields = {
+        "id": "run-2026-10-06-01",
+        "workflow": "milestone",
+        "repo_dir": Path("/home/dev/agent-manager"),
+        "base_branch": "main",
+        "branch_prefix": "m1",
+    }
+    fields.update(overrides)
+    return models.Run(**fields)
+
+
+def test_run_config_harness_timeouts_default_to_none_and_empty():
+    config = models.RunConfig()
+    assert config.harness_timeout is None
+    assert config.harness_timeouts == {}
+    run = _bare_run()
+    assert run.config.harness_timeout is None
+    assert run.config.harness_timeouts == {}
+    dumped = config.model_dump(mode="json")
+    assert dumped["harness_timeout"] is None
+    assert dumped["harness_timeouts"] == {}
+    run_dumped = run.model_dump(mode="json")["config"]
+    assert run_dumped["harness_timeout"] is None
+    assert run_dumped["harness_timeouts"] == {}
+
+
+def test_run_config_accepts_a_harness_timeout_and_per_phase_map():
+    config = models.RunConfig(
+        harness_timeout=900.0, harness_timeouts={"implement": 3600.0, "resolve": 600.0}
+    )
+    assert config.harness_timeout == 900.0
+    assert config.harness_timeouts == {"implement": 3600.0, "resolve": 600.0}
+    dumped = config.model_dump(mode="json")
+    assert dumped["harness_timeout"] == 900.0
+    assert dumped["harness_timeouts"] == {"implement": 3600.0, "resolve": 600.0}
+    assert models.RunConfig.model_validate(dumped) == config
+    run = _bare_run(config=config)
+    assert models.Run.model_validate(run.model_dump(mode="json")) == run
+
+
+def test_run_config_accepts_a_harness_timeout_below_the_cli_floor():
+    """C8: the 60 s floor is the CLI's. A test records a 2 s timeout directly."""
+    config = models.RunConfig(harness_timeout=2.0, harness_timeouts={"implement": 2.0})
+    assert config.harness_timeout == 2.0
+    assert config.harness_timeouts == {"implement": 2.0}
+    above = models.RunConfig(harness_timeout=86401.0)
+    assert above.harness_timeout == 86401.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
+def test_run_config_rejects_a_non_finite_or_non_positive_harness_timeout(value):
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeout=value)
+    assert "harness_timeout" in str(excinfo.value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeouts={"implement": value})
+    assert "harness_timeouts" in str(excinfo.value)
+
+
+def test_run_config_rejects_an_empty_phase_key():
+    with pytest.raises(ValidationError) as excinfo:
+        models.RunConfig(harness_timeouts={"": 600.0})
+    assert "harness_timeouts" in str(excinfo.value)
+
+
+def test_run_config_loads_a_payload_written_before_harness_timeouts():
+    """Additive: a config or run dict with neither key still loads."""
+    old_config = {
+        "max_concurrent_stories": 2,
+        "dry_run": False,
+        "launcher": "direct",
+        "harness_map": {},
+        "story_id": None,
+    }
+    config = models.RunConfig.model_validate(old_config)
+    assert config.harness_timeout is None
+    assert config.harness_timeouts == {}
+    old_run = {
+        "id": "run-2026-10-06-01",
+        "workflow": "milestone",
+        "repo_dir": "/home/dev/agent-manager",
+        "base_branch": "main",
+        "branch_prefix": "m1",
+        "status": "started",
+        "config": old_config,
+    }
+    run = models.Run.model_validate(old_run)
+    assert run.config.harness_timeout is None
+    assert run.config.harness_timeouts == {}
 
 def test_run_config_max_limit_wait_defaults_to_never_waiting_and_is_bounded_below():
     assert models.RunConfig().max_limit_wait_hours == 0.0

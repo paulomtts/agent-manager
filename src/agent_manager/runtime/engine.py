@@ -172,8 +172,12 @@ async def run_subtask_async(
     binding.update(walk._document_paths(workflow, card))
 
     # Compiled first on both paths: it registers the digest-prefixed tools
-    # that `Agent.from_dict` below resolves by name from `ToolRegistry`.
-    compiled = C.compile_workflow(workflow)
+    # that `Agent.from_dict` below resolves by name from `ToolRegistry`. The
+    # runner's per-phase launcher seconds derive the agent turn timeouts (G2);
+    # a runner without `timeout_for` (every fake) keeps the declared ones.
+    compiled = C.compile_workflow(
+        workflow, launcher_timeout=getattr(agent_runner, "timeout_for", None)
+    )
     resumed_at: str | None = None
     # Out-of-band lines for `summary.warnings`, handed to `RunDeps` below.
     warnings: list[str] = []
@@ -237,6 +241,7 @@ async def run_subtask_async(
             stop=stop,
             adopt=adopt,
             warnings=warnings,
+            compiled=compiled,
         )
         summary = await _run(agent, deps)
         summary.resumed_at = resumed_at

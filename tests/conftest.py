@@ -43,6 +43,7 @@ from pathlib import Path, PurePath
 import pytest
 
 from agent_manager import board
+from agent_manager.harness import launcher as harness_launcher
 
 
 def _real_data_dir() -> Path:
@@ -366,6 +367,42 @@ def unit_tier_path_shim(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}")
 
 
+_PROBE_TIERS = frozenset({"e2e_fake", "e2e", "soak"})
+"""Tiers whose tests run the real isolation probe (A5 test harness rule)."""
+
+_LAUNCHER_TESTS = "harness/test_launcher.py"
+"""The module that manages the probe cache itself and tests the real runner."""
+
+
+def stubs_isolation_probe(markers: Iterable[str], rel_path: PurePath | None) -> bool:
+    """Whether an item gets the stubbed probe: not in a process tier, not the launcher tests."""
+    if _PROBE_TIERS.intersection(markers):
+        return False
+    return rel_path is None or rel_path.as_posix() != _LAUNCHER_TESTS
+
+
+@pytest.fixture(autouse=True)
+def stubbed_isolation_probe(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Generator[None, None, None]:
+    """Make every isolation mode "available" without spawning a probe.
+
+    `probe` caches per process and `bwrap`/`unshare` are not among the PATH
+    stubs, so without this a unit or git test resolving `--isolation auto`
+    would spawn the real probe, and its answer would leak into every later
+    test. The cache is cleared before and after; a test that needs
+    "unavailable" patches `default_probe_runner` itself, after this runs.
+    """
+    markers = [mark.name for mark in request.node.iter_markers()]
+    if not stubs_isolation_probe(markers, relative_to_tests(request.path)):
+        yield
+        return
+    harness_launcher.clear_probe_cache()
+    monkeypatch.setattr(harness_launcher, "default_probe_runner", lambda argv: 0)
+    yield
+    harness_launcher.clear_probe_cache()
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
@@ -390,17 +427,23 @@ BINARY_TIERS = ("git", "brd")
 
 
 def missing_binary(
-    markers: Iterable[str], which: Callable[[str], str | None] | None = None
+    markers: Iterable[str],
+    which: Callable[[str], str | None] | None = None,
+    *,
+    among: Sequence[str] = BINARY_TIERS,
 ) -> str | None:
-    """The first of `git`, `brd` that `markers` names and `which` cannot find, or None.
+    """The first name of `among` that `markers` names and `which` cannot find, or None.
 
     `markers` is every marker name on the item's chain. `which` defaults to
-    `shutil.which`, looked up at call time. Items with neither marker are never
-    reported, whatever `which` says.
+    `shutil.which`, looked up at call time. `among` defaults to `BINARY_TIERS`
+    (`git`, then `brd`), so the setup hook and the e2e `toolchain` gate never
+    report anything else; a caller that needs a binary that is not a tier (the
+    agent-signal proofs' `bwrap`, card 4a3e0414) names it there. Names outside
+    `among` are never reported, whatever `which` says.
     """
     names = set(markers)
     lookup = shutil.which if which is None else which
-    for name in BINARY_TIERS:
+    for name in among:
         if name in names and lookup(name) is None:
             return name
     return None

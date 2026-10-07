@@ -1622,9 +1622,16 @@ def preflight_milestone(
     base_branch: str | None = None,
     branch_prefix: str | None = None,
     max_concurrent: int = 1,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
     resume_run_id: str | None = None,
     driver: Driver | None = None,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> MilestonePreflight:
     """Stage 1 of a milestone run: every read and refusal, then the run record (card 5daa944e).
 
@@ -1635,14 +1642,28 @@ def preflight_milestone(
     read-only, before `refresh_git` and before any store, so a key another
     live run holds leaves no fetch, prune, run row or run directory. A fresh
     run then refreshes git (its first side effect, still before the store),
-    reads the clock and mints the run id; a resume keeps its own id and
-    refreshes git later, under the lease. The store is never opened here.
+    reads the clock, mints the run id and builds a record whose config
+    carries `commands` as its `verify` suite and `allow_no_verification`; a
+    resume keeps its own id, records `commands` and `allow_no_verification`
+    as its config's suite and opt-out (its other config fields are the
+    recorded ones), and refreshes git later, under the lease. The store is
+    never opened here.
+
+    `launcher` and `isolation_warning` are what `cli` resolved (A5): a fresh
+    run records them, `None` recording `direct`; a resume replaces the
+    recorded pair only when `launcher` is given, else keeps it.
 
     A resumed run whose `config.story_id` is set is a story run: its story
     must still be a child of the milestone (else `runs.NotResumableError`,
     before any write and before git), and its plan, levels, tips and claim
     keys are `_story_plan`'s, as a fresh `preflight_story` computes them,
     `errors.StoryBlockedError` for a re-opened blocker included.
+
+    `harness_override` (card eee43099) is read only on a resume: it
+    replaces both of the recorded run's harness timeouts in `run_record`
+    (`runs.with_harness_override`), so the recorded stage writes it and the
+    engine binds it. A fresh run records `harness_timeout(s)` and never
+    reads it.
     """
     root = runs.resolve_repo_dir(repo_dir)
     resumed = None if resume_run_id is None else resumable_milestone_run(root, resume_run_id)
@@ -1700,15 +1721,37 @@ def preflight_milestone(
             branch_prefix=branch_prefix,
             status="started",
             started_at=started_at,
-            config=models.RunConfig(max_concurrent_stories=max_concurrent),
+            config=models.RunConfig(
+                max_concurrent_stories=max_concurrent,
+                verify=list(commands),
+                allow_no_verification=allow_no_verification,
+                launcher="direct" if launcher is None else launcher,
+                isolation_warning=isolation_warning,
+                harness_timeout=harness_timeout,
+                harness_timeouts=dict(harness_timeouts or {}),
+            ),
             milestone_id=milestone_card.id,
         )
     else:
         run_id = resumed.id
+        config_update: dict[str, Any] = {
+            "verify": list(commands),
+            "allow_no_verification": allow_no_verification,
+        }
+        if launcher is not None:
+            # `cli.resume_run` decided the mode: restored and re-probed, or
+            # `--isolation none`. `None` keeps the recorded mode and warning.
+            config_update["launcher"] = launcher
+            config_update["isolation_warning"] = isolation_warning
         # Stamps a run recorded before `milestone_id` existed, so the next
         # resume no longer needs the short-id fallback.
-        run_record = resumed.model_copy(
-            update={"status": "started", "milestone_id": milestone_card.id}
+        overridden = runs.with_harness_override(resumed, harness_override)
+        run_record = overridden.model_copy(
+            update={
+                "status": "started",
+                "milestone_id": milestone_card.id,
+                "config": overridden.config.model_copy(update=config_update),
+            }
         )
     return MilestonePreflight(
         root=root,
@@ -1840,8 +1883,14 @@ def preflight_story(
     repo_dir: Path,
     base_branch: str,
     branch_prefix: str,
+    commands: Sequence[str] = (),
+    allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
     driver: Driver | None = None,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> MilestonePreflight:
     """Stage 1 of a story run: `preflight_milestone`'s result, its plan cut to one story.
 
@@ -1856,7 +1905,8 @@ def preflight_story(
     refusal. Everything up to there is read-only; `refresh_git` is the first
     side effect, then the clock and the run id, minted from the story's id.
     The run is recorded as a milestone run of the parent milestone, one
-    story at a time, with `RunConfig.story_id` naming the story.
+    story at a time, with `RunConfig.story_id` naming the story and
+    `commands` and `allow_no_verification` as its suite and opt-out.
     """
     root = runs.resolve_repo_dir(repo_dir)
     roots = board.roots(repo_dir=root)
@@ -1883,7 +1933,16 @@ def preflight_story(
         branch_prefix=branch_prefix,
         status="started",
         started_at=started_at,
-        config=models.RunConfig(max_concurrent_stories=1, story_id=match.story.id),
+        config=models.RunConfig(
+            max_concurrent_stories=1,
+            story_id=match.story.id,
+            verify=list(commands),
+            allow_no_verification=allow_no_verification,
+            launcher="direct" if launcher is None else launcher,
+            isolation_warning=isolation_warning,
+            harness_timeout=harness_timeout,
+            harness_timeouts=dict(harness_timeouts or {}),
+        ),
         milestone_id=match.milestone.id,
     )
     return MilestonePreflight(
@@ -1994,6 +2053,10 @@ async def run_milestone_engine(
     root, plan, levels, tips = pre.root, pre.plan, pre.levels, pre.tips
     milestone_card, run_record, resumed = pre.milestone_card, pre.run_record, pre.resumed
     base_branch, branch_prefix = pre.base_branch, pre.branch_prefix
+    # Card eee43099: every lane, merged base and Integrate resolver of this
+    # run launches with the run's recorded harness timeouts; an injected
+    # factory (the test seam) is handed on unchanged.
+    runner_factory = cli.runner_factory_for(run_record.config, runner_factory)
 
     # Board-comments B7: any run's leftover comments on this milestone's
     # cards go out under this lease, before anything is driven; a board
@@ -2176,12 +2239,17 @@ def run_milestone(
     branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
     resume_run_id: str | None = None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of `milestone` as a grafo tree, and report (O6, T1-T6).
 
@@ -2227,7 +2295,9 @@ def run_milestone(
     (`find_run_milestone`), and the rest is what the run recorded too. Both a
     fresh and a resumed run are recorded with `milestone_id` set to the
     milestone card's full id, which stamps a run recorded before that field
-    existed. The plan is
+    existed. `harness_override` replaces both recorded harness timeouts of a
+    resumed run, and is recorded (card eee43099); a fresh run ignores it.
+    The plan is
     re-derived from the board as a fresh run derives it. Every refusal -- an
     unknown, non-milestone, `cancelled` or `done` run, an unknown milestone, a blocker
     cycle, and a checkpoint saved under another workflow digest -- comes
@@ -2279,12 +2349,17 @@ def run_milestone(
             branch_prefix=branch_prefix,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
             max_concurrent=max_concurrent,
             resume_run_id=resume_run_id,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
+            harness_override=harness_override,
         )
     )
 
@@ -2320,12 +2395,17 @@ async def _run_milestone_async(
     branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
     resume_run_id: str | None = None,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
+    harness_override: runs.HarnessOverride | None = None,
     slots: asyncio.Semaphore | None = None,
 ) -> dict[str, Any]:
     """`run_milestone`'s body without its argument validation, awaitable in a
@@ -2356,9 +2436,16 @@ async def _run_milestone_async(
         base_branch=base_branch,
         branch_prefix=branch_prefix,
         max_concurrent=max_concurrent,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         resume_run_id=resume_run_id,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
+        harness_override=harness_override,
     )
     with recorded_milestone_run(pre) as recorded:
         return await run_milestone_engine(
@@ -2380,10 +2467,14 @@ def run_story(
     branch_prefix: str,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive every remaining subtask of one story through the milestone engine, and report.
 
@@ -2408,10 +2499,14 @@ def run_story(
             branch_prefix=branch_prefix,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
         )
     )
 
@@ -2424,10 +2519,14 @@ async def _run_story_async(
     branch_prefix: str,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`run_story`'s body, awaitable in a caller's own event loop."""
     pre = preflight_story(
@@ -2435,8 +2534,14 @@ async def _run_story_async(
         repo_dir=repo_dir,
         base_branch=base_branch,
         branch_prefix=branch_prefix,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     with recorded_milestone_run(pre) as recorded:
         return await run_milestone_engine(
@@ -2500,11 +2605,15 @@ def detach_milestone(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     max_concurrent: int = 1,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --milestone --detach` (card aff9fdbf): stages 1 and 2 here, stage 3 in a child.
 
@@ -2518,8 +2627,14 @@ def detach_milestone(
         base_branch=base_branch,
         branch_prefix=branch_prefix,
         max_concurrent=max_concurrent,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     return _detach_recorded(
         pre,
@@ -2540,10 +2655,14 @@ def detach_story(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`run_story` with its run handed to a detached child: stages 1 and 2 here, stage 3 there.
 
@@ -2557,8 +2676,14 @@ def detach_story(
         repo_dir=repo_dir,
         base_branch=base_branch,
         branch_prefix=branch_prefix,
+        commands=commands,
+        allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
     return _detach_recorded(
         pre,
@@ -2852,10 +2977,14 @@ def run_board_engine(
     *,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Stage 2 of a board run: run the board `pre` approved, and report (card 203a9a5e).
 
@@ -2866,7 +2995,8 @@ def run_board_engine(
     `escalated` entry. With nothing open it returns `ok` with no milestones and
     starts no event loop. Otherwise one `asyncio.run(_run_board_async(...))`
     on `pre.max_concurrent`, and `run_board`'s payload with `pre.levels_payload`
-    as its `levels`. Synchronous; does not mutate `pre`.
+    as its `levels`. Synchronous; does not mutate `pre`. `harness_timeout(s)` are
+    handed to every milestone run it starts (card 33dc5549).
     """
     if not pre.milestones:
         return {"ok": True, "board": True, "levels": pre.levels_payload, "milestones": []}
@@ -2878,11 +3008,15 @@ def run_board_engine(
             root=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
             max_concurrent=pre.max_concurrent,
             control_interval=control_interval,
+            harness_timeout=harness_timeout,
+            harness_timeouts=harness_timeouts,
         )
     )
     return {
@@ -2900,11 +3034,15 @@ def run_board(
     branch_prefix_of: Callable[[models.CardNode], str],
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     max_concurrent: int = 1,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Drive every open milestone on the board as one grafo tree, and report.
 
@@ -2959,10 +3097,14 @@ def run_board(
         pre,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         runner_factory=runner_factory,
         driver=driver,
         clock=clock,
         control_interval=control_interval,
+        harness_timeout=harness_timeout,
+        harness_timeouts=harness_timeouts,
     )
 
 
@@ -2984,11 +3126,15 @@ def detach_board(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     max_concurrent: int = 1,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
     control_interval: float = control.CONTROL_POLL_SECONDS,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """`am run --board --detach` (card 03f027ea): pre-flight here, the board run in a child.
 
@@ -3033,10 +3179,14 @@ def detach_board(
                 pre,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=launcher,
+                isolation_warning=isolation_warning,
                 runner_factory=runner_factory,
                 driver=driver,
                 clock=clock,
                 control_interval=control_interval,
+                harness_timeout=harness_timeout,
+                harness_timeouts=harness_timeouts,
             )
         except cli.HANDLED as error:
             detach.write_board_report(report, cli.render(cli.error_envelope(error)))
@@ -3063,11 +3213,15 @@ async def _run_board_async(
     root: Path,
     commands: Sequence[str],
     allow_no_verification: bool,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None,
     driver: Driver | None,
     clock: Callable[[], datetime],
     max_concurrent: int,
     control_interval: float,
+    harness_timeout: float | None = None,
+    harness_timeouts: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """`run_board`'s one event loop: one entry per milestone, in `milestones` order.
 
@@ -3112,11 +3266,15 @@ async def _run_board_async(
                     branch_prefix=prefixes[card.id],
                     commands=commands,
                     allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
                     runner_factory=runner_factory,
                     driver=driver,
                     clock=clock,
                     max_concurrent=max_concurrent,
                     control_interval=control_interval,
+                    harness_timeout=harness_timeout,
+                    harness_timeouts=harness_timeouts,
                     slots=slots,
                 )
             except Exception as error:

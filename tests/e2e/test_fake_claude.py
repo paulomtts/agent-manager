@@ -34,10 +34,12 @@ import ast
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -1731,3 +1733,297 @@ def test_a_blocking_critic_process_writes_the_blocked_result(tmp_path, monkeypat
     assert payload["blockers"] is True
     assert payload["reason"] == fake_claude.CRITIC_BLOCK_REASON
     assert json.loads(budget.read_text(encoding="utf-8")) == {"validate_spec": 0}
+
+
+# --- the pkill marker (card 4a3e0414) ---------------------------------------
+
+BWRAP_INIT = [
+    "bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+    "--unshare-pid", "--die-with-parent", "--new-session", "claude",
+]
+"""`/proc/1/cmdline` as the fake sees it inside `launcher.BWRAP_PREFIX`'s namespace."""
+
+
+def _never_read_init():
+    raise AssertionError("/proc/1 must not be read for a list with no empty pattern")
+
+
+def test_the_pkill_marker_name_is_the_conftest_twin():
+    """The proofs write `FAKE_PKILL_MARKER`; the script reads `PKILL_MARKER`."""
+    assert fake_claude.PKILL_MARKER == "fake-claude-pkill"
+    assert fake_claude.PKILL_MARKER == _conftest_constant("FAKE_PKILL_MARKER")
+
+
+def test_a_pkill_marker_is_a_json_list_of_patterns_the_empty_one_included():
+    marker = Path("/repo/.git/fake-claude-pkill")
+
+    assert fake_claude.parse_pkill_marker('["test -n x", ""]', marker) == ["test -n x", ""]
+    assert fake_claude.parse_pkill_marker("[]", marker) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["not json", '{"pattern": "x"}', '"x"', '["x", 1]', "[null]", '[["x"]]'],
+    ids=["invalid-json", "object", "string", "int-element", "null-element", "list-element"],
+)
+def test_a_malformed_pkill_marker_is_refused_naming_its_path(text):
+    marker = Path("/repo/.git/fake-claude-pkill")
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.parse_pkill_marker(text, marker)
+
+    assert str(marker) in str(caught.value)
+
+
+def test_the_pkill_runner_runs_each_pattern_in_order_and_records_its_exit():
+    calls = []
+    codes = iter([1, 0])
+
+    def runner(argv):
+        calls.append(argv)
+        return next(codes)
+
+    results = fake_claude.run_pkills(
+        ["test -n am-a6-x", ""], runner=runner, read_init=lambda: BWRAP_INIT
+    )
+
+    assert calls == [["pkill", "-f", "test -n am-a6-x"], ["pkill", "-f", ""]]
+    assert results == [
+        {"pattern": "test -n am-a6-x", "returncode": 1},
+        {"pattern": "", "returncode": 0},
+    ]
+
+
+def test_sigterm_is_ignored_while_the_pkills_run_and_restored_after():
+    def handler(signum, frame):
+        pass
+
+    seen = []
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        fake_claude.run_pkills(
+            ["a", "b"],
+            runner=lambda argv: seen.append(signal.getsignal(signal.SIGTERM)) or 1,
+            read_init=_never_read_init,
+        )
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert seen == [signal.SIG_IGN, signal.SIG_IGN]
+    assert after is handler
+
+
+def test_sigterm_is_restored_even_when_a_pkill_raises():
+    """Review focus 1: `pkill` missing must not leave the fake deaf to SIGTERM."""
+
+    def handler(signum, frame):
+        pass
+
+    def runner(argv):
+        raise FileNotFoundError("pkill")
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        with pytest.raises(FileNotFoundError):
+            fake_claude.run_pkills(["a"], runner=runner, read_init=_never_read_init)
+        after = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert after is handler
+
+
+@pytest.mark.parametrize(
+    "init",
+    [
+        ["/usr/lib/systemd/systemd", "--switched-root"],
+        ["/sbin/init"],
+        [],
+        ["/usr/bin/python3", "bwrap"],
+        ["/opt/bwrapper"],
+    ],
+    ids=["systemd", "init", "unreadable", "bwrap-not-first", "bwrap-prefix-only"],
+)
+def test_an_empty_pattern_outside_bwrap_is_refused_before_any_pkill_runs(init):
+    """Un-isolated, `pkill -f ''` signals every process of this user: the guard
+    must stop the whole list, the safe patterns before it included. Review focus 2."""
+    calls = []
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.run_pkills(
+            ["a-safe-pattern", ""],
+            runner=lambda argv: calls.append(argv) or 0,
+            read_init=lambda: init,
+        )
+
+    assert calls == []
+    assert "refusing `pkill -f ''` outside a bwrap PID namespace" in str(caught.value)
+
+
+@pytest.mark.parametrize("first", ["bwrap", "/usr/bin/bwrap"])
+def test_bwrap_is_judged_by_proc_1s_first_argument_basename(first):
+    assert fake_claude.in_bwrap_namespace([first, "--bind", "/", "/"]) is True
+    assert fake_claude.in_bwrap_namespace([]) is False
+
+
+def test_an_unreadable_proc_1_reads_as_no_argv(tmp_path):
+    """Review focus 3: hidepid or no /proc means "not bwrap", never a crash."""
+    assert fake_claude.init_argv(tmp_path / "no-such-cmdline") == []
+
+
+def test_init_argv_splits_a_cmdline_file_on_nul(tmp_path):
+    cmdline = tmp_path / "cmdline"
+    cmdline.write_bytes(b"bwrap\0--bind\0/\0/\0")
+
+    assert fake_claude.init_argv(cmdline) == ["bwrap", "--bind", "/", "/"]
+
+
+def test_an_empty_marker_list_runs_nothing_and_reads_no_proc():
+    """Review focus 4."""
+    calls = []
+
+    results = fake_claude.run_pkills(
+        [], runner=lambda argv: calls.append(argv) or 0, read_init=_never_read_init
+    )
+
+    assert results == []
+    assert calls == []
+
+
+def _implement_brief(tmp_path):
+    """An implement brief whose result path names a card, as `paths.attempt_dir` does."""
+    result_path = _hold_result_path(tmp_path)
+    result_path.parent.mkdir(parents=True)
+    prompt_path = _brief(
+        tmp_path,
+        "implement",
+        "coder",
+        f"\n## plan_path\n{PLAN_RELATIVE}\n\n## plan_hash\n{BRIEF_HASH}\n",
+        IMPLEMENT_SCHEMA,
+        result_path,
+    )
+    return prompt_path, result_path
+
+
+def _p_argv(prompt_path):
+    return ["-p", f"Read {prompt_path} and follow the instructions in it exactly."]
+
+
+def _log_entries(tmp_path):
+    log = tmp_path / "runs" / "r1" / fake_claude.LOG_NAME
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.git
+def test_without_a_pkill_marker_there_are_no_patterns(tmp_path):
+    repo = _implement_repo(tmp_path)
+
+    assert fake_claude.pkill_patterns(repo) is None
+
+
+@pytest.mark.git
+def test_a_cwd_outside_any_repo_has_no_pkill_patterns(tmp_path):
+    """No repo, no common dir, so no marker: the implement's other failures
+    (a bad rendezvous count) must still surface as themselves."""
+    _implement_repo(tmp_path)
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+
+    assert fake_claude.pkill_patterns(elsewhere) is None
+
+
+@pytest.mark.git
+def test_a_pkill_marker_in_the_git_common_dir_is_found_from_the_repo(tmp_path):
+    repo = _implement_repo(tmp_path)
+    (repo / ".git" / fake_claude.PKILL_MARKER).write_text(
+        json.dumps(["test -n x", ""]), encoding="utf-8"
+    )
+
+    assert fake_claude.pkill_patterns(repo) == ["test -n x", ""]
+
+
+@pytest.mark.git
+def test_without_a_pkill_marker_an_implement_logs_no_pkill_key(tmp_path, monkeypatch):
+    monkeypatch.delenv(fake_claude.HOLD_DIR_ENV, raising=False)
+    monkeypatch.delenv(fake_claude.RENDEZVOUS_DIR_ENV, raising=False)
+    repo = _implement_repo(tmp_path)
+    prompt_path, result_path = _implement_brief(tmp_path)
+    monkeypatch.chdir(repo)
+
+    assert fake_claude.main(_p_argv(prompt_path)) == 0
+
+    (entry,) = _log_entries(tmp_path)
+    assert set(entry) == {"phase", "cwd", "result_path"}
+    assert result_path.is_file()
+
+
+@pytest.mark.git
+def test_an_empty_pattern_outside_bwrap_stops_main_before_any_pkill_or_write(
+    tmp_path, monkeypatch
+):
+    """The guard, wired into `main`. `run_pkill` is replaced first, so even a
+    broken guard could not spawn a real `pkill -f ''` from this test."""
+    monkeypatch.delenv(fake_claude.HOLD_DIR_ENV, raising=False)
+    monkeypatch.delenv(fake_claude.RENDEZVOUS_DIR_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(fake_claude, "run_pkill", lambda argv: calls.append(argv) or 0)
+    monkeypatch.setattr(fake_claude, "init_argv", lambda path=None: ["/sbin/init"])
+    repo = _implement_repo(tmp_path)
+    (repo / ".git" / fake_claude.PKILL_MARKER).write_text(
+        json.dumps(["a-safe-pattern", ""]), encoding="utf-8"
+    )
+    before = _head(repo)
+    prompt_path, result_path = _implement_brief(tmp_path)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError):
+        fake_claude.main(_p_argv(prompt_path))
+
+    assert calls == []
+    assert not result_path.exists()
+    assert _head(repo) == before
+
+
+@pytest.mark.git
+def test_a_malformed_pkill_marker_stops_main_before_anything_is_written(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(fake_claude.HOLD_DIR_ENV, raising=False)
+    monkeypatch.delenv(fake_claude.RENDEZVOUS_DIR_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(fake_claude, "run_pkill", lambda argv: calls.append(argv) or 0)
+    repo = _implement_repo(tmp_path)
+    marker = repo / ".git" / fake_claude.PKILL_MARKER
+    marker.write_text('{"not": "a list"}', encoding="utf-8")
+    before = _head(repo)
+    prompt_path, result_path = _implement_brief(tmp_path)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(fake_claude.FakeClaudeError) as caught:
+        fake_claude.main(_p_argv(prompt_path))
+
+    assert str(marker) in str(caught.value)
+    assert calls == []
+    assert not result_path.exists()
+    assert _head(repo) == before
+
+
+@pytest.mark.e2e_fake
+def test_the_fake_process_runs_the_pkill_marker_and_logs_each_result(tmp_path):
+    """`main` wires the marker in: a pattern that matches nothing exits 1, is
+    recorded, and the implement still writes its normal result."""
+    repo = _implement_repo(tmp_path)
+    pattern = f"fake-claude-matches-nothing-{uuid.uuid4().hex}"
+    (repo / ".git" / fake_claude.PKILL_MARKER).write_text(
+        json.dumps([pattern]), encoding="utf-8"
+    )
+    prompt_path, result_path = _implement_brief(tmp_path)
+
+    completed = _run_fake(prompt_path, repo)
+
+    assert completed.returncode == 0, completed.stderr
+    (entry,) = _log_entries(tmp_path)
+    assert entry["phase"] == "implement"
+    assert entry["pkill"] == [{"pattern": pattern, "returncode": 1}]
+    assert json.loads(result_path.read_text(encoding="utf-8"))["plan_hash"] == BRIEF_HASH

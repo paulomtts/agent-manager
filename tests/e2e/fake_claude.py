@@ -15,7 +15,10 @@ test-controlled inputs, and none tells the fake anything the brief owns:
 `REVIEW_FAIL_MARKER`, a file in the repo's git common dir that the fake finds
 from its own cwd and compares with the brief's `## branch`;
 `IMPLEMENT_EDITS_MARKER`, a JSON file beside it giving the files an implement
-writes for the brief's `## branch`; the implement-only rendezvous
+writes for the brief's `## branch`; `PKILL_MARKER`, a JSON list beside them of
+`pkill -f` patterns every implement runs after its hold, with SIGTERM
+ignored, the empty pattern only inside a bwrap PID namespace (card
+4a3e0414); the implement-only rendezvous
 (`RENDEZVOUS_DIR_ENV` / `RENDEZVOUS_COUNT_ENV`), which only makes implement
 wait for other lanes and changes nothing it writes; `RESOLVER_ENV`, which
 only makes the resolve phase leave the merge it was given unfinished while
@@ -35,6 +38,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -527,6 +531,101 @@ def review_fail_branches(cwd):
     }
 
 
+PKILL_MARKER = "fake-claude-pkill"
+"""A JSON file, in the repo's git common dir, of `pkill -f` patterns every implement runs.
+
+A JSON list of strings, run in list order: JSON so that the empty pattern
+`''` can be written. Found from this process's own cwd through
+`git rev-parse --git-common-dir`, like `REVIEW_FAIL_MARKER`, so it is in no
+worktree's tree. Not keyed by branch: every implement of the run runs the
+whole list, after the hold and before any work. The run-hardening proofs
+(card 4a3e0414) use it to make an agent signal everything it can see. No
+marker changes nothing, and the log entry gets no `pkill` key.
+"""
+
+PKILL_COMMAND = ("pkill", "-f")
+
+INIT_CMDLINE = Path("/proc/1/cmdline")
+"""Whose first argument says whether this process is inside bwrap's PID namespace."""
+
+
+def parse_pkill_marker(text, marker):
+    """The marker's patterns: a JSON list of strings, `""` included, or `FakeClaudeError`."""
+    try:
+        patterns = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise FakeClaudeError(
+            f"the pkill marker {marker} is not valid JSON: {error}"
+        ) from None
+    if not isinstance(patterns, list) or not all(
+        isinstance(pattern, str) for pattern in patterns
+    ):
+        raise FakeClaudeError(
+            f"the pkill marker {marker} is not a JSON list of pattern strings"
+        )
+    return patterns
+
+
+def pkill_patterns(cwd):
+    """The pkill marker's patterns, or `None` when there is no marker (or no repo)."""
+    try:
+        marker = _common_dir_file(cwd, PKILL_MARKER)
+    except FakeClaudeError:
+        return None  # not a git checkout: nowhere a marker could be
+    if not marker.is_file():
+        return None
+    return parse_pkill_marker(marker.read_text(encoding="utf-8"), marker)
+
+
+def init_argv(path=None):
+    """`/proc/1/cmdline` split on NUL, or `[]` when it cannot be read."""
+    try:
+        raw = (INIT_CMDLINE if path is None else Path(path)).read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "surrogateescape") for part in raw.split(b"\0") if part]
+
+
+def in_bwrap_namespace(argv):
+    """Whether pid 1 is bwrap: its first argument's basename is exactly `bwrap`."""
+    return bool(argv) and Path(argv[0]).name == "bwrap"
+
+
+def run_pkill(argv):
+    """Run one `pkill` argv quietly and return its exit code (1 = nothing matched)."""
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True).returncode
+
+
+def run_pkills(patterns, runner=None, read_init=None):
+    """Run `pkill -f <pattern>` per pattern, in order, and record each exit code.
+
+    Safety guard: an empty pattern runs only inside bwrap's PID namespace,
+    judged by `/proc/1`'s first argument. Otherwise the whole list is refused
+    before any pattern runs: un-isolated, `pkill -f ''` signals every process
+    of this user. SIGTERM, pkill's default signal, is ignored while the
+    pkills run, so `pkill -f ''` in the namespace does not end this fake, and
+    the previous handler is restored afterwards, error or not. `runner` and
+    `read_init` default to `run_pkill` and `init_argv`, looked up at call time.
+    """
+    if "" in patterns:
+        argv = (init_argv if read_init is None else read_init)()
+        if not in_bwrap_namespace(argv):
+            raise FakeClaudeError(
+                "refusing `pkill -f ''` outside a bwrap PID namespace: /proc/1 "
+                f"runs {argv[:1]!r}, and un-isolated it would signal every "
+                "process of this user"
+            )
+    run = run_pkill if runner is None else runner
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        return [
+            {"pattern": pattern, "returncode": run([*PKILL_COMMAND, pattern])}
+            for pattern in patterns
+        ]
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def log_path(result_path):
     """`<run dir>/fake-claude.log`, derived from the result path alone.
 
@@ -844,10 +943,19 @@ def main(argv):
     # Test scaffolding: park here, before any work, when the hold is armed.
     hold(phase, result_path)
     cwd = Path(os.getcwd())
+    # Test scaffolding: after the hold, so a held implement has signalled
+    # nothing yet, and before any work, so a refused marker writes nothing.
+    pkills = None
+    if phase == "implement":
+        patterns = pkill_patterns(cwd)
+        if patterns is not None:
+            pkills = run_pkills(patterns)
     payload = build_result(phase, payload_from_schema(schema_of(text)), text, cwd)
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     entry = {"phase": phase, "cwd": str(cwd), "result_path": str(result_path)}
+    if pkills is not None:
+        entry["pkill"] = pkills
     with log_path(result_path).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
     # stdout is a log, never a channel (D4); nothing reads it.

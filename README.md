@@ -15,13 +15,41 @@ See `docs/superpowers/specs/2026-09-23-agent-manager-design.md` for the design.
 uv tool install agent-manager     # or: pipx install agent-manager
 ```
 
-To work on agent-manager itself, clone the repository and run `uv sync`.
+To work on agent-manager itself, clone the repository and run `uv sync`. It builds the project venv that `uv run am` and the tests use; it does not touch the installed `am`.
+
+### Installing `am` from a checkout
+
+Runs execute the installed `am`, so install it as a regular, non-editable `uv tool` install of a built copy, never with `uv tool install -e` or `--editable`. An editable install points at the checkout, so merging, checking out or saving a file there changes the `am` that live runs execute.
+
+From a clean checkout of the verified commit, reinstall with:
+
+```bash
+uv tool install --reinstall .
+```
+
+Or build a wheel and install that:
+
+```bash
+uv build
+uv tool install --reinstall dist/*.whl
+```
+
+Afterwards the tool receipt must not mention `editable`, so this must print nothing:
+
+```bash
+grep editable "$(uv tool dir)/agent-manager/uv-receipt.toml"
+```
+
+Once it prints nothing, editing the checkout no longer changes what the installed `am` does.
+
+Reinstalling replaces the tool's virtual environment, so never do it while any `am` run is live. Run `am runs` first in each repository `am` drives: no run may show `lease.live` `true`.
 
 ## Requires
 
 - `git`
 - [`brd`](https://github.com/paulomtts/brd) — the board `am` drives
 - `claude` (Claude Code) on `PATH` — the only harness wired up today; Codex and Pi are planned
+- `bwrap` (bubblewrap) or `unshare` (util-linux), optional — `am run` starts every agent in a PID namespace of its own with one of them, so an agent cannot signal `am` (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)). Without either, runs go un-isolated with a warning.
 
 ## Usage
 
@@ -36,7 +64,9 @@ am run --card 19efcddc-0000-0000-0000-000000000000 \
   --verify "uv run ruff check"
 ```
 
-Pick a run back up where it was interrupted: a `--card` run's one stopped or killed subtask, at the phase it was interrupted in, or a `--milestone` run's whole milestone, under the same run id. There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here: they were decided when the run started and are recorded on the run. The verification suite is not recorded. A walk continued from a checkpoint keeps the suite and the opt-out the run started with, so on a `--card` run `--verify` and `--allow-no-verification` have no effect. The exception is a checkpoint declined because its worktree could not be kept (see [Resuming: what runs again](#resuming-what-runs-again)): that subtask is walked again from its first phase with the `--verify` commands and `--allow-no-verification` passed now, not the kept suite, and a `verification: kept from checkpoint: [...]` warning shown beside the decline warning is then stale. When `--verify` on a `--card` run differs from the kept suite, `data.warnings` names the kept suite as `verification: kept from checkpoint: [...]`. On a milestone run, pass the same `--verify` commands (or `--allow-no-verification`) again: they are what every subtask with no checkpoint, every merged base and Integrate run. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
+`--harness-timeout [PHASE=]SECONDS` sets how long one agent attempt may run before it is killed. It is repeatable: a bare `SECONDS` is the run's default for every agent phase, and `PHASE=SECONDS` overrides one phase. Seconds go from 60 to 86400; without the flag every attempt gets 1800. A `--card` or `--story` run accepts the task phases (`explore`, `spec`, `validate_spec`, `plan`, `validate_plan`, `implement`, `review`), and a `--milestone` or `--board` run also accepts `resolve`. A value that is not a number, out of bounds, or given twice, or a phase not in that list, is a usage error (exit 2) that lists the phases. The timeouts are recorded on the run, and ignored with `--dry-run`. An attempt that outlives its timeout is killed and recorded `harness_error`, and it is not dispatched again: its phase fails.
+
+Pick a run back up where it was interrupted: a `--card` run's one stopped or killed subtask, at the phase it was interrupted in, or a `--milestone` run's whole milestone, under the same run id. There is no `--base-branch`, no `--branch-prefix` and no `--max-concurrent` here: they were decided when the run started and are recorded on the run. So are the verification suite and the opt-out. With no `--verify`, the resume uses the recorded suite. A `--verify` passed now replaces the recorded suite for whatever starts afresh and is recorded in its place, and when it differs from the recorded one, `data.warnings` gains `verification: replaced in run record: [...]`, naming the suite it replaced. `--allow-no-verification` can only add the opt-out to a run that lacked it. A walk continued from a checkpoint keeps the suite and the opt-out the checkpoint was saved with, so on a `--card` run `--verify` and `--allow-no-verification` do not change that walk. The exception is a checkpoint declined because its worktree could not be kept (see [Resuming: what runs again](#resuming-what-runs-again)): that subtask is walked again from its first phase with the run's recorded suite (or the `--verify` passed now, which replaces it) and the run's opt-out, not the kept suite, and a `verification: kept from checkpoint: [...]` warning shown beside the decline warning is then stale. When `--verify` on a `--card` run differs from the kept suite, `data.warnings` names the kept suite as `verification: kept from checkpoint: [...]`. On a milestone run, the recorded suite (or the `--verify` passed now) is what every subtask with no checkpoint, every merged base and Integrate run. The run's isolation mode is restored as well. A resume keeps the harness timeouts the run recorded when `--harness-timeout` is not given. Given on resume, `--harness-timeout` replaces both the recorded default and the recorded per-phase overrides (they are not merged), and the new values are recorded, so a later resume keeps them. A phase the run cannot dispatch, `resolve` on a `--card` or `--story` run, is refused with exit 2 and nothing written. See [Relaunching resumes](#relaunching-resumes) for what a resume does and when it is refused.
 
 ```bash
 am resume 20260923T140506Z-19efcddc
@@ -107,6 +137,49 @@ am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run
 - With `--story` it behaves as with `--milestone`: the same pre-flight refusals before anything starts (`StoryBlockedError` included), the same envelope, and the same `run.log` and `report.json`.
 - With `--board`, the command runs the board's whole pre-flight here: the argument checks, the board read, the cycle check, each milestone's prefix and base, and the up-front claim check. A refusal is the usual envelope with exit code 3, and nothing starts. Then the board run moves to the background process. The envelope's `data` has the keys `board`, `detached`, `pid`, `log`, `report` and `levels`, and no `run_id`: each milestone's run is created when that milestone starts, and `am runs` or `am watch --all` finds it. `log` is `<data dir>/boards/<stamp>-<digest>.log` and `report` is `<data dir>/boards/<stamp>-<digest>.report.json`, where `<digest>` is the repository's digest. Both are mode 0600. The report holds the envelope `am run --board` would have printed. A claim another run takes after the up-front check shows up there as an `escalated` milestone.
 - Later versions may add keys to these envelopes. Ignore keys you do not know.
+
+#### Isolating agents with `--isolation`
+
+```bash
+am run --milestone "document milestone runs" --branch-prefix m3 --verify "uv run pytest" --isolation bwrap
+```
+
+An agent that stops a stuck test with `pkill -f pytest`, `killall python` or `kill -9 -1` can hit `am` itself and end the whole run. `--isolation` starts every agent in a PID namespace of its own, where it sees and can signal only its own process tree. It takes `auto` (the default), `bwrap`, `unshare` or `none`, and works with every form of `am run`: `--card`, `--milestone`, `--story` and `--board`, with or without `--detach`. It is ignored with `--dry-run`: a preview launches nothing and probes nothing.
+
+The mode is decided once, right after the argument checks and before the board is read, the run is recorded, its lease is taken or anything is forked:
+
+- `none`: agents run un-isolated. Nothing is probed and there is no warning.
+- `bwrap` or `unshare`: only that mode is probed, and there is no fallback. When it cannot start, the run is refused with `IsolationUnavailableError`, as `{"ok": false, "error": {"type": "IsolationUnavailableError", "message"}}`, and exit code 3, before anything is written: no run row, no run directory, no lease and no claim. The message is `isolation <mode> is unavailable: <reason> — pass --isolation none to run without it`. `<reason>` starts with the exact command the probe ran and ends with what went wrong (`exited 1`, `timed out after 10s`, or `could not start: ...`), so you can run that command by hand to see why.
+- `auto`: `bwrap` if it starts, else `unshare` (still isolated, no warning), else the run goes on un-isolated with the warning `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`. `auto` never refuses.
+
+A probe runs the mode's command on `true`, with a 10-second timeout, at most once per process for each mode.
+
+What each mode changes:
+
+- `bwrap` starts each agent under `bwrap --bind / / --dev-bind /dev /dev --proc /proc --unshare-pid --die-with-parent --new-session`. The whole filesystem stays bound read-write, so the worktree, `~/.claude`, caches and tools are exactly what they are un-isolated, and the network is untouched: `bwrap` here is not a filesystem or network sandbox. Only the PID namespace is new (`--unshare-pid`), with a fresh `/proc`, so inside it `ps` and `pkill -f` see only the agent's own process tree.
+- `unshare` starts each agent under `unshare --user --map-root-user --pid --fork --mount-proc`: a new user namespace and a new PID namespace. The user namespace is what lets an unprivileged user create the PID namespace, and it maps you to uid 0 inside, so file ownership looks different from inside the agent: your own files show as owned by `root`.
+
+Where you see which mode a run got:
+
+- The run records its mode as `config.launcher` (`direct` when un-isolated, else `bwrap` or `unshare`) and the `auto` warning as `config.isolation_warning` (`null` when there is none), for example in the journal head line's `payload.config`.
+- The warning is appended once to the envelope's `data.warnings`, at the top level (on `--board`, never inside a milestone's entry). With `--detach` it is in the hand-off envelope.
+- `am status <run-id>` always has a `warnings` key: `[]`, or a list holding the run's recorded isolation warning, so a detached run whose envelope is gone still says it is un-isolated.
+
+Every agent's brief also carries a "Process safety" block telling it never to use `pkill -f`, `pkill` by name, `killall`, `kill -1` or `kill` with a pattern, and to stop a stuck test with `timeout` or by a PID it recorded. That is advice an agent can ignore; isolation is the guarantee. `am resume` restores the mode a run recorded (see [Relaunching resumes](#relaunching-resumes)).
+
+#### Verification commands stay out of `ps`
+
+An agent's `pkill -f "uv run pytest"` matches every process whose command line holds that text, and `am run --verify "uv run pytest"` used to be one of them. So when `am run` or `am resume` is given at least one `--verify X` or `--verify=X` (before any `--`), `am` re-execs itself at once with a neutral command line: every `--verify` is removed, the hidden flag `--verify-from-env` takes their place, and the commands travel in the environment variable `AM_VERIFY_JSON`, a JSON list in command-line order. `pkill -f` matches command lines, never environments, so it can no longer match `am`. Every other token stays, so identity options such as `--milestone`, `--story` and `--branch-prefix` remain visible in `ps`:
+
+```text
+/usr/bin/python3 /home/me/.local/bin/am run --verify-from-env --milestone document milestone runs --branch-prefix m3
+```
+
+This holds for a foreground run, for a `--detach` run (the background process is forked after the re-exec, so it has the neutral command line too) and for `am resume`. The run reads `AM_VERIFY_JSON` once, at start, and removes it from its own environment, so no agent, verification command or other child process inherits it. Each `--verify` command still runs exactly as written.
+
+`--verify-from-env` is internal: it is what `ps` shows, not an option to type, and `--help` does not list it. Typed by hand it is a usage error (exit code 2, the message on stderr, the variable's value never echoed) when it is combined with `--verify`, when `AM_VERIFY_JSON` is unset, or when `AM_VERIFY_JSON` is not a JSON list of strings.
+
+If the re-exec itself fails, the run goes on with its original command line, verification text included, and the ok envelope's `data.warnings` ends with `argv: verification commands visible in the process command line`.
 
 #### Preview with `--dry-run`
 
@@ -184,7 +257,7 @@ A story run claims `card:<milestone>`, `card:<story>`, and the `card:<id>` and `
 Pause, resume, detach and preview:
 
 - `am pause`, `am cancel` and the escalation report work as on a milestone run (see [Pausing and cancelling a run](#pausing-and-cancelling-a-run) and [What an escalation report contains](#what-an-escalation-report-contains)).
-- `am resume <run-id>` continues that story alone, found from the run's recorded `config.story_id`, with no `--story`, `--branch-prefix` or `--base-branch`; pass your `--verify` commands again, as on a milestone run. It is refused with exit code 3, before anything is written, when the story is no longer a story of that milestone, and with `StoryBlockedError` when one of its blockers has re-opened. See [Relaunching resumes](#relaunching-resumes).
+- `am resume <run-id>` continues that story alone, found from the run's recorded `config.story_id`, with no `--story`, `--branch-prefix` or `--base-branch`; the recorded suite is restored; a `--verify` passed now replaces it, as on a milestone run. It is refused with exit code 3, before anything is written, when the story is no longer a story of that milestone, and with `StoryBlockedError` when one of its blockers has re-opened. See [Relaunching resumes](#relaunching-resumes).
 - `--detach` works with `--story` exactly as with `--milestone`: the same envelope, `run.log` and `report.json` (see [Running detached with `--detach`](#running-detached-with---detach)).
 - `--dry-run` previews the story and writes nothing. Its `data` is `{"max_concurrent": 1, "levels", "already_done", "integrate": null}`: one level holding the story alone, with its remaining subtasks and their `branch` and `base`. A done blocker the story stacks on gets no row, and `already_done` lists only this story's entries. It refuses everything the run refuses except `ClaimedError`, since a preview checks no claim.
 
@@ -483,9 +556,13 @@ skips every card already `done` on the board. A subtask that was stopped or
 killed part way picks up in its existing worktree and does not redo a plan
 that already passed. Relaunching a finished milestone drives no subtask but still runs [Integrate](#integrate). With every tip already merged, it merges nothing and dispatches no agent, runs the final check again, and reports `done` with an empty `completed` and an `integrated` whose `resolved` is empty. Relaunching after an Integrate escalation runs Integrate again, so commit your fix in the integration worktree first. A relaunch after an `am cancel` or an `am reset` ignores the canceled run's checkpoints, so a subtask that run left parked starts again from its first phase.
 
-`am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. Pass your `--verify` commands again: the suite is not recorded, and it is what every subtask with no checkpoint, every merged base and Integrate run. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished, was paused or was canceled, and 1 when it escalated again.
+`am resume <run-id>` on a milestone run continues that milestone under the same run id, instead of starting a new run. It finds the milestone from the run id, reads the board again and derives the plan exactly as a relaunch does (no story or milestone state is saved), and reuses the `branch_prefix`, `base_branch` and `max_concurrent_stories` the run recorded. Attempts left recorded `started` with no terminal event are marked `harness_error`, every open subtask recorded `stopped`, `escalated` or `started` is recorded `started` again, and the run goes on as a fresh one would, with the same scheduling and stop. Every open subtask with a checkpoint in this run continues from it; an escalated subtask continues at the phase that failed. A parked merged-base resolver continues from its own `base-<story id>` checkpoint, merged bases are built again (a tip already merged is skipped), and Integrate runs when every story finished clean. The run's recorded suite is restored, and it is what every subtask with no checkpoint, every merged base and Integrate run. A `--verify` passed now replaces it and is recorded in its place, and when it differs `data.warnings` gains `verification: replaced in run record: [...]`, naming the suite it replaced; `--allow-no-verification` can only add the opt-out. The report has the shape of a fresh run's, plus `resumed: true`, and `completed` lists only what finished in this invocation. It exits 0 when the milestone finished, was paused or was canceled, and 1 when it escalated again.
 
 A story run relaunches the same way: running the same `am run --story` command again starts a new run of that story that skips every subtask already `done` on the board. `am resume <run-id>` of a story run continues that story alone under the same run id, found from the run's recorded `config.story_id`, with its plan, root and claims worked out again from the board as a fresh `am run --story` would. It refuses, with exit code 3 and nothing written, when the story is no longer a story of the recorded milestone (`NotResumableError`), or when one of its blockers has re-opened (`StoryBlockedError`). A story run never runs Integrate, on a resume either.
+
+`am resume` restores the run's recorded isolation mode as well (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)). Its `--isolation` accepts only `none`; any other value is a usage error (exit 2). Omitted, a run recorded `bwrap` or `unshare` is probed again and refused with `IsolationUnavailableError` (exit code 3, nothing written) when this host can no longer start that mode, so a run recorded isolated never silently resumes un-isolated. A run recorded un-isolated (`direct`) stays un-isolated with no probe and keeps its recorded warning, if it has one, which `data.warnings` shows again. `--isolation none` runs the rest of the run un-isolated on purpose: nothing is probed, there is no warning, and the run record says so (`config.launcher` is `direct`, `config.isolation_warning` is `null`). The mode is decided after the canceled and live-lease refusals and before anything is written, and a carried warning comes in `data.warnings` before any `verification: replaced in run record: [...]` entry.
+
+Every resume, of a `--card`, `--milestone` or `--story` run, keeps the harness timeouts the run recorded when `--harness-timeout` is not given (see [Usage](#usage)). `am resume --harness-timeout` replaces both the recorded default and the recorded per-phase overrides; they are not merged, so `--harness-timeout 900` on a run started with `--harness-timeout implement=3600` leaves a default of 900 and no override. The new values are recorded, so a later resume keeps them. A phase the run cannot dispatch, `resolve` on a `--card` or `--story` run, is refused with exit 2 and nothing written. A relaunch (`am run` again) is a new run and takes only the `--harness-timeout` values given to it.
 
 A milestone resume refuses before anything is written and before git is fetched, with `{"ok": false, "error": {...}}` and exit code 3, when:
 
@@ -494,6 +571,7 @@ A milestone resume refuses before anything is written and before git is fetched,
 - the run is still live: another process holds its lease and its heartbeat is fresh (`RunIsLiveError`). Wait for that process to exit, or check `am status <run-id>`.
 - any open subtask, or any open `base-<story id>` resolver, has a checkpoint saved under a workflow that has changed since (its digest no longer matches). One stale checkpoint refuses the whole resume, and nothing is written. Relaunch with `am run --milestone` instead: a relaunch starts such a card again from its first phase rather than refusing.
 - the run id's milestone is not on the board, or more than one root card has its short id, or the stories now have a blocker cycle.
+- the run was recorded `bwrap` or `unshare` and this host can no longer start that mode (`IsolationUnavailableError`). Pass `--isolation none` to resume it un-isolated on purpose (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 On a `task` run (`am run --card`), `am resume <run-id>` continues one stopped (parked) or killed subtask from its newest checkpoint. It no longer refuses a stopped subtask. A checkpoint is saved before every phase runs, so the walk goes on at the interrupted phase, which runs again from its start, and nothing before that phase re-runs. A phase that finished just before the process was killed, before the next checkpoint was saved, depends on its kind: an agent phase is adopted and not dispatched again, and a step runs again (see [Resuming: what runs again](#resuming-what-runs-again)). Attempts left recorded `started` with no terminal event are marked `harness_error` first. `data` names the phase the walk continued at as `resumed_from` (`null` when the checkpoint was declined and the walk started over, see [Resuming: what runs again](#resuming-what-runs-again)) and lists the marked attempts as `discarded_attempts`. A resumed walk that ends `done`, `stopped` or `canceled` exits 0, and one that escalates exits 1 (unless a cancel was requested, which wins).
 
@@ -504,6 +582,7 @@ A `task` run's resume refuses before anything runs, with `{"ok": false, "error":
 - the run has no subtask recorded `started` or `stopped`, or more than one of them.
 - the run was canceled (`NotResumableError`). Start a fresh `am run --card`.
 - the run is still live: another process holds its lease and its heartbeat is fresh (`RunIsLiveError`). Wait for that process to exit, or check `am status <run-id>`.
+- the run was recorded `bwrap` or `unshare` and this host can no longer start that mode (`IsolationUnavailableError`). Pass `--isolation none` to resume it un-isolated on purpose (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 #### Pausing and cancelling a run
 
@@ -558,6 +637,8 @@ Which report you get when more than one thing happened:
 `am status <run-id>` always has a `control` key: `{"lease": {"pid", "host", "acquired_at", "heartbeat_at", "accepting", "live"} or null, "requests": [{"command", "requested_at", "handled_at"}], "claims": ["card:<id>", "branch:<name>", ...]}`. `claims` lists the keys the run's lease holds while it is live, and is empty otherwise (see [Several am processes](#several-am-processes)). `requests` lists the requests from every life of the run, in the order they were made, and `handled_at` is `null` until the run has acted on one. `live` is worked out when `am status` reads the lease; it is not stored. `accepting` turns `false` when the run is finishing.
 
 `am status <run-id>` also always has an `integrity` key: `{"checked", "reason", "mismatches"}`. It compares the run's journal, which `am` appends before every write, with the projection `am status` reads. The journal rebuilds only the run's tree (`runs`, `stories`, `subtasks`, `phases`, `attempts`); the six row-only tables (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`, `board_comments`) have no journal and are the projection's alone, so they are never compared. When no comparison was made, `checked` is `false` and `reason` says why: `"lease is live"` (a running process's writes in flight are not divergence), `"no journal"`, or `"journal unreadable: <error>"`. Otherwise `checked` is `true` and `reason` is `null`. Each entry of `mismatches` is `{"node", "field", "journal", "projection", "kind"}`: `node` is `{"story", "card", "phase", "attempt"}`, all `null` for the run itself; `field` is `"status"` when both sides have the node with different statuses and `null` when only one side has it; `journal` and `projection` are each side's status, `null` on the side that lacks the node. Only statuses and the tree's shape are compared. The check only reports: it writes nothing and never changes the exit code. A `stale` mismatch means the journal is ahead, and a resume or a rebuild moves the projection forward. A `foreign` mismatch means something other than `am` wrote this row.
+
+`am status <run-id>` also always has a `warnings` key: `[]`, or a list holding the run's isolation warning, `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`, when `--isolation auto` found neither `bwrap` nor `unshare` and the run went un-isolated (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
 

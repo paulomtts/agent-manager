@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_manager import census, dag, runs
+from agent_manager import census, dag, models, runs
 
 CARD_ID = "46244d0e-1111-2222-3333-444455556666"
 
@@ -418,3 +418,53 @@ def test_checkpoint_resume_phase_stays_in_cli():
 
     assert cli.checkpoint_resume_phase.__module__ == "agent_manager.cli"
     assert not hasattr(runs, "checkpoint_resume_phase")
+
+
+def _timed_run() -> models.Run:
+    return models.Run(
+        id="20261006T120000Z-eee43099",
+        workflow="task",
+        repo_dir=Path("/repo"),
+        base_branch="main",
+        branch_prefix="m1",
+        status="escalated",
+        config=models.RunConfig(harness_timeout=900.0, harness_timeouts={"implement": 3600.0}),
+    )
+
+
+def test_with_harness_override_none_keeps_the_run():
+    run = _timed_run()
+
+    assert runs.with_harness_override(run, None) is run
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ((600.0, {}), (600.0, {})),
+        ((None, {"plan": 120.0}), (None, {"plan": 120.0})),
+        ((60.0, {"review": 90.0}), (60.0, {"review": 90.0})),
+    ],
+)
+def test_with_harness_override_replaces_both_values_wholesale(override, expected):
+    """Review Focus 3: never merged -- a bare override clears the recorded map."""
+    run = _timed_run()
+
+    replaced = runs.with_harness_override(run, override)
+
+    assert (replaced.config.harness_timeout, replaced.config.harness_timeouts) == expected
+    assert replaced.config.max_concurrent_stories == run.config.max_concurrent_stories
+    assert (replaced.id, replaced.status) == (run.id, run.status)
+    assert (run.config.harness_timeout, run.config.harness_timeouts) == (
+        900.0,
+        {"implement": 3600.0},
+    )
+
+
+def test_with_harness_override_copies_the_map():
+    per_phase = {"plan": 120.0}
+
+    replaced = runs.with_harness_override(_timed_run(), (None, per_phase))
+    per_phase["plan"] = 1.0
+
+    assert replaced.config.harness_timeouts == {"plan": 120.0}

@@ -17,7 +17,7 @@ A workflow engine built as a functional core inside an imperative shell:
 - **Pure core.** Card derivations (`census`, `dag`), prompt resolution (`prompt`), result models (`results`) and pure gates (`steps/reducers.py`).
 - **Deterministic steps.** `steps/` holds git, verify and board writes. There are no model calls there.
 - **Truth and projection.** An append-only journal is the truth, with a SQLite projection (`store/`) next to it. Every write appends the journal line first, then writes the row, and is fenced by the lease.
-- **Thin adapters at the edges.** `board.py` (the `brd` CLI), `harness/` (agent processes), `locks.py`, `detach.py`.
+- **Thin adapters at the edges.** `board.py` (the `brd` CLI), `harness/` (agent processes), `locks.py`, `detach.py`, `argv_guard.py`.
 - **Use cases above all of it.** Run, resume, milestone and board runs, Integrate. A Typer shell (`cli/`) sits on top of the use cases and only parses options and renders output.
 
 ## 3. Layer order
@@ -35,7 +35,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 2 | Core | `dag` | Card identity, branch names, levels, stacking, `merge_order` |
 | 3 | Core | `prompt` | Resolves a phase's inputs and renders its prompt |
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
-| 5 | Adapters | `locks`, `detach`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; the harness Protocol (with its optional `limit_hit`) and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
+| 5 | Adapters | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; re-exec with a neutral argv; the harness Protocol (with its optional `limit_hit`) and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
 | 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`* | Replay and divergence; read models; per-table row types and SQL (they never commit) |
 | 7 | Adapters | *`store.writer`* | `Store`: every write, under one lock and fence (§6.4) |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
@@ -72,13 +72,13 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 50 `.py` files (44 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 52 `.py` files (46 modules plus 6 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
 | 0 | `__init__`, `harness/__init__`, `roles/__init__`, `runtime/__init__`, `steps/__init__`, `workflow/__init__`, `models`, `errors`, `runtime.errors`, `paths`, `runtime.stop`, `harness.limits` |
 | 1-4 | `census`, `results`, `roles.loader`, `steps.reducers`, `harness.claude_limits` (L1); `dag` (L2); `prompt` (L3); `workflow.phases` (L4) |
-| 5 | `locks`, `detach`, `harness.base`, `harness.claude` |
+| 5 | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude` |
 | 7 | `store` (splits into L5-L7) |
 | 8 | `board`, `control`, `harness.launcher`, `harness.registry` |
 | 9-10 | `steps.worktree`, `steps.verify`, `steps.plan_check`, `steps.rollup` (L9); `steps.docs_commit`, `steps.integrate` (L10) |
@@ -125,13 +125,14 @@ All 50 `.py` files (44 modules plus 6 `__init__.py`) appear here exactly once. `
 | 5.3 | `cli/` | `import typer` | holds (`cli.py:34`) |
 | 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129`, `control.py:20,210,251` |
 | 5.5 | `board.py` | builds or runs a `brd` argv | holds (`board.py:44-135`) |
-| 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:146`) |
+| 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:150`) |
 | 5.7 | `steps/worktree.py` (`run_git`) | runs `git`. Everyone else calls `worktree.run_git`. | holds |
 | 5.8 | `steps/verify.py` | runs the card's verification commands | holds |
 | 5.9 | `detach.py` | `os.fork`, `os.setsid` | holds (`detach.py:149,170`) |
 | 5.10 | `locks.py` | `fcntl` | holds |
 | 5.11 | `paths.py` | derives every path under `<data dir>`. Directories are created only by `paths.ensure`. | **violated:** `cli.py:2411` and `store.py:406` build paths by hand; `paths.py:18,33,57` call `mkdir` |
 | 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391` and `store.py:528` |
+| 5.15 | `argv_guard.py` | `os.execve` | holds (`argv_guard.py:91`) |
 
 Other rules:
 

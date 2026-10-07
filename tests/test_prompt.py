@@ -10,6 +10,7 @@ touch is pytest's `tmp_path`, and only where the module itself reads files
 import ast
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -653,13 +654,17 @@ def test_each_methodology_file_gets_its_own_heading_and_a_verbatim_body():
     assert PLANS_BODY.strip("\n") in brief
 
 
-def test_a_role_with_no_methodology_puts_the_rendered_prompt_straight_after_system():
+def test_a_role_with_no_methodology_puts_the_rendered_prompt_after_system_and_the_process_safety_block():
     role = _role(name="reviewer", system="# Reviewer\n\nYou review finished work.\n")
 
     brief = prompt.compose_brief(role, _rendered())
 
     assert prompt.METHODOLOGY_HEADING_PREFIX not in brief
-    assert brief.startswith("# Reviewer\n\nYou review finished work.\n\n# phase: implement\n")
+    assert brief.startswith(
+        "# Reviewer\n\nYou review finished work.\n\n"
+        + prompt.PROCESS_SAFETY_BLOCK
+        + "\n\n# phase: implement\n"
+    )
 
 
 def test_the_brief_carries_the_rendered_text_verbatim_and_ends_in_one_newline():
@@ -700,7 +705,7 @@ def test_trailing_blank_lines_in_system_text_collapse_to_one_separator():
 
     brief = prompt.compose_brief(role, _rendered())
 
-    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+    assert brief.startswith("# Coder\n\nDo the work.\n\n" + prompt.PROCESS_SAFETY_BLOCK + "\n\n")
 
 
 def test_system_text_with_no_trailing_newline_still_gets_one_blank_line():
@@ -708,7 +713,7 @@ def test_system_text_with_no_trailing_newline_still_gets_one_blank_line():
 
     brief = prompt.compose_brief(role, _rendered())
 
-    assert brief.startswith("# Coder\n\nDo the work.\n\n# phase: implement\n")
+    assert brief.startswith("# Coder\n\nDo the work.\n\n" + prompt.PROCESS_SAFETY_BLOCK + "\n\n")
 
 
 def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
@@ -718,6 +723,109 @@ def test_a_methodology_body_keeps_its_own_headings_and_interior_blank_lines():
     brief = prompt.compose_brief(role, _rendered())
 
     assert "## methodology: writing-plans.md\n" + body.strip("\n") in brief
+
+
+CARD_ROLES = {"coder", "resolver", "explorer", "reviewer"}
+"""The roles card 913e748a names; parametrizing over `list_roles()` must keep them."""
+
+assert CARD_ROLES <= set(roles_loader.list_roles())
+
+PHASE_LINE = re.compile(r"^# phase: ", re.M)
+"""Any line fake claude's `PHASE_HEADER` (`tests/e2e/fake_claude.py`) could anchor on."""
+
+
+def test_the_process_safety_block_names_every_forbidden_kill_and_the_safe_alternatives():
+    block = prompt.PROCESS_SAFETY_BLOCK
+
+    assert block.startswith("## Process safety\n")
+    assert block == block.strip("\n")
+    for literal in (
+        "`pkill -f`",
+        "`pkill` by name",
+        "`killall`",
+        "`kill -1`",
+        "`kill` with a pattern",
+        "`timeout`",
+        "PID",
+        "started",
+        "recorded",
+    ):
+        assert literal in block, literal
+
+
+def test_the_process_safety_block_cannot_be_mistaken_for_brief_structure():
+    block = prompt.PROCESS_SAFETY_BLOCK
+
+    lines = block.splitlines()
+    assert not any(line.startswith("# phase:") for line in lines)
+    assert not any(line.startswith("# role:") for line in lines)
+    assert prompt.RESULT_HEADING not in block
+    assert "```json" not in block
+    assert prompt.METHODOLOGY_HEADING_PREFIX not in block
+    assert prompt.FEEDBACK_HEADING not in block
+    assert "${" not in block
+
+
+@pytest.mark.parametrize("name", roles_loader.list_roles())
+def test_every_shipped_role_brief_carries_the_process_safety_block_once(name):
+    role = roles_loader.load_role(name)
+    rendered = _rendered()
+
+    brief = prompt.compose_brief(role, rendered)
+
+    block = prompt.PROCESS_SAFETY_BLOCK
+    assert brief.count(block) == 1
+    assert brief.index(role.system.strip("\n")) == 0
+    assert 0 < brief.index(block) < brief.index(rendered.text.strip("\n"))
+    if role.methodology:
+        first_heading = prompt.METHODOLOGY_HEADING_PREFIX + next(iter(role.methodology))
+        # Searched after the system text: shipped system.md files mention the
+        # `## methodology:` heading inline when they tell the agent to follow it.
+        assert brief.index(block) < brief.index(
+            "\n\n" + first_heading + "\n", len(role.system.strip("\n"))
+        )
+    assert len(PHASE_LINE.findall(brief)) == 1
+    assert brief == prompt.compose_brief(role, rendered)
+
+
+def test_the_process_safety_block_sits_between_system_and_methodology():
+    role = _role(
+        methodology={
+            "test-driven-development.md": TDD_BODY,
+            "writing-plans.md": PLANS_BODY,
+        }
+    )
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    positions = [
+        brief.index("# Coder"),
+        brief.index(prompt.PROCESS_SAFETY_BLOCK),
+        brief.index("## methodology: test-driven-development.md"),
+        brief.index("# phase: implement"),
+    ]
+    assert positions == sorted(positions)
+    assert len(set(positions)) == len(positions)
+
+
+def test_the_process_safety_block_is_present_without_methodology_contract_or_feedback():
+    system = "# Reviewer\n\nYou review finished work."
+    role = _role(name="reviewer", system=system)
+
+    brief = prompt.compose_brief(role, _rendered())
+
+    assert brief.startswith(
+        system + "\n\n" + prompt.PROCESS_SAFETY_BLOCK + "\n\n# phase: implement\n"
+    )
+    assert brief.count(prompt.PROCESS_SAFETY_BLOCK) == 1
+
+
+@pytest.mark.parametrize("system", ["\n", "\n\n"])
+def test_an_empty_system_text_brief_starts_with_the_process_safety_block(system):
+    brief = prompt.compose_brief(_role(system=system), _rendered())
+
+    assert brief.startswith(prompt.PROCESS_SAFETY_BLOCK + "\n\n# phase: implement\n")
+    assert brief.count(prompt.PROCESS_SAFETY_BLOCK) == 1
 
 
 def _shipped_coder_brief() -> str:
@@ -974,6 +1082,23 @@ def test_feedback_that_already_ends_in_newlines_does_not_accumulate_blank_lines(
 
     assert retry.startswith(base)
     assert retry.endswith(f"{prompt.FEEDBACK_HEADING}\n{FEEDBACK}\n")
+
+
+def test_feedback_still_appends_after_the_process_safety_block():
+    from agent_manager import dispatch
+
+    role = _role(methodology={"test-driven-development.md": TDD_BODY})
+    rendered = _rendered()
+
+    base = prompt.compose_brief(role, rendered)
+    retry = prompt.compose_brief(role, rendered, feedback=FEEDBACK)
+    dispatched_retry = dispatch._append_feedback(base, [FEEDBACK, FEEDBACK])
+
+    assert retry.startswith(base)
+    assert retry.count(prompt.PROCESS_SAFETY_BLOCK) == 1
+    assert retry.index(prompt.PROCESS_SAFETY_BLOCK) < retry.index(prompt.FEEDBACK_HEADING)
+    assert dispatched_retry.startswith(base)
+    assert dispatched_retry.count(prompt.PROCESS_SAFETY_BLOCK) == 1
 
 
 def test_input_names_are_exactly_the_resolver_table():

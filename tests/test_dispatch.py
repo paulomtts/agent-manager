@@ -580,7 +580,7 @@ def _runner(store, launcher, tmp_path, worktree, **overrides):
             "explorer": models.HarnessAssignment(harness=adapter.name, model="fake-model")
         },
         "role_root": tmp_path / "bundles",
-        "timeout": 45.0,
+        "harness_timeout": 45.0,
     }
     kwargs.update(overrides)
     return dispatch.AgentRunner(**kwargs), adapter
@@ -1070,6 +1070,229 @@ def test_a_timeout_is_never_redispatched(store, tmp_path, worktree):
     assert len(launcher.calls) == 1
     assert _attempt_statuses(store) == [(1, "started"), (1, "harness_error")]
     assert runner.warnings == []
+
+
+@dataclass
+class TimeoutRecordingLauncher(FakeLauncher):
+    """A `FakeLauncher` that also records the `timeout` keyword of every call."""
+
+    timeouts: list[float] = field(default_factory=list)
+
+    def __call__(self, argv, *, cwd, timeout, stdout_path) -> Outcome:
+        self.timeouts.append(timeout)
+        return super().__call__(argv, cwd=cwd, timeout=timeout, stdout_path=stdout_path)
+
+
+def _journalled_timeouts(opened) -> list[tuple[str | None, int | None, str, float]]:
+    """`(phase, attempt, status, dispatch.timeout)` of every journalled attempt."""
+    return [
+        (line.phase, line.attempt, line.payload["status"], line.payload["dispatch"]["timeout"])
+        for line in opened.journal.read()
+        if line.event == "attempt_upsert"
+    ]
+
+
+def _two_phase_workflow() -> phases.Workflow:
+    """Two agent phases, `explore` then `spec`, both role `explorer`."""
+    return phases.Workflow(
+        "two-phase",
+        (_model_phase(name="explore"), _model_phase(name="spec")),
+    )
+
+
+def _run_both_phases(runner, worktree: Path) -> None:
+    workflow = _two_phase_workflow()
+    runner(workflow.phase("explore"), _context(worktree), _rendered())
+    runner(
+        workflow.phase("spec"),
+        _context(worktree),
+        prompt.RenderedPrompt(
+            phase="spec", text="# phase: spec\n# role: explorer\n", sections=(("card", "{}"),)
+        ),
+    )
+
+
+def test_timeout_for_prefers_the_phase_override_then_the_run_default_then_1800(
+    store, tmp_path, worktree
+):
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    both, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"explore": 120.0},
+        harness_timeout=600.0,
+    )
+    assert both.timeout_for("explore") == 120.0
+    assert both.timeout_for("spec") == 600.0
+
+    neither = dispatch.AgentRunner(
+        store=store, launcher=launcher, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD
+    )
+    assert neither.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT == 1800.0
+
+    only_overrides, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"explore": 120.0},
+        harness_timeout=None,
+    )
+    assert only_overrides.timeout_for("spec") == 1800.0
+
+    # Review Focus 1: no bounds here -- D4 injects 2 s through this path.
+    sub_floor, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"explore": 2.0},
+        harness_timeout=2.5,
+    )
+    assert sub_floor.timeout_for("explore") == 2.0
+    assert sub_floor.timeout_for("spec") == 2.5
+
+    # Review Focus 2: an override for a phase never dispatched is just never read.
+    unknown, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"integrate": 300.0},
+        harness_timeout=600.0,
+    )
+    assert unknown.timeout_for("explore") == 600.0
+
+
+def test_the_production_runner_factory_resolves_1800_for_every_phase(store):
+    # Review Focus 3: production wiring of RunConfig is a sibling card's; until
+    # then the shipped runner keeps today's 1800 s everywhere.
+    _seed(store)
+    runner = cli.default_runner_factory(
+        store=store, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD
+    )
+
+    assert runner.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT
+    assert runner.timeout_for("review") == dispatch.DEFAULT_TIMEOUT
+
+
+def test_runners_do_not_share_one_overrides_table(store):
+    # Review Focus 4: `default_factory`, not one shared dict.
+    def build():
+        return dispatch.AgentRunner(
+            store=store,
+            launcher=FakeLauncher(results=[VALID_RESULT]),
+            run_id=RUN_ID,
+            story_id=STORY_ID,
+            card_id=CARD,
+        )
+
+    first, second = build(), build()
+    first.harness_timeouts["explore"] = 5.0
+
+    assert second.timeout_for("explore") == dispatch.DEFAULT_TIMEOUT
+
+
+def test_each_attempt_journals_the_timeout_resolved_for_its_phase(store, tmp_path, worktree):
+    launcher = FakeLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"explore": 120.0},
+        harness_timeout=600.0,
+    )
+
+    _run_both_phases(runner, worktree)
+
+    journalled = _journalled_timeouts(store)
+    assert [(phase, status) for phase, _n, status, _t in journalled] == [
+        ("explore", "started"),
+        ("explore", "ok"),
+        ("spec", "started"),
+        ("spec", "ok"),
+    ]
+    assert {t for phase, _n, _s, t in journalled if phase == "explore"} == {120.0}
+    assert {t for phase, _n, _s, t in journalled if phase == "spec"} == {600.0}
+
+
+def test_the_launcher_receives_the_resolved_timeout(store, tmp_path, worktree):
+    launcher = TimeoutRecordingLauncher(results=[VALID_RESULT])
+    runner, _ = _runner(
+        store,
+        launcher,
+        tmp_path,
+        worktree,
+        harness_timeouts={"explore": 120.0},
+        harness_timeout=600.0,
+    )
+
+    _run_both_phases(runner, worktree)
+
+    assert launcher.timeouts == [120.0, 600.0]
+    # The journal shows the timeout actually applied: call i's timeout is the
+    # terminal journalled attempt i's dispatch.timeout.
+    terminal = [t for _p, _n, status, t in _journalled_timeouts(store) if status != "started"]
+    assert terminal == launcher.timeouts
+
+
+def test_a_redispatch_keeps_the_phase_timeout(store, tmp_path, worktree):
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = TimeoutRecordingLauncher(results=[VALID_RESULT], exit_codes=[3, 0])
+    runner, _ = _runner(
+        store, launcher, tmp_path, worktree, harness_timeouts={"explore": 120.0}
+    )
+
+    result = runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert result == {"summary": "explored the tree", "ok": True}
+    assert launcher.timeouts == [120.0, 120.0]
+    assert [(n, status, t) for _p, n, status, t in _journalled_timeouts(store)] == [
+        (1, "started", 120.0),
+        (1, "harness_error", 120.0),
+        (2, "started", 120.0),
+        (2, "ok", 120.0),
+    ]
+
+
+def test_a_timed_out_attempt_under_an_override_is_dispatched_once_with_it(
+    store, tmp_path, worktree
+):
+    # Review Focus 5: B4 holds with a configured timeout, and the one attempt
+    # journals the configured value, not the 1800 s default.
+    workflow = _workflow(AGENT_DOCUMENT, {"output_gate": lambda result: None})
+    launcher = TimeoutRecordingLauncher(results=[None], exit_code=None, timed_out=True)
+    runner, _ = _runner(
+        store, launcher, tmp_path, worktree, harness_timeouts={"explore": 120.0}
+    )
+
+    with pytest.raises(AgentPhaseFailed) as caught:
+        runner(workflow.phase("explore"), _context(worktree), _rendered())
+
+    assert caught.value.outcome == "harness_error"
+    assert launcher.timeouts == [120.0]
+    assert [(n, status, t) for _p, n, status, t in _journalled_timeouts(store)] == [
+        (1, "started", 120.0),
+        (1, "harness_error", 120.0),
+    ]
+    assert runner.warnings == []
+
+
+def test_timeout_is_not_a_runner_field(store):
+    # The old single field is gone, not silently accepted as an alias. Built
+    # directly, not via `_runner`, so the only unknown keyword is `timeout`.
+    with pytest.raises(TypeError):
+        dispatch.AgentRunner(
+            store=store,
+            launcher=FakeLauncher(results=[VALID_RESULT]),
+            run_id=RUN_ID,
+            story_id=STORY_ID,
+            card_id=CARD,
+            timeout=45.0,
+        )
 
 
 def test_a_result_less_phase_redispatches_a_bad_exit(store, tmp_path, worktree):
@@ -1699,6 +1922,7 @@ def test_a_default_runner_carries_the_shipped_result_model_table(store):
 def test_the_production_runner_factory_carries_the_shipped_table(store):
     # `cli.default_runner_factory` omits `result_models` on purpose. This is the
     # path the addendum section 1 smoke takes, and the only test that walks it.
+    _seed(store)
     runner = cli.default_runner_factory(
         store=store,
         run_id=RUN_ID,
@@ -2819,9 +3043,9 @@ def test_the_default_runner_factory_restores_the_runs_recorded_limit_wait(store,
     assert runner.max_limit_wait_hours == 3
 
 
-def test_the_default_runner_factory_without_a_recorded_run_uses_the_default_wait(store):
-    runner = cli.default_runner_factory(
-        store=store, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD
-    )
-
-    assert runner.max_limit_wait_hours == models.DEFAULT_MAX_LIMIT_WAIT_HOURS
+def test_the_default_runner_factory_without_a_recorded_run_is_refused_not_given_a_default_wait(
+    store,
+):
+    """A5 B2: a run with no row has no recorded launcher or wait to restore."""
+    with pytest.raises(cli.UnknownRunError):
+        cli.default_runner_factory(store=store, run_id=RUN_ID, story_id=STORY_ID, card_id=CARD)
