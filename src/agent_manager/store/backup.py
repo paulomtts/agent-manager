@@ -15,12 +15,31 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from agent_manager import paths
 from agent_manager.store import db as store_db
 
+BackupRefusal = Literal["no_database", "target_exists", "no_target_dir"]
+"""Which check refused a backup."""
+
 _SIDECARS = ("-wal", "-shm", "-journal")
 """What SQLite may leave beside the temporary copy."""
+
+
+class BackupRefusedError(RuntimeError):
+    """`backup` will not write the copy; nothing has been written.
+
+    `reason` names the check that refused, `path` the file it is about: the
+    `am.db` path for `no_database`, the target otherwise.
+    """
+
+    def __init__(self, reason: BackupRefusal, path: Path) -> None:
+        super().__init__(
+            f"am backup refused ({reason}): {path}; nothing has been written"
+        )
+        self.reason = reason
+        self.path = path
 
 
 @dataclass(frozen=True)
@@ -34,11 +53,22 @@ class BackupResult:
 def backup(out: Path | None, *, now: datetime) -> BackupResult:
     """Copy `am.db` to `out`, or to `paths.default_backup_path(now)` when `out` is None.
 
-    A relative `out` is taken from the current directory. Any failure
-    propagates; in every case the temporary copy and its sidecars are removed.
+    Refused, in this order, as `BackupRefusedError`: `no_database` when
+    `paths.db_path()` does not exist (nothing is created, not even the data
+    directory); `target_exists` when the target exists, as anything, a
+    dangling symlink included, or appears while the copy runs; `no_target_dir`
+    when `out`'s parent is not a directory. A relative `out` is taken from
+    the current directory. Any other failure propagates; in every case the
+    temporary copy and its sidecars are removed.
     """
     source = paths.db_path()
+    if not source.exists():
+        raise BackupRefusedError("no_database", source)
     target = (out if out is not None else paths.default_backup_path(now)).absolute()
+    if os.path.lexists(target):
+        raise BackupRefusedError("target_exists", target)
+    if not target.parent.is_dir():
+        raise BackupRefusedError("no_target_dir", target)
     handle, name = tempfile.mkstemp(
         dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
     )
@@ -46,7 +76,10 @@ def backup(out: Path | None, *, now: datetime) -> BackupResult:
     temporary = Path(name)
     try:
         _copy(source, temporary)
-        os.link(temporary, target)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            raise BackupRefusedError("target_exists", target) from None
     finally:
         for leftover in (temporary, *_sidecars(temporary)):
             leftover.unlink(missing_ok=True)

@@ -211,3 +211,127 @@ def test_backup_does_not_refuse_an_unmigrated_machine(tmp_path, out_dir):
         assert copy.execute("SELECT value FROM kept").fetchall() == [("before migrate",)]
     finally:
         copy.close()
+
+
+def test_backup_refuses_an_existing_target_and_leaves_it_untouched(
+    conns, project_id, out_dir
+):
+    out = out_dir / "copy.db"
+    out.write_bytes(b"precious")
+    before = out.stat().st_mtime_ns
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(out, now=NOW)
+
+    assert refused.value.reason == "target_exists"
+    assert refused.value.path == out
+    assert str(out) in str(refused.value)
+    assert str(refused.value).endswith("nothing has been written")
+    assert out.read_bytes() == b"precious"
+    assert out.stat().st_mtime_ns == before
+    assert _listing(out_dir) == ["copy.db"]
+
+
+def test_backup_refuses_a_dangling_symlink_as_target(conns, project_id, out_dir):
+    out = out_dir / "copy.db"
+    out.symlink_to(out_dir / "nowhere.db")
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(out, now=NOW)
+
+    assert refused.value.reason == "target_exists"
+    assert out.is_symlink()
+    assert _listing(out_dir) == ["copy.db"]
+
+
+def test_backup_refuses_am_db_itself_as_target(conns, project_id):
+    conn, _ = conns
+    _append(conn, project_id, 2)
+    source = paths.db_path()
+    before = _events(source)
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(source, now=NOW)
+
+    assert refused.value.reason == "target_exists"
+    assert refused.value.path == source
+    assert _events(source) == before
+
+
+def test_backup_refuses_a_target_created_while_copying(
+    conns, project_id, out_dir, monkeypatch
+):
+    out = out_dir / "copy.db"
+    real_open_reader = store_db.open_reader
+
+    def intruding_open_reader(location: Path) -> sqlite3.Connection:
+        out.write_bytes(b"intruder")
+        return real_open_reader(location)
+
+    monkeypatch.setattr(store_db, "open_reader", intruding_open_reader)
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(out, now=NOW)
+
+    assert refused.value.reason == "target_exists"
+    assert out.read_bytes() == b"intruder"
+    assert _listing(out_dir) == ["copy.db"]
+
+
+def test_backup_refuses_when_there_is_no_database_and_creates_nothing(tmp_path):
+    out = tmp_path / "copy.db"
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(out, now=NOW)
+
+    assert refused.value.reason == "no_database"
+    assert refused.value.path == paths.db_path()
+    assert not paths.data_path().exists()
+    assert not out.exists()
+
+    with pytest.raises(store_backup.BackupRefusedError) as default_refused:
+        store_backup.backup(None, now=NOW)
+
+    assert default_refused.value.reason == "no_database"
+    assert not paths.data_path().exists()
+
+    with pytest.raises(store_backup.BackupRefusedError) as bad_out_refused:
+        store_backup.backup(tmp_path / "missing" / "copy.db", now=NOW)
+
+    assert bad_out_refused.value.reason == "no_database"
+    assert not (tmp_path / "missing").exists()
+
+
+def test_backup_refuses_a_missing_target_directory(conns, project_id, tmp_path):
+    out = tmp_path / "missing" / "copy.db"
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(out, now=NOW)
+
+    assert refused.value.reason == "no_target_dir"
+    assert refused.value.path == out
+    assert not (tmp_path / "missing").exists()
+
+
+def test_backup_refuses_a_target_directory_that_is_a_file(conns, project_id, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"file")
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(blocker / "copy.db", now=NOW)
+
+    assert refused.value.reason == "no_target_dir"
+    assert blocker.read_bytes() == b"file"
+
+
+def test_a_second_default_backup_in_the_same_second_is_refused(conns, project_id):
+    first = store_backup.backup(None, now=NOW)
+    before = first.path.read_bytes()
+
+    with pytest.raises(store_backup.BackupRefusedError) as refused:
+        store_backup.backup(None, now=NOW)
+
+    assert refused.value.reason == "target_exists"
+    assert refused.value.path == first.path
+    assert first.path.read_bytes() == before
+    assert _listing(first.path.parent) == [first.path.name]
