@@ -8625,6 +8625,137 @@ def test_requests_sent_to_an_earlier_life_do_not_make_a_new_pause_a_no_op(
     ]
 
 
+def _control_requested_events(root: Path) -> list[store_events.EventRow]:
+    """The run's committed `control_requested` events, in `seq` order."""
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return [
+            event
+            for event in store_events.read(conn, run_id=CONTROL_RUN_ID)
+            if event.kind == "control_requested"
+        ]
+    finally:
+        conn.close()
+
+
+def _run_project_id(root: Path) -> int:
+    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    try:
+        return conn.execute(
+            "SELECT project_id FROM runs WHERE id = ?", (CONTROL_RUN_ID,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_recorded_pause_and_cancel_each_insert_one_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    cli.request_control(CONTROL_RUN_ID, "cancel", repo_dir=projection, clock=lambda: _at(1))
+
+    events = _control_requested_events(projection)
+    project_id = _run_project_id(projection)
+    assert [
+        (event.project_id, event.source, event.schema)
+        + (event.story_id, event.card_id, event.phase, event.attempt)
+        for event in events
+    ] == [(project_id, "live", 1, None, None, None, None)] * 2
+    # `ts` is the request's clock, the same instant as `requested_at`.
+    assert [event.ts for event in events] == [
+        store_journal.ts_text(CONTROL_NOW),
+        store_journal.ts_text(_at(1)),
+    ]
+    assert [event.payload for event in events] == [
+        {
+            "command": "pause",
+            "lease": "life-2",
+            "requested_at": CONTROL_NOW.isoformat(),
+            "control_seq": 0,
+        },
+        {
+            "command": "cancel",
+            "lease": "life-2",
+            "requested_at": _at(1).isoformat(),
+            "control_seq": 1,
+        },
+    ]
+    assert events[0].run_seq < events[1].run_seq
+
+
+def test_a_no_op_request_inserts_no_control_requested_event(projection):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    cli.request_control(CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW)
+    repeat = cli.request_control(
+        CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: _at(5)
+    )
+
+    assert repeat["already_requested"] is True
+    assert [event.payload["control_seq"] for event in _control_requested_events(projection)] == [0]
+
+
+def _plant_refusal(root: Path, case: str) -> None:
+    """The projection state each refused-request case starts from."""
+    if case == "unknown-run":
+        return
+    if case == "not-started":
+        _plant_run(root, status="stopped")
+        _plant_lease(root)
+    elif case == "dead-lease":
+        _plant_run(root)
+        _plant_lease(root, heartbeat_at=_at(-31))
+    elif case == "window-closed":
+        _plant_run(root)
+        _plant_lease(root, accepting=False)
+    elif case == "unknown-command":
+        _plant_run(root)
+        _plant_lease(root)
+
+
+@pytest.mark.parametrize(
+    ("case", "command", "error"),
+    [
+        ("unknown-run", "pause", cli.UnknownRunError),
+        ("not-started", "pause", cli.NotRunningError),
+        ("dead-lease", "cancel", cli.DeadRunError),
+        ("window-closed", "cancel", cli.NotAcceptingError),
+        ("unknown-command", "resume", ValueError),
+    ],
+    ids=["unknown-run", "not-started", "dead-lease", "window-closed", "unknown-command"],
+)
+def test_a_refused_request_inserts_no_control_requested_event(projection, case, command, error):
+    _plant_refusal(projection, case)
+
+    with pytest.raises(error):
+        cli.request_control(
+            CONTROL_RUN_ID, command, repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _control_requested_events(projection) == []
+    assert _controls(projection) == []
+
+
+def test_a_failed_control_requested_insert_rolls_the_request_back(projection, monkeypatch):
+    _plant_run(projection)
+    _plant_lease(projection)
+
+    def failing(conn, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cli.store_events, "insert", failing)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        cli.request_control(
+            CONTROL_RUN_ID, "pause", repo_dir=projection, clock=lambda: CONTROL_NOW
+        )
+
+    assert _controls(projection) == []
+    assert _control_requested_events(projection) == []
+
+
 def test_the_status_payload_defaults_to_an_empty_control():
     assert cli.status_payload(_pure_run([]))["control"] == {
         "lease": None,

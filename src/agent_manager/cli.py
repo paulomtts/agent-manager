@@ -3290,10 +3290,13 @@ def request_control(
     """Record `am pause` or `am cancel` for the process holding `run_id` (C8).
 
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
-    check and the insert, so two requesters cannot both insert and a refusal
-    leaves no row. The project is looked up, never created, so a
-    refusal creates no `projects` row either. The process holding the lease applies the request at its
-    next poll; this function only records it. SQLite is the only channel (C1).
+    check, the insert and its `control_requested` event (`ts` the request's
+    clock, never mirrored to a journal file), so two requesters cannot both
+    insert and a refusal or a failed event insert leaves no row. A no-op
+    request inserts neither. The project is looked up, never created, so a
+    refusal creates no `projects` row either. The process holding the lease
+    applies the request at its next poll; this function only records it.
+    SQLite is the only channel (C1).
     """
     if command not in CONTROL_COMMANDS:
         raise ValueError(
@@ -3312,6 +3315,21 @@ def request_control(
             row, already = _record_control(
                 conn, run_id, project_id=project_id, lease=lease, command=command, now=now
             )
+            if not already:
+                store_events.insert(
+                    conn,
+                    project_id=project_id,
+                    run_id=run_id,
+                    ts=store_journal.ts_text(now),
+                    kind="control_requested",
+                    payload={
+                        "command": row.command,
+                        "lease": row.lease,
+                        "requested_at": store_db.iso(row.requested_at),
+                        "control_seq": row.seq,
+                    },
+                    source="live",
+                )
             effective = _effective_command(
                 store_leases.control_requests(conn, run_id, lease=lease.token)
             )
