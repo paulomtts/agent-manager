@@ -215,6 +215,46 @@ class Wrapped:
         return getattr(self._inner, name)
 
 
+def _control_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "agent_manager.control" and record.levelno == logging.WARNING
+    ]
+
+
+class _BusyCleanup(Wrapped):
+    """A real store whose window close and control mark stay busy, recording each attempt."""
+
+    def __init__(self, inner: store_writer.Store, events: list[str]) -> None:
+        super().__init__(inner)
+        self._events = events
+
+    def close_window(self, token: str) -> None:
+        self._events.append("close_window")
+        raise store_db.StoreBusyError("close_window", 5, 10.0)
+
+    def mark_control_handled(self, seq: int, now: datetime) -> None:
+        self._events.append("mark_control_handled")
+        raise store_db.StoreBusyError("mark_control_handled", 5, 10.0)
+
+
+class _BusyRelease(Wrapped):
+    """A real store whose claim and lease releases stay busy, recording each attempt."""
+
+    def __init__(self, inner: store_writer.Store, events: list[str]) -> None:
+        super().__init__(inner)
+        self._events = events
+
+    def release_claims(self, token: str) -> None:
+        self._events.append("release_claims")
+        raise store_db.StoreBusyError("release_claims", 5, 10.0)
+
+    def release_lease(self, token: str) -> None:
+        self._events.append("release_lease")
+        raise store_db.StoreBusyError("release_lease", 5, 10.0)
+
+
 # -- pid_alive and lease_is_live (C2) -----------------------------------------
 
 
@@ -634,6 +674,67 @@ def test_lease_exit_leaves_a_new_holders_lease_and_claims_alone(root, opened_sto
     assert _all_claims(root) == [("card:a", RUN_ID, "thief")]
 
 
+def test_busy_releases_on_a_failing_exit_are_logged_and_the_error_kept(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    with pytest.raises(RuntimeError, match="inside the run") as caught:
+        with control.Lease(
+            _BusyRelease(opened_store, events), claims=["card:a"], clock=lambda: _at(1)
+        ) as lease:
+            raise RuntimeError("inside the run")
+
+    assert type(caught.value) is RuntimeError
+    assert events == ["release_claims", "release_lease"]
+    assert opened_store._token is None
+    # The unreleased lease row stays behind and goes stale.
+    assert _read_lease(root) is not None
+    warnings = _control_warnings(caplog)
+    assert len(warnings) == 2
+    assert all(lease.token in record.getMessage() for record in warnings)
+    assert "release_claims: the database stayed busy" in warnings[0].getMessage()
+    assert "release_lease: the database stayed busy" in warnings[1].getMessage()
+
+
+def test_a_busy_release_on_a_clean_exit_still_raises(root, opened_store, caplog):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    with pytest.raises(store_db.StoreBusyError, match="release_lease"):
+        with control.Lease(_BusyRelease(opened_store, events), clock=lambda: _at(1)):
+            pass
+
+    assert events == ["release_claims", "release_lease"]
+    assert opened_store._token is None
+    assert _control_warnings(caplog) == []
+
+
+def test_a_non_busy_release_error_on_a_failing_exit_keeps_todays_behaviour(
+    root, opened_store
+):
+    # Review Focus 3: only `StoreBusyError` is logged and kept back.
+    events: list[str] = []
+
+    class Broken(Wrapped):
+        def release_claims(self, token: str) -> None:
+            events.append("release_claims")
+            raise sqlite3.IntegrityError("claims broke")
+
+        def release_lease(self, token: str) -> None:
+            events.append("release_lease")
+            self._inner.release_lease(token)
+
+    with pytest.raises(sqlite3.IntegrityError, match="claims broke"):
+        with control.Lease(Broken(opened_store), clock=lambda: _at(1)):
+            raise RuntimeError("inside the run")
+
+    assert events == ["release_claims", "release_lease"]
+    assert _read_lease(root) is None
+    assert opened_store._token is None
+
+
 # -- hand-off and adoption (am run --detach, card aff9fdbf) ---------------------
 
 
@@ -925,3 +1026,98 @@ async def test_controlled_cancels_work_on_exception_and_always_stops_the_watcher
                 control.controlled(failing(), store=opened_store, stop=stop, lease=lease, interval=0)
             )
         assert asyncio.all_tasks() == before
+
+
+async def test_busy_cleanup_writes_after_a_failed_work_are_logged_not_raised(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+    busy = _BusyCleanup(opened_store, events)
+    with control.Lease(busy) as lease:
+        # A pending row, so the final sweep has a mark to attempt.
+        _send(root, lease.token, "pause")
+
+        async def failing() -> str:
+            raise ValueError("work failed")
+
+        with pytest.raises(ValueError, match="work failed"):
+            await _within(
+                control.controlled(
+                    failing(), store=busy, stop=StopSignal(), lease=lease, interval=3600
+                )
+            )
+
+    # The watcher's first tick may have tried the mark too (and swallowed it);
+    # the close and then the final sweep are always attempted.
+    assert "close_window" in events
+    assert events[-1] == "mark_control_handled"
+    assert events.index("close_window") < len(events) - 1
+    warnings = _control_warnings(caplog)
+    assert len(warnings) == 2
+    assert all(lease.token in record.getMessage() for record in warnings)
+    assert "close_window: the database stayed busy" in warnings[0].getMessage()
+    assert "mark_control_handled: the database stayed busy" in warnings[1].getMessage()
+
+
+async def test_busy_cleanup_writes_never_replace_a_cancellation(root, opened_store, caplog):
+    # Review Focus 2: the task running `controlled` is cancelled from outside
+    # while both cleanup writes stay busy.
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+    busy = _BusyCleanup(opened_store, events)
+    with control.Lease(busy) as lease:
+        _send(root, lease.token, "cancel")
+        started, cancelled = asyncio.Event(), []
+        outer = asyncio.create_task(
+            control.controlled(
+                _blocked_forever(started, cancelled),
+                store=busy,
+                stop=StopSignal(),
+                lease=lease,
+                interval=3600,
+            )
+        )
+        await _within(started.wait())
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+
+    assert cancelled == [True]
+    assert "close_window" in events
+    assert events[-1] == "mark_control_handled"
+    assert len(_control_warnings(caplog)) == 2
+
+
+async def test_a_busy_final_sweep_after_work_returned_still_raises(
+    root, opened_store, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agent_manager.control")
+    events: list[str] = []
+
+    class BusySweep(Wrapped):
+        def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
+            events.append("pending")
+            return self._inner.pending_controls(token)
+
+        def mark_control_handled(self, seq: int, now: datetime) -> None:
+            raise store_db.StoreBusyError("mark_control_handled", 5, 10.0)
+
+    busy = BusySweep(opened_store)
+    with control.Lease(busy) as lease:
+
+        async def work() -> str:
+            # The watcher's first tick has run and it is parked on a long
+            # interval, so only the final sweep sees this request.
+            await _until(lambda: "pending" in events)
+            _send(root, lease.token, "pause")
+            return "done"
+
+        with pytest.raises(store_db.StoreBusyError, match="mark_control_handled"):
+            await _within(
+                control.controlled(
+                    work(), store=busy, stop=StopSignal(), lease=lease, interval=3600
+                )
+            )
+
+    assert _control_warnings(caplog) == []

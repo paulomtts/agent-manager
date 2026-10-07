@@ -103,7 +103,11 @@ class Lease:
     retry budget is logged as a `WARNING` on `agent_manager.control`, and the
     next beat tries again. `__exit__` stops and joins it, then releases
     this token's claims, then this token's lease, on any exit, and never
-    swallows the exception. A process that took the lease over keeps its rows.
+    swallows the block's exception. When the block raised, a
+    `StoreBusyError` from either release is logged the same way and not
+    raised, so the block's exception propagates and the unreleased lease goes
+    stale; on a clean exit it propagates. A process that took the lease over
+    keeps its rows.
 
     `am run --detach` (card aff9fdbf) adds two things. `hand_off()` stops and
     joins the heartbeat and unbinds the store but releases nothing; `__exit__`
@@ -175,10 +179,18 @@ class Lease:
             return
         self._stop_heartbeat()
         try:
-            try:
-                self._store.release_claims(self.token)
-            finally:
-                self._store.release_lease(self.token)
+            if exc_type is None:
+                try:
+                    self._store.release_claims(self.token)
+                finally:
+                    self._store.release_lease(self.token)
+            else:
+                # The block's own exception is the one to surface: a busy
+                # release leaves its row behind to go stale instead.
+                try:
+                    _logged_if_busy(lambda: self._store.release_claims(self.token), self.token)
+                finally:
+                    _logged_if_busy(lambda: self._store.release_lease(self.token), self.token)
         finally:
             # This process no longer holds the run: stop fencing its writes to
             # a token that is gone, as M9's store never fenced them.
@@ -216,6 +228,20 @@ class Lease:
             except store_db.StoreBusyError as error:
                 # The write's retry budget ran out; the next beat tries again.
                 _log.warning("lease %s missed a heartbeat: %s", self.token, error)
+
+
+def _logged_if_busy(write: Callable[[], object], token: str) -> None:
+    """Run the cleanup `write`; a `StoreBusyError` from it is logged, not raised.
+
+    For the cleanup that follows an earlier error: the earlier error is the one
+    that must surface. Every other exception propagates.
+    """
+    try:
+        write()
+    except store_db.StoreBusyError as error:
+        _log.warning(
+            "lease %s: a cleanup write after an earlier error failed: %s", token, error
+        )
 
 
 def apply_pending(
@@ -275,17 +301,24 @@ async def controlled(
     or on any other exception, including this task being cancelled. On every
     exit the watcher is stopped, then the window is closed, then one final
     sweep runs. In that order, no request can be accepted after the sweep.
+    When `work` returned, an error from the close or the sweep propagates.
+    Otherwise a `StoreBusyError` from either is logged as a `WARNING` on
+    `agent_manager.control` and not raised, so the original error propagates,
+    and the sweep is still attempted after a busy close.
     """
     work_task = asyncio.ensure_future(work)
     watcher = asyncio.create_task(
         watch(store, stop, lease.token, interval=interval, clock=clock)
     )
+    returned = False
     try:
         done, _ = await asyncio.wait(
             {work_task, watcher}, return_when=asyncio.FIRST_COMPLETED
         )
         if work_task in done:
-            return work_task.result()
+            result = work_task.result()
+            returned = True
+            return result
         watcher.result()
         raise RuntimeError("the control watcher stopped without an error")
     except BaseException:
@@ -295,5 +328,11 @@ async def controlled(
     finally:
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
-        lease.close_window()
-        apply_pending(store, stop, lease.token, clock=clock)
+        if returned:
+            lease.close_window()
+            apply_pending(store, stop, lease.token, clock=clock)
+        else:
+            _logged_if_busy(lease.close_window, lease.token)
+            _logged_if_busy(
+                lambda: apply_pending(store, stop, lease.token, clock=clock), lease.token
+            )
