@@ -845,5 +845,3 @@ def test_a_relaunch_whose_source_journal_file_is_gone_still_adopts_from_its_even
     assert summary.status == "done"
     assert _dispatches(launcher) == {"a": 1, "b": 1}
     assert runner.warnings == [_reused("a", 1, RUN_ID)]
-
-
