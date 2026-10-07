@@ -4679,6 +4679,13 @@ def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
                 "card-1",
                 models.PhaseRun(name="verify", kind="deterministic", status="failed"),
             )
+            writer.take_lease(
+                token="snapshot-life",
+                pid=os.getpid(),
+                host=socket.gethostname(),
+                now=datetime.now(timezone.utc),
+                is_live=lambda row: False,
+            )
 
         fired = _write_once_after(monkeypatch, cli.store_events, "head", fail_the_run)
         during = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
@@ -4688,6 +4695,8 @@ def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
         assert during["run"]["status"] == "started"
         assert during["stories"] == before["stories"]
         assert during["rows"] == before["rows"]
+        assert during["control"] == before["control"]
+        assert during["control"]["lease"] is None
         assert during["integrity"] == before["integrity"]
 
         after = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
@@ -4697,6 +4706,7 @@ def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
             for row in after["rows"]
         ]
         assert after["as_of_seq"] > during["as_of_seq"]
+        assert after["control"]["lease"] is not None
     finally:
         writer.close()
 
