@@ -10,6 +10,7 @@ these are unit tests.
 """
 
 import ast
+import contextlib
 import inspect
 import re
 import sqlite3
@@ -1161,6 +1162,80 @@ def test_close_finishes_a_queued_batch_then_stops(repo):
     assert closer.error is None
     assert keys == ["closing-0", "closing-1", "closing-2"]
     assert _writer_threads(RUN_A) == []
+
+
+def test_a_batch_busy_past_the_budget_fails_every_caller(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    calls: list[int] = []
+
+    def always_busy(conn):
+        calls.append(1)
+        _insert_meta(conn, "budget-b")
+        raise _busy()
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            a, b = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("budget-a"), operation="op_a"),
+                    _coalesced(st, always_busy, operation="op_b"),
+                ],
+            )
+        _wait_all([a, b])
+        after = st._submit(_inserting("budget-after"), operation="after")
+        keys = _meta_keys(st.connection, "budget-")
+    finally:
+        st.close()
+
+    assert isinstance(a.error, store_db.StoreBusyError)
+    assert b.error is a.error
+    assert a.error.operation == "op_a+op_b"
+    assert a.error.attempts == store_db.RETRY_ATTEMPTS
+    assert len(calls) == store_db.RETRY_ATTEMPTS
+    assert keys == ["budget-after"]
+    assert after == "budget-after"
+
+
+def test_a_failure_outside_every_savepoint_fails_the_whole_batch(repo, monkeypatch):
+    # Review Focus 1: the COMMIT itself refuses.
+    failure = RuntimeError("the commit is refused")
+    real = store_db.immediate
+
+    @contextlib.contextmanager
+    def refusing_commit(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+        raise failure
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            a, b = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("whole-a")),
+                    _coalesced(st, _inserting("whole-b")),
+                ],
+            )
+            # The gate is already inside the real `immediate`; only the batch
+            # meets the refusing one.
+            monkeypatch.setattr(store_db, "immediate", refusing_commit)
+        _wait_all([a, b])
+        monkeypatch.setattr(store_db, "immediate", real)
+        after = st._submit(_inserting("whole-after"), operation="after")
+        keys = _meta_keys(st.connection, "whole-")
+    finally:
+        st.close()
+
+    assert a.error is failure
+    assert b.error is failure
+    assert keys == ["whole-after"]
+    assert after == "whole-after"
 
 
 def test_a_lost_lease_writes_neither_line_nor_row(repo):
