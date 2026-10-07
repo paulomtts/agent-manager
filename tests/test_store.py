@@ -938,9 +938,9 @@ def _record_summary(
 
 
 def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
-    """The `runs` table is shared by every run of one project, so the listing is
-    a read of that table alone -- and a second project is a second database file,
-    which this one must not see."""
+    """The `runs` table holds every project's runs, so the listing is scoped to
+    this project's `projects.id`: a second project's run, newer or not, is not
+    in it."""
     _record_summary(repo, "run-a", datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     _record_summary(repo, "run-b", datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc))
     other = tmp_path / "other-repo"
@@ -949,7 +949,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
 
     conn = store_db.open_db(repo)
     try:
-        summaries = store_queries.list_runs(conn)
+        summaries = store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))
     finally:
         conn.close()
 
@@ -962,7 +962,7 @@ def test_list_runs_returns_this_projects_runs_newest_first(repo, tmp_path):
 def test_list_runs_on_a_project_with_no_runs_is_empty(repo):
     conn = store_db.open_db(repo)
     try:
-        assert store_queries.list_runs(conn) == []
+        assert store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo)) == []
     finally:
         conn.close()
 
@@ -974,7 +974,7 @@ def test_list_runs_puts_a_run_with_no_start_time_last(repo):
 
     conn = store_db.open_db(repo)
     try:
-        summaries = store_queries.list_runs(conn)
+        summaries = store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))
     finally:
         conn.close()
 
@@ -991,7 +991,7 @@ def test_list_runs_breaks_a_started_at_tie_with_the_run_id(repo):
 
     conn = store_db.open_db(repo)
     try:
-        assert [summary.id for summary in store_queries.list_runs(conn)] == ["run-b", "run-a"]
+        assert [summary.id for summary in store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))] == ["run-b", "run-a"]
     finally:
         conn.close()
 
@@ -1018,7 +1018,7 @@ SUMMARY_KEYS = {
 def _listed(root: Path) -> list[store_queries.RunSummary]:
     conn = store_db.open_db(root)
     try:
-        return store_queries.list_runs(conn)
+        return store_queries.list_runs(conn, project_id=store_projects.lookup(conn, root))
     finally:
         conn.close()
 
@@ -1792,7 +1792,7 @@ def test_list_runs_progress_reads_without_writing(repo):
     conn = store_db.open_db(repo)
     try:
         before = conn.total_changes
-        [summary] = store_queries.list_runs(conn)
+        [summary] = store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))
         after = conn.total_changes
         in_transaction = conn.in_transaction
     finally:
@@ -1811,8 +1811,8 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
 
     conn = store_db.open_db(repo)
     try:
-        assert store_queries.latest_run_id(conn) == "run-c"
-        assert store_queries.latest_run_id(conn) == store_queries.list_runs(conn)[0].id
+        assert store_queries.latest_run_id(conn, project_id=store_projects.lookup(conn, repo)) == "run-c"
+        assert store_queries.latest_run_id(conn, project_id=store_projects.lookup(conn, repo)) == store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))[0].id
     finally:
         conn.close()
 
@@ -1820,7 +1820,7 @@ def test_latest_run_id_is_the_newest_recorded_run(repo):
 def test_latest_run_id_is_none_for_a_project_with_no_runs(repo):
     conn = store_db.open_db(repo)
     try:
-        assert store_queries.latest_run_id(conn) is None
+        assert store_queries.latest_run_id(conn, project_id=store_projects.lookup(conn, repo)) is None
     finally:
         conn.close()
 
@@ -2805,7 +2805,7 @@ def _migrated_legacy(repo: Path, extra_sql: str = "") -> list[store_queries.RunS
 
     migrated = store_db.open_db(repo)
     try:
-        return store_queries.list_runs(migrated)
+        return store_queries.list_runs(migrated, project_id=store_projects.lookup(migrated, repo))
     finally:
         migrated.close()
 
@@ -4108,7 +4108,7 @@ def test_a_cancelled_run_round_trips_through_the_journal_and_the_listing(repo):
     replayed = store_writer.Store.open(repo, RUN_ID)
     try:
         replayed.rebuild_from_journal(RUN_ID)
-        summaries = store_queries.list_runs(replayed.connection)
+        summaries = store_queries.list_runs(replayed.connection, project_id=replayed.project_id)
         status = store_queries.run_status(replayed.connection, RUN_ID)
     finally:
         replayed.close()
@@ -4178,7 +4178,7 @@ def test_rebuild_from_journal_with_either_spelling(repo, status):
     try:
         rebuilt.rebuild_from_journal(RUN_ID)
         loaded = rebuilt.load_run(RUN_ID)
-        summaries = store_queries.list_runs(rebuilt.connection)
+        summaries = store_queries.list_runs(rebuilt.connection, project_id=rebuilt.project_id)
     finally:
         rebuilt.close()
 
@@ -6321,8 +6321,8 @@ def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert store_queries.list_runs(conn) == []
-        assert store_queries.latest_run_id(conn) is None
+        assert store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo)) == []
+        assert store_queries.latest_run_id(conn, project_id=store_projects.lookup(conn, repo)) is None
         assert store_queries.load_run(conn, RUN_ID) is None
         assert store_leases.read_lease(conn, RUN_ID) is None
         assert store_leases.control_requests(conn, RUN_ID) == []
@@ -6340,7 +6340,7 @@ def test_open_db_for_reading_an_existing_db_reads_its_rows_and_cannot_write(repo
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert [summary.id for summary in store_queries.list_runs(conn)] == [RUN_ID]
+        assert [summary.id for summary in store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))] == [RUN_ID]
         assert store_queries.load_run(conn, RUN_ID) is not None
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             conn.execute("DELETE FROM runs")
@@ -6384,7 +6384,7 @@ def test_open_db_for_reading_an_older_schema_still_reads_it(repo):
 
     conn = store_db.open_db_for_reading(repo)
     try:
-        assert [summary.id for summary in store_queries.list_runs(conn)] == [RUN_ID]
+        assert [summary.id for summary in store_queries.list_runs(conn, project_id=store_projects.lookup(conn, repo))] == [RUN_ID]
         assert store_queries.load_run(conn, RUN_ID).milestone_id is None
     finally:
         conn.close()

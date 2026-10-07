@@ -22,6 +22,7 @@ from typer.testing import CliRunner
 
 from agent_manager import board, cli, models, orchestrate
 from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.harness import launcher
 from agent_manager.runtime.stop import StopSignal
@@ -197,9 +198,12 @@ def _attempt_of(stdout_path: Path) -> tuple[str, str]:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        run_id = store_queries.latest_run_id(conn)
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, resolved)
+        )
     finally:
         conn.close()
     assert run_id is not None

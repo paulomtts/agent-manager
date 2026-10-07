@@ -6,6 +6,7 @@ found it, and still answer as they do for an unknown run.
 """
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from typer.testing import CliRunner
 
 from agent_manager import cli, models, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 
 runner = CliRunner()
@@ -196,3 +198,30 @@ def test_a_writer_still_creates_the_projection(tmp_path, monkeypatch):
     _record(root)
 
     assert paths.project_db_location(root).is_file()
+
+
+def test_project_run_hides_a_run_another_project_recorded_in_the_same_file(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    _record(theirs)
+
+    # One connection on the file that holds `theirs`'s run, with a second
+    # project in it: the file is shared, the run is not.
+    conn = store_db.open_db(theirs)
+    try:
+        store_projects.resolve(conn, mine, now=datetime(2026, 10, 7, tzinfo=timezone.utc))
+        conn.commit()
+        found = cli._project_run(conn, theirs, RUN_ID)
+        assert found is not None and found.id == RUN_ID
+        assert cli._project_run(conn, mine, RUN_ID) is None
+        assert cli._project_run(conn, stranger, RUN_ID) is None
+        assert cli._project_run(conn, theirs, "no-such-run") is None
+    finally:
+        conn.close()

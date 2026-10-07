@@ -33,6 +33,7 @@ _PUBLIC_QUERY_NAMES = (
     "latest_run_id",
     "load_run",
     "run_status",
+    "run_project_id",
 )
 
 _QUERY_NAMES = (
@@ -170,3 +171,50 @@ def test_callers_call_load_run_through_the_queries_module(module):
     ]
     assert calls != []
     assert "load_run" not in bound
+
+
+def _insert_run(conn, run_id: str, *, project_id: int, started_at: str) -> None:
+    conn.execute(
+        "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
+        " branch_prefix, status, started_at, config)"
+        " VALUES (?, ?, 'milestone', '/repo', 'main', 'm1/', 'started', ?, '{}')",
+        (project_id, run_id, started_at),
+    )
+
+
+def test_list_runs_lists_only_the_given_projects_runs(conns, project_id, other_project_id):
+    conn, _ = conns
+    _insert_run(conn, "run-mine", project_id=project_id, started_at="2026-10-01T09:00:00+00:00")
+    _insert_run(
+        conn, "run-theirs", project_id=other_project_id, started_at="2026-10-02T09:00:00+00:00"
+    )
+    conn.commit()
+
+    assert [s.id for s in store_queries.list_runs(conn, project_id=project_id)] == ["run-mine"]
+    assert [s.id for s in store_queries.list_runs(conn, project_id=other_project_id)] == [
+        "run-theirs"
+    ]
+    assert store_queries.list_runs(conn, project_id=None) == []
+    # The newer run belongs to the other project: "latest" never crosses over.
+    assert store_queries.latest_run_id(conn, project_id=project_id) == "run-mine"
+    assert store_queries.latest_run_id(conn, project_id=None) is None
+
+
+def test_run_project_id_is_the_runs_project_or_none(conns, project_id, other_project_id):
+    conn, _ = conns
+    _insert_run(conn, "run-mine", project_id=project_id, started_at="2026-10-01T09:00:00+00:00")
+    _insert_run(
+        conn, "run-theirs", project_id=other_project_id, started_at="2026-10-02T09:00:00+00:00"
+    )
+    conn.commit()
+
+    assert store_queries.run_project_id(conn, "run-mine") == project_id
+    assert store_queries.run_project_id(conn, "run-theirs") == other_project_id
+    assert store_queries.run_project_id(conn, "no-such-run") is None
+
+
+@pytest.mark.parametrize("name", ["list_runs", "latest_run_id"])
+def test_project_id_is_keyword_only_with_no_default(name):
+    parameter = inspect.signature(getattr(store_queries, name)).parameters["project_id"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty

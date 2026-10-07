@@ -1991,6 +1991,22 @@ def run(
         raise typer.Exit(EXIT_ESCALATED)
 
 
+def _project_run(conn: sqlite3.Connection, root: Path, run_id: str) -> models.Run | None:
+    """`store_queries.load_run`, or `None` unless `run_id` is a run of `root`'s project.
+
+    The projection holds every repository's runs, so a run another project
+    recorded reads as absent: a command scoped to `--repo-dir` neither sees
+    nor acts on another repository's run. A repository with no `projects`
+    row (looked up, never created) knows no run.
+    """
+    run = store_queries.load_run(conn, run_id)
+    if run is None:
+        return None
+    if store_queries.run_project_id(conn, run_id) != store_projects.lookup(conn, root):
+        return None
+    return run
+
+
 def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     """The §9 tree and §10 table of one run of this project.
 
@@ -2008,13 +2024,15 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     try:
         wanted = run_id
         if wanted is None:
-            wanted = store_queries.latest_run_id(conn)
+            wanted = store_queries.latest_run_id(
+                conn, project_id=store_projects.lookup(conn, root)
+            )
             if wanted is None:
                 raise UnknownRunError(
                     f"no run has been recorded for {root}, so there is no most recent"
                     " run to report on; pass a run id or start one with `run --card`"
                 )
-        run = store_queries.load_run(conn, wanted)
+        run = _project_run(conn, root, wanted)
         if run is None:
             raise UnknownRunError(
                 f"run {wanted!r} is not in the projection for {root}"
@@ -2083,7 +2101,9 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     try:
         now = _utcnow()
         entries = []
-        for summary in store_queries.list_runs(conn):
+        for summary in store_queries.list_runs(
+            conn, project_id=store_projects.lookup(conn, root)
+        ):
             lease = store_leases.read_lease(conn, summary.id)
             shown = (
                 None
@@ -2183,7 +2203,7 @@ def select_logs(
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        run = store_queries.load_run(conn, run_id)
+        run = _project_run(conn, root, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -2312,7 +2332,7 @@ def logs_end_status(selection: LogsSelection, *, repo_dir: Path) -> str | None:
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        run = store_queries.load_run(conn, run_id)
+        run = _project_run(conn, root, run_id)
     finally:
         conn.close()
     if run is None:
@@ -3035,7 +3055,7 @@ def resume_run(
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db(root)
     try:
-        run = store_queries.load_run(conn, run_id)
+        run = _project_run(conn, root, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"
@@ -3139,16 +3159,22 @@ def _heartbeat_age(lease: store_leases.LeaseRow, now: datetime) -> int:
 
 
 def _controllable_lease(
-    conn: sqlite3.Connection, run_id: str, *, command: str, now: datetime
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    project_id: int | None,
+    command: str,
+    now: datetime,
 ) -> store_leases.LeaseRow:
     """The lease a request to `run_id` is addressed to, or C8's refusal.
 
     The order is C8's: unknown run, not `started`, no live lease, window
-    closed. Runs inside `request_control`'s transaction, so a refusal rolls
-    back and leaves no row.
+    closed. A run of another project than `project_id`, or any run when
+    `project_id` is `None`, is an unknown run. Runs inside `request_control`'s
+    transaction, so a refusal rolls back and leaves no row.
     """
     status = store_queries.run_status(conn, run_id)
-    if status is None:
+    if status is None or store_queries.run_project_id(conn, run_id) != project_id:
         raise UnknownRunError(
             f"run {run_id!r} is not in the projection"
             " (`agent-manager runs` lists the ones that are)"
@@ -3252,7 +3278,7 @@ def request_control(
 
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
     check and the insert, so two requesters cannot both insert and a refusal
-    leaves no row. The project is resolved only after the refusals, so a
+    leaves no row. The project is looked up, never created, so a
     refusal creates no `projects` row either. The process holding the lease applies the request at its
     next poll; this function only records it. SQLite is the only channel (C1).
     """
@@ -3266,8 +3292,10 @@ def request_control(
     conn = store_db.open_db(root)
     try:
         with store_db.immediate(conn):
-            lease = _controllable_lease(conn, run_id, command=command, now=now)
-            project_id = store_projects.resolve(conn, root, now=now)
+            project_id = store_projects.lookup(conn, root)
+            lease = _controllable_lease(
+                conn, run_id, project_id=project_id, command=command, now=now
+            )
             row, already = _record_control(
                 conn, run_id, project_id=project_id, lease=lease, command=command, now=now
             )
@@ -3379,7 +3407,7 @@ def reset_run(run_id: str, *, repo_dir: Path) -> dict[str, Any]:
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db(root)
     try:
-        run = store_queries.load_run(conn, run_id)
+        run = _project_run(conn, root, run_id)
         if run is None:
             raise UnknownRunError(
                 f"run {run_id!r} is not in the projection for {root}"

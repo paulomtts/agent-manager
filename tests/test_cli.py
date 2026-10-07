@@ -9431,9 +9431,15 @@ def _run_dirs() -> list[Path]:
 
 
 def _recorded_run_ids(project: Path) -> list[str]:
-    conn = store_db.open_db(cli.resolve_repo_dir(project))
+    root = cli.resolve_repo_dir(project)
+    conn = store_db.open_db(root)
     try:
-        return [summary.id for summary in store_queries.list_runs(conn)]
+        return [
+            summary.id
+            for summary in store_queries.list_runs(
+                conn, project_id=store_projects.lookup(conn, root)
+            )
+        ]
     finally:
         conn.close()
 
