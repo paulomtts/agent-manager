@@ -164,6 +164,37 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    run_id     TEXT NOT NULL,
+    run_seq    INTEGER NOT NULL,
+    ts         TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    story_id   TEXT,
+    card_id    TEXT,
+    phase      TEXT,
+    attempt    INTEGER,
+    schema     INTEGER NOT NULL DEFAULT 1,
+    payload    TEXT NOT NULL,
+    source     TEXT NOT NULL CHECK (source IN ('live', 'imported')),
+    UNIQUE (run_id, run_seq)
+);
+
+CREATE INDEX IF NOT EXISTS events_run_seq ON events (run_id, seq);
+
+CREATE INDEX IF NOT EXISTS events_project_seq ON events (project_id, seq);
+
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
 """
 
 
