@@ -286,7 +286,34 @@ def test_open_db_creates_every_projection_table(repo):
         }
     finally:
         conn.close()
-    assert {"runs", "stories", "subtasks", "phases", "attempts"} <= names
+    assert {"projects", "runs", "stories", "subtasks", "phases", "attempts"} <= names
+
+
+def test_open_db_creates_the_projects_table(repo):
+    conn = db.open_db(repo)
+    try:
+        info = conn.execute("PRAGMA table_info(projects)").fetchall()
+    finally:
+        conn.close()
+    assert [row["name"] for row in info] == ["id", "repo_dir", "created_at"]
+    by_name = {row["name"]: row for row in info}
+    assert (by_name["id"]["type"], by_name["id"]["pk"]) == ("INTEGER", 1)
+    assert (by_name["repo_dir"]["notnull"], by_name["created_at"]["notnull"]) == (1, 1)
+
+
+def test_projects_repo_dir_is_unique(repo):
+    conn = db.open_db(repo)
+    try:
+        conn.execute(
+            "INSERT INTO projects (repo_dir, created_at) VALUES ('/a', '2026-10-07')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO projects (repo_dir, created_at) VALUES ('/a', '2026-10-08')"
+            )
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 def test_reopening_an_existing_db_keeps_its_rows(repo):

@@ -13,6 +13,12 @@ from pathlib import Path
 from agent_manager import paths
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id         INTEGER PRIMARY KEY,
+    repo_dir   TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id            TEXT PRIMARY KEY,
     workflow      TEXT NOT NULL,

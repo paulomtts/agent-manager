@@ -28,7 +28,16 @@ from agent_manager.store import writer as store_writer
 
 _REPO = Path(__file__).resolve().parents[2]
 
-_STORE_LEAVES = ("db", "journal", "replay", "queries", "leases", "checkpoints", "outbox")
+_STORE_LEAVES = (
+    "db",
+    "journal",
+    "replay",
+    "queries",
+    "leases",
+    "checkpoints",
+    "outbox",
+    "projects",
+)
 
 _WRITER_MAY_IMPORT = frozenset(
     {"agent_manager.models", *(f"agent_manager.store.{leaf}" for leaf in _STORE_LEAVES)}
