@@ -14,10 +14,22 @@ from agent_manager import paths
 JOURNAL_NAME = "journal.jsonl"
 
 EventKind = Literal[
-    "run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"
+    "run_upsert",
+    "story_upsert",
+    "subtask_upsert",
+    "phase_upsert",
+    "attempt_upsert",
+    "control_requested",
+    "control_handled",
+    "lease_acquired",
+    "lease_taken_over",
+    "claim_conflict",
 ]
-"""Every event is an upsert of one node of the §9 tree: a status transition is
-the same node recorded again with a new status."""
+"""Every kind of event a run records. The five `*_upsert`s (`NODE_KINDS`) each
+record one node of the §9 tree: a status transition is the same node recorded
+again with a new status. The other five record lease and control facts in the
+`events` table only: no tree reader folds them, and none is ever written to a
+journal file."""
 
 
 class JournalError(RuntimeError):

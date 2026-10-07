@@ -3482,6 +3482,11 @@ def test_checkpoints_stay_out_of_the_journal_and_survive_a_rebuild(repo):
         "subtask_upsert",
         "phase_upsert",
         "attempt_upsert",
+        "control_requested",
+        "control_handled",
+        "lease_acquired",
+        "lease_taken_over",
+        "claim_conflict",
     }
 
 

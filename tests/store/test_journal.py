@@ -59,6 +59,11 @@ def test_journal_is_a_leaf_module_of_the_store_package():
         "subtask_upsert",
         "phase_upsert",
         "attempt_upsert",
+        "control_requested",
+        "control_handled",
+        "lease_acquired",
+        "lease_taken_over",
+        "claim_conflict",
     }
     assert store_journal.JOURNAL_NAME == "journal.jsonl"
 
@@ -68,6 +73,29 @@ def test_node_kinds_are_the_five_tree_upserts():
         {"run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"}
     )
     assert store_journal.NODE_KINDS <= set(get_args(store_journal.EventKind))
+
+
+_LEASE_AND_CONTROL_KINDS = (
+    "control_requested",
+    "control_handled",
+    "lease_acquired",
+    "lease_taken_over",
+    "claim_conflict",
+)
+
+
+@pytest.mark.parametrize("kind", _LEASE_AND_CONTROL_KINDS)
+def test_a_journal_line_of_a_lease_or_control_kind_validates_and_is_no_node_kind(kind):
+    line = store_journal.JournalLine(
+        seq=1,
+        ts=datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc),
+        run_id=RUN_ID,
+        event=kind,
+        payload={"token": "t1"},
+    )
+
+    assert line.event == kind
+    assert kind not in store_journal.NODE_KINDS
 
 
 def test_the_store_package_does_not_re_export_journal_names():
