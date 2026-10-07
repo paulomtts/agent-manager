@@ -52,7 +52,10 @@ def _milestone_argv(
     root: Path, milestone: str, prefix: str, *, max_concurrent: int = 1
 ) -> list[str]:
     """`am run --milestone`, one story at a time unless asked, so an overlap
-    can only come from another process."""
+    can only come from another process.
+
+    Un-isolated (`--isolation none`): these scenarios read the held fake's pid
+    and kill it from outside, which a PID namespace would renumber."""
     return [
         "run",
         "--milestone",
@@ -60,6 +63,8 @@ def _milestone_argv(
         *_common(root, prefix),
         "--max-concurrent",
         str(max_concurrent),
+        "--isolation",
+        "none",
     ]
 
 

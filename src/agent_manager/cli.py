@@ -1923,6 +1923,16 @@ def run(
     verify_from_env: bool = typer.Option(
         False, argv_guard.FROM_ENV_FLAG, hidden=True
     ),
+    isolation: launcher.IsolationRequest = typer.Option(
+        "auto",
+        "--isolation",
+        help=(
+            "Run every agent in a PID namespace of its own, so it cannot signal "
+            "the engine: `bwrap`, `unshare`, `auto` (bwrap, then unshare, else "
+            "none with a warning) or `none`. A named mode this host cannot start "
+            "is refused before anything is written. Ignored with --dry-run."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Drive one subtask card, one story (--story, no Integrate), a whole milestone, or every open milestone (--board) end to end, or preview a story, a milestone or the board with --dry-run."""
@@ -1938,7 +1948,16 @@ def run(
         story=story,
     )
     lanes = DEFAULT_MAX_CONCURRENT if max_concurrent is None else max_concurrent
+    isolation_warning: str | None = None
     try:
+        # A5 B1: first after the argument checks, before any board read,
+        # `refresh_git`, store, lease or fork, so a refused mode writes
+        # nothing. A dry run launches nothing and probes nothing. Read as
+        # `launcher.resolve_isolation` so a test can patch it.
+        mode: models.Launcher | None = None
+        if not dry_run:
+            resolved = launcher.resolve_isolation(isolation)
+            mode, isolation_warning = resolved.mode, resolved.warning
         if whole_board and dry_run:
             payload = dry_run_board(
                 repo_dir=repo_dir,
@@ -1955,6 +1974,8 @@ def run(
                 branch_prefix_of=board_prefix_of(branch_prefix),
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
             )
@@ -1968,6 +1989,8 @@ def run(
                 branch_prefix_of=board_prefix_of(branch_prefix),
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
             )
         elif milestone is not None and dry_run:
@@ -1988,6 +2011,8 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
                 detacher=detach.fork_detacher,
             )
@@ -2002,6 +2027,8 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 max_concurrent=lanes,
             )
         elif story is not None and dry_run:
@@ -2021,6 +2048,8 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 detacher=detach.fork_detacher,
             )
         elif story is not None:
@@ -2033,6 +2062,8 @@ def run(
                 branch_prefix=branch_prefix,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
             )
         elif detach_run:
             # Read as `detach.fork_detacher` so a test can patch it there.
@@ -2042,6 +2073,8 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 commands=commands,
                 detacher=detach.fork_detacher,
             )
@@ -2052,11 +2085,17 @@ def run(
                 base_branch=base_branch,
                 branch_prefix=branch_prefix,
                 allow_no_verification=allow_no_verification,
+                launcher=mode,
+                isolation_warning=isolation_warning,
                 commands=commands,
             )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    if isolation_warning is not None:
+        # Once, at the top level (a board's milestone entries never carry
+        # it), before `argv_guard`'s warning.
+        payload.setdefault("warnings", []).append(isolation_warning)
     add_argv_warnings(ctx, payload)
     typer.echo(render(ok_envelope(payload), pretty=pretty))
     if detach_run:
