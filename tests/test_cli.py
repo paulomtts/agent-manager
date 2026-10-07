@@ -56,6 +56,7 @@ from agent_manager import (
 )
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
@@ -12226,11 +12227,11 @@ def test_resume_refuses_a_reset_run_as_cancelled_and_writes_nothing(
 
 # ── am status integrity (card f63036db) ─────────────────────────────────────
 #
-# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the journal
-# with the projection through `store_replay.diverging` and reports it under an
-# always-present `integrity` key, at exit 0, writing nothing. Unit tier: the
-# projection fixture writes SQLite rows and journal files in `tmp_path`; no
-# subprocess.
+# journal/DB divergence spec §3.3, §3.5, §3.7: `status` compares the run's
+# events with the projection through `store_replay.diverging` and reports it
+# under an always-present `integrity` key, at exit 0, writing nothing. Unit
+# tier: the projection fixture writes SQLite rows and journal files in
+# `tmp_path`; no subprocess.
 
 CLEAN_INTEGRITY = {"checked": True, "reason": None, "mismatches": []}
 
@@ -12258,6 +12259,71 @@ def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID)
     try:
         with store_db.immediate(conn):
             conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+    finally:
+        conn.close()
+
+
+PLANTED_TS = "2026-09-29T09:00:00+00:00"
+
+
+def _plant_event(
+    root: Path,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_id: str = CONTROL_RUN_ID,
+    story: str | None = None,
+) -> None:
+    """One `events` row of `run_id` written behind the store's back, as a hand
+    `INSERT` would: no row and no journal line record it."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            store_events.insert(
+                conn,
+                project_id=store_projects.lookup(conn, resolved),
+                run_id=run_id,
+                ts=PLANTED_TS,
+                kind=kind,
+                payload=payload,
+                source="live",
+                story_id=story,
+            )
+    finally:
+        conn.close()
+
+
+def _plant_raw_payload(root: Path, kind: str, text: str, *, run_id: str = CONTROL_RUN_ID) -> int:
+    """An `events` row of `run_id` whose `payload` column is `text` verbatim,
+    which `store_events.insert` (it serialises) cannot write. Returns its `run_seq`."""
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
+    try:
+        with store_db.immediate(conn):
+            run_seq = conn.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) + 1 FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'live')",
+                (store_projects.lookup(conn, resolved), run_id, run_seq, PLANTED_TS, kind, text),
+            )
+    finally:
+        conn.close()
+    return run_seq
+
+
+def _drop_events(root: Path, run_id: str = CONTROL_RUN_ID) -> None:
+    """Delete every event of `run_id`, as a restored or foreign database may
+    lack them while keeping the run's rows. The append-only trigger is
+    dropped first so the rows can go."""
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        conn.execute("DROP TRIGGER events_no_delete")
+        conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -12348,102 +12414,103 @@ def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monke
     assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
 
 
-def test_status_of_a_run_with_no_journal_says_so_and_creates_no_run_directory(
+def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
     projection, monkeypatch
 ):
-    """Spec test 5: `Journal._for_reading`, never the constructor that calls
-    `paths.run_dir` and would create the directory."""
+    """Spec test 16: the run's rows are there, its events are not."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
     shutil.rmtree(run_dir)
+    _drop_events(projection)
 
-    def forbidden(self, run_id):
-        raise AssertionError("status must not construct Journal(run_id)")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must not construct a Journal")
 
     monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
+    monkeypatch.setattr(store_journal.Journal, "_for_reading", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
-    assert data["integrity"] == {"checked": False, "reason": "no journal", "mismatches": []}
+    assert data["integrity"] == {"checked": False, "reason": "no events", "mismatches": []}
     assert not run_dir.exists()
 
 
-def test_a_torn_final_journal_line_is_ignored_and_the_run_still_checked(
+def test_status_of_a_clean_run_with_its_journal_file_gone_is_still_checked_clean(
     projection, monkeypatch
 ):
-    """Spec test 6, first half: an append in flight, no trailing newline."""
+    """Spec test 17: the events, not the file, are compared."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write('{"seq": 9999, "ts": "2026-')
+    shutil.rmtree(paths.data_dir() / "runs" / CONTROL_RUN_ID)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == CLEAN_INTEGRITY
 
 
-def test_a_newline_terminated_non_json_line_makes_the_journal_unreadable(
+def test_an_event_payload_that_is_not_json_makes_the_events_unreadable(
     projection, monkeypatch
 ):
-    """Spec test 6, second half: still `CorruptJournalError`, reported at exit 0."""
+    """Spec test 18; Review Focus 1: a hand INSERT is reported at exit 0."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    run_seq = _plant_raw_payload(projection, "story_upsert", "{not json")
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
-    assert "line is not JSON" in integrity["reason"]
+    assert integrity["reason"].startswith("events unreadable: ")
+    assert f"run_seq {run_seq}" in integrity["reason"]
+    assert "not JSON" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_empty_journal_is_unreadable_not_a_traceback(projection, monkeypatch):
-    """Review Focus: `read()` returns `[]`, and `replay` inside `diverging`
-    raises `JournalError` -- the try must cover `diverging` too."""
+def test_events_without_a_run_upsert_are_unreadable_not_a_traceback(projection, monkeypatch):
+    """Spec test 19: `run_lines` returns a story line only, and `replay` inside
+    `diverging` raises `JournalError` -- the try must cover `diverging` too."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    _journal_path().write_text("", encoding="utf-8")
+    _drop_events(projection)
+    _plant_event(
+        projection,
+        "story_upsert",
+        {"card_id": "story-1", "title": "The CLI", "level": 0, "status": "started", "tip_branch": None},
+        story="story-1",
+    )
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"] == {
         "checked": False,
-        "reason": "journal unreadable: journal contains no run_upsert line",
+        "reason": "events unreadable: journal line 1 is a story_upsert but no"
+        " run_upsert preceded it: the head of the journal is missing",
         "mismatches": [],
     }
 
 
-def test_a_journal_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
-    """Review Focus: the envelope is valid, the run payload is not, so
-    `diverging` raises a pydantic `ValidationError`."""
+def test_an_event_payload_that_fails_validation_is_unreadable(projection, monkeypatch):
+    """Spec test 20: the event is valid JSON, the run payload is not a `Run`,
+    so `diverging` raises a pydantic `ValidationError`."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    path = _journal_path()
-    first, *rest = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    line = json.loads(first)
-    assert line["event"] == "run_upsert"
-    line["payload"]["status"] = "not-a-status"
-    path.write_text(json.dumps(line) + "\n" + "".join(rest), encoding="utf-8")
+    _plant_event(projection, "run_upsert", {"id": CONTROL_RUN_ID, "status": "not-a-status"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     integrity = data["integrity"]
     assert integrity["checked"] is False
-    assert integrity["reason"].startswith("journal unreadable: ")
+    assert integrity["reason"].startswith("events unreadable: ")
     assert "validation error" in integrity["reason"]
     assert integrity["mismatches"] == []
 
 
-def test_an_unknown_journal_event_kind_is_skipped_by_the_check(projection, monkeypatch):
-    """Review Focus: a line a newer `am` wrote is not divergence and does not raise."""
+def test_an_event_of_another_kind_is_skipped_by_the_check(projection, monkeypatch):
+    """Spec test 21; Review Focus 2: a lease or control event is not divergence."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"seq": 9999, "event": "from_the_future"}) + "\n")
+    _plant_event(projection, "from_the_future", {"anything": "at all"})
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -12479,18 +12546,19 @@ def test_a_live_lease_is_not_checked_and_a_stale_one_is(
     assert data["integrity"] == integrity
 
 
-def test_a_live_lease_never_opens_the_journal(projection, monkeypatch):
-    """Review Focus: the live-lease rule comes first, so even a corrupt
-    journal reads as `lease is live`, and `diverging` is never called."""
+def test_a_live_lease_never_reads_the_events(projection, monkeypatch):
+    """Review Focus: the live-lease rule comes first, so even an unreadable
+    event reads as `lease is live`, and neither `run_lines` nor `diverging`
+    is called."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    with _journal_path().open("a", encoding="utf-8") as handle:
-        handle.write("not json\n")
+    _plant_raw_payload(projection, "story_upsert", "{not json")
     _plant_lease(projection, heartbeat_at=CONTROL_NOW - timedelta(seconds=5))
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("a live run's journal must not be compared")
+        raise AssertionError("a live run's events must not be compared")
 
+    monkeypatch.setattr(store_events, "run_lines", forbidden)
     monkeypatch.setattr(store_replay, "diverging", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
