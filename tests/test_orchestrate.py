@@ -4618,6 +4618,23 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
+def test_a_milestone_run_of_another_repo_is_an_unknown_run(tmp_path, monkeypatch):
+    """`am.db` holds every repository's runs: a run another repository
+    recorded is unknown to this one, and to a repository with no project."""
+    theirs = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(theirs)
+    mine = (tmp_path / "mine").resolve()
+    mine.mkdir()
+    _record_resume_run(mine, "20260924T120000Z-00000008")
+    stranger = (tmp_path / "stranger").resolve()
+    stranger.mkdir()
+
+    for root in (mine, stranger):
+        with pytest.raises(cli.UnknownRunError, match=RESUME_RUN_ID):
+            orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+    assert orchestrate.resumable_milestone_run(theirs, RESUME_RUN_ID).id == RESUME_RUN_ID
+
+
 @pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
 def test_resume_refuses_run_canceled_in_either_spelling(tmp_path, monkeypatch, status):
     """C9: unknown run, then wrong workflow, then canceled in either spelling --
