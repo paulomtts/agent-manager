@@ -465,3 +465,38 @@ def test_attempt_path_and_list_run_ids_create_no_data_dir(monkeypatch, tmp_path)
     assert paths.list_run_ids() == []
 
     assert not (tmp_path / "xdg").exists()
+
+
+def test_db_path_uses_xdg_data_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.db_path() == tmp_path / "agent-manager" / "am.db"
+
+
+def test_db_path_defaults_to_home_local_share(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert paths.db_path() == tmp_path / ".local" / "share" / "agent-manager" / "am.db"
+
+
+def test_db_path_treats_empty_xdg_data_home_as_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", "")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert paths.db_path() == tmp_path / ".local" / "share" / "agent-manager" / "am.db"
+
+
+def test_db_path_creates_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    paths.db_path()
+
+    assert not (tmp_path / "agent-manager").exists()
+
+
+def test_db_path_raises_key_error_when_home_and_xdg_are_unset(monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", "")
+    monkeypatch.delenv("HOME", raising=False)
+    with pytest.raises(KeyError):
+        paths.db_path()

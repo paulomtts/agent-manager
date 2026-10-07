@@ -24,6 +24,15 @@ def data_dir() -> Path:
     return result
 
 
+def db_path() -> Path:
+    """The machine-wide database, `<data dir>/am.db`, without creating anything.
+
+    Neither the data directory nor the file: whoever opens the database
+    creates the directory first.
+    """
+    return data_path() / "am.db"
+
+
 def project_digest(root: Path) -> str:
     """The per-project file stem: sha256 of the resolved root path, 64 hex chars.
 
