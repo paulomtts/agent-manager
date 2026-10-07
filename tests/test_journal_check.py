@@ -9,6 +9,7 @@ exact JSON lines. Nothing spawns a process, so these are unit tests.
 import ast
 import inspect
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -418,7 +419,7 @@ def _mkdir(path: Path) -> Path:
     return path
 
 
-def test_a_row_whose_payload_is_not_json_propagates(rows):
+def test_a_row_whose_payload_is_not_json_propagates(rows, monkeypatch):
     # Review Focus: never swallowed; a ValueError the CLI renders at exit 3.
     rows.conn.execute(
         "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
@@ -426,9 +427,41 @@ def test_a_row_whose_payload_is_not_json_propagates(rows):
         (rows.project_id, RUN, TS),
     )
     rows.conn.commit()
+    opened = _record_reader(monkeypatch)
 
     with pytest.raises(json.JSONDecodeError):
         journal_check.check(RUN)
+
+    _assert_closed(opened)
+
+
+def _record_reader(monkeypatch) -> list[sqlite3.Connection]:
+    """Every connection `check` opens through `open_db_for_reading`."""
+    opened: list[sqlite3.Connection] = []
+    real = store_db.open_db_for_reading
+
+    def recording(root: Path) -> sqlite3.Connection:
+        opened.append(real(root))
+        return opened[-1]
+
+    monkeypatch.setattr(store_db, "open_db_for_reading", recording)
+    return opened
+
+
+def _assert_closed(opened: list[sqlite3.Connection]) -> None:
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+
+
+def test_check_closes_its_connection(rows, monkeypatch):
+    rows.add(1)
+    write_journal(RUN, [_line(1)])
+    opened = _record_reader(monkeypatch)
+
+    journal_check.check(RUN)
+
+    _assert_closed(opened)
 
 
 def test_compare_without_a_journal_is_pure(rows):
