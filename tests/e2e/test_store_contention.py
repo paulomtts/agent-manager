@@ -104,3 +104,67 @@ def test_am_run_blocked_past_the_retry_budget_is_a_store_busy_envelope_at_exit_3
     runs = _data(*am("runs", "--repo-dir", str(root)))["runs"]
     (run_id,) = [row["id"] for row in runs]
     assert _clean_runs(am, run_id) == {run_id: True}
+
+
+def _events_by_run(run_ids: list[str]) -> dict[str, list[store_events.EventRow]]:
+    """Each run's committed events in `seq` order, read through a WAL reader."""
+    reader = store_db.open_reader(paths.db_path())
+    try:
+        return {run_id: store_events.read(reader, run_id=run_id) for run_id in run_ids}
+    finally:
+        reader.close()
+
+
+@pytest.mark.e2e_fake
+def test_two_am_processes_on_different_runs_keep_every_event_in_order(
+    two_milestone_board, fake_claude_bin, rendezvous, spawn_am, finish_am, am
+):
+    """D:385. Each milestone drives one story at a time, so the count-2
+    rendezvous can only be met while both processes are live: their writes
+    overlap in time."""
+    root = two_milestone_board["root"]
+    prefixes = {"first": "m10a", "second": "m10b"}
+    rendezvous.arm(2)
+
+    children = {
+        side: spawn_am(
+            "run",
+            "--milestone",
+            two_milestone_board["milestones"][side],
+            *_common(root, prefix),
+            "--max-concurrent",
+            "1",
+        )
+        for side, prefix in prefixes.items()
+    }
+    results = {side: _data(*finish_am(child)) for side, child in children.items()}
+
+    run_ids = [results[side]["run_id"] for side in prefixes]
+    assert all(results[side]["done"] is True for side in prefixes), results
+    assert run_ids[0] != run_ids[1]
+    events = _events_by_run(run_ids)
+    seqs = {run_id: [event.seq for event in events[run_id]] for run_id in run_ids}
+    for run_id in run_ids:
+        assert seqs[run_id], run_id
+        # One writer per run, `run_seq` assigned MAX+1 inside the transaction.
+        assert [event.run_seq for event in events[run_id]] == list(
+            range(1, len(events[run_id]) + 1)
+        ), run_id
+        assert seqs[run_id] == sorted(set(seqs[run_id])), run_id
+    first, second = (seqs[run_id] for run_id in run_ids)
+    assert set(first).isdisjoint(second)
+    # Non-vacuity: each run committed events both before and after the other's.
+    assert min(first) < max(second) and min(second) < max(first)
+    clean = _clean_runs(am, "--all")
+    assert {run_id: clean.get(run_id) for run_id in run_ids} == dict.fromkeys(run_ids, True)
+    for run_id in run_ids:
+        st = store_writer.Store.open(root, run_id)
+        try:
+            replayed = st.replay_events(run_id)
+            loaded = st.load_run(run_id)
+            lines = store_events.run_lines(st.read_connection, run_id)
+        finally:
+            st.close()
+        assert loaded is not None, run_id
+        assert store_replay.diverging(lines, loaded) == [], run_id
+        assert replayed == loaded, run_id
