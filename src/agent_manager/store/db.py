@@ -5,7 +5,7 @@ migrating it, and the write-transaction helper.
 import functools
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -201,6 +201,24 @@ class StoreSchemaError(RuntimeError):
         self.found = found
 
 
+class MigrationRequiredError(RuntimeError):
+    """Per-project databases from an older `am` are present and `am.db` has no
+    `MIGRATED_KEY` row in `meta` (or no `am.db`, or no `meta` table).
+
+    Raised by `open_db` and `open_db_for_reading` before anything is created
+    or written: not the data directory, not `am.db` or its sidecars, not any
+    legacy file. `legacy` is what `paths.legacy_project_dbs` listed.
+    """
+
+    def __init__(self, legacy: Sequence[Path]) -> None:
+        super().__init__(
+            f"{len(legacy)} per-project database(s) from an older am are in"
+            f" {paths.data_path() / 'projects'} and have not been migrated into"
+            f" {paths.db_path()}; run `am migrate` first. Nothing has been changed"
+        )
+        self.legacy = tuple(legacy)
+
+
 _WAL_RETRY_FIRST_PAUSE = 0.05
 """Seconds `_enable_wal` waits after the first locked attempt; each later pause doubles."""
 
@@ -264,6 +282,56 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
+def _read_only_uri(location: Path) -> str:
+    """A URI that opens the existing `location` without writing or creating anything.
+
+    A `mode=ro` read of a WAL database creates its `-wal` and `-shm`
+    sidecars. When neither exists, no connection holds the file open, so it is
+    opened `immutable=1` instead: that read takes no lock and creates nothing.
+    """
+    settled = not any(
+        location.with_name(location.name + suffix).exists() for suffix in ("-wal", "-shm")
+    )
+    return f"{location.absolute().as_uri()}?{'immutable=1' if settled else 'mode=ro'}"
+
+
+def _refuse_unmigrated(location: Path) -> None:
+    """Raise `MigrationRequiredError` when the machine still needs `am migrate`.
+
+    No legacy database (`paths.legacy_project_dbs`): no refusal. Otherwise
+    refused unless `location` exists and its `meta` table has a
+    `MIGRATED_KEY` row. `location` is read through a read-only connection,
+    closed before returning or raising, so the check takes no write lock and
+    creates nothing.
+    """
+    legacy = paths.legacy_project_dbs()
+    if not legacy:
+        return
+    if location.exists():
+        conn = sqlite3.connect(
+            _read_only_uri(location), uri=True, timeout=BUSY_TIMEOUT_SECONDS
+        )
+        try:
+            has_meta = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+                ).fetchone()
+                is not None
+            )
+            migrated = (
+                has_meta
+                and conn.execute(
+                    "SELECT 1 FROM meta WHERE key = ?", (MIGRATED_KEY,)
+                ).fetchone()
+                is not None
+            )
+        finally:
+            conn.close()
+        if migrated:
+            return
+    raise MigrationRequiredError(legacy)
+
+
 def open_db(root: Path) -> sqlite3.Connection:
     """Open the machine-wide projection `paths.db_path()`, applying the schema idempotently.
 
@@ -283,6 +351,10 @@ def open_db(root: Path) -> sqlite3.Connection:
     `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
     any more, so they stay NULL.
 
+    Before anything else, `_refuse_unmigrated` raises `MigrationRequiredError`
+    on a machine with per-project databases and no completed migration; the
+    refusal is checked before the schema version, and creates nothing.
+
     `PRAGMA user_version` is read before anything is written: a value above
     `SCHEMA_VERSION` closes the connection and raises `StoreSchemaError`,
     leaving the file as it was. A lower value (0 on a new or unstamped file)
@@ -295,6 +367,7 @@ def open_db(root: Path) -> sqlite3.Connection:
     run write is fenced by the lease token (multi-process X4).
     """
     location = paths.db_path()
+    _refuse_unmigrated(location)
     paths.data_dir()
     conn = sqlite3.connect(
         location,
@@ -361,22 +434,19 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
     nothing created; below it, or missing tables or columns, is "an older
     schema".
 
-    A read through `mode=ro` of a WAL database creates its `-wal` and `-shm`
-    sidecars. When neither exists, no connection holds the file open, so it is
-    opened `immutable=1` instead: that read takes no lock and creates nothing,
-    and the connection is for one short read, never held across writes.
+    First, as `open_db` does, `_refuse_unmigrated` may raise
+    `MigrationRequiredError`. The connection is opened by `_read_only_uri`
+    and is for one short read, never held across writes.
     """
     location = paths.db_path()
+    _refuse_unmigrated(location)
     if not location.exists():
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         return conn
-    settled = not any(
-        location.with_name(location.name + suffix).exists() for suffix in ("-wal", "-shm")
-    )
     conn = sqlite3.connect(
-        f"{location.absolute().as_uri()}?{'immutable=1' if settled else 'mode=ro'}",
+        _read_only_uri(location),
         uri=True,
         timeout=BUSY_TIMEOUT_SECONDS,
         check_same_thread=False,

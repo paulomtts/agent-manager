@@ -1451,6 +1451,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     store_leases.LeaseLostError,
     store_journal.CorruptJournalError,
     store_db.StoreSchemaError,
+    store_db.MigrationRequiredError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1467,7 +1468,10 @@ torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
 is a refusal naming the file and line, not a bug; only that subclass, not
 `JournalError` as a whole. `store_db.StoreSchemaError` is in it because an
 `am.db` written by a newer `am` is a refusal naming the file and both versions,
-not a bug. Anything outside this tuple is a bug in this program
+not a bug. `store_db.MigrationRequiredError` is in it because every command
+that opens the projection refuses, naming `am migrate`, on a machine whose
+per-project databases have not been migrated; it is raised before anything is
+written. Anything outside this tuple is a bug in this program
 and should crash loudly with its stack intact.
 """
 

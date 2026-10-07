@@ -329,3 +329,41 @@ def test_runs_on_a_newer_machine_database_is_a_store_schema_error(tmp_path, monk
     assert envelope["ok"] is False
     assert envelope["error"]["type"] == "StoreSchemaError"
     assert str(path) in envelope["error"]["message"]
+
+
+def _leave_a_legacy_database() -> None:
+    projects = paths.data_path() / "projects"
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / f"{'0' * 64}.db").write_bytes(b"")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["runs"],
+        ["status"],
+        ["status", RUN_ID],
+        ["logs", RUN_ID, "card"],
+        ["resume", RUN_ID],
+        ["reset", RUN_ID],
+        ["cancel", RUN_ID],
+        ["pause", RUN_ID],
+    ],
+)
+def test_every_store_command_refuses_an_unmigrated_machine_and_writes_nothing(
+    tmp_path, monkeypatch, argv
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, [*argv, "--repo-dir", str(root)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()

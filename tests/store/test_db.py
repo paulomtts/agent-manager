@@ -19,6 +19,7 @@ import pytest
 from agent_manager import paths, store
 from agent_manager.store import db
 from agent_manager.store import projects as store_projects
+from agent_manager.store.writer import Store
 
 RUN_ID = "run-2026-09-23-01"
 
@@ -157,6 +158,8 @@ _DB_NAMES = (
     "SCHEMA_VERSION",
     "MIGRATED_KEY",
     "StoreSchemaError",
+    "MigrationRequiredError",
+    "_refuse_unmigrated",
 )
 
 
@@ -184,6 +187,8 @@ def test_db_is_a_leaf_module_of_the_store_package():
     assert db.MIGRATED_KEY == "migrated_at"
     assert db.StoreSchemaError.__module__ == "agent_manager.store.db"
     assert issubclass(db.StoreSchemaError, RuntimeError)
+    assert db.MigrationRequiredError.__module__ == "agent_manager.store.db"
+    assert issubclass(db.MigrationRequiredError, RuntimeError)
 
 
 def test_the_store_package_does_not_re_export_db_names():
@@ -709,3 +714,145 @@ def test_open_db_for_reading_stamps_an_unstamped_db_and_reads_its_rows(repo):
 
     assert kept == ["/kept"]
     assert _user_version(path) == db.SCHEMA_VERSION
+
+
+def _leave_legacy(name: str = "x.db") -> Path:
+    """A per-project database from an older `am`, as `legacy_project_dbs` lists it."""
+    projects = paths.data_path() / "projects"
+    projects.mkdir(parents=True, exist_ok=True)
+    legacy = projects / name
+    legacy.write_bytes(b"legacy bytes")
+    return legacy
+
+
+def _mark_migrated(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)", (db.MIGRATED_KEY, _STAMP)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_OPENERS = pytest.mark.parametrize(
+    "opener", [db.open_db, db.open_db_for_reading], ids=["open_db", "open_db_for_reading"]
+)
+
+
+@_OPENERS
+def test_legacy_dbs_and_no_am_db_refuse_and_change_nothing(repo, opener):
+    _leave_legacy("a.db")
+    _leave_legacy("b.db")
+    before = _data_tree()
+
+    with pytest.raises(db.MigrationRequiredError) as raised:
+        opener(repo)
+
+    message = str(raised.value)
+    assert "am migrate" in message
+    assert str(paths.data_path() / "projects") in message
+    assert "2 " in message
+    assert "Nothing has been changed" in message
+    assert _data_tree() == before
+    for name in ("am.db", "am.db-wal", "am.db-shm"):
+        assert not (paths.data_path() / name).exists()
+
+
+@_OPENERS
+def test_legacy_dbs_and_an_am_db_without_the_marker_refuse(repo, opener):
+    db.open_db(repo).close()
+    _leave_legacy()
+    before = paths.db_path().read_bytes()
+
+    with pytest.raises(db.MigrationRequiredError):
+        opener(repo)
+
+    assert paths.db_path().read_bytes() == before
+
+
+@_OPENERS
+def test_legacy_dbs_and_an_am_db_without_a_meta_table_refuse(repo, opener):
+    path = paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bare = sqlite3.connect(path)
+    bare.execute("CREATE TABLE sentinel (x)")
+    bare.commit()
+    bare.close()
+    _leave_legacy()
+
+    with pytest.raises(db.MigrationRequiredError):
+        opener(repo)
+
+
+@_OPENERS
+def test_legacy_dbs_and_the_marker_open_normally(repo, opener):
+    db.open_db(repo).close()
+    _mark_migrated(paths.db_path())
+    legacy = _leave_legacy()
+
+    conn = opener(repo)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (db.MIGRATED_KEY,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert marker == _STAMP
+    assert legacy.read_bytes() == b"legacy bytes"
+
+
+def test_lock_files_sidecars_and_directories_under_projects_never_refuse(repo):
+    projects = paths.data_path() / "projects"
+    projects.mkdir(parents=True)
+    (projects / f"{'0' * 64}.events.lock").write_bytes(b"")
+    (projects / "x.db-wal").write_bytes(b"")
+    (projects / "sub.db").mkdir()
+
+    db.open_db(repo).close()
+
+    assert paths.db_path().is_file()
+
+
+def test_the_refusal_is_checked_before_the_schema_version(repo):
+    _write_newer_db(paths.db_path())
+    _leave_legacy()
+
+    with pytest.raises(db.MigrationRequiredError):
+        db.open_db(repo)
+
+
+def test_store_open_on_an_unmigrated_machine_refuses_before_any_run_directory(repo):
+    # Review Focus 1: `Store.open` opens the projection before it builds a
+    # `Journal`, so a refused write leaves no `runs/<run id>` behind.
+    _leave_legacy()
+
+    with pytest.raises(db.MigrationRequiredError):
+        Store.open(repo, RUN_ID)
+
+    assert not (paths.data_path() / "runs").exists()
+    assert not paths.db_path().exists()
+
+
+def test_the_refusal_check_does_not_wait_for_a_writer_holding_a_transaction(repo):
+    # Review Focus 2: the marker and version are read `mode=ro` under WAL,
+    # so a writer's open transaction never blocks them.
+    writer = db.open_db(repo)
+    _mark_migrated(paths.db_path())
+    _leave_legacy()
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "INSERT INTO projects (repo_dir, created_at) VALUES ('/held', ?)", (_STAMP,)
+        )
+        started = time.monotonic()
+        reader = db.open_db_for_reading(repo)
+        try:
+            assert reader.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+        finally:
+            reader.close()
+        assert time.monotonic() - started < 1.0
+    finally:
+        writer.rollback()
+        writer.close()
