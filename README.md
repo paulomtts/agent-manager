@@ -72,8 +72,12 @@ To drive one story of a milestone instead of the whole milestone, with no Integr
 `<repo>/.claude/worktrees/<branch>`. `--verify` is repeatable, passed through as
 written, and run in the order given. With no `--verify`, pass
 `--allow-no-verification` to opt out on purpose; with neither, the verification
-gate refuses to go on. `--repo-dir` defaults to `.` and `--base-branch` to
-`master`.
+gate refuses to go on. `--repo-dir` defaults to `.`. `--base-branch` defaults to the repository's
+default branch: the branch `origin/HEAD` points at, else the checked-out branch,
+else `master`, each only if it exists. A `--base-branch` that is not a local
+branch or `origin/<name>` is refused in pre-flight (exit code 3,
+`BaseBranchError`, listing the existing branches) before any run, claim or
+worktree is created, with `--dry-run` too. `am resume` keeps the recorded base.
 
 Each `--verify` command runs with `AM_RUN_ID` (the run's id) and
 `AM_CARD_ID` (the card being verified) added to its environment.
@@ -211,7 +215,7 @@ Stacking. Each milestone starts from one branch, its base. Only the ids in its `
 
 A stacked milestone runs exactly as before from its base: its stories root on the blocker's `<prefix>-integrate` instead of `--base-branch`, and its own Integrate still merges into its own `<prefix>-integrate`. `am` never merges into `--base-branch`. Stacking changes where a milestone starts, not when. It still waits for every open blocker to finish `done`, and is reported `blocked` if one ends any other way.
 
-Flags. Give exactly one of `--card`, `--milestone`, `--story` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default `master`) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card`, `--milestone` or `--story` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
+Flags. Give exactly one of `--card`, `--milestone`, `--story` and `--board`. `--verify`, `--allow-no-verification`, `--base-branch` (default: the repository's default branch, see above) and `--repo-dir` apply to every milestone. `--branch-prefix` is optional with `--board`. Without it, each milestone's prefix is its own card stem, `<title slug>-<first 8 hex of the card id>`. With `--branch-prefix P`, each milestone's prefix is `P-<stem>`, never `P` itself, so milestone M's integration branch is `P-<stem of M>-integrate`. `--board` with `--card`, `--milestone` or `--story` and a blank `--branch-prefix` with `--board` are usage errors (exit 2).
 
 Refusals. These come in this order, before anything is written. Each prints `{"ok": false, "error": {"type", "message"}}` and exits 3:
 
@@ -771,6 +775,8 @@ phase 'implement' was not dispatched again: attempt 1 of run <run-id> had alread
 A recorded result that no longer holds up is dispatched again, with one warning line `phase '<name>': attempt <n> of run <run-id> was not reused (<why>); dispatching again`. The envelope shape and the exit codes are the same as for any other resume.
 
 Exactly-once covers am's dispatch of an agent phase, not what the harness did. The harness's own effects are never transactional: commits, files written in the worktree, or anything else an agent did before the kill stay as they are, whether the phase is then adopted or dispatched again. A phase that is dispatched again finds that work already in its worktree; `implement`, for example, resumes from git and the `Plan-Hash` trailers. The coder role is explicitly told never to rewrite, amend, squash or delete a commit; the `docs_commit` step does exactly that (rebuilding and moving the branch ref) to backfill a missing or stale `Plan-Hash` trailer, which is a deliberate asymmetry -- that rewrite is the engine's own, narrow and idempotent, done before an agent is ever dispatched into the worktree, not a license the coder shares.
+
+Stale base and stale branch. For a `--card`, `--milestone` or `--story` subtask, the `worktree` step first fast-forwards a local base branch that is strictly behind `origin/<base>` (with `merge --ff-only` when the base is checked out and clean, otherwise a compare-and-swap `update-ref`), so the worktree and every `<base>..HEAD` comparison use one commit. A base with local-only commits or a dirty checkout is never touched, and Integrate never moves the base. When `docs_commit` finds a clean worktree whose branch holds commits beyond the base that all carry a `Plan-Hash` of an older plan and none carries this plan's, it saves the tip at `refs/am/stale/<branch>/<short-sha>-<UTC timestamp>`, recreates the branch from the base, and the run records a warning naming that ref. Nothing is rewritten, and a branch with any commit of the current plan resumes as before. A dirty worktree is left as it is and escalates as before.
 
 `docs_commit` commits the spec and the plan in one commit with the `Plan-Hash` trailer when the repository tracks them. When the repository git-ignores both (for example `docs/superpowers/` in its `.gitignore`), it neither adds nor commits them: they stay in the worktree as ignored files, the plan is still hashed, and the backfill still stamps the trailer on every commit the branch already has. When git ignores only one of the two, the subtask escalates at `docs_commit`.
 

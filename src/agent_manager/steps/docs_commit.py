@@ -25,6 +25,7 @@ import hashlib
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_manager.steps import reducers
@@ -288,6 +289,91 @@ def _resolves(git_runner: GitRunner, worktree_path: str, revision: str) -> bool:
     return True
 
 
+def _preserved(ref: str | None) -> dict[str, str]:
+    return {} if ref is None else {"preserved_ref": ref}
+
+
+def _git_ok(git_runner: GitRunner, argv: list[str]) -> bool:
+    try:
+        git_runner(argv)
+    except GitError:
+        return False
+    return True
+
+
+def _retire_stale_branch(
+    git_runner: GitRunner,
+    worktree_path: str,
+    base_branch: str,
+    digest: str,
+    documents: tuple[str, str],
+) -> str | None:
+    """Preserve and recreate a branch whose own commits all belong to an older plan.
+
+    Acts only when `base..HEAD` (excluding `origin/<base>`) is non-empty, every
+    commit carries some Plan-Hash, none carries `digest`, and the worktree is
+    clean. The tip is first saved at `refs/am/stale/<branch>/<short-sha>-<utc
+    timestamp>`; the branch is then recreated at the base. No commit is
+    rewritten. Returns the preserved ref, or `None` when nothing was done.
+    """
+    if not _resolves(git_runner, worktree_path, base_branch):
+        return None
+    try:
+        ref = git_runner(["-C", worktree_path, "symbolic-ref", "-q", "HEAD"]).strip()
+    except GitError:
+        return None
+    if not ref.startswith("refs/heads/"):
+        return None
+    excluded = [f"^{base_branch}"]
+    if _resolves(git_runner, worktree_path, f"origin/{base_branch}"):
+        excluded.append(f"^origin/{base_branch}")
+    listing = git_runner(
+        ["-C", worktree_path, "rev-list", "--parents", "HEAD", *excluded, "--"]
+    )
+    rows = [line.split() for line in listing.splitlines() if line.strip()]
+    if not rows or any(len(row) != 2 for row in rows):
+        return None
+    wanted = f"{TRAILER_PREFIX}{digest}"
+    for row in rows:
+        message = _split_commit(git_runner(["-C", worktree_path, "cat-file", "commit", row[0]]))[1]
+        if not _is_stamped(message) or any(
+            line.strip() == wanted for line in message.splitlines()
+        ):
+            return None
+    # The two documents are expected to be untracked here; anything else dirty
+    # means a human or a killed run left work this must not discard.
+    dirty = git_runner(
+        [
+            "-C",
+            worktree_path,
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            *(f":(exclude){path}" for path in documents),
+        ]
+    )
+    if dirty.strip():
+        return None
+    tip = git_runner(["-C", worktree_path, "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    preserved = f"refs/am/stale/{ref.removeprefix('refs/heads/')}/{tip[:8]}-{stamp}"
+    git_runner(["-C", worktree_path, "update-ref", preserved, tip])
+    new_base = (
+        f"origin/{base_branch}"
+        if _resolves(git_runner, worktree_path, f"origin/{base_branch}")
+        and _git_ok(
+            git_runner,
+            ["-C", worktree_path, "merge-base", "--is-ancestor", base_branch, f"origin/{base_branch}"],
+        )
+        else base_branch
+    )
+    # The worktree is clean, so moving it to the base discards no work: the
+    # old commits live on at `preserved`.
+    git_runner(["-C", worktree_path, "reset", "--hard", "-q", new_base])
+    return preserved
+
+
 def _backfill(
     git_runner: GitRunner, worktree_path: str, base_branch: str, digest: str
 ) -> list[str]:
@@ -429,10 +515,18 @@ def commit_documents(
     # Before the add/commit below: when a role already committed the documents
     # themselves, nothing is staged and `_branch_carries` decides -- which it
     # can only answer yes to once those drafts carry the trailer.
+    preserved = _retire_stale_branch(
+        git_runner, worktree_path, base_branch, digest, (spec_path, plan_path)
+    )
     backfilled = _backfill(git_runner, worktree_path, base_branch, digest)
 
     if spec_ignored:
-        return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": False}
+        return {
+            "plan_hash": digest,
+            "backfilled": backfilled,
+            "documents_committed": False,
+            **_preserved(preserved),
+        }
 
     # `--` and then exactly two literal pathspecs. Never `-A`, never `.`.
     git_runner(["-C", worktree_path, "add", "--", spec_path, plan_path])
@@ -447,6 +541,7 @@ def commit_documents(
                 "plan_hash": digest,
                 "backfilled": backfilled,
                 "documents_committed": True,
+                **_preserved(preserved),
             }
         raise UntaggedDocumentsError(
             plan_hash=digest, spec_path=spec_path, plan_path=plan_path
@@ -468,4 +563,9 @@ def commit_documents(
             plan_path,
         ]
     )
-    return {"plan_hash": digest, "backfilled": backfilled, "documents_committed": True}
+    return {
+        "plan_hash": digest,
+        "backfilled": backfilled,
+        "documents_committed": True,
+        **_preserved(preserved),
+    }

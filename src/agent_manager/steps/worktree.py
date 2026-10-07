@@ -199,6 +199,54 @@ def _resolve_base(git_runner: GitRunner, repo_path: str, base: str) -> str:
     return f"origin/{base}"
 
 
+def _ok(git_runner: GitRunner, argv: list[str]) -> bool:
+    try:
+        git_runner(argv)
+    except GitError:
+        return False
+    return True
+
+
+def _checkout_of(git_runner: GitRunner, repo_path: str, branch: str) -> str | None:
+    """The path of the worktree that has `branch` checked out, or `None`."""
+    porcelain = git_runner(["-C", repo_path, "worktree", "list", "--porcelain"])
+    path = None
+    for line in porcelain.split("\n"):
+        if line.startswith(_WORKTREE_PREFIX):
+            path = line[len(_WORKTREE_PREFIX) :].strip()
+        elif line.strip() == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def fast_forward_base(git_runner: GitRunner, repo_path: str, base: str) -> bool:
+    """Fast-forward local `base` to `origin/<base>` when that loses nothing.
+
+    Only when the local branch is a strict ancestor of its upstream, so a
+    branch holding local-only commits is never touched. A checked-out `base` is
+    advanced with `merge --ff-only`, and only when that checkout is clean;
+    otherwise the ref is moved with a compare-and-swap `update-ref`. Returns
+    whether it moved. Never resets, never rewrites.
+    """
+    local, remote = f"refs/heads/{base}", f"refs/remotes/origin/{base}"
+    if not (_ok(git_runner, ["-C", repo_path, "rev-parse", "--verify", "--quiet", local])
+            and _ok(git_runner, ["-C", repo_path, "rev-parse", "--verify", "--quiet", remote])):
+        return False
+    old = git_runner(["-C", repo_path, "rev-parse", local]).strip()
+    new = git_runner(["-C", repo_path, "rev-parse", remote]).strip()
+    if old == new or not _ok(
+        git_runner, ["-C", repo_path, "merge-base", "--is-ancestor", old, new]
+    ):
+        return False
+    with git_lock(repo_path):
+        checkout = _checkout_of(git_runner, repo_path, base)
+        if checkout is None:
+            return _ok(git_runner, ["-C", repo_path, "update-ref", local, new, old])
+        if git_runner(["-C", checkout, "status", "--porcelain"]).strip():
+            return False
+        return _ok(git_runner, ["-C", checkout, "merge", "--ff-only", "-q", new])
+
+
 _REPO_LOCKS: dict[str, threading.RLock] = {}
 """One lock per repository, keyed by its resolved path, created on first use."""
 
@@ -244,6 +292,7 @@ def ensure(
     worktree: str | Path,
     repo_dir: str | Path,
     git_runner: GitRunner = run_git,
+    fast_forward: bool = False,
 ) -> dict[str, object]:
     """Make sure `branch`'s worktree exists at `worktree`, and report what was there.
 
@@ -278,6 +327,7 @@ def ensure(
     )
     worktree_existed = _is_live_worktree(worktree_path, registered)
 
+    base_fast_forwarded = fast_forward and fast_forward_base(git_runner, repo_path, base)
     resolved_base = _resolve_base(git_runner, repo_path, base)
 
     created = False
@@ -344,4 +394,5 @@ def ensure(
         "worktree_existed": worktree_existed,
         "created": created,
         "commit_count": _commit_count(git_runner, worktree_path, resolved_base),
+        **({"base_fast_forwarded": True} if base_fast_forwarded else {}),
     }

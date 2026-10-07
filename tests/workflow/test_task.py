@@ -65,6 +65,7 @@ def test_the_worktree_phase_is_the_real_worktree_step() -> None:
     phase = TASK.phase("worktree")
     assert isinstance(phase, Step)
     assert phase.run is worktree.ensure
+    assert dict(phase.args) == {"fast_forward": True}
 
 
 def test_no_agent_phase_precedes_the_worktree_phase() -> None:
@@ -105,7 +106,8 @@ def test_docs_commit_sits_between_the_marker_and_the_coder() -> None:
     # worktree and base_branch from the context by parameter name. Not best-effort and not
     # gated: an uncommitted or untagged pair of documents must escalate.
     assert dict(phase.args) == {}
-    assert phase.gates == ()
+    # Only a warning gate: it names a preserved stale branch and never blocks.
+    assert phase.gates == (reducers.stale_branch_gate,)
     assert phase.best_effort is False
     assert phase.when is None
     assert phase.skip_to is None
@@ -215,10 +217,9 @@ def test_review_carries_its_three_gates_blockers_first() -> None:
         reducers.review_gate,
         reducers.plan_hash_gate_adapter,
     )
-    assert phase.inputs == ("branch", "base_branch", "plan_path")
-    # The reviewer recomputes the hash from the plan file; card f26b377d gives
-    # the input to the coder only.
-    assert "plan_hash" not in phase.inputs
+    # The reviewer counts trailers against the hash docs_commit recorded and
+    # never recomputes it from the live plan file.
+    assert phase.inputs == ("branch", "base_branch", "plan_path", "plan_hash")
 
 
 def test_the_plan_hash_gate_is_the_adapter_not_the_bare_reducer() -> None:
@@ -263,7 +264,7 @@ def test_no_phase_declares_plan_hash_before_docs_commit_runs() -> None:
         if isinstance(phase, AgentPhase) and "plan_hash" in phase.inputs
     ]
 
-    assert declaring == ["implement"]  # non-vacuity
+    assert declaring == ["implement", "review"]  # non-vacuity
     for name in declaring:
         assert names.index("docs_commit") < names.index(name)
 
@@ -453,6 +454,7 @@ def test_the_workflow_still_holds_exactly_the_gates_this_suite_covers() -> None:
         ("explore", reducers.verification_gate),
         ("validate_spec", reducers.critic_blockers_gate),
         ("validate_plan", reducers.critic_blockers_gate),
+        ("docs_commit", reducers.stale_branch_gate),
         ("implement", reducers.implement_blocked_gate),
         ("review", reducers.review_blockers_gate),
         ("review", reducers.review_gate),
@@ -503,20 +505,26 @@ def test_review_gate_reads_a_real_dumped_untagged_count_and_blocks() -> None:
     assert "only 1 of 3 commits" in verdict["detail"]
 
 
-def test_the_plan_hash_gate_compares_the_two_real_dumped_hashes() -> None:
+def test_the_plan_hash_gate_compares_the_recorded_hash_to_the_review_hash() -> None:
     gate = reducers.plan_hash_gate_adapter
-    values = _values_for("review")
-    values["implement"] = ImplementResult(
-        blocked=False,
-        blocked_reason=None,
-        resumed=False,
-        plan_hash="0badcafe",
-        report=REAL_SUMMARY,
-    ).model_dump(mode="json")
+    values = _values_for(
+        "review",
+        ReviewResult(
+            findings=[],
+            unresolved_blockers=[],
+            fix_summary="",
+            porcelain="",
+            commit_count=1,
+            tagged_count=1,
+            plan_hash="0badcafe",
+        ).model_dump(mode="json"),
+    )
+    assert values["docs_commit"] == {"plan_hash": PLAN_HASH}
     verdict = gate(
         **walk.bind_arguments(gate, values, phase="review", function="plan_hash_gate")
     )
-    assert "plan hash CHANGED mid-run" in verdict["detail"]
+    assert set(verdict) == {"warn"}
+    assert PLAN_HASH in verdict["warn"] and "0badcafe" in verdict["warn"]
 
 
 def test_exploration_output_gate_matches_a_caller_provided_suite() -> None:

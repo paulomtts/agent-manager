@@ -1093,3 +1093,12 @@ def test_feedback_is_not_a_producer_input_and_prompt_imports_no_pygents():
         alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
     } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
     assert not any(name.split(".")[0] == "pygents" for name in imported)
+
+
+def test_the_real_review_brief_carries_the_hash_docs_commit_recorded():
+    from agent_manager.workflow.task import TASK
+
+    review = TASK.phase("review")
+    rendered = prompt.render_prompt(review, _context())
+
+    assert _section(rendered, "plan_hash") == PLAN_HASH

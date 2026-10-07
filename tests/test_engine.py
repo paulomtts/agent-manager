@@ -1129,7 +1129,9 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subt
         calls.append(f"rollup.set_status:{status}")
         return {"card": card, "status": status}
 
-    def ensure(branch: str, base: str, worktree: Any, repo_dir: Any) -> dict[str, Any]:
+    def ensure(
+        branch: str, base: str, worktree: Any, repo_dir: Any, fast_forward: bool = False
+    ) -> dict[str, Any]:
         calls.append("worktree.ensure")
         return {"created": True}
 
@@ -1153,6 +1155,9 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subt
     def run_suite(commands: list[str], worktree: Any) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
+
+    def stale_branch_gate(result: dict[str, Any]) -> None:
+        return None
 
     def verification_passed_gate(result: dict[str, Any]) -> None:
         calls.append("verification_passed_gate")
@@ -1179,6 +1184,7 @@ def test_the_builtin_task_document_walks_against_a_fake_registry(store, run_subt
         "review_blockers_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
+        "stale_branch_gate": stale_branch_gate,
         "verification_gate": agent_only_gate,
         "merge_completed_gate": integrate_only_gate,
     }
@@ -1571,6 +1577,7 @@ _TASK_FUNCTION_NAMES: dict[Any, str] = {
     reducers.review_blockers_gate: "review_blockers_gate",
     reducers.review_gate: "review_gate",
     reducers.plan_hash_gate_adapter: "plan_hash_gate",
+    reducers.stale_branch_gate: "stale_branch_gate",
 }
 """Every callable `TASK` holds, under the name the fake tables below use for it."""
 
@@ -1611,7 +1618,9 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         calls.append(f"rollup.set_status:{status}")
         return {"card": card, "status": status}
 
-    def ensure(branch: str, base: str, worktree: Any, repo_dir: Any) -> dict[str, Any]:
+    def ensure(
+        branch: str, base: str, worktree: Any, repo_dir: Any, fast_forward: bool = False
+    ) -> dict[str, Any]:
         calls.append("worktree.ensure")
         return {"created": True}
 
@@ -1636,6 +1645,9 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         calls.append("verify.run_suite")
         return {"passed": True}
 
+    def stale_branch_gate(result: dict[str, Any]) -> None:
+        return None
+
     def passed(result: dict[str, Any]) -> None:
         return None
 
@@ -1657,6 +1669,7 @@ def _builtin_functions(calls: list[str], *, validated: bool) -> dict[str, Any]:
         "review_blockers_gate": agent_only_gate,
         "review_gate": agent_only_gate,
         "plan_hash_gate": agent_only_gate,
+        "stale_branch_gate": stale_branch_gate,
         "verification_gate": agent_only_gate,
     }
 
@@ -1721,7 +1734,7 @@ def test_each_agent_phase_receives_exactly_the_inputs_it_declares(store, run_sub
         "plan": ("spec_path", "plan_path"),
         "validate_plan": ("spec_path", "plan_path"),
         "implement": ("plan_path", "spec_path", "branch", "base_branch", "plan_hash"),
-        "review": ("branch", "base_branch", "plan_path"),
+        "review": ("branch", "base_branch", "plan_path", "plan_hash"),
     }
 
 

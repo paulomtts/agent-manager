@@ -41,7 +41,7 @@ def agent_timeout(minutes: int) -> timedelta:
 
 
 TASK = Workflow("task", (
-    Step("worktree", worktree.ensure),
+    Step("worktree", worktree.ensure, args={"fast_forward": True}),
     AgentPhase(
         "explore",
         role="explorer",
@@ -93,7 +93,7 @@ TASK = Workflow("task", (
         on_fail=Goto("plan"),
     ),
     Step("mark_validated", plan_check.mark_validated),
-    Step("docs_commit", docs_commit.commit_documents),
+    Step("docs_commit", docs_commit.commit_documents, gates=(reducers.stale_branch_gate,)),
     AgentPhase(
         "implement",
         role="coder",
@@ -105,7 +105,7 @@ TASK = Workflow("task", (
     AgentPhase(
         "review",
         role="reviewer",
-        inputs=("branch", "base_branch", "plan_path"),
+        inputs=("branch", "base_branch", "plan_path", "plan_hash"),
         result=results.ReviewResult,
         gates=(
             reducers.review_blockers_gate,

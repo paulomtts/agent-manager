@@ -467,10 +467,9 @@ def test_a_zero_count_from_a_numeric_string_still_blocks_as_implement():
 
 
 # ── is_plan_hash / plan_hash_mismatch ────────────────────────────────────────
-# Ported from task.test.mjs:189-220. A Plan-Hash is the first 8 hex characters
-# of sha256sum(<plan file>). Implement writes the trailers; Review recomputes
-# the hash independently, so comparing the two catches the plan file changing
-# mid-run — which silently invalidates every trailer already written.
+# A Plan-Hash is the first 8 hex characters of sha256sum(<plan file>), recorded
+# once by docs_commit. Review is told that value and counts against it; a
+# differing reported hash is a warning, never a stop.
 
 
 @pytest.mark.parametrize("good", ["a1b2c3d4", "00000000", "ffffffff", "0123456789abcdef"[:8]])
@@ -509,19 +508,15 @@ def test_matching_hashes_report_no_drift():
     assert plan_hash_mismatch("a1b2c3d4", "a1b2c3d4") is None
 
 
-def test_a_hash_that_changed_mid_run_is_named_as_a_modified_plan():
-    # The gate downstream will say "0 of 3 commits carry their trailer", which
-    # reads as an implementation failure. It is not: the plan moved underneath
-    # commits that were correct when written. Only this comparison can say so.
+def test_a_reported_hash_that_differs_from_the_recorded_one_is_a_warning_text():
     drift = plan_hash_mismatch("a1b2c3d4", "ffffffff")
     assert "a1b2c3d4" in drift
     assert "ffffffff" in drift
-    assert "modified after implementation" in drift
-    assert "hard-reset" in drift
+    assert "recorded" in drift
 
 
 @pytest.mark.parametrize(
-    ("impl", "review"),
+    ("recorded", "reported"),
     [
         (None, "a1b2c3d4"),
         ("a1b2c3d4", None),
@@ -532,19 +527,17 @@ def test_a_hash_that_changed_mid_run_is_named_as_a_modified_plan():
         (12345678, "a1b2c3d4"),
     ],
 )
-def test_drift_is_not_claimed_when_either_hash_is_unusable(impl, review):
+def test_drift_is_not_claimed_when_either_hash_is_unusable(recorded, reported):
     # A stage that failed to report its hash tells us nothing about the other
     # one; inventing a mismatch there would send someone after a phantom.
-    assert plan_hash_mismatch(impl, review) is None
+    assert plan_hash_mismatch(recorded, reported) is None
 
 
-def test_the_wrapper_returns_none_or_a_detail_verdict():
+def test_the_wrapper_returns_none_or_a_warn_verdict():
     assert plan_hash_gate("a1b2c3d4", "a1b2c3d4") is None
     assert plan_hash_gate(None, "a1b2c3d4") is None
     gate = plan_hash_gate("a1b2c3d4", "ffffffff")
-    assert gate["detail"] == plan_hash_mismatch("a1b2c3d4", "ffffffff")
-    # task.js only logs the drift (line 833); the stop is review_gate's.
-    assert "blocked" not in gate
+    assert gate == {"warn": plan_hash_mismatch("a1b2c3d4", "ffffffff")}
 
 
 def test_verification_passed_gate_passes_a_green_suite():
@@ -787,44 +780,60 @@ def test_implement_blocked_gate_blocks_anything_that_is_not_a_result_mapping(dea
     assert "no implement result to judge" in verdict["detail"]
 
 
-def test_plan_hash_gate_adapter_compares_the_two_results():
-    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "aaaaaaaa"}) is None
-    assert plan_hash_gate_adapter({"plan_hash": "aaaaaaaa"}, {"plan_hash": "bbbbbbbb"}) is not None
+def test_plan_hash_gate_adapter_compares_the_recorded_hash_to_the_review_result():
+    recorded = {"plan_hash": "aaaaaaaa", "backfilled": 0}
+    assert plan_hash_gate_adapter(recorded, {"plan_hash": "aaaaaaaa"}) is None
+    assert plan_hash_gate_adapter(recorded, {"plan_hash": "bbbbbbbb"}) is not None
     assert plan_hash_gate_adapter(None, None) is None
     # digest() hashes `module.qualname`, so the adapter's home is part of the
     # declared workflow's identity (Review Focus 5).
     assert plan_hash_gate_adapter.__module__ == "agent_manager.steps.reducers"
 
 
-def test_the_plan_hash_adapter_compares_the_two_phases_plan_hash_fields():
+def test_a_review_hash_that_differs_from_the_recorded_one_warns_and_never_blocks():
     gate = plan_hash_gate_adapter(
-        {"plan_hash": "a1b2c3d4", "report": "done"},
-        {"plan_hash": "ffffffff", "porcelain": ""},
+        {"plan_hash": "a1b2c3d4"}, {"plan_hash": "ffffffff", "porcelain": ""}
     )
-    assert "plan hash CHANGED mid-run" in gate["detail"]
-    assert "a1b2c3d4" in gate["detail"] and "ffffffff" in gate["detail"]
-    assert "blocked" not in gate
+    assert set(gate) == {"warn"}
+    assert "a1b2c3d4" in gate["warn"] and "ffffffff" in gate["warn"]
 
 
-def test_the_plan_hash_adapter_passes_when_the_two_hashes_match():
-    assert (
-        plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, {"plan_hash": "a1b2c3d4"})
-        is None
-    )
-
-
-@pytest.mark.parametrize("dead", [None, {}, "implement", 7, [{"plan_hash": "a1b2c3d4"}]])
-def test_the_plan_hash_adapter_passes_when_either_phase_result_is_missing(dead):
-    # A skipped or dead phase has no hash to compare; the reducer's own rule is
-    # "nothing trustworthy to say" -> None.
+@pytest.mark.parametrize("dead", [None, {}, "docs_commit", 7, [{"plan_hash": "a1b2c3d4"}]])
+def test_the_plan_hash_adapter_passes_when_either_result_is_missing(dead):
     assert plan_hash_gate_adapter(dead, {"plan_hash": "a1b2c3d4"}) is None
     assert plan_hash_gate_adapter({"plan_hash": "a1b2c3d4"}, dead) is None
 
 
 def test_the_plan_hash_adapter_binds_with_no_arguments_at_all():
-    """Both parameters default to None so a run that skipped `implement` binds
-    and passes, instead of `bind_arguments` reporting a required parameter."""
+    """Both parameters default to None so a run where `docs_commit` did not run
+    in this process binds and passes."""
     assert plan_hash_gate_adapter() is None
+
+
+def test_a4_regression_trailers_counted_by_the_recorded_hash_proceed_though_the_live_file_changed():
+    """Run 20261006T221837Z-24b83562 subtask A4: 5 commits all tagged with the
+    recorded c6864f95; the plan file was appended to afterwards, so its live
+    hash is dfcfe3a2. Review counts against the recorded value, so the gates
+    that run on the review phase all proceed."""
+    recorded, live = "c6864f95", "dfcfe3a2"
+    review = {
+        "porcelain": "",
+        "commitCount": 5,
+        "taggedCount": 5,
+        "unresolved_blockers": [],
+        "plan_hash": recorded,
+    }
+    assert recorded != live
+    assert review_blockers_gate(review) is None
+    assert review_gate(review, "a4", "main") is None
+    assert plan_hash_gate_adapter({"plan_hash": recorded}, review) is None
+
+
+def test_a4_numbers_with_a_live_file_hash_reported_still_proceed_with_a_warning():
+    review = {"porcelain": "", "commitCount": 5, "taggedCount": 5, "plan_hash": "dfcfe3a2"}
+    assert review_gate(review, "a4", "main") is None
+    gate = plan_hash_gate_adapter({"plan_hash": "c6864f95"}, review)
+    assert set(gate) == {"warn"}
 
 
 # ── review_blockers_gate ─────────────────────────────────────────────────────

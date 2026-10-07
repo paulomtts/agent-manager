@@ -2,7 +2,7 @@
 
 You review a finished branch against its plan and the spec that plan came from, fix what is wrong, commit every change you make, and then report three git facts.
 
-Your working directory is already the subtask's worktree, checked out on the branch named in this brief's `## branch` section. Run every command below from here, exactly as written; never add a `-C` option. Throughout, `<base>` means the value of this brief's `## base_branch` section (the `base_branch` input) and `<plan>` means the path in its `## plan_path` section (the `plan_path` input). The plan cites the spec it came from and this repo's own architecture and standards docs; read them.
+Your working directory is already the subtask's worktree, checked out on the branch named in this brief's `## branch` section. Run every command below from here, exactly as written; never add a `-C` option. Throughout, `<base>` means the value of this brief's `## base_branch` section (the `base_branch` input) and `<plan>` means the path in its `## plan_path` section (the `plan_path` input) and `<hash>` means the 8 characters in its `## plan_hash` section (the `plan_hash` input). The plan cites the spec it came from and this repo's own architecture and standards docs; read them.
 
 ## Review the diff
 
@@ -24,13 +24,13 @@ You are the only stage that reads this diff and the only one that writes: the st
 
 If you find any real findings, fix them yourself in the same pass, on this branch. Use TDD wherever behavior changes: write the failing test first and watch it fail, then fix. Commit granularly, one small commit per fix.
 
-Compute `PLAN_HASH` once, before your first commit:
+Set `PLAN_HASH` once, before your first commit, to the value of the `## plan_hash` section:
 
 ```
-PLAN_HASH=$(sha256sum "<plan>" | cut -c1-8)
+PLAN_HASH=<hash>
 ```
 
-That is the same value every commit already on this branch carries. End EVERY commit you make, fixes and lint/format fixes alike, with both of these trailers, each on its own line at the end of the message, with `$PLAN_HASH` expanded to its 8 characters:
+That is the value every commit already on this branch carries. Never hash the plan file yourself: the plan file may have been edited after those commits were written, so its current bytes no longer hash to that value, and the recorded one is the only truth. End EVERY commit you make, fixes and lint/format fixes alike, with both of these trailers, each on its own line at the end of the message, with `$PLAN_HASH` expanded to its 8 characters:
 
 ```
 Co-Authored-By: Claude <noreply@anthropic.com>
@@ -50,7 +50,7 @@ FINALLY, once you have finished committing, run exactly these three commands and
 ```
 git status --porcelain
 git rev-list --count <base>..HEAD
-PLAN_HASH=$(sha256sum "<plan>" | cut -c1-8); git log <base>..HEAD --format=%B | grep -c "^Plan-Hash: $PLAN_HASH"
+PLAN_HASH=<hash>; git log <base>..HEAD --format=%B | grep -c "^Plan-Hash: $PLAN_HASH"
 ```
 
 ## What you return
@@ -63,4 +63,4 @@ Write your result to the path this brief's result contract names, with exactly t
 - `porcelain`: the FIRST command's output exactly as printed. Empty string if it printed nothing.
 - `commit_count`: the SECOND command's number.
 - `tagged_count`: the THIRD command's number.
-- `plan_hash`: the value `$PLAN_HASH` held when you ran that third command: the 8 characters, not the command.
+- `plan_hash`: the value `$PLAN_HASH` held when you ran that third command: the 8 characters of the `## plan_hash` section, not the command.
