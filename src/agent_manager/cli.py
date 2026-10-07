@@ -29,7 +29,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from pydantic import ValidationError
@@ -3137,6 +3137,7 @@ def resume_run(
     allow_no_verification: bool = False,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
+    isolation: Literal["none"] | None = None,
 ) -> dict[str, Any]:
     """Pick a stopped, escalated or killed run back up from its checkpoints (§9).
 
@@ -3170,6 +3171,16 @@ def resume_run(
     A run canceled in either spelling is refused for both workflows (live
     control C9), and so is a run whose lease is still live (C10): both
     refusals read only the connection that loaded the run.
+
+    The launcher mode (A5 B3) is decided after those read-only refusals and
+    before anything is written. `isolation="none"` runs it `direct` with no
+    warning and probes nothing. Otherwise a run recorded `bwrap` or
+    `unshare` is re-probed (`launcher.resolve_isolation`) and refused with
+    `IsolationUnavailableError` if this host can no longer start it; a run
+    recorded `direct` keeps `direct` and its recorded `isolation_warning`
+    with no probe. The pair goes into the same config copy as the suite, so
+    a refused resume writes nothing, and a warning is placed in `warnings`
+    before the `verification: replaced` entry.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_module.open_db(root)
@@ -3192,6 +3203,16 @@ def resume_run(
             raise _run_is_live_error(lease, now)
     finally:
         conn.close()
+    # A5 B3: after every read-only refusal, before anything is written.
+    if isolation == "none":
+        mode: models.Launcher = "direct"
+        isolation_warning: str | None = None
+    elif run.config.launcher in ("bwrap", "unshare"):
+        # Read as `launcher.resolve_isolation` so a test can patch it.
+        restored = launcher.resolve_isolation(run.config.launcher)
+        mode, isolation_warning = restored.mode, restored.warning
+    else:
+        mode, isolation_warning = run.config.launcher, run.config.isolation_warning
     explicit = list(commands)
     recorded = run.config.verify
     run = run.model_copy(
@@ -3201,6 +3222,8 @@ def resume_run(
                     "verify": explicit or list(recorded),
                     "allow_no_verification": allow_no_verification
                     or run.config.allow_no_verification,
+                    "launcher": mode,
+                    "isolation_warning": isolation_warning,
                 }
             )
         }
@@ -3225,6 +3248,8 @@ def resume_run(
             repo_dir=root,
             commands=list(run.config.verify),
             allow_no_verification=run.config.allow_no_verification,
+            launcher=mode,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             resume_run_id=run.id,
         )
@@ -3233,6 +3258,8 @@ def resume_run(
             f"run {run.id!r} records workflow {run.workflow!r}, and `resume` continues"
             f" only {WORKFLOW_NAME!r} and {orchestrate.MILESTONE_WORKFLOW!r} runs"
         )
+    if isolation_warning is not None:
+        payload.setdefault("warnings", []).append(isolation_warning)
     if replaced is not None:
         payload.setdefault("warnings", []).append(replaced)
     return payload
@@ -3266,6 +3293,15 @@ def resume(
     verify_from_env: bool = typer.Option(
         False, argv_guard.FROM_ENV_FLAG, hidden=True
     ),
+    isolation: Literal["none"] | None = typer.Option(
+        None,
+        "--isolation",
+        help=(
+            "Omitted, the run's recorded launcher is restored and re-probed, and a "
+            "run recorded isolated is refused if this host can no longer start it. "
+            "`none` runs the rest of it without isolation, on purpose, and records that."
+        ),
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """Continue a stopped, escalated or killed run from its checkpoints, and drive it to the end.
@@ -3281,6 +3317,7 @@ def resume(
             repo_dir=repo_dir,
             allow_no_verification=allow_no_verification,
             commands=commands,
+            isolation=isolation,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))

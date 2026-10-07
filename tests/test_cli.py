@@ -8109,6 +8109,8 @@ def _record_milestone(
     workflow: str = "milestone",
     verify: tuple[str, ...] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
 ) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
@@ -8122,7 +8124,10 @@ def _record_milestone(
                 status=status,
                 started_at=RECORDED_AT,
                 config=models.RunConfig(
-                    verify=list(verify), allow_no_verification=allow_no_verification
+                    verify=list(verify),
+                    allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
                 ),
             )
         )
@@ -8308,6 +8313,8 @@ def test_resume_routes_a_milestone_run_to_run_milestone_under_its_own_id(
                 "repo_dir": projection.resolve(),
                 "commands": ["uv run pytest"],
                 "allow_no_verification": True,
+                "launcher": "direct",
+                "isolation_warning": None,
                 "runner_factory": factory,
                 "resume_run_id": run_id,
             },
@@ -14592,3 +14599,209 @@ def test_run_hands_the_resolved_mode_and_warning_to_every_run_branch(
 
     assert result.exit_code == 0, result.output
     assert seen == [(seam, "unshare", "a warning")]
+
+
+MILESTONE_ISOLATION_RUN_ID = "20260927T100000Z-cbe34d00"
+
+
+def _probe_recorder(monkeypatch, exit_code: int) -> list[list[str]]:
+    probes: list[list[str]] = []
+
+    def probe_runner(argv):
+        probes.append(list(argv))
+        return exit_code
+
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", probe_runner)
+    return probes
+
+
+def _forbid_probe(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.launcher, "default_probe_runner", _Forbidden("launcher.default_probe_runner")
+    )
+
+
+def test_a_task_resume_re_probes_the_recorded_mode_and_keeps_it(projection, monkeypatch):
+    """A5 spec test 12, task run."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    seen = _task_resume_spy(monkeypatch)
+    probes = _probe_recorder(monkeypatch, 0)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection)
+
+    [(run, _kwargs)] = seen
+    assert probes == [launcher.wrap_argv("bwrap", ["true"], Path("/"))]
+    assert (run.config.launcher, run.config.isolation_warning) == ("bwrap", None)
+    assert payload["warnings"] == []
+
+
+def test_a_milestone_resume_re_probes_the_recorded_mode_and_hands_it_on(
+    projection, monkeypatch
+):
+    """A5 spec test 12, milestone run."""
+    _record_milestone(
+        projection, MILESTONE_ISOLATION_RUN_ID, status="escalated", launcher="unshare"
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+    probes = _probe_recorder(monkeypatch, 0)
+
+    cli.resume_run(MILESTONE_ISOLATION_RUN_ID, repo_dir=projection)
+
+    assert probes == [launcher.wrap_argv("unshare", ["true"], Path("/"))]
+    [kwargs] = calls
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("unshare", None)
+
+
+@pytest.mark.parametrize("workflow", ["task", "milestone"])
+def test_a_resume_whose_recorded_mode_cannot_start_is_refused_and_writes_nothing(
+    projection, monkeypatch, workflow
+):
+    """A5 spec test 13: never silently un-isolated; row, config, journal, lease untouched."""
+    run_id = ISOLATION_RUN_ID if workflow == "task" else MILESTONE_ISOLATION_RUN_ID
+    if workflow == "task":
+        _record(projection, run_id, started_at=RECORDED_AT, status="started", launcher="bwrap")
+    else:
+        _record_milestone(projection, run_id, status="escalated", launcher="bwrap")
+    monkeypatch.setattr(cli, "_resume_from_checkpoint", _Forbidden("_resume_from_checkpoint"))
+    monkeypatch.setattr(orchestrate, "run_milestone", _Forbidden("orchestrate.run_milestone"))
+    monkeypatch.setattr(cli.launcher, "default_probe_runner", lambda argv: 1)
+    before = (
+        _runs_snapshot(),
+        _recorded_config(projection, run_id),
+        len(_journal_lines(run_id)),
+    )
+
+    result = runner.invoke(cli.app, ["resume", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "IsolationUnavailableError"
+    assert BWRAP_PROBE_FAILED in envelope["error"]["message"]
+    assert "--isolation none" in envelope["error"]["message"]
+    after = (
+        _runs_snapshot(),
+        _recorded_config(projection, run_id),
+        len(_journal_lines(run_id)),
+    )
+    assert after == before
+    conn = store_module.open_db(cli.resolve_repo_dir(projection))
+    try:
+        assert store_module.read_lease(conn, run_id) is None
+    finally:
+        conn.close()
+
+
+def test_resume_isolation_none_runs_an_isolated_task_run_direct_without_probing(
+    projection, monkeypatch
+):
+    """A5 spec test 14, task run."""
+    _record(
+        projection, ISOLATION_RUN_ID, started_at=RECORDED_AT, status="started", launcher="bwrap"
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection, isolation="none")
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", None)
+    assert payload["warnings"] == []
+
+
+def test_resume_isolation_none_hands_direct_to_a_milestone_resume(projection, monkeypatch):
+    """A5 spec test 14, milestone run, through the CLI flag."""
+    _record_milestone(
+        projection, MILESTONE_ISOLATION_RUN_ID, status="escalated", launcher="bwrap"
+    )
+    calls = _milestone_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            MILESTONE_ISOLATION_RUN_ID,
+            "--repo-dir",
+            str(projection),
+            "--isolation",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [kwargs] = calls
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", None)
+
+
+def test_resume_isolation_none_clears_a_recorded_fallback_warning(projection, monkeypatch):
+    """Review Focus 3: an explicit opt-out is not a fallback, so nothing is warned."""
+    _record(
+        projection,
+        ISOLATION_RUN_ID,
+        started_at=RECORDED_AT,
+        status="started",
+        isolation_warning=FALLBACK,
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(ISOLATION_RUN_ID, repo_dir=projection, isolation="none")
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", None)
+    assert payload["warnings"] == []
+
+
+def test_a_resume_of_an_auto_fallback_run_keeps_its_warning_before_the_replaced_suite(
+    projection, monkeypatch
+):
+    """A5 spec test 15 and Review Focus 2: no probe, no silent upgrade, warning kept."""
+    _record(
+        projection,
+        ISOLATION_RUN_ID,
+        started_at=RECORDED_AT,
+        status="started",
+        isolation_warning=FALLBACK,
+    )
+    seen = _task_resume_spy(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    payload = cli.resume_run(
+        ISOLATION_RUN_ID, repo_dir=projection, commands=("uv run pytest",)
+    )
+
+    [(run, _kwargs)] = seen
+    assert (run.config.launcher, run.config.isolation_warning) == ("direct", FALLBACK)
+    assert payload["warnings"] == [FALLBACK, "verification: replaced in run record: []"]
+
+
+@pytest.mark.parametrize("value", ["bwrap", "unshare", "auto", "bogus"])
+def test_resume_isolation_accepts_only_none(tmp_path, monkeypatch, value):
+    """A5 spec test 16: upgrading a run's isolation on resume is out of scope."""
+    monkeypatch.setattr(cli, "resume_run", _Forbidden("resume_run"))
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path), "--isolation", value],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert '"ok"' not in result.stdout
+
+
+def test_resume_without_isolation_hands_none_to_resume_run(tmp_path, monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_resume_run(run_id, **kwargs):
+        seen.update(kwargs)
+        return {"run_id": run_id, "status": "done"}
+
+    monkeypatch.setattr(cli, "resume_run", fake_resume_run)
+
+    result = runner.invoke(cli.app, ["resume", FROM_ENV_RUN_ID, "--repo-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert seen["isolation"] is None
