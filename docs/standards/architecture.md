@@ -48,7 +48,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 15 | Runtime | `runtime.checkpoint`, `runtime.compile` | Checkpoint hooks; the workflow compiled into pygents tools |
 | 16 | Runtime | `runtime.engine` | One subtask, one agent, one loop |
 | 17 | Application | `runs`, `comments`, *`envelope`* | Run identity and the shared subtask driver; the comment outbox; the envelope and exit-code contract |
-| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db` |
+| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `journal_check` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; the dual-write checker: `events` against each run's journal file |
 | 19 | Application | `bases`, `integration`, *`card_run`* | The merged base; Integrate; the `--card` run |
 | 20 | Application | *`milestone.plan`*, *`milestone.payloads`* | Pure story plan; lane outcome types and report shapes |
 | 21 | Application | *`milestone.lane`* | The per-story state machine |
@@ -86,7 +86,7 @@ All 62 `.py` files (55 modules plus 7 `__init__.py`) appear here exactly once. `
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
 | 13-16 | `runtime.walk`, `runtime.bridge`, `runtime.state` (L13); `runtime.context`, `dispatch` (L14); `runtime.checkpoint`, `runtime.compile` (L15); `runtime.engine` (L16) |
 | 17 | `runs`, `comments` |
-| 18 | `migrate` |
+| 18 | `migrate`, `journal_check` |
 | 19 | `bases`, `integration` |
 | 24 | `orchestrate` (splits into L19-L24) |
 | 29 | `cli` (splits into L17-L29) |
@@ -202,7 +202,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | `store/checkpoints.py` | 6 | `TurnFloor`, `Checkpoint`, readers, the SQL behind `save_checkpoint` | never commits |
 | `store/outbox.py` | 6 | `CommentRow`, `COMMENT_ATTEMPTS`, the SQL behind enqueue/pending/mark | never commits |
 | `store/projects.py` | 6 | `resolve`, `lookup`: the `projects` rows, resolved or created by `repo_dir` | never commits |
-| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
+| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_ids`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
 | `store/backup.py` | 6 | `backup`, `BackupResult`, `BackupRefusedError`, `BackupRefusal`: `am backup`'s online copy of `am.db` through SQLite's backup API, read-only on the source, built in a temporary file and put in place with `os.link`, never overwriting | opens `am.db` only through `store_db.open_reader`, never `open_db`; commits nothing to it |
 | `store/writer.py` | 7 | `Store` | §6.4 |
 | `store/legacy.py` | 7 | `LegacyFile`, `read_legacy`, `import_order`, `merge` and their errors: legacy per-project databases read through a private copy and merged into `am.db`; run journals imported into `events` in `import_order` in the same one merge transaction, marker last | commits only its one merge transaction; imports `store/events.py` and `store/journal.py`, both lower layers |
