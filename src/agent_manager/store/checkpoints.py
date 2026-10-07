@@ -88,6 +88,7 @@ def insert_checkpoint(
     run_id: str,
     card_id: str,
     *,
+    project_id: int,
     workflow: str,
     digest: str,
     reason: str,
@@ -98,10 +99,10 @@ def insert_checkpoint(
     """Insert the next checkpoint of `card_id` under `run_id`, and its floor if given.
 
     `seq` is 0 for the card's first row in the run and one past the highest
-    after that. Does not commit or roll back: an unknown `reason` or a
-    negative floor raises `sqlite3.IntegrityError` from the table's `CHECK`,
-    and the caller discards the transaction. `agent` in the result is the
-    decoded JSON of the stored text.
+    after that. Both rows carry `project_id`. Does not commit or roll back:
+    an unknown `reason` or a negative floor raises `sqlite3.IntegrityError`
+    from the table's `CHECK`, and the caller discards the transaction.
+    `agent` in the result is the decoded JSON of the stored text.
     """
     text = json.dumps(agent, sort_keys=True)
     highest = conn.execute(
@@ -110,9 +111,10 @@ def insert_checkpoint(
     ).fetchone()[0]
     seq = 0 if highest is None else highest + 1
     conn.execute(
-        "INSERT INTO checkpoints (run_id, card_id, seq, workflow, digest,"
-        " reason, agent, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO checkpoints (project_id, run_id, card_id, seq, workflow,"
+        " digest, reason, agent, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            project_id,
             run_id,
             card_id,
             seq,
@@ -125,9 +127,10 @@ def insert_checkpoint(
     )
     if floor is not None:
         conn.execute(
-            "INSERT INTO checkpoint_floors (run_id, card_id, seq, phase,"
-            " loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO checkpoint_floors (project_id, run_id, card_id, seq,"
+            " phase, loop, source_run, floor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                project_id,
                 run_id,
                 card_id,
                 seq,

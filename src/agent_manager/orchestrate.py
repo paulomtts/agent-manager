@@ -85,6 +85,7 @@ from agent_manager.runtime.stop import Command, StopSignal
 from agent_manager.steps import rollup, worktree
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store.writer import Store
 from agent_manager.workflow import integrate as integrate_workflow
@@ -596,12 +597,17 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
     `Store.open` would construct a `Journal`. Refused, in this order (live
-    control C9): an unknown run, a run of another workflow, then a run
-    canceled in either spelling and a `done` run (card 54e4ec29, card 0e1edf31).
+    control C9): an unknown run (a run of another repository's project is
+    unknown), a run of another workflow, then a run canceled in either
+    spelling and a `done` run (card 54e4ec29, card 0e1edf31).
     """
     conn = store_db.open_db(root)
     try:
         run = store_queries.load_run(conn, run_id)
+        if run is not None and store_queries.run_project_id(
+            conn, run_id
+        ) != store_projects.lookup(conn, root):
+            run = None
     finally:
         conn.close()
     if run is None:

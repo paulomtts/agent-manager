@@ -1,4 +1,4 @@
-"""Read-only queries over a project's projection: each run's summary with
+"""Read-only queries over the projection: each run's summary with
 its progress, and one run's assembled tree. Every function takes an open
 connection and never writes or commits."""
 
@@ -160,12 +160,15 @@ def _run_progress(conn: sqlite3.Connection, run_id: str) -> RunProgress:
     )
 
 
-def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
-    """Every run recorded in this project's projection, newest first.
+def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSummary]:
+    """Every run of project `project_id`, newest first.
 
-    Takes a connection rather than a root so one caller can list the history and
-    then load a run's tree over the same connection, and close it once. The
-    connection comes from `open_db(root)`; there is no second database.
+    Only rows whose `runs.project_id` is `project_id` are listed: the
+    projection holds every repository's runs, and a listing for one
+    repository shows that repository's alone. `None` (a repository with no
+    `projects` row) lists nothing. Takes a connection rather than a root so
+    one caller can list the history and then load a run's tree over the same
+    connection, and close it once.
 
     `started_at DESC` puts a NULL start time last (SQLite orders NULL below every
     value, so descending sends it to the end) and the id breaks a tie, which run
@@ -196,6 +199,8 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     shows the phase it stopped in, and `lease.live` tells whether anyone is
     still working on it. A run with no tree rows is 0 of 0 with no `current`.
     """
+    if project_id is None:
+        return []
     rows = conn.execute(
         "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
         " runs.branch_prefix, runs.status, runs.started_at, runs.milestone_id,"
@@ -205,7 +210,9 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
         "    WHERE subtasks.run_id = runs.id"
         "    ORDER BY subtasks.position, subtasks.card_id LIMIT 1"
         " ) END AS card_id"
-        " FROM runs ORDER BY runs.started_at DESC, runs.id DESC"
+        " FROM runs WHERE runs.project_id = ?"
+        " ORDER BY runs.started_at DESC, runs.id DESC",
+        (project_id,),
     ).fetchall()
     return [
         RunSummary.model_validate(
@@ -221,13 +228,14 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     ]
 
 
-def latest_run_id(conn: sqlite3.Connection) -> str | None:
-    """The most recent run of this project, or `None` if it has never been run.
+def latest_run_id(conn: sqlite3.Connection, *, project_id: int | None) -> str | None:
+    """The most recent run of project `project_id`, or `None` if it has none.
 
     Derived from `list_runs` rather than from a second `ORDER BY`, so "most
-    recent" can never mean two different things in two commands.
+    recent" can never mean two different things in two commands, and it is
+    scoped exactly as `list_runs` is.
     """
-    summaries = list_runs(conn)
+    summaries = list_runs(conn, project_id=project_id)
     return summaries[0].id if summaries else None
 
 
@@ -342,3 +350,11 @@ def run_config(conn: sqlite3.Connection, run_id: str) -> models.RunConfig | None
     """
     row = conn.execute("SELECT config FROM runs WHERE id = ?", (run_id,)).fetchone()
     return None if row is None else models.RunConfig.model_validate_json(row["config"])
+
+
+def run_project_id(conn: sqlite3.Connection, run_id: str) -> int | None:
+    """`runs.project_id` of `run_id`, or `None` if the run was never recorded."""
+    row = conn.execute(
+        "SELECT project_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    return None if row is None else row["project_id"]

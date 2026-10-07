@@ -54,6 +54,7 @@ from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import leases as store_leases
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import writer as store_writer
 from agent_manager.steps import rollup, worktree
@@ -2192,18 +2193,18 @@ def test_a_failed_fetch_propagates_and_leaves_no_run_behind(project, tmp_path, m
     # No run was left behind: the data directory holds nothing but the `git`
     # ProcessLock's own lock file, the one thing spec X7 does put there even on
     # this early a failure (paths.project_lock_path creates its `projects`
-    # directory as soon as the lock object exists), and the project's
-    # projection, which the read-only claims preflight (`cli.refuse_claimed`,
-    # X5) opens before the fetch. That projection records no run.
+    # directory as soon as the lock object exists), and the machine database
+    # `am.db` with its WAL sidecars, which the read-only claims preflight
+    # (`cli.refuse_claimed`, X5) opens before the fetch. It records no run.
     data = paths.data_dir()
     projects = data / "projects"
-    db_name = paths.project_db_path(cli.resolve_repo_dir(project)).name
+    machine_db = {"am.db", "am.db-wal", "am.db-shm"}
     written = sorted(
         str(entry.relative_to(data))
         for entry in data.rglob("*")
         if entry != projects
         and not (entry.parent == projects and entry.suffix == ".lock")
-        and not (entry.parent == projects and entry.name.startswith(db_name))
+        and not (entry.parent == data and entry.name in machine_db)
     )
     assert written == []
     assert _run_ids(project) == []
@@ -4628,6 +4629,23 @@ def test_a_task_run_and_an_unknown_run_are_not_milestone_resumes(tmp_path, monke
         orchestrate.resumable_milestone_run(root, "no-such-run")
 
 
+def test_a_milestone_run_of_another_repo_is_an_unknown_run(tmp_path, monkeypatch):
+    """`am.db` holds every repository's runs: a run another repository
+    recorded is unknown to this one, and to a repository with no project."""
+    theirs = _resume_root(tmp_path, monkeypatch)
+    _record_resume_run(theirs)
+    mine = (tmp_path / "mine").resolve()
+    mine.mkdir()
+    _record_resume_run(mine, "20260924T120000Z-00000008")
+    stranger = (tmp_path / "stranger").resolve()
+    stranger.mkdir()
+
+    for root in (mine, stranger):
+        with pytest.raises(cli.UnknownRunError, match=RESUME_RUN_ID):
+            orchestrate.resumable_milestone_run(root, RESUME_RUN_ID)
+    assert orchestrate.resumable_milestone_run(theirs, RESUME_RUN_ID).id == RESUME_RUN_ID
+
+
 @pytest.mark.parametrize("status", ["cancelled", "canceled"], ids=["cancelled", "canceled"])
 def test_resume_refuses_run_canceled_in_either_spelling(tmp_path, monkeypatch, status):
     """C9: unknown run, then wrong workflow, then canceled in either spelling --
@@ -5201,7 +5219,14 @@ def _send(project: Path, run_id: str, command: str, *, token: str | None = None)
             token = lease.token
         with store_db.immediate(conn):
             store_leases.add_control(
-                conn, run_id, lease=token, command=command, requested_at=STARTED_AT
+                conn,
+                run_id,
+                project_id=store_projects.resolve(
+                    conn, cli.resolve_repo_dir(project), now=STARTED_AT
+                ),
+                lease=token,
+                command=command,
+                requested_at=STARTED_AT,
             )
     finally:
         conn.close()
@@ -5786,21 +5811,25 @@ def _plant_lease(
     conn = store_db.open_db(cli.resolve_repo_dir(project))
     try:
         with store_db.immediate(conn):
+            project_id = store_projects.resolve(
+                conn, cli.resolve_repo_dir(project), now=heartbeat_at
+            )
             conn.execute(
-                "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-                " heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, 1)"
+                "INSERT INTO run_leases (project_id, run_id, token, pid, host,"
+                " acquired_at, heartbeat_at, accepting) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
                 " ON CONFLICT(run_id) DO UPDATE SET token=excluded.token,"
                 " pid=excluded.pid, host=excluded.host, acquired_at=excluded.acquired_at,"
                 " heartbeat_at=excluded.heartbeat_at, accepting=1",
-                (run_id, token, pid, HERE, heartbeat_at.isoformat(), heartbeat_at.isoformat()),
+                (project_id, run_id, token, pid, HERE, heartbeat_at.isoformat(),
+                 heartbeat_at.isoformat()),
             )
             for key in claims:
                 conn.execute(
-                    "INSERT INTO run_claims (key, run_id, token, claimed_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                    "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, key) DO UPDATE SET"
                     " run_id=excluded.run_id, token=excluded.token,"
                     " claimed_at=excluded.claimed_at",
-                    (key, run_id, token, heartbeat_at.isoformat()),
+                    (project_id, key, run_id, token, heartbeat_at.isoformat()),
                 )
     finally:
         conn.close()

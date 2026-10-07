@@ -24,6 +24,15 @@ def data_dir() -> Path:
     return result
 
 
+def db_path() -> Path:
+    """The machine-wide database, `<data dir>/am.db`, without creating anything.
+
+    Neither the data directory nor the file: whoever opens the database
+    creates the directory first.
+    """
+    return data_path() / "am.db"
+
+
 def project_digest(root: Path) -> str:
     """The per-project file stem: sha256 of the resolved root path, 64 hex chars.
 
@@ -40,12 +49,38 @@ def _projects_dir() -> Path:
 
 
 def project_db_path(root: Path) -> Path:
+    """The legacy per-project database of `root`, `projects/<digest>.db`; creates `projects`.
+
+    The store no longer opens it: `am.db` (`db_path`) replaced it. It names
+    the pre-`am.db` layout `am migrate` reads.
+    """
     return _projects_dir() / f"{project_digest(root)}.db"
 
 
 def project_db_location(root: Path) -> Path:
-    """Where `project_db_path` puts the project's database, without creating anything."""
+    """Where `project_db_path` names the legacy per-project database, without creating anything."""
     return data_path() / "projects" / f"{project_digest(root)}.db"
+
+
+def legacy_project_dbs() -> list[Path]:
+    """Every per-project database left under `data_dir()/projects`, sorted.
+
+    The pre-`am.db` files (`projects/<digest>.db`), for the migration refusal
+    and `am migrate`. Lists only: it creates neither the data directory nor
+    `projects`, so the caller finds the data directory as it left it. Regular
+    files directly in `projects` whose name ends in `.db`; not the `.lock`
+    files beside them, not `-wal`/`-shm` sidecars, not directories or
+    anything below one. The stem is not checked against the digest shape:
+    migrate does that, and reports a mismatch by name. A missing `projects`
+    directory is an empty list, not an error.
+    """
+    projects = data_path() / "projects"
+    if not projects.is_dir():
+        return []
+    return sorted(
+        entry for entry in projects.iterdir()
+        if entry.name.endswith(".db") and entry.is_file()
+    )
 
 
 def project_lock_path(root: Path, name: str) -> Path:

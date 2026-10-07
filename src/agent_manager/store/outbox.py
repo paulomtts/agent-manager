@@ -46,25 +46,27 @@ def _comment_from_row(row: sqlite3.Row) -> CommentRow:
 def enqueue_comment(
     conn: sqlite3.Connection,
     *,
+    project_id: int,
     run_id: str,
     card_id: str,
     key: str,
     body: str,
     now: datetime,
 ) -> bool:
-    """Queue `body` for `card_id` under `key`, once.
+    """Queue `body` for `card_id` under `(project_id, key)`, once.
 
-    True when a `pending` row was inserted; False when `key` already had a
-    row, which is left exactly as it was. Only the key collision is ignored:
-    a NULL body or any other refused value raises `sqlite3.IntegrityError`
-    for the caller to roll back.
+    True when a `pending` row was inserted; False when that pair already had
+    a row, which is left exactly as it was. The same `key` in another
+    project is a separate row. Only the key collision is ignored: a NULL
+    body or any other refused value raises `sqlite3.IntegrityError` for the
+    caller to roll back.
     """
     cursor = conn.execute(
-        "INSERT INTO board_comments (run_id, card_id, key, body, state,"
+        "INSERT INTO board_comments (project_id, run_id, card_id, key, body, state,"
         " comment_id, failed_attempts, created_at, posted_at)"
-        " VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
-        " ON CONFLICT(key) DO NOTHING",
-        (run_id, card_id, key, body, store_db.iso(now)),
+        " VALUES (?, ?, ?, ?, ?, 'pending', NULL, 0, ?, NULL)"
+        " ON CONFLICT(project_id, key) DO NOTHING",
+        (project_id, run_id, card_id, key, body, store_db.iso(now)),
     )
     return cursor.rowcount == 1
 
@@ -101,31 +103,37 @@ def pending_comments(
 
 
 def mark_comment_posted(
-    conn: sqlite3.Connection, key: str, comment_id: str, now: datetime
+    conn: sqlite3.Connection,
+    key: str,
+    comment_id: str,
+    now: datetime,
+    *,
+    project_id: int,
 ) -> None:
-    """Record that `key`'s body is on the board as `comment_id`; an unknown `key`
-    changes nothing."""
+    """Record that `(project_id, key)`'s body is on the board as `comment_id`; an
+    unknown pair changes nothing, and the same key in another project is untouched."""
     conn.execute(
         "UPDATE board_comments SET state = 'posted', comment_id = ?,"
-        " posted_at = ? WHERE key = ?",
-        (comment_id, store_db.iso(now), key),
+        " posted_at = ? WHERE project_id = ? AND key = ?",
+        (comment_id, store_db.iso(now), project_id, key),
     )
 
 
-def record_comment_failure(conn: sqlite3.Connection, key: str) -> int:
-    """Count one failed post of `key` and return the new `failed_attempts`.
+def record_comment_failure(conn: sqlite3.Connection, key: str, *, project_id: int) -> int:
+    """Count one failed post of `(project_id, key)` and return the new `failed_attempts`.
 
     A `pending` row reaching `COMMENT_ATTEMPTS` becomes `abandoned`; a row
-    already `posted` keeps its state. An unknown `key` changes nothing and
-    gives 0.
+    already `posted` keeps its state. An unknown pair changes nothing and
+    gives 0; the same key in another project is untouched.
     """
     conn.execute(
         "UPDATE board_comments SET failed_attempts = failed_attempts + 1,"
         " state = CASE WHEN state = 'pending' AND failed_attempts + 1 >= ?"
-        " THEN 'abandoned' ELSE state END WHERE key = ?",
-        (COMMENT_ATTEMPTS, key),
+        " THEN 'abandoned' ELSE state END WHERE project_id = ? AND key = ?",
+        (COMMENT_ATTEMPTS, project_id, key),
     )
     row = conn.execute(
-        "SELECT failed_attempts FROM board_comments WHERE key = ?", (key,)
+        "SELECT failed_attempts FROM board_comments WHERE project_id = ? AND key = ?",
+        (project_id, key),
     ).fetchone()
     return 0 if row is None else row["failed_attempts"]

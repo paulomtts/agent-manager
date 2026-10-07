@@ -11,7 +11,10 @@ import ast
 import inspect
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from agent_manager import (
     bases,
@@ -19,16 +22,30 @@ from agent_manager import (
     control,
     dispatch,
     integration,
+    models,
     orchestrate,
     runs,
     store,
 )
 from agent_manager.runtime import walk as runtime_walk
+from agent_manager.store import checkpoints as store_checkpoints
+from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
+from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 
 _REPO = Path(__file__).resolve().parents[2]
 
-_STORE_LEAVES = ("db", "journal", "replay", "queries", "leases", "checkpoints", "outbox")
+_STORE_LEAVES = (
+    "db",
+    "journal",
+    "replay",
+    "queries",
+    "leases",
+    "checkpoints",
+    "outbox",
+    "projects",
+)
 
 _WRITER_MAY_IMPORT = frozenset(
     {"agent_manager.models", *(f"agent_manager.store.{leaf}" for leaf in _STORE_LEAVES)}
@@ -163,3 +180,150 @@ def test_every_source_caller_binds_the_one_store_class():
     assert [
         module.__name__ for module in callers if module.Store is not store_writer.Store
     ] == []
+
+
+RUN_A = "run-2026-10-07-01"
+RUN_B = "run-2026-10-07-02"
+
+
+def test_store_open_resolves_the_project_once_per_repo(repo):
+    first = store_writer.Store.open(repo, RUN_A)
+    second = store_writer.Store.open(repo, RUN_B)
+    try:
+        ids = (first.project_id, second.project_id)
+    finally:
+        first.close()
+        second.close()
+
+    # A fresh connection sees the row: `Store.open` committed it.
+    observer = store_db.open_db(repo)
+    try:
+        rows = [tuple(row) for row in observer.execute("SELECT id, repo_dir FROM projects")]
+    finally:
+        observer.close()
+
+    assert ids[0] == ids[1]
+    assert rows == [(ids[0], str(repo.resolve()))]
+
+
+def test_store_open_through_a_symlink_is_the_same_project(repo):
+    # Review Focus 1: two spellings of one directory are one project.
+    link = repo.parent / "repo-link"
+    link.symlink_to(repo, target_is_directory=True)
+
+    direct = store_writer.Store.open(repo, RUN_A)
+    linked = store_writer.Store.open(link, RUN_B)
+    try:
+        assert linked.project_id == direct.project_id
+        count = direct.connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        direct.close()
+        linked.close()
+
+    assert count == 1
+
+
+def test_store_project_id_is_read_only_and_set_by_the_constructor(repo):
+    st = store_writer.Store(store_db.open_db(repo), store_journal.Journal(RUN_A), 7)
+    try:
+        assert st.project_id == 7
+        with pytest.raises(AttributeError):
+            st.project_id = 8  # type: ignore[misc]
+    finally:
+        st.close()
+
+
+NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+
+_TREE_TABLES = ("runs", "stories", "subtasks", "phases", "attempts")
+_STORE_WRITTEN_TABLES = (
+    *_TREE_TABLES,
+    "checkpoints",
+    "checkpoint_floors",
+    "run_leases",
+    "run_claims",
+    "board_comments",
+)
+
+
+def _project_ids(conn, table: str) -> list[int]:
+    return [row[0] for row in conn.execute(f"SELECT project_id FROM {table}")]
+
+
+def _record_tree(st: store_writer.Store, repo: Path) -> None:
+    st.record_run(
+        models.Run(
+            id=RUN_A,
+            workflow="milestone",
+            repo_dir=repo,
+            base_branch="main",
+            branch_prefix="m1/",
+            status="started",
+            started_at=NOW,
+        )
+    )
+    st.record_story(models.StoryRun(card_id="story-a", title="Story", level=0, status="started"))
+    st.record_subtask(
+        "story-a",
+        models.SubtaskRun(
+            card_id="card-a", branch="m1/task-card-a", base_branch="main", status="started"
+        ),
+    )
+    st.record_phase(
+        "story-a",
+        "card-a",
+        models.PhaseRun(name="implement", kind="agent", status="started", started_at=NOW),
+    )
+    st.record_attempt(
+        "story-a",
+        "card-a",
+        "implement",
+        models.Attempt(
+            n=1,
+            dispatch=models.Dispatch(
+                harness="claude",
+                model="sonnet",
+                role="coder",
+                cwd=repo,
+                prompt_path=repo / "prompt.txt",
+                result_path=repo / "result.json",
+            ),
+        ),
+    )
+
+
+def test_every_row_the_store_writes_carries_its_project_id(repo):
+    # Another project is seen first, so this store's id is not the first one
+    # a fresh table hands out: a hard-coded or defaulted id cannot pass.
+    seed = store_db.open_db(repo)
+    try:
+        elsewhere = store_projects.resolve(seed, repo.parent / "elsewhere", now=NOW)
+        seed.commit()
+    finally:
+        seed.close()
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        _record_tree(st, repo)
+        st.save_checkpoint(
+            "card-a",
+            workflow="task",
+            digest="d",
+            reason="turn",
+            agent={},
+            saved_at=NOW,
+            floor=store_checkpoints.TurnFloor(phase="implement", loop=0, source_run=RUN_A, floor=0),
+        )
+        st.enqueue_comment(run_id=RUN_A, card_id="card-a", key="k1", body="b", now=NOW)
+        st.take_lease(
+            token="t1", pid=1, host="h", now=NOW, is_live=lambda row: False, claims=["card:card-a"]
+        )
+        written = {table: _project_ids(st.connection, table) for table in _STORE_WRITTEN_TABLES}
+        st.rebuild_from_journal(RUN_A)
+        rebuilt = {table: _project_ids(st.connection, table) for table in _TREE_TABLES}
+        project_id = st.project_id
+    finally:
+        st.close()
+
+    assert project_id != elsewhere
+    assert written == {table: [project_id] for table in _STORE_WRITTEN_TABLES}
+    assert rebuilt == {table: [project_id] for table in _TREE_TABLES}

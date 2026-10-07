@@ -153,12 +153,19 @@ def _enqueue(
     conn: sqlite3.Connection,
     key: str,
     *,
+    project_id: int,
     run_id: str = RUN_ID,
     card_id: str = "card-a",
     now: datetime = NOW,
 ) -> None:
     assert store_outbox.enqueue_comment(
-        conn, run_id=run_id, card_id=card_id, key=key, body=f"body {key}", now=now
+        conn,
+        project_id=project_id,
+        run_id=run_id,
+        card_id=card_id,
+        key=key,
+        body=f"body {key}",
+        now=now,
     )
     conn.commit()
 
@@ -172,12 +179,13 @@ def _state(conn: sqlite3.Connection, key: str) -> tuple:
     return tuple(row)
 
 
-def test_enqueue_comment_queues_a_key_once_without_committing(conns):
+def test_enqueue_comment_queues_a_key_once_without_committing(conns, project_id):
     conn, other = conns
 
     assert (
         store_outbox.enqueue_comment(
-            conn, run_id=RUN_ID, card_id="card-a", key="k1", body="first", now=NOW
+            conn, run_id=RUN_ID, card_id="card-a", key="k1", body="first", now=NOW,
+            project_id=project_id,
         )
         is True
     )
@@ -187,7 +195,8 @@ def test_enqueue_comment_queues_a_key_once_without_committing(conns):
     conn.commit()
     assert (
         store_outbox.enqueue_comment(
-            conn, run_id=RUN_ID, card_id="card-a", key="k1", body="second", now=LATER
+            conn, run_id=RUN_ID, card_id="card-a", key="k1", body="second", now=LATER,
+            project_id=project_id,
         )
         is False
     )
@@ -205,12 +214,13 @@ def test_enqueue_comment_queues_a_key_once_without_committing(conns):
     ]
 
 
-def test_enqueue_comment_with_no_body_raises_and_leaves_nothing_once_rolled_back(conns):
+def test_enqueue_comment_with_no_body_raises_and_leaves_nothing_once_rolled_back(conns, project_id):
     conn, other = conns
 
     with pytest.raises(sqlite3.IntegrityError):
         store_outbox.enqueue_comment(
-            conn, run_id=RUN_ID, card_id="card-a", key="k1", body=None, now=NOW
+            conn, run_id=RUN_ID, card_id="card-a", key="k1", body=None, now=NOW,
+            project_id=project_id,
         )
     conn.rollback()
 
@@ -218,13 +228,13 @@ def test_enqueue_comment_with_no_body_raises_and_leaves_nothing_once_rolled_back
     assert _count(other) == 0
 
 
-def test_pending_comments_filters_and_orders_like_the_store(repo, conns):
+def test_pending_comments_filters_and_orders_like_the_store(repo, conns, project_id):
     conn, _ = conns
-    _enqueue(conn, "k1", now=NOW)
-    _enqueue(conn, "k2", run_id=OTHER_RUN, card_id="card-b", now=NOW)
-    _enqueue(conn, "k3", now=NOW - timedelta(minutes=1))
-    _enqueue(conn, "k4", now=NOW - timedelta(minutes=2))
-    store_outbox.mark_comment_posted(conn, "k4", "c-4", NOW)
+    _enqueue(conn, "k1", now=NOW, project_id=project_id)
+    _enqueue(conn, "k2", run_id=OTHER_RUN, card_id="card-b", now=NOW, project_id=project_id)
+    _enqueue(conn, "k3", now=NOW - timedelta(minutes=1), project_id=project_id)
+    _enqueue(conn, "k4", now=NOW - timedelta(minutes=2), project_id=project_id)
+    store_outbox.mark_comment_posted(conn, "k4", "c-4", NOW, project_id=project_id)
     conn.commit()
 
     def keys(**filters) -> list[str]:
@@ -252,12 +262,12 @@ def test_pending_comments_with_no_card_ids_never_queries():
     assert store_outbox.pending_comments(closed, card_ids=[]) == []
 
 
-def test_mark_comment_posted_records_the_board_id_without_committing(conns):
+def test_mark_comment_posted_records_the_board_id_without_committing(conns, project_id):
     conn, other = conns
-    _enqueue(conn, "k1")
+    _enqueue(conn, "k1", project_id=project_id)
 
-    store_outbox.mark_comment_posted(conn, "k1", "c-9", LATER)
-    store_outbox.mark_comment_posted(conn, "nope", "c-0", LATER)  # unknown key
+    store_outbox.mark_comment_posted(conn, "k1", "c-9", LATER, project_id=project_id)
+    store_outbox.mark_comment_posted(conn, "nope", "c-0", LATER, project_id=project_id)  # unknown key
 
     assert conn.in_transaction
     assert _state(other, "k1") == ("pending", None, 0, None)
@@ -266,23 +276,23 @@ def test_mark_comment_posted_records_the_board_id_without_committing(conns):
     assert _count(other) == 1
 
 
-def test_record_comment_failure_counts_abandons_at_the_cap_and_keeps_posted_rows(conns):
+def test_record_comment_failure_counts_abandons_at_the_cap_and_keeps_posted_rows(conns, project_id):
     conn, other = conns
-    _enqueue(conn, "k1")
-    _enqueue(conn, "k2")
-    store_outbox.mark_comment_posted(conn, "k2", "c-2", NOW)
+    _enqueue(conn, "k1", project_id=project_id)
+    _enqueue(conn, "k2", project_id=project_id)
+    store_outbox.mark_comment_posted(conn, "k2", "c-2", NOW, project_id=project_id)
     conn.commit()
 
-    assert store_outbox.record_comment_failure(conn, "k1") == 1
+    assert store_outbox.record_comment_failure(conn, "k1", project_id=project_id) == 1
     assert conn.in_transaction
     assert _state(other, "k1")[2] == 0
     conn.commit()
     counts = [
-        store_outbox.record_comment_failure(conn, "k1")
+        store_outbox.record_comment_failure(conn, "k1", project_id=project_id)
         for _ in range(store_outbox.COMMENT_ATTEMPTS - 1)
     ]
     posted = [
-        store_outbox.record_comment_failure(conn, "k2")
+        store_outbox.record_comment_failure(conn, "k2", project_id=project_id)
         for _ in range(store_outbox.COMMENT_ATTEMPTS)
     ]
     conn.commit()
@@ -292,4 +302,79 @@ def test_record_comment_failure_counts_abandons_at_the_cap_and_keeps_posted_rows
     assert (state, attempts) == ("abandoned", 3)
     assert posted == [1, 2, 3]
     assert _state(other, "k2")[0] == "posted"
-    assert store_outbox.record_comment_failure(conn, "nope") == 0
+    assert store_outbox.record_comment_failure(conn, "nope", project_id=project_id) == 0
+
+
+# -- comments are per project (B6) ---------------------------------------------
+
+
+def _comment(conn: sqlite3.Connection, project_id: int, key: str) -> tuple | None:
+    row = conn.execute(
+        "SELECT body, state, comment_id, failed_attempts FROM board_comments"
+        " WHERE project_id = ? AND key = ?",
+        (project_id, key),
+    ).fetchone()
+    return None if row is None else tuple(row)
+
+
+def test_the_same_comment_key_in_two_projects_queues_twice(
+    conns, project_id, other_project_id
+):
+    conn, other = conns
+
+    def enqueue(pid: int, run_id: str, body: str, now: datetime = NOW) -> bool:
+        return store_outbox.enqueue_comment(
+            conn, project_id=pid, run_id=run_id, card_id="card-a", key="c", body=body, now=now
+        )
+
+    assert enqueue(project_id, RUN_ID, "for A") is True
+    assert enqueue(other_project_id, OTHER_RUN, "for B") is True
+    assert enqueue(project_id, RUN_ID, "again", LATER) is False
+    conn.commit()
+
+    assert _comment(other, project_id, "c") == ("for A", "pending", None, 0)
+    assert _comment(other, other_project_id, "c") == ("for B", "pending", None, 0)
+
+
+def test_mark_posted_and_record_failure_touch_only_their_project(
+    conns, project_id, other_project_id
+):
+    conn, other = conns
+    for pid, run_id in ((project_id, RUN_ID), (other_project_id, OTHER_RUN)):
+        store_outbox.enqueue_comment(
+            conn, project_id=pid, run_id=run_id, card_id="card-a", key="c", body="b", now=NOW
+        )
+    conn.commit()
+
+    store_outbox.mark_comment_posted(conn, "c", "c-1", LATER, project_id=project_id)
+    failures = store_outbox.record_comment_failure(conn, "c", project_id=other_project_id)
+    conn.commit()
+
+    assert failures == 1
+    assert _comment(other, project_id, "c") == ("b", "posted", "c-1", 0)
+    assert _comment(other, other_project_id, "c") == ("b", "pending", None, 1)
+
+
+def test_a_key_only_another_project_has_is_unknown_to_this_one(
+    conns, project_id, other_project_id
+):
+    # Review Focus 3.
+    conn, other = conns
+    store_outbox.enqueue_comment(
+        conn,
+        project_id=other_project_id,
+        run_id=OTHER_RUN,
+        card_id="card-a",
+        key="c",
+        body="b",
+        now=NOW,
+    )
+    conn.commit()
+
+    store_outbox.mark_comment_posted(conn, "c", "c-1", LATER, project_id=project_id)
+    failures = store_outbox.record_comment_failure(conn, "c", project_id=project_id)
+    conn.commit()
+
+    assert failures == 0
+    assert _comment(other, other_project_id, "c") == ("b", "pending", None, 0)
+    assert _comment(other, project_id, "c") is None

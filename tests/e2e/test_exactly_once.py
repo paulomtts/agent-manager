@@ -32,6 +32,7 @@ from typer.testing import CliRunner
 from agent_manager import cli, models
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import writer as store_writer
 from agent_manager.runtime import bridge
@@ -92,9 +93,12 @@ def _load_run(root: Path, run_id: str) -> models.Run:
 
 
 def _latest_run_id(root: Path) -> str:
-    conn = store_db.open_db(cli.resolve_repo_dir(root))
+    resolved = cli.resolve_repo_dir(root)
+    conn = store_db.open_db(resolved)
     try:
-        run_id = store_queries.latest_run_id(conn)
+        run_id = store_queries.latest_run_id(
+            conn, project_id=store_projects.lookup(conn, resolved)
+        )
     finally:
         conn.close()
     assert run_id is not None

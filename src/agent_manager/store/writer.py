@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_manager import models
@@ -17,6 +17,7 @@ from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import outbox as store_outbox
+from agent_manager.store import projects as store_projects
 from agent_manager.store import queries as store_queries
 from agent_manager.store import replay as store_replay
 
@@ -34,7 +35,7 @@ class Store:
     (exactly-once 1.1), `run_controls` and `run_leases` (live control C1/C2),
     `run_claims` (multi-process X5) and `board_comments` (board-comments B6):
     the six row-only tables, which have no journal and are the projection's
-    alone.
+    alone. Every row this store writes carries its `project_id`.
     Their methods write rows and never touch the journal, and
     `rebuild_from_journal` leaves those rows alone.
 
@@ -49,16 +50,43 @@ class Store:
     only the append and the row write.
     """
 
-    def __init__(self, conn: sqlite3.Connection, journal: store_journal.Journal) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        journal: store_journal.Journal,
+        project_id: int,
+    ) -> None:
         self._conn = conn
         self._journal = journal
+        self._project_id = project_id
         self._lock = threading.RLock()
         self._token: str | None = None
         self._in_fence = False
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
-        return cls(store_db.open_db(root), store_journal.Journal(run_id))
+        """A store on `root`'s projection, bound to `root`'s `projects` row.
+
+        The row is resolved, or created on first sight, and committed before
+        the store exists, so every run of one project shares one id. The
+        wall clock is read here for the row's `created_at`, as
+        `Journal.append` reads it for a line's time.
+        """
+        conn = store_db.open_db(root)
+        try:
+            project_id = store_projects.resolve(
+                conn, root, now=datetime.now(timezone.utc)
+            )
+            conn.commit()
+        except BaseException:
+            conn.close()
+            raise
+        return cls(conn, store_journal.Journal(run_id), project_id)
+
+    @property
+    def project_id(self) -> int:
+        """The `projects.id` every row this store writes carries."""
+        return self._project_id
 
     @property
     def run_id(self) -> str:
@@ -191,10 +219,10 @@ class Store:
     def _write_run_row(self, run_id: str, run: models.Run) -> None:
         self._conn.execute(
             """
-            INSERT INTO runs (id, workflow, repo_dir, base_branch, branch_prefix,
-                              status, started_at, config, milestone_id)
-            VALUES (:id, :workflow, :repo_dir, :base_branch, :branch_prefix,
-                    :status, :started_at, :config, :milestone_id)
+            INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,
+                              branch_prefix, status, started_at, config, milestone_id)
+            VALUES (:project_id, :id, :workflow, :repo_dir, :base_branch,
+                    :branch_prefix, :status, :started_at, :config, :milestone_id)
             ON CONFLICT(id) DO UPDATE SET
                 workflow=excluded.workflow,
                 repo_dir=excluded.repo_dir,
@@ -206,6 +234,7 @@ class Store:
                 milestone_id=excluded.milestone_id
             """,
             {
+                "project_id": self._project_id,
                 "id": run_id,
                 "workflow": run.workflow,
                 "repo_dir": str(run.repo_dir),
@@ -222,8 +251,9 @@ class Store:
     def _write_story_row(self, run_id: str, story: models.StoryRun) -> None:
         self._conn.execute(
             """
-            INSERT INTO stories (run_id, card_id, title, level, status, tip_branch, position)
-            VALUES (:run_id, :card_id, :title, :level, :status, :tip_branch,
+            INSERT INTO stories (project_id, run_id, card_id, title, level, status,
+                                 tip_branch, position)
+            VALUES (:project_id, :run_id, :card_id, :title, :level, :status, :tip_branch,
                     (SELECT COUNT(*) FROM stories WHERE run_id = :run_id))
             ON CONFLICT(run_id, card_id) DO UPDATE SET
                 title=excluded.title,
@@ -232,6 +262,7 @@ class Store:
                 tip_branch=excluded.tip_branch
             """,
             {
+                "project_id": self._project_id,
                 "run_id": run_id,
                 "card_id": story.card_id,
                 "title": story.title,
@@ -247,9 +278,9 @@ class Store:
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO subtasks (run_id, story_id, card_id, branch, base_branch,
-                                  status, worktree_path, position)
-            VALUES (:run_id, :story_id, :card_id, :branch, :base_branch,
+            INSERT INTO subtasks (project_id, run_id, story_id, card_id, branch,
+                                  base_branch, status, worktree_path, position)
+            VALUES (:project_id, :run_id, :story_id, :card_id, :branch, :base_branch,
                     :status, :worktree_path,
                     (SELECT COUNT(*) FROM subtasks
                       WHERE run_id = :run_id AND story_id = :story_id))
@@ -260,6 +291,7 @@ class Store:
                 worktree_path=excluded.worktree_path
             """,
             {
+                "project_id": self._project_id,
                 "run_id": run_id,
                 "story_id": story_id,
                 "card_id": subtask.card_id,
@@ -276,9 +308,9 @@ class Store:
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO phases (run_id, story_id, card_id, name, kind, status,
-                                started_at, ended_at, detail, position)
-            VALUES (:run_id, :story_id, :card_id, :name, :kind, :status,
+            INSERT INTO phases (project_id, run_id, story_id, card_id, name, kind,
+                                status, started_at, ended_at, detail, position)
+            VALUES (:project_id, :run_id, :story_id, :card_id, :name, :kind, :status,
                     :started_at, :ended_at, :detail,
                     (SELECT COUNT(*) FROM phases
                       WHERE run_id = :run_id AND story_id = :story_id
@@ -291,6 +323,7 @@ class Store:
                 detail=excluded.detail
             """,
             {
+                "project_id": self._project_id,
                 "run_id": run_id,
                 "story_id": story_id,
                 "card_id": card_id,
@@ -314,10 +347,10 @@ class Store:
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO attempts (run_id, story_id, card_id, phase, n, status,
-                                  exit_code, duration,
+            INSERT INTO attempts (project_id, run_id, story_id, card_id, phase, n,
+                                  status, exit_code, duration,
                                   prompt_path, result_path, stdout_path, dispatch)
-            VALUES (:run_id, :story_id, :card_id, :phase, :n, :status,
+            VALUES (:project_id, :run_id, :story_id, :card_id, :phase, :n, :status,
                     :exit_code, :duration,
                     :prompt_path, :result_path, :stdout_path, :dispatch)
             ON CONFLICT(run_id, story_id, card_id, phase, n) DO UPDATE SET
@@ -330,6 +363,7 @@ class Store:
                 dispatch=excluded.dispatch
             """,
             {
+                "project_id": self._project_id,
                 "run_id": run_id,
                 "story_id": story_id,
                 "card_id": card_id,
@@ -394,6 +428,7 @@ class Store:
                     self._conn,
                     self.run_id,
                     card_id,
+                    project_id=self._project_id,
                     workflow=workflow,
                     digest=digest,
                     reason=reason,
@@ -472,15 +507,17 @@ class Store:
         """Queue `body` for `card_id` under `key`, once (B9).
 
         True when a `pending` row was inserted; False when `key` already had a
-        row, which is left exactly as it was, whatever its state. Only the key
-        collision is ignored (`ON CONFLICT(key) DO NOTHING`, not `OR IGNORE`):
-        a NULL body or any other refused value raises `sqlite3.IntegrityError`
-        and rolls back.
+        row in this store's project, which is left exactly as it was, whatever
+        its state. Only the key collision is ignored
+        (`ON CONFLICT(project_id, key) DO NOTHING`, not `OR IGNORE`): a NULL
+        body or any other refused value raises `sqlite3.IntegrityError` and
+        rolls back.
         """
         with self._lock, self._fenced():
             try:
                 inserted = store_outbox.enqueue_comment(
                     self._conn,
+                    project_id=self._project_id,
                     run_id=run_id,
                     card_id=card_id,
                     key=key,
@@ -511,11 +548,14 @@ class Store:
     def mark_comment_posted(self, key: str, comment_id: str, now: datetime) -> None:
         """Record that `key`'s body is on the board as `comment_id`.
 
-        The row leaves `pending_comments`. An unknown `key` changes nothing.
+        The row leaves `pending_comments`. An unknown `key` changes nothing. Only
+        this store's project's row is touched.
         """
         with self._lock, self._fenced():
             try:
-                store_outbox.mark_comment_posted(self._conn, key, comment_id, now)
+                store_outbox.mark_comment_posted(
+                    self._conn, key, comment_id, now, project_id=self._project_id
+                )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
@@ -527,10 +567,13 @@ class Store:
         A `pending` row reaching `COMMENT_ATTEMPTS` becomes `abandoned` and
         leaves `pending_comments`; a row already `posted` keeps its state. No
         warning is emitted here. An unknown `key` changes nothing and gives 0.
+        Only this store's project's row is touched.
         """
         with self._lock, self._fenced():
             try:
-                failures = store_outbox.record_comment_failure(self._conn, key)
+                failures = store_outbox.record_comment_failure(
+                    self._conn, key, project_id=self._project_id
+                )
                 self._commit()
             except sqlite3.Error:
                 self._conn.rollback()
@@ -559,8 +602,8 @@ class Store:
 
         One `BEGIN IMMEDIATE` transaction (X5, X9): a live lease under another
         token raises `LeaseHeldError`; otherwise that row, or `None`, is the
-        `displaced` one. Then the first key another run holds under a live
-        lease raises `ClaimHeldError`. Only then are the lease (window open)
+        `displaced` one. Then the first key another run of this project holds
+        under a live lease raises `ClaimHeldError`. Only then are the lease (window open)
         and every claim upserted and committed. Any raise rolls all of it
         back and leaves the bound token as it was. On success the store is
         bound to `token` and the journal re-reads its highest `seq`.
@@ -570,6 +613,7 @@ class Store:
                 taken = store_leases.take_lease(
                     self._conn,
                     self.run_id,
+                    project_id=self._project_id,
                     token=token,
                     pid=pid,
                     host=host,

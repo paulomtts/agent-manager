@@ -32,6 +32,8 @@ RUN_ID = "run-2026-10-07-01"
 OTHER_RUN = "run-2026-10-07-02"
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
 LATER = NOW + timedelta(minutes=1)
+THIRD_RUN = "run-2026-10-07-03"
+FOURTH_RUN = "run-2026-10-07-04"
 
 _PUBLIC_LEASE_NAMES = (
     "LeaseRow",
@@ -188,19 +190,24 @@ def test_no_caller_reaches_a_lease_name_through_the_store_package():
 # -- the SQL never commits ---------------------------------------------------
 
 
-def _seed_lease(conn: sqlite3.Connection, run_id: str = RUN_ID, *, token: str = "t1") -> None:
+def _seed_lease(
+    conn: sqlite3.Connection, run_id: str = RUN_ID, *, project_id: int, token: str = "t1"
+) -> None:
     conn.execute(
-        "INSERT INTO run_leases (run_id, token, pid, host, acquired_at,"
-        " heartbeat_at, accepting) VALUES (?, ?, 1, 'h', ?, ?, 1)",
-        (run_id, token, NOW.isoformat(), NOW.isoformat()),
+        "INSERT INTO run_leases (project_id, run_id, token, pid, host, acquired_at,"
+        " heartbeat_at, accepting) VALUES (?, ?, ?, 1, 'h', ?, ?, 1)",
+        (project_id, run_id, token, NOW.isoformat(), NOW.isoformat()),
     )
     conn.commit()
 
 
-def _seed_claim(conn: sqlite3.Connection, key: str, run_id: str, token: str) -> None:
+def _seed_claim(
+    conn: sqlite3.Connection, key: str, run_id: str, token: str, *, project_id: int
+) -> None:
     conn.execute(
-        "INSERT INTO run_claims (key, run_id, token, claimed_at) VALUES (?, ?, ?, ?)",
-        (key, run_id, token, NOW.isoformat()),
+        "INSERT INTO run_claims (project_id, key, run_id, token, claimed_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (project_id, key, run_id, token, NOW.isoformat()),
     )
     conn.commit()
 
@@ -209,14 +216,16 @@ def _seed_control(
     conn: sqlite3.Connection,
     seq: int,
     *,
+    project_id: int,
     run_id: str = RUN_ID,
     lease: str = "t1",
     handled_at: datetime | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO run_controls (run_id, seq, lease, command, requested_at,"
-        " handled_at) VALUES (?, ?, ?, 'pause', ?, ?)",
+        "INSERT INTO run_controls (project_id, run_id, seq, lease, command,"
+        " requested_at, handled_at) VALUES (?, ?, ?, ?, 'pause', ?, ?)",
         (
+            project_id,
             run_id,
             seq,
             lease,
@@ -231,9 +240,9 @@ def _claim_keys(conn: sqlite3.Connection) -> list[str]:
     return [row["key"] for row in conn.execute("SELECT key FROM run_claims ORDER BY key")]
 
 
-def test_take_lease_upserts_the_lease_and_every_claim_without_committing(conns):
+def test_take_lease_upserts_the_lease_and_every_claim_without_committing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn, token="t0")
+    _seed_lease(conn, token="t0", project_id=project_id)
     displaced = store_leases.read_lease(other, RUN_ID)
 
     taken = store_leases.take_lease(
@@ -245,6 +254,7 @@ def test_take_lease_upserts_the_lease_and_every_claim_without_committing(conns):
         now=LATER,
         is_live=lambda row: False,
         claims=(key for key in ("k1", "k2")),  # a one-shot iterator
+        project_id=project_id,
     )
 
     assert conn.in_transaction
@@ -269,11 +279,12 @@ def test_take_lease_upserts_the_lease_and_every_claim_without_committing(conns):
     ]
 
 
-def test_take_lease_of_a_free_run_displaces_nothing_and_claims_nothing_by_default(conns):
+def test_take_lease_of_a_free_run_displaces_nothing_and_claims_nothing_by_default(conns, project_id):
     conn, other = conns
 
     taken = store_leases.take_lease(
-        conn, RUN_ID, token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True
+        conn, RUN_ID, token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True,
+        project_id=project_id,
     )
     conn.commit()
 
@@ -282,9 +293,9 @@ def test_take_lease_of_a_free_run_displaces_nothing_and_claims_nothing_by_defaul
     assert _claim_keys(other) == []
 
 
-def test_take_lease_refuses_a_live_lease_under_another_token_and_writes_nothing(conns):
+def test_take_lease_refuses_a_live_lease_under_another_token_and_writes_nothing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn, token="t0")
+    _seed_lease(conn, token="t0", project_id=project_id)
 
     with pytest.raises(store_leases.LeaseHeldError) as raised:
         store_leases.take_lease(
@@ -296,6 +307,7 @@ def test_take_lease_refuses_a_live_lease_under_another_token_and_writes_nothing(
             now=LATER,
             is_live=lambda row: True,
             claims=["k1"],
+            project_id=project_id,
         )
     conn.rollback()
 
@@ -305,10 +317,10 @@ def test_take_lease_refuses_a_live_lease_under_another_token_and_writes_nothing(
     assert _claim_keys(other) == []
 
 
-def test_take_lease_refuses_a_key_another_live_run_holds_and_writes_nothing(conns):
+def test_take_lease_refuses_a_key_another_live_run_holds_and_writes_nothing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn, OTHER_RUN, token="o1")
-    _seed_claim(conn, "k1", OTHER_RUN, "o1")
+    _seed_lease(conn, OTHER_RUN, token="o1", project_id=project_id)
+    _seed_claim(conn, "k1", OTHER_RUN, "o1", project_id=project_id)
 
     with pytest.raises(store_leases.ClaimHeldError) as raised:
         store_leases.take_lease(
@@ -320,6 +332,7 @@ def test_take_lease_refuses_a_key_another_live_run_holds_and_writes_nothing(conn
             now=LATER,
             is_live=lambda row: True,
             claims=["k0", "k1"],
+            project_id=project_id,
         )
     conn.rollback()
 
@@ -329,11 +342,11 @@ def test_take_lease_refuses_a_key_another_live_run_holds_and_writes_nothing(conn
     assert _claim_keys(other) == ["k1"]
 
 
-def test_release_claims_deletes_only_this_tokens_claims_without_committing(conns):
+def test_release_claims_deletes_only_this_tokens_claims_without_committing(conns, project_id):
     conn, other = conns
-    _seed_claim(conn, "k1", RUN_ID, "t1")
-    _seed_claim(conn, "k2", RUN_ID, "t0")
-    _seed_claim(conn, "k3", OTHER_RUN, "t1")
+    _seed_claim(conn, "k1", RUN_ID, "t1", project_id=project_id)
+    _seed_claim(conn, "k2", RUN_ID, "t0", project_id=project_id)
+    _seed_claim(conn, "k3", OTHER_RUN, "t1", project_id=project_id)
 
     store_leases.release_claims(conn, RUN_ID, "t1")
 
@@ -343,10 +356,10 @@ def test_release_claims_deletes_only_this_tokens_claims_without_committing(conns
     assert _claim_keys(other) == ["k2", "k3"]
 
 
-def test_beat_moves_only_the_matching_tokens_heartbeat_without_committing(conns):
+def test_beat_moves_only_the_matching_tokens_heartbeat_without_committing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn, RUN_ID, token="t1")
-    _seed_lease(conn, OTHER_RUN, token="t1")
+    _seed_lease(conn, RUN_ID, token="t1", project_id=project_id)
+    _seed_lease(conn, OTHER_RUN, token="t1", project_id=project_id)
 
     store_leases.beat(conn, RUN_ID, "t1", LATER)
     store_leases.beat(conn, RUN_ID, "t9", LATER + timedelta(minutes=5))  # not the holder
@@ -358,9 +371,9 @@ def test_beat_moves_only_the_matching_tokens_heartbeat_without_committing(conns)
     assert store_leases.read_lease(other, OTHER_RUN).heartbeat_at == NOW
 
 
-def test_close_window_stops_accepting_without_committing(conns):
+def test_close_window_stops_accepting_without_committing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn)
+    _seed_lease(conn, project_id=project_id)
 
     store_leases.close_window(conn, RUN_ID, "t1")
 
@@ -370,10 +383,10 @@ def test_close_window_stops_accepting_without_committing(conns):
     assert store_leases.read_lease(other, RUN_ID).accepting is False
 
 
-def test_release_lease_deletes_only_the_holders_row_without_committing(conns):
+def test_release_lease_deletes_only_the_holders_row_without_committing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn, RUN_ID, token="t1")
-    _seed_lease(conn, OTHER_RUN, token="o1")
+    _seed_lease(conn, RUN_ID, token="t1", project_id=project_id)
+    _seed_lease(conn, OTHER_RUN, token="o1", project_id=project_id)
 
     store_leases.release_lease(conn, RUN_ID, "t1")
     store_leases.release_lease(conn, OTHER_RUN, "t9")  # not the holder
@@ -385,9 +398,9 @@ def test_release_lease_deletes_only_the_holders_row_without_committing(conns):
     assert store_leases.read_lease(other, OTHER_RUN) is not None
 
 
-def test_set_lease_holder_renames_the_holder_without_committing(conns):
+def test_set_lease_holder_renames_the_holder_without_committing(conns, project_id):
     conn, other = conns
-    _seed_lease(conn)
+    _seed_lease(conn, project_id=project_id)
 
     store_leases.set_lease_holder(conn, RUN_ID, "t1", pid=9, host="h9")
 
@@ -399,13 +412,13 @@ def test_set_lease_holder_renames_the_holder_without_committing(conns):
     assert (lease.pid, lease.host) == (9, "h9")
 
 
-def test_pending_controls_reads_this_tokens_unhandled_requests_like_the_store(repo, conns):
+def test_pending_controls_reads_this_tokens_unhandled_requests_like_the_store(repo, conns, project_id):
     conn, _ = conns
-    _seed_control(conn, 0)
-    _seed_control(conn, 1, handled_at=NOW)
-    _seed_control(conn, 2, lease="t0")
-    _seed_control(conn, 3)
-    _seed_control(conn, 0, run_id=OTHER_RUN)
+    _seed_control(conn, 0, project_id=project_id)
+    _seed_control(conn, 1, handled_at=NOW, project_id=project_id)
+    _seed_control(conn, 2, lease="t0", project_id=project_id)
+    _seed_control(conn, 3, project_id=project_id)
+    _seed_control(conn, 0, run_id=OTHER_RUN, project_id=project_id)
 
     rows = store_leases.pending_controls(conn, RUN_ID, "t1")
 
@@ -418,10 +431,10 @@ def test_pending_controls_reads_this_tokens_unhandled_requests_like_the_store(re
         st.close()
 
 
-def test_mark_control_handled_marks_only_this_runs_request_without_committing(conns):
+def test_mark_control_handled_marks_only_this_runs_request_without_committing(conns, project_id):
     conn, other = conns
-    _seed_control(conn, 0)
-    _seed_control(conn, 0, run_id=OTHER_RUN)
+    _seed_control(conn, 0, project_id=project_id)
+    _seed_control(conn, 0, run_id=OTHER_RUN, project_id=project_id)
 
     store_leases.mark_control_handled(conn, RUN_ID, 0, LATER)
 
@@ -432,11 +445,12 @@ def test_mark_control_handled_marks_only_this_runs_request_without_committing(co
     assert store_leases.control_requests(other, OTHER_RUN)[0].handled_at is None
 
 
-def test_add_control_numbers_requests_without_committing(conns):
+def test_add_control_numbers_requests_without_committing(conns, project_id):
     conn, other = conns
 
     row = store_leases.add_control(
-        conn, RUN_ID, lease="t1", command="pause", requested_at=NOW
+        conn, RUN_ID, lease="t1", command="pause", requested_at=NOW,
+        project_id=project_id,
     )
 
     assert conn.in_transaction
@@ -446,12 +460,13 @@ def test_add_control_numbers_requests_without_committing(conns):
     assert store_leases.control_requests(other, RUN_ID) == [row]
 
 
-def test_add_control_refuses_an_unknown_command(conns):
+def test_add_control_refuses_an_unknown_command(conns, project_id):
     conn, other = conns
 
     with pytest.raises(sqlite3.IntegrityError):
         store_leases.add_control(
-            conn, RUN_ID, lease="t1", command="explode", requested_at=NOW
+            conn, RUN_ID, lease="t1", command="explode", requested_at=NOW,
+            project_id=project_id,
         )
     conn.rollback()
 
@@ -655,3 +670,139 @@ def test_fence_reads_the_lease_through_store_leases(repo, monkeypatch):
         assert seen == [(st.connection, RUN_ID)]
     finally:
         st.close()
+
+
+# -- claims are per project (B6) -----------------------------------------------
+
+
+def _take_in(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    project_id: int,
+    token: str,
+    claims: tuple[str, ...] | list[str] = (),
+    is_live=lambda row: True,
+) -> store_leases.LeaseTake:
+    return store_leases.take_lease(
+        conn,
+        run_id,
+        project_id=project_id,
+        token=token,
+        pid=1,
+        host="h",
+        now=NOW,
+        is_live=is_live,
+        claims=claims,
+    )
+
+
+def _claim_rows(conn: sqlite3.Connection, key: str) -> list[tuple[int, str]]:
+    return sorted(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT project_id, run_id FROM run_claims WHERE key = ?", (key,)
+        )
+    )
+
+
+def test_the_same_claim_key_in_two_projects_does_not_clash(
+    conns, project_id, other_project_id
+):
+    conn, other = conns
+
+    _take_in(conn, RUN_ID, project_id=project_id, token="ta", claims=["card:k"])
+    _take_in(conn, OTHER_RUN, project_id=other_project_id, token="tb", claims=["card:k"])
+    conn.commit()
+
+    assert _claim_rows(other, "card:k") == sorted(
+        [(project_id, RUN_ID), (other_project_id, OTHER_RUN)]
+    )
+
+
+def test_claim_conflicts_only_looks_within_its_project(conns, project_id, other_project_id):
+    conn, _ = conns
+    mine = _take_in(conn, RUN_ID, project_id=project_id, token="ta", claims=["card:k"]).lease
+    theirs = _take_in(
+        conn, OTHER_RUN, project_id=other_project_id, token="tb", claims=["card:k"]
+    ).lease
+    conn.commit()
+
+    def conflicts(pid: int, run_id: str) -> list[tuple[str, store_leases.LeaseRow]]:
+        return store_leases.claim_conflicts(
+            conn, ["card:k"], project_id=pid, is_live=lambda row: True, run_id=run_id
+        )
+
+    assert conflicts(other_project_id, FOURTH_RUN) == [("card:k", theirs)]
+    assert conflicts(other_project_id, OTHER_RUN) == []
+    assert conflicts(project_id, THIRD_RUN) == [("card:k", mine)]
+
+
+def test_a_claim_held_in_the_same_project_is_still_refused(
+    conns, project_id, other_project_id
+):
+    conn, other = conns
+    _take_in(conn, RUN_ID, project_id=project_id, token="ta", claims=["card:k"])
+    _take_in(conn, OTHER_RUN, project_id=other_project_id, token="tb", claims=["card:k"])
+    conn.commit()
+
+    with pytest.raises(store_leases.ClaimHeldError) as raised:
+        _take_in(conn, THIRD_RUN, project_id=project_id, token="tc", claims=["card:k"])
+    conn.rollback()
+
+    assert raised.value.key == "card:k"
+    assert raised.value.holder.run_id == RUN_ID
+    assert store_leases.read_lease(other, THIRD_RUN) is None
+
+
+def test_a_dead_claim_is_taken_over_within_its_project_only(
+    conns, project_id, other_project_id
+):
+    # Review Focus 4.
+    conn, other = conns
+    _take_in(conn, RUN_ID, project_id=project_id, token="ta", claims=["card:k"])
+    _take_in(conn, OTHER_RUN, project_id=other_project_id, token="tb", claims=["card:k"])
+    conn.commit()
+
+    _take_in(
+        conn,
+        THIRD_RUN,
+        project_id=project_id,
+        token="tc",
+        claims=["card:k"],
+        is_live=lambda row: False,
+    )
+    conn.commit()
+
+    assert _claim_rows(other, "card:k") == sorted(
+        [(project_id, THIRD_RUN), (other_project_id, OTHER_RUN)]
+    )
+
+
+def test_release_claims_leaves_the_other_projects_key(conns, project_id, other_project_id):
+    conn, other = conns
+    _take_in(conn, RUN_ID, project_id=project_id, token="ta", claims=["card:k"])
+    _take_in(conn, OTHER_RUN, project_id=other_project_id, token="tb", claims=["card:k"])
+    conn.commit()
+
+    store_leases.release_claims(conn, RUN_ID, "ta")
+    conn.commit()
+
+    assert _claim_rows(other, "card:k") == [(other_project_id, OTHER_RUN)]
+
+
+def test_take_lease_and_add_control_write_project_id(conns, project_id):
+    conn, other = conns
+
+    _take_in(conn, RUN_ID, project_id=project_id, token="t1", claims=["k1", "k2"])
+    store_leases.add_control(
+        conn, RUN_ID, project_id=project_id, lease="t1", command="pause", requested_at=NOW
+    )
+    conn.commit()
+
+    def ids(table: str) -> list[int]:
+        return [row[0] for row in other.execute(f"SELECT project_id FROM {table}")]
+
+    assert ids("run_leases") == [project_id]
+    assert ids("run_claims") == [project_id, project_id]
+    assert ids("run_controls") == [project_id]
