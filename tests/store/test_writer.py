@@ -89,7 +89,7 @@ def test_the_store_package_holds_no_code_and_re_exports_nothing():
     assert not hasattr(store, "_text")
     assert store.writer is store_writer
     names = {name for name in vars(store) if not name.startswith("__")}
-    assert names <= {*_STORE_LEAVES, "writer"}, sorted(names)
+    assert names <= {*_STORE_LEAVES, "writer", "legacy"}, sorted(names)
 
 
 def _imported_modules(path: Path) -> list[str]:

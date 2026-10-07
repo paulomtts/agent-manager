@@ -38,6 +38,7 @@ FOURTH_RUN = "run-2026-10-07-04"
 _PUBLIC_LEASE_NAMES = (
     "LeaseRow",
     "read_lease",
+    "read_leases",
     "ClaimRow",
     "LeaseTake",
     "LeaseHeldError",
@@ -199,6 +200,21 @@ def _seed_lease(
         (project_id, run_id, token, NOW.isoformat(), NOW.isoformat()),
     )
     conn.commit()
+
+
+def test_read_leases_lists_every_lease_row_in_run_id_order(conns, project_id):
+    conn, _ = conns
+    assert store_leases.read_leases(conn) == []
+
+    _seed_lease(conn, OTHER_RUN, project_id=project_id, token="t2")
+    _seed_lease(conn, RUN_ID, project_id=project_id)
+
+    found = store_leases.read_leases(conn)
+    assert [(lease.run_id, lease.token) for lease in found] == [
+        (RUN_ID, "t1"),
+        (OTHER_RUN, "t2"),
+    ]
+    assert found[0] == store_leases.read_lease(conn, RUN_ID)
 
 
 def _seed_claim(
