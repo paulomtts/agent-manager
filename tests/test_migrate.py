@@ -4,9 +4,11 @@ test's data directory; nothing spawns a process, so these are unit tests.
 """
 
 import ast
+import json
+import os
 import sqlite3
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -16,17 +18,21 @@ from legacyhelpers import (
     OLD_SCHEMA,
     STAMP,
     full_rows,
+    journal_line,
     lease_row,
     project_file,
     projects_dir,
     run_row,
     tree,
     write_db,
+    write_journal,
     write_wal_db,
 )
 
 from agent_manager import control, migrate, models, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
 
 HOST = "here"
@@ -466,3 +472,308 @@ def test_the_snapshot_directory_is_gone_after_success_and_after_a_refusal(
     project_file(beta).unlink()
     _run()
     assert list(scratch.iterdir()) == []
+
+
+# -- run journals imported as events (single-store 1.3.2) ---------------------
+
+
+def _ts(second: int) -> str:
+    return f"2026-10-07T10:00:{second:02d}+00:00"
+
+
+def _events() -> list[sqlite3.Row]:
+    return _query("SELECT * FROM events ORDER BY seq")
+
+
+def _two_runs(repos) -> None:
+    alpha, beta = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    write_db(project_file(beta), full_rows("run-b", beta))
+
+
+def test_journals_import_as_events_with_their_original_ts_and_run_seq(repos):
+    alpha, beta = repos
+    _two_runs(repos)
+    a = write_journal(
+        "run-a",
+        [
+            journal_line("run-a", 1, "2026-10-07T10:00:00.1+00:00"),
+            journal_line(
+                "run-a", 2, "2026-10-07T10:00:02.123+00:00", "story_upsert",
+                {"status": "running"}, story="s1",
+            ),
+        ],
+    )
+    b = write_journal("run-b", [journal_line("run-b", 1, "2026-10-07T10:00:01Z")])
+
+    report = _run()
+
+    by_repo = {project.repo_dir: project.project_id for project in report.projects}
+    project = {"run-a": by_repo[str(alpha.resolve())], "run-b": by_repo[str(beta.resolve())]}
+    assert report.journals == (
+        migrate.ImportedJournal(run_id="run-a", path=a, events=2, torn_line=None),
+        migrate.ImportedJournal(run_id="run-b", path=b, events=1, torn_line=None),
+    )
+    assert report.missing_journals == ()
+    assert report.orphan_journals == ()
+    assert sorted(
+        (row["run_id"], row["run_seq"], row["ts"], row["source"], row["project_id"])
+        for row in _events()
+    ) == [
+        ("run-a", 1, "2026-10-07T10:00:00.1+00:00", "imported", project["run-a"]),
+        ("run-a", 2, "2026-10-07T10:00:02.123+00:00", "imported", project["run-a"]),
+        ("run-b", 1, "2026-10-07T10:00:01Z", "imported", project["run-b"]),
+    ]
+    assert _marker() == [store_db.iso(NOW)]
+
+
+def test_global_seq_is_a_k_way_merge_on_ts_preserving_each_runs_order(repos):
+    _two_runs(repos)
+    write_journal("run-a", [journal_line("run-a", n, _ts(s)) for n, s in ((1, 1), (2, 4), (3, 5))])
+    write_journal("run-b", [journal_line("run-b", n, _ts(s)) for n, s in ((1, 2), (2, 3), (3, 6))])
+
+    _run()
+
+    assert [(row["run_id"], row["run_seq"]) for row in _events()] == [
+        ("run-a", 1), ("run-b", 1), ("run-b", 2), ("run-a", 2), ("run-a", 3), ("run-b", 3),
+    ]
+
+
+def test_a_cancelled_run_and_retired_attempt_keys_are_stored_verbatim(repos):
+    alpha, _ = repos
+    rows = full_rows("run-a", alpha)
+    rows["runs"] = [run_row("run-a", alpha, status=models.LEGACY_CANCELED)]
+    write_db(project_file(alpha), rows)
+    stamp = store_journal.ts_text(datetime(2026, 10, 7, 10, 0, 0, 123456, tzinfo=timezone.utc))
+    lines = [
+        journal_line("run-a", 1, stamp, "run_upsert",
+                     {"status": models.LEGACY_CANCELED, "workflow": "task"}),
+        journal_line("run-a", 2, stamp, "story_upsert", {"status": "done", "title": "t"},
+                     story="s1"),
+        journal_line("run-a", 3, stamp, "subtask_upsert", {"status": "done"},
+                     story="s1", card="c1"),
+        journal_line("run-a", 4, stamp, "phase_upsert", {"status": "done", "kind": "agent"},
+                     story="s1", card="c1", phase="spec"),
+        journal_line("run-a", 5, stamp, "attempt_upsert",
+                     {"status": "done", "tokens_in": 10, "tokens_out": 20, "cost": 0.5,
+                      "ratio": 1.0, "nested": {"é": [1.0, 2]}},
+                     story="s1", card="c1", phase="spec", attempt=1),
+    ]
+    write_journal("run-a", lines)
+
+    (project,) = _run().projects
+
+    stored = {row["run_seq"]: json.loads(row["payload"]) for row in _events()}
+    assert stored == {line["seq"]: line["payload"] for line in lines}
+    assert type(stored[5]["ratio"]) is float
+    assert type(stored[5]["nested"]["é"][0]) is float
+    conn = store_db.open_db_for_reading(alpha)
+    try:
+        (summary,) = store_queries.list_runs(conn, project_id=project.project_id)
+        found = store_events.run_lines(conn, "run-a")
+    finally:
+        conn.close()
+    assert summary.status == models.CANCELED
+    assert [line.model_dump(mode="json") for line in found] == lines
+
+
+def test_a_torn_tail_is_skipped_reported_and_the_migration_succeeds(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    path = write_journal(
+        "run-a",
+        [journal_line("run-a", 1, _ts(1)), journal_line("run-a", 2, _ts(2))],
+        tail='{"seq": 3, "ts',
+    )
+    before = path.read_bytes()
+
+    report = _run()
+
+    assert report.journals == (
+        migrate.ImportedJournal(run_id="run-a", path=path, events=2, torn_line=3),
+    )
+    assert [row["run_seq"] for row in _events()] == [1, 2]
+    assert path.read_bytes() == before
+    assert _marker() == [store_db.iso(NOW)]
+
+
+def test_a_bad_journal_line_refuses_and_commits_nothing(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    good = [journal_line("run-a", 1, _ts(1)), journal_line("run-a", 3, _ts(3))]
+    path = write_journal(
+        "run-a", good[:1], tail="not json\n" + json.dumps(good[1], sort_keys=True) + "\n"
+    )
+    before = tree(projects_dir())
+    journal_bytes = path.read_bytes()
+
+    error = _refused()
+
+    assert error.reason == "bad_journal_line"
+    assert error.paths == (path,)
+    assert error.run_ids == ("run-a",)
+    assert f"{path}:2" in str(error)
+    assert "not JSON" in str(error)
+    assert not paths.db_path().exists()
+    assert tree(projects_dir()) == before
+    assert path.read_bytes() == journal_bytes
+
+    write_journal("run-a", good)
+    report = _run()
+
+    assert report.journals == (
+        migrate.ImportedJournal(run_id="run-a", path=path, events=2, torn_line=None),
+    )
+
+
+def test_a_bad_line_in_the_second_run_still_commits_nothing_of_the_first(repos):
+    _two_runs(repos)
+    write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    bad = write_journal(
+        "run-b",
+        [journal_line("run-b", 1, _ts(2)), journal_line("run-b", 2, _ts(3), attempt=True)],
+    )
+    before = tree(projects_dir())
+    runs_before = tree(paths.data_path() / "runs")
+
+    error = _refused()
+
+    assert error.reason == "bad_journal_line"
+    assert error.paths == (bad,)
+    assert error.run_ids == ("run-b",)
+    assert f"{bad}:2" in str(error)
+    assert not paths.db_path().exists()
+    assert tree(projects_dir()) == before
+    assert tree(paths.data_path() / "runs") == runs_before
+
+
+@pytest.mark.parametrize("absence", ["no run directory", "journal is a directory"])
+def test_a_run_without_a_journal_is_reported_and_still_merged(repos, absence):
+    _two_runs(repos)
+    a = write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    if absence == "journal is a directory":
+        (paths.data_path() / "runs" / "run-b" / store_journal.JOURNAL_NAME).mkdir(parents=True)
+
+    report = _run()
+
+    assert report.journals == (
+        migrate.ImportedJournal(run_id="run-a", path=a, events=1, torn_line=None),
+    )
+    assert report.missing_journals == ("run-b",)
+    assert {row["id"] for row in _query("SELECT id FROM runs")} == {"run-a", "run-b"}
+    assert [row["run_id"] for row in _events()] == ["run-a"]
+
+
+def test_a_journal_gone_before_it_is_read_is_reported_missing(repos, monkeypatch):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+
+    def gone(path, run_id):
+        raise store_journal.MissingJournalError(f"no journal for run {run_id!r} at {path}")
+
+    monkeypatch.setattr(store_journal, "read_verbatim", gone)
+
+    report = _run()
+
+    assert report.journals == ()
+    assert report.missing_journals == ("run-a",)
+    assert _events() == []
+    assert _marker() == [store_db.iso(NOW)]
+
+
+def test_an_orphan_journal_is_reported_and_not_imported(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    a = write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    ghost = write_journal("run-ghost", [journal_line("run-ghost", 1, _ts(2))])
+    (paths.data_path() / "runs" / "run-empty").mkdir()
+
+    report = _run()
+
+    assert report.journals == (
+        migrate.ImportedJournal(run_id="run-a", path=a, events=1, torn_line=None),
+    )
+    assert report.orphan_journals == (ghost,)
+    assert {row["run_id"] for row in _events()} == {"run-a"}
+
+
+def test_with_every_file_skipped_every_journal_is_an_orphan(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha))
+    path = write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+
+    report = _run()
+
+    assert report.projects == ()
+    assert report.journals == ()
+    assert report.missing_journals == ()
+    assert report.orphan_journals == (path,)
+    assert _events() == []
+    assert _marker() == [store_db.iso(NOW)]
+
+
+def test_a_second_call_reads_no_journal(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    path = write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    first = _run()
+    count = len(_events())
+    path.write_bytes(b"garbage\n" * 3)
+
+    second = _run(now=NOW + timedelta(hours=1))
+
+    assert second == migrate.MigrationReport(
+        already_migrated=True, migrated_at=first.migrated_at, projects=(), skipped=()
+    )
+    assert len(_events()) == count == 1
+
+
+def test_a_racing_second_call_reports_no_journals(repos, monkeypatch):
+    _two_runs(repos)
+    write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    write_journal("run-ghost", [journal_line("run-ghost", 1, _ts(2))])
+    first = _run()
+    count = len(_events())
+    monkeypatch.setattr(store_db, "migration_marker", lambda location: None)
+
+    second = _run(now=NOW + timedelta(hours=1))
+
+    assert second == migrate.MigrationReport(
+        already_migrated=True, migrated_at=first.migrated_at, projects=(), skipped=()
+    )
+    assert len(_events()) == count == 1
+
+
+def test_migrate_creates_and_changes_nothing_under_runs(repos):
+    _two_runs(repos)
+    write_journal("run-a", [journal_line("run-a", 1, _ts(1))], tail='{"seq": 2')
+    write_journal("run-ghost", [journal_line("run-ghost", 1, _ts(2))])
+    runs = paths.data_path() / "runs"
+    (runs / "run-empty").mkdir()
+    entries = sorted(runs.rglob("*"))
+    before = tree(runs)
+
+    report = _run()
+
+    assert report.missing_journals == ("run-b",)
+    assert sorted(runs.rglob("*")) == entries
+    assert tree(runs) == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode")
+def test_an_unreadable_journal_refuses_as_unreadable(repos):
+    alpha, _ = repos
+    write_db(project_file(alpha), full_rows("run-a", alpha))
+    path = write_journal("run-a", [journal_line("run-a", 1, _ts(1))])
+    path.chmod(0)
+    try:
+        error = _refused()
+    finally:
+        path.chmod(0o644)
+
+    assert error.reason == "unreadable"
+    assert error.paths == (path,)
+    assert error.run_ids == ("run-a",)
+    assert str(path) in str(error)
+    assert not paths.db_path().exists()

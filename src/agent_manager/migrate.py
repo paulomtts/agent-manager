@@ -1,9 +1,9 @@
-"""Merging every per-project database an older `am` left into the
-machine-wide `am.db`: once, in one transaction, idempotent, and a typed
-refusal that commits nothing."""
+"""Merging every per-project database an older `am` left, and its runs'
+journals, into the machine-wide `am.db`: once, in one transaction,
+idempotent, and a typed refusal that commits nothing."""
 
 import socket
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +11,7 @@ from typing import Literal
 
 from agent_manager import control, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.store import legacy as store_legacy
 
 RefusalReason = Literal[
@@ -20,6 +21,7 @@ RefusalReason = Literal[
     "digest_mismatch",
     "duplicate_run_id",
     "row_clash",
+    "bad_journal_line",
 ]
 """Which check refused a migration."""
 
@@ -27,8 +29,9 @@ RefusalReason = Literal[
 class MigrationRefusedError(RuntimeError):
     """`migrate` cannot merge safely; nothing has been committed.
 
-    `reason` names the check that refused, `paths` the legacy files involved,
-    and `run_ids` the run ids involved (empty when none is).
+    `reason` names the check that refused, `paths` the legacy files or
+    journals involved, and `run_ids` the run ids involved (empty when none
+    is).
     """
 
     def __init__(
@@ -62,6 +65,18 @@ class MigratedProject:
 
 
 @dataclass(frozen=True)
+class ImportedJournal:
+    """One run's journal as imported: `events` the rows inserted, `torn_line`
+    the 1-based number of the torn final line skipped, `None` when there was
+    none."""
+
+    run_id: str
+    path: Path
+    events: int
+    torn_line: int | None
+
+
+@dataclass(frozen=True)
 class MigrationReport:
     """What `migrate` did.
 
@@ -69,13 +84,20 @@ class MigrationReport:
     `migrated_at`: the marker's value, new or existing; `None` when there was
     nothing to migrate. `projects`: one per merged file, in
     `paths.legacy_project_dbs` order. `skipped`: the files with no `runs`
-    rows, in that order.
+    rows, in that order. `journals`: one per merged run with a journal file,
+    ascending by run id. `missing_journals`: the merged runs with none,
+    ascending. `orphan_journals`: the journals of runs no merged file has,
+    not imported, ascending. The last three are empty when
+    `already_migrated` or there was nothing to migrate.
     """
 
     already_migrated: bool
     migrated_at: str | None
     projects: tuple[MigratedProject, ...]
     skipped: tuple[Path, ...]
+    journals: tuple[ImportedJournal, ...] = ()
+    missing_journals: tuple[str, ...] = ()
+    orphan_journals: tuple[Path, ...] = ()
 
 
 def _read(path: Path) -> store_legacy.LegacyFile:
@@ -156,12 +178,62 @@ def _refuse_duplicates(files: Sequence[store_legacy.LegacyFile]) -> None:
     )
 
 
+def _journal_path(run_id: str) -> Path:
+    """Where run `run_id`'s journal is, creating nothing (`paths.run_dir` would)."""
+    return paths.data_path() / "runs" / run_id / store_journal.JOURNAL_NAME
+
+
+def _read_journal(path: Path, run_id: str) -> store_journal.VerbatimJournal | None:
+    """`run_id`'s journal at `path`, or `None` when it is gone."""
+    try:
+        return store_journal.read_verbatim(path, run_id)
+    except store_journal.MissingJournalError:
+        return None
+    except store_journal.UnimportableLineError as error:
+        raise MigrationRefusedError(
+            "bad_journal_line", str(error), files=(path,), run_ids=(run_id,)
+        ) from error
+    except OSError as error:
+        raise MigrationRefusedError(
+            "unreadable", f"{path} cannot be read: {error}", files=(path,), run_ids=(run_id,)
+        ) from error
+
+
+def _read_journals(
+    run_ids: Collection[str],
+) -> tuple[list[store_journal.VerbatimJournal], list[str]]:
+    """The journal of each of `run_ids` that has a regular file, and the ids
+    of those that have none, both ascending by run id."""
+    journals: list[store_journal.VerbatimJournal] = []
+    missing: list[str] = []
+    for run_id in sorted(run_ids):
+        path = _journal_path(run_id)
+        journal = _read_journal(path, run_id) if path.is_file() else None
+        if journal is None:
+            missing.append(run_id)
+        else:
+            journals.append(journal)
+    return journals, missing
+
+
+def _orphan_journals(run_ids: Collection[str]) -> tuple[Path, ...]:
+    """Every `runs/<id>/journal.jsonl` file whose `<id>` is none of `run_ids`, ascending."""
+    return tuple(
+        _journal_path(run_id)
+        for run_id in paths.list_run_ids()
+        if run_id not in run_ids and _journal_path(run_id).is_file()
+    )
+
+
 def _merge(
-    files: Sequence[store_legacy.LegacyFile], *, now: datetime
+    files: Sequence[store_legacy.LegacyFile],
+    journals: Sequence[store_journal.VerbatimJournal],
+    *,
+    now: datetime,
 ) -> store_legacy.MergeOutcome:
     conn = store_db.open_db_for_migration()
     try:
-        return store_legacy.merge(conn, files, now=now)
+        return store_legacy.merge(conn, files, now=now, journals=journals)
     except store_legacy.LegacyRunClashError as error:
         raise MigrationRefusedError(
             "duplicate_run_id", str(error), files=(error.path,), run_ids=(error.run_id,)
@@ -178,20 +250,28 @@ def migrate(
     host: str = socket.gethostname(),
     alive: Callable[[int], bool] = control.pid_alive,
 ) -> MigrationReport:
-    """Merge every `paths.legacy_project_dbs()` file into `paths.db_path()`.
+    """Merge every `paths.legacy_project_dbs()` file, and its runs' journals,
+    into `paths.db_path()`.
 
     In order: a marker already in `am.db` (read read-only) returns it as
-    `already_migrated` without opening any legacy file. No legacy file
-    returns `migrated_at=None` and creates nothing. Otherwise every file is
-    read through `store_legacy.read_legacy` (`unreadable`). Any lease that
+    `already_migrated` without opening any legacy file or journal. No legacy
+    file returns `migrated_at=None` and creates nothing. Otherwise every file
+    is read through `store_legacy.read_legacy` (`unreadable`). Any lease that
     `control.lease_is_live` accepts with `now`, `host` and `alive` refuses
     (`live_run`). Each file with runs must have one `repo_dir`
     (`repo_dir_disagrees`) whose digest is its stem (`digest_mismatch`), and
     no run id may be in two files (`duplicate_run_id`); files with no runs are
-    skipped. These checks create nothing. Then `store_legacy.merge` runs one
+    skipped. Then the journal of every run of a merged file,
+    `<data dir>/runs/<id>/journal.jsonl`, is read once through
+    `store_journal.read_verbatim`: a line it refuses refuses
+    (`bad_journal_line`), a file it cannot read refuses (`unreadable`), and a
+    run with no journal file is reported in `missing_journals`. A journal of a
+    run no merged file has is not read, and is reported in `orphan_journals`.
+    These checks create nothing. Then `store_legacy.merge` runs one
     transaction that re-checks the marker, refuses a run id already in
-    `am.db` (`duplicate_run_id`) or a refused row (`row_clash`), and writes
-    the marker, even when every file was skipped.
+    `am.db` (`duplicate_run_id`) or a refused row or event (`row_clash`),
+    imports the journals into `events`, and writes the marker last, even
+    when every file was skipped.
 
     Every refusal is `MigrationRefusedError`, and nothing is committed.
     """
@@ -213,7 +293,10 @@ def migrate(
     for legacy_file in merging:
         _refuse_foreign(legacy_file)
     _refuse_duplicates(merging)
-    outcome = _merge(merging, now=now)
+    run_ids = {run_id for legacy_file in merging for run_id in legacy_file.run_ids}
+    journals, missing = _read_journals(run_ids)
+    orphans = _orphan_journals(run_ids)
+    outcome = _merge(merging, journals, now=now)
     if outcome.already_migrated:
         return MigrationReport(
             already_migrated=True, migrated_at=outcome.migrated_at, projects=(), skipped=()
@@ -232,4 +315,15 @@ def migrate(
             for merged in outcome.merged
         ),
         skipped=skipped,
+        journals=tuple(
+            ImportedJournal(
+                run_id=journal.run_id,
+                path=journal.path,
+                events=outcome.events[journal.run_id],
+                torn_line=journal.torn_line,
+            )
+            for journal in journals
+        ),
+        missing_journals=tuple(missing),
+        orphan_journals=orphans,
     )
