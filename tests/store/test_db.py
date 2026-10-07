@@ -165,7 +165,7 @@ _DB_NAMES = (
     "MigrationRequiredError",
     "_refuse_unmigrated",
     "run_with_retry",
-    "_is_busy",
+    "is_busy",
     "StoreBusyError",
     "RETRY_ATTEMPTS",
     "RETRY_DEADLINE_SECONDS",

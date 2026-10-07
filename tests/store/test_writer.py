@@ -1238,6 +1238,196 @@ def test_a_failure_outside_every_savepoint_fails_the_whole_batch(repo, monkeypat
     assert after == "whole-after"
 
 
+def _raise_value_error(conn: sqlite3.Connection, raised: list[BaseException]) -> None:
+    error = ValueError("job B refuses")
+    raised.append(error)
+    raise error
+
+
+def _raise_integrity_error(conn: sqlite3.Connection, raised: list[BaseException]) -> None:
+    try:
+        _insert_meta(conn, "batch-b")  # a duplicate of the key job B just inserted
+    except sqlite3.IntegrityError as error:
+        raised.append(error)
+        raise
+
+
+@pytest.mark.parametrize(
+    "fail",
+    [_raise_value_error, _raise_integrity_error],
+    ids=["value-error", "integrity-error"],
+)
+def test_a_job_raising_in_a_batch_fails_only_its_own_caller(repo, fail):
+    raised: list[BaseException] = []
+
+    def job_b(conn):
+        _insert_meta(conn, "batch-b")
+        fail(conn, raised)
+
+    st = store_writer.Store.open(repo, RUN_A)
+    statements = _traced(st)
+    try:
+        with _Gate(st):
+            a, b, c = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("batch-a")),
+                    _coalesced(st, job_b),
+                    _coalesced(st, _inserting("batch-c")),
+                ],
+            )
+        _wait_all([a, b, c])
+        keys = _meta_keys(st.connection, "batch-")
+    finally:
+        st.close()
+
+    assert len(raised) == 1
+    assert b.error is raised[0]
+    assert (a.value, a.error) == ("batch-a", None)
+    assert (c.value, c.error) == ("batch-c", None)
+    assert keys == ["batch-a", "batch-c"]
+    assert _begins(statements) == 2  # the gate's, then the batch's
+
+
+@pytest.mark.parametrize(
+    "error",
+    [store_leases.LeaseLostError(RUN_A, None), KeyboardInterrupt()],
+    ids=["lease-lost", "keyboard-interrupt"],
+)
+def test_a_base_exception_in_a_batch_reaches_only_its_caller(repo, error):
+    def job_b(conn):
+        _insert_meta(conn, "batch-b")
+        raise error
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            a, b, c = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("batch-a")),
+                    _coalesced(st, job_b),
+                    _coalesced(st, _inserting("batch-c")),
+                ],
+            )
+        _wait_all([a, b, c])
+        after = st._submit(lambda conn: "still serving", operation="after")
+        keys = _meta_keys(st.connection, "batch-")
+    finally:
+        st.close()
+
+    assert b.error is error
+    assert (a.value, a.error) == ("batch-a", None)
+    assert (c.value, c.error) == ("batch-c", None)
+    assert keys == ["batch-a", "batch-c"]
+    assert after == "still serving"
+
+
+def test_a_busy_job_re_runs_the_whole_batch(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    a_calls: list[int] = []
+    b_calls: list[int] = []
+
+    def job_a(conn):
+        a_calls.append(len(a_calls) + 1)
+        _insert_meta(conn, "rerun-a")
+        return f"a{len(a_calls)}"
+
+    def job_b(conn):
+        b_calls.append(len(b_calls) + 1)
+        _insert_meta(conn, "rerun-b")
+        if len(b_calls) == 1:
+            raise _busy()
+        return f"b{len(b_calls)}"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    statements = _traced(st)
+    try:
+        with _Gate(st):
+            a, b = _enqueue_in_order(st, [_coalesced(st, job_a), _coalesced(st, job_b)])
+        _wait_all([a, b])
+        keys = _meta_keys(st.connection, "rerun-")
+    finally:
+        st.close()
+
+    assert a_calls == [1, 2]
+    assert b_calls == [1, 2]
+    assert (a.value, a.error) == ("a2", None)
+    assert (b.value, b.error) == ("b2", None)
+    assert keys == ["rerun-a", "rerun-b"]
+    assert _begins(statements) == 3  # the gate's, then two attempts
+
+
+def test_outcomes_come_from_the_batchs_final_attempt(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    a_calls: list[int] = []
+    b_calls: list[int] = []
+
+    def job_a(conn):
+        a_calls.append(1)
+        _insert_meta(conn, "final-a")
+        if len(a_calls) == 1:
+            raise ValueError("attempt 1 only")
+        return "a2"
+
+    def job_b(conn):
+        b_calls.append(1)
+        _insert_meta(conn, "final-b")
+        if len(b_calls) == 1:
+            raise _busy()
+        return "b2"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            a, b = _enqueue_in_order(st, [_coalesced(st, job_a), _coalesced(st, job_b)])
+        _wait_all([a, b])
+        keys = _meta_keys(st.connection, "final-")
+    finally:
+        st.close()
+
+    assert (a.value, a.error) == ("a2", None)
+    assert (b.value, b.error) == ("b2", None)
+    assert keys == ["final-a", "final-b"]
+
+
+def test_a_fenced_job_in_a_batch_is_fenced_in_its_own_savepoint(repo):
+    # Review Focus 5.
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        st.take_lease(token="t1", pid=1, host="h", now=NOW, is_live=lambda row: True)
+        thief = store_db.open_db(repo)
+        try:
+            thief.execute("DELETE FROM run_leases WHERE run_id = ?", (RUN_A,))
+            thief.commit()
+        finally:
+            thief.close()
+
+        with _Gate(st):
+            a, b, c = _enqueue_in_order(
+                st,
+                [
+                    _coalesced(st, _inserting("fence-a")),
+                    lambda: st._submit(
+                        _inserting("fence-b"),
+                        operation="fenced",
+                        fenced=True,
+                        coalesce=True,
+                    ),
+                    _coalesced(st, _inserting("fence-c")),
+                ],
+            )
+        _wait_all([a, b, c])
+        keys = _meta_keys(st.connection, "fence-")
+    finally:
+        st.close()
+
+    assert isinstance(b.error, store_leases.LeaseLostError)
+    assert (a.value, a.error) == ("fence-a", None)
+    assert (c.value, c.error) == ("fence-c", None)
+    assert keys == ["fence-a", "fence-c"]
+
+
 def test_a_lost_lease_writes_neither_line_nor_row(repo):
     st = store_writer.Store.open(repo, RUN_A)
     try:

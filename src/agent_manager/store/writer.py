@@ -324,16 +324,30 @@ class Store:
         """One attempt at `batch`: `BEGIN IMMEDIATE`, each job in a savepoint, `COMMIT`.
 
         Each job's fence and body run inside `SAVEPOINT job_<n>`, `n` its place
-        in the batch. Returns each job's `(value, None)`, in batch order.
+        in the batch. A busy error escapes, so the whole transaction rolls back
+        and the retry re-runs the batch from its first job. Any other raise,
+        `BaseException`s included, rolls back to the job's savepoint and becomes
+        that job's outcome; the other jobs' writes stand. Returns each job's
+        `(value, None)` or `(None, error)`, in batch order.
         """
         outcomes: list[tuple[Any, BaseException | None]] = []
         with store_db.immediate(self._conn) as conn:
             for n, job in enumerate(batch):
                 savepoint = f"job_{n}"
                 conn.execute(f"SAVEPOINT {savepoint}")
-                self._check_fence(conn, job)
-                outcomes.append((job.body(conn), None))
-                conn.execute(f"RELEASE {savepoint}")
+                try:
+                    self._check_fence(conn, job)
+                    value = job.body(conn)
+                except BaseException as error:  # handed to the job's caller
+                    busy = isinstance(error, sqlite3.OperationalError)
+                    if busy and store_db.is_busy(error):
+                        raise
+                    conn.execute(f"ROLLBACK TO {savepoint}")
+                    conn.execute(f"RELEASE {savepoint}")
+                    outcomes.append((None, error))
+                else:
+                    outcomes.append((value, None))
+                    conn.execute(f"RELEASE {savepoint}")
         return outcomes
 
     def _check_fence(self, conn: sqlite3.Connection, job: _Job) -> None:

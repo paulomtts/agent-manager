@@ -610,7 +610,7 @@ def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     conn.commit()
 
 
-def _is_busy(error: sqlite3.OperationalError) -> bool:
+def is_busy(error: sqlite3.OperationalError) -> bool:
     """Whether `error` is SQLite reporting busy or locked, extended codes included.
 
     Only the primary code counts (`sqlite_errorcode & 0xFF`), so
@@ -656,7 +656,7 @@ def run_with_retry(
         try:
             return job()
         except sqlite3.OperationalError as error:
-            if not _is_busy(error):
+            if not is_busy(error):
                 raise
             elapsed = clock() - start
             if attempts >= RETRY_ATTEMPTS or elapsed >= RETRY_DEADLINE_SECONDS:
