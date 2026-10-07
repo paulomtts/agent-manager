@@ -109,6 +109,53 @@ def test_am_returns_the_exit_code_and_the_parsed_envelope(tmp_path, am):
     assert _error(code, envelope)["type"] == "RepoDirError"
 
 
+SOME_VERIFY = "test -n am-a6-console-seam"
+"""A `--verify` value for the console-entry seam's own test; it never runs."""
+
+
+def test_a_console_spawn_runs_am_through_a_script_calling_cli_entry(
+    tmp_path, am_processes, spawn_am_console, finish_am
+):
+    """Card 4a3e0414's seam: `am` started the way the installed console script
+    starts it, so `argv_guard` runs first."""
+    missing = str(tmp_path / "no-such-repo")
+
+    child = spawn_am_console("runs", "--repo-dir", missing)
+    code, envelope = finish_am(child)
+
+    assert _error(code, envelope)["type"] == "RepoDirError"
+    assert child.args[0] == sys.executable
+    script = Path(child.args[1])
+    assert script == am_processes.log_dir / "am_console.py"
+    assert script.read_text(encoding="utf-8") == (
+        "from agent_manager.cli import entry; entry()\n"
+    )
+    assert list(child.args[2:]) == ["runs", "--repo-dir", missing]
+
+
+def test_a_console_spawned_run_with_verify_survives_the_argv_guard_reexec(
+    tmp_path, spawn_am_console, finish_am
+):
+    """`argv_guard.reexec_neutral` execs `[sys.executable, argv[0], ...]`; under
+    `python -c` that is `python -c run ...`, a NameError with no envelope. A
+    script path re-execs the same entry, so the run gets as far as the repo check."""
+    child = spawn_am_console(
+        "run",
+        "--card",
+        SOME_CARD,
+        "--repo-dir",
+        str(tmp_path / "no-such-repo"),
+        "--branch-prefix",
+        "m1",
+        "--verify",
+        SOME_VERIFY,
+        "--isolation",
+        "none",
+    )
+
+    assert _error(*finish_am(child))["type"] == "RepoDirError"
+
+
 def test_a_child_that_prints_no_envelope_fails_with_its_output(am_processes, finish_am):
     """Review focus: a traceback instead of an envelope names what the child said."""
     child = am_processes.track(

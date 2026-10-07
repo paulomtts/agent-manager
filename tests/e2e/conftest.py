@@ -190,7 +190,7 @@ def _init_project(root: Path, board_name: str) -> Path:
     # brd leaves its `.gitignore`/`.brd` markers untracked; committing them keeps
     # the baseline clean, so the later porcelain check reflects only the run.
     git(root, "add", "-A")
-    git(root, "commit", "-m", "brd init")
+    git(root, "commit", "--allow-empty", "-m", "brd init")
     return root
 
 
@@ -641,6 +641,17 @@ def checkpoint_rows() -> Callable[[Path, str], int]:
 AM_ENTRY = "from agent_manager.cli import app; app()"
 """What a spawned `am` child runs: the real Typer app, argv from its own `sys.argv`."""
 
+AM_CONSOLE_ENTRY = "from agent_manager.cli import entry; entry()\n"
+"""The whole body of the script `spawn_console` runs: `cli.entry`, the `am`
+console script (`pyproject.toml`), which runs `argv_guard` before the app.
+
+A file, not `-c`: `argv_guard.reexec_neutral` re-execs
+`[sys.executable, argv[0], ...]`, and only a real path as `argv[0]` runs the
+same entry again, as the installed `am` does (card 4a3e0414)."""
+
+AM_CONSOLE_NAME = "am_console.py"
+"""The console script's name under the test's `log_dir`."""
+
 AM_WAIT = 240.0
 """Seconds a spawned `am` or a marker wait may take. It only bounds a broken
 run; a healthy one never waits this long."""
@@ -673,13 +684,13 @@ class AmProcesses:
         self.children.append(child)
         return child
 
-    def spawn(self, *args: str, env: Mapping[str, str] | None = None) -> subprocess.Popen:
-        """Start `am *args` as a real child process and track it."""
+    def _start(self, argv: list[str], env: Mapping[str, str] | None) -> subprocess.Popen:
+        """Start `argv` with the envelope on a pipe and stderr in a file, and track it."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stderr_path = self.log_dir / f"am-{len(self.children)}.stderr"
         with stderr_path.open("w", encoding="utf-8") as stderr:
             child = subprocess.Popen(
-                [sys.executable, "-c", AM_ENTRY, *args],
+                argv,
                 env=self.child_env(env),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -688,6 +699,24 @@ class AmProcesses:
             )
         self.stderr_paths[child.pid] = stderr_path
         return self.track(child)
+
+    def spawn(self, *args: str, env: Mapping[str, str] | None = None) -> subprocess.Popen:
+        """Start `am *args` as a real child process and track it."""
+        return self._start([sys.executable, "-c", AM_ENTRY, *args], env)
+
+    def spawn_console(
+        self, *args: str, env: Mapping[str, str] | None = None
+    ) -> subprocess.Popen:
+        """Start `am *args` through the console entry, as the installed `am` runs, and track it.
+
+        The script is written once under `log_dir`. A `run` or `resume` with a
+        `--verify` re-execs itself under the same pid with a neutral argv.
+        """
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        script = self.log_dir / AM_CONSOLE_NAME
+        if not script.is_file():
+            script.write_text(AM_CONSOLE_ENTRY, encoding="utf-8")
+        return self._start([sys.executable, str(script), *args], env)
 
     def stderr_of(self, child: subprocess.Popen) -> str:
         path = self.stderr_paths.get(child.pid)
@@ -762,6 +791,12 @@ def am_processes(tmp_path) -> Any:
 def spawn_am(am_processes) -> Callable[..., subprocess.Popen]:
     """`spawn_am(*args, env=None)`: start a real `am` child and return it."""
     return am_processes.spawn
+
+
+@pytest.fixture
+def spawn_am_console(am_processes) -> Callable[..., subprocess.Popen]:
+    """`spawn_am_console(*args, env=None)`: start `am` through `cli.entry`, so the argv guard runs."""
+    return am_processes.spawn_console
 
 
 @pytest.fixture
