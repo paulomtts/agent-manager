@@ -410,8 +410,16 @@ def test_run_config_rejects_an_unknown_launcher():
     with pytest.raises(ValidationError) as excinfo:
         models.RunConfig(launcher="docker")
     message = str(excinfo.value)
-    for allowed in ("direct", "bwrap", "container"):
+    for allowed in ("direct", "bwrap", "unshare", "container"):
         assert allowed in message
+
+
+def test_run_config_accepts_and_round_trips_the_unshare_launcher():
+    config = models.RunConfig(launcher="unshare")
+    assert config.launcher == "unshare"
+    restored = models.RunConfig.model_validate_json(config.model_dump_json())
+    assert restored.launcher == "unshare"
+    assert restored == config
 
 
 def test_run_config_rejects_a_harness_map_entry_missing_its_model():

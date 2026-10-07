@@ -1,9 +1,11 @@
 """How a harness process is actually started (design §4 line 132, decision D7).
 
-D7 says v1 launches harnesses full-auto with cwd pinned to the subtask
-worktree, and puts confinement behind a seam: the adapter takes a launcher,
-`direct` | `bwrap` | `container`, and only `direct` is implemented. This module
-is that seam. The seam, not the confinement, is the deliverable here.
+D7 launches harnesses full-auto with cwd pinned to the subtask worktree and
+puts confinement behind a seam: the adapter takes a launcher, `direct` |
+`bwrap` | `unshare` | `container`. `bwrap` and `unshare` run the harness in a
+PID namespace of its own (run-hardening design, Story A); `container` is
+still only a name. `wrap_argv` is the one place the isolating forms are
+spelled, and `probe` is the one place that asks whether this host runs them.
 
 Everything this module does is deliberately blind to what it is running. It
 never reads the result file (§6 step 5 is the engine's), never parses the log
@@ -35,7 +37,7 @@ class UnsupportedLauncherError(RuntimeError):
 
     Carries the requested `kind` and a reason, matching `RoleBundleError`'s
     shape: the caller journals the message, and "unsupported" without the mode
-    name is unactionable when three modes exist.
+    name is unactionable when four modes exist.
     """
 
     def __init__(self, kind: str, *, reason: str) -> None:
@@ -176,46 +178,146 @@ def run_direct(
     )
 
 
+BWRAP_PREFIX: tuple[str, ...] = (
+    "bwrap",
+    "--bind",
+    "/",
+    "/",
+    "--dev-bind",
+    "/dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--unshare-pid",
+    "--die-with-parent",
+    "--new-session",
+)
+"""The `bwrap` form (run-hardening design, Story A Design 3).
+
+The whole filesystem is bound read-write, so the harness sees the worktree,
+`~/.claude` and every tool exactly as `direct` would; only the PID namespace
+is new. `--die-with-parent` takes the namespace down with the process
+`run_direct` spawned, so `kill_tree`'s `killpg` still ends everything.
+"""
+
+UNSHARE_PREFIX: tuple[str, ...] = (
+    "unshare",
+    "--user",
+    "--map-root-user",
+    "--pid",
+    "--fork",
+    "--mount-proc",
+)
+"""The fallback form for hosts without `bwrap`.
+
+Plain `unshare --pid --fork` fails `EPERM` for an unprivileged user; a user
+namespace mapping the caller to root is what lets it create the PID namespace.
+"""
+
+_PREFIXES: dict[str, tuple[str, ...]] = {
+    "direct": (),
+    "bwrap": BWRAP_PREFIX,
+    "unshare": UNSHARE_PREFIX,
+}
+
+_UNKNOWN_REASON = (
+    "not a launcher mode; the modes are direct, bwrap, unshare and container"
+)
+_SEAM_REASON = (
+    "is a seam, not an implementation -- the implemented modes are direct, "
+    "bwrap and unshare"
+)
+
+
+def wrap_argv(mode: str, argv: list[str], cwd: Path) -> list[str]:
+    """The argv that runs `argv` under launcher `mode`. Pure: spawns nothing.
+
+    Each element passes through unchanged after the mode's prefix -- no
+    quoting, no joining, never a shell string. `cwd` is accepted and unused:
+    `bwrap --bind / /` and `unshare` both keep the caller's cwd, and
+    `run_direct` both validates it and sets it on the spawn.
+
+    The empty-argv check comes first because, once wrapped, the list is never
+    empty and `run_direct`'s own guard would no longer see the mistake.
+    """
+    if not argv:
+        raise ValueError("launcher argv is empty: there is no program to run")
+    if mode == "container":
+        raise UnsupportedLauncherError(mode, reason=_SEAM_REASON)
+    if mode not in _PREFIXES:
+        raise UnsupportedLauncherError(mode, reason=_UNKNOWN_REASON)
+    return [*_PREFIXES[mode], *argv]
+
+
+def run_bwrap(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    stdout_path: Path,
+    on_spawn: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> Outcome:
+    """`run_direct` on `wrap_argv("bwrap", argv, cwd)`.
+
+    The returned `Outcome.argv` is the wrapped argv, so the journal shows how
+    the agent was contained. No probe here: a missing `bwrap` is `run_direct`'s
+    ordinary `FileNotFoundError`; choosing a mode the host can run is
+    `resolve_isolation`'s job, once, at run start.
+    """
+    return run_direct(
+        wrap_argv("bwrap", argv, cwd),
+        cwd=cwd,
+        timeout=timeout,
+        stdout_path=stdout_path,
+        on_spawn=on_spawn,
+    )
+
+
+def run_unshare(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    stdout_path: Path,
+    on_spawn: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> Outcome:
+    """`run_direct` on `wrap_argv("unshare", argv, cwd)`; see `run_bwrap`."""
+    return run_direct(
+        wrap_argv("unshare", argv, cwd),
+        cwd=cwd,
+        timeout=timeout,
+        stdout_path=stdout_path,
+        on_spawn=on_spawn,
+    )
+
+
 LAUNCHERS: dict[str, LauncherFn | None] = {
     "direct": run_direct,
-    "bwrap": None,
+    "bwrap": run_bwrap,
+    "unshare": run_unshare,
     "container": None,
 }
 """Every mode `models.Launcher` names, mapped to its implementation or `None`.
 
-The two `None`s are the seam, spelled out. Leaving `bwrap` and `container` out
-of this dict entirely would make asking for one an "unknown launcher" -- which
-is wrong, they are known, they are simply not built -- and would lose the only
-place in the code where D7's deferred work is visible.
+The `None` is the seam, spelled out. Leaving `container` out of this dict
+entirely would make asking for it an "unknown launcher" -- which is wrong, it
+is known, it is simply not built -- and would lose the only place in the code
+where that deferred work is visible.
 """
 
 
 def get_launcher(kind: Launcher) -> LauncherFn:
     """Resolve a launcher mode to the function the engine will inject.
 
-    Not wired to any caller yet: production always injects `run_direct`
-    directly (`cli.py` imports it by name), since v1 implements only `direct`
-    and `RunConfig.launcher` has no reader. This is the seam a future
-    multi-mode wiring would call, at run start, with `RunConfig.launcher` --
-    failing here would mean failing before a single worktree is created,
-    which is the whole reason the unimplemented modes are named rather than
-    omitted.
+    Never probes: whether this host can run `bwrap` or `unshare` is decided
+    once, at run start, by `resolve_isolation`, and the mode it returns is the
+    one passed here. Not wired to a caller yet (`cli.py` still injects
+    `run_direct` by name). Failing here means failing before a single worktree
+    is created, which is why `container` is named rather than omitted.
     """
     if kind not in LAUNCHERS:
-        raise UnsupportedLauncherError(
-            kind,
-            reason=(
-                "not a launcher mode; the modes are direct, bwrap and container"
-            ),
-        )
+        raise UnsupportedLauncherError(kind, reason=_UNKNOWN_REASON)
     implementation = LAUNCHERS[kind]
     if implementation is None:
-        raise UnsupportedLauncherError(
-            kind,
-            reason=(
-                "is a seam, not an implementation -- v1 implements only "
-                "direct, which launches with permissions bypassed and cwd "
-                "pinned to the subtask worktree (D7)"
-            ),
-        )
+        raise UnsupportedLauncherError(kind, reason=_SEAM_REASON)
     return implementation

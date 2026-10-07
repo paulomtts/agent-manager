@@ -74,7 +74,7 @@ AttemptStatus = Literal[
 """`started` (no terminal event yet, §9 resume) plus §6's four journalled
 outcomes."""
 
-Launcher = Literal["direct", "bwrap", "container"]
+Launcher = Literal["direct", "bwrap", "unshare", "container"]
 """§4: how a harness process is contained when it runs."""
 
 

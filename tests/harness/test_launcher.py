@@ -19,7 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_manager import dispatch
 from agent_manager.harness import launcher
+from agent_manager.harness.base import Outcome
 
 
 def test_a_successful_command_reports_exit_zero_and_captures_stdout(tmp_path):
@@ -301,17 +303,18 @@ def test_get_launcher_direct_returns_the_direct_launcher(tmp_path):
     assert outcome.exit_code == 0
 
 
-@pytest.mark.parametrize("kind", ["bwrap", "container"])
+@pytest.mark.parametrize("kind", ["container"])
 def test_the_unimplemented_modes_are_named_and_refuse(kind):
-    # D7: they are in the mapping on purpose. A deliberate refusal at config
-    # time beats a KeyError surfacing mid-run, and it keeps the two names
-    # discoverable as the seam they are.
+    # D7: it is in the mapping on purpose. A deliberate refusal at config
+    # time beats a KeyError surfacing mid-run, and it keeps the name
+    # discoverable as the seam it is.
     with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
         launcher.get_launcher(kind)
     assert excinfo.value.kind == kind
     message = str(excinfo.value)
     assert kind in message
-    assert "direct" in message
+    for implemented in ("direct", "bwrap", "unshare"):
+        assert implemented in message
 
 
 def test_an_unknown_launcher_name_raises_the_same_error_type():
@@ -321,7 +324,7 @@ def test_an_unknown_launcher_name_raises_the_same_error_type():
     with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
         launcher.get_launcher("docker")
     assert excinfo.value.kind == "docker"
-    for known in ("direct", "bwrap", "container"):
+    for known in ("direct", "bwrap", "unshare", "container"):
         assert known in str(excinfo.value)
 
 
@@ -413,3 +416,212 @@ def test_only_the_grandchild_kill_launcher_test_is_soak():
     assert _marks(test_a_timeout_kills_the_processes_the_child_started) == {"soak"}
     assert _marks(test_a_timeout_kills_the_child_and_returns_a_value) == set()
     assert _marks(test_on_spawn_is_called_once_with_the_live_process) == set()
+
+
+BWRAP_FORM = [
+    "bwrap",
+    "--bind",
+    "/",
+    "/",
+    "--dev-bind",
+    "/dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--unshare-pid",
+    "--die-with-parent",
+    "--new-session",
+]
+"""Run-hardening design §Story A Design 3, written out by hand on purpose:
+comparing against `launcher.BWRAP_PREFIX` would pass whatever it says."""
+
+UNSHARE_FORM = [
+    "unshare",
+    "--user",
+    "--map-root-user",
+    "--pid",
+    "--fork",
+    "--mount-proc",
+]
+
+
+def test_wrap_argv_bwrap_is_the_design_form_then_the_argv(tmp_path):
+    wrapped = launcher.wrap_argv("bwrap", ["claude", "-p", "hi"], tmp_path)
+    assert wrapped == [*BWRAP_FORM, "claude", "-p", "hi"]
+
+
+def test_wrap_argv_unshare_is_the_design_form_then_the_argv(tmp_path):
+    # --user --map-root-user is what lets an unprivileged user create the PID
+    # namespace at all; plain `unshare --pid --fork` fails EPERM.
+    wrapped = launcher.wrap_argv("unshare", ["claude", "-p", "hi"], tmp_path)
+    assert wrapped == [*UNSHARE_FORM, "claude", "-p", "hi"]
+
+
+def test_wrap_argv_direct_is_an_equal_new_list(tmp_path):
+    argv = ["claude", "-p", "hi"]
+    wrapped = launcher.wrap_argv("direct", argv, tmp_path)
+    assert wrapped == argv
+    assert wrapped is not argv
+
+
+@pytest.mark.parametrize("mode", ["direct", "bwrap", "unshare"])
+def test_wrap_argv_does_not_mutate_its_input(mode, tmp_path):
+    argv = ["claude", "-p", "hi"]
+    launcher.wrap_argv(mode, argv, tmp_path)
+    assert argv == ["claude", "-p", "hi"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "prefix"),
+    [("direct", []), ("bwrap", BWRAP_FORM), ("unshare", UNSHARE_FORM)],
+)
+def test_wrap_argv_passes_awkward_elements_through_one_for_one(mode, prefix, tmp_path):
+    # No quoting, no joining: the launcher never builds a shell string, so an
+    # element with spaces, quotes or a leading -- must arrive as it left.
+    argv = ["claude", "-p", "--weird value", "it's \"quoted\"", ""]
+    assert launcher.wrap_argv(mode, argv, tmp_path) == [*prefix, *argv]
+
+
+@pytest.mark.parametrize("mode", ["direct", "bwrap", "unshare"])
+def test_wrap_argv_neither_uses_nor_validates_cwd(mode, tmp_path):
+    # bwrap --bind / / and unshare keep the caller's cwd; run_direct sets and
+    # validates it. A --chdir here would be a second opinion about the cwd.
+    cwd = tmp_path / "never-created"
+    wrapped = launcher.wrap_argv(mode, ["claude"], cwd)
+    assert str(cwd) not in wrapped
+    assert "--chdir" not in wrapped
+
+
+@pytest.mark.parametrize("mode", ["direct", "bwrap", "unshare"])
+def test_wrap_argv_refuses_an_empty_argv_for_every_mode(mode, tmp_path):
+    # Once wrapped the list is never empty, so run_direct's own guard would no
+    # longer catch this; wrap_argv has to.
+    with pytest.raises(ValueError, match="argv is empty"):
+        launcher.wrap_argv(mode, [], tmp_path)
+
+
+def test_wrap_argv_refuses_container_as_the_seam_it_is(tmp_path):
+    with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
+        launcher.wrap_argv("container", ["claude"], tmp_path)
+    assert excinfo.value.kind == "container"
+    message = str(excinfo.value)
+    for implemented in ("direct", "bwrap", "unshare"):
+        assert implemented in message
+
+
+def test_wrap_argv_refuses_an_unknown_mode_naming_all_four(tmp_path):
+    with pytest.raises(launcher.UnsupportedLauncherError) as excinfo:
+        launcher.wrap_argv("docker", ["claude"], tmp_path)
+    assert excinfo.value.kind == "docker"
+    for known in ("direct", "bwrap", "unshare", "container"):
+        assert known in str(excinfo.value)
+
+
+def _recording_run_direct(calls):
+    """A stand-in for `run_direct` that records its call and echoes its argv."""
+
+    def fake(argv, *, cwd, timeout, stdout_path, on_spawn=None):
+        calls.append(
+            {
+                "argv": argv,
+                "cwd": cwd,
+                "timeout": timeout,
+                "stdout_path": stdout_path,
+                "on_spawn": on_spawn,
+            }
+        )
+        return Outcome(
+            argv=list(argv),
+            exit_code=0,
+            timed_out=False,
+            duration=0.01,
+            stdout_path=stdout_path,
+        )
+
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("mode", "fn_name"), [("bwrap", "run_bwrap"), ("unshare", "run_unshare")]
+)
+def test_the_isolating_launchers_hand_run_direct_the_wrapped_argv(
+    mode, fn_name, tmp_path, monkeypatch
+):
+    # Everything run_direct guarantees (devnull stdin, truncated log, own
+    # session, kill_tree on timeout) carries over only if the isolating
+    # launchers go through it with every argument intact.
+    calls = []
+    monkeypatch.setattr(launcher, "run_direct", _recording_run_direct(calls))
+
+    def hook(process):
+        pass
+
+    log = tmp_path / "stdout.log"
+    outcome = getattr(launcher, fn_name)(
+        ["claude", "-p", "hi"],
+        cwd=tmp_path,
+        timeout=12.5,
+        stdout_path=log,
+        on_spawn=hook,
+    )
+    assert calls == [
+        {
+            "argv": launcher.wrap_argv(mode, ["claude", "-p", "hi"], tmp_path),
+            "cwd": tmp_path,
+            "timeout": 12.5,
+            "stdout_path": log,
+            "on_spawn": hook,
+        }
+    ]
+    assert outcome.exit_code == 0
+    assert outcome.stdout_path == log
+
+
+@pytest.mark.parametrize(
+    ("mode", "fn_name"), [("bwrap", "run_bwrap"), ("unshare", "run_unshare")]
+)
+def test_the_outcome_argv_is_the_wrapped_argv(mode, fn_name, tmp_path, monkeypatch):
+    # The journal records Outcome.argv; it must show how the agent was
+    # contained, not just what it was asked to run.
+    monkeypatch.setattr(launcher, "run_direct", _recording_run_direct([]))
+    argv = ["claude", "-p", "hi"]
+    outcome = getattr(launcher, fn_name)(
+        argv, cwd=tmp_path, timeout=30.0, stdout_path=tmp_path / "stdout.log"
+    )
+    assert outcome.argv == launcher.wrap_argv(mode, argv, tmp_path)
+
+
+@pytest.mark.parametrize("fn_name", ["run_bwrap", "run_unshare"])
+def test_the_isolating_launchers_receive_the_bridge_spawn_hook(fn_name):
+    # dispatch._spawn_kwargs forwards on_spawn only to a launcher that declares
+    # it; without the parameter a cancelled turn could not kill the process.
+    fn = getattr(launcher, fn_name)
+    assert dispatch._spawn_kwargs(fn) == {"on_spawn": None}
+
+
+def test_get_launcher_returns_each_implemented_mode():
+    assert launcher.get_launcher("direct") is launcher.run_direct
+    assert launcher.get_launcher("bwrap") is launcher.run_bwrap
+    assert launcher.get_launcher("unshare") is launcher.run_unshare
+
+
+def test_the_launchers_map_is_exactly_the_four_modes():
+    assert launcher.LAUNCHERS == {
+        "direct": launcher.run_direct,
+        "bwrap": launcher.run_bwrap,
+        "unshare": launcher.run_unshare,
+        "container": None,
+    }
+
+
+@pytest.mark.parametrize("fn_name", ["run_bwrap", "run_unshare"])
+def test_an_empty_argv_never_reaches_run_direct(fn_name, tmp_path, monkeypatch):
+    # Review Focus: run_direct's own empty-argv guard cannot see an argv that
+    # has already been wrapped, so the isolating launchers must refuse first.
+    calls = []
+    monkeypatch.setattr(launcher, "run_direct", _recording_run_direct(calls))
+    with pytest.raises(ValueError, match="argv is empty"):
+        getattr(launcher, fn_name)(
+            [], cwd=tmp_path, timeout=30.0, stdout_path=tmp_path / "stdout.log"
+        )
+    assert calls == []
