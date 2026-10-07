@@ -2423,13 +2423,16 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     Every statement runs in one `store_db.read_snapshot`, and the first one
     reads `store_events.head`: that is `as_of_seq`, and the payload reflects
     every event up to it and none after it. Lease liveness is still judged at
-    read time, against `now`.
+    read time, against `now`. `store_id` is `store_db.store_id`, read in the
+    same snapshot and never minted here: it names the database read, so a
+    consumer seeing a different one drops any `as_of_seq` it holds.
     """
     root = resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
         with store_db.read_snapshot(conn):
             as_of_seq = store_events.head(conn)
+            store_id = store_db.store_id(conn)
             wanted = run_id
             if wanted is None:
                 wanted = store_queries.latest_run_id(
@@ -2464,6 +2467,7 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
             payload = status_payload(run, state)
             payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
             payload["as_of_seq"] = as_of_seq
+            payload["store_id"] = store_id
             return payload
     finally:
         conn.close()

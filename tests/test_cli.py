@@ -4615,6 +4615,18 @@ def _events_head(root: Path) -> int:
         conn.close()
 
 
+_HEX_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _store_id(root: Path) -> str | None:
+    """`store_db.store_id` read on a connection of its own, outside any command."""
+    conn = store_db.open_db_for_reading(cli.resolve_repo_dir(root))
+    try:
+        return store_db.store_id(conn)
+    finally:
+        conn.close()
+
+
 def _write_once_after(monkeypatch, module, name: str, write) -> list[bool]:
     """Patch `module.name` so it returns what it always did, and on its first
     call only, after the original returned, runs `write`.
@@ -4652,6 +4664,7 @@ def test_status_as_of_seq_is_the_events_head(projection):
         "warnings",
         "integrity",
         "as_of_seq",
+        "store_id",
     }
     argv = ["status", SNAPSHOT_RUN_ID, "--repo-dir", str(projection)]
     plain = runner.invoke(cli.app, argv)
@@ -4660,6 +4673,81 @@ def test_status_as_of_seq_is_the_events_head(projection):
     assert pretty.exit_code == 0, pretty.output
     for result in (plain, pretty):
         assert json.loads(result.stdout)["data"]["as_of_seq"] == head
+
+
+def test_status_store_id_is_the_meta_store_id(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    expected = _store_id(projection)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert isinstance(payload["store_id"], str)
+    assert _HEX_ID.fullmatch(payload["store_id"])
+    assert payload["store_id"] == expected
+    argv = ["status", SNAPSHOT_RUN_ID, "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["store_id"] == expected
+
+
+def test_status_store_id_is_stable(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    first = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+    second = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+    _record(
+        projection,
+        "20260930T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+    )
+    third = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert first["store_id"] == second["store_id"] == third["store_id"]
+    assert _HEX_ID.fullmatch(first["store_id"])
+    assert third["as_of_seq"] > first["as_of_seq"]
+
+
+def test_status_store_id_differs_across_databases(projection, tmp_path, monkeypatch):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    first = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)["store_id"]
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "other-xdg"))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    second = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)["store_id"]
+
+    assert _HEX_ID.fullmatch(first)
+    assert _HEX_ID.fullmatch(second)
+    assert first != second
+
+
+def test_status_reads_store_id_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 2: on the command's own connection, inside `read_snapshot`."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    opened: list[sqlite3.Connection] = []
+    seen: list[tuple[sqlite3.Connection, bool]] = []
+    original_open = cli.store_db.open_db_for_reading
+    original_store_id = cli.store_db.store_id
+
+    def capture_open(root):
+        conn = original_open(root)
+        opened.append(conn)
+        return conn
+
+    def capture_store_id(conn):
+        seen.append((conn, conn.in_transaction))
+        return original_store_id(conn)
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture_open)
+    monkeypatch.setattr(cli.store_db, "store_id", capture_store_id)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert len(opened) == 1
+    assert seen == [(opened[0], True)]
+    assert _HEX_ID.fullmatch(payload["store_id"])
 
 
 def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
@@ -4773,6 +4861,7 @@ def test_status_error_paths_are_unchanged_and_close_the_snapshot(projection, mon
         assert set(envelope) == {"ok", "error"}
         assert envelope["error"]["type"] == "UnknownRunError"
         assert "as_of_seq" not in result.stdout
+        assert "store_id" not in result.stdout
     assert len(opened) == 2
     for conn in opened:
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -13347,7 +13436,12 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))
     expected = cli.render(
         cli.ok_envelope(
-            {**before, "integrity": CLEAN_INTEGRITY, "as_of_seq": _events_head(projection)}
+            {
+                **before,
+                "integrity": CLEAN_INTEGRITY,
+                "as_of_seq": _events_head(projection),
+                "store_id": _store_id(projection),
+            }
         )
     )
 

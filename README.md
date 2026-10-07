@@ -640,6 +640,8 @@ Which report you get when more than one thing happened:
 
 `am status` also always has an `as_of_seq` key: the `seq` of the newest event the report reflects (`0` when no event has been recorded). Everything in the report is read in one read transaction together with that number, so it reflects every event up to `as_of_seq` and none after it; only `control.lease.live` is judged at the moment you ask.
 
+`am status` also always has a `store_id` key: the identity of the `am.db` the report was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds.
+
 `am status <run-id>` also always has a `warnings` key: `[]`, or a list holding the run's isolation warning, `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`, when `--isolation auto` found neither `bwrap` nor `unshare` and the run went un-isolated (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
