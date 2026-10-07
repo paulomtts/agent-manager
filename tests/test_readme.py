@@ -11,6 +11,7 @@ import inspect
 import json
 import re
 import typing
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -689,3 +690,75 @@ def test_resume_documents_the_recorded_suite():
         " as on a milestone run" in story
     )
     assert STORY_SHAPE in story
+
+
+RESUME_ISOLATION_OPENING = "`am resume` restores the run's recorded isolation mode"
+STATUS_WARNINGS_OPENING = "`am status <run-id>` also always has a `warnings` key"
+
+
+def test_resume_documents_isolation():
+    section = _section("Relaunching resumes")
+    paragraph = _paragraph(RESUME_ISOLATION_OPENING)
+    assert paragraph in section
+    for phrase in (
+        "accepts only `none`",
+        "usage error (exit 2)",
+        f"`{errors.IsolationUnavailableError.__name__}`",
+        "exit code 3, nothing written",
+        "never silently resumes un-isolated",
+        "keeps its recorded warning",
+        "`--isolation none`",
+        "nothing is probed, there is no warning",
+        "`config.launcher` is `direct`",
+        "before any `verification: replaced in run record: [...]` entry",
+    ):
+        assert phrase in paragraph, phrase
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(paragraph)
+
+    name = errors.IsolationUnavailableError.__name__
+    bullets = [
+        line for line in section.splitlines() if line.startswith("- ") and name in line
+    ]
+    assert len(bullets) == 2, bullets
+    assert all("`--isolation none`" in line for line in bullets)
+
+    option = _command_param("resume", "isolation")
+    assert list(option.type.choices) == ["none"]
+    assert option.default is None
+
+
+def test_status_documents_warnings():
+    paragraph = _paragraph(STATUS_WARNINGS_OPENING)
+    assert paragraph in _section("Pausing and cancelling a run")
+    assert "`[]`" in paragraph
+    assert launcher.ISOLATION_NONE_WARNING in paragraph
+    assert _slug(ISOLATION_TITLE) in _assert_anchors_resolve(paragraph)
+
+    run = models.Run(
+        id="20260923T140506Z-cbe34d00",
+        workflow="task",
+        repo_dir=Path("/repo"),
+        base_branch="main",
+        branch_prefix="m1",
+        status="started",
+        started_at=datetime(2026, 9, 23, 14, 5, 6, tzinfo=timezone.utc),
+        stories=[],
+    )
+    assert cli.status_payload(run)["warnings"] == []
+    run.config = models.RunConfig(isolation_warning=launcher.ISOLATION_NONE_WARNING)
+    assert cli.status_payload(run)["warnings"] == [launcher.ISOLATION_NONE_WARNING]
+
+
+def test_isolation_and_resume_passages_link_only_to_headings():
+    for text in (
+        _section("Requires"),
+        _section(ISOLATION_TITLE),
+        _section(ARGV_TITLE),
+        _section(STORY_TITLE),
+        _section("Relaunching resumes"),
+        _paragraph(RESUME_OPENING),
+        _paragraph(STATUS_WARNINGS_OPENING),
+    ):
+        _assert_anchors_resolve(text)
+    assert "relaunching-resumes" in _assert_anchors_resolve(_section(ISOLATION_TITLE))
+    assert "resuming-what-runs-again" in _assert_anchors_resolve(_paragraph(RESUME_OPENING))
