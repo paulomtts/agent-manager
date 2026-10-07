@@ -142,7 +142,7 @@ def test_store_load_run_reads_through_the_queries_module(repo, monkeypatch):
     st = Store.open(repo, "run-2026-10-06-01")
     try:
         assert st.load_run("run-2026-10-06-01") is loaded
-        assert seen == [(st.connection, "run-2026-10-06-01")]
+        assert seen == [(st.read_connection, "run-2026-10-06-01")]
     finally:
         st.close()
 

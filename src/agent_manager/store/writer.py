@@ -52,6 +52,11 @@ class _Job:
     future: Future = field(default_factory=Future)
 
 
+def _main_file(conn: sqlite3.Connection) -> str:
+    """The file `conn`'s main database lives in, or `""` for an in-memory one."""
+    return next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+
+
 class Store:
     """The two stores of D5, bound together by the write ordering of §9.
 
@@ -92,6 +97,9 @@ class Store:
         self._writer: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._closed = False
+        self._file = _main_file(conn)
+        self._reader: sqlite3.Connection | None = None
+        self._reader_lock = threading.Lock()
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
@@ -130,13 +138,24 @@ class Store:
     def connection(self) -> sqlite3.Connection:
         return self._conn
 
+    @property
+    def read_connection(self) -> sqlite3.Connection:
+        """The read-only connection every read method uses, opened on first use.
+
+        On the writing connection's file, never written through, and never
+        used by a job. Raises `ValueError` when the writing connection has no
+        file (in-memory) and `sqlite3.ProgrammingError` once `close` has begun.
+        """
+        with self._reader_lock:
+            return self._open_reader()
+
     def close(self) -> None:
         """Let every job already enqueued finish, stop and join the writer, then
-        close the writing connection.
+        close the writing connection and the read connection.
 
         Works whether or not the writer was ever started; a second call is a
         no-op. Called from inside a job it raises `RuntimeError`. Afterwards
-        every write method raises `sqlite3.ProgrammingError`.
+        every write and read method raises `sqlite3.ProgrammingError`.
         """
         if threading.current_thread() is self._writer:
             raise RuntimeError(
@@ -153,6 +172,9 @@ class Store:
         if writer is not None:
             writer.join()
         self._conn.close()
+        with self._reader_lock:
+            if self._reader is not None:
+                self._reader.close()
 
     def _submit(
         self,
@@ -226,6 +248,28 @@ class Store:
                 if current is None or current.token != token:
                     raise store_leases.LeaseLostError(self.run_id, current)
             return job.body(conn)
+
+    def _read(self, query: Callable[[sqlite3.Connection], T]) -> T:
+        """Run `query` on the read connection, on the calling thread.
+
+        Reads are serialised among themselves by a lock no write takes, so a
+        read never waits for a job, and sees only committed rows.
+        """
+        with self._reader_lock:
+            return query(self._open_reader())
+
+    def _open_reader(self) -> sqlite3.Connection:
+        """The read connection, opened on first use. Callers hold `_reader_lock`."""
+        if self._closed:
+            raise sqlite3.ProgrammingError(_CLOSED)
+        if self._reader is None:
+            if not self._file:
+                raise ValueError(
+                    f"the store of run {self.run_id!r} writes an in-memory"
+                    " database, which no second connection can read"
+                )
+            self._reader = store_db.open_reader(Path(self._file))
+        return self._reader
 
     @contextmanager
     def _fenced(self) -> Iterator[None]:
@@ -508,15 +552,13 @@ class Store:
     # -- reading -------------------------------------------------------------
 
     def load_run(self, run_id: str) -> models.Run | None:
-        """`store_queries.load_run` over this store's own connection.
+        """`store_queries.load_run` on this store's read connection.
 
-        Kept as a method because `rebuild_from_journal` and every existing caller
-        already hold a `Store`; the free function is what a reader without a run
-        id uses. Holds the store lock so a read on the shared connection never
-        interleaves with a write's execute or commit.
+        Kept as a method because every existing caller already holds a
+        `Store`; the free function is what a reader without a run id uses.
+        Sees only committed rows and never waits for a write.
         """
-        with self._lock:
-            return store_queries.load_run(self._conn, run_id)
+        return self._read(lambda conn: store_queries.load_run(conn, run_id))
 
     # -- checkpoints ---------------------------------------------------------
     #
@@ -567,8 +609,9 @@ class Store:
 
     def latest_checkpoint(self, card_id: str) -> store_checkpoints.Checkpoint | None:
         """The highest-`seq` checkpoint of `card_id` in this store's run, any reason."""
-        with self._lock:
-            return store_checkpoints.latest_checkpoint(self._conn, self.run_id, card_id)
+        return self._read(
+            lambda conn: store_checkpoints.latest_checkpoint(conn, self.run_id, card_id)
+        )
 
     def latest_turn_checkpoint(self, card_id: str) -> store_checkpoints.Checkpoint | None:
         """The highest-`seq` `turn` checkpoint of `card_id` in this store's run.
@@ -578,10 +621,9 @@ class Store:
         is the newest `turn` row, saved by `BEFORE_TURN` before it ran. A
         milestone resume rewinds to it (card 54e4ec29).
         """
-        with self._lock:
-            return store_checkpoints.latest_turn_checkpoint(
-                self._conn, self.run_id, card_id
-            )
+        return self._read(
+            lambda conn: store_checkpoints.latest_turn_checkpoint(conn, self.run_id, card_id)
+        )
 
     def latest_open_checkpoint(
         self, card_id: str, workflow: str
@@ -596,8 +638,9 @@ class Store:
         no `runs` row counts as not canceled. "Newest" is `saved_at`
         descending, then `seq` descending.
         """
-        with self._lock:
-            return store_checkpoints.latest_open_checkpoint(self._conn, card_id, workflow)
+        return self._read(
+            lambda conn: store_checkpoints.latest_open_checkpoint(conn, card_id, workflow)
+        )
 
     def checkpoint_cards(self, run_id: str) -> list[tuple[str, str]]:
         """Every distinct `(card_id, workflow)` with a checkpoint row under `run_id`.
@@ -607,8 +650,7 @@ class Store:
         `self.run_id`: `am reset` asks it about the run it closes
         (am-reset §3.5, card af52db54).
         """
-        with self._lock:
-            return store_checkpoints.checkpoint_cards(self._conn, run_id)
+        return self._read(lambda conn: store_checkpoints.checkpoint_cards(conn, run_id))
 
     # -- board comment outbox ------------------------------------------------
     #
@@ -665,8 +707,9 @@ class Store:
         runs, which is what a relaunch needs; an empty `card_ids` matches
         nothing.
         """
-        with self._lock:
-            return store_outbox.pending_comments(self._conn, run_id, card_ids)
+        return self._read(
+            lambda conn: store_outbox.pending_comments(conn, run_id, card_ids)
+        )
 
     def mark_comment_posted(self, key: str, comment_id: str, now: datetime) -> None:
         """Record that `key`'s body is on the board as `comment_id`.
@@ -810,8 +853,9 @@ class Store:
 
     def pending_controls(self, token: str) -> list[store_leases.ControlRow]:
         """This run's unhandled requests addressed to `token`, in `seq` order."""
-        with self._lock:
-            return store_leases.pending_controls(self._conn, self.run_id, token)
+        return self._read(
+            lambda conn: store_leases.pending_controls(conn, self.run_id, token)
+        )
 
     def mark_control_handled(self, seq: int, now: datetime) -> None:
         """Record that this run's request `seq` has been applied."""
@@ -856,7 +900,7 @@ class Store:
                     f" {run.id!r}: refusing to key its projection under two ids"
                 )
             if not force:
-                projection = self.load_run(run_id)
+                projection = store_queries.load_run(self._conn, run_id)
                 if projection is not None:
                     foreign = [
                         mismatch
@@ -889,18 +933,16 @@ class Store:
         """The §9 tree `run_id`'s journal records, without touching any row.
 
         Adoption reads attempts here and never from the `attempts` projection.
-        The store lock is held across the read: `Journal.read` takes no lock,
-        and other lanes of a milestone resume append to this run's journal
-        through this store, so an unlocked read could meet half a line. Nothing
-        is written, so there is no `_fenced()`. Another run's journal may be
-        live in another process, so only there is a torn final line ignored.
+        Takes no store lock: `Journal.read` holds this run's journal append
+        lock across its scan, so it never meets half a line this store is
+        appending. Another run's journal may be live in another process, so
+        only there is a torn final line ignored.
         """
-        with self._lock:
-            if run_id == self.run_id:
-                lines = self._journal.read()
-            else:
-                lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
-            return store_replay.replay(lines)
+        if run_id == self.run_id:
+            lines = self._journal.read()
+        else:
+            lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
+        return store_replay.replay(lines)
 
     def _delete_run(self, run_id: str) -> None:
         self._conn.execute("DELETE FROM attempts WHERE run_id = ?", (run_id,))

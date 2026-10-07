@@ -614,6 +614,19 @@ _DELEGATIONS = [
 ]
 
 
+_READ_LEAVES = frozenset(
+    {
+        "pending_controls",
+        "latest_checkpoint",
+        "latest_turn_checkpoint",
+        "latest_open_checkpoint",
+        "checkpoint_cards",
+        "pending_comments",
+    }
+)
+"""The delegations that are reads: their leaf gets `Store.read_connection`."""
+
+
 @pytest.mark.parametrize(("leaf", "function", "setup", "drive"), _DELEGATIONS)
 def test_store_methods_call_the_leaf_through_the_module(
     repo, monkeypatch, leaf, function, setup, drive
@@ -632,8 +645,9 @@ def test_store_methods_call_the_leaf_through_the_module(
         setup(st)
         monkeypatch.setattr(leaf, function, spy)
         drive(st)
+        expected = st.read_connection if function in _READ_LEAVES else st.connection
         assert seen != []
-        assert all(conn is st.connection for conn in seen)
+        assert all(conn is expected for conn in seen)
     finally:
         st.close()
 

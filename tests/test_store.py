@@ -2017,13 +2017,14 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
     assert rebuilt == loaded
     # The first `load_run` is the foreign-value check (divergence §3.6): it
     # reads the projection under the same lock, before anything is deleted.
+    # The second is `Store.load_run`, a read: it takes no store lock.
     assert seen == [
         ("read", True),
         ("load_run", True),
         ("_delete_run", True),
         ("_write_attempt_row", True),
         ("_write_attempt_row", True),
-        ("load_run", True),
+        ("load_run", False),
     ]
 
 
@@ -5160,19 +5161,18 @@ def test_replay_journal_of_its_own_run_returns_the_recorded_tree(repo):
     assert replayed == loaded
 
 
-def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
+def test_replay_journal_reads_under_the_journal_append_lock(repo, monkeypatch):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
         st.record_story(_story())
-        real_read = st.journal.read
+        real_scan = st.journal._scan
         seen: list[bool] = []
         writers: list[threading.Thread] = []
 
-        def interleaving_read(**kwargs):
-            # A record_* started from another thread mid-replay must wait for
-            # the replay: if it could land now, this read would include it.
-            seen.append(_held_elsewhere(st._lock))
+        def interleaving_scan(**kwargs):
+            # A record_* started from another thread mid-scan must wait for
+            # the scan: if its line could land now, this scan would include it.
             writer = threading.Thread(
                 target=st.record_subtask, args=("8831189b", _subtask())
             )
@@ -5180,16 +5180,16 @@ def test_replay_journal_holds_the_store_lock(repo, monkeypatch):
             writer.start()
             writer.join(timeout=0.2)
             seen.append(writer.is_alive())
-            return real_read(**kwargs)
+            return real_scan(**kwargs)
 
-        monkeypatch.setattr(st.journal, "read", interleaving_read)
+        monkeypatch.setattr(st.journal, "_scan", interleaving_scan)
         replayed = st.replay_journal(RUN_ID)
         writers[0].join()
-        after = store_replay.replay(real_read())
+        after = store_replay.replay(store_journal.Journal(RUN_ID).read())
     finally:
         st.close()
 
-    assert seen == [True, True]
+    assert seen == [True]
     assert replayed.stories[0].subtasks == []
     assert [subtask.card_id for subtask in after.stories[0].subtasks] == ["ef248597"]
 

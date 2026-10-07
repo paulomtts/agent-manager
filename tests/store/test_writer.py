@@ -688,3 +688,161 @@ def test_a_write_racing_close_either_lands_or_raises_programming_error(repo):
     landed = {f"race-{caller.value}" for caller in writers if caller.error is None}
     assert keys == landed
     assert _writer_threads(RUN_A) == []
+
+
+# -- reads ----------------------------------------------------------------------
+
+
+def test_a_read_does_not_wait_for_a_running_write(repo):
+    inserted = threading.Event()
+    release = threading.Event()
+    st = store_writer.Store.open(repo, RUN_A)
+
+    def held_open(conn):
+        store_checkpoints.insert_checkpoint(
+            conn,
+            RUN_A,
+            "card-a",
+            project_id=st.project_id,
+            workflow="task",
+            digest="d",
+            reason="turn",
+            agent={},
+            saved_at=NOW,
+        )
+        store_outbox.enqueue_comment(
+            conn,
+            project_id=st.project_id,
+            run_id=RUN_A,
+            card_id="card-a",
+            key="k1",
+            body="b",
+            now=NOW,
+        )
+        inserted.set()
+        assert release.wait(TIMEOUT)
+
+    try:
+        writing = _Caller(st._submit, held_open, operation="held_open")
+        assert inserted.wait(TIMEOUT)
+        during = _Caller(
+            lambda: (st.latest_checkpoint("card-a"), st.pending_comments())
+        ).wait()
+        release.set()
+        writing.wait()
+        after_checkpoint = st.latest_checkpoint("card-a")
+        after_comments = st.pending_comments()
+    finally:
+        release.set()
+        st.close()
+
+    assert during.error is None
+    assert during.value == (None, [])
+    assert after_checkpoint is not None and after_checkpoint.seq == 0
+    assert [comment.key for comment in after_comments] == ["k1"]
+
+
+def test_a_read_sees_the_callers_own_completed_write(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        saved = st.save_checkpoint(
+            "card-a", workflow="task", digest="d", reason="turn", agent={}, saved_at=NOW
+        )
+        found = st.latest_checkpoint("card-a")
+    finally:
+        st.close()
+
+    assert found == saved
+
+
+def _main_file_of(conn: sqlite3.Connection) -> str:
+    return next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+
+
+def test_reads_use_the_read_connection_and_writes_the_writing_connection(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        reader = st.read_connection
+        again = st.read_connection
+        files = (_main_file_of(reader), _main_file_of(st.connection))
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("INSERT INTO meta (key, value) VALUES ('refused', 'v')")
+    finally:
+        st.close()
+
+    assert reader is not st.connection
+    assert again is reader
+    assert files[0] == files[1] != ""
+    assert reader.row_factory is sqlite3.Row
+
+
+_READS = [
+    pytest.param(lambda st: st.load_run(RUN_A), id="load_run"),
+    pytest.param(lambda st: st.latest_checkpoint("card-a"), id="latest_checkpoint"),
+    pytest.param(lambda st: st.latest_turn_checkpoint("card-a"), id="latest_turn_checkpoint"),
+    pytest.param(
+        lambda st: st.latest_open_checkpoint("card-a", "task"), id="latest_open_checkpoint"
+    ),
+    pytest.param(lambda st: st.checkpoint_cards(RUN_A), id="checkpoint_cards"),
+    pytest.param(lambda st: st.pending_comments(), id="pending_comments"),
+    pytest.param(lambda st: st.pending_controls("t1"), id="pending_controls"),
+]
+
+
+@pytest.mark.parametrize("read", _READS)
+def test_the_writer_is_not_used_by_reads(repo, read):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with _Gate(st):
+            call = _Caller(read, st).wait()
+    finally:
+        st.close()
+
+    assert call.error is None
+
+
+def test_close_joins_the_writer_and_closes_both_connections(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    st._submit(lambda conn: None, operation="start")
+    st.latest_checkpoint("card-a")
+    (writer,) = _writer_threads(RUN_A)
+    reader = st.read_connection
+
+    st.close()
+
+    assert writer.is_alive() is False
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.connection.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError):
+        reader.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda st: st.beat("t1", NOW), id="write"),
+        pytest.param(lambda st: st.latest_checkpoint("card-a"), id="read"),
+    ],
+)
+def test_a_write_or_read_after_close_raises_programming_error(repo, call):
+    st = store_writer.Store.open(repo, RUN_A)
+    st.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        call(st)
+
+    assert _writer_threads(RUN_A) == []
+    assert st._reader is None
+
+
+def test_the_first_read_of_a_store_over_an_in_memory_connection_raises_value_error(repo):
+    st = store_writer.Store(
+        sqlite3.connect(":memory:", check_same_thread=False),
+        store_journal.Journal(RUN_A),
+        1,
+    )
+    try:
+        with pytest.raises(ValueError, match="in-memory"):
+            st.latest_checkpoint("card-a")
+    finally:
+        st.close()
