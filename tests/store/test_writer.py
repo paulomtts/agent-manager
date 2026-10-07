@@ -1264,7 +1264,7 @@ def test_a_legacy_cancelled_event_mirrors_verbatim(repo):
             ),
             operation="seed",
         )
-        line = store_writer._line_from_event(event)
+        line = store_events.journal_line(event)
         st.journal.mirror(line)
         (stored,) = _events(st)
         (text,) = _file_texts(st)
@@ -1274,6 +1274,19 @@ def test_a_legacy_cancelled_event_mirrors_verbatim(repo):
     assert line.payload == {"status": models.LEGACY_CANCELED}
     assert stored.payload == {"status": models.LEGACY_CANCELED}
     assert json.loads(text)["payload"] == {"status": models.LEGACY_CANCELED}
+
+
+def test_the_mirrored_line_is_journal_line_of_the_committed_event(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        returned = st.record_run(_run(repo))
+        (event,) = _events(st)
+        (text,) = _file_texts(st)
+    finally:
+        st.close()
+
+    assert returned == store_events.journal_line(event)
+    assert store_journal.JournalLine.model_validate_json(text) == store_events.journal_line(event)
 
 
 # -- batches: coalesced jobs share one transaction ---------------------------

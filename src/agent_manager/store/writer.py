@@ -38,23 +38,6 @@ def _text(value: Path | None) -> str | None:
 _log = logging.getLogger(__name__)
 
 
-def _line_from_event(event: store_events.EventRow) -> store_journal.JournalLine:
-    """The journal line `event` is mirrored to: its `run_seq` is the line's
-    `seq` and its `kind` the line's `event`; `ts`, coordinates and payload are
-    the event's own, unchanged."""
-    return store_journal.JournalLine(
-        seq=event.run_seq,
-        ts=event.ts,
-        run_id=event.run_id,
-        event=event.kind,
-        story=event.story_id,
-        card=event.card_id,
-        phase=event.phase,
-        attempt=event.attempt,
-        payload=event.payload,
-    )
-
-
 T = TypeVar("T")
 
 _CLOSED = "Cannot operate on a closed database."
@@ -451,7 +434,7 @@ class Store:
                 attempt=attempt,
             )
             write_row(conn)
-            committed[:] = [_line_from_event(event)]
+            committed[:] = [store_events.journal_line(event)]
             return committed[0]
 
         return self._submit(

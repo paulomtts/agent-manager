@@ -1,12 +1,15 @@
-"""The append-only `events` rows, numbered by `seq`. Every function takes an
-open connection and never commits; the table's DDL and the triggers that
-refuse an update or delete live in `store.db`."""
+"""The append-only `events` rows, numbered by `seq`, and the journal lines
+they are. Every function takes an open connection and never commits; the
+table's DDL and the triggers that refuse an update or delete live in
+`store.db`. From this package it imports only `store.journal`, a lower layer."""
 
 import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from agent_manager.store import journal as store_journal
 
 
 @dataclass(frozen=True)
@@ -141,3 +144,49 @@ def read(
 def head(conn: sqlite3.Connection) -> int:
     """The largest `seq` in `events`, or 0 when it has no rows. Read-only."""
     return conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
+
+
+def journal_line(event: EventRow) -> store_journal.JournalLine:
+    """The journal line `event` is: its `run_seq` is the line's `seq` and its
+    `kind` the line's `event`; `ts`, coordinates and payload are the event's
+    own, unchanged. A field `JournalLine` refuses raises pydantic's
+    `ValidationError`."""
+    return store_journal.JournalLine(
+        seq=event.run_seq,
+        ts=event.ts,
+        run_id=event.run_id,
+        event=event.kind,
+        story=event.story_id,
+        card=event.card_id,
+        phase=event.phase,
+        attempt=event.attempt,
+        payload=event.payload,
+    )
+
+
+def run_lines(conn: sqlite3.Connection, run_id: str) -> list[store_journal.JournalLine]:
+    """`run_id`'s events whose kind is in `store_journal.NODE_KINDS`, as
+    `journal_line`s, ascending by `run_seq`.
+
+    A row of any other kind is skipped; another run's rows are never read.
+    `[]` when the run has no such row. A row whose payload is not JSON raises
+    `JournalError` naming the run and the row's `run_seq`; a row
+    `journal_line` refuses raises pydantic's `ValidationError`. Read-only.
+    """
+    kinds = sorted(store_journal.NODE_KINDS)
+    rows = conn.execute(
+        "SELECT * FROM events WHERE run_id = ? AND kind IN"
+        f" ({', '.join('?' for _ in kinds)}) ORDER BY run_seq",
+        (run_id, *kinds),
+    ).fetchall()
+    lines: list[store_journal.JournalLine] = []
+    for row in rows:
+        try:
+            event = _event_from_row(row)
+        except json.JSONDecodeError as error:
+            raise store_journal.JournalError(
+                f"event run_seq {row['run_seq']} of run {run_id!r} has a payload"
+                f" that is not JSON: {error}"
+            ) from error
+        lines.append(journal_line(event))
+    return lines

@@ -194,14 +194,14 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | Target module | L | Takes | Note |
 |---|---|---|---|
 | `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
-| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, the `JournalError` family | the schema contract (§10.1) |
+| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family | the schema contract (§10.1) |
 | `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
 | `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
 | `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
 | `store/checkpoints.py` | 6 | `TurnFloor`, `Checkpoint`, readers, the SQL behind `save_checkpoint` | never commits |
 | `store/outbox.py` | 6 | `CommentRow`, `COMMENT_ATTEMPTS`, the SQL behind enqueue/pending/mark | never commits |
 | `store/projects.py` | 6 | `resolve`, `lookup`: the `projects` rows, resolved or created by `repo_dir` | never commits |
-| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`: the append-only `events` rows; the table's DDL and triggers live in `store/db.py` | never commits |
+| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
 | `store/writer.py` | 7 | `Store` | §6.4 |
 
 ### 6.4 What stays in one piece

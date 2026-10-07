@@ -34,6 +34,7 @@ _JOURNAL_NAMES = (
     "CorruptJournalError",
     "JOURNAL_NAME",
     "_EVENT_KINDS",
+    "NODE_KINDS",
     "_UnknownEventLine",
     "ts_text",
     "_TS",
@@ -60,6 +61,13 @@ def test_journal_is_a_leaf_module_of_the_store_package():
         "attempt_upsert",
     }
     assert store_journal.JOURNAL_NAME == "journal.jsonl"
+
+
+def test_node_kinds_are_the_five_tree_upserts():
+    assert store_journal.NODE_KINDS == frozenset(
+        {"run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"}
+    )
+    assert store_journal.NODE_KINDS <= set(get_args(store_journal.EventKind))
 
 
 def test_the_store_package_does_not_re_export_journal_names():

@@ -63,6 +63,13 @@ def ts_text(ts: datetime) -> str:
 
 _EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
 
+NODE_KINDS: frozenset[str] = frozenset(
+    {"run_upsert", "story_upsert", "subtask_upsert", "phase_upsert", "attempt_upsert"}
+)
+"""The event kinds that upsert one node of the §9 tree: the only events
+`replay` folds. Other kinds may be recorded for a run; no tree reader reads
+them."""
+
 
 class _UnknownEventLine(BaseModel):
     """What a line with an unrecognised `event` must still carry: its `seq`.

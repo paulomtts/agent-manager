@@ -11,13 +11,16 @@ import json
 import sqlite3
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agent_manager import paths, store
 from agent_manager.store import db as store_db
 from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
 
 TS = "2026-10-07T12:00:00+00:00"
 
@@ -291,18 +294,33 @@ def test_open_db_for_reading_upgrades_an_am_db_without_events(repo):
 
 
 def test_events_is_a_leaf_module_of_the_store_package():
-    for function in (store_events.insert, store_events.read, store_events.head):
+    for function in (
+        store_events.insert,
+        store_events.read,
+        store_events.head,
+        store_events.run_lines,
+        store_events.journal_line,
+    ):
         assert function.__module__ == "agent_manager.store.events"
     assert store_events.EventRow.__module__ == "agent_manager.store.events"
     assert inspect.ismodule(store.events)
     assert store.events is store_events
-    for name in ("insert", "read", "head", "EventRow"):
+    for name in ("insert", "read", "head", "run_lines", "journal_line", "EventRow"):
         assert not hasattr(store, name)
 
 
-def test_events_imports_only_the_stdlib_and_store_db():
+_EVENTS_MAY_IMPORT_FROM_THE_STORE = frozenset(
+    {("db", "store_db"), ("journal", "store_journal")}
+)
+"""`(name, asname)` of the `from agent_manager.store import ...` aliases
+`store/events.py` may use: both are lower layers (§4.1)."""
+
+
+def _outside_imports(source: str) -> list[str]:
+    """Every import in `source` that is neither the stdlib nor one of
+    `_EVENTS_MAY_IMPORT_FROM_THE_STORE`."""
     outside: list[str] = []
-    for node in ast.walk(ast.parse(Path(store_events.__file__).read_text())):
+    for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             outside.extend(
                 alias.name
@@ -317,11 +335,21 @@ def test_events_imports_only_the_stdlib_and_store_db():
                 outside.extend(
                     f"agent_manager.store.{alias.name}"
                     for alias in node.names
-                    if (alias.name, alias.asname) != ("db", "store_db")
+                    if (alias.name, alias.asname) not in _EVENTS_MAY_IMPORT_FROM_THE_STORE
                 )
             elif module.split(".")[0] not in sys.stdlib_module_names:
                 outside.append(module)
-    assert outside == []
+    return outside
+
+
+def test_events_imports_only_the_stdlib_store_db_and_store_journal():
+    assert _outside_imports(Path(store_events.__file__).read_text()) == []
+    # The guard still refuses everything else.
+    assert _outside_imports("from agent_manager.store import replay as store_replay") == [
+        "agent_manager.store.replay"
+    ]
+    assert _outside_imports("from agent_manager import models") == ["agent_manager"]
+    assert _outside_imports("import pydantic") == ["pydantic"]
 
 
 _TRANSACTION_CALLS = frozenset({"commit", "rollback", "immediate", "open_db", "connect"})
@@ -678,5 +706,136 @@ def test_read_and_head_open_no_transaction(conns, project_id, other_project_id):
 
     store_events.read(conn, limit=2)
     store_events.head(conn)
+
+    assert not conn.in_transaction
+
+
+# ── run_lines and journal_line ───────────────────────────────────────────────
+
+NODE_TS = store_journal.ts_text(datetime(2026, 10, 7, 12, 0, 0, 123456, tzinfo=timezone.utc))
+"""A `ts` as the writer stores it, so it round-trips through `ts_text`."""
+
+
+def test_run_lines_are_the_runs_node_events_ascending_by_run_seq(conns, project_id):
+    # Review Focus 3: the two runs' rows interleave in global `seq`.
+    conn, _ = conns
+    a1 = _insert(conn, project_id, run_id="run-a", kind="run_upsert", ts=NODE_TS, payload={"id": "run-a"})
+    _insert(conn, project_id, run_id="run-b", kind="run_upsert", ts=NODE_TS, payload={"id": "run-b"})
+    a2 = _insert(
+        conn,
+        project_id,
+        run_id="run-a",
+        kind="attempt_upsert",
+        ts=NODE_TS,
+        payload={"n": 1},
+        story_id="s",
+        card_id="c",
+        phase="implement",
+        attempt=1,
+    )
+    _insert(
+        conn, project_id, run_id="run-b", kind="story_upsert", ts=NODE_TS,
+        payload={"card_id": "s"}, story_id="s",
+    )
+    conn.commit()
+
+    lines = store_events.run_lines(conn, "run-a")
+
+    assert lines == [store_events.journal_line(a1), store_events.journal_line(a2)]
+    second = lines[1]
+    assert (
+        second.seq,
+        second.run_id,
+        second.event,
+        second.story,
+        second.card,
+        second.phase,
+        second.attempt,
+        second.payload,
+    ) == (2, "run-a", "attempt_upsert", "s", "c", "implement", 1, {"n": 1})
+    assert store_journal.ts_text(second.ts) == a2.ts
+    assert [line.run_id for line in store_events.run_lines(conn, "run-b")] == ["run-b", "run-b"]
+    assert [line.seq for line in store_events.run_lines(conn, "run-b")] == [1, 2]
+
+
+def test_run_lines_order_by_run_seq_not_by_insert_order(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id, kind="story_upsert", ts=NODE_TS, payload={"card_id": "s"}, story_id="s", run_seq=2)
+    _insert(conn, project_id, kind="run_upsert", ts=NODE_TS, payload={"id": "run-a"}, run_seq=1)
+    conn.commit()
+
+    assert [line.event for line in store_events.run_lines(conn, "run-a")] == [
+        "run_upsert",
+        "story_upsert",
+    ]
+
+
+def test_run_lines_skip_other_kinds_and_are_empty_for_a_run_without_rows(conns, project_id):
+    # Review Focus 2: a lease event may be a run's very first.
+    conn, _ = conns
+    _insert(conn, project_id, kind="lease_acquired", payload={"token": "t1"})
+    kept = _insert(conn, project_id, kind="run_upsert", ts=NODE_TS, payload={"id": "run-a"})
+    _insert(conn, project_id, kind="phase_started")
+    conn.commit()
+
+    assert store_events.run_lines(conn, "run-a") == [store_events.journal_line(kept)]
+    assert store_events.run_lines(conn, "run-never") == []
+
+
+def _raw_node_row(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    run_seq: int = 1,
+    ts: str = NODE_TS,
+    payload: str = '{"id": "run-a"}',
+) -> None:
+    """A `run_upsert` row of `run-a` written by hand, `payload` text verbatim:
+    what `store_events.insert`, which serialises, cannot write."""
+    conn.execute(
+        "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+        " VALUES (?, 'run-a', ?, ?, 'run_upsert', ?, 'live')",
+        (project_id, run_seq, ts, payload),
+    )
+
+
+def test_run_lines_name_the_run_and_run_seq_of_a_payload_that_is_not_json(conns, project_id):
+    conn, _ = conns
+    _raw_node_row(conn, project_id, run_seq=1)
+    _raw_node_row(conn, project_id, run_seq=7, payload="{not json")
+    conn.commit()
+
+    with pytest.raises(store_journal.JournalError) as caught:
+        store_events.run_lines(conn, "run-a")
+
+    message = str(caught.value)
+    assert "'run-a'" in message
+    assert "run_seq 7" in message
+    assert "not JSON" in message
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"payload": "[1, 2]"}, {"ts": "not a time"}, {"run_seq": 0}],
+    ids=["payload-array", "ts-unparseable", "run-seq-zero"],
+)
+def test_run_lines_raise_validation_error_for_a_row_no_journal_line_can_hold(
+    conns, project_id, overrides
+):
+    conn, _ = conns
+    _raw_node_row(conn, project_id, **overrides)
+    conn.commit()
+
+    with pytest.raises(ValidationError):
+        store_events.run_lines(conn, "run-a")
+
+
+def test_run_lines_open_no_transaction(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id, kind="run_upsert", ts=NODE_TS, payload={"id": "run-a"})
+    conn.commit()
+
+    store_events.run_lines(conn, "run-a")
 
     assert not conn.in_transaction
