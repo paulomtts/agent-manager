@@ -991,6 +991,8 @@ def preflight_card(
     base_branch: str = "master",
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> CardPreflight:
     """Stage 1 of `run --card`: every board read and refusal, then the run id (card 5daa944e).
@@ -1000,8 +1002,9 @@ def preflight_card(
     and before any store exists, so a refused card leaves no run directory
     (X5). Only then is the clock read and the run id minted, and the
     `started` run, story and subtask records built; the run's config records
-    `commands` as its `verify` suite and `allow_no_verification`. Nothing is
-    written.
+    `commands` as its `verify` suite, `allow_no_verification`, and the resolved
+    `launcher` (`None` recording `direct`) with its `isolation_warning`. Nothing
+    is written.
     """
     root = resolve_repo_dir(repo_dir)
     card = board.show(card_id, repo_dir=root)
@@ -1038,7 +1041,10 @@ def preflight_card(
             status="started",
             started_at=started_at,
             config=models.RunConfig(
-                verify=list(commands), allow_no_verification=allow_no_verification
+                verify=list(commands),
+                allow_no_verification=allow_no_verification,
+                launcher="direct" if launcher is None else launcher,
+                isolation_warning=isolation_warning,
             ),
         ),
         story=models.StoryRun(
@@ -1183,6 +1189,8 @@ def run_card(
     branch_prefix: str,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -1223,6 +1231,8 @@ def run_card(
         base_branch=base_branch,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:
@@ -1589,6 +1599,8 @@ def detach_card(
     detacher: detach.Detacher,
     base_branch: str = "master",
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     commands: Sequence[str] = (),
     runner_factory: RunnerFactory | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -1609,6 +1621,8 @@ def detach_card(
         base_branch=base_branch,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
     )
     with recorded_card_run(pre) as recorded:

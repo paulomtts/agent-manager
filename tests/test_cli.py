@@ -11295,6 +11295,31 @@ def test_preflight_card_records_the_suite_and_the_opt_out(tmp_path, monkeypatch,
     assert default.run_record.config.allow_no_verification is False
 
 
+def test_preflight_card_records_the_launcher_and_its_warning(tmp_path, monkeypatch, fake_board):
+    """A5 B5: omitted records `direct` and no warning, as before."""
+    root = _seam_root(tmp_path, monkeypatch)
+    cards = _seam_cards(fake_board)
+    common: dict[str, Any] = {
+        "repo_dir": root,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "clock": lambda: SEAM_AT,
+    }
+
+    fallback = cli.preflight_card(
+        cards["subtask"], launcher="direct", isolation_warning=FALLBACK, **common
+    )
+    isolated = cli.preflight_card(cards["subtask"], launcher="unshare", **common)
+    default = cli.preflight_card(cards["subtask"], **common)
+
+    assert fallback.run_record.config == models.RunConfig(
+        launcher="direct", isolation_warning=FALLBACK
+    )
+    assert isolated.run_record.config == models.RunConfig(launcher="unshare")
+    assert default.run_record.config == models.RunConfig()
+    assert _run_dirs() == []
+
+
 class _PreflightReached(Exception):
     """Raised by a patched pre-flight once it has captured its arguments."""
 
@@ -11323,6 +11348,35 @@ def test_run_card_and_its_detach_path_hand_the_suite_to_the_preflight(tmp_path, 
     assert [(kwargs["commands"], kwargs["allow_no_verification"]) for kwargs in seen] == [
         (["a"], True),
         (["a"], True),
+    ]
+
+
+def test_run_card_and_detach_card_hand_the_launcher_and_its_warning_to_preflight_card(
+    tmp_path, monkeypatch
+):
+    seen: list[dict[str, Any]] = []
+
+    def capture(card_id, **kwargs):
+        seen.append(kwargs)
+        raise _PreflightReached(card_id)
+
+    monkeypatch.setattr(cli, "preflight_card", capture)
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "branch_prefix": "m1",
+        "base_branch": "main",
+        "launcher": "direct",
+        "isolation_warning": FALLBACK,
+    }
+
+    with pytest.raises(_PreflightReached):
+        cli.run_card("c1", **common)
+    with pytest.raises(_PreflightReached):
+        cli.detach_card("c1", detacher=_Forbidden("detacher"), **common)
+
+    assert [(kwargs["launcher"], kwargs["isolation_warning"]) for kwargs in seen] == [
+        ("direct", FALLBACK),
+        ("direct", FALLBACK),
     ]
 
 
