@@ -1,16 +1,21 @@
 """Where `agent_manager.store.writer`'s `Store` lives, what the module may
-import, and that no caller reaches `Store` through the `agent_manager.store`
-package, which holds no code.
+import, that no caller reaches `Store` through the `agent_manager.store`
+package, which holds no code, and how its writer thread, job queue and read
+connection behave.
 
-`Store` behaviour is tested in `tests/test_store.py`. Everything here imports
-modules or reads source files; nothing spawns a process, so these are unit
-tests.
+The rest of `Store`'s behaviour is tested in `tests/test_store.py`. The tests
+here import modules, read source files, or drive a `Store` on a real SQLite
+file under `tmp_path` with in-process threads; nothing spawns a process, so
+these are unit tests.
 """
 
 import ast
 import inspect
 import re
+import sqlite3
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,7 +36,10 @@ from agent_manager.runtime import walk as runtime_walk
 from agent_manager.store import checkpoints as store_checkpoints
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
+from agent_manager.store import leases as store_leases
+from agent_manager.store import outbox as store_outbox
 from agent_manager.store import projects as store_projects
+from agent_manager.store import queries as store_queries
 from agent_manager.store import writer as store_writer
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -328,3 +336,355 @@ def test_every_row_the_store_writes_carries_its_project_id(repo):
     assert project_id != elsewhere
     assert written == {table: [project_id] for table in _STORE_WRITTEN_TABLES}
     assert rebuilt == {table: [project_id] for table in _TREE_TABLES}
+
+
+# -- the writer thread and its job queue -------------------------------------
+
+TIMEOUT = 5.0
+"""The longest any test here waits on another thread; it only expires on failure."""
+
+
+def _busy() -> sqlite3.OperationalError:
+    """A busy error as SQLite raises it: `run_with_retry` re-runs the job."""
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    return error
+
+
+def _insert_meta(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("INSERT INTO meta (key, value) VALUES (?, 'v')", (key,))
+
+
+def _meta_keys(conn: sqlite3.Connection, prefix: str) -> list[str]:
+    """Committed `meta` keys starting with `prefix`, in insertion order."""
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT key FROM meta WHERE key LIKE ? ORDER BY rowid", (prefix + "%",)
+        )
+    ]
+
+
+def _writer_threads(run_id: str) -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == f"am-store-writer-{run_id}"]
+
+
+class _Caller:
+    """Calls `fn(*args, **kwargs)` on a thread of its own and keeps the outcome."""
+
+    def __init__(self, fn, *args, **kwargs) -> None:
+        self.value: object = None
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(
+            target=self._run, args=(fn, args, kwargs), daemon=True
+        )
+        self.thread.start()
+
+    def _run(self, fn, args, kwargs) -> None:
+        try:
+            self.value = fn(*args, **kwargs)
+        except BaseException as error:  # handed to the test through `error`
+            self.error = error
+
+    def wait(self) -> "_Caller":
+        self.thread.join(TIMEOUT)
+        assert not self.thread.is_alive(), "the call did not return within the timeout"
+        return self
+
+
+class _Gate:
+    """A job that holds the writer thread, inside its open transaction, until released."""
+
+    def __init__(self, st: store_writer.Store) -> None:
+        self.entered = threading.Event()
+        self.released = threading.Event()
+        self._caller = _Caller(st._submit, self._body, operation="gate")
+        assert self.entered.wait(TIMEOUT), "the gate job never started"
+
+    def _body(self, conn: sqlite3.Connection) -> None:
+        self.entered.set()
+        assert self.released.wait(TIMEOUT), "the gate was never released"
+
+    def release(self) -> None:
+        self.released.set()
+        self._caller.wait()
+
+    def __enter__(self) -> "_Gate":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+
+def _wait_enqueued(st: store_writer.Store, count: int) -> None:
+    """Return once `count` jobs wait in `st`'s queue behind the running one."""
+    deadline = time.monotonic() + TIMEOUT
+    while st._jobs.qsize() < count:
+        assert time.monotonic() < deadline, f"{count} job(s) were never enqueued"
+        time.sleep(0.001)
+
+
+def test_every_job_runs_on_the_one_writer_thread(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        callers = [
+            _Caller(st._submit, lambda conn: threading.current_thread(), operation="probe")
+            for _ in range(2)
+        ]
+        ran_on = [caller.wait().value for caller in callers]
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None, None]
+    assert ran_on[0] is ran_on[1]
+    assert ran_on[0] not in [caller.thread for caller in callers]
+    assert ran_on[0] is not threading.current_thread()
+    assert ran_on[0].name == f"am-store-writer-{RUN_A}"
+
+
+def test_jobs_run_in_the_order_they_were_enqueued(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        callers: list[_Caller] = []
+        with _Gate(st):
+            for n in range(5):
+                callers.append(
+                    _Caller(
+                        st._submit,
+                        lambda conn, key=f"fifo-{n}": _insert_meta(conn, key),
+                        operation="fifo",
+                    )
+                )
+                _wait_enqueued(st, n + 1)
+        for caller in callers:
+            caller.wait()
+        keys = _meta_keys(st.connection, "fifo-")
+    finally:
+        st.close()
+
+    assert [caller.error for caller in callers] == [None] * 5
+    assert keys == [f"fifo-{n}" for n in range(5)]
+
+
+def test_a_failing_job_fails_only_its_own_caller(repo):
+    failure = ValueError("job A refuses")
+    ran_on: list[threading.Thread] = []
+
+    def job_a(conn):
+        ran_on.append(threading.current_thread())
+        _insert_meta(conn, "job-a")
+        raise failure
+
+    def job_b(conn):
+        _insert_meta(conn, "job-b")
+        return "b"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(ValueError) as caught:
+            st._submit(job_a, operation="job_a")
+        b = st._submit(job_b, operation="job_b")
+        third_ran_on = st._submit(lambda conn: threading.current_thread(), operation="job_c")
+        keys = _meta_keys(st.connection, "job-")
+    finally:
+        st.close()
+
+    assert caught.value is failure
+    assert b == "b"
+    assert keys == ["job-b"]
+    assert third_ran_on is ran_on[0]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [store_leases.LeaseLostError(RUN_A, None), KeyboardInterrupt()],
+    ids=["lease-lost", "keyboard-interrupt"],
+)
+def test_a_base_exception_from_a_job_reaches_its_caller_unchanged(repo, error):
+    def job(conn):
+        raise error
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(type(error)) as caught:
+            st._submit(job, operation="raises")
+        after = st._submit(lambda conn: "still serving", operation="after")
+    finally:
+        st.close()
+
+    assert caught.value is error
+    assert after == "still serving"
+
+
+def test_a_busy_job_is_rolled_back_and_re_run_from_its_start(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    attempts: list[int] = []
+
+    def job(conn):
+        attempts.append(len(attempts) + 1)
+        _insert_meta(conn, f"busy-{len(attempts)}")
+        if len(attempts) == 1:
+            raise _busy()
+        return f"attempt {len(attempts)}"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        result = st._submit(job, operation="busy_once")
+        keys = _meta_keys(st.connection, "busy-")
+    finally:
+        st.close()
+
+    assert attempts == [1, 2]
+    assert result == "attempt 2"
+    assert keys == ["busy-2"]
+
+
+def test_a_job_busy_past_the_budget_raises_store_busy_error(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    calls: list[int] = []
+
+    def job(conn):
+        calls.append(1)
+        _insert_meta(conn, f"never-{len(calls)}")
+        raise _busy()
+
+    def next_job(conn):
+        _insert_meta(conn, "next")
+        return "next"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(store_db.StoreBusyError) as caught:
+            st._submit(job, operation="always_busy")
+        after = st._submit(next_job, operation="next")
+        never = _meta_keys(st.connection, "never-")
+    finally:
+        st.close()
+
+    assert caught.value.operation == "always_busy"
+    assert caught.value.attempts == store_db.RETRY_ATTEMPTS
+    assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+    assert len(calls) == store_db.RETRY_ATTEMPTS
+    assert never == []
+    assert after == "next"
+
+
+def test_an_integrity_error_is_not_retried(repo, monkeypatch):
+    monkeypatch.setattr(store_db, "RETRY_FIRST_PAUSE", 0)
+    calls: list[int] = []
+
+    def job(conn):
+        calls.append(1)
+        conn.execute("INSERT INTO meta (key, value) VALUES ('refused', NULL)")
+
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            st._submit(job, operation="refused")
+    finally:
+        st.close()
+
+    assert calls == [1]
+
+
+def test_a_submit_from_inside_a_job_raises_instead_of_deadlocking(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        call = _Caller(
+            st._submit,
+            lambda conn: st._submit(lambda inner: None, operation="inner"),
+            operation="outer",
+        ).wait()
+    finally:
+        st.close()
+
+    assert isinstance(call.error, RuntimeError)
+    assert "writer thread" in str(call.error)
+
+
+def test_close_without_a_write_and_twice_is_safe(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    st.close()
+    st.close()
+
+    assert _writer_threads(RUN_A) == []
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.connection.execute("SELECT 1")
+
+
+def test_close_lets_already_enqueued_jobs_finish(repo):
+    def queued_job(conn):
+        _insert_meta(conn, "queued")
+        return "landed"
+
+    st = store_writer.Store.open(repo, RUN_A)
+    gate = _Gate(st)
+    try:
+        queued = _Caller(st._submit, queued_job, operation="queued")
+        _wait_enqueued(st, 1)
+        closer = _Caller(st.close)
+        _wait_enqueued(st, 2)
+        gate.release()
+        closer.wait()
+        queued.wait()
+    finally:
+        gate.release()
+        st.close()
+
+    observer = store_db.open_db(repo)
+    try:
+        keys = _meta_keys(observer, "queued")
+    finally:
+        observer.close()
+
+    assert queued.error is None and queued.value == "landed"
+    assert closer.error is None
+    assert keys == ["queued"]
+    assert _writer_threads(RUN_A) == []
+
+
+def test_close_from_inside_a_job_raises(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    try:
+        with pytest.raises(RuntimeError, match="writer thread"):
+            st._submit(lambda conn: st.close(), operation="closes")
+        after = st._submit(lambda conn: "open", operation="after")
+    finally:
+        st.close()
+
+    assert after == "open"
+
+
+def test_a_write_racing_close_either_lands_or_raises_programming_error(repo):
+    st = store_writer.Store.open(repo, RUN_A)
+    start = threading.Barrier(9)
+
+    def write(n: int) -> int:
+        start.wait(TIMEOUT)
+        st._submit(lambda conn: _insert_meta(conn, f"race-{n}"), operation="race")
+        return n
+
+    def close() -> None:
+        start.wait(TIMEOUT)
+        st.close()
+
+    try:
+        writers = [_Caller(write, n) for n in range(8)]
+        closer = _Caller(close)
+        for caller in [*writers, closer]:
+            caller.wait()
+    finally:
+        st.close()
+
+    observer = store_db.open_db(repo)
+    try:
+        keys = set(_meta_keys(observer, "race-"))
+    finally:
+        observer.close()
+
+    assert closer.error is None
+    refused = [caller.error for caller in writers if caller.error is not None]
+    assert all(isinstance(error, sqlite3.ProgrammingError) for error in refused)
+    landed = {f"race-{caller.value}" for caller in writers if caller.error is None}
+    assert keys == landed
+    assert _writer_threads(RUN_A) == []

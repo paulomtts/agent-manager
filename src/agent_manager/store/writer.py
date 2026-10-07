@@ -4,12 +4,16 @@ describes, so the journal is the truth the projection is rebuilt from.
 """
 
 import json
+import queue
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, TypeVar
 
 from agent_manager import models
 from agent_manager.store import checkpoints as store_checkpoints
@@ -24,6 +28,28 @@ from agent_manager.store import replay as store_replay
 
 def _text(value: Path | None) -> str | None:
     return None if value is None else str(value)
+
+
+T = TypeVar("T")
+
+_CLOSED = "Cannot operate on a closed database."
+"""The message of the `sqlite3.ProgrammingError` a closed `Store` raises, as a
+closed `sqlite3.Connection` words it."""
+
+
+@dataclass
+class _Job:
+    """One write: `body(conn)` inside one transaction, then `after_commit`.
+
+    `future` carries the body's return value, or whatever the body, the retry
+    or `after_commit` raised, to the thread that submitted the job.
+    """
+
+    body: Callable[[sqlite3.Connection], Any]
+    operation: str
+    fenced: bool
+    after_commit: Callable[[], object] | None
+    future: Future = field(default_factory=Future)
 
 
 class Store:
@@ -62,6 +88,10 @@ class Store:
         self._lock = threading.RLock()
         self._token: str | None = None
         self._in_fence = False
+        self._jobs: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
+        self._writer: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._closed = False
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Store":
@@ -101,8 +131,101 @@ class Store:
         return self._conn
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """Let every job already enqueued finish, stop and join the writer, then
+        close the writing connection.
+
+        Works whether or not the writer was ever started; a second call is a
+        no-op. Called from inside a job it raises `RuntimeError`. Afterwards
+        every write method raises `sqlite3.ProgrammingError`.
+        """
+        if threading.current_thread() is self._writer:
+            raise RuntimeError(
+                "close() was called from inside a job on the writer thread,"
+                " which would wait on itself forever"
+            )
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            writer = self._writer
+            if writer is not None:
+                self._jobs.put(None)
+        if writer is not None:
+            writer.join()
+        self._conn.close()
+
+    def _submit(
+        self,
+        body: Callable[[sqlite3.Connection], T],
+        *,
+        operation: str,
+        fenced: bool = False,
+        after_commit: Callable[[], object] | None = None,
+    ) -> T:
+        """Run `body` as one job on the writer thread and return what it returned.
+
+        Blocks until the job is done; jobs run one at a time in the order they
+        were submitted. `body` gets the writing connection inside one
+        `BEGIN IMMEDIATE` transaction, under the lease fence when `fenced`, and
+        the whole attempt re-runs from `BEGIN` while SQLite is busy
+        (`store_db.run_with_retry`, `operation` naming the write). `after_commit`
+        runs on the writer thread after the commit and before the next job, and
+        is neither retried nor rolled back. Whatever the body, the retry or
+        `after_commit` raised is raised here as the same object. The first call
+        starts the writer. Raises `RuntimeError` on the writer thread itself and
+        `sqlite3.ProgrammingError` once `close` has begun.
+        """
+        if threading.current_thread() is self._writer:
+            raise RuntimeError(
+                f"{operation}: a Store write was submitted from inside a job on"
+                " the writer thread, which would wait on itself forever"
+            )
+        job = _Job(body, operation, fenced, after_commit)
+        with self._state_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError(_CLOSED)
+            if self._writer is None:
+                self._writer = threading.Thread(
+                    target=self._drain,
+                    name=f"am-store-writer-{self.run_id}",
+                    daemon=True,
+                )
+                self._writer.start()
+            self._jobs.put(job)
+        return job.future.result()
+
+    def _drain(self) -> None:
+        """The writer thread: run each job in turn until `close` enqueues `None`.
+
+        Every outcome of a job, `BaseException`s included, goes to that job's
+        caller; the loop always moves on to the next job.
+        """
+        while (job := self._jobs.get()) is not None:
+            try:
+                result = store_db.run_with_retry(
+                    lambda: self._transact(job), operation=job.operation
+                )
+                if job.after_commit is not None:
+                    job.after_commit()
+            except BaseException as error:  # re-raised by the caller
+                job.future.set_exception(error)
+            else:
+                job.future.set_result(result)
+
+    def _transact(self, job: _Job) -> Any:
+        """One attempt at `job`: `BEGIN IMMEDIATE`, the fence, the body, `COMMIT`.
+
+        A fenced job, while a token is bound, first checks that this run's
+        lease row still carries the token and raises `LeaseLostError` before
+        the body otherwise. Any raise rolls the whole transaction back.
+        """
+        with store_db.immediate(self._conn) as conn:
+            token = self._token
+            if job.fenced and token is not None:
+                current = store_leases.read_lease(conn, self.run_id)
+                if current is None or current.token != token:
+                    raise store_leases.LeaseLostError(self.run_id, current)
+            return job.body(conn)
 
     @contextmanager
     def _fenced(self) -> Iterator[None]:

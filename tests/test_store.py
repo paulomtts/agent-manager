@@ -2027,16 +2027,17 @@ def test_rebuild_and_load_run_hold_the_store_lock_on_the_shared_connection(
     ]
 
 
-def test_close_holds_the_store_lock(repo):
-    # The connection is never closed under an in-flight record.
+def test_close_closes_the_connection_after_the_writer_has_stopped(repo):
+    # The connection is never closed under a running job.
     st = store_writer.Store.open(repo, RUN_ID)
-    held: list[bool] = []
-    st._conn = _SpyingConnection(st._conn, lambda: held.append(_held_elsewhere(st._lock)))
+    st._submit(lambda conn: None, operation="start")
+    (writer,) = [t for t in threading.enumerate() if t.name == f"am-store-writer-{RUN_ID}"]
+    alive_at_close: list[bool] = []
+    st._conn = _SpyingConnection(st._conn, lambda: alive_at_close.append(writer.is_alive()))
 
     st.close()
 
-    assert held == [True]
-    assert _held_elsewhere(st._lock) is False
+    assert alive_at_close == [False]
 
 
 def test_a_failed_row_write_releases_the_store_lock(repo):
