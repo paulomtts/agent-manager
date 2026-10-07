@@ -159,14 +159,33 @@ def test_backup_of_a_settled_database(conns, project_id, out_dir):
 def test_backup_that_fails_while_copying_leaves_no_temporary_file(
     conns, project_id, out_dir, monkeypatch
 ):
-    def failing_open_reader(location: Path) -> sqlite3.Connection:
-        raise sqlite3.OperationalError("disk I/O error")
+    conn, _ = conns
+    _append(conn, project_id, 50)
+    real_open_reader = store_db.open_reader
+    copied: list[int] = []
 
-    monkeypatch.setattr(store_db, "open_reader", failing_open_reader)
+    class FailingReader:
+        """The real reader, whose backup fails after its first page is written."""
+
+        def __init__(self, location: Path) -> None:
+            self._conn = real_open_reader(location)
+
+        def backup(self, target: sqlite3.Connection) -> None:
+            def fail(status: int, remaining: int, total: int) -> None:
+                copied.append(total - remaining)
+                raise sqlite3.OperationalError("disk I/O error")
+
+            self._conn.backup(target, pages=1, progress=fail)
+
+        def close(self) -> None:
+            self._conn.close()
+
+    monkeypatch.setattr(store_db, "open_reader", FailingReader)
 
     with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
         store_backup.backup(out_dir / "copy.db", now=NOW)
 
+    assert copied == [1]
     assert _listing(out_dir) == []
 
 
