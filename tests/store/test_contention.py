@@ -113,6 +113,7 @@ def test_hold_db_fails_the_test_when_the_child_never_reports_held(repo, monkeypa
 
     assert "'not held'" in str(caught.value)
 
+
 @dataclass
 class AttemptLog:
     """Every call of every job `store_db.run_with_retry` was handed, per write.
@@ -327,6 +328,7 @@ def test_a_foreign_hold_past_the_retry_budget_raises_store_busy_error_and_spends
     assert held_journal == [1]
     assert line.seq == 2
     assert events[-1].seq == head + 1
+
 
 CRASH_CHILD = textwrap.dedent(
     """
