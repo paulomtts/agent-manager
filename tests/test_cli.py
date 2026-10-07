@@ -1279,7 +1279,7 @@ def project(tmp_path, monkeypatch) -> Path:
     # them here keeps the fixture's baseline clean so a later porcelain check
     # reflects only what `run_card` itself adds to the repo.
     _git(root, "add", "-A")
-    _git(root, "commit", "-m", "brd init")
+    _git(root, "commit", "--allow-empty", "-m", "brd init")
     return root
 
 
