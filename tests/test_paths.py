@@ -500,3 +500,88 @@ def test_db_path_raises_key_error_when_home_and_xdg_are_unset(monkeypatch):
     monkeypatch.delenv("HOME", raising=False)
     with pytest.raises(KeyError):
         paths.db_path()
+
+
+def test_legacy_project_dbs_is_empty_and_creates_nothing_without_a_projects_directory(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.legacy_project_dbs() == []
+    assert not (tmp_path / "agent-manager").exists()
+    assert not (tmp_path / "agent-manager" / "projects").exists()
+
+
+def test_legacy_project_dbs_lists_only_db_files_sorted(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    data = tmp_path / "agent-manager"
+    projects = data / "projects"
+    projects.mkdir(parents=True)
+    a, b = "a" * 64, "b" * 64
+    (projects / f"{b}.db").write_bytes(b"")
+    (projects / f"{a}.db").write_bytes(b"")
+    (projects / f"{a}.board.lock").write_bytes(b"")
+    (projects / f"{a}.db-wal").write_bytes(b"")
+    (projects / f"{a}.db-shm").write_bytes(b"")
+    (projects / "x.db.bak").write_bytes(b"")
+    (projects / "d.db").mkdir()
+    (projects / "sub").mkdir()
+    (projects / "sub" / "c.db").write_bytes(b"")
+    (data / "am.db").write_bytes(b"")
+    before = sorted(p.name for p in projects.iterdir())
+
+    assert paths.legacy_project_dbs() == [projects / f"{a}.db", projects / f"{b}.db"]
+    # Listing only: nothing was added or removed under projects/.
+    assert sorted(p.name for p in projects.iterdir()) == before
+
+
+def test_legacy_project_dbs_keeps_a_db_whose_stem_is_not_a_digest(monkeypatch, tmp_path):
+    # Migrate checks the stem against the repo digest and refuses naming the
+    # file; the lister must not hide it.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    projects = tmp_path / "agent-manager" / "projects"
+    projects.mkdir(parents=True)
+    (projects / "notadigest.db").write_bytes(b"")
+
+    assert paths.legacy_project_dbs() == [projects / "notadigest.db"]
+
+
+def test_legacy_project_dbs_is_empty_when_projects_is_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    data = tmp_path / "agent-manager"
+    data.mkdir()
+    (data / "projects").write_text("not a directory")
+
+    assert paths.legacy_project_dbs() == []
+    assert (data / "projects").read_text() == "not a directory"
+
+
+def test_legacy_project_dbs_is_empty_when_the_data_dir_is_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    (tmp_path / "agent-manager").write_text("not a directory")
+
+    assert paths.legacy_project_dbs() == []
+    assert (tmp_path / "agent-manager").read_text() == "not a directory"
+
+
+def test_legacy_project_dbs_skips_a_dangling_symlink(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    projects = tmp_path / "agent-manager" / "projects"
+    projects.mkdir(parents=True)
+    (projects / f"{'a' * 64}.db").symlink_to(tmp_path / "gone.db")
+
+    assert paths.legacy_project_dbs() == []
+
+
+def test_legacy_project_dbs_follows_xdg_data_home_at_call_time(monkeypatch, tmp_path):
+    first = tmp_path / "first" / "agent-manager" / "projects"
+    second = tmp_path / "second" / "agent-manager" / "projects"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "one.db").write_bytes(b"")
+    (second / "two.db").write_bytes(b"")
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "first"))
+    assert paths.legacy_project_dbs() == [first / "one.db"]
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "second"))
+    assert paths.legacy_project_dbs() == [second / "two.db"]
