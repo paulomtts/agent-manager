@@ -308,3 +308,24 @@ def test_a_run_of_another_repo_is_an_unknown_run_and_nothing_is_written(two_repo
     assert f"run {B_RUN!r} is not in the projection" in result.output
     assert _tree(runs_root) == runs_before
     assert _row_counts() == rows_before
+
+
+def test_runs_on_a_newer_machine_database_is_a_store_schema_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = paths.db_path()
+    path.parent.mkdir(parents=True)
+    newer = sqlite3.connect(path)
+    newer.execute("CREATE TABLE sentinel (x)")
+    newer.execute(f"PRAGMA user_version = {store_db.SCHEMA_VERSION + 1}")
+    newer.commit()
+    newer.close()
+
+    result = _invoke_creating_nothing(tmp_path, ["runs", "--repo-dir", str(root)])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "StoreSchemaError"
+    assert str(path) in envelope["error"]["message"]

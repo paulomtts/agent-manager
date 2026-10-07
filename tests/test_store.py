@@ -6327,6 +6327,7 @@ def test_open_db_for_reading_without_a_db_creates_nothing_and_reads_empty(
         assert store_queries.load_run(conn, RUN_ID) is None
         assert store_leases.read_lease(conn, RUN_ID) is None
         assert store_leases.control_requests(conn, RUN_ID) == []
+        assert conn.execute("SELECT COUNT(*) FROM meta").fetchone()[0] == 0
     finally:
         conn.close()
 

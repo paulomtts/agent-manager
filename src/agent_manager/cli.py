@@ -1450,6 +1450,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     locks.LockTimeoutError,
     store_leases.LeaseLostError,
     store_journal.CorruptJournalError,
+    store_db.StoreSchemaError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1464,7 +1465,9 @@ holder. It is a `BaseException`, so it has to be listed by name.
 `store_journal.CorruptJournalError` is in it because a crashed run can leave a
 torn line in its journal, and `Store.open` reading it (`am reset`, `am resume`)
 is a refusal naming the file and line, not a bug; only that subclass, not
-`JournalError` as a whole. Anything outside this tuple is a bug in this program
+`JournalError` as a whole. `store_db.StoreSchemaError` is in it because an
+`am.db` written by a newer `am` is a refusal naming the file and both versions,
+not a bug. Anything outside this tuple is a bug in this program
 and should crash loudly with its stack intact.
 """
 

@@ -158,6 +158,11 @@ CREATE TABLE IF NOT EXISTS board_comments (
     posted_at       TEXT,
     PRIMARY KEY (project_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -169,6 +174,31 @@ It covers a reader in another process, such as `am status`, holding the
 database briefly, and a second `am` process's short `BEGIN IMMEDIATE` write
 transactions: a lease take-over, or one fenced journal line and row
 (multi-process X4, X9)."""
+
+SCHEMA_VERSION = 1
+"""The `PRAGMA user_version` this build stamps `am.db` with and can open."""
+
+MIGRATED_KEY = "migrated_at"
+"""The `meta` key `am migrate` writes once its merge has committed; the value
+is that commit's ISO time. Its presence is what lets the store open on a
+machine that still has per-project databases."""
+
+
+class StoreSchemaError(RuntimeError):
+    """`am.db`'s `PRAGMA user_version` is greater than `SCHEMA_VERSION`.
+
+    Raised by `open_db` and `open_db_for_reading` before anything is written
+    to the file: the database was written by a newer `am`. Never retried.
+    """
+
+    def __init__(self, path: Path, found: int) -> None:
+        super().__init__(
+            f"{path} has schema version {found}, but this am only knows schema"
+            f" version {SCHEMA_VERSION}: this am is older than the database."
+            " Upgrade am; nothing has been changed"
+        )
+        self.path = path
+        self.found = found
 
 
 _WAL_RETRY_FIRST_PAUSE = 0.05
@@ -253,6 +283,11 @@ def open_db(root: Path) -> sqlite3.Connection:
     `tokens_in`, `tokens_out` and `cost` columns, which nothing writes or reads
     any more, so they stay NULL.
 
+    `PRAGMA user_version` is read before anything is written: a value above
+    `SCHEMA_VERSION` closes the connection and raises `StoreSchemaError`,
+    leaving the file as it was. A lower value (0 on a new or unstamped file)
+    is set to `SCHEMA_VERSION` after the schema and columns are applied.
+
     The connection may be used from any thread of the process that holds the
     run's lease, so `check_same_thread` is off; `Store` serialises that use
     behind its own lock. `BUSY_TIMEOUT_SECONDS` covers another process holding
@@ -266,11 +301,20 @@ def open_db(root: Path) -> sqlite3.Connection:
         timeout=BUSY_TIMEOUT_SECONDS,
         check_same_thread=False,
     )
-    conn.row_factory = sqlite3.Row
-    _enable_wal(conn)
-    conn.executescript(_SCHEMA)
-    _add_missing_columns(conn)
-    conn.commit()
+    try:
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            raise StoreSchemaError(location, found)
+        conn.row_factory = sqlite3.Row
+        _enable_wal(conn)
+        conn.executescript(_SCHEMA)
+        _add_missing_columns(conn)
+        if found < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -312,7 +356,10 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
     in-memory, empty projection with the current schema, and nothing is
     created on disk. An existing database with the current schema: opened `mode=ro`, so it can never be written or created;
     its rows are read live alongside a writer in WAL mode. An existing database
-    with an older schema: `open_db`, which migrates it as before.
+    with an older schema: `open_db`, which migrates it as before. A
+    `user_version` above `SCHEMA_VERSION` raises `StoreSchemaError` with
+    nothing created; below it, or missing tables or columns, is "an older
+    schema".
 
     A read through `mode=ro` of a WAL database creates its `-wal` and `-shm`
     sidecars. When neither exists, no connection holds the file open, so it is
@@ -335,7 +382,15 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    if _has_current_schema(conn):
+    try:
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            raise StoreSchemaError(location, found)
+        current = found == SCHEMA_VERSION and _has_current_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    if current:
         return conn
     conn.close()
     return open_db(root)

@@ -154,6 +154,9 @@ _DB_NAMES = (
     "_SCHEMA",
     "_ADDED_COLUMNS",
     "_enable_wal",
+    "SCHEMA_VERSION",
+    "MIGRATED_KEY",
+    "StoreSchemaError",
 )
 
 
@@ -177,6 +180,10 @@ def test_db_is_a_leaf_module_of_the_store_package():
         assert callable(function)
         assert function.__module__ == "agent_manager.store.db"
     assert db.BUSY_TIMEOUT_SECONDS == 30.0
+    assert db.SCHEMA_VERSION == 1
+    assert db.MIGRATED_KEY == "migrated_at"
+    assert db.StoreSchemaError.__module__ == "agent_manager.store.db"
+    assert issubclass(db.StoreSchemaError, RuntimeError)
 
 
 def test_the_store_package_does_not_re_export_db_names():
@@ -572,3 +579,133 @@ def test_open_db_for_reading_a_settled_db_creates_no_sidecars(repo):
     db.open_db_for_reading(repo).close()
 
     assert not any(path.exists() for path in sidecars)
+
+
+def _user_version(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _write_newer_db(path: Path) -> bytes:
+    """A bare SQLite file one schema version past this build's, with one
+    sentinel table; returns its bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE sentinel (x)")
+        conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    return path.read_bytes()
+
+
+def _data_tree() -> dict[str, bytes | None]:
+    """Every path under the data dir with its bytes (`None` for a directory)."""
+    root = paths.data_path()
+    if not root.exists():
+        return {}
+    return {
+        str(entry.relative_to(root)): entry.read_bytes() if entry.is_file() else None
+        for entry in sorted(root.rglob("*"))
+    }
+
+
+def test_a_new_db_is_stamped_with_the_schema_version_and_reopening_keeps_it(repo):
+    db.open_db(repo).close()
+    assert _user_version(paths.db_path()) == db.SCHEMA_VERSION == 1
+
+    db.open_db(repo).close()
+    assert _user_version(paths.db_path()) == 1
+
+
+def test_an_unstamped_db_with_the_current_tables_is_stamped_and_keeps_its_rows(repo):
+    path = paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    built.executescript(db._SCHEMA)
+    built.execute(
+        "INSERT INTO projects (repo_dir, created_at) VALUES ('/kept', ?)", (_STAMP,)
+    )
+    built.commit()
+    built.close()
+    assert _user_version(path) == 0
+
+    conn = db.open_db(repo)
+    try:
+        kept = [row["repo_dir"] for row in conn.execute("SELECT repo_dir FROM projects")]
+    finally:
+        conn.close()
+
+    assert kept == ["/kept"]
+    assert _user_version(path) == 1
+
+
+def test_open_db_refuses_a_newer_db_and_leaves_it_untouched(repo):
+    path = paths.db_path()
+    before = _write_newer_db(path)
+
+    with pytest.raises(db.StoreSchemaError) as raised:
+        db.open_db(repo)
+
+    message = str(raised.value)
+    assert str(path) in message
+    assert str(db.SCHEMA_VERSION + 1) in message
+    assert str(db.SCHEMA_VERSION) in message
+    assert "older" in message
+    assert path.read_bytes() == before
+    assert _user_version(path) == db.SCHEMA_VERSION + 1
+    conn = sqlite3.connect(path)
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+    assert tables == {"sentinel"}
+
+
+def test_open_db_for_reading_refuses_a_newer_db_and_creates_nothing(repo):
+    _write_newer_db(paths.db_path())
+    before = _data_tree()
+
+    with pytest.raises(db.StoreSchemaError):
+        db.open_db_for_reading(repo)
+
+    assert _data_tree() == before
+
+
+def test_open_db_creates_the_meta_table(repo):
+    conn = db.open_db(repo)
+    try:
+        info = conn.execute("PRAGMA table_info(meta)").fetchall()
+    finally:
+        conn.close()
+    assert [row["name"] for row in info] == ["key", "value"]
+    by_name = {row["name"]: row for row in info}
+    assert (by_name["key"]["type"], by_name["key"]["pk"]) == ("TEXT", 1)
+    assert (by_name["value"]["type"], by_name["value"]["notnull"]) == ("TEXT", 1)
+
+
+def test_open_db_for_reading_stamps_an_unstamped_db_and_reads_its_rows(repo):
+    # Review Focus 3: the current tables at user_version 0 fall through to
+    # `open_db`, which stamps the file; the rows are still read.
+    path = paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    built.executescript(db._SCHEMA)
+    built.execute(
+        "INSERT INTO projects (repo_dir, created_at) VALUES ('/kept', ?)", (_STAMP,)
+    )
+    built.commit()
+    built.close()
+
+    conn = db.open_db_for_reading(repo)
+    try:
+        kept = [row["repo_dir"] for row in conn.execute("SELECT repo_dir FROM projects")]
+    finally:
+        conn.close()
+
+    assert kept == ["/kept"]
+    assert _user_version(path) == db.SCHEMA_VERSION
