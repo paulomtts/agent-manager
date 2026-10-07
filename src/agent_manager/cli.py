@@ -367,7 +367,8 @@ def status_payload(
     once, at the edge, the same way `run_card`'s `worktree` is handled. Field
     names are `models.py`'s and are not renamed for display. `control` is
     `control_view`'s result; `None` renders as no lease and no requests, so
-    the key is always present (C12).
+    the key is always present (C12). `warnings` lists the run's recorded
+    `isolation_warning`, or is empty (A5).
     """
     tree = run.model_dump()
     return {
@@ -380,6 +381,9 @@ def status_payload(
         "control": {"lease": None, "requests": [], "claims": []}
         if control is None
         else control,
+        "warnings": []
+        if run.config.isolation_warning is None
+        else [run.config.isolation_warning],
     }
 
 

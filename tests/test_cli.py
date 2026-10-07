@@ -58,6 +58,7 @@ from agent_manager import (
     store as store_module,
 )
 from agent_manager.errors import AgentPhaseFailed
+from agent_manager.harness import launcher
 from agent_manager.runtime.errors import EngineError
 from agent_manager.runtime.walk import SubtaskSummary
 from agent_manager.steps.reducers import verification_gate
@@ -362,6 +363,30 @@ def test_the_status_header_of_a_story_run_carries_its_story_id_through_render():
     assert payload["run"]["story_id"] == story
     assert data["run"]["story_id"] == story
     assert set(data["run"]) == STATUS_HEADER_KEYS
+
+
+FALLBACK = launcher.ISOLATION_NONE_WARNING
+"""`--isolation auto`'s warning when neither bwrap nor unshare can start."""
+
+
+def test_the_status_payload_shows_a_recorded_isolation_warning_at_the_top_level():
+    """A5 spec test 10: `warnings` is a top-level key; the header is unchanged."""
+    run = _pure_run([])
+    run.config = models.RunConfig(isolation_warning=FALLBACK)
+
+    payload = cli.status_payload(run)
+
+    assert payload["warnings"] == [FALLBACK]
+    assert set(payload["run"]) == STATUS_HEADER_KEYS
+    assert not CONFIG_ONLY_KEYS & set(payload["run"])
+
+
+@pytest.mark.parametrize("mode", ["direct", "bwrap", "unshare"])
+def test_the_status_payload_of_a_run_without_a_warning_has_empty_warnings(mode):
+    run = _pure_run([])
+    run.config = models.RunConfig(launcher=mode)
+
+    assert cli.status_payload(run)["warnings"] == []
 
 
 def _pure_subtask(card_id: str, phases: list[models.PhaseRun]) -> models.SubtaskRun:
@@ -4418,6 +4443,8 @@ def _record(
     story_id: str | None = None,
     verify: tuple[str, ...] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
 ) -> None:
     """One run -- story, subtask, and optionally two phases and two attempts --
     in `root`'s projection, written the only way this program writes rows. The
@@ -4439,6 +4466,8 @@ def _record(
                     story_id=story_id,
                     verify=list(verify),
                     allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
                 ),
                 milestone_id=milestone_id,
             )
@@ -4773,6 +4802,21 @@ def test_status_on_a_story_run_shows_its_story_id_and_no_config(projection):
     assert header["story_id"] == RUNS_STORY_ID
     assert header["workflow"] == "milestone"
     assert set(header) == STATUS_HEADER_KEYS
+
+
+def test_am_status_shows_a_recorded_isolation_warning(projection):
+    """A5 spec test 10, CLI: how a detached fallback run still says it."""
+    run_id = "20260923T090000Z-cbe34d00"
+    _record(
+        projection, run_id, started_at=RECORDED_AT, status="started", isolation_warning=FALLBACK
+    )
+
+    result = runner.invoke(cli.app, ["status", run_id, "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["warnings"] == [FALLBACK]
+    assert set(data["run"]) == STATUS_HEADER_KEYS
 
 
 def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_id_lease_and_progress(projection):
