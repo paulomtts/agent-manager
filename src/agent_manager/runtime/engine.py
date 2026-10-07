@@ -25,6 +25,7 @@ from agent_manager.runtime import context
 from agent_manager.runtime.state import Adoption, RunDeps, current_run
 from agent_manager.runtime.stop import StopSignal
 from agent_manager.steps import worktree
+from agent_manager.store import db as store_db
 from agent_manager.workflow.phases import Workflow
 
 if TYPE_CHECKING:
@@ -142,6 +143,10 @@ async def run_subtask_async(
     phase is not started, and the subtask is recorded `stopped before
     <phase>`. A trigger after the last phase finished changes nothing: the
     subtask ends `done`.
+
+    A `StoreBusyError` from any write of the walk -- a phase or attempt
+    record, a checkpoint save -- ends it at that write: `stop` is triggered
+    with `story_id`, nothing more is written, and the same error is raised.
 
     `resume_from` continues from a saved checkpoint instead of the first phase:
     the agent is rebuilt from it, so the pool (seed and earlier results) and
@@ -325,6 +330,14 @@ async def _run(agent: Agent, deps: RunDeps) -> walk.SubtaskSummary:
         # A missing runner or an unresolvable input: a wiring or workflow bug
         # raised to the caller, `.phase`/`.parameter` intact.
         # Not an escalation, so no checkpoint row.
+        raise
+    except store_db.StoreBusyError:
+        # A store write gave up after its retry budget. Nothing more is
+        # written for this subtask -- no checkpoint, no phase, no subtask
+        # row -- so the newest committed `turn` row stays the one a resume
+        # continues from. The stop parks every agent on the signal.
+        if deps.stop is not None:
+            deps.stop.trigger(deps.story_id)
         raise
     except Exception as error:
         _collect(agent, deps, summary)
