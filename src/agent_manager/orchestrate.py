@@ -1624,6 +1624,8 @@ def preflight_milestone(
     max_concurrent: int = 1,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
     resume_run_id: str | None = None,
     driver: Driver | None = None,
@@ -1643,6 +1645,10 @@ def preflight_milestone(
     as its config's suite and opt-out (its other config fields are the
     recorded ones), and refreshes git later, under the lease. The store is
     never opened here.
+
+    `launcher` and `isolation_warning` are what `cli` resolved (A5): a fresh
+    run records them, `None` recording `direct`; a resume replaces the
+    recorded pair only when `launcher` is given, else keeps it.
 
     A resumed run whose `config.story_id` is set is a story run: its story
     must still be a child of the milestone (else `runs.NotResumableError`,
@@ -1710,23 +1716,29 @@ def preflight_milestone(
                 max_concurrent_stories=max_concurrent,
                 verify=list(commands),
                 allow_no_verification=allow_no_verification,
+                launcher="direct" if launcher is None else launcher,
+                isolation_warning=isolation_warning,
             ),
             milestone_id=milestone_card.id,
         )
     else:
         run_id = resumed.id
+        config_update: dict[str, Any] = {
+            "verify": list(commands),
+            "allow_no_verification": allow_no_verification,
+        }
+        if launcher is not None:
+            # `cli.resume_run` decided the mode: restored and re-probed, or
+            # `--isolation none`. `None` keeps the recorded mode and warning.
+            config_update["launcher"] = launcher
+            config_update["isolation_warning"] = isolation_warning
         # Stamps a run recorded before `milestone_id` existed, so the next
         # resume no longer needs the short-id fallback.
         run_record = resumed.model_copy(
             update={
                 "status": "started",
                 "milestone_id": milestone_card.id,
-                "config": resumed.config.model_copy(
-                    update={
-                        "verify": list(commands),
-                        "allow_no_verification": allow_no_verification,
-                    }
-                ),
+                "config": resumed.config.model_copy(update=config_update),
             }
         )
     return MilestonePreflight(
@@ -1861,6 +1873,8 @@ def preflight_story(
     branch_prefix: str,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
     driver: Driver | None = None,
 ) -> MilestonePreflight:
@@ -1910,6 +1924,8 @@ def preflight_story(
             story_id=match.story.id,
             verify=list(commands),
             allow_no_verification=allow_no_verification,
+            launcher="direct" if launcher is None else launcher,
+            isolation_warning=isolation_warning,
         ),
         milestone_id=match.milestone.id,
     )
@@ -2203,6 +2219,8 @@ def run_milestone(
     branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2306,6 +2324,8 @@ def run_milestone(
             branch_prefix=branch_prefix,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
@@ -2347,6 +2367,8 @@ async def _run_milestone_async(
     branch_prefix: str | None = None,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2385,6 +2407,8 @@ async def _run_milestone_async(
         max_concurrent=max_concurrent,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         resume_run_id=resume_run_id,
         driver=driver,
@@ -2409,6 +2433,8 @@ def run_story(
     branch_prefix: str,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2437,6 +2463,8 @@ def run_story(
             branch_prefix=branch_prefix,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
@@ -2453,6 +2481,8 @@ async def _run_story_async(
     branch_prefix: str,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2466,6 +2496,8 @@ async def _run_story_async(
         branch_prefix=branch_prefix,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
     )
@@ -2531,6 +2563,8 @@ def detach_milestone(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     max_concurrent: int = 1,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
@@ -2551,6 +2585,8 @@ def detach_milestone(
         max_concurrent=max_concurrent,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
     )
@@ -2573,6 +2609,8 @@ def detach_story(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2592,6 +2630,8 @@ def detach_story(
         branch_prefix=branch_prefix,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         clock=clock,
         driver=driver,
     )
@@ -2887,6 +2927,8 @@ def run_board_engine(
     *,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2913,6 +2955,8 @@ def run_board_engine(
             root=pre.root,
             commands=commands,
             allow_no_verification=allow_no_verification,
+            launcher=launcher,
+            isolation_warning=isolation_warning,
             runner_factory=runner_factory,
             driver=driver,
             clock=clock,
@@ -2935,6 +2979,8 @@ def run_board(
     branch_prefix_of: Callable[[models.CardNode], str],
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
     clock: Callable[[], datetime] = _utcnow,
@@ -2994,6 +3040,8 @@ def run_board(
         pre,
         commands=commands,
         allow_no_verification=allow_no_verification,
+        launcher=launcher,
+        isolation_warning=isolation_warning,
         runner_factory=runner_factory,
         driver=driver,
         clock=clock,
@@ -3019,6 +3067,8 @@ def detach_board(
     detacher: detach.Detacher,
     commands: Sequence[str] = (),
     allow_no_verification: bool = False,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     max_concurrent: int = 1,
     runner_factory: runs.RunnerFactory | None = None,
     driver: Driver | None = None,
@@ -3068,6 +3118,8 @@ def detach_board(
                 pre,
                 commands=commands,
                 allow_no_verification=allow_no_verification,
+                launcher=launcher,
+                isolation_warning=isolation_warning,
                 runner_factory=runner_factory,
                 driver=driver,
                 clock=clock,
@@ -3098,6 +3150,8 @@ async def _run_board_async(
     root: Path,
     commands: Sequence[str],
     allow_no_verification: bool,
+    launcher: models.Launcher | None = None,
+    isolation_warning: str | None = None,
     runner_factory: runs.RunnerFactory | None,
     driver: Driver | None,
     clock: Callable[[], datetime],
@@ -3147,6 +3201,8 @@ async def _run_board_async(
                     branch_prefix=prefixes[card.id],
                     commands=commands,
                     allow_no_verification=allow_no_verification,
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
                     runner_factory=runner_factory,
                     driver=driver,
                     clock=clock,

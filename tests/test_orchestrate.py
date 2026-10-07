@@ -4542,6 +4542,8 @@ def _record_resume_run(
     status: str = "escalated",
     base_branch: str = "main",
     verify: tuple[str, ...] = (),
+    launcher: models.Launcher = "direct",
+    isolation_warning: str | None = None,
 ) -> None:
     opened = store_module.Store.open(root, run_id)
     try:
@@ -4553,7 +4555,12 @@ def _record_resume_run(
                 base_branch=base_branch,
                 branch_prefix=PREFIX,
                 status=status,
-                config=models.RunConfig(max_concurrent_stories=3, verify=list(verify)),
+                config=models.RunConfig(
+                    max_concurrent_stories=3,
+                    verify=list(verify),
+                    launcher=launcher,
+                    isolation_warning=isolation_warning,
+                ),
             )
         )
     finally:
@@ -8773,6 +8780,155 @@ def test_every_fresh_milestone_story_and_board_entry_hands_the_suite_to_its_pref
     assert kwargs["allow_no_verification"] is True
 
 
+FALLBACK_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+def test_preflight_milestone_records_the_launcher_and_its_warning(
+    tmp_path, monkeypatch, fake_board
+):
+    """A5 spec test 17, fresh run: omitted records `direct` and no warning."""
+    root = _resume_root(tmp_path, monkeypatch)
+    shape = _milestone(root, {"A": 1})
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    fallback = _preflight_milestone(
+        root, shape["milestone"], launcher="direct", isolation_warning=FALLBACK_WARNING
+    )
+    isolated = _preflight_milestone(root, shape["milestone"], launcher="bwrap")
+    default = _preflight_milestone(root, shape["milestone"])
+
+    assert fallback.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, launcher="direct", isolation_warning=FALLBACK_WARNING
+    )
+    assert isolated.run_record.config == models.RunConfig(
+        max_concurrent_stories=1, launcher="bwrap"
+    )
+    assert default.run_record.config == models.RunConfig(max_concurrent_stories=1)
+
+
+def test_a_resumed_milestone_preflight_applies_a_passed_launcher_and_keeps_the_record_otherwise(
+    tmp_path, monkeypatch, fake_board
+):
+    """A5 spec test 17, resume branch: `None` keeps the recorded mode and warning."""
+    root = _resume_root(tmp_path, monkeypatch)
+    _seam_resume_board(fake_board)
+    _record_resume_run(root, launcher="direct", isolation_warning=FALLBACK_WARNING)
+    monkeypatch.setattr(orchestrate, "refresh_git", _no_refresh)
+
+    kept = orchestrate.preflight_milestone(None, repo_dir=root, resume_run_id=RESUME_RUN_ID)
+    replaced = orchestrate.preflight_milestone(
+        None,
+        repo_dir=root,
+        resume_run_id=RESUME_RUN_ID,
+        launcher="unshare",
+        isolation_warning=None,
+    )
+
+    assert (kept.run_record.config.launcher, kept.run_record.config.isolation_warning) == (
+        "direct",
+        FALLBACK_WARNING,
+    )
+    assert replaced.run_record.config == models.RunConfig(
+        max_concurrent_stories=3, launcher="unshare"
+    )
+
+
+def test_preflight_story_records_the_launcher_and_its_warning(tmp_path, monkeypatch, fake_board):
+    """A5 spec test 18."""
+    root = _resume_root(tmp_path, monkeypatch)
+    milestone = fake_board.add_card("Milestone 3: orchestration")
+    story, _subtasks = _seed_story(fake_board, milestone, "Story B: cols")
+    monkeypatch.setattr(orchestrate, "refresh_git", lambda at: None)
+
+    pre = _preflight_story(root, story, launcher="direct", isolation_warning=FALLBACK_WARNING)
+    default = _preflight_story(root, story)
+
+    assert pre.run_record.config == models.RunConfig(
+        max_concurrent_stories=1,
+        story_id=story,
+        launcher="direct",
+        isolation_warning=FALLBACK_WARNING,
+    )
+    assert default.run_record.config == models.RunConfig(max_concurrent_stories=1, story_id=story)
+
+
+@pytest.mark.parametrize(
+    "entry", ["run_milestone", "detach_milestone", "board", "run_story", "detach_story"]
+)
+def test_every_fresh_entry_hands_the_launcher_and_its_warning_to_its_preflight(
+    tmp_path, monkeypatch, entry
+):
+    """`board` is `_run_milestone_async`, the call every board milestone goes through."""
+    common: dict[str, Any] = {
+        "repo_dir": tmp_path,
+        "base_branch": "main",
+        "branch_prefix": PREFIX,
+        "launcher": "direct",
+        "isolation_warning": FALLBACK_WARNING,
+    }
+    entries: dict[str, tuple[str, Callable[[], Any]]] = {
+        "run_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.run_milestone("M", **common),
+        ),
+        "detach_milestone": (
+            "preflight_milestone",
+            lambda: orchestrate.detach_milestone("M", detacher=_FakeDetacher(), **common),
+        ),
+        "board": (
+            "preflight_milestone",
+            lambda: asyncio.run(orchestrate._run_milestone_async("M", **common)),
+        ),
+        "run_story": ("preflight_story", lambda: orchestrate.run_story("S", **common)),
+        "detach_story": (
+            "preflight_story",
+            lambda: orchestrate.detach_story("S", detacher=_FakeDetacher(), **common),
+        ),
+    }
+    name, call = entries[entry]
+    seen: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached(name)
+
+    monkeypatch.setattr(orchestrate, name, capture)
+
+    with pytest.raises(_PreflightReached):
+        call()
+
+    [kwargs] = seen
+    assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", FALLBACK_WARNING)
+
+
+def test_a_resumed_run_milestone_hands_the_launcher_to_its_preflight(tmp_path, monkeypatch):
+    seen: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise _PreflightReached("preflight_milestone")
+
+    monkeypatch.setattr(orchestrate, "preflight_milestone", capture)
+
+    with pytest.raises(_PreflightReached):
+        orchestrate.run_milestone(
+            None,
+            repo_dir=tmp_path,
+            launcher="direct",
+            isolation_warning=None,
+            resume_run_id=RESUME_RUN_ID,
+        )
+
+    [kwargs] = seen
+    assert (kwargs["launcher"], kwargs["isolation_warning"], kwargs["resume_run_id"]) == (
+        "direct",
+        None,
+        RESUME_RUN_ID,
+    )
+
+
 def test_preflight_story_selects_a_story_by_title_piece_with_the_default_driver(
     tmp_path, monkeypatch, fake_board
 ):
@@ -10820,3 +10976,22 @@ def test_a_refused_detached_story_run_forks_nothing(
     assert fake.calls == []
     assert _run_dirs() == []
     assert _run_ids(root) == []
+
+
+@pytest.mark.parametrize("form", ["run_board", "detach_board"])
+def test_a_board_run_hands_the_launcher_and_its_warning_to_every_milestone(board_seams, form):
+    """A5 B1: one resolution for the whole board, recorded on every milestone run."""
+    one, two = _board_milestone(1), _board_milestone(2)
+    board_seams.cards = [one, two]
+    isolation: dict[str, Any] = {"launcher": "direct", "isolation_warning": FALLBACK_WARNING}
+
+    if form == "run_board":
+        _board(board_seams, **isolation)
+    else:
+        fake = _FakeDetacher()
+        _detach_board(board_seams, fake, **isolation)
+        fake.body()
+
+    assert sorted(board_seams.runs.called()) == sorted([one.id, two.id])
+    for _milestone_id, kwargs in board_seams.runs.calls:
+        assert (kwargs["launcher"], kwargs["isolation_warning"]) == ("direct", FALLBACK_WARNING)
