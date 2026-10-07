@@ -3267,8 +3267,10 @@ def test_an_integrate_escalation_exits_one_with_an_ok_envelope(tmp_path, monkeyp
         # Spec X7: another process held a project lock past its timeout before
         # the run started (e.g. `refresh_git`'s git lock).
         locks.LockTimeoutError(Path("/data/projects/abc.git.lock"), 600.0),
+        # Card 7ffee8c4: a write stayed busy through its whole retry budget.
+        store_db.StoreBusyError("beat", 5, 10.0),
     ],
-    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError"],
+    ids=["CliError", "BoardError", "ValueError", "LockTimeoutError", "StoreBusyError"],
 )
 def test_a_handled_error_from_a_milestone_run_is_an_envelope(tmp_path, monkeypatch, error):
     """Spec test 5: every `HANDLED` refusal is `ok: false` at exit 3."""
@@ -12143,6 +12145,12 @@ def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
     assert isinstance(store_journal.CorruptJournalError("torn"), cli.HANDLED)
     assert not isinstance(store_journal.MissingJournalError("gone"), cli.HANDLED)
     assert not isinstance(store_journal.JournalError("other"), cli.HANDLED)
+
+
+def test_handled_takes_store_busy_error():
+    """A write that stayed busy through its whole retry budget is a refusal,
+    not a bug: it gets the exit-3 envelope, not a traceback."""
+    assert isinstance(store_db.StoreBusyError("beat", 5, 10.0), cli.HANDLED)
 
 
 @pytest.mark.parametrize(

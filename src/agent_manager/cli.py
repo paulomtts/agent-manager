@@ -1452,6 +1452,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     store_journal.CorruptJournalError,
     store_db.StoreSchemaError,
     store_db.MigrationRequiredError,
+    store_db.StoreBusyError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1471,7 +1472,10 @@ is a refusal naming the file and line, not a bug; only that subclass, not
 not a bug. `store_db.MigrationRequiredError` is in it because every command
 that opens the projection refuses, naming `am migrate`, on a machine whose
 per-project databases have not been migrated; it is raised before anything is
-written. Anything outside this tuple is a bug in this program
+written. `store_db.StoreBusyError` is in it because a write that stayed busy or
+locked through `store_db.run_with_retry`'s whole budget is a refusal naming the
+operation and the budget, not a bug: the lease goes stale and the run is
+resumable. Anything outside this tuple is a bug in this program
 and should crash loudly with its stack intact.
 """
 
