@@ -427,9 +427,12 @@ def open_db_for_reading(root: Path) -> sqlite3.Connection:
 
     `root` does not choose the file, as for `open_db`. No `am.db`: an
     in-memory, empty projection with the current schema, and nothing is
-    created on disk. An existing database with the current schema: opened `mode=ro`, so it can never be written or created;
-    its rows are read live alongside a writer in WAL mode. An existing database
-    with an older schema: `open_db`, which migrates it as before. A
+    created on disk. An existing database with the current schema: opened
+    read-only through `_read_only_uri`, so it can never be written or
+    created; `mode=ro` while a writer has it open (its rows are read live in
+    WAL mode), `immutable=1` when no `-wal`/`-shm` exists (the rows as they
+    were at open). An existing database with an older schema: `open_db`,
+    which migrates it as before. A
     `user_version` above `SCHEMA_VERSION` raises `StoreSchemaError` with
     nothing created; below it, or missing tables or columns, is "an older
     schema".
