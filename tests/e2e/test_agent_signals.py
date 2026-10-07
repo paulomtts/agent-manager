@@ -238,3 +238,80 @@ def test_under_bwrap_an_agents_pkill_reaches_neither_the_engine_nor_the_stand_in
         _isolated_pkills(verify),
         _isolated_pkills(verify),
     ]
+
+
+def _lease(root: Path, run_id: str) -> store.LeaseRow | None:
+    conn = store.open_db(cli.resolve_repo_dir(root))
+    try:
+        return store.read_lease(conn, run_id)
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def detached_pids():
+    """Every detached engine the test started; its whole session is killed at teardown."""
+    pids: list[int] = []
+    yield pids
+    for pid in pids:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.e2e_fake
+def test_under_bwrap_a_detached_engine_survives_its_agents_pkill(
+    bwrap_ready,
+    milestone_board,
+    fake_claude_bin,
+    hold,
+    pkill_marker,
+    am_processes,
+    spawn_am_console,
+    finish_am,
+    read_fake_log,
+    detached_pids,
+):
+    root = milestone_board["root"]
+    story = milestone_board["stories"]["A"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    verify = _verify_text()
+    pkill_marker.write_text(json.dumps([verify, ""]), encoding="utf-8")
+    stand_in = _stand_in(am_processes, verify)
+    hold.arm()
+    hold.release(a2)  # only a1's implement is held
+
+    child = spawn_am_console(*_story_argv(root, story, verify, "bwrap", detach=True))
+    code, envelope = finish_am(child)
+
+    assert code == 0, (envelope, am_processes.stderr_of(child))
+    assert envelope["ok"] is True, envelope
+    data = envelope["data"]
+    assert data["detached"] is True, data
+    pid, run_id = data["pid"], data["run_id"]
+    detached_pids.append(pid)
+
+    _until(lambda: hold.held_marker(a1).exists(), "a1's implement being held")
+    lease = _lease(root, run_id)
+    assert lease is not None, run_id
+    # The pid read below is the detached engine's, not a stale or foreign one.
+    assert lease.pid == pid
+    assert os.getsid(pid) == pid
+    _assert_neutral(lease.pid, verify)
+    assert stand_in.poll() is None
+
+    hold.release(a1)
+    report = paths.data_dir() / "runs" / run_id / detach.REPORT_NAME
+    _until(report.exists, "report.json appearing")
+    final = json.loads(report.read_text(encoding="utf-8"))
+    assert final["ok"] is True, final
+    assert final["data"]["done"] is True, final
+    _until(lambda: _lease(root, run_id) is None, "the engine releasing its lease")
+
+    assert stand_in.poll() is None
+    assert _recorded_launcher(root, run_id) == "bwrap"
+    assert _implement_pkills(read_fake_log(run_id)) == [
+        _isolated_pkills(verify),
+        _isolated_pkills(verify),
+    ]
