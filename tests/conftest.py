@@ -43,6 +43,7 @@ from pathlib import Path, PurePath
 import pytest
 
 from agent_manager import board
+from agent_manager.harness import launcher as harness_launcher
 
 
 def _real_data_dir() -> Path:
@@ -364,6 +365,42 @@ def unit_tier_path_shim(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
         return
     bin_dir = request.getfixturevalue("unit_tier_stub_dir")
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}")
+
+
+_PROBE_TIERS = frozenset({"e2e_fake", "e2e", "soak"})
+"""Tiers whose tests run the real isolation probe (A5 test harness rule)."""
+
+_LAUNCHER_TESTS = "harness/test_launcher.py"
+"""The module that manages the probe cache itself and tests the real runner."""
+
+
+def stubs_isolation_probe(markers: Iterable[str], rel_path: PurePath | None) -> bool:
+    """Whether an item gets the stubbed probe: not in a process tier, not the launcher tests."""
+    if _PROBE_TIERS.intersection(markers):
+        return False
+    return rel_path is None or rel_path.as_posix() != _LAUNCHER_TESTS
+
+
+@pytest.fixture(autouse=True)
+def stubbed_isolation_probe(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Generator[None, None, None]:
+    """Make every isolation mode "available" without spawning a probe.
+
+    `probe` caches per process and `bwrap`/`unshare` are not among the PATH
+    stubs, so without this a unit or git test resolving `--isolation auto`
+    would spawn the real probe, and its answer would leak into every later
+    test. The cache is cleared before and after; a test that needs
+    "unavailable" patches `default_probe_runner` itself, after this runs.
+    """
+    markers = [mark.name for mark in request.node.iter_markers()]
+    if not stubs_isolation_probe(markers, relative_to_tests(request.path)):
+        yield
+        return
+    harness_launcher.clear_probe_cache()
+    monkeypatch.setattr(harness_launcher, "default_probe_runner", lambda argv: 0)
+    yield
+    harness_launcher.clear_probe_cache()
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
