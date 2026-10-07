@@ -865,3 +865,10 @@ def test_the_default_runner_gives_up_on_a_hung_probe(monkeypatch):
             [sys.executable, "-c", "import time; time.sleep(30)"]
         )
     assert time.monotonic() - started < 10.0
+
+
+def test_the_default_runner_puts_the_probe_in_a_session_of_its_own():
+    # Like every child of this module: a probe must not share the engine's
+    # session, so nothing it does can reach the engine's process group.
+    child = "import os, sys; sys.exit(0 if os.getsid(0) == os.getpid() else 5)"
+    assert launcher.default_probe_runner([sys.executable, "-c", child]) == 0
