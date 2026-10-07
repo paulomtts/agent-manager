@@ -146,6 +146,13 @@ def head(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
 
 
+def run_ids(conn: sqlite3.Connection) -> list[str]:
+    """Every distinct `run_id` in `events`, ascending, over every kind and
+    every project; `[]` when the table has no rows. Read-only."""
+    rows = conn.execute("SELECT DISTINCT run_id FROM events ORDER BY run_id").fetchall()
+    return [row[0] for row in rows]
+
+
 def journal_line(event: EventRow) -> store_journal.JournalLine:
     """The journal line `event` is: its `run_seq` is the line's `seq` and its
     `kind` the line's `event`; `ts`, coordinates and payload are the event's

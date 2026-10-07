@@ -312,12 +312,14 @@ class VerbatimJournal:
 
 
 class UnimportableLineError(JournalError):
-    """Line `line` (1-based) of the journal at `path` cannot be imported as it is."""
+    """Line `line` (1-based) of the journal at `path` cannot be imported as it
+    is; `why` is the reason, the message without its `path:line: ` prefix."""
 
     def __init__(self, path: Path, line: int, why: str) -> None:
         super().__init__(f"{path}:{line}: {why}")
         self.path = path
         self.line = line
+        self.why = why
 
 
 def _is_int(value: object) -> bool:

@@ -843,7 +843,9 @@ def _first(seq: int = 1) -> dict[str, object]:
 def test_unimportable_line_error_is_a_journal_error():
     assert issubclass(store_journal.UnimportableLineError, store_journal.JournalError)
     error = store_journal.UnimportableLineError(Path("/x/journal.jsonl"), 3, "why")
-    assert (error.path, error.line, str(error)) == (Path("/x/journal.jsonl"), 3, "/x/journal.jsonl:3: why")
+    assert (error.path, error.line, error.why, str(error)) == (
+        Path("/x/journal.jsonl"), 3, "why", "/x/journal.jsonl:3: why"
+    )
 
 
 def test_read_verbatim_keeps_the_ts_string_and_maps_every_field():
