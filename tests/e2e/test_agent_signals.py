@@ -185,3 +185,56 @@ def test_without_isolation_the_agents_pkill_kills_a_matching_process_but_not_the
         [{"pattern": verify, "returncode": 0}],
         [{"pattern": verify, "returncode": 1}],
     ]
+
+
+def _isolated_pkills(verify: str) -> list[dict[str, Any]]:
+    """What one implement records inside bwrap: the verify pattern reached
+    nothing (1); the empty pattern really ran and matched in-namespace processes (0)."""
+    return [
+        {"pattern": verify, "returncode": 1},
+        {"pattern": "", "returncode": 0},
+    ]
+
+
+@pytest.mark.e2e_fake
+def test_under_bwrap_an_agents_pkill_reaches_neither_the_engine_nor_the_stand_in(
+    bwrap_ready,
+    milestone_board,
+    fake_claude_bin,
+    hold,
+    pkill_marker,
+    am_processes,
+    spawn_am_console,
+    finish_am,
+    wait_for_file,
+    read_fake_log,
+):
+    root = milestone_board["root"]
+    story = milestone_board["stories"]["A"]
+    a1, a2 = milestone_board["subtasks"]["A"]
+    verify = _verify_text()
+    pkill_marker.write_text(json.dumps([verify, ""]), encoding="utf-8")
+    stand_in = _stand_in(am_processes, verify)
+    hold.arm()
+    hold.release(a2)  # only a1's implement is held
+
+    child = spawn_am_console(*_story_argv(root, story, verify, "bwrap"))
+    wait_for_file(hold.held_marker(a1), child)
+
+    _assert_neutral(child.pid, verify)
+    assert stand_in.poll() is None
+
+    hold.release(a1)
+    code, envelope = finish_am(child)
+
+    # 0, not -SIGTERM or -SIGKILL: the engine lived through both pkills.
+    assert code == 0, (envelope, am_processes.stderr_of(child))
+    assert envelope["ok"] is True, envelope
+    data = envelope["data"]
+    assert data["done"] is True, data
+    assert stand_in.poll() is None
+    assert _recorded_launcher(root, data["run_id"]) == "bwrap"
+    assert _implement_pkills(read_fake_log(data["run_id"])) == [
+        _isolated_pkills(verify),
+        _isolated_pkills(verify),
+    ]
