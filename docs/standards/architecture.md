@@ -125,7 +125,7 @@ All 50 `.py` files (44 modules plus 6 `__init__.py`) appear here exactly once. `
 | 5.3 | `cli/` | `import typer` | holds (`cli.py:34`) |
 | 5.4 | `store/` | `import sqlite3`, SQL, transaction boundaries (`immediate`, `commit`) | **violated:** `cli.py:24,3129`, `control.py:20,210,251` |
 | 5.5 | `board.py` | builds or runs a `brd` argv | holds (`board.py:44-135`) |
-| 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:146`) |
+| 5.6 | `harness/launcher.py` | spawns a harness (`subprocess.Popen`). `harness/<name>.py` only builds the argv. | holds (`harness/launcher.py:150`) |
 | 5.7 | `steps/worktree.py` (`run_git`) | runs `git`. Everyone else calls `worktree.run_git`. | holds |
 | 5.8 | `steps/verify.py` | runs the card's verification commands | holds |
 | 5.9 | `detach.py` | `os.fork`, `os.setsid` | holds (`detach.py:149,170`) |

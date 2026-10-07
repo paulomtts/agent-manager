@@ -25,9 +25,11 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
+from agent_manager.errors import IsolationUnavailableError
 from agent_manager.harness.base import Outcome
 from agent_manager.models import Launcher
 
@@ -321,3 +323,112 @@ def get_launcher(kind: Launcher) -> LauncherFn:
     if implementation is None:
         raise UnsupportedLauncherError(kind, reason=_SEAM_REASON)
     return implementation
+
+
+ProbeRunner = Callable[[list[str]], int]
+"""Runs an argv and returns its exit code; injected so tests spawn nothing."""
+
+PROBE_TIMEOUT = 10.0
+"""Seconds a probe gets. `<form> true` takes milliseconds when it works."""
+
+_PROBEABLE = ("bwrap", "unshare")
+
+_probe_cache: dict[str, str | None] = {}
+"""`probe`'s per-process memory, failures included: one probe per mode."""
+
+
+def default_probe_runner(argv: list[str]) -> int:
+    """Run `argv` silently and return its exit code.
+
+    `cwd="/"` so the probe does not depend on the engine's own cwd still
+    existing; its own session, like every child of this module. `OSError` and
+    `TimeoutExpired` propagate: `probe` turns them into reasons.
+    """
+    return subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd="/",
+        start_new_session=True,
+        timeout=PROBE_TIMEOUT,
+        check=False,
+    ).returncode
+
+
+def probe(mode: str, *, runner: ProbeRunner | None = None) -> str | None:
+    """`None` if this host can start `mode`, else a one-line reason.
+
+    Runs `wrap_argv(mode, ["true"], Path("/"))` once per process: the first
+    answer for a mode, failure included, is cached and every later call returns
+    it without running anything, whichever `runner` it is given. The reason
+    starts with the probe argv, so an operator can rerun it by hand. An
+    exception other than `OSError` or `TimeoutExpired` is a bug, not
+    "unavailable": it propagates and nothing is cached.
+    """
+    if mode not in _PROBEABLE:
+        raise ValueError(f"only bwrap and unshare can be probed, not {mode!r}")
+    if mode in _probe_cache:
+        return _probe_cache[mode]
+    argv = wrap_argv(mode, ["true"], Path("/"))
+    shown = " ".join(argv)
+    run = default_probe_runner if runner is None else runner
+    try:
+        exit_code = run(argv)
+        reason = None if exit_code == 0 else f"{shown} exited {exit_code}"
+    except subprocess.TimeoutExpired:
+        reason = f"{shown} timed out after {PROBE_TIMEOUT:g}s"
+    except OSError as error:
+        reason = f"{shown} could not start: {error}"
+    _probe_cache[mode] = reason
+    return reason
+
+
+def clear_probe_cache() -> None:
+    """Forget every cached probe result. Tests only; production never clears."""
+    _probe_cache.clear()
+
+
+IsolationRequest = Literal["auto", "bwrap", "unshare", "none"]
+"""What an operator can ask for; `resolve_isolation` turns it into a `Launcher`."""
+
+ISOLATION_NONE_WARNING = (
+    "isolation: none (bwrap and unshare are unavailable): agents can signal the engine"
+)
+
+
+@dataclass(frozen=True)
+class Isolation:
+    """The launcher mode a run uses, and the warning to surface if any."""
+
+    mode: Launcher
+    warning: str | None
+
+
+def resolve_isolation(
+    requested: str, *, runner: ProbeRunner | None = None
+) -> Isolation:
+    """Turn an isolation request into the launcher mode this host can run.
+
+    `none` probes nothing. An explicit `bwrap` or `unshare` probes only itself
+    and never falls back: an operator who named a mode gets it or an
+    `IsolationUnavailableError`. `auto` tries `bwrap`, then `unshare` (still
+    isolated, so no warning), then lands on `direct` with
+    `ISOLATION_NONE_WARNING`.
+    """
+    if requested == "none":
+        return Isolation("direct", None)
+    if requested == "bwrap" or requested == "unshare":
+        reason = probe(requested, runner=runner)
+        if reason is not None:
+            raise IsolationUnavailableError(requested, reason)
+        return Isolation(requested, None)
+    if requested == "auto":
+        if probe("bwrap", runner=runner) is None:
+            return Isolation("bwrap", None)
+        if probe("unshare", runner=runner) is None:
+            return Isolation("unshare", None)
+        return Isolation("direct", ISOLATION_NONE_WARNING)
+    raise ValueError(
+        f"isolation must be auto, bwrap, unshare or none, got {requested!r}"
+    )
