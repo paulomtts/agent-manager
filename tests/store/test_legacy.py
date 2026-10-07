@@ -3,6 +3,7 @@
 process is spawned, so these are unit tests.
 """
 
+import json
 import sqlite3
 import tempfile
 from collections.abc import Iterator
@@ -16,15 +17,19 @@ from legacyhelpers import (
     OLD_SCHEMA,
     STAMP,
     full_rows,
+    journal_line,
     lease_row,
     run_row,
     tree,
     write_db,
+    write_journal,
     write_wal_db,
 )
 
 from agent_manager import paths
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import legacy as store_legacy
 from agent_manager.store import projects as store_projects
@@ -331,3 +336,73 @@ def test_merge_reports_a_clashing_row_and_rolls_everything_back(tmp_path, am):
     assert _observe("SELECT * FROM projects") == []
     assert _observe("SELECT * FROM runs") == []
     assert _observe("SELECT * FROM meta WHERE key = ?", (store_db.MIGRATED_KEY,)) == []
+
+
+# -- import_order: the k-way merge on `ts` (single-store 1.3.2 D5) -----------
+
+
+def _t(second: int) -> str:
+    return f"2026-10-07T12:00:{second:02d}+00:00"
+
+
+def _verbatim(run_id: str, *stamps: str) -> store_journal.VerbatimJournal:
+    """A journal of `run_id` read from nowhere: one `run_upsert` line per
+    stamp, `run_seq` 1, 2, ... in stamp order."""
+    return store_journal.VerbatimJournal(
+        run_id=run_id,
+        path=Path(f"/nowhere/{run_id}/journal.jsonl"),
+        lines=tuple(
+            store_journal.VerbatimLine(
+                line=n, run_seq=n, ts=ts, kind="run_upsert", story_id=None,
+                card_id=None, phase=None, attempt=None, payload={"n": n},
+            )
+            for n, ts in enumerate(stamps, start=1)
+        ),
+        torn_line=None,
+    )
+
+
+def _order(journals: list[store_journal.VerbatimJournal]) -> list[tuple[str, int]]:
+    return [
+        (journal.run_id, line.run_seq)
+        for journal, line in store_legacy.import_order(journals)
+    ]
+
+
+def test_import_order_interleaves_by_ts_and_keeps_each_run_in_seq_order():
+    a = _verbatim("run-a", _t(1), _t(3))
+    b = _verbatim("run-b", _t(2), _t(4))
+
+    assert _order([a, b]) == [("run-a", 1), ("run-b", 1), ("run-a", 2), ("run-b", 2)]
+
+
+def test_import_order_keeps_a_runs_own_order_when_its_ts_goes_backwards():
+    a = _verbatim("run-a", _t(5), _t(1), _t(6))
+    b = _verbatim("run-b", _t(2), _t(3))
+
+    assert _order([a, b]) == [
+        ("run-b", 1), ("run-b", 2), ("run-a", 1), ("run-a", 2), ("run-a", 3),
+    ]
+
+
+def test_import_order_breaks_ties_by_run_id():
+    a = _verbatim("run-a", _t(1))
+    b = _verbatim("run-b", _t(1))
+
+    assert _order([b, a]) == [("run-a", 1), ("run-b", 1)]
+    assert _order([a, b]) == [("run-a", 1), ("run-b", 1)]
+
+
+def test_import_order_compares_instants_not_text():
+    # As text, "...00.50001+00:00" < "...00.5Z" and "...01.000001+00:00" < "...01Z";
+    # as instants both go the other way.
+    a = _verbatim("run-a", "2026-10-07T12:00:00.5Z", "2026-10-07T12:00:01Z")
+    b = _verbatim(
+        "run-b", "2026-10-07T12:00:00.50001+00:00", "2026-10-07T12:00:01.000001+00:00"
+    )
+
+    assert _order([a, b]) == [("run-a", 1), ("run-b", 1), ("run-a", 2), ("run-b", 2)]
+
+
+def test_import_order_of_no_journals_is_empty():
+    assert store_legacy.import_order([]) == []

@@ -2,6 +2,7 @@
 that leaves the file and its sidecars untouched, and all of them merged into
 `am.db` in one write transaction."""
 
+import heapq
 import shutil
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 
@@ -121,6 +123,33 @@ def read_legacy(path: Path) -> LegacyFile:
             raise LegacyUnreadableError(path) from error
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+ImportedLine = tuple[store_journal.VerbatimJournal, store_journal.VerbatimLine]
+"""One journal line to import, with the journal it is from."""
+
+
+def _instant(entry: ImportedLine) -> datetime:
+    return datetime.fromisoformat(entry[1].ts)
+
+
+def import_order(journals: Sequence[store_journal.VerbatimJournal]) -> list[ImportedLine]:
+    """Every line of `journals`, each with its journal, in the order `merge`
+    inserts them into `events`.
+
+    A k-way merge on `ts`: of the runs' next lines, the earliest instant goes
+    first (`datetime.fromisoformat`; `read_verbatim` admits only offset-aware
+    stamps), the smallest `run_id` on a tie, whatever order `journals` came
+    in. Only the runs' next lines are compared, so each run keeps its own
+    `run_seq` order even where its `ts` goes backwards.
+    """
+    runs = sorted(journals, key=lambda journal: journal.run_id)
+    return list(
+        heapq.merge(
+            *([(journal, line) for line in journal.lines] for journal in runs),
+            key=_instant,
+        )
+    )
 
 
 @dataclass(frozen=True)
