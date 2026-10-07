@@ -1296,7 +1296,8 @@ def project(tmp_path, monkeypatch) -> Path:
     )
     # `brd init` leaves its own `.gitignore`/`.brd` marker untracked; committing
     # them here keeps the fixture's baseline clean so a later porcelain check
-    # reflects only what `run_card` itself adds to the repo.
+    # reflects only what `run_card` itself adds to the repo. A brd that leaves
+    # nothing untracked makes that commit empty, hence `--allow-empty`.
     _git(root, "add", "-A")
     _git(root, "commit", "--allow-empty", "-m", "brd init")
     return root
