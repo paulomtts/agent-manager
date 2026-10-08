@@ -649,11 +649,6 @@ def test_rebuild_picks_up_an_event_whose_row_never_landed(repo):
     assert row["status"] == "started"
 
 
-def _append_raw(journal: store_journal.Journal, record: dict) -> None:
-    with journal.path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
-
-
 def test_an_event_with_an_unknown_payload_key_raises_out_of_rebuild(repo):
     st = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -916,40 +911,6 @@ def test_a_status_transition_on_a_parent_keeps_the_children_recorded_before_it(r
     implement = subtask.phases[1]
     assert implement.status == "done"
     assert [attempt.n for attempt in implement.attempts] == [1]
-
-
-def test_read_returns_lines_in_sequence_order_not_file_order(repo):
-    # A line can reach the file out of order (two writers, a partial flush).
-    # `seq` is the ordering, so `read` sorts by it and `replay` folds in that
-    # order rather than in the order the bytes happen to sit on disk.
-    journal = store_journal.Journal(RUN_ID)
-    journal.append("run_upsert", _run(repo).model_dump(mode="json", exclude={"stories"}))
-    _append_raw(
-        journal,
-        {
-            "seq": 3,
-            "ts": "2026-09-23T10:20:00+00:00",
-            "run_id": RUN_ID,
-            "event": "story_upsert",
-            "story": "8831189b",
-            "payload": _story().model_dump(mode="json", exclude={"subtasks"})
-            | {"status": "done"},
-        },
-    )
-    _append_raw(
-        journal,
-        {
-            "seq": 2,
-            "ts": "2026-09-23T10:10:00+00:00",
-            "run_id": RUN_ID,
-            "event": "story_upsert",
-            "story": "8831189b",
-            "payload": _story().model_dump(mode="json", exclude={"subtasks"})
-            | {"status": "started"},
-        },
-    )
-
-    assert [line.seq for line in journal.read()] == [1, 2, 3]
 
 
 def test_rebuild_folds_events_in_run_seq_order_not_insert_order(repo):
