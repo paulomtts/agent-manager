@@ -74,7 +74,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
-The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)).
+The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)). `am export` without `--out` is a third: it prints a run's events as bare JSON lines, with no envelope (see [Exporting a run](#exporting-a-run)).
 
 ### Milestone runs
 
@@ -943,6 +943,37 @@ So the first line tells a stream from a refusal: only a refusal has an `"ok"` ke
 The hello line's `schema` is the stream's own version, `1` today. It is independent of the journal line's version and of the `am watch` hello line's `schema`, and a change to the chunk or end lines is signaled there.
 
 New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
+
+### Exporting a run
+
+`am export` prints every event of one run, of every kind, as JSON lines in the run's own order (ascending per-run `seq`), each with its `gseq`. It reads `am.db` only, and takes no lease, no claim and no lock.
+
+```bash
+am export 20261002T140000Z-19efcddc > run.jsonl
+am export 20261002T140000Z-19efcddc --out ~/run.jsonl
+```
+
+The shape is `am export RUN [--out FILE] [--pretty]`:
+
+- `RUN` is found by its id alone, whichever repository recorded it.
+- Without `--out`, the lines go to stdout, one JSON object per line: the output is not an envelope, unlike every other command but the two streams. A run with a run row but no event prints nothing.
+- With `--out FILE`, the lines are written to `FILE`, a new file, and `am export` prints the usual envelope, `{"ok": true, "data": {"run_id", "path", "lines"}}`: the `run_id`, the absolute `path` written, and `lines`, how many lines it holds. A relative `FILE` is taken from the current directory.
+
+Each line has the journal line's keys plus `gseq`, sorted, and is written the way `am` writes a `journal.jsonl` line:
+
+```
+{"attempt": null, "card": "<subtask-id>", "event": "phase_upsert", "gseq": 1187, "payload": {"detail": null, "ended_at": null, "kind": "agent", "name": "implement", "started_at": "2026-10-02T14:03:11.410000Z", "status": "started"}, "phase": "implement", "run_id": "20261002T140000Z-19efcddc", "seq": 17, "story": "<story-id>", "ts": "2026-10-02T14:03:11.412000Z"}
+```
+
+For a line `am` also wrote to the run's `journal.jsonl`, the exported line without `gseq` is the same bytes. The lease and control kinds, which no journal file holds, are exported too.
+
+`am export` never writes to a run's `journal.jsonl`. These are refused with `ExportRefusedError`, exit code 3, and nothing written. The message reads `am export refused (<reason>): <path>; nothing has been written`, and `<reason>` is the first check that failed:
+
+- `journal_path`: `FILE` is any run's `<data dir>/runs/<run-id>/journal.jsonl`, whether it exists or not;
+- `target_exists`: something is already at `FILE`, a dangling symlink included, or appeared there before the file was opened;
+- `no_target_dir`: the directory of `FILE` does not exist.
+
+These checks run after the run is read, so an unknown `RUN` is refused as `UnknownRunError`, exit code 3, and creates nothing. Any refusal is printed as the usual envelope on stdout, with or without `--out`.
 
 ### Backing up and restoring `am.db`
 

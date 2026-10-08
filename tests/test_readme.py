@@ -24,6 +24,7 @@ from agent_manager import (
     detach,
     dispatch,
     errors,
+    export,
     migrate,
     models,
     orchestrate,
@@ -1302,3 +1303,62 @@ def test_events_example_line_matches_code():
         assert set(line) == set(store_journal.JournalLine.model_fields) | {"gseq"}
         assert line["gseq"] <= envelope["data"]["head"]
         assert cli._event_line(_row(line)) == line
+
+
+EXPORT_TITLE = "Exporting a run"
+
+
+def test_export_section():
+    section = _section(EXPORT_TITLE)
+    assert "The shape is `am export RUN [--out FILE] [--pretty]`:" in section
+    assert _long_options("export") <= _backticked_flags(section)
+    assert "the output is not an envelope" in section
+    assert "ascending per-run `seq`" in section
+    for field in dataclasses.fields(export.ExportResult):
+        assert f"`{field.name}`" in section, field.name
+    assert f"`{export.ExportRefusedError.__name__}`" in section
+    template = str(export.ExportRefusedError("<reason>", Path("<path>")))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(export.ExportRefusal):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+    assert "`am export` never writes to a run's `journal.jsonl`." in section
+    assert "the exported line without `gseq` is the same bytes" in section
+    assert "as `UnknownRunError`, exit code 3, and creates nothing" in section
+    assert "Any refusal is printed as the usual envelope on stdout, with or without `--out`." in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(EXPORT_TITLE) < titles.index(BACKUP_TITLE)
+    assert heads[titles.index(EXPORT_TITLE)][1] == 3
+    _assert_anchors_resolve(section)
+
+
+def test_export_example_line_matches_code():
+    examples = _fenced_json_lines(_section(EXPORT_TITLE))
+    assert len(examples) == 1
+    raw, line = examples[0]
+    assert set(line) == set(store_journal.JournalLine.model_fields) | {"gseq"}
+    assert raw == json.dumps(line, sort_keys=True)
+    assert export.line(_row(line)) == raw
+
+
+def test_usage_names_export_as_a_non_envelope_output():
+    paragraph = _usage_paragraph()
+    assert "`am export` without `--out` is a third" in paragraph
+    assert "with no envelope" in paragraph
+    assert _slug(EXPORT_TITLE) in _assert_anchors_resolve(paragraph)
+
+
+def test_new_sections_link_only_to_headings():
+    for title in (
+        "Several am processes",
+        "Watching a run",
+        EVENTS_TITLE,
+        EXPORT_TITLE,
+        BACKUP_TITLE,
+        MIGRATE_TITLE,
+        DATA_DIR_TITLE,
+    ):
+        _assert_anchors_resolve(_section(title))
+    _assert_anchors_resolve(_usage_paragraph())
