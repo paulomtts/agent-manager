@@ -5244,6 +5244,189 @@ def test_runs_reads_every_lease_inside_the_snapshot(projection, monkeypatch):
     finally:
         writer.close()
 
+PAGED_RUN_IDS = (
+    "20260923T090000Z-cccccccc",
+    "20260923T090000Z-bbbbbbbb",
+    "20260923T090000Z-aaaaaaaa",
+    "20260921T090000Z-cbe34d00",
+)
+"""The listing order of `_record_paged_runs`: three runs share one
+`started_at`, so only the id orders them."""
+
+
+def _record_paged_runs(root: Path) -> None:
+    for run_id in PAGED_RUN_IDS[:3]:
+        _record(root, run_id, started_at=RECORDED_AT)
+    _record(
+        root, PAGED_RUN_IDS[3], started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)
+    )
+
+
+def _listed_ids(argv: list[str]) -> list[str]:
+    result = runner.invoke(cli.app, argv)
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    return [entry["id"] for entry in envelope["data"]["runs"]]
+
+
+def test_runs_pages_by_last_run_id_through_equal_start_times(projection):
+    _record_paged_runs(projection)
+    base = ["runs", "--repo-dir", str(projection)]
+
+    full = _listed_ids(base)
+    first = _listed_ids([*base, "--limit", "2"])
+    second = _listed_ids([*base, "--limit", "2", "--before", first[-1]])
+    third = _listed_ids([*base, "--limit", "2", "--before", second[-1]])
+
+    assert full == list(PAGED_RUN_IDS)
+    assert first == list(PAGED_RUN_IDS[:2])
+    assert first + second == full
+    assert third == []
+
+
+def test_runs_limit_beyond_the_listing_returns_it_all_and_the_next_page_is_empty(
+    projection,
+):
+    """Review Focus 4."""
+    _record_paged_runs(projection)
+    base = ["runs", "--repo-dir", str(projection)]
+
+    page = _listed_ids([*base, "--limit", "50"])
+
+    assert page == list(PAGED_RUN_IDS)
+    assert _listed_ids([*base, "--limit", "50", "--before", page[-1]]) == []
+
+
+@pytest.mark.parametrize("pretty", [[], ["--pretty"]])
+def test_runs_before_without_limit_is_refused_before_the_database_is_opened(
+    projection, monkeypatch, pretty
+):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    def refuse(root):
+        raise AssertionError("the database was opened")
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", refuse)
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(projection), "--before", SNAPSHOT_RUN_ID, *pretty],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "CliError", "message": "--before requires --limit"},
+    }
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_runs_limit_below_one_is_refused(projection, monkeypatch, limit):
+    def refuse(root):
+        raise AssertionError("the database was opened")
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", refuse)
+
+    result = runner.invoke(
+        cli.app, ["runs", "--repo-dir", str(projection), "--limit", limit]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "CliError",
+        "message": f"--limit must be at least 1, got {limit}",
+    }
+
+
+@pytest.mark.parametrize("before", ["no-such-thing", ""])
+def test_runs_before_neither_a_run_id_nor_a_timestamp_is_an_unknown_run(
+    projection, before
+):
+    """Review Focus 2 is the empty string."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(projection), "--limit", "5", "--before", before],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"--before {before!r} is neither a run id nor an ISO 8601 timestamp"
+        " (pass the last run id of the previous page)",
+    }
+
+
+@pytest.mark.parametrize(
+    "before",
+    ["2026-09-22T09:00:00Z", "2026-09-22T11:00:00+02:00", "2026-09-22T09:00:00", "2026-09-22"],
+    ids=["z", "offset", "naive", "date"],
+)
+def test_runs_before_a_timestamp_lists_runs_started_strictly_before_it(
+    projection, before
+):
+    """Review Focus 3: every spelling is one instant (the date is midnight UTC)."""
+    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260922T090000Z-cbe34d00", started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    assert _listed_ids(
+        ["runs", "--repo-dir", str(projection), "--limit", "5", "--before", before]
+    ) == ["20260921T090000Z-cbe34d00"]
+
+
+def test_runs_reads_the_before_cursor_inside_the_snapshot(projection, monkeypatch):
+    """The cursor run's `started_at` moves after `head` returned: only a
+    `run_cursor` outside the snapshot could see the new value, and it would
+    then list nothing."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def move_the_cursor_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(
+                run.model_copy(
+                    update={"started_at": datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)}
+                )
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_events, "head", move_the_cursor_run
+        )
+        during = cli.runs_for(repo_dir=projection, limit=5, before=SNAPSHOT_RUN_ID)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert [entry["id"] for entry in during["runs"]] == [SNAPSHOT_OLDER_RUN_ID]
+        after = cli.runs_for(repo_dir=projection, limit=5, before=SNAPSHOT_RUN_ID)
+        assert after["runs"] == []
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_runs_before_a_run_on_a_repo_with_no_project_is_unknown(projection, tmp_path):
+    """Review Focus 5: `stranger` has no `projects` row, so every run is foreign to it."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(stranger), "--limit", "5", "--before", SNAPSHOT_RUN_ID],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {SNAPSHOT_RUN_ID!r} is not in the projection for {stranger.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+
 
 def test_runs_store_id_is_the_meta_store_id(projection):
     _record_two_started_runs(projection)

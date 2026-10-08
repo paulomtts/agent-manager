@@ -2492,13 +2492,63 @@ def status(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def runs_for(*, repo_dir: Path) -> dict[str, Any]:
-    """This project's run history, newest first, each run with its lease and progress.
+def _runs_before(
+    conn: sqlite3.Connection,
+    before: str,
+    *,
+    scope: int | None | store_queries.AllProjects,
+    root: Path,
+) -> store_queries.RunCursor | datetime:
+    """`am runs --before X` as `store_queries.list_runs`' `before`.
+
+    X is looked up as a run id first: a run in `scope` is its `RunCursor`
+    (`ALL_PROJECTS` takes any run). A run recorded for another project, when
+    the listing is scoped to `root`'s, is an `UnknownRunError` -- the same
+    refusal `status` gives a run of another repository -- not a position in
+    this listing. A value that is no run id is parsed with
+    `datetime.fromisoformat` (a date alone is midnight); `list_runs` reads a
+    naive value as UTC. Neither is an `UnknownRunError`.
+    """
+    found = store_queries.run_cursor(conn, before)
+    if found is not None:
+        cursor, project_id = found
+        if isinstance(scope, store_queries.AllProjects) or project_id == scope:
+            return cursor
+        raise UnknownRunError(
+            f"run {before!r} is not in the projection for {root}"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    try:
+        return datetime.fromisoformat(before)
+    except ValueError:
+        raise UnknownRunError(
+            f"--before {before!r} is neither a run id nor an ISO 8601 timestamp"
+            " (pass the last run id of the previous page)"
+        ) from None
+
+
+def runs_for(
+    *,
+    repo_dir: Path,
+    all_projects: bool = False,
+    limit: int | None = None,
+    before: str | None = None,
+) -> dict[str, Any]:
+    """This project's run history, or every project's, newest first, each run
+    with its lease and progress.
 
     An empty history is an empty list, not a refusal: a project that has never
     been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
+
+    `all_projects` lists every project's runs in one order. `--repo-dir` is
+    then ignored: never resolved, so a directory that does not exist is no
+    `RepoDirError`, and handed to `open_db_for_reading` only because that
+    takes a root, which never chooses the file. `limit` keeps the first
+    `limit` rows; `before` starts after it (see `_runs_before`). `--limit`
+    below 1, and `--before` without `--limit`, are `CliError`s raised before
+    the database is opened.
 
     `lease` is filled here, not in `store_queries.list_runs`: `live` needs `control`,
     which `store` must not import. Each run's `run_leases` row is read on the
@@ -2506,26 +2556,42 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
     `None` when the run has no lease row. One `now` judges the whole listing.
 
-    `progress` arrives already counted by `store_queries.list_runs`; `model_copy`
-    keeps it and `model_dump` carries it into the entry unchanged.
+    `progress` and `project` arrive already filled by `store_queries.list_runs`;
+    `model_copy` keeps them and `model_dump` carries them into the entry
+    unchanged.
 
     Every statement runs in one `store_db.read_snapshot`, and the first one
     reads `store_events.head`: that is `as_of_seq`, the machine-wide head (so
-    it can be above 0 on an empty listing), and the listing reflects every
-    event up to it and none after it. `store_id` is `store_db.store_id`, read
-    in the same snapshot and never minted here, so it is `None` when no
-    `am.db` exists yet or its `meta` has no `store_id` row.
+    it can be above 0 on an empty listing), and the listing -- the `--before`
+    lookup included -- reflects every event up to it and none after it.
+    `store_id` is `store_db.store_id`, read in the same snapshot and never
+    minted here, so it is `None` when no `am.db` exists yet or its `meta` has
+    no `store_id` row.
     """
-    root = resolve_repo_dir(repo_dir)
+    if limit is not None and limit < 1:
+        raise CliError(f"--limit must be at least 1, got {limit}")
+    if before is not None and limit is None:
+        raise CliError("--before requires --limit")
+    root = repo_dir if all_projects else resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
         with store_db.read_snapshot(conn):
             as_of_seq = store_events.head(conn)
             store_id = store_db.store_id(conn)
+            scope = (
+                store_queries.ALL_PROJECTS
+                if all_projects
+                else store_projects.lookup(conn, root)
+            )
+            start = (
+                None
+                if before is None
+                else _runs_before(conn, before, scope=scope, root=root)
+            )
             now = _utcnow()
             entries = []
             for summary in store_queries.list_runs(
-                conn, project_id=store_projects.lookup(conn, root)
+                conn, project_id=scope, limit=limit, before=start
             ):
                 lease = store_leases.read_lease(conn, summary.id)
                 shown = (
@@ -2544,11 +2610,26 @@ def runs(
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository whose projection is read."
     ),
+    all_projects: bool = typer.Option(
+        False, "--all-projects", help="List every project's runs; --repo-dir is ignored."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="List at most this many runs (at least 1)."
+    ),
+    before: str | None = typer.Option(
+        None,
+        "--before",
+        help="Start the page after this run: pass the last run id of the previous"
+        " page. An ISO 8601 timestamp lists runs started strictly before it."
+        " Needs --limit.",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """List this project's run history, newest first."""
+    """List this project's run history, or every project's, newest first."""
     try:
-        payload = runs_for(repo_dir=repo_dir)
+        payload = runs_for(
+            repo_dir=repo_dir, all_projects=all_projects, limit=limit, before=before
+        )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None

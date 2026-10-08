@@ -685,7 +685,14 @@ for everything deferred.
 
 ```bash
 am runs --repo-dir . --pretty
+am runs --all-projects --limit 20
+am runs --all-projects --limit 20 --before 20260923T140506Z-19efcddc
 ```
+
+- `--all-projects` lists the runs of every project on the machine, in one order (newest first, not grouped by project). `--repo-dir` is then ignored, even if it names no directory.
+- `--limit N` lists at most the first `N` runs; `N` must be at least 1. Without it the listing is unbounded.
+- `--before X` needs `--limit` and starts the page after `X`. To read the next page, pass the last run id of the previous page: paging by run id never skips or repeats a run, even when several runs started in the same second. In a single repository's listing, `X` must be a run of that repository. `X` may also be an ISO 8601 timestamp (a date alone means midnight; no offset means UTC): the page then holds only runs that started strictly before that instant, and runs with no `started_at` are left out. Paging by timestamp can skip the rest of a group of runs that started in the same second, so prefer the run id.
+- `--before` without `--limit`, or a `--limit` below 1, is refused with a `CliError`; an `X` that is neither a run id nor an ISO timestamp, or a run of another repository, is an `UnknownRunError`. Both are exit code 3.
 
 `data.runs` is a list with one object per run. Each object has these keys:
 

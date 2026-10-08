@@ -172,6 +172,9 @@ def test_runs_section_documents_new_keys():
     assert "`null` if no process has a lease row for it" in section
     assert "`am status <run-id>` shows in `control.lease`" in section
     assert "`project`: `{id, repo_dir}`" in section
+    for flag in ("`--all-projects`", "`--limit N`", "`--before X`"):
+        assert flag in section, flag
+    assert "pass the last run id of the previous page" in section
     assert ADDITIVE in section
     assert IGNORE_UNKNOWN in section
 

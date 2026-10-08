@@ -361,6 +361,77 @@ def test_a_run_of_another_repo_is_an_unknown_run_and_nothing_is_written(two_repo
     assert _tree(runs_root) == runs_before
     assert _row_counts() == rows_before
 
+def _project_repo_dirs(stdout: str) -> list[tuple[str, str]]:
+    return [
+        (run["id"], run["project"]["repo_dir"])
+        for run in json.loads(stdout)["data"]["runs"]
+    ]
+
+
+def test_runs_all_projects_lists_every_repos_runs_and_writes_nothing(two_repos):
+    a, b = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["runs", "--all-projects", "--repo-dir", str(a)])
+
+    assert result.exit_code == 0, result.output
+    assert _project_repo_dirs(result.stdout) == [
+        (B_RUN, str(b.resolve())),
+        (A_RUN, str(a.resolve())),
+    ]
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_runs_all_projects_ignores_a_repo_dir_that_does_not_exist(two_repos, tmp_path):
+    result = runner.invoke(
+        cli.app, ["runs", "--all-projects", "--repo-dir", str(tmp_path / "missing")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [run["id"] for run in json.loads(result.stdout)["data"]["runs"]] == [
+        B_RUN,
+        A_RUN,
+    ]
+
+
+def test_runs_before_another_repos_run_is_unknown_unless_all_projects(two_repos):
+    a, _ = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+    argv = ["runs", "--repo-dir", str(a), "--limit", "5", "--before", B_RUN]
+
+    scoped = runner.invoke(cli.app, argv)
+    everywhere = runner.invoke(cli.app, [*argv, "--all-projects"])
+
+    assert scoped.exit_code == cli.EXIT_ERROR, scoped.output
+    assert json.loads(scoped.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {B_RUN!r} is not in the projection for {a.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+    assert everywhere.exit_code == 0, everywhere.output
+    assert [run["id"] for run in json.loads(everywhere.stdout)["data"]["runs"]] == [A_RUN]
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_runs_all_projects_with_no_database_is_empty_and_creates_nothing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _invoke_creating_nothing(tmp_path, ["runs", "--all-projects"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": 0, "store_id": None},
+    }
+
 
 def test_runs_on_a_newer_machine_database_is_a_store_schema_error(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
