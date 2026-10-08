@@ -328,3 +328,38 @@ def test_snapshot_then_follow_from_as_of_seq_has_no_gap_and_no_repeat(repo, am, 
         assert set(_gseqs(before)).isdisjoint(_gseqs(feed)), k
         assert sorted(_gseqs(before) + _gseqs(feed)) == _gseqs(final), k
         assert _events(am, "--since-seq", str(cursor)) == feed, k
+
+
+@pytest.mark.e2e_fake
+def test_cursor_above_head_resets_to_head(repo, am, children):
+    """D:243-249, D:367-368, C5, C7. The writes after the hello land below the
+    stale cursor, and are still emitted: the stream started at head."""
+    _record(repo, "reset-a", "reset-b", "reset-c")
+    snapshot = _snapshot(am)
+    head = snapshot["as_of_seq"]
+
+    follower, hello = children.follow("--since-seq", str(head + 5))
+    assert hello["cursor_reset"] is True, hello
+    assert hello["head"] == head, hello
+    assert hello["store_id"] == snapshot["store_id"], hello
+    written = _record(repo, "reset-d", "reset-e")
+    assert all(head < gseq < head + 5 for gseq in written), (head, written)
+
+    lines = [follower.next_json(), follower.next_json()]
+    assert _gseqs(lines) == written
+    assert [line["run_id"] for line in lines] == ["reset-d", "reset-e"]
+    assert _events(am, "--since-seq", str(_head() + 5)) == []
+
+
+@pytest.mark.e2e_fake
+def test_cursor_at_head_is_not_a_reset(repo, am, children):
+    """D:243-249, C5. A cursor equal to head resumes there: no reset, no backlog."""
+    (*_, head) = _record(repo, "at-a", "at-b", "at-c")
+
+    follower, hello = children.follow("--since-seq", str(head))
+    assert hello["cursor_reset"] is False, hello
+    assert hello["head"] == head, hello
+    (written,) = _record(repo, "at-d")
+
+    line = follower.next_json()
+    assert line["gseq"] == written and line["run_id"] == "at-d", line
