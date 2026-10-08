@@ -72,7 +72,7 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 67 `.py` files (60 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 66 `.py` files (59 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
