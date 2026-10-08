@@ -402,3 +402,71 @@ def test_replaced_smaller_database_resets_and_has_a_new_store_id(repo, am, child
     assert hello["cursor_reset"] is True, hello
     assert hello["head"] == 1, hello
     assert hello["store_id"] and hello["store_id"] != first["store_id"], (first, hello)
+
+
+@pytest.mark.e2e_fake
+def test_from_now_starts_at_head(repo, am, children):
+    """D:232, C4. `--from-now` skips the backlog: only later events appear."""
+    _record(repo, "now-a", "now-b", "now-c")
+    snapshot = _snapshot(am)
+    head = snapshot["as_of_seq"]
+
+    follower, hello = children.follow("--from-now")
+    assert hello["head"] == head, hello
+    assert hello["cursor_reset"] is False, hello
+    assert hello["store_id"] == snapshot["store_id"], hello
+    written = _record(repo, "now-d", "now-e")
+
+    lines = [follower.next_json(), follower.next_json()]
+    assert _gseqs(lines) == written
+    assert all(gseq > head for gseq in _gseqs(lines)), lines
+
+
+@pytest.mark.e2e_fake
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--from-now"],
+        ["--follow", "--from-now", "--since-seq", "0"],
+        ["--follow", "--from-now", "--since", "0"],
+        ["--follow", "--since-seq", "-1"],
+    ],
+    ids=["from-now-without-follow", "from-now-with-since-seq", "from-now-with-since", "since-seq-below-0"],
+)
+def test_from_now_refusals(repo, am, args):
+    """D:367-368, C7. One envelope at exit 3 and no stream line: `am` parses
+    the whole stdout as one JSON value, so a hello before it would fail."""
+    _record(repo, "refused-a")
+    head = _head()
+
+    code, envelope = am("watch", "--all", *args)
+
+    assert code == cli.EXIT_ERROR, envelope
+    assert envelope["ok"] is False, envelope
+    assert envelope["error"]["type"] == "CliError", envelope
+    assert _head() == head
+
+
+@pytest.mark.e2e_fake
+def test_since_seq_resumes_without_repeat(repo, am, children):
+    """D:232, D:389, C4, C8. A consumer that stops and resumes from the last
+    gseq it read misses nothing and sees nothing twice."""
+    seeded = _record(repo, "resume-a", "resume-b", "resume-c", "resume-d")
+
+    first, hello = children.follow("--since-seq", str(seeded[1]))
+    assert hello["cursor_reset"] is False, hello
+    first_lines = first.until_gseq(seeded[3])
+    assert _gseqs(first_lines) == seeded[2:]
+    more = _record(repo, "resume-e", "resume-f")
+    first_lines += first.until_gseq(more[-1])
+    assert _gseqs(first_lines) == seeded[2:] + more
+    first.close()
+    last = first_lines[-1]["gseq"]
+    (later,) = _record(repo, "resume-g")
+
+    second, hello = children.follow("--since-seq", str(last))
+    assert hello["cursor_reset"] is False, hello
+    second_lines = second.until_gseq(later)
+    assert _gseqs(second_lines) == [later]
+    assert set(_gseqs(second_lines)).isdisjoint(_gseqs(first_lines))
+    assert _events(am, "--since-seq", str(seeded[1])) == first_lines + second_lines
