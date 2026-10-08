@@ -1097,10 +1097,11 @@ SUMMARY_KEYS = {
     "story_id",
     "lease",
     "progress",
+    "project",
 }
 """The seven names `am runs` always had, plus `milestone_id` and `card_id`
-(card 0b5a15d7), `lease` (card 6bf47e74), `progress` (card 882b212b) and
-`story_id` (card 3d2a3ef8)."""
+(card 0b5a15d7), `lease` (card 6bf47e74), `progress` (card 882b212b),
+`story_id` (card 3d2a3ef8) and `project` (card 5d9554f6)."""
 
 
 def _listed(root: Path) -> list[store_queries.RunSummary]:

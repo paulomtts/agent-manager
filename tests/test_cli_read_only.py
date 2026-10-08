@@ -1,8 +1,9 @@
 """The read-only commands create nothing under the data directory.
 
-`am runs`, `am status`, `am logs`, `am watch` and `am run --dry-run` against a
-repository with no projection leave the data directory byte-for-byte as they
-found it, and still answer as they do for an unknown run.
+`am runs`, `am status`, `am events`, `am logs`, `am watch` and
+`am run --dry-run` against a repository with no projection leave the data
+directory byte-for-byte as they found it, and still answer as they do for an
+unknown run.
 """
 
 import json
@@ -15,6 +16,7 @@ from typer.testing import CliRunner
 
 from agent_manager import cli, models, paths
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import projects as store_projects
 from agent_manager.store import writer as store_writer
 
@@ -84,7 +86,20 @@ def test_runs_on_an_unknown_repo_is_empty_and_creates_nothing(unknown_repo, tmp_
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"ok": True, "data": {"runs": []}}
+    head = 0
+    store_id = None
+    if paths.db_path().exists():
+        conn = store_db.open_db_for_reading(unknown_repo)
+        try:
+            head = store_events.head(conn)
+            store_id = store_db.store_id(conn)
+        finally:
+            conn.close()
+        assert store_id is not None
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": head, "store_id": store_id},
+    }
 
 
 def test_status_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(
@@ -115,6 +130,44 @@ def test_status_without_a_run_id_on_an_unknown_repo_refuses_and_creates_nothing(
     assert error["message"].startswith(
         f"no run has been recorded for {unknown_repo.resolve()}"
     )
+
+
+def _write_stamped_db_without_a_store_id(path: Path) -> None:
+    """A current-schema `am.db` at `SCHEMA_VERSION` that no `open_db` has
+    touched: no `store_id` row in `meta`, no sidecars."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    built = sqlite3.connect(path)
+    try:
+        built.executescript(store_db._SCHEMA)
+        built.execute(f"PRAGMA user_version = {store_db.SCHEMA_VERSION}")
+        built.commit()
+    finally:
+        built.close()
+
+
+def test_runs_and_status_on_a_database_without_a_store_id_report_null_and_write_nothing(
+    tmp_path, monkeypatch
+):
+    """Review Focus 1 and 3: a reader never back-fills `store_id`."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = paths.db_path()
+    _write_stamped_db_without_a_store_id(path)
+    before = path.read_bytes()
+
+    listed = _invoke_creating_nothing(tmp_path, ["runs", "--repo-dir", str(root)])
+    shown = _invoke_creating_nothing(tmp_path, ["status", "--repo-dir", str(root)])
+
+    assert listed.exit_code == 0, listed.output
+    assert json.loads(listed.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": 0, "store_id": None},
+    }
+    assert shown.exit_code == cli.EXIT_ERROR, shown.output
+    assert json.loads(shown.stdout)["error"]["type"] == "UnknownRunError"
+    assert "store_id" not in shown.stdout
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("extra", [[], ["--phase", "verify"], ["--follow"]])
@@ -309,6 +362,77 @@ def test_a_run_of_another_repo_is_an_unknown_run_and_nothing_is_written(two_repo
     assert _tree(runs_root) == runs_before
     assert _row_counts() == rows_before
 
+def _project_repo_dirs(stdout: str) -> list[tuple[str, str]]:
+    return [
+        (run["id"], run["project"]["repo_dir"])
+        for run in json.loads(stdout)["data"]["runs"]
+    ]
+
+
+def test_runs_all_projects_lists_every_repos_runs_and_writes_nothing(two_repos):
+    a, b = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["runs", "--all-projects", "--repo-dir", str(a)])
+
+    assert result.exit_code == 0, result.output
+    assert _project_repo_dirs(result.stdout) == [
+        (B_RUN, str(b.resolve())),
+        (A_RUN, str(a.resolve())),
+    ]
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_runs_all_projects_ignores_a_repo_dir_that_does_not_exist(two_repos, tmp_path):
+    result = runner.invoke(
+        cli.app, ["runs", "--all-projects", "--repo-dir", str(tmp_path / "missing")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [run["id"] for run in json.loads(result.stdout)["data"]["runs"]] == [
+        B_RUN,
+        A_RUN,
+    ]
+
+
+def test_runs_before_another_repos_run_is_unknown_unless_all_projects(two_repos):
+    a, _ = two_repos
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+    argv = ["runs", "--repo-dir", str(a), "--limit", "5", "--before", B_RUN]
+
+    scoped = runner.invoke(cli.app, argv)
+    everywhere = runner.invoke(cli.app, [*argv, "--all-projects"])
+
+    assert scoped.exit_code == cli.EXIT_ERROR, scoped.output
+    assert json.loads(scoped.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {B_RUN!r} is not in the projection for {a.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+    assert everywhere.exit_code == 0, everywhere.output
+    assert [run["id"] for run in json.loads(everywhere.stdout)["data"]["runs"]] == [A_RUN]
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_runs_all_projects_with_no_database_is_empty_and_creates_nothing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _invoke_creating_nothing(tmp_path, ["runs", "--all-projects"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"runs": [], "as_of_seq": 0, "store_id": None},
+    }
+
 
 def test_runs_on_a_newer_machine_database_is_a_store_schema_error(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
@@ -386,3 +510,253 @@ def test_journal_check_refuses_an_unmigrated_machine_and_writes_nothing(
     assert "am migrate" in envelope["error"]["message"]
     assert not paths.db_path().exists()
     assert not (paths.data_path() / "runs").exists()
+
+
+def test_export_refuses_an_unmigrated_machine_and_writes_nothing(tmp_path, monkeypatch):
+    # export is machine-wide and takes no --repo-dir, so it cannot join the
+    # parametrization above, which appends one to every argv.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, ["export", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_export_of_an_unknown_run_creates_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _invoke_creating_nothing(tmp_path, ["export", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+    assert not (tmp_path / "xdg").exists()
+
+
+def _db_head_and_store_id() -> tuple[int, str | None]:
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        return store_events.head(conn), store_db.store_id(conn)
+    finally:
+        conn.close()
+
+
+MACHINE_WIDE_UNKNOWN = (
+    "run 'nope' is not in the projection"
+    " (`agent-manager runs --all-projects` lists the ones that are)"
+)
+
+
+def test_status_of_another_repos_run_without_repo_dir_reports_it_and_writes_nothing(
+    two_repos, monkeypatch
+):
+    a, b = two_repos
+    monkeypatch.chdir(a)
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+    head, store_id = _db_head_and_store_id()
+
+    result = runner.invoke(cli.app, ["status", B_RUN])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["run"]["id"] == B_RUN
+    assert data["run"]["repo_dir"] == str(b.resolve())
+    assert data["as_of_seq"] == head
+    assert data["store_id"] == store_id
+    assert store_id is not None
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_status_run_without_repo_dir_from_a_cwd_with_no_project_reports_it(
+    two_repos, tmp_path, monkeypatch
+):
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    monkeypatch.chdir(stranger)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["status", A_RUN])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["run"]["id"] == A_RUN
+    assert _row_counts() == rows_before
+
+
+def test_status_of_an_unknown_run_without_repo_dir_refuses_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(unknown_repo)
+
+    result = _invoke_creating_nothing(tmp_path, ["status", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+def test_events_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch
+):
+    """Review Focus 5: with no `am.db` (`fresh`) nothing is created either."""
+    monkeypatch.chdir(unknown_repo)
+
+    result = _invoke_creating_nothing(tmp_path, ["events", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+@pytest.mark.parametrize("project", [False, True], ids=["all", "project"])
+def test_events_escalations_on_an_unknown_repo_is_empty_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch, project
+):
+    """Spec test 16: with no `am.db` (`fresh`) the page is empty with head 0
+    and nothing is created; beside another project's runs, still empty."""
+    monkeypatch.chdir(unknown_repo)
+    argv = ["events", "--escalations"]
+    if project:
+        argv += ["--project", str(unknown_repo)]
+
+    result = _invoke_creating_nothing(tmp_path, argv)
+
+    assert result.exit_code == 0, result.output
+    head = 0
+    if paths.db_path().exists():
+        conn = store_db.open_db_for_reading(unknown_repo)
+        try:
+            head = store_events.head(conn)
+        finally:
+            conn.close()
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"events": [], "head": head},
+    }
+
+
+def test_status_run_without_repo_dir_refuses_an_unmigrated_machine(
+    tmp_path, monkeypatch
+):
+    # The parametrized unmigrated test above appends --repo-dir to every argv,
+    # so it cannot cover the machine-wide form.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, ["status", RUN_ID])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_status_without_run_id_or_repo_dir_reports_the_cwd_repos_latest(
+    two_repos, monkeypatch
+):
+    a, _ = two_repos
+    monkeypatch.chdir(a)
+
+    result = runner.invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["run"]["id"] == A_RUN
+
+
+@pytest.mark.parametrize("given", ["a", "~/a"])
+def test_status_run_with_a_relative_or_home_repo_dir_stays_scoped(
+    two_repos, tmp_path, monkeypatch, given
+):
+    """Review Focus 1: an explicit --repo-dir is still resolved and still scopes."""
+    a, _ = two_repos
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rows_before = _row_counts()
+
+    own = runner.invoke(cli.app, ["status", A_RUN, "--repo-dir", given])
+    other = runner.invoke(cli.app, ["status", B_RUN, "--repo-dir", given])
+
+    assert own.exit_code == 0, own.output
+    assert json.loads(own.stdout)["data"]["run"]["id"] == A_RUN
+    assert other.exit_code == cli.EXIT_ERROR, other.output
+    assert json.loads(other.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {B_RUN!r} is not in the projection for {a.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+    assert _row_counts() == rows_before
+
+
+def test_status_run_with_a_repo_dir_that_is_not_a_directory_is_a_repo_dir_error(
+    two_repos, tmp_path
+):
+    """Review Focus 2: an explicit --repo-dir is never ignored, even with RUN."""
+    missing = tmp_path / "missing"
+
+    result = _invoke_creating_nothing(
+        tmp_path, ["status", A_RUN, "--repo-dir", str(missing)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"]["type"] == "RepoDirError"
+
+
+def test_status_run_without_repo_dir_reports_a_run_whose_project_row_is_missing(
+    two_repos, monkeypatch
+):
+    """Review Focus 3: `load_run` does not consult `projects`."""
+    a, b = two_repos
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        conn.execute(
+            "DELETE FROM projects WHERE id = (SELECT project_id FROM runs WHERE id = ?)",
+            (B_RUN,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.chdir(a)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["status", B_RUN])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["run"]["id"] == B_RUN
+    assert data["run"]["repo_dir"] == str(b.resolve())
+    assert _row_counts() == rows_before
+
+
+def test_status_of_an_unknown_run_without_repo_dir_honours_pretty(
+    two_repos, tmp_path, monkeypatch
+):
+    """Review Focus 4: the new refusal is the usual envelope under --pretty."""
+    a, _ = two_repos
+    monkeypatch.chdir(a)
+
+    result = _invoke_creating_nothing(tmp_path, ["status", "nope", "--pretty"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert "\n  " in result.stdout
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }

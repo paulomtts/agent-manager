@@ -48,7 +48,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 15 | Runtime | `runtime.checkpoint`, `runtime.compile` | Checkpoint hooks; the workflow compiled into pygents tools |
 | 16 | Runtime | `runtime.engine` | One subtask, one agent, one loop |
 | 17 | Application | `runs`, `comments`, *`envelope`* | Run identity and the shared subtask driver; the comment outbox; the envelope and exit-code contract |
-| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `journal_check` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; the dual-write checker: `events` against each run's journal file |
+| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `journal_check`, `export` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; the dual-write checker: `events` against each run's journal file; events to journal-shaped lines: `am export` |
 | 19 | Application | `bases`, `integration`, *`card_run`* | The merged base; Integrate; the `--card` run |
 | 20 | Application | *`milestone.plan`*, *`milestone.payloads`* | Pure story plan; lane outcome types and report shapes |
 | 21 | Application | *`milestone.lane`* | The per-story state machine |
@@ -72,7 +72,7 @@ Band rules (inferred, and they are what the table encodes):
 
 ### 3.2 Today's files on the target order (measured)
 
-All 66 `.py` files (59 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
+All 67 `.py` files (60 modules plus 7 `__init__.py`) appear here exactly once. `find src/agent_manager -name '*.py'` confirms the count. A file that §6 splits is placed at the layer of its highest part. Checked against the AST import graph (module-level, function-local and `TYPE_CHECKING` edges), the only imports that violate this order are the three in §11.1.
 
 | L | Current files |
 |---|---|
@@ -86,7 +86,7 @@ All 66 `.py` files (59 modules plus 7 `__init__.py`) appear here exactly once. `
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
 | 13-16 | `runtime.walk`, `runtime.bridge`, `runtime.state` (L13); `runtime.context`, `dispatch` (L14); `runtime.checkpoint`, `runtime.compile` (L15); `runtime.engine` (L16) |
 | 17 | `runs`, `comments` |
-| 18 | `migrate`, `journal_check` |
+| 18 | `migrate`, `journal_check`, `export` |
 | 19 | `bases`, `integration` |
 | 24 | `orchestrate` (splits into L19-L24) |
 | 29 | `cli` (splits into L17-L29) |
@@ -162,13 +162,13 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | `errors` | 0 | every `CliError` subclass (`cli.py:93-176`, and `runs.py`'s), merged with `runtime/errors.py`. Class names unchanged (§10.2). |
 | `control` | 8 | `refuse_claimed`, `run_lease`, `_claimed_error`, `_run_is_live_error`, and the request side (`CONTROL_*`, `_controllable_lease`, `_record_control`, `request_control`, ...) |
 | `runs` | 17 | the shared subtask driver: `default_runner_factory`, `SubtaskDrive`, `drive_subtask_async`, `drive_subtask` (`cli.py:672-805`) |
-| `envelope` | 17 | `ok_envelope`, `error_envelope`, `render`, `EXIT_ESCALATED`, `EXIT_ERROR`, `HANDLED`, `WATCH_HANDLED`. It sits below the Interface band because detached children write `report.json` with the same envelope (§13 D6). |
+| `envelope` | 17 | `ok_envelope`, `error_envelope`, `render`, `EXIT_ESCALATED`, `EXIT_ERROR`, `HANDLED`. It sits below the Interface band because detached children write `report.json` with the same envelope (§13 D6). |
 | `handoff` | 18 | `release_handed_off`, `run_detached_child`, `hand_off_to_child` (`cli.py:1411-1496`) |
 | `reset` | 18 | `reset_run` and its messages (`cli.py:3187-3307`) |
 | `card_run` | 19 | `card_run_status`, `card_outcome_comment`, `CardPreflight`, `preflight_card`, `RecordedRun`, `recorded_card_run`, `run_card_engine`, `run_card`, `detach_card` |
 | `resume` | 25 | `checkpoint_resume_phase`, `_resume_from_checkpoint`, `resume_run` (`cli.py:608-649, 2724-2946`) |
 | `preview` | 25 | `already_done_entries` ... `dry_run_board` (`cli.py:1207-1378`), plus `runs.DryRunPlan` and `compute_dry_run_plan` |
-| `cli/views.py` | 26 | `RUN_IDENTITY` ... `step_logs_payload` (`cli.py:205-605`, without `checkpoint_resume_phase`), `status_for`, `runs_for`, `LogsSelection`, `select_logs`, `logs_for`, `logs_end_status` |
+| `cli/views.py` | 26 | `RUN_IDENTITY` ... `step_logs_payload` (`cli.py:205-605`, without `checkpoint_resume_phase`), `status_for`, `runs_for`, `events_for`, `escalations_for`, `LogsSelection`, `select_logs`, `logs_for`, `logs_end_status` |
 | `cli/output.py` | 26 | printing an envelope (`--pretty`) and mapping `HANDLED` to exit 3. The only exit-code site. |
 | `cli/options.py` | 26 | shared `typer.Option`/`Argument` declarations (`--repo-dir`, `--pretty`, ...) and `RUN_EXAMPLES` |
 | `cli/streams.py` | 27 | the watch and logs-follow protocols: `cli.py:2301-2660` (hello lines, poll/follow, UTF-8 chunking, `WATCH_*`) |
@@ -195,15 +195,15 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 | Target module | L | Takes | Note |
 |---|---|---|---|
-| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
+| `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, the read-transaction helper `read_snapshot`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
 | `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family; `read_verbatim`, `VerbatimJournal`, `VerbatimLine`, `UnimportableLineError`: a journal read as `am migrate` imports it, every value as the file holds it | the schema contract (§10.1) |
 | `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
-| `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status` | take a connection |
+| `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status`, `run_known` | take a connection |
 | `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
 | `store/checkpoints.py` | 6 | `TurnFloor`, `Checkpoint`, readers, the SQL behind `save_checkpoint` | never commits |
 | `store/outbox.py` | 6 | `CommentRow`, `COMMENT_ATTEMPTS`, the SQL behind enqueue/pending/mark | never commits |
 | `store/projects.py` | 6 | `resolve`, `lookup`: the `projects` rows, resolved or created by `repo_dir` | never commits |
-| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `head`, `run_ids`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
+| `store/events.py` | 6 | `EventRow`, `insert`, `read`, `read_last`, `read_escalations`, `head`, `run_ids`, `has_run`, `read_run`, `run_lines`, `journal_line`: the append-only `events` rows and the journal lines they are; the table's DDL and triggers live in `store/db.py` | never commits; imports only `store/journal.py` from the store |
 | `store/backup.py` | 6 | `backup`, `BackupResult`, `BackupRefusedError`, `BackupRefusal`: `am backup`'s online copy of `am.db` through SQLite's backup API, read-only on the source, built in a temporary file and put in place with `os.link`, never overwriting | opens `am.db` only through `store_db.open_reader`, never `open_db`; commits nothing to it |
 | `store/writer.py` | 7 | `Store` | §6.4 |
 | `store/legacy.py` | 7 | `LegacyFile`, `read_legacy`, `import_order`, `merge` and their errors: legacy per-project databases read through a private copy and merged into `am.db`; run journals imported into `events` in `import_order` in the same one merge transaction, marker last | commits only its one merge transaction; imports `store/events.py` and `store/journal.py`, both lower layers |

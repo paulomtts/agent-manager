@@ -354,3 +354,57 @@ def test_a_second_default_backup_in_the_same_second_is_refused(conns, project_id
     assert refused.value.path == first.path
     assert first.path.read_bytes() == before
     assert _listing(first.path.parent) == [first.path.name]
+
+
+def test_documented_restore_keeps_store_id_and_rolls_head_back(
+    conns, project_id, out_dir, repo, tmp_path
+):
+    """README "Backing up and restoring `am.db`": move `am.db` and its
+    sidecars aside, copy a backup into its place, reopen. The restored file
+    keeps the `store_id` it was backed up with, its head is the head at backup
+    time, and the next event reuses the number above that head, so a cursor
+    held from before the restore is not caught by `store_id` or `cursor_reset`."""
+    conn, other = conns
+    _append(conn, project_id, 3)
+    backed_up_head = store_events.head(conn)
+    original_id = store_db.store_id(conn)
+    assert original_id is not None
+    backup = store_backup.backup(out_dir / "am-backup.db", now=NOW).path
+    _append(conn, project_id, 2)
+    assert store_events.head(conn) == backed_up_head + 2
+    # Step 1 of the procedure: no `am` process uses the data directory.
+    conn.close()
+    other.close()
+
+    # Step 2: move `am.db` aside with whatever sidecars are beside it.
+    database = paths.db_path()
+    aside = tmp_path / "aside"
+    aside.mkdir()
+    for name in ("am.db", "am.db-wal", "am.db-shm"):
+        source = database.with_name(name)
+        if source.exists():
+            source.rename(aside / name)
+    # Step 3: copy the backup in; no stale sidecar may remain beside it.
+    assert not database.with_name("am.db-wal").exists()
+    assert not database.with_name("am.db-shm").exists()
+    shutil.copyfile(backup, database)
+
+    restored = store_db.open_db(repo)
+    try:
+        assert store_db.store_id(restored) == original_id
+        assert store_events.head(restored) == backed_up_head
+        with store_db.immediate(restored):
+            row = store_events.insert(
+                restored,
+                project_id=project_id,
+                run_id="run-a",
+                ts=TS,
+                kind="phase_started",
+                payload={"n": 1},
+                source="live",
+            )
+        assert row.seq == backed_up_head + 1
+    finally:
+        restored.close()
+    # The number the new event took was already used by the database set aside.
+    assert backed_up_head + 1 in {event.seq for event in _events(aside / "am.db")}

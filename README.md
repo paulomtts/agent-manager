@@ -74,7 +74,7 @@ am resume 20260923T140506Z-19efcddc
 
 Every command prints one line of JSON — `{"ok": true, "data": ...}` on success,
 `{"ok": false, "error": {...}}` on a refusal. Add `--pretty` to indent it.
-The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)).
+The two exceptions are the streams. `am watch --follow` prints one JSON object per line until stopped (see [Watching a run](#watching-a-run)), and `am logs --follow` prints one JSON object per line until the attempt it follows is over (see [Reading an attempt's output](#reading-an-attempts-output)). `am export` without `--out` is a third: it prints a run's events as bare JSON lines, with no envelope (see [Exporting a run](#exporting-a-run)).
 
 ### Milestone runs
 
@@ -471,7 +471,7 @@ Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am 
 
 `LeaseLostError`. A process that was stuck rather than dead (stopped with SIGSTOP, or on a laptop that was suspended) may wake after another process has taken its run over. Every write of a run checks that this process still holds the lease, so the stuck process stops at its next store write: it writes nothing, not even the journal line, its lanes are cancelled as on a kill, and it exits 3 with `type: "LeaseLostError"` and the message `this process lost the lease of run '<run-id>': pid <pid> on <host> holds it now`. The new owner's rows are untouched. What this does not cover: a `git` or `brd` call the stuck process had already started finishes on its own. Such a call is bounded by one phase.
 
-Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is the same per-repository digest as the project database `<digest>.db` beside them, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
+Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is a per-repository digest, the sha256 of the repository's resolved path, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
 
 Limits, stated plainly:
 
@@ -484,10 +484,10 @@ Limits, stated plainly:
 - **Machine load.** N lanes means up to N `claude -p` processes at once, and
   nothing rate-limits them.
 - **`--max-concurrent` is per process.** Two `am` processes with `--max-concurrent 4` each can run 8 lanes, and 8 `claude -p` processes, at once. Nothing caps lanes across processes.
-- **One data directory per machine.** Leases, claims and lock files live under the data directory. Two processes that see different data directories, for example through a different `XDG_DATA_HOME`, do not see each other's runs and are not kept apart.
+- **One data directory per machine.** The store, `am.db`, which holds every run with its leases and claims, and the lock files live under the data directory (see [The data directory](#the-data-directory)). Two processes that see different data directories, for example through a different `XDG_DATA_HOME`, do not see each other's runs and are not kept apart.
 - **Not over NFS.** The locks are `flock`s, which are not reliable on a network filesystem. Keep the data directory on a local disk.
 - **POSIX only.** The locks use `fcntl`, so `am` does not run on Windows.
-- **A repository is known by its resolved path.** A linked worktree of the repository given as `--repo-dir` is a different project, with its own database, leases and locks, so a run there is not kept apart from a run on the main checkout.
+- **A repository is known by its resolved path.** A linked worktree of the repository given as `--repo-dir` is a different project in `am.db`, with its own leases, claims and locks, so a run there is not kept apart from a run on the main checkout.
 
 #### Multiple blockers
 
@@ -638,6 +638,10 @@ Which report you get when more than one thing happened:
 
 `am status <run-id>` also always has an `integrity` key: `{"checked", "reason", "mismatches"}`. It compares the run's events, which `am` records in the same transaction as every row it writes, with the projection `am status` reads; the run's `journal.jsonl` file is not read. The events rebuild only the run's tree (`runs`, `stories`, `subtasks`, `phases`, `attempts`); the six row-only tables (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`, `board_comments`) have no events and are the projection's alone, so they are never compared. When no comparison was made, `checked` is `false` and `reason` says why: `"lease is live"` (a running process's writes in flight are not divergence), `"no events"`, or `"events unreadable: <error>"`. Otherwise `checked` is `true` and `reason` is `null`. Each entry of `mismatches` is `{"node", "field", "journal", "projection", "kind"}`: `node` is `{"story", "card", "phase", "attempt"}`, all `null` for the run itself; `field` is `"status"` when both sides have the node with different statuses and `null` when only one side has it; `journal` is the status the run's events replay to and `projection` the projection's, each `null` on the side that lacks the node. Only statuses and the tree's shape are compared. The check only reports: it writes nothing and never changes the exit code. A `stale` mismatch means the events are ahead, and a resume or a rebuild moves the projection forward. A `foreign` mismatch means something other than `am` wrote this row.
 
+`am status` also always has an `as_of_seq` key: the `seq` of the newest event the report reflects (`0` when no event has been recorded). Everything in the report is read in one read transaction together with that number, so it reflects every event up to `as_of_seq` and none after it; only `control.lease.live` is judged at the moment you ask.
+
+`am status` also always has a `store_id` key: the identity of the `am.db` the report was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds.
+
 `am status <run-id>` also always has a `warnings` key: `[]`, or a list holding the run's isolation warning, `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`, when `--isolation auto` found neither `bwrap` nor `unshare` and the run went un-isolated (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
@@ -681,7 +685,14 @@ for everything deferred.
 
 ```bash
 am runs --repo-dir . --pretty
+am runs --all-projects --limit 20
+am runs --all-projects --limit 20 --before 20260923T140506Z-19efcddc
 ```
+
+- `--all-projects` lists the runs of every project on the machine, in one order (newest first, not grouped by project). `--repo-dir` is then ignored, even if it names no directory.
+- `--limit N` lists at most the first `N` runs; `N` must be at least 1. Without it the listing is unbounded.
+- `--before X` needs `--limit` and starts the page after `X`. To read the next page, pass the last run id of the previous page: paging by run id never skips or repeats a run, even when several runs started in the same second. In a single repository's listing, `X` must be a run of that repository. `X` may also be an ISO 8601 timestamp (a date alone means midnight; no offset means UTC): the page then holds only runs that started strictly before that instant, and runs with no `started_at` are left out. Paging by timestamp can skip the rest of a group of runs that started in the same second, so prefer the run id.
+- `--before` without `--limit`, or a `--limit` below 1, is refused with a `CliError`; an `X` that is neither a run id nor an ISO timestamp, or a run of another repository, is an `UnknownRunError`. Both are exit code 3.
 
 `data.runs` is a list with one object per run. Each object has these keys:
 
@@ -691,61 +702,79 @@ am runs --repo-dir . --pretty
 - `story_id`: the story card an `am run --story` run drives. It is `null` on any other run (a milestone, `--card` or `--board` run), and on a run recorded by an `am` too old to store it. A story run's `workflow` is `milestone`, its `card_id` is `null`, and its `milestone_id` is still the story's parent milestone, so a consumer that maps a run to its milestone keeps working.
 - `lease`: the process holding the run, or `null` if no process has a lease row for it. When present it is `{live, pid, host, heartbeat_at, accepting}`, the same values `am status <run-id>` shows in `control.lease` (without `acquired_at`). `live` is worked out when you ask: the heartbeat is at most 30 seconds old, and the lease is on another host or its pid is alive here. `heartbeat_at` is an ISO 8601 string. `accepting` is `false` once the run's control window has closed.
 - `progress`: how far the run has got, counted from its recorded tree: `{stories: {done, total}, subtasks: {done, total}, current}`. `done` counts only rows whose status is `done`; `failed`, `escalated`, `stopped` and `canceled` rows count toward `total` only. A milestone run that had to resolve a merge conflict also counts its synthetic `Integrate` story and that story's resolver subtasks, so it shows one story more than the milestone has. `current` is `{card, phase, attempt}` for the `started` phase that started most recently (`attempt` is that phase's highest attempt number, `null` before its first attempt), or `null` when no phase is started. It is read from the recorded rows, not from a live process: a run whose process died mid-phase still shows the phase it stopped in, so check `lease.live` to know whether anyone is still working on it. A run with nothing recorded below it shows `0` of `0` at both levels and `current: null`; `progress` itself is never `null`.
+- `project`: `{id, repo_dir}`, the project the run belongs to. `id` is the project's number in the machine database and `repo_dir` is the resolved path the project is keyed by. It can be spelled differently from the run's own `repo_dir`, which is the path the run recorded. It is `null` only for a run whose project row is missing from a damaged database; such a run is still listed.
+
+`data.as_of_seq` is the `seq` of the newest event the listing reflects (`0` when no event has been recorded). It is the machine-wide newest event, so it can be above `0` when this repository has no runs. Every row in the listing is read in one read transaction together with it; only `lease.live` is judged at the moment you ask.
+
+`data.store_id` is the identity of the `am.db` the listing was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. Like `as_of_seq` it is machine-wide, so an empty listing still carries it. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds. It is `null` when no database exists yet; `am runs` never creates one to report it.
 
 New keys are additive: a newer `am` may add keys to these objects, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
 ### Watching a run
 
-`am watch` prints a run's journal: the append-only log, one JSON object per line, that every run writes to `<data dir>/runs/<run-id>/journal.jsonl` (`<data dir>` is defined under [Several am processes](#several-am-processes)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine writes under the same `<data dir>/runs/`, one `am watch --all` sees the runs of every repository at once.
+`am watch` prints run events from `am.db`, the machine-wide store under `<data dir>` (`<data dir>` is defined under [Several am processes](#several-am-processes); see [The data directory](#the-data-directory)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine records its events in the same `am.db`, one `am watch --all` sees the runs of every repository at once.
 
 ```bash
 am watch 20260923T140506Z-19efcddc
 am watch --all --since 40
+am watch --project ~/code/my-repo --since-seq 1187
 am watch 20260923T140506Z-19efcddc --follow
 am watch --all --follow --from-now
+am watch --all --follow --since-seq 1187
 ```
 
-The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:
+The shape is `am watch RUN_ID | --all | --all-projects | --project PATH [--since SEQ] [--since-seq GSEQ] [--follow [--from-now]]`:
 
-- Give exactly one of `RUN_ID` and `--all`.
-- `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
-- `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
-- `--from-now` needs `--follow` and skips the backlog: the stream prints only lines appended after the command started. It cannot be combined with `--since`, whatever its value.
+- Give exactly one selector: `RUN_ID`, `--all` (or `--all-projects`), or `--project PATH`.
+- `--all` and `--all-projects` are the same set: every run of every project on the machine. Giving both is the same as giving one.
+- `--project PATH` reads only the runs of the repository at `PATH`, looked up by its resolved path. Nothing is created for it, and a path `am` has never run in gives no events, not an error.
+- `RUN_ID` is found by its id alone, whichever repository recorded it.
+- `--since SEQ` keeps only the lines whose per-run `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+- `--since-seq GSEQ` keeps only the lines whose `gseq` is greater than `GSEQ`, the same meaning as `am events --after-seq`. `gseq` is one number across every run on the machine, so it is the cursor to use with `--all` and `--project` (see [Snapshots and cursors](#snapshots-and-cursors)). With both `--since` and `--since-seq`, a line must pass both.
+- `--from-now` needs `--follow` and skips the backlog: the stream starts at head and prints only events recorded after the command started. It cannot be combined with `--since` or `--since-seq`, whatever their value.
 
-Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
+Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line) plus its `gseq`, and the list is ordered by `gseq`. A `--since-seq` at or above head gives `[]`, not an error. With no `am.db` there are no events, and nothing is created.
 
-These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3:
+These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3, as `CliError` unless named otherwise, the first failing one in this order:
 
-- both `RUN_ID` and `--all`, or neither;
+- `RUN_ID` together with `--project`;
+- `--project` together with `--all` or `--all-projects`;
+- none of `RUN_ID`, `--all`, `--all-projects` and `--project`, or `RUN_ID` together with `--all` or `--all-projects`;
 - a `--since` below 0;
+- a `--since-seq` below 0;
 - `--from-now` together with `--since`, any value, 0 included;
+- `--from-now` together with `--since-seq`, any value, 0 included;
 - `--from-now` without `--follow`;
-- a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
-- a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
+- a `RUN_ID` with no event and no run row in `am.db`, as `UnknownRunError`.
 
-Watching a run id that does not exist creates no run directory.
+Watching a run id that does not exist creates nothing.
 
 #### Following with `--follow`
 
 `--follow` turns the output into a stream. The first line is a hello line, the only line that is not a journal line:
 
 ```
-{"am":"0.1.0","event":"watch","runs_dir":"/home/you/.local/share/agent-manager/runs","schema":2}
+{"am":"0.1.0","cursor_reset":false,"event":"watch","head":1204,"runs_dir":"/home/you/.local/share/agent-manager/runs","schema":2,"store_id":"3f2a9c0e8b7d4e6fa1c2b3d4e5f60718"}
 ```
 
-`am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+- `am` is the version of `am` printing the stream, and `runs_dir` is `<data dir>/runs`.
+- `head` is the largest `gseq` on the machine when the stream started, `0` with no `am.db`.
+- `store_id` is the identity of the `am.db` the stream reads, the same value `am runs` and `am status` report, or `null` with no `am.db` (see [Snapshots and cursors](#snapshots-and-cursors)).
+- `cursor_reset` is `true` when `--since-seq` was above `head`: that cursor cannot belong to this database, so the stream starts at head instead and prints every event recorded after it. A reset is not an error. It is `false` otherwise.
 
-With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":2`.
+After the hello line comes the backlog, every selected event above the cursor, then each event as it is recorded, one JSON object per line, until stopped. The cursor starts at 0, at `--since-seq` when it is at or below `head`, and at `head` with `--from-now` or a reset. Each line is a bare journal line plus `gseq`, with no envelope, flushed as soon as it is read. With `--all`, `--all-projects` or `--project`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
 
-Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
+With `--from-now`, the hello line comes first as always, then no backlog: only events recorded after the command started. The hello line is the same, `"schema":2`.
 
-Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. A journal that turns corrupt after the stream has started cannot get an envelope, because every line after the hello line must be a journal line: `am watch` prints `am watch: <message>` on stderr and exits 3.
+Every refusal listed above comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream's first line has `"event":"watch"`.
 
-`am watch --follow` checks for new lines about every 250 ms. That interval is internal and is not part of the contract.
+Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. An error after the hello line, such as a database that stays busy, cannot get an envelope, because every line after the hello line must be a journal line: `am watch` prints `am watch: <message>` on stderr and exits 3.
+
+`am watch --follow` checks for new events about every 250 ms. That interval is internal and is not part of the contract.
 
 #### The journal line
 
-Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`):
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`) plus `gseq`. This is a line as a run's `journal.jsonl` file holds it, without `gseq`:
 
 ```
 {"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}
@@ -753,17 +782,18 @@ Every event, in the envelope's `events` and on the stream, is one journal line (
 
 | Field | What it holds |
 |---|---|
-| `seq` | the line's number in its run's journal, increasing; a run's other events (lease and control) take numbers too, so the first line may be above 1 and numbers may skip |
+| `seq` | the line's number within its run, increasing; a run's lease and control events take numbers too, so in a `journal.jsonl` file the first line may be above 1 and numbers may skip |
+| `gseq` | the event's number across every run on the machine: increasing, may skip. It is on the lines `am watch`, `am events` and `am export` print; not in a `journal.jsonl` file |
 | `ts` | when the line was written, ISO 8601 in UTC |
 | `run_id` | the run |
-| `event` | which kind of node the line records, one of the five below |
+| `event` | which kind of event the line records, one of the ten below |
 | `story` | the story id; `null` on a `run_upsert` |
 | `card` | the subtask id on subtask, phase and attempt lines; otherwise `null` |
 | `phase` | the phase name on phase and attempt lines; otherwise `null` |
 | `attempt` | the attempt number on an attempt line; otherwise `null` |
 | `payload` | the node itself, as the run recorded it, without its children |
 
-Every line records one node of the run's tree. A status change is the same node recorded again with its new status; there is no separate transition event.
+Five kinds record one node of the run's tree each. A status change is the same node recorded again with its new status; there is no separate transition event.
 
 | `event` | Covers |
 |---|---|
@@ -773,6 +803,8 @@ Every line records one node of the run's tree. A status change is the same node 
 | `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed, or, on a `started` one, that it is waiting for a usage limit to reset (see [Usage limits](#usage-limits)) |
 | `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its `exit_code` and `duration` |
 
+The other five kinds record lease and control facts: `control_requested`, `control_handled`, `lease_acquired`, `lease_taken_over` and `claim_conflict`. They are only in output read from `am.db` (`am watch`, `am events` and `am export`), never in a `journal.jsonl` file, and their payloads are not part of the contract: ignore what you do not recognize.
+
 There is no separate "run finished" or "escalation" event. A run has finished when a `run_upsert` line's `payload.status` is `done`, `escalated`, `stopped` or `canceled`, and it escalated when that status is `escalated`.
 
 Journals written before this version of `am` record a canceled run as `cancelled`, and those lines are never rewritten. Read both spellings as the same status. `am status` and `am runs` report such a run as `canceled`.
@@ -781,11 +813,86 @@ Journals written before this version of `am` record a canceled run as `cancelled
 
 The journal line is a public contract, version 1. A consumer that follows these rules keeps working across `am` versions:
 
-- Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
+- Cursor by `gseq`, never by time or line count. To pick up where you left off, pass the highest `gseq` you have seen as `--since-seq`; it works the same for one run, `--project` and `--all`. Cursoring by `(run_id, seq)` with `--since` still works for one run. Either cursor survives a lease takeover: the process that takes a run over keeps recording at a higher `seq` and `gseq`. After a restore of `am.db`, drop every cursor and read a snapshot again (see [Snapshots and cursors](#snapshots-and-cursors)).
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
-- An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
+- An unterminated final line in a `journal.jsonl` file you read yourself is a write in flight, not a malformed file: skip it until it is complete. `am watch` reads `am.db` and never prints a partial line.
 - Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a schema bump is signaled. It is `2` today. Schema 1 became 2 when `am` started writing a canceled run's status as `canceled` instead of `cancelled`; nothing else changed. Lines are replayed as stored, so a schema-2 stream still carries `cancelled` for a run canceled by an older `am`: accept both, whatever the schema.
+
+#### Snapshots and cursors
+
+`am` numbers every event it records on the machine with one counter, `gseq`. `gseq` is increasing, may skip: never assume it is contiguous. `head` is the largest `gseq` recorded, `0` when there is none. The readers tie what they print to it:
+
+- `am runs` and `am status` carry `as_of_seq`, the head their rows were read at, and `store_id`, both read in the same read transaction as every row (see [Listing runs](#listing-runs)).
+- `am events` carries `head`, read in the same snapshot as its lines, so no line's `gseq` is above it.
+- `am watch --follow` puts `head` and `store_id` in its hello line, and `cursor_reset` when the `--since-seq` it was given is above head.
+
+To read a snapshot and then follow every later event with no gap and no repeat, take `as_of_seq` from the snapshot and pass it on as the cursor:
+
+```bash
+am runs --all-projects                    # data.as_of_seq is, say, 1187
+am watch --all --follow --since-seq 1187
+am events 20261002T140000Z-19efcddc --after-seq 1187
+```
+
+Every event with a `gseq` up to `as_of_seq` is already in the snapshot, and the stream prints exactly the ones above it. The same holds for `--after-seq` on `am events`, given the `gseq` of the last line read.
+
+- A `--since-seq` above head cannot be a cursor into this database. The stream starts at head instead, its hello line has `cursor_reset: true`, and every event recorded after head is printed. The exit code is 0: drop what you held and read a snapshot again.
+- `--from-now` starts at head, with no backlog.
+- `store_id` is the identity of one `am.db`. A `store_id` other than the one you saw means the database was replaced: drop every `as_of_seq` and cursor you hold and read a snapshot again.
+
+A restored backup is the one case neither catches. A backup restored over `am.db` keeps the `store_id` it was taken with, which is the database's own, and its head goes back to the head at backup time, which can be lower than a cursor you hold. New events then take the `gseq` numbers above the restored head again. A consumer that reconnects after those new events have pushed head past its old cursor gets no `cursor_reset`, and silently skips the events between the restored head and its cursor. So after a restore every consumer must drop its cursors and read a snapshot again (see [Backing up and restoring `am.db`](#backing-up-and-restoring-amdb)).
+
+### Reading events with `am events`
+
+`am events` reads the events of one run, or every run's escalations, from `am.db` as one envelope. Like `am watch`, it takes no lease, no claim and no lock, and never writes.
+
+```bash
+am events 20261002T140000Z-19efcddc
+am events 20261002T140000Z-19efcddc --after-seq 1187 --limit 100
+am events 20261002T140000Z-19efcddc --tail 20
+am events 20261002T140000Z-19efcddc --before-seq 1187 --limit 100
+am events --escalations --after-seq 1187
+am events --escalations --project ~/code/my-repo
+```
+
+It has two forms. One run's events have the shape `am events RUN [--after-seq N] [--limit N] [--tail N] [--before-seq N] [--pretty]`:
+
+- `RUN` is found by its id alone, whichever repository recorded it.
+- With no window flag, or with `--after-seq` and `--limit`, the page is the first `--limit` events whose `gseq` is above `--after-seq` (0 when not given; every such event when there is no `--limit`). To read the next page, pass the last `gseq` of the previous page as `--after-seq`.
+- `--tail N` is the run's last `N` events.
+- `--before-seq X` is the events whose `gseq` is below `X`, the nearest `--limit` of them, or all of them with no `--limit`. To page backward, pass the first `gseq` of the page as the next `--before-seq`.
+
+The escalations have the shape `am events --escalations [--project PATH] [--after-seq N] [--limit N] [--pretty]`:
+
+- The page is every run's `run_upsert` lines whose `payload.status` is `escalated`, ascending by `gseq`, paged forward with `--after-seq` and `--limit` as above.
+- `--project PATH` narrows it to the repository at `PATH`, looked up by its resolved path and never created. A path `am` has never run in gives an empty page.
+
+Either way, `am events` prints `{"ok": true, "data": {"events": [...], "head": H}}` and exits 0:
+
+```
+{"data":{"events":[{"attempt":null,"card":"<subtask-id>","event":"phase_upsert","gseq":1187,"payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}],"head":1204},"ok":true}
+```
+
+- `events` is ascending by `gseq`. Each event is a [journal line](#the-journal-line) plus its `gseq`, of any of the ten kinds.
+- `head` is the machine-wide head, read in the same snapshot as the page, so no line's `gseq` is above it, and it stays machine-wide with `--project`. It serves as an `as_of_seq` (see [Snapshots and cursors](#snapshots-and-cursors)).
+- An empty window is `[]`, not an error: past the run's last event, past head, or a `--before-seq` at or below the run's first event. A `--before-seq` above head reads up to head.
+- A run with a run row but no event yet is an empty page.
+
+These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3, as `CliError` before `am.db` is opened, the first failing one in this order:
+
+- a `--limit` below 1;
+- an `--after-seq` below 0;
+- a `--tail` below 1;
+- a `--before-seq` below 1;
+- `--escalations` together with `RUN`;
+- `--project` without `--escalations`;
+- neither `RUN` nor `--escalations`;
+- `--escalations` together with `--tail` or `--before-seq`;
+- `--tail` together with `--after-seq`, `--before-seq` or `--limit`;
+- `--before-seq` together with `--after-seq`.
+
+A `RUN` with no event and no run row in `am.db` is refused as `UnknownRunError`, exit code 3.
 
 ### Reading an attempt's output
 
@@ -836,6 +943,139 @@ So the first line tells a stream from a refusal: only a refusal has an `"ok"` ke
 The hello line's `schema` is the stream's own version, `1` today. It is independent of the journal line's version and of the `am watch` hello line's `schema`, and a change to the chunk or end lines is signaled there.
 
 New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
+
+### Exporting a run
+
+`am export` prints every event of one run, of every kind, as JSON lines in the run's own order (ascending per-run `seq`), each with its `gseq`. It reads `am.db` only, and takes no lease, no claim and no lock.
+
+```bash
+am export 20261002T140000Z-19efcddc > run.jsonl
+am export 20261002T140000Z-19efcddc --out ~/run.jsonl
+```
+
+The shape is `am export RUN [--out FILE] [--pretty]`:
+
+- `RUN` is found by its id alone, whichever repository recorded it.
+- Without `--out`, the lines go to stdout, one JSON object per line: the output is not an envelope, unlike every other command but the two streams. A run with a run row but no event prints nothing.
+- With `--out FILE`, the lines are written to `FILE`, a new file, and `am export` prints the usual envelope, `{"ok": true, "data": {"run_id", "path", "lines"}}`: the `run_id`, the absolute `path` written, and `lines`, how many lines it holds. A relative `FILE` is taken from the current directory.
+
+Each line has the journal line's keys plus `gseq`, sorted, and is written the way `am` writes a `journal.jsonl` line:
+
+```
+{"attempt": null, "card": "<subtask-id>", "event": "phase_upsert", "gseq": 1187, "payload": {"detail": null, "ended_at": null, "kind": "agent", "name": "implement", "started_at": "2026-10-02T14:03:11.410000Z", "status": "started"}, "phase": "implement", "run_id": "20261002T140000Z-19efcddc", "seq": 17, "story": "<story-id>", "ts": "2026-10-02T14:03:11.412000Z"}
+```
+
+For a line `am` also wrote to the run's `journal.jsonl`, the exported line without `gseq` is the same bytes. The lease and control kinds, which no journal file holds, are exported too.
+
+`am export` never writes to a run's `journal.jsonl`. These are refused with `ExportRefusedError`, exit code 3, and nothing written. The message reads `am export refused (<reason>): <path>; nothing has been written`, and `<reason>` is the first check that failed:
+
+- `journal_path`: `FILE` is any run's `<data dir>/runs/<run-id>/journal.jsonl`, whether it exists or not;
+- `target_exists`: something is already at `FILE`, a dangling symlink included, or appeared there before the file was opened;
+- `no_target_dir`: the directory of `FILE` does not exist.
+
+These checks run after the run is read, so an unknown `RUN` is refused as `UnknownRunError`, exit code 3, and creates nothing. Any refusal is printed as the usual envelope on stdout, with or without `--out`.
+
+### Backing up and restoring `am.db`
+
+`am backup` copies `am.db` to a new file through SQLite's online-backup API. It is safe while runs are live: the copy is one consistent snapshot, read in one read transaction, and holds every committed event, even one not yet checkpointed out of `am.db-wal`. It takes no write lock, so live runs keep writing.
+
+```bash
+am backup
+am backup --out ~/am-before-upgrade.db
+```
+
+The shape is `am backup [--out FILE] [--pretty]`:
+
+- Without `--out`, the copy goes to `<data dir>/backups/am-<YYYYMMDDTHHMMSSZ>.db`, stamped in UTC; `backups/` is created when it is missing.
+- A relative `--out` is taken from the current directory.
+- The copy is built in a temporary file beside the target and then linked into place, so `am backup` never overwrites anything.
+- `am.db` is copied as it is, without being opened as a store: an `am.db` that still needs `am migrate`, or one written by a newer `am`, is backed up all the same.
+
+It prints `{"ok": true, "data": {"path", "size_bytes"}}`: the absolute `path` of the copy and its `size_bytes`. The copy is one self-contained file, with no `-wal` or `-shm` beside it.
+
+These are refused with `BackupRefusedError`, exit code 3, and nothing written. The message reads `am backup refused (<reason>): <path>; nothing has been written`, and `<reason>` is one of:
+
+- `no_database`: there is no `am.db`; nothing is created, not even the data directory;
+- `target_exists`: something is already at the target, a dangling symlink and `am.db` itself included, or appeared there while the copy ran;
+- `no_target_dir`: the directory of `--out` does not exist.
+
+The temporary file, and anything SQLite left beside it, is removed on every refusal.
+
+There is no `am restore` command. To restore a backup:
+
+1. Make sure no `am` process uses the data directory: `am runs --all-projects` must show no run with `lease.live` `true`, and every `am watch --follow` stream and any other `am` command must be stopped.
+2. Move `<data dir>/am.db` aside, together with `am.db-wal` and `am.db-shm` if they are beside it. Do not delete them: they are the only copy of anything recorded after the backup.
+3. Copy the backup file to `<data dir>/am.db`. No `am.db-wal` or `am.db-shm` may remain beside it.
+
+```bash
+cd ~/.local/share/agent-manager
+mkdir aside
+for name in am.db am.db-wal am.db-shm; do [ -e "$name" ] && mv "$name" aside/; done
+cp backups/am-20261007T090000Z.db am.db
+```
+
+After a restore:
+
+- `store_id` is the one the backup was taken with, so a restore of a database's own backup does not change it.
+- `head`, and every `as_of_seq`, are the backup's, possibly lower than before. New events take the `gseq` numbers above the restored head again.
+- Events recorded after the backup are not in it. A run's `journal.jsonl` may still hold its node events; `am journal-check` compares a run's events with its journal.
+- Every consumer must drop its cursors and read a snapshot again. Neither `store_id` nor `cursor_reset` tells a consumer that a restore happened.
+- A run that was live when the backup was taken shows the lease it had then. Its process is gone, so `am resume` takes it over as it takes over any dead lease (see `took_over` under [Several am processes](#several-am-processes)).
+
+### Migrating from per-project databases
+
+An older `am` kept one database per repository, `<data dir>/projects/<digest>.db`. This version keeps every repository in one machine-wide database, `<data dir>/am.db`. `am migrate` moves the old data across:
+
+```bash
+am migrate
+```
+
+The shape is `am migrate [--pretty]`; it takes no arguments and has no `--dry-run`.
+
+- It merges every legacy `projects/<digest>.db` that has runs, and each merged run's `runs/<run-id>/journal.jsonl`, into `am.db`, in one transaction: all of it is committed, or none of it.
+- It runs once. It records in `am.db` when it ran, and a second `am migrate` reports `already_migrated: true` and does nothing else.
+- The legacy files and journals are left untouched.
+
+Until it has run, every command that opens `am.db` while a legacy `projects/<digest>.db` is present is refused with `MigrationRequiredError`, exit code 3, and changes nothing. The message reads ``<n> per-project database(s) from an older am are in <data dir>/projects and have not been migrated into <data dir>/am.db; run `am migrate` first. Nothing has been changed``.
+
+It prints `{"ok": true, "data": {...}}` with these keys:
+
+- `already_migrated`: `true` when an earlier `am migrate` already ran, and nothing was done this time.
+- `migrated_at`: when the migration committed, ISO 8601. It is `null` when there was nothing to migrate, and `already_migrated` is then `false`.
+- `projects`: one object per merged file, `{path, repo_dir, project_id, rows, ignored_tables}`: the file, the resolved repository path it is now keyed by, its project id in `am.db`, the rows copied per table, and the file's tables nothing was copied from.
+- `skipped`: the legacy files with no runs, which are not merged.
+- `journals`: one object per merged run that has a journal file, `{run_id, path, events, torn_line}`: the events imported, and the 1-based number of a torn final line that was skipped, `null` when there was none.
+- `missing_journals`: the merged runs that have no journal file.
+- `orphan_journals`: the journal files of runs no legacy file has. They are not imported.
+
+These are refused with `MigrationRefusedError`, exit code 3, and nothing committed. The message reads `am migrate refused (<reason>): <detail>; nothing has been migrated`, and `<reason>` is one of:
+
+- `unreadable`: a legacy file or a journal cannot be read;
+- `live_run`: a run in a legacy file holds a live lease; wait for it to finish, or stop it, then run `am migrate` again;
+- `repo_dir_disagrees`: a legacy file holds the runs of more than one repository;
+- `digest_mismatch`: a legacy file's name is not the digest of the repository its runs name;
+- `duplicate_run_id`: one run id is in two legacy files, or already in `am.db`;
+- `row_clash`: a row to copy clashes with a row already in `am.db`;
+- `bad_journal_line`: a journal line other than a torn final one is not a journal line. A torn final line is skipped and reported in `journals[].torn_line`.
+
+If `am.db` already exists, run `am backup` first. To rehearse, run `am migrate` on a copy of the data directory first, with `XDG_DATA_HOME` pointed at the copy, and read its report:
+
+```bash
+mkdir -p /tmp/am-rehearsal
+cp -a ~/.local/share/agent-manager /tmp/am-rehearsal/agent-manager
+XDG_DATA_HOME=/tmp/am-rehearsal am migrate --pretty
+```
+
+### The data directory
+
+`<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager` when `XDG_DATA_HOME` is unset. It holds:
+
+- `am.db`: the one machine-wide store of every run, event, lease and claim, with its `am.db-wal` and `am.db-shm` sidecars beside it while it is in use;
+- `backups/`: where `am backup` writes without `--out`;
+- `runs/<run-id>/`: one run's files: `run.log` and `report.json` for a detached run, one directory per agent attempt, and `journal.jsonl`, a mirror of the run's node events that `am` still appends to but no longer reads;
+- `boards/`: a detached `--board` run's log and report;
+- `projects/<digest>.board.lock` and `projects/<digest>.git.lock`: the lock files of [Several am processes](#several-am-processes);
+- legacy `projects/<digest>.db`: an older `am`'s per-project databases, read only by `am migrate` (see [Migrating from per-project databases](#migrating-from-per-project-databases)).
 
 ## Resuming: what runs again
 
