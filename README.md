@@ -161,7 +161,7 @@ What each mode changes:
 
 Where you see which mode a run got:
 
-- The run records its mode as `config.launcher` (`direct` when un-isolated, else `bwrap` or `unshare`) and the `auto` warning as `config.isolation_warning` (`null` when there is none), for example in the journal head line's `payload.config`.
+- The run records its mode as `config.launcher` (`direct` when un-isolated, else `bwrap` or `unshare`) and the `auto` warning as `config.isolation_warning` (`null` when there is none), for example in the `payload.config` of the run's first event, a `run_upsert`.
 - The warning is appended once to the envelope's `data.warnings`, at the top level (on `--board`, never inside a milestone's entry). With `--detach` it is in the hand-off envelope.
 - `am status <run-id>` always has a `warnings` key: `[]`, or a list holding the run's recorded isolation warning, so a detached run whose envelope is gone still says it is un-isolated.
 
@@ -315,12 +315,12 @@ The outer envelope's `ok` is `true` whatever the outcome, because the report its
 
 `--max-concurrent N` is one slot pool for the whole board, not N per milestone. Every story of every milestone takes a slot from the same N, so N caps the stories running at once across the board. It defaults to 4, as with `--milestone`, and `--max-concurrent 1` runs one story at a time on the whole board. Integrate merges do not take a slot (see [Integrate](#integrate)). Everything else in [Parallel runs](#parallel-runs) holds inside each milestone.
 
-One run and one journal per milestone. A board run is not a run itself: nothing records it as a whole. Each milestone it starts is a run of its own, with its own run id, `<data dir>/runs/<run-id>/journal.jsonl` and lease, exactly as a `--milestone` run would be. To follow a board run, take each entry's `run_id` (or find the runs in `am runs`) and read each journal separately with `am watch <run-id>`, or read them all with `am watch --all`. In each journal:
+One run per milestone. A board run is not a run itself: nothing records it as a whole. Each milestone it starts is a run of its own, with its own run id, its own events in `am.db` and its own lease, exactly as a `--milestone` run would be. To follow a board run, take each entry's `run_id` (or find the runs in `am runs`) and read each run's events separately with `am watch <run-id>`, or read them all with `am watch --all`. In each run's events:
 
 - The first line is a `run_upsert` whose `payload.milestone_id` is that milestone's full card id. It is never `null` on a board run.
 - Every line has that run's `run_id`.
-- A `story_upsert` line has the story card id in `story`, and its `payload` has no milestone key. A story belongs to the milestone named on the first line of its journal.
-- A real story id appears in only one milestone's journal. The synthetic ids `"integrate"`, `"bases"` and `"base-<story id>"` (see [Reading the stream safely](#reading-the-stream-safely)) are fixed names that may appear in several milestones' journals, so identify a story by `(run_id, story)`, never by `story` alone.
+- A `story_upsert` line has the story card id in `story`, and its `payload` has no milestone key. A story belongs to the milestone named in its run's first event.
+- A real story id appears in only one milestone's run. The synthetic ids `"integrate"`, `"bases"` and `"base-<story id>"` (see [Reading the stream safely](#reading-the-stream-safely)) are fixed names that may appear in several milestones' runs, so identify a story by `(run_id, story)`, never by `story` alone.
 
 Recovery. Because nothing records the board run as a whole, there is nothing to resume at the board level. After a fix, either:
 
@@ -469,7 +469,7 @@ Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am 
 
 `took_over`. `am resume` of a run whose process is dead takes its lease over. A lease is dead when its pid no longer exists on the same host, or when its heartbeat is more than 30 seconds old; from another host, the heartbeat is the only test. The resumed report then has `"took_over": {"pid", "host", "heartbeat_at"}`, naming the dead holder. On a milestone run it is on every report shape.
 
-`LeaseLostError`. A process that was stuck rather than dead (stopped with SIGSTOP, or on a laptop that was suspended) may wake after another process has taken its run over. Every write of a run checks that this process still holds the lease, so the stuck process stops at its next store write: it writes nothing, not even the journal line, its lanes are cancelled as on a kill, and it exits 3 with `type: "LeaseLostError"` and the message `this process lost the lease of run '<run-id>': pid <pid> on <host> holds it now`. The new owner's rows are untouched. What this does not cover: a `git` or `brd` call the stuck process had already started finishes on its own. Such a call is bounded by one phase.
+`LeaseLostError`. A process that was stuck rather than dead (stopped with SIGSTOP, or on a laptop that was suspended) may wake after another process has taken its run over. Every write of a run checks that this process still holds the lease, so the stuck process stops at its next store write: it writes nothing, not even an event, its lanes are cancelled as on a kill, and it exits 3 with `type: "LeaseLostError"` and the message `this process lost the lease of run '<run-id>': pid <pid> on <host> holds it now`. The new owner's rows are untouched. What this does not cover: a `git` or `brd` call the stuck process had already started finishes on its own. Such a call is bounded by one phase.
 
 Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is a per-repository digest, the sha256 of the repository's resolved path, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
 
@@ -774,7 +774,7 @@ Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and not
 
 #### The journal line
 
-Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`) plus `gseq`. This is a line as a run's `journal.jsonl` file holds it, without `gseq`:
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`) plus `gseq`. This is a line without `gseq`, as a `journal.jsonl` an older `am` wrote holds it; `am export` prints the same line with `gseq` added:
 
 ```
 {"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}
@@ -782,7 +782,7 @@ Every event, in the envelope's `events` and on the stream, is one journal line (
 
 | Field | What it holds |
 |---|---|
-| `seq` | the line's number within its run, increasing; a run's lease and control events take numbers too, so in a `journal.jsonl` file the first line may be above 1 and numbers may skip |
+| `seq` | the event's number within its run, increasing; a run's lease and control events take numbers too, so a run's node events may skip numbers, and in a `journal.jsonl` an older `am` wrote the first line may be above 1 |
 | `gseq` | the event's number across every run on the machine: increasing, may skip. It is on the lines `am watch`, `am events` and `am export` print; not in a `journal.jsonl` file |
 | `ts` | when the line was written, ISO 8601 in UTC |
 | `run_id` | the run |
@@ -815,8 +815,8 @@ The journal line is a public contract, version 1. A consumer that follows these 
 
 - Cursor by `gseq`, never by time or line count. To pick up where you left off, pass the highest `gseq` you have seen as `--since-seq`; it works the same for one run, `--project` and `--all`. Cursoring by `(run_id, seq)` with `--since` still works for one run. Either cursor survives a lease takeover: the process that takes a run over keeps recording at a higher `seq` and `gseq`. After a restore of `am.db`, drop every cursor and read a snapshot again (see [Snapshots and cursors](#snapshots-and-cursors)).
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
-- An unterminated final line in a `journal.jsonl` file you read yourself is a write in flight, not a malformed file: skip it until it is complete. `am watch` reads `am.db` and never prints a partial line.
-- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
+- An unterminated final line in a `journal.jsonl` file an older `am` wrote is an append that was cut short, not a malformed file: skip it, as `am migrate` does. `am watch` reads `am.db` and never prints a partial line.
+- Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run is not a run of its own: each milestone it starts is a separate run, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a schema bump is signaled. It is `2` today. Schema 1 became 2 when `am` started writing a canceled run's status as `canceled` instead of `cancelled`; nothing else changed. Lines are replayed as stored, so a schema-2 stream still carries `cancelled` for a run canceled by an older `am`: accept both, whatever the schema.
 
 #### Snapshots and cursors
@@ -959,13 +959,13 @@ The shape is `am export RUN [--out FILE] [--pretty]`:
 - Without `--out`, the lines go to stdout, one JSON object per line: the output is not an envelope, unlike every other command but the two streams. A run with a run row but no event prints nothing.
 - With `--out FILE`, the lines are written to `FILE`, a new file, and `am export` prints the usual envelope, `{"ok": true, "data": {"run_id", "path", "lines"}}`: the `run_id`, the absolute `path` written, and `lines`, how many lines it holds. A relative `FILE` is taken from the current directory.
 
-Each line has the journal line's keys plus `gseq`, sorted, and is written the way `am` writes a `journal.jsonl` line:
+Each line has the journal line's keys plus `gseq`, sorted, and is written the way an older `am` wrote a `journal.jsonl` line:
 
 ```
 {"attempt": null, "card": "<subtask-id>", "event": "phase_upsert", "gseq": 1187, "payload": {"detail": null, "ended_at": null, "kind": "agent", "name": "implement", "started_at": "2026-10-02T14:03:11.410000Z", "status": "started"}, "phase": "implement", "run_id": "20261002T140000Z-19efcddc", "seq": 17, "story": "<story-id>", "ts": "2026-10-02T14:03:11.412000Z"}
 ```
 
-For a line `am` also wrote to the run's `journal.jsonl`, the exported line without `gseq` is the same bytes. The lease and control kinds, which no journal file holds, are exported too.
+For a line an older `am` also wrote to the run's `journal.jsonl`, the exported line without `gseq` is the same bytes. The lease and control kinds, which no journal file holds, are exported too.
 
 `am export` never writes to a run's `journal.jsonl`. These are refused with `ExportRefusedError`, exit code 3, and nothing written. The message reads `am export refused (<reason>): <path>; nothing has been written`, and `<reason>` is the first check that failed:
 
@@ -1072,7 +1072,8 @@ XDG_DATA_HOME=/tmp/am-rehearsal am migrate --pretty
 
 - `am.db`: the one machine-wide store of every run, event, lease and claim, with its `am.db-wal` and `am.db-shm` sidecars beside it while it is in use;
 - `backups/`: where `am backup` writes without `--out`;
-- `runs/<run-id>/`: one run's files: `run.log` and `report.json` for a detached run, one directory per agent attempt, and `journal.jsonl`, a mirror of the run's node events that `am` still appends to but no longer reads;
+- `runs/<run-id>/`: one run's files: `run.log` and `report.json` for a detached run, and one directory per agent attempt;
+- legacy `runs/<run-id>/journal.jsonl`: a run's journal written by an older `am`, read only by `am migrate`; `am` never writes a `journal.jsonl`;
 - `boards/`: a detached `--board` run's log and report;
 - `projects/<digest>.board.lock` and `projects/<digest>.git.lock`: the lock files of [Several am processes](#several-am-processes);
 - legacy `projects/<digest>.db`: an older `am`'s per-project databases, read only by `am migrate` (see [Migrating from per-project databases](#migrating-from-per-project-databases)).
