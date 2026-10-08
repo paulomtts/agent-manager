@@ -44,6 +44,7 @@ from agent_manager import (
     dag,
     detach,
     dispatch,
+    export,
     journal_check,
     locks,
     migrate,
@@ -1577,6 +1578,7 @@ HANDLED: tuple[type[BaseException], ...] = (
     store_db.StoreBusyError,
     migrate.MigrationRefusedError,
     store_backup.BackupRefusedError,
+    export.ExportRefusedError,
 )
 """Everything the command turns into an `ok: false` envelope and exit 3.
 
@@ -1604,7 +1606,10 @@ be done safely is a refusal naming the reason and the files or runs, raised
 before anything is committed, not a bug. `store_backup.BackupRefusedError` is
 in it because a backup with no `am.db` to copy, a target that already exists or
 a target directory that does not is a refusal naming the reason and the path,
-with nothing written, not a bug. Anything outside this tuple is a bug in this
+with nothing written, not a bug. `export.ExportRefusedError` is in it for the
+same reason: an `am export --out` naming a run's journal, an existing target or
+a missing directory is a refusal naming the reason and the path, with nothing
+written. Anything outside this tuple is a bug in this
 program and should crash loudly with its stack intact.
 """
 
@@ -4582,6 +4587,36 @@ def backup_command(
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(asdict(result)), pretty=pretty))
+
+
+@app.command("export")
+def export_command(
+    run_id: str = typer.Argument(
+        ..., metavar="RUN", help="The run whose events are exported."
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help="Write the lines to this new file and print an envelope instead;"
+        " never overwritten, never a run's journal.jsonl.",
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """Print one run's events as journal-shaped JSON lines in run order, each
+    with its gseq: the journal's own lines for the events it held. The run is
+    found by id alone, whichever repository recorded it."""
+    try:
+        if out is None:
+            lines = export.export_run(run_id)
+        else:
+            result = export.write_export(run_id, out)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    if out is None:
+        typer.echo("".join(f"{text}\n" for text in lines), nl=False)
+        return
     typer.echo(render(ok_envelope(asdict(result)), pretty=pretty))
 
 
