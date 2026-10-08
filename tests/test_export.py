@@ -336,6 +336,22 @@ def test_write_export_refuses_an_existing_target_and_leaves_it_unchanged(
         assert out.is_symlink() and not (tmp_path / "nowhere").exists()
 
 
+def test_write_export_refuses_a_target_created_after_the_check(
+    migrated, tmp_path, monkeypatch
+):
+    out = tmp_path / "out.jsonl"
+    out.write_bytes(b"precious")
+    # The target appears between the lexists check and the open: the exclusive
+    # open is what refuses it.
+    monkeypatch.setattr(export.os.path, "lexists", lambda path: False)
+
+    error = _refusal("run-a", out)
+
+    assert error.reason == "target_exists"
+    assert error.path == out
+    assert out.read_bytes() == b"precious"
+
+
 def test_write_export_refuses_a_missing_parent_directory(migrated, tmp_path):
     out = tmp_path / "missing" / "out.jsonl"
 
