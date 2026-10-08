@@ -853,6 +853,50 @@ The hello line's `schema` is the stream's own version, `1` today. It is independ
 
 New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
+### Migrating from per-project databases
+
+An older `am` kept one database per repository, `<data dir>/projects/<digest>.db`. This version keeps every repository in one machine-wide database, `<data dir>/am.db`. `am migrate` moves the old data across:
+
+```bash
+am migrate
+```
+
+The shape is `am migrate [--pretty]`; it takes no arguments and has no `--dry-run`.
+
+- It merges every legacy `projects/<digest>.db` that has runs, and each merged run's `runs/<run-id>/journal.jsonl`, into `am.db`, in one transaction: all of it is committed, or none of it.
+- It runs once. It records in `am.db` when it ran, and a second `am migrate` reports `already_migrated: true` and does nothing else.
+- The legacy files and journals are left untouched.
+
+Until it has run, every command that opens `am.db` while a legacy `projects/<digest>.db` is present is refused with `MigrationRequiredError`, exit code 3, and changes nothing. The message reads ``<n> per-project database(s) from an older am are in <data dir>/projects and have not been migrated into <data dir>/am.db; run `am migrate` first. Nothing has been changed``.
+
+It prints `{"ok": true, "data": {...}}` with these keys:
+
+- `already_migrated`: `true` when an earlier `am migrate` already ran, and nothing was done this time.
+- `migrated_at`: when the migration committed, ISO 8601. It is `null` when there was nothing to migrate, and `already_migrated` is then `false`.
+- `projects`: one object per merged file, `{path, repo_dir, project_id, rows, ignored_tables}`: the file, the resolved repository path it is now keyed by, its project id in `am.db`, the rows copied per table, and the file's tables nothing was copied from.
+- `skipped`: the legacy files with no runs, which are not merged.
+- `journals`: one object per merged run that has a journal file, `{run_id, path, events, torn_line}`: the events imported, and the 1-based number of a torn final line that was skipped, `null` when there was none.
+- `missing_journals`: the merged runs that have no journal file.
+- `orphan_journals`: the journal files of runs no legacy file has. They are not imported.
+
+These are refused with `MigrationRefusedError`, exit code 3, and nothing committed. The message reads `am migrate refused (<reason>): <detail>; nothing has been migrated`, and `<reason>` is one of:
+
+- `unreadable`: a legacy file or a journal cannot be read;
+- `live_run`: a run in a legacy file holds a live lease; wait for it to finish, or stop it, then run `am migrate` again;
+- `repo_dir_disagrees`: a legacy file holds the runs of more than one repository;
+- `digest_mismatch`: a legacy file's name is not the digest of the repository its runs name;
+- `duplicate_run_id`: one run id is in two legacy files, or already in `am.db`;
+- `row_clash`: a row to copy clashes with a row already in `am.db`;
+- `bad_journal_line`: a journal line other than a torn final one is not a journal line. A torn final line is skipped and reported in `journals[].torn_line`.
+
+If `am.db` already exists, run `am backup` first. To rehearse, run `am migrate` on a copy of the data directory first, with `XDG_DATA_HOME` pointed at the copy, and read its report:
+
+```bash
+mkdir -p /tmp/am-rehearsal
+cp -a ~/.local/share/agent-manager /tmp/am-rehearsal/agent-manager
+XDG_DATA_HOME=/tmp/am-rehearsal am migrate --pretty
+```
+
 ## Resuming: what runs again
 
 `am resume <run-id>`, and a relaunch that continues an open checkpoint from an earlier run, go on at the turn the newest checkpoint saved, which is before the interrupted phase ran. Whether that phase runs again depends on its kind and on what was recorded before the process stopped:

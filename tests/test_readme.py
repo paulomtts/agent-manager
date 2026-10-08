@@ -7,6 +7,7 @@ tier and carries no marker.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import re
@@ -14,6 +15,7 @@ import typing
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 import typer
 
 from agent_manager import (
@@ -22,12 +24,14 @@ from agent_manager import (
     detach,
     dispatch,
     errors,
+    migrate,
     models,
     orchestrate,
     prompt,
     runs,
 )
 from agent_manager.harness import launcher
+from agent_manager.store import db as store_db
 from agent_manager.store import queries as store_queries
 
 README = Path(__file__).resolve().parents[1] / "README.md"
@@ -121,6 +125,26 @@ def _command_param(command: str, name: str):
     """The Click parameter `name` of the `am` subcommand `command`, introspected in-process."""
     group = typer.main.get_command(cli.app)
     return next(param for param in group.commands[command].params if param.name == name)
+
+
+def _long_options(command: str) -> set[str]:
+    """Every `--long` option of the `am` subcommand `command`, introspected in-process."""
+    group = typer.main.get_command(cli.app)
+    return {
+        opt
+        for param in group.commands[command].params
+        for opt in param.opts
+        if opt.startswith("--")
+    }
+
+
+def _backticked_flags(text: str) -> set[str]:
+    """Every `--flag` token inside a backtick span of `text`."""
+    return {
+        flag
+        for span in re.findall(r"`([^`\n]+)`", text)
+        for flag in re.findall(r"--[a-z][a-z-]*", span)
+    }
 
 
 def _paragraph(opening: str) -> str:
@@ -851,3 +875,54 @@ def test_checkout_install_never_shows_an_editable_command():
     for line in fenced_lines:
         assert "-e " not in line, line
         assert "--editable" not in line, line
+
+
+MIGRATE_TITLE = "Migrating from per-project databases"
+
+
+def test_migrate_section():
+    section = _section(MIGRATE_TITLE)
+    group = typer.main.get_command(cli.app)
+    # "takes no arguments" stays true only while `--pretty` is its one parameter.
+    assert [param.name for param in group.commands["migrate"].params] == ["pretty"]
+    assert _long_options("migrate") <= _backticked_flags(section)
+    assert (
+        "The shape is `am migrate [--pretty]`; it takes no arguments and has no `--dry-run`."
+        in section
+    )
+    assert "in one transaction" in section
+    assert "`already_migrated: true`" in section
+    assert "left untouched" in section
+
+    for field in dataclasses.fields(migrate.MigrationReport):
+        assert f"- `{field.name}`: " in section, field.name
+    for model in (migrate.MigratedProject, migrate.ImportedJournal):
+        for field in dataclasses.fields(model):
+            assert re.search(rf"\b{field.name}\b", section), f"{model.__name__}.{field.name}"
+    assert "`journals[].torn_line`" in section
+
+    required = store_db.MigrationRequiredError.__name__
+    assert f"`{required}`" in section
+    tail = "run `am migrate` first. Nothing has been changed"
+    assert tail in str(store_db.MigrationRequiredError([]))
+    assert tail in section
+
+    refused = migrate.MigrationRefusedError.__name__
+    assert f"`{refused}`" in section
+    template = str(migrate.MigrationRefusedError("<reason>", "<detail>", files=()))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(migrate.RefusalReason):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+    assert "wait for it to finish, or stop it" in section
+
+    assert "run `am backup` first" in section
+    assert "XDG_DATA_HOME=" in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(MIGRATE_TITLE) < titles.index(
+        "Resuming: what runs again"
+    )
+    assert heads[titles.index(MIGRATE_TITLE)][1] == 3
+    _assert_anchors_resolve(section)
