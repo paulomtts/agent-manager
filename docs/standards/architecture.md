@@ -162,7 +162,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | `errors` | 0 | every `CliError` subclass (`cli.py:93-176`, and `runs.py`'s), merged with `runtime/errors.py`. Class names unchanged (§10.2). |
 | `control` | 8 | `refuse_claimed`, `run_lease`, `_claimed_error`, `_run_is_live_error`, and the request side (`CONTROL_*`, `_controllable_lease`, `_record_control`, `request_control`, ...) |
 | `runs` | 17 | the shared subtask driver: `default_runner_factory`, `SubtaskDrive`, `drive_subtask_async`, `drive_subtask` (`cli.py:672-805`) |
-| `envelope` | 17 | `ok_envelope`, `error_envelope`, `render`, `EXIT_ESCALATED`, `EXIT_ERROR`, `HANDLED`, `WATCH_HANDLED`. It sits below the Interface band because detached children write `report.json` with the same envelope (§13 D6). |
+| `envelope` | 17 | `ok_envelope`, `error_envelope`, `render`, `EXIT_ESCALATED`, `EXIT_ERROR`, `HANDLED`. It sits below the Interface band because detached children write `report.json` with the same envelope (§13 D6). |
 | `handoff` | 18 | `release_handed_off`, `run_detached_child`, `hand_off_to_child` (`cli.py:1411-1496`) |
 | `reset` | 18 | `reset_run` and its messages (`cli.py:3187-3307`) |
 | `card_run` | 19 | `card_run_status`, `card_outcome_comment`, `CardPreflight`, `preflight_card`, `RecordedRun`, `recorded_card_run`, `run_card_engine`, `run_card`, `detach_card` |

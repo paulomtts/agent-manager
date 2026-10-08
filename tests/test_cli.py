@@ -12272,41 +12272,10 @@ def test_a_card_comment_the_board_refuses_is_a_warning_and_changes_nothing_else(
 
 # ── am watch, one-shot (card 43f4f076) ─────────────────────────────────────
 #
-# Default (unit) tier per design §14: no git, no brd, no harness. Journals are
-# written straight to `XDG_DATA_HOME/agent-manager/runs/<id>/journal.jsonl`.
-
-WATCH_TS = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
-
+# Default (unit) tier per design §14: no git, no brd, no harness. Rows are inserted with the `am events` helpers (`_insert_events`, `_insert_rows`).
 
 def _watch_runs_dir(tmp_path: Path) -> Path:
     return tmp_path / "xdg" / "agent-manager" / "runs"
-
-
-def _write_watch_journal(
-    tmp_path: Path, run_id: str, seqs: list[int], *, tail: str = ""
-) -> list[dict[str, Any]]:
-    """Write `run_id`'s journal with one line per seq, then `tail` verbatim.
-
-    Returns the lines as `am watch` must report them: JSON-mode dumps.
-    """
-    run_dir = _watch_runs_dir(tmp_path) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    dumped = [
-        store_journal.JournalLine(
-            seq=seq,
-            ts=WATCH_TS,
-            run_id=run_id,
-            event="phase_upsert",
-            card="card-1",
-            phase="implement",
-            attempt=1,
-            payload={"status": "started", "n": seq},
-        ).model_dump(mode="json")
-        for seq in seqs
-    ]
-    text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    (run_dir / store_journal.JOURNAL_NAME).write_text(text + tail, encoding="utf-8")
-    return dumped
 
 
 def _watch(*args: str):
@@ -12619,33 +12588,6 @@ def test_watch_selector_refusals(projection, monkeypatch, argv, message):
 # before it, with no wall-clock wait and no signal.
 
 
-def _watch_line(run_id: str, seq: int) -> dict[str, Any]:
-    """One journal line in the shape `_write_watch_journal` writes, JSON-mode."""
-    return store_journal.JournalLine(
-        seq=seq,
-        ts=WATCH_TS,
-        run_id=run_id,
-        event="phase_upsert",
-        card="card-1",
-        phase="implement",
-        attempt=1,
-        payload={"status": "started", "n": seq},
-    ).model_dump(mode="json")
-
-
-def _append_watch_journal(
-    tmp_path: Path, run_id: str, seqs: list[int], *, tail: str = ""
-) -> list[dict[str, Any]]:
-    """Append one line per seq to `run_id`'s journal, then `tail` verbatim."""
-    run_dir = _watch_runs_dir(tmp_path) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    dumped = [_watch_line(run_id, seq) for seq in seqs]
-    text = "".join(json.dumps(line, sort_keys=True) + "\n" for line in dumped)
-    with (run_dir / store_journal.JOURNAL_NAME).open("a", encoding="utf-8") as handle:
-        handle.write(text + tail)
-    return dumped
-
-
 def _watch_follow(monkeypatch, *args: str, actions=()):
     """Run `am watch ARGS --follow` for exactly `len(actions)` polls after the backlog.
 
@@ -12678,20 +12620,26 @@ def _hello(tmp_path: Path) -> dict[str, Any]:
     }
 
 
-def test_watch_hello_is_schema_2(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+def test_watch_hello_is_schema_2(projection, tmp_path, monkeypatch):
     hello = cli._watch_hello()
     assert hello["schema"] == 2
     assert type(hello["schema"]) is int
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
-    _write_watch_journal(tmp_path, "run-b", [1])
+    _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+    )
 
     for argv in (
-        ["run-a"],
-        ["run-a", "--since", "1"],
+        [EVENTS_RUN_A],
+        [EVENTS_RUN_A, "--since", "1"],
         ["--all"],
-        ["run-a", "--from-now"],
+        ["--all-projects"],
+        ["--project", str(projection)],
+        [EVENTS_RUN_A, "--from-now"],
         ["--all", "--from-now"],
+        ["--project", str(projection), "--from-now"],
     ):
         result, _ = _watch_follow(monkeypatch, *argv)
         assert result.exit_code == 0, (argv, result.output)
@@ -12700,10 +12648,8 @@ def test_watch_hello_is_schema_2(tmp_path, monkeypatch):
         assert set(first) == {"event", "schema", "am", "runs_dir"}, argv
         assert type(first["schema"]) is int, argv
         assert first == _hello(tmp_path), argv
-        # One hello per stream, however many runs it covers.
-        assert [line for line in lines if "event" in line and "seq" not in line] == [
-            first
-        ], argv
+        # One hello per stream; every other line is an event with a gseq.
+        assert [line for line in lines if "gseq" not in line] == [first], argv
 
 
 def test_logs_hello_stays_schema_1():
@@ -12712,63 +12658,52 @@ def test_logs_hello_stays_schema_1():
     assert hello == _logs_hello_line(Path("x"))
 
 
-def test_watch_schema_2_replays_legacy_cancelled_unchanged(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    run_dir = _watch_runs_dir(tmp_path) / "run-old"
-    run_dir.mkdir(parents=True)
-    # As an `am` from before the spelling switch wrote it.
-    legacy = store_journal.JournalLine(
-        seq=1,
-        ts=WATCH_TS,
-        run_id="run-old",
-        event="run_upsert",
-        payload={"run_id": "run-old", "status": "cancelled"},
-    ).model_dump(mode="json")
-    after = _watch_line("run-old", 2)
-    journal = run_dir / store_journal.JOURNAL_NAME
-    journal.write_text(
-        "".join(json.dumps(line, sort_keys=True) + "\n" for line in (legacy, after)),
-        encoding="utf-8",
+def test_watch_schema_2_replays_legacy_cancelled_unchanged(projection, tmp_path, monkeypatch):
+    # As an `am` from before the spelling switch recorded it.
+    rows = _insert_rows(
+        (projection, "run-old", "run_upsert", {"run_id": "run-old", "status": "cancelled"}),
+        (projection, "run-old", "phase_upsert", {"status": "started"}),
     )
-    before = journal.read_bytes()
 
     result, _ = _watch_follow(monkeypatch, "run-old")
 
     assert result.exit_code == 0, result.output
     lines = _stream(result)
-    assert lines == [_hello(tmp_path), legacy, after]
+    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in rows]]
     assert lines[0]["schema"] == 2
-    assert lines[1]["payload"]["status"] == "cancelled"
-    assert journal.read_bytes() == before
+    assert lines[1]["payload"] == {"run_id": "run-old", "status": "cancelled"}
 
 
-def test_watch_follow_hello_line_shape(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3, 4])
+def test_watch_follow_hello_line_shape(projection, tmp_path, monkeypatch):
+    rows = _insert_events(
+        projection,
+        *[
+            (EVENTS_RUN_A, kind)
+            for kind in ("run_upsert", "story_upsert", "subtask_upsert", "phase_upsert")
+        ],
+    )
 
-    result, sleeps = _watch_follow(monkeypatch, "run-a", "--since", "2")
+    result, sleeps = _watch_follow(monkeypatch, EVENTS_RUN_A, "--since", "2")
 
     assert result.exit_code == 0, result.output
     assert sleeps == []
     lines = _stream(result)
     assert lines[0] == _hello(tmp_path)
-    assert lines[1:] == written[2:]
+    assert lines[1:] == [_watch_event(row) for row in rows[2:]]
     assert [line["seq"] for line in lines[1:]] == [3, 4]
-    # Bare JournalLines: no envelope, and compact, one object per line.
+    # Bare lines: no envelope, and compact, one object per line.
     assert all("ok" not in line for line in lines)
     assert result.stdout.endswith("\n")
     assert all(": " not in text for text in result.stdout.splitlines())
     assert result.stderr == ""
 
     # `--pretty` only shapes a refusal: the stream is byte-for-byte the same.
-    pretty, _ = _watch_follow(monkeypatch, "run-a", "--since", "2", "--pretty")
+    pretty, _ = _watch_follow(monkeypatch, EVENTS_RUN_A, "--since", "2", "--pretty")
     assert pretty.exit_code == 0, pretty.output
     assert pretty.stdout == result.stdout
 
 
-def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-
+def test_watch_follow_refusal_prints_envelope_and_no_stream(projection, tmp_path, monkeypatch):
     result, sleeps = _watch_follow(monkeypatch, "no-such-run")
 
     assert result.exit_code == cli.EXIT_ERROR, result.output
@@ -12777,11 +12712,13 @@ def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatc
     assert len(lines) == 1, result.stdout
     envelope = json.loads(lines[0])
     assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "UnknownRunError"
-    assert "no-such-run" in envelope["error"]["message"]
+    assert envelope["error"] == {
+        "type": "UnknownRunError",
+        "message": EVENTS_UNKNOWN_MESSAGE,
+    }
     assert "event" not in envelope
-    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
     assert not _watch_runs_dir(tmp_path).exists()
+    assert not paths.db_path().exists()
 
     # `--pretty` still indents a refusal, and it is still the only output.
     pretty, _ = _watch_follow(monkeypatch, "no-such-run", "--pretty")
@@ -12790,14 +12727,14 @@ def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatc
     assert json.loads(pretty.stdout) == envelope
 
     # Every other refusal the one-shot form makes is made before the stream too.
-    _write_watch_journal(tmp_path, "run-a", [1])
-    _write_watch_journal(tmp_path, "run-c", [1], tail="not json\n")
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
     for argv, kind in (
         (["../escape"], "UnknownRunError"),
-        (["run-a", "--since", "-1"], "CliError"),
-        (["--all", "run-a"], "CliError"),
+        ([EVENTS_RUN_A, "--since", "-1"], "CliError"),
+        (["--all", EVENTS_RUN_A], "CliError"),
         ([], "CliError"),
-        (["run-c"], "CorruptJournalError"),
+        ([EVENTS_RUN_A, "--project", str(projection)], "CliError"),
+        (["--project", str(projection), "--all-projects"], "CliError"),
     ):
         refused, sleeps = _watch_follow(monkeypatch, *argv)
         assert refused.exit_code == cli.EXIT_ERROR, (argv, refused.output)
@@ -12809,17 +12746,34 @@ def test_watch_follow_refusal_prints_envelope_and_no_stream(tmp_path, monkeypatc
         assert refusal["error"]["type"] == kind, argv
 
 
-def test_watch_follow_observes_a_line_appended_after_start(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    backlog = _write_watch_journal(tmp_path, "run-a", [1, 2])
-    appended: list[dict[str, Any]] = []
+def _spy_on_event_reads(monkeypatch) -> list[int]:
+    """Record the `after_seq` of every `store_events.read` call, then read as
+    before; the list fills as `am watch` polls."""
+    original = store_events.read
+    seen: list[int] = []
 
-    def append_third() -> None:
-        appended.extend(_append_watch_journal(tmp_path, "run-a", [3]))
+    def spy(conn, **kwargs):
+        seen.append(kwargs.get("after_seq", 0))
+        return original(conn, **kwargs)
+
+    monkeypatch.setattr(store_events, "read", spy)
+    return seen
+
+
+def test_watch_follow_observes_an_event_inserted_after_start(
+    projection, tmp_path, monkeypatch
+):
+    backlog = _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
+    inserted: list[store_events.EventRow] = []
+
+    def record_third() -> None:
+        inserted.extend(_insert_events(projection, (EVENTS_RUN_A, "subtask_upsert")))
 
     # Poll 1 sees seq 3; poll 2 sees nothing new, so seq 3 must not repeat.
     result, sleeps = _watch_follow(
-        monkeypatch, "run-a", actions=[append_third, lambda: None]
+        monkeypatch, EVENTS_RUN_A, actions=[record_third, lambda: None]
     )
 
     assert result.exit_code == 0, result.output
@@ -12827,148 +12781,203 @@ def test_watch_follow_observes_a_line_appended_after_start(tmp_path, monkeypatch
     assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
     lines = _stream(result)
     assert lines[0] == _hello(tmp_path)
-    assert lines[1:] == backlog + appended
+    assert lines[1:] == [_watch_event(row) for row in backlog + inserted]
     assert [line["seq"] for line in lines[1:]] == [1, 2, 3]
+    assert [line["gseq"] for line in lines[1:]] == [row.seq for row in backlog + inserted]
 
 
-def test_watch_follow_survives_lease_takeover(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    old_owner = store_journal.Journal("run-t")
-    for _ in range(2):
-        old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
+def test_watch_follow_one_cursor_across_runs(projection, tmp_path, monkeypatch):
+    written = _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_B, "run_upsert"))
 
-    def old_owner_keeps_writing() -> None:
-        for _ in range(2):
-            old_owner.append("phase_upsert", {"by": "old"}, card="card-1", phase="implement", attempt=1)
-
-    def new_owner_takes_over() -> None:
-        # The new owner opens the journal once the old owner has stopped
-        # appending, so it numbers after the old owner's last line.
-        new_owner = store_journal.Journal("run-t")
-        for _ in range(2):
-            new_owner.append("phase_upsert", {"by": "new"}, card="card-1", phase="implement", attempt=1)
-
-    result, _ = _watch_follow(
-        monkeypatch,
-        "run-t",
-        actions=[old_owner_keeps_writing, new_owner_takes_over, lambda: None],
-    )
-
-    assert result.exit_code == 0, result.output
-    lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
-    events = lines[1:]
-    seqs = [event["seq"] for event in events]
-    assert seqs == [1, 2, 3, 4, 5, 6]  # strictly increasing, contiguous, no repeat
-    assert [event["payload"]["by"] for event in events] == ["old"] * 4 + ["new"] * 2
-    assert {event["run_id"] for event in events} == {"run-t"}
-
-
-def test_watch_follow_all_picks_up_a_run_created_later(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-
-    # Nothing to watch yet: the hello line alone, and nothing created under runs/.
-    idle, _ = _watch_follow(monkeypatch, "--all", actions=[lambda: None, lambda: None])
-    assert idle.exit_code == 0, idle.output
-    assert _stream(idle) == [_hello(tmp_path)]
-    assert not _watch_runs_dir(tmp_path).exists()
-
-    third = json.dumps(_watch_line("run-new", 3), sort_keys=True)
-    created: list[dict[str, Any]] = []
-
-    def create_run_with_a_torn_tail() -> None:
-        created.extend(
-            _write_watch_journal(tmp_path, "run-new", [1, 2], tail=third[:20])
+    def interleave() -> None:
+        written.extend(
+            _insert_events(
+                projection,
+                (EVENTS_RUN_B, "story_upsert"),
+                (EVENTS_RUN_A, "story_upsert"),
+                (EVENTS_RUN_B, "subtask_upsert"),
+            )
         )
 
-    def finish_the_torn_line() -> None:
-        journal = _watch_runs_dir(tmp_path) / "run-new" / store_journal.JOURNAL_NAME
-        with journal.open("a", encoding="utf-8") as handle:
-            handle.write(third[20:] + "\n")
-
-    result, _ = _watch_follow(
-        monkeypatch,
-        "--all",
-        actions=[lambda: None, create_run_with_a_torn_tail, finish_the_torn_line],
-    )
-
-    assert result.exit_code == 0, result.output
-    lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
-    # Seqs 1 and 2 on poll 2 with seq 3 held back as a write in flight, then seq 3 on poll 3.
-    assert lines[1:] == created + [_watch_line("run-new", 3)]
-
-
-def test_watch_follow_tolerates_a_journal_that_disappears(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
-    recreated: list[dict[str, Any]] = []
-
-    def delete_journal() -> None:
-        journal.unlink()
-
-    def recreate_journal() -> None:
-        recreated.extend(_write_watch_journal(tmp_path, "run-a", [1, 2]))
-
-    result, _ = _watch_follow(
-        monkeypatch, "run-a", actions=[delete_journal, recreate_journal]
-    )
-
-    assert result.exit_code == 0, result.output
-    assert result.stderr == ""
-    lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
-    # Seq 1 is not repeated: the run's cursor outlived the missing file.
-    assert lines[1:] == backlog + recreated[1:]
-
-
-def test_watch_follow_mid_stream_corruption_ends_stream_with_stderr_message(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    backlog = _write_watch_journal(tmp_path, "run-a", [1])
-    journal = _watch_runs_dir(tmp_path) / "run-a" / store_journal.JOURNAL_NAME
-    appended: list[dict[str, Any]] = []
-
-    def append_second() -> None:
-        appended.extend(_append_watch_journal(tmp_path, "run-a", [2]))
-
-    def corrupt_third() -> None:
-        # Newline-terminated, so a corrupt line rather than a torn tail.
-        _append_watch_journal(tmp_path, "run-a", [], tail="not json\n")
+    def one_more_of_a() -> None:
+        written.extend(_insert_events(projection, (EVENTS_RUN_A, "subtask_upsert")))
 
     result, sleeps = _watch_follow(
         monkeypatch,
-        "run-a",
-        actions=[append_second, corrupt_third, lambda: None],
+        "--all",
+        actions=[interleave, lambda: None, one_more_of_a, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(sleeps) == 4
+    lines = _stream(result)
+    assert lines[0] == _hello(tmp_path)
+    # Every row exactly once, in gseq order, whichever run and poll it came in.
+    assert lines[1:] == [_watch_event(row) for row in written]
+    gseqs = [line["gseq"] for line in lines[1:]]
+    assert gseqs == sorted(set(gseqs))
+    for run_id in (EVENTS_RUN_A, EVENTS_RUN_B):
+        assert [line["seq"] for line in lines[1:] if line["run_id"] == run_id] == [1, 2, 3]
+
+
+def test_watch_follow_since_filtered_rows_advance_the_cursor(
+    projection, tmp_path, monkeypatch
+):
+    """Review Focus 1: rows `--since` filters out still move the cursor, so
+    no poll reads them again."""
+    rows = _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
+
+    def poll_one() -> None:
+        rows.extend(
+            _insert_events(
+                projection, (EVENTS_RUN_A, "subtask_upsert"), (EVENTS_RUN_B, "run_upsert")
+            )
+        )
+
+    def poll_two() -> None:
+        rows.extend(_insert_events(projection, (EVENTS_RUN_A, "phase_upsert")))
+
+    reads = _spy_on_event_reads(monkeypatch)
+    result, _ = _watch_follow(
+        monkeypatch,
+        EVENTS_RUN_A,
+        "--since",
+        "2",
+        actions=[poll_one, poll_two, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+    assert _stream(result) == [
+        _hello(tmp_path),
+        _watch_event(a_rows[2]),
+        _watch_event(a_rows[3]),
+    ]
+    # Backlog from 0, then each poll above the last gseq the one before read.
+    assert reads == [0, a_rows[1].seq, a_rows[2].seq, a_rows[3].seq]
+
+    # A --since above every seq: nothing is emitted, and the cursor still moves.
+    reads.clear()
+
+    def poll_three() -> None:
+        rows.extend(_insert_events(projection, (EVENTS_RUN_A, "attempt_upsert")))
+
+    quiet, _ = _watch_follow(
+        monkeypatch, EVENTS_RUN_A, "--since", "99", actions=[poll_three, lambda: None]
+    )
+
+    assert quiet.exit_code == 0, quiet.output
+    assert _stream(quiet) == [_hello(tmp_path)]
+    assert reads == [0, a_rows[3].seq, rows[-1].seq]
+
+
+def test_watch_follow_all_picks_up_a_database_created_later(
+    projection, tmp_path, monkeypatch
+):
+    # Nothing to watch yet: the hello line alone, and nothing created.
+    idle, _ = _watch_follow(monkeypatch, "--all", actions=[lambda: None, lambda: None])
+    assert idle.exit_code == 0, idle.output
+    assert _stream(idle) == [_hello(tmp_path)]
+    assert not paths.db_path().exists()
+
+    created: list[store_events.EventRow] = []
+
+    def create() -> None:
+        created.extend(
+            _insert_events(
+                projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+            )
+        )
+
+    result, _ = _watch_follow(monkeypatch, "--all", actions=[create, lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in created]]
+
+
+def test_watch_follow_project_picks_up_a_project_that_appears_later(
+    escalation_repos, tmp_path, monkeypatch
+):
+    root, other = escalation_repos
+    _insert_rows((root, EVENTS_RUN_A, "run_upsert", {}))
+    later: list[store_events.EventRow] = []
+
+    def root_only() -> None:
+        _insert_rows((root, EVENTS_RUN_A, "story_upsert", {}))
+
+    def other_starts() -> None:
+        later.extend(
+            _insert_rows(
+                (other, EVENTS_RUN_B, "run_upsert", {}),
+                (root, EVENTS_RUN_A, "subtask_upsert", {}),
+                (other, EVENTS_RUN_B, "story_upsert", {}),
+            )
+        )
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--project",
+        str(other),
+        actions=[root_only, other_starts, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stream(result) == [
+        _hello(tmp_path),
+        _watch_event(later[0]),
+        _watch_event(later[2]),
+    ]
+    assert _project_count() == 2
+
+
+def test_watch_follow_mid_stream_error_ends_with_stderr_line(
+    projection, tmp_path, monkeypatch
+):
+    backlog = _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    inserted: list[store_events.EventRow] = []
+
+    def record_second() -> None:
+        inserted.extend(_insert_events(projection, (EVENTS_RUN_A, "story_upsert")))
+
+    def record_unreadable() -> None:
+        _plant_raw_payload(projection, "subtask_upsert", "{not json", run_id=EVENTS_RUN_A)
+
+    result, sleeps = _watch_follow(
+        monkeypatch,
+        EVENTS_RUN_A,
+        actions=[record_second, record_unreadable, lambda: None],
     )
 
     assert result.exit_code == cli.EXIT_ERROR, result.output
-    assert len(sleeps) == 2  # the stream ended on the corrupt poll
-    assert _stream(result) == [_hello(tmp_path), *backlog, *appended]
+    assert len(sleeps) == 2  # the stream ended on the unreadable poll
+    assert _stream(result) == [
+        _hello(tmp_path),
+        *[_watch_event(row) for row in backlog + inserted],
+    ]
     message = result.stderr.strip()
     assert "\n" not in message
-    assert f"{journal}:3:" in message
+    assert message.startswith("am watch: ")
 
 
-def test_watch_follow_ctrl_c_exits_zero_quietly(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    backlog = _write_watch_journal(tmp_path, "run-a", [1, 2])
+def test_watch_follow_ctrl_c_exits_zero_quietly(projection, tmp_path, monkeypatch):
+    backlog = _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
 
     def press_ctrl_c() -> None:
         raise KeyboardInterrupt
 
-    result, _ = _watch_follow(monkeypatch, "run-a", actions=[press_ctrl_c])
+    result, _ = _watch_follow(monkeypatch, EVENTS_RUN_A, actions=[press_ctrl_c])
 
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
-    assert _stream(result) == [_hello(tmp_path), *backlog]
+    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in backlog]]
 
 
-def test_watch_follow_closed_pipe_exits_zero_quietly(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
+def test_watch_follow_closed_pipe_exits_zero_quietly(projection, tmp_path, monkeypatch):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
     real_emit = cli._emit_stream_line
     emitted: list[Any] = []
 
@@ -12980,7 +12989,7 @@ def test_watch_follow_closed_pipe_exits_zero_quietly(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_emit_stream_line", emit_into_a_closed_pipe)
 
-    result, _ = _watch_follow(monkeypatch, "run-a", actions=[lambda: None])
+    result, _ = _watch_follow(monkeypatch, EVENTS_RUN_A, actions=[lambda: None])
 
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
@@ -13051,8 +13060,8 @@ def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
 
 # ── am watch --from-now (card db129e6a) ────────────────────────────────────
 #
-# Default (unit) tier per design §14, like the follow tests above: journals in
-# tmp_path, polling driven by the fake `cli._watch_sleep`, no subprocess.
+# Default (unit) tier per design §14, like the follow tests above: rows in the
+# projection under tmp_path, polling driven by the fake `cli._watch_sleep`, no subprocess.
 
 
 def _assert_one_cli_error(result, *needles: str) -> dict[str, Any]:
@@ -13069,14 +13078,14 @@ def _assert_one_cli_error(result, *needles: str) -> dict[str, Any]:
     return envelope
 
 
-def test_watch_from_now_refused_with_since(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
+def test_watch_from_now_refused_with_since(projection, monkeypatch):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
 
     for argv in (
-        ["run-a", "--from-now", "--since", "0"],
-        ["run-a", "--from-now", "--since", "2"],
+        [EVENTS_RUN_A, "--from-now", "--since", "0"],
+        [EVENTS_RUN_A, "--from-now", "--since", "2"],
         ["--all", "--from-now", "--since", "0"],
+        ["--project", str(projection), "--from-now", "--since", "0"],
     ):
         result, sleeps = _watch_follow(monkeypatch, *argv)
         assert sleeps == [], argv
@@ -13084,7 +13093,7 @@ def test_watch_from_now_refused_with_since(tmp_path, monkeypatch):
 
     # `--pretty` still indents the refusal, and it is still the only output.
     pretty, sleeps = _watch_follow(
-        monkeypatch, "run-a", "--from-now", "--since", "0", "--pretty"
+        monkeypatch, EVENTS_RUN_A, "--from-now", "--since", "0", "--pretty"
     )
     assert pretty.exit_code == cli.EXIT_ERROR, pretty.output
     assert sleeps == []
@@ -13092,15 +13101,18 @@ def test_watch_from_now_refused_with_since(tmp_path, monkeypatch):
     assert json.loads(pretty.stdout)["error"]["type"] == "CliError"
 
     # Breaking both new rules at once reports the --since conflict.
-    both = _watch("run-a", "--from-now", "--since", "2")
+    both = _watch(EVENTS_RUN_A, "--from-now", "--since", "2")
     _assert_one_cli_error(both, "--from-now", "--since", "exclusive")
 
 
-def test_watch_from_now_refused_without_follow(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
+def test_watch_from_now_refused_without_follow(projection):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
 
-    for argv in (["run-a", "--from-now"], ["--all", "--from-now"]):
+    for argv in (
+        [EVENTS_RUN_A, "--from-now"],
+        ["--all", "--from-now"],
+        ["--project", str(projection), "--from-now"],
+    ):
         result = runner.invoke(cli.app, ["watch", *argv])
         _assert_one_cli_error(result, "--from-now", "--follow")
 
@@ -13143,57 +13155,74 @@ def test_watch_from_now_keeps_existing_refusals_and_since_zero(
     _assert_one_cli_error(negative, "--since must be 0 or more")
 
 
-def test_watch_follow_from_now_skips_backlog(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+def test_watch_follow_from_now_skips_backlog(projection, tmp_path, monkeypatch):
+    # The run's own backlog and another run's: neither is emitted.
+    _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+    )
 
-    # Nothing appended: the hello line alone.
+    # Nothing recorded: the hello line alone.
     idle, idle_sleeps = _watch_follow(
-        monkeypatch, "run-a", "--from-now", actions=[lambda: None]
+        monkeypatch, EVENTS_RUN_A, "--from-now", actions=[lambda: None]
     )
     assert idle.exit_code == 0, idle.output
     assert idle_sleeps == [cli.WATCH_POLL_SECONDS]
     assert _stream(idle) == [_hello(tmp_path)]
 
-    appended: list[dict[str, Any]] = []
+    inserted: list[store_events.EventRow] = []
 
-    def append_fourth() -> None:
-        appended.extend(_append_watch_journal(tmp_path, "run-a", [4]))
+    def record_third() -> None:
+        inserted.extend(
+            _insert_events(
+                projection, (EVENTS_RUN_A, "subtask_upsert"), (EVENTS_RUN_B, "story_upsert")
+            )
+        )
 
-    def append_fifth() -> None:
-        appended.extend(_append_watch_journal(tmp_path, "run-a", [5]))
+    def record_fourth() -> None:
+        inserted.extend(_insert_events(projection, (EVENTS_RUN_A, "phase_upsert")))
 
-    # The last poll sees nothing new, so seq 5 must not repeat.
+    # The last poll sees nothing new, so seq 4 must not repeat.
     result, sleeps = _watch_follow(
         monkeypatch,
-        "run-a",
+        EVENTS_RUN_A,
         "--from-now",
-        actions=[append_fourth, append_fifth, lambda: None],
+        actions=[record_third, record_fourth, lambda: None],
     )
 
     assert result.exit_code == 0, result.output
     assert sleeps == [cli.WATCH_POLL_SECONDS] * 3
     lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
-    assert lines[1:] == appended
-    assert [line["seq"] for line in lines[1:]] == [4, 5]
+    a_rows = [row for row in inserted if row.run_id == EVENTS_RUN_A]
+    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in a_rows]]
+    assert [line["seq"] for line in lines[1:]] == [3, 4]
     assert result.stderr == ""
 
 
-def test_watch_follow_all_from_now_skips_only_runs_present_at_start(
-    tmp_path, monkeypatch
+def test_watch_follow_all_from_now_emits_runs_created_later_in_full(
+    projection, tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
-    _write_watch_journal(tmp_path, "run-c", [1])  # present at start, never appended
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
+    later: list[store_events.EventRow] = []
 
     def first_poll() -> None:
-        _append_watch_journal(tmp_path, "run-a", [3])
-        _write_watch_journal(tmp_path, "run-b", [1, 2])  # appears after the start
+        later.extend(
+            _insert_events(
+                projection,
+                (EVENTS_RUN_A, "subtask_upsert"),
+                (EVENTS_RUN_B, "run_upsert"),  # B has no row at start
+                (EVENTS_RUN_B, "story_upsert"),
+            )
+        )
 
     def second_poll() -> None:
-        _append_watch_journal(tmp_path, "run-a", [4])
-        _append_watch_journal(tmp_path, "run-b", [3])
+        later.extend(
+            _insert_events(
+                projection, (EVENTS_RUN_B, "subtask_upsert"), (EVENTS_RUN_A, "phase_upsert")
+            )
+        )
 
     result, sleeps = _watch_follow(
         monkeypatch, "--all", "--from-now", actions=[first_poll, second_poll]
@@ -13202,47 +13231,30 @@ def test_watch_follow_all_from_now_skips_only_runs_present_at_start(
     assert result.exit_code == 0, result.output
     assert len(sleeps) == 2
     lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
-    # Runs are read in sorted order on each poll: run-a, then run-b.
-    assert lines[1:] == [
-        _watch_line("run-a", 3),
-        _watch_line("run-b", 1),
-        _watch_line("run-b", 2),
-        _watch_line("run-a", 4),
-        _watch_line("run-b", 3),
-    ]
+    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in later]]
+    assert [line["seq"] for line in lines[1:] if line["run_id"] == EVENTS_RUN_B] == [1, 2, 3]
     assert result.stderr == ""
 
 
-def test_watch_follow_from_now_emits_a_torn_tail_once_complete(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    third_a = json.dumps(_watch_line("run-a", 3), sort_keys=True)
-    first_d = json.dumps(_watch_line("run-d", 1), sort_keys=True)
-    # run-a: seqs 1-2 complete, seq 3 still being written at start.
-    _write_watch_journal(tmp_path, "run-a", [1, 2], tail=third_a[:20])
-    # run-d: only a torn first line at start, so it gets no seeded cursor.
-    _write_watch_journal(tmp_path, "run-d", [], tail=first_d[:20])
+def test_watch_follow_from_now_on_an_empty_machine_emits_every_later_event(
+    projection, tmp_path, monkeypatch
+):
+    """Review Focus 5: no `am.db` at start, so head is 0 and nothing is skipped."""
+    later: list[store_events.EventRow] = []
 
-    def finish_the_torn_lines() -> None:
-        for run_id, text in (("run-a", third_a), ("run-d", first_d)):
-            journal = _watch_runs_dir(tmp_path) / run_id / store_journal.JOURNAL_NAME
-            with journal.open("a", encoding="utf-8") as handle:
-                handle.write(text[20:] + "\n")
+    def first_poll() -> None:
+        later.extend(
+            _insert_events(
+                projection, (EVENTS_RUN_A, "lease_acquired"), (EVENTS_RUN_A, "run_upsert")
+            )
+        )
 
     result, _ = _watch_follow(
-        monkeypatch,
-        "--all",
-        "--from-now",
-        actions=[lambda: None, finish_the_torn_lines, lambda: None],
+        monkeypatch, "--all", "--from-now", actions=[first_poll, lambda: None]
     )
 
     assert result.exit_code == 0, result.output
-    assert result.stderr == ""
-    assert _stream(result) == [
-        _hello(tmp_path),
-        _watch_line("run-a", 3),
-        _watch_line("run-d", 1),
-    ]
+    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in later]]
 
 
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────

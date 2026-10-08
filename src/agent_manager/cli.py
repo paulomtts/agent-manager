@@ -3232,42 +3232,6 @@ def logs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-WATCH_HANDLED: tuple[type[BaseException], ...] = (*HANDLED, store_journal.JournalError)
-"""`HANDLED` plus `JournalError`, for `watch` only.
-
-A corrupt journal is a refusal for a reader, so `watch` turns it into an
-`ok: false` envelope at exit 3. It is not added to `HANDLED` itself: for the
-commands that write a journal, a corrupt one is still a bug that should crash
-with its stack intact. `MissingJournalError` never reaches this tuple; `watch_for`
-turns it into `UnknownRunError` first.
-"""
-
-
-def _check_watch_run_id(run_id: str) -> None:
-    """Refuse a run id that is a path rather than one directory name.
-
-    `Journal._for_reading` joins the id onto `<data dir>/runs/`, so `..` or a
-    `/` would read a `journal.jsonl` outside the runs directory.
-    """
-    if run_id in ("", ".", "..") or Path(run_id).name != run_id:
-        raise UnknownRunError(
-            f"run id {run_id!r} is not a run directory name"
-            " (`agent-manager watch --all` reads every run there is)"
-        )
-
-
-def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
-    """`run_id`'s journal lines with `seq > since`, JSON-mode, in `seq` order.
-
-    Opened through `Journal._for_reading`, never `Journal(run_id)`: the normal
-    constructor calls `paths.run_dir`, which would create a directory for a run
-    that does not exist (am-watch design 3.7). A torn last line is an append in
-    flight and is skipped. Raises `MissingJournalError` when there is no journal.
-    """
-    lines = store_journal.Journal._for_reading(run_id).read(ignore_torn_tail=True)
-    return [line.model_dump(mode="json") for line in lines if line.seq > since]
-
-
 def _check_watch_form(
     run_id: str | None, *, all_runs: bool, project: Path | None
 ) -> None:
@@ -3320,6 +3284,9 @@ def watch_for(
     Without `follow` the events are read in one `store_db.read_snapshot` on
     one `open_db_for_reading(Path("."))` connection (the root never chooses
     the file), closed on every path; with no `am.db` nothing is created.
+
+    With `follow` nothing is read but, for `run_id`, the unknown-run check in
+    one short snapshot: the stream reads the backlog itself.
     """
     _check_watch_form(run_id, all_runs=all_runs, project=project)
     if since < 0:
@@ -3335,16 +3302,14 @@ def watch_for(
             " and without --follow there is only the backlog"
         )
     if follow:
-        # The stream still reads journals; Task 2 replaces this block.
+        # The stream reads its own backlog; only an unknown RUN is refused here.
         if run_id is not None:
-            _check_watch_run_id(run_id)
+            conn = store_db.open_db_for_reading(Path("."))
             try:
-                _journal_events(run_id, since=since)
-            except store_journal.MissingJournalError as error:
-                raise UnknownRunError(
-                    f"run {run_id!r} has no journal under the data directory"
-                    " (`agent-manager watch --all` reads every run there is)"
-                ) from error
+                with store_db.read_snapshot(conn):
+                    _refuse_unknown_run(conn, run_id)
+            finally:
+                conn.close()
         return None
     conn = store_db.open_db_for_reading(Path("."))
     try:
@@ -3401,64 +3366,94 @@ def _emit_stream_line(obj: Mapping[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _poll_watch(
-    run_id: str | None, *, since: int, cursors: dict[str, int]
-) -> Iterator[dict[str, Any]]:
-    """One pass over the watched runs: each line above its run's cursor.
+@dataclass
+class _WatchCursor:
+    """Where `am watch --follow` has read to: `gseq`, the largest global `seq`
+    any poll read (emitted or filtered out by `--since`), and `project_id`,
+    `--project`'s id once a poll found it."""
 
-    `cursors` maps a run directory name to the highest `seq` already emitted
-    for it, so the cursor is `(run_id, seq)` and nothing else (design 3.3). A
-    lease takeover appends to the same file at a higher `seq` and needs no
-    case of its own. A run not yet in `cursors` starts at `since`. With
-    `--all` the runs are listed again on every pass, so a run that appears
-    later is picked up. A run with no journal, now or any more, has nothing
-    to emit. A torn last line is skipped by `_journal_events` and emitted on a
-    later pass once it is complete.
+    gseq: int = 0
+    project_id: int | None = None
+
+
+def _watch_head() -> int:
+    """The machine-wide `head`, on a read connection of its own, closed
+    before returning; 0 with no `am.db`."""
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        with store_db.read_snapshot(conn):
+            return store_events.head(conn)
+    finally:
+        conn.close()
+
+
+def _poll_watch(
+    cursor: _WatchCursor, *, run_id: str | None, project: Path | None, since: int
+) -> Iterator[dict[str, Any]]:
+    """One poll: the selected events above `cursor.gseq`, in `gseq` order, as
+    `_event_line`s, keeping those whose per-run `seq` is above `since`.
+
+    The rows are read in one snapshot on a connection of this poll's own,
+    closed before the first line is yielded, so a stream holds no connection
+    between polls and an `am.db` created after it started is read. Every row
+    read advances `cursor.gseq`, filtered or not, so none is read twice and
+    none committed above the cursor is skipped. `project` is looked up until
+    it has a `projects` row; until then the poll reads nothing.
     """
-    run_ids = [run_id] if run_id is not None else paths.list_run_ids()
-    for each in run_ids:
-        try:
-            events = _journal_events(each, since=cursors.get(each, since))
-        except store_journal.MissingJournalError:
-            continue
-        for event in events:
-            cursors[each] = event["seq"]
-            yield event
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        with store_db.read_snapshot(conn):
+            if project is not None and cursor.project_id is None:
+                cursor.project_id = store_projects.lookup(
+                    conn, Path(project).expanduser()
+                )
+                if cursor.project_id is None:
+                    return
+            rows = store_events.read(
+                conn,
+                after_seq=cursor.gseq,
+                run_id=run_id,
+                project_id=cursor.project_id,
+            )
+    finally:
+        conn.close()
+    for row in rows:
+        cursor.gseq = row.seq
+        if row.run_seq > since:
+            yield _event_line(row)
 
 
 def _follow_watch(
     run_id: str | None,
     *,
+    project: Path | None = None,
     since: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
     from_now: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    """The backlog above `since`, then every line appended after it.
+    """The backlog, then every event recorded after it.
 
-    One pass at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
-    another pass, `max_polls` times or forever when it is `None`. One cursor
-    dict spans every pass, so no `seq` of a run is emitted twice and none is
-    skipped, however its lines are spread across polls.
+    One poll at once for the backlog, then `sleep(WATCH_POLL_SECONDS)` and
+    another poll, `max_polls` times or forever when it is `None`. One
+    `_WatchCursor` spans every poll, so no event is emitted twice and none is
+    skipped, however runs interleave across polls.
 
-    With `from_now` the backlog pass still runs, so it seeds each existing
-    run's cursor to its highest complete `seq`, but nothing it reads is
-    yielded. A torn last line is not read, so it is emitted once complete;
-    a run with no complete line, or none at all yet, has no cursor and is
-    emitted in full from `since` when its lines appear.
+    With `from_now` there is no backlog poll: the cursor starts at the
+    machine-wide `head`, so only events committed after the start are
+    emitted, and a run or project that appears later is emitted from its
+    first event.
     """
-    cursors: dict[str, int] = {}
-    backlog = _poll_watch(run_id, since=since, cursors=cursors)
+    cursor = _WatchCursor()
     if from_now:
-        for _ in backlog:
-            pass
+        cursor.gseq = _watch_head()
     else:
-        yield from backlog
+        yield from _poll_watch(cursor, run_id=run_id, project=project, since=since)
     polls = 0
     while max_polls is None or polls < max_polls:
         sleep(WATCH_POLL_SECONDS)
         polls += 1
-        yield from _poll_watch(run_id, since=since, cursors=cursors)
+        yield from _poll_watch(cursor, run_id=run_id, project=project, since=since)
 
 
 def _silence_stdout() -> None:
@@ -3477,20 +3472,28 @@ def _silence_stdout() -> None:
     os.close(devnull)
 
 
-def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> None:
+def _stream_watch(
+    run_id: str | None,
+    *,
+    project: Path | None = None,
+    since: int,
+    from_now: bool = False,
+) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
     `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
     test that replaces them controls every poll. Ctrl-C and a closed pipe are
-    how a stream normally ends: exit 0, nothing on stderr. A journal that
-    turns corrupt after the hello line cannot get an envelope, because every
-    line after the first must be a JournalLine. So its message goes to stderr
+    how a stream normally ends: exit 0, nothing on stderr. An error after the
+    hello line (a busy or too-new database, a row whose payload is not JSON or
+    whose kind `JournalLine` refuses) cannot get an envelope, because every
+    line after the first must be an event line. So its message goes to stderr
     and the exit is `EXIT_ERROR`.
     """
     try:
         _emit_stream_line(_watch_hello())
         for event in _follow_watch(
             run_id,
+            project=project,
             since=since,
             sleep=_watch_sleep,
             max_polls=WATCH_MAX_POLLS,
@@ -3502,7 +3505,7 @@ def _stream_watch(run_id: str | None, *, since: int, from_now: bool = False) -> 
     except BrokenPipeError:
         _silence_stdout()
         return
-    except WATCH_HANDLED as error:
+    except HANDLED as error:
         typer.echo(f"am watch: {error}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
 
@@ -3710,11 +3713,11 @@ def watch(
             from_now=from_now,
             since_given=since_given,
         )
-    except WATCH_HANDLED as error:
+    except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_watch(run_id, since=since_value, from_now=from_now)
+        _stream_watch(run_id, project=project, since=since_value, from_now=from_now)
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 

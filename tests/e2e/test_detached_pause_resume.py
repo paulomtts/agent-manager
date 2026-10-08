@@ -141,7 +141,7 @@ class _Stream:
         deadline = time.monotonic() + DEADLINE
         while not predicate(self.events):
             event = self._next(what, deadline - time.monotonic())
-            assert set(event) == JOURNAL_KEYS, event
+            assert set(event) == JOURNAL_KEYS | {"gseq"}, event
             assert event["run_id"] == self.run_id, event
             assert event["event"] in EVENT_KINDS, event
             self.events.append(event)
