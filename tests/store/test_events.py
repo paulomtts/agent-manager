@@ -298,6 +298,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
         store_events.insert,
         store_events.read,
         store_events.head,
+        store_events.has_run,
         store_events.run_lines,
         store_events.journal_line,
     ):
@@ -305,7 +306,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
     assert store_events.EventRow.__module__ == "agent_manager.store.events"
     assert inspect.ismodule(store.events)
     assert store.events is store_events
-    for name in ("insert", "read", "head", "run_lines", "journal_line", "EventRow"):
+    for name in ("insert", "read", "head", "has_run", "run_lines", "journal_line", "EventRow"):
         assert not hasattr(store, name)
 
 
@@ -644,6 +645,29 @@ def test_run_ids_lists_each_run_once_sorted_over_every_kind_and_project(
 
     assert store_events.run_ids(conn) == ["run-a", "run-b", "run-c"]
     assert not conn.in_transaction
+
+
+# ── has_run ──────────────────────────────────────────────────────────────────
+
+
+def test_has_run_is_true_for_a_run_with_any_event_row(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id, run_id="run-a", kind="lease_acquired", payload={"token": "t1"})
+    conn.commit()
+
+    assert store_events.has_run(conn, "run-a") is True
+    assert not conn.in_transaction
+
+
+def test_has_run_is_false_for_an_absent_run_and_an_empty_table(conns, project_id):
+    conn, _ = conns
+    assert store_events.has_run(conn, "run-a") is False
+
+    _insert(conn, project_id, run_id="run-b", kind="run_upsert")
+    conn.commit()
+
+    assert store_events.has_run(conn, "run-a") is False
+    assert store_events.has_run(conn, "run-b") is True
 
 
 # ── read ─────────────────────────────────────────────────────────────────────

@@ -153,6 +153,15 @@ def run_ids(conn: sqlite3.Connection) -> list[str]:
     return [row[0] for row in rows]
 
 
+def has_run(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Whether `events` holds at least one row of `run_id`, of any kind and
+    any project. Read-only."""
+    row = conn.execute(
+        "SELECT 1 FROM events WHERE run_id = ? LIMIT 1", (run_id,)
+    ).fetchone()
+    return row is not None
+
+
 def journal_line(event: EventRow) -> store_journal.JournalLine:
     """The journal line `event` is: its `run_seq` is the line's `seq` and its
     `kind` the line's `event`; `ts`, coordinates and payload are the event's
