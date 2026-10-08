@@ -289,3 +289,118 @@ def test_a_run_with_a_runs_row_and_no_events_exports_nothing(tmp_path):
     _migrate()
 
     assert export.export_run("run-a") == []
+
+
+# -- write_export: --out ------------------------------------------------------
+
+
+def _refusal(run_id: str, out: Path) -> export.ExportRefusedError:
+    with pytest.raises(export.ExportRefusedError) as caught:
+        export.write_export(run_id, out)
+    return caught.value
+
+
+def test_write_export_writes_the_lines_and_reports_the_count(migrated, tmp_path):
+    out = tmp_path / "out.jsonl"
+
+    result = export.write_export("run-a", out)
+
+    lines = export.export_run("run-a")
+    assert result == export.ExportResult(run_id="run-a", path=out, lines=5)
+    assert len(lines) == 5
+    assert out.read_text(encoding="utf-8") == "".join(f"{text}\n" for text in lines)
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "dangling_symlink"])
+def test_write_export_refuses_an_existing_target_and_leaves_it_unchanged(
+    migrated, tmp_path, kind
+):
+    out = tmp_path / "out.jsonl"
+    if kind == "file":
+        out.write_bytes(b"precious")
+    elif kind == "directory":
+        out.mkdir()
+    else:
+        out.symlink_to(tmp_path / "nowhere")
+
+    error = _refusal("run-a", out)
+
+    assert error.reason == "target_exists"
+    assert error.path == out
+    assert "(target_exists)" in str(error) and str(out) in str(error)
+    if kind == "file":
+        assert out.read_bytes() == b"precious"
+    elif kind == "directory":
+        assert list(out.iterdir()) == []
+    else:
+        assert out.is_symlink() and not (tmp_path / "nowhere").exists()
+
+
+def test_write_export_refuses_a_missing_parent_directory(migrated, tmp_path):
+    out = tmp_path / "missing" / "out.jsonl"
+
+    error = _refusal("run-a", out)
+
+    assert error.reason == "no_target_dir"
+    assert error.path == out
+    assert not (tmp_path / "missing").exists()
+
+
+def test_write_export_refuses_any_runs_journal_path(migrated):
+    journal = paths.run_dir("run-a") / store_journal.JOURNAL_NAME
+    other = paths.run_dir("other") / store_journal.JOURNAL_NAME
+    before = journal.read_bytes()
+
+    # The existing journal is refused as journal_path, not target_exists.
+    assert _refusal("run-a", journal).reason == "journal_path"
+    assert _refusal("run-a", other).reason == "journal_path"
+    assert journal.read_bytes() == before
+    assert not other.exists()
+
+
+def test_write_export_refuses_a_symlink_to_a_journal(migrated, tmp_path):
+    journal = migrated["run-b"]
+    before = journal.read_bytes()
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(journal)
+
+    assert _refusal("run-a", link).reason == "journal_path"
+    assert journal.read_bytes() == before
+
+
+def test_write_export_writes_a_journal_named_file_outside_the_runs_dir(migrated, tmp_path):
+    out = tmp_path / "elsewhere" / "run-a" / store_journal.JOURNAL_NAME
+    out.parent.mkdir(parents=True)
+
+    result = export.write_export("run-a", out)
+
+    assert result.lines == 5
+    assert out.is_file()
+
+
+def test_write_export_makes_a_relative_or_home_target_absolute(
+    migrated, tmp_path, monkeypatch
+):
+    work = tmp_path / "work"
+    home = tmp_path / "home"
+    work.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("HOME", str(home))
+
+    relative = export.write_export("run-a", Path("rel.jsonl"))
+    homed = export.write_export("run-a", Path("~/out.jsonl"))
+
+    assert relative.path == Path.cwd() / "rel.jsonl"
+    assert relative.path.is_absolute() and relative.path.is_file()
+    assert homed.path == home / "out.jsonl"
+    assert homed.path.is_file()
+
+
+def test_an_unknown_run_with_out_creates_no_file(migrated, tmp_path):
+    out = tmp_path / "out.jsonl"
+
+    with pytest.raises(runs.UnknownRunError):
+        export.write_export("nope", out)
+
+    assert not out.exists()

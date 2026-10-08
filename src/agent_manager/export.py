@@ -5,17 +5,48 @@ A line is the journal envelope plus the additive `gseq` (the row's global
 `sort_keys`. It is built straight from the row, never through `JournalLine`,
 so `ts` stays the stored text and a kind outside `EventKind` is exported like
 any other. For a journal line `am` wrote, the exported line minus `gseq` is
-the same bytes. Read-only: `am.db` only through `store_db.open_db_for_reading`,
-and nothing under the data directory is created, changed or removed.
+the same bytes. Read-only: `am.db` only through `store_db.open_db_for_reading`;
+the only file it ever creates is `write_export`'s target, never a run's
+journal.
 """
 
 import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from agent_manager import runs
+from agent_manager import paths, runs
 from agent_manager.store import db as store_db
 from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
+
+ExportRefusal = Literal["journal_path", "target_exists", "no_target_dir"]
+"""Which check refused an export to `--out`."""
+
+
+class ExportRefusedError(RuntimeError):
+    """`write_export` will not write the file; nothing has been written.
+
+    `reason` names the check that refused, `path` the target it is about.
+    """
+
+    def __init__(self, reason: ExportRefusal, path: Path) -> None:
+        super().__init__(
+            f"am export refused ({reason}): {path}; nothing has been written"
+        )
+        self.reason = reason
+        self.path = path
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """The file `write_export` wrote: the run, its absolute path, its line count."""
+
+    run_id: str
+    path: Path
+    lines: int
 
 
 def line(row: store_events.EventRow) -> str:
@@ -61,3 +92,42 @@ def export_run(run_id: str) -> list[str]:
     finally:
         conn.close()
     return [line(row) for row in rows]
+
+
+def write_export(run_id: str, out: Path) -> ExportResult:
+    """`export_run(run_id)` written to the new file `out`, one line and a
+    newline per event (an empty file for none).
+
+    `out` is taken after `expanduser`, from the current directory when
+    relative. The run is checked and read first, so an unknown run creates
+    nothing. Then refused, in this order, as `ExportRefusedError`:
+    `journal_path` when `out`, resolved, is any run's journal file
+    (`<data dir>/runs/<id>/journal.jsonl`), existing or not; `target_exists`
+    when `out` exists as anything, a dangling symlink included, or appears
+    before the exclusive open; `no_target_dir` when its parent is not a
+    directory.
+    """
+    lines = export_run(run_id)
+    target = out.expanduser().absolute()
+    if _is_journal_path(target):
+        raise ExportRefusedError("journal_path", target)
+    if os.path.lexists(target):
+        raise ExportRefusedError("target_exists", target)
+    if not target.parent.is_dir():
+        raise ExportRefusedError("no_target_dir", target)
+    try:
+        with open(target, "xb") as handle:
+            handle.write("".join(f"{text}\n" for text in lines).encode("utf-8"))
+    except FileExistsError:
+        raise ExportRefusedError("target_exists", target) from None
+    return ExportResult(run_id=run_id, path=target, lines=len(lines))
+
+
+def _is_journal_path(target: Path) -> bool:
+    """Whether `target`, resolved, is `<data dir>/runs/<id>/journal.jsonl` for
+    some `<id>`. `paths.data_path()`, not `data_dir()`: nothing is created."""
+    resolved = target.resolve()
+    return (
+        resolved.name == store_journal.JOURNAL_NAME
+        and resolved.parent.parent == (paths.data_path() / "runs").resolve()
+    )
