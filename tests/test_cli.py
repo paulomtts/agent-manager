@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
+import eventlines
 import typer
 from typer.testing import CliRunner
 
@@ -2141,7 +2142,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
 
 
 @pytest.mark.git
-def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
+def test_the_events_open_with_the_run_story_and_subtask_lines(project, cards):
     payload = cli.run_card(
         cards["subtask"],
         repo_dir=project,
@@ -2150,7 +2151,7 @@ def test_the_journal_opens_with_the_run_story_and_subtask_lines(project, cards):
         runner_factory=lambda **kwargs: fake_runner(),
     )
 
-    lines = store_journal.Journal(payload["run_id"]).read()
+    lines = eventlines.run_lines(payload["run_id"])
     assert [line.event for line in lines[:3]] == [
         "run_upsert",
         "story_upsert",
@@ -9407,8 +9408,8 @@ def test_a_task_resume_without_verify_hands_the_walk_the_recorded_suite(
 
 
 def _run_upserts(run_id: str) -> list[Any]:
-    """Every `run_upsert` line of `run_id`'s journal, oldest first."""
-    return [line for line in store_journal.Journal(run_id).read() if line.event == "run_upsert"]
+    """Every `run_upsert` node event of `run_id`, oldest first."""
+    return [line for line in eventlines.run_lines(run_id) if line.event == "run_upsert"]
 
 
 @pytest.mark.git
@@ -11213,10 +11214,8 @@ def test_card_cancel_journals_canceled(project, cards, control_applied):
 
     run_id = _controlled_card_run(project, cards, factory)["run_id"]
 
-    raw = (paths.run_dir(run_id) / "journal.jsonl").read_text(encoding="utf-8")
-    upserts = [
-        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
-    ]
+    raw = eventlines.run_line_texts(run_id)
+    upserts = [line for line in raw if json.loads(line)["event"] == "run_upsert"]
     assert upserts, raw
     assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
     assert not [line for line in upserts if "cancelled" in line], upserts
@@ -12014,7 +12013,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     _plant_lease(project, run_id=run_id, token="racer", heartbeat_at=now - timedelta(seconds=5))
-    before = (_attempt_rows(project), _checkpoint_rows(project), store_journal.Journal(run_id).read())
+    before = (_attempt_rows(project), _checkpoint_rows(project), eventlines.run_lines(run_id))
 
     with pytest.raises(cli.RunIsLiveError) as caught:
         _resume_card_run(project, run_id, _Forbidden("runner_factory"))
@@ -12027,7 +12026,7 @@ def test_a_resume_that_loses_the_lease_race_is_run_is_live_and_writes_nothing(
     assert (
         _attempt_rows(project),
         _checkpoint_rows(project),
-        store_journal.Journal(run_id).read(),
+        eventlines.run_lines(run_id),
     ) == before
     lease = _card_lease(project, run_id)
     assert lease is not None and lease.token == "racer"
@@ -13176,7 +13175,8 @@ def _invoke_reset(root: Path, run_id: str = CONTROL_RUN_ID, *extra: str):
 
 
 def _journal_lines(run_id: str = CONTROL_RUN_ID) -> list[store_journal.JournalLine]:
-    return store_journal.Journal(run_id).read()
+    """`run_id`'s committed node events, ascending by `run_seq`."""
+    return eventlines.run_lines(run_id)
 
 
 def _recorded_status(root: Path, run_id: str = CONTROL_RUN_ID) -> str | None:
@@ -14698,22 +14698,19 @@ def test_reset_closes_a_run_that_never_saved_a_checkpoint(projection):
 
 
 def test_reset_journals_canceled(projection):
-    """The `run_upsert` the reset appends carries `canceled` in the raw
-    `journal.jsonl`, and no line it writes carries the legacy spelling."""
+    """The `run_upsert` the reset records carries `canceled` in its raw line,
+    and no line it writes carries the legacy spelling."""
     _plant_run(projection, status="stopped")
-    journal = paths.run_dir(CONTROL_RUN_ID) / "journal.jsonl"
-    count_before = len(journal.read_text(encoding="utf-8").splitlines())
+    count_before = len(eventlines.run_line_texts(CONTROL_RUN_ID))
 
     result = _invoke_reset(projection)
 
     assert result.exit_code == 0, result.output
-    raw = journal.read_text(encoding="utf-8")
-    upserts = [
-        line for line in raw.splitlines() if json.loads(line)["event"] == "run_upsert"
-    ]
+    raw = eventlines.run_line_texts(CONTROL_RUN_ID)
+    upserts = [line for line in raw if json.loads(line)["event"] == "run_upsert"]
     assert upserts, raw
     assert json.loads(upserts[-1])["payload"]["status"] == "canceled", upserts[-1]
-    written = raw.splitlines()[count_before:]
+    written = raw[count_before:]
     assert len(written) == 1, written
     assert not [line for line in written if "cancelled" in line], written
 
