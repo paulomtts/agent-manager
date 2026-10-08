@@ -699,7 +699,10 @@ def test_a_none_like_typecheck_or_lint_entry_is_skipped_not_run(tmp_path: Path, 
     ]
 
 
-def test_a_real_command_that_merely_starts_with_none_letters_still_runs(tmp_path: Path):
+def test_a_real_command_that_merely_starts_with_none_letters_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("shutil.which", lambda head: f"/usr/bin/{head}")
     calls, runner = _recorder()
     explore = {"verification": {"typecheck": "nonexistent-checker --strict", "lint": []}}
     verify.run_suite([], str(tmp_path), explore, runner=runner)
@@ -841,7 +844,10 @@ def test_a_red_suite_command_stops_before_typecheck_runs(tmp_path: Path):
     assert not marker.exists()
 
 
-def test_an_unlaunchable_typecheck_raises_verify_error(tmp_path: Path):
+def test_an_unlaunchable_typecheck_raises_verify_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("shutil.which", lambda head: f"/usr/bin/{head}")
     # Like a missing `--verify` binary: a misconfigured card, not a red suite.
     ran: list[list[str]] = []
 
@@ -1235,9 +1241,10 @@ def _env_recorder() -> tuple[list[tuple[tuple, dict]], verify.CommandRunner]:
 
 
 def test_both_ids_reach_every_planned_command_including_explore_extras(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     # T1
+    monkeypatch.setattr("shutil.which", lambda head: f"/usr/bin/{head}")
     calls, runner = _env_recorder()
     explore = {"verification": {"typecheck": "mypy .", "lint": ["ruff check ."]}}
 
