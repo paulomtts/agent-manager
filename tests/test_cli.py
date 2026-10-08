@@ -6212,6 +6212,208 @@ def test_events_pretty_indents_the_same_envelope(projection):
     assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
+# ── am events --tail / --before-seq (card 5d2663f5) ──────────────────────────
+
+
+def _interleaved_a_and_b(root: Path, a_count: int) -> list[store_events.EventRow]:
+    """`a_count` rounds of one A `phase_upsert` then one B `phase_upsert`, so
+    B's row is always the newest; the rows as stored."""
+    return _insert_events(
+        root,
+        *[(run, "phase_upsert") for _ in range(a_count) for run in (EVENTS_RUN_A, EVENTS_RUN_B)],
+    )
+
+
+def _gseqs(data: dict[str, Any]) -> list[int]:
+    return [line["gseq"] for line in data["events"]]
+
+
+def test_events_tail_is_the_runs_last_lines_ascending(projection):
+    """C1, Review Focus 2 and 3: B's rows interleave A's and B writes last."""
+    rows = _interleaved_a_and_b(projection, 4)
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+
+    data = _events([EVENTS_RUN_A, "--tail", "2"])
+
+    assert set(data) == {"events", "head"}
+    assert _gseqs(data) == [a_rows[2].seq, a_rows[3].seq]
+    assert [line["seq"] for line in data["events"]] == [3, 4]
+    assert {line["run_id"] for line in data["events"]} == {EVENTS_RUN_A}
+    for line in data["events"]:
+        assert set(line) == EVENT_LINE_KEYS
+    assert data["head"] == rows[-1].seq == _events_head(projection)
+
+
+def test_events_tail_larger_than_the_run_is_all_of_it_and_one_is_the_last(projection):
+    """C2."""
+    rows = _interleaved_a_and_b(projection, 3)
+    a_seqs = [row.seq for row in rows if row.run_id == EVENTS_RUN_A]
+
+    assert _gseqs(_events([EVENTS_RUN_A, "--tail", "10"])) == a_seqs
+    assert _gseqs(_events([EVENTS_RUN_A, "--tail", "1"])) == a_seqs[-1:]
+
+
+def test_events_before_seq_is_every_earlier_line_strictly(projection):
+    """C3, Review Focus 1: the event at B itself is absent."""
+    rows = _interleaved_a_and_b(projection, 4)
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+
+    data = _events([EVENTS_RUN_A, "--before-seq", str(a_rows[2].seq)])
+
+    assert _gseqs(data) == [a_rows[0].seq, a_rows[1].seq]
+    assert data["head"] == rows[-1].seq
+
+
+def test_events_before_seq_with_limit_is_the_nearest_k_before_it(projection):
+    """C4, and Review Focus (plan) 2: fewer than K before B is all of them."""
+    rows = _interleaved_a_and_b(projection, 5)
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+
+    near = _events([EVENTS_RUN_A, "--before-seq", str(a_rows[4].seq), "--limit", "2"])
+    short = _events([EVENTS_RUN_A, "--before-seq", str(a_rows[1].seq), "--limit", "3"])
+
+    assert _gseqs(near) == [a_rows[2].seq, a_rows[3].seq]
+    assert _gseqs(short) == [a_rows[0].seq]
+
+
+def test_events_before_seq_at_another_runs_gseq_is_a_boundary_like_any_other(projection):
+    """Review Focus (plan) 1: B names a row of run B, not of run A."""
+    rows = _interleaved_a_and_b(projection, 3)
+    b_rows = [row for row in rows if row.run_id == EVENTS_RUN_B]
+    a_seqs = [row.seq for row in rows if row.run_id == EVENTS_RUN_A]
+
+    data = _events([EVENTS_RUN_A, "--before-seq", str(b_rows[1].seq)])
+
+    assert _gseqs(data) == [seq for seq in a_seqs if seq < b_rows[1].seq] == a_seqs[:2]
+    assert {line["run_id"] for line in data["events"]} == {EVENTS_RUN_A}
+
+
+def test_events_tail_then_before_seq_pages_backwards_without_gap_or_repeat(projection):
+    """C5, Review Focus 1: each page's first gseq is the next --before-seq."""
+    _interleaved_a_and_b(projection, 5)
+    full = _events([EVENTS_RUN_A])
+    pages = [_events([EVENTS_RUN_A, "--tail", "2"])]
+
+    for _ in range(10):
+        page = _events(
+            [EVENTS_RUN_A, "--before-seq", str(pages[-1]["events"][0]["gseq"]), "--limit", "2"]
+        )
+        assert page["head"] == full["head"]
+        if not page["events"]:
+            assert page == {"events": [], "head": full["head"]}
+            break
+        pages.append(page)
+    else:
+        pytest.fail("paging never reached an empty page")
+
+    assert [len(page["events"]) for page in pages] == [2, 2, 1]
+    walked = [line for page in reversed(pages) for line in page["events"]]
+    assert walked == full["events"]
+    assert len({line["gseq"] for line in walked}) == len(walked) == 5
+
+
+def test_events_before_seq_one_is_empty_and_above_head_is_everything(projection):
+    """C6, and Review Focus (plan) 3: above head with --limit K is --tail K."""
+    _interleaved_a_and_b(projection, 3)
+    full = _events([EVENTS_RUN_A])
+    head = full["head"]
+
+    assert _events([EVENTS_RUN_A, "--before-seq", "1"]) == {"events": [], "head": head}
+    assert _events([EVENTS_RUN_A, "--before-seq", str(head + 100)]) == full
+    assert (
+        _events([EVENTS_RUN_A, "--before-seq", str(head + 1), "--limit", "2"])
+        == _events([EVENTS_RUN_A, "--tail", "2"])
+    )
+
+
+@pytest.mark.parametrize(
+    "flags", [["--tail", "2"], ["--before-seq", "5"], ["--before-seq", "5", "--limit", "1"]]
+)
+def test_events_tail_and_before_seq_of_an_unknown_run_refuse(projection, flags):
+    """C7."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+
+    assert _events_refusal(["no-such-run", *flags]) == {
+        "type": "UnknownRunError",
+        "message": EVENTS_UNKNOWN_MESSAGE,
+    }
+
+
+def test_events_tail_and_before_seq_of_a_run_without_events_are_empty_pages(projection):
+    """C8, and Review Focus (plan) 4: a `runs` row with its events removed
+    behind the append-only trigger's back."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, with_phases=False)
+    _insert_events(projection, (EVENTS_RUN_B, "run_upsert"))
+    conn = store_db.open_db(projection)
+    try:
+        conn.execute("DROP TRIGGER events_no_delete")
+        conn.execute("DELETE FROM events WHERE run_id = ?", (SNAPSHOT_RUN_ID,))
+        conn.commit()
+    finally:
+        conn.close()
+    head = _events_head(projection)
+
+    assert _events([SNAPSHOT_RUN_ID, "--tail", "3"]) == {"events": [], "head": head}
+    assert _events([SNAPSHOT_RUN_ID, "--before-seq", str(head + 1)]) == {
+        "events": [],
+        "head": head,
+    }
+
+
+def test_events_tail_never_shows_an_event_after_head(projection, monkeypatch):
+    """C12, Review Focus 5: an event of the run commits right after `head`
+    returns; the --tail page is the snapshot's, not the newest."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    head_before = _events_head(projection)
+    writer, project_id = _open_event_writer(projection)
+    try:
+
+        def write() -> None:
+            store_events.insert(
+                writer,
+                project_id=project_id,
+                run_id=EVENTS_RUN_A,
+                ts=EVENT_TS,
+                kind="story_upsert",
+                payload={},
+                source="live",
+            )
+            writer.commit()
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", write)
+        during = cli.events_for(EVENTS_RUN_A, tail=5)
+
+        assert fired == [True]
+        assert during["head"] == head_before
+        assert [line["event"] for line in during["events"]] == ["run_upsert"]
+        assert all(line["gseq"] <= during["head"] for line in during["events"])
+        after = cli.events_for(EVENTS_RUN_A, tail=5)
+        assert after["head"] > head_before
+        assert [line["event"] for line in after["events"]] == [
+            "run_upsert",
+            "story_upsert",
+        ]
+    finally:
+        writer.close()
+
+
+def test_events_tail_and_before_seq_help_texts():
+    parameters = inspect.signature(cli.events).parameters
+
+    assert parameters["tail"].default.help == (
+        "List the run's last N events (at least 1). Not with --after-seq,"
+        " --before-seq or --limit."
+    )
+    assert parameters["before_seq"].default.help == (
+        "List events with a gseq below this (at least 1), the nearest --limit of"
+        " them. To page backwards, pass the first gseq of the previous page. Not"
+        " with --after-seq or --tail."
+    )
+    assert parameters["after_seq"].default.default is None
+    assert "--before-seq" in cli.events.__doc__
+    assert "--tail N" in cli.events.__doc__
+
+
 def _write_logs_attempt(
     run_id: str,
     phase: str,

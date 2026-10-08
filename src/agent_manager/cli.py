@@ -2666,23 +2666,40 @@ def runs(
 
 
 def events_for(
-    run_id: str, *, after_seq: int = 0, limit: int | None = None
+    run_id: str,
+    *,
+    after_seq: int | None = None,
+    limit: int | None = None,
+    tail: int | None = None,
+    before_seq: int | None = None,
 ) -> dict[str, Any]:
-    """`run_id`'s events with a global `seq` above `after_seq`, ascending, at
-    most `limit` of them, and the machine-wide `head`.
+    """`run_id`'s events in one window, ascending by global `seq`, and the
+    machine-wide `head`.
+
+    `None` means "not given" for every keyword. The window is, by what is
+    given: nothing, `after_seq` and/or `limit` -- the events with a `gseq`
+    above `after_seq` (0 when not given), the first `limit` of them; `tail`
+    -- the run's last `tail` events (all of them when it has fewer);
+    `before_seq` -- the events with a `gseq` below it, the nearest `limit` of
+    them (all when no `limit`). A caller pages forward by passing the last
+    `gseq` as `after_seq`, and backwards by passing the first `gseq` as
+    `before_seq` with `limit`. A window holding nothing (past the run's last
+    event or `head`, `before_seq` 1 or at or below the run's first event) is
+    `[]`, not a refusal; a `before_seq` above `head` reads up to `head`.
 
     Each line is the row's `store_events.journal_line` dumped in JSON mode
     plus `gseq`, the row's global `seq`; its own `seq` stays the per-run
-    number. Every kind is included and no other run's row ever is. A caller
-    pages forward by passing the last `gseq` as `after_seq`; a page past the
-    run's last event, or past `head`, is `[]`, not a refusal.
+    number. Every kind is included and no other run's row ever is.
 
-    `limit` below 1 and `after_seq` below 0 are `CliError`s raised before the
-    database is opened. A run with no `events` row and no `runs` row is an
-    `UnknownRunError`; a `runs` row with no events is an empty page. Run ids
-    are machine-unique, so no repository is resolved: `open_db_for_reading`
-    gets `Path(".")` only because it takes a root, which never chooses the
-    file.
+    These are `CliError`s raised before the database is opened, the first
+    failing one in this order: `limit` below 1, `after_seq` below 0, `tail`
+    below 1, `before_seq` below 1; then `tail` with `after_seq`, with
+    `before_seq` or with `limit`, and `before_seq` with `after_seq` -- given
+    at all, so an explicit `after_seq=0` counts. A run with no `events` row
+    and no `runs` row is an `UnknownRunError`; a `runs` row with no events is
+    an empty page. Run ids are machine-unique, so no repository is resolved:
+    `open_db_for_reading` gets `Path(".")` only because it takes a root,
+    which never chooses the file.
 
     Every statement runs in one `store_db.read_snapshot`, and the first one
     reads `store_events.head`: the run check and the page see every event up
@@ -2691,7 +2708,7 @@ def events_for(
     """
     if limit is not None and limit < 1:
         raise CliError(f"--limit must be at least 1, got {limit}")
-    if after_seq < 0:
+    if after_seq is not None and after_seq < 0:
         raise CliError(f"--after-seq must be 0 or more, got {after_seq}")
     conn = store_db.open_db_for_reading(Path("."))
     try:
@@ -2707,9 +2724,16 @@ def events_for(
                     f"run {run_id!r} is not in the projection"
                     " (`agent-manager runs --all-projects` lists the ones that are)"
                 )
-            rows = store_events.read(
-                conn, after_seq=after_seq, limit=limit, run_id=run_id
-            )
+            if tail is not None:
+                rows = store_events.read_last(conn, limit=tail, run_id=run_id)
+            elif before_seq is not None:
+                rows = store_events.read_last(
+                    conn, before_seq=before_seq, limit=limit, run_id=run_id
+                )
+            else:
+                rows = store_events.read(
+                    conn, after_seq=after_seq or 0, limit=limit, run_id=run_id
+                )
             lines = [
                 {
                     **store_events.journal_line(row).model_dump(mode="json"),
@@ -2725,8 +2749,8 @@ def events_for(
 @app.command("events")
 def events(
     run_id: str = typer.Argument(..., metavar="RUN", help="The run whose events are read."),
-    after_seq: int = typer.Option(
-        0,
+    after_seq: int | None = typer.Option(
+        None,
         "--after-seq",
         help="List events with a gseq above this (0 or more). To page forward,"
         " pass the last gseq of the previous page.",
@@ -2734,15 +2758,32 @@ def events(
     limit: int | None = typer.Option(
         None, "--limit", help="List at most this many events (at least 1)."
     ),
+    tail: int | None = typer.Option(
+        None,
+        "--tail",
+        help="List the run's last N events (at least 1). Not with --after-seq,"
+        " --before-seq or --limit.",
+    ),
+    before_seq: int | None = typer.Option(
+        None,
+        "--before-seq",
+        help="List events with a gseq below this (at least 1), the nearest --limit of"
+        " them. To page backwards, pass the first gseq of the previous page. Not"
+        " with --after-seq or --tail.",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
     """List one run's events in gseq order, with the machine-wide head.
 
     The run is found by id alone, whichever repository recorded it. Pass the
-    last gseq as --after-seq to read the next page.
+    last gseq as --after-seq to read the next page, or the first gseq as
+    --before-seq (with --limit) to read the previous one; --tail N reads the
+    last N.
     """
     try:
-        payload = events_for(run_id, after_seq=after_seq, limit=limit)
+        payload = events_for(
+            run_id, after_seq=after_seq, limit=limit, tail=tail, before_seq=before_seq
+        )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
