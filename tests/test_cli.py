@@ -12691,7 +12691,10 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(projection, tmp_path,
 
     assert result.exit_code == 0, result.output
     lines = _stream(result)
-    assert lines == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in rows]]
+    assert lines == [
+        _hello(tmp_path, head=2, store_id=_store_id(projection)),
+        *[_watch_event(row) for row in rows],
+    ]
     assert lines[0]["schema"] == 2
     assert lines[1]["payload"] == {"run_id": "run-old", "status": "cancelled"}
 
@@ -12918,7 +12921,10 @@ def test_watch_follow_all_picks_up_a_database_created_later(
     result, _ = _watch_follow(monkeypatch, "--all", actions=[create, lambda: None])
 
     assert result.exit_code == 0, result.output
-    assert _stream(result) == [_hello(tmp_path, head=0, store_id=None), *[_watch_event(row) for row in created]]
+    assert _stream(result) == [
+        _hello(tmp_path, head=0, store_id=None),
+        *[_watch_event(row) for row in created],
+    ]
 
 
 def test_watch_follow_project_picks_up_a_project_that_appears_later(
@@ -12997,7 +13003,10 @@ def test_watch_follow_ctrl_c_exits_zero_quietly(projection, tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
-    assert _stream(result) == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in backlog]]
+    assert _stream(result) == [
+        _hello(tmp_path, head=2, store_id=_store_id(projection)),
+        *[_watch_event(row) for row in backlog],
+    ]
 
 
 def test_watch_follow_closed_pipe_exits_zero_quietly(projection, tmp_path, monkeypatch):
@@ -13316,7 +13325,10 @@ def test_watch_follow_from_now_skips_backlog(projection, tmp_path, monkeypatch):
     assert sleeps == [cli.WATCH_POLL_SECONDS] * 3
     lines = _stream(result)
     a_rows = [row for row in inserted if row.run_id == EVENTS_RUN_A]
-    assert lines == [_hello(tmp_path, head=3, store_id=_store_id(projection)), *[_watch_event(row) for row in a_rows]]
+    assert lines == [
+        _hello(tmp_path, head=3, store_id=_store_id(projection)),
+        *[_watch_event(row) for row in a_rows],
+    ]
     assert [line["seq"] for line in lines[1:]] == [3, 4]
     assert result.stderr == ""
 
@@ -13351,7 +13363,10 @@ def test_watch_follow_all_from_now_emits_runs_created_later_in_full(
     assert result.exit_code == 0, result.output
     assert len(sleeps) == 2
     lines = _stream(result)
-    assert lines == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in later]]
+    assert lines == [
+        _hello(tmp_path, head=2, store_id=_store_id(projection)),
+        *[_watch_event(row) for row in later],
+    ]
     assert [line["seq"] for line in lines[1:] if line["run_id"] == EVENTS_RUN_B] == [1, 2, 3]
     assert result.stderr == ""
 
@@ -13374,7 +13389,10 @@ def test_watch_follow_from_now_on_an_empty_machine_emits_every_later_event(
     )
 
     assert result.exit_code == 0, result.output
-    assert _stream(result) == [_hello(tmp_path, head=0, store_id=None), *[_watch_event(row) for row in later]]
+    assert _stream(result) == [
+        _hello(tmp_path, head=0, store_id=None),
+        *[_watch_event(row) for row in later],
+    ]
 
 
 # ── am watch --since-seq (card b3818d9f) ───────────────────────────────────
