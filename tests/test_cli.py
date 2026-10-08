@@ -4950,6 +4950,22 @@ def test_runs_lists_the_projects_history_newest_first(projection):
     assert envelope["data"]["runs"][0]["repo_dir"] == str(projection.resolve())
 
 
+def test_runs_entries_carry_the_project_id_and_its_repo_dir(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    conn = store_db.open_db_for_reading(projection.resolve())
+    try:
+        project_id = store_projects.lookup(conn, projection.resolve())
+    finally:
+        conn.close()
+    assert entry["project"] == {"id": project_id, "repo_dir": str(projection.resolve())}
+    assert entry["repo_dir"] == str(projection.resolve())
+
+
 def test_runs_on_a_project_that_has_never_been_run_is_ok_and_empty(projection):
     """A project nobody has run yet is a fact, not a fault."""
     result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
@@ -4995,10 +5011,12 @@ RUNS_ENTRY_KEYS = {
     "story_id",
     "lease",
     "progress",
+    "project",
 }
 """Every `data.runs[]` entry: the seven names `am runs` always had, plus
 `milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74),
-`progress` (card 882b212b) and `story_id` (card 3d2a3ef8)."""
+`progress` (card 882b212b), `story_id` (card 3d2a3ef8) and `project`
+(card 5d9554f6)."""
 
 RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
 """A non-null `data.runs[].lease`: `am status`'s `control.lease` minus

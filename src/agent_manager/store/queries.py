@@ -71,6 +71,18 @@ class RunProgress(BaseModel):
     current: ProgressCurrent | None
 
 
+class RunProject(BaseModel):
+    """The `project` of one `am runs` entry: the run's `runs.project_id` and
+    that project's `projects.repo_dir`, the resolved path the project is
+    keyed by. It can differ in spelling from the run's own `repo_dir`, which
+    is the path the run recorded; neither is rewritten."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    repo_dir: Path
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
@@ -99,6 +111,12 @@ class RunSummary(BaseModel):
     `RunProgress`. `list_runs` always fills it (a run with no tree rows is 0
     of 0 with no `current`); it defaults to `None` only so that a
     `RunSummary` built by hand stays valid, which keeps it additive.
+
+    `project` is the run's project as a `RunProject`. `list_runs` always
+    fills it from a `LEFT JOIN projects`, and leaves it `None` only when
+    `runs.project_id` names no `projects` row (possible only in a
+    hand-damaged database): such a run is still listed. It defaults to
+    `None`, so it is additive.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -115,6 +133,7 @@ class RunSummary(BaseModel):
     story_id: str | None = None
     lease: RunLease | None = None
     progress: RunProgress | None = None
+    project: RunProject | None = None
 
 
 def _progress_count(
@@ -160,6 +179,27 @@ def _run_progress(conn: sqlite3.Connection, run_id: str) -> RunProgress:
     )
 
 
+def _summary(conn: sqlite3.Connection, row: sqlite3.Row) -> RunSummary:
+    """One `list_runs` row as a `RunSummary`, with its `progress` counted and
+    its `project` built from the joined `project_key` / `project_repo_dir`
+    columns (`None` when the join found no `projects` row)."""
+    fields = dict(row)
+    project_key = fields.pop("project_key")
+    project_repo_dir = fields.pop("project_repo_dir")
+    return RunSummary.model_validate(
+        {
+            **fields,
+            "story_id": None
+            if fields["story_id"] is None
+            else json.loads(fields["story_id"]),
+            "progress": _run_progress(conn, fields["id"]),
+            "project": None
+            if project_key is None
+            else RunProject(id=project_key, repo_dir=project_repo_dir),
+        }
+    )
+
+
 def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSummary]:
     """Every run of project `project_id`, newest first.
 
@@ -198,6 +238,10 @@ def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSu
     from rows, not from liveness: a run whose process died mid-phase still
     shows the phase it stopped in, and `lease.live` tells whether anyone is
     still working on it. A run with no tree rows is 0 of 0 with no `current`.
+
+    `project` is joined from `projects` (`LEFT JOIN`), so a run whose
+    `project_id` names no `projects` row is still listed, with `project`
+    `None`.
     """
     if project_id is None:
         return []
@@ -209,23 +253,14 @@ def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSu
         "   SELECT subtasks.card_id FROM subtasks"
         "    WHERE subtasks.run_id = runs.id"
         "    ORDER BY subtasks.position, subtasks.card_id LIMIT 1"
-        " ) END AS card_id"
-        " FROM runs WHERE runs.project_id = ?"
+        " ) END AS card_id,"
+        " projects.id AS project_key, projects.repo_dir AS project_repo_dir"
+        " FROM runs LEFT JOIN projects ON projects.id = runs.project_id"
+        " WHERE runs.project_id = ?"
         " ORDER BY runs.started_at DESC, runs.id DESC",
         (project_id,),
     ).fetchall()
-    return [
-        RunSummary.model_validate(
-            {
-                **dict(row),
-                "story_id": None
-                if row["story_id"] is None
-                else json.loads(row["story_id"]),
-                "progress": _run_progress(conn, row["id"]),
-            }
-        )
-        for row in rows
-    ]
+    return [_summary(conn, row) for row in rows]
 
 
 def latest_run_id(conn: sqlite3.Connection, *, project_id: int | None) -> str | None:

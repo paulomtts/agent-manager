@@ -28,6 +28,7 @@ _PUBLIC_QUERY_NAMES = (
     "ProgressCount",
     "ProgressCurrent",
     "RunProgress",
+    "RunProject",
     "RunSummary",
     "list_runs",
     "latest_run_id",
@@ -41,6 +42,7 @@ _QUERY_NAMES = (
     "_progress_count",
     "_CURRENT_PHASE_SQL",
     "_run_progress",
+    "_summary",
 )
 
 
@@ -86,13 +88,13 @@ def test_queries_imports_only_the_stdlib_pydantic_and_models():
 
 
 _THROUGH_THE_PACKAGE = re.compile(
-    r"\bstore(_module)?\.(RunLease|ProgressCount|ProgressCurrent|RunProgress|RunSummary"
-    r"|_progress_count|_CURRENT_PHASE_SQL|_run_progress|list_runs|latest_run_id"
+    r"\bstore(_module)?\.(RunLease|ProgressCount|ProgressCurrent|RunProgress|RunProject"
+    r"|RunSummary|_progress_count|_CURRENT_PHASE_SQL|_run_progress|_summary|list_runs|latest_run_id"
     r"|run_status)\b"
     r"|\bstore_module\.load_run\b"
     r"|\bstore\.load_run\(\s*[^,()]+,"
     r"|from agent_manager\.store import (?!queries\b).*\b(RunLease|ProgressCount"
-    r"|ProgressCurrent|RunProgress|RunSummary|list_runs|latest_run_id|load_run"
+    r"|ProgressCurrent|RunProgress|RunProject|RunSummary|list_runs|latest_run_id|load_run"
     r"|run_status)\b"
 )
 
@@ -173,12 +175,19 @@ def test_callers_call_load_run_through_the_queries_module(module):
     assert "load_run" not in bound
 
 
-def _insert_run(conn, run_id: str, *, project_id: int, started_at: str) -> None:
+def _insert_run(
+    conn,
+    run_id: str,
+    *,
+    project_id: int,
+    started_at: str | None,
+    status: str = "started",
+) -> None:
     conn.execute(
         "INSERT INTO runs (project_id, id, workflow, repo_dir, base_branch,"
         " branch_prefix, status, started_at, config)"
-        " VALUES (?, ?, 'milestone', '/repo', 'main', 'm1/', 'started', ?, '{}')",
-        (project_id, run_id, started_at),
+        " VALUES (?, ?, 'milestone', '/repo', 'main', 'm1/', ?, ?, '{}')",
+        (project_id, run_id, status, started_at),
     )
 
 
@@ -218,3 +227,37 @@ def test_project_id_is_keyword_only_with_no_default(name):
     parameter = inspect.signature(getattr(store_queries, name)).parameters["project_id"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
+
+
+def test_list_runs_rows_carry_their_project_beside_their_own_repo_dir(
+    conns, repo, project_id
+):
+    conn, _ = conns
+    _insert_run(conn, "run-mine", project_id=project_id, started_at="2026-10-01T09:00:00+00:00")
+    conn.commit()
+
+    [summary] = store_queries.list_runs(conn, project_id=project_id)
+
+    assert summary.project == store_queries.RunProject(id=project_id, repo_dir=repo.resolve())
+    # The run's own column, as recorded, is not rewritten to the project's key.
+    assert summary.repo_dir == Path("/repo")
+
+
+def test_list_runs_lists_a_run_with_no_project_row_with_a_null_project(conns, project_id):
+    conn, _ = conns
+    # Foreign keys are not enforced on these connections, so a dangling
+    # `project_id` is how a hand-damaged database looks.
+    _insert_run(conn, "run-orphan", project_id=project_id + 1000, started_at=None)
+    conn.commit()
+
+    [summary] = store_queries.list_runs(conn, project_id=project_id + 1000)
+
+    assert summary.id == "run-orphan"
+    assert summary.project is None
+
+
+def test_run_summary_project_defaults_to_none():
+    field = store_queries.RunSummary.model_fields["project"]
+    assert field.default is None
+    assert get_args(field.annotation) == (store_queries.RunProject, type(None))
+    assert store_queries.RunProject.model_config["extra"] == "forbid"
