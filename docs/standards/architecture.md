@@ -16,7 +16,7 @@ A workflow engine built as a functional core inside an imperative shell:
 - **Interpreter.** An engine walks that data (`runtime/`, the only home of pygents). The agent-phase runner (`dispatch.py`) is injected into it.
 - **Pure core.** Card derivations (`census`, `dag`), prompt resolution (`prompt`), result models (`results`) and pure gates (`steps/reducers.py`).
 - **Deterministic steps.** `steps/` holds git, verify and board writes. There are no model calls there.
-- **Truth and projection.** An append-only journal is the truth, with a SQLite projection (`store/`) next to it. Every write appends the journal line first, then writes the row, and is fenced by the lease.
+- **One store.** `am.db` (`store/`) is the truth. Every write puts its event in the `events` table and its row in one transaction, fenced by the lease. The journal is an export (`am export`); `am watch` and `am events` print the same lines.
 - **Thin adapters at the edges.** `board.py` (the `brd` CLI), `harness/` (agent processes), `locks.py`, `detach.py`, `argv_guard.py`.
 - **Use cases above all of it.** Run, resume, milestone and board runs, Integrate. A Typer shell (`cli/`) sits on top of the use cases and only parses options and renders output.
 
@@ -35,7 +35,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 2 | Core | `dag` | Card identity, branch names, levels, stacking, `merge_order` |
 | 3 | Core | `prompt` | Resolves a phase's inputs and renders its prompt |
 | 4 | Core | `workflow.phases` | The phase model: frozen data, `validate()`, `digest()` |
-| 5 | Adapters | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; re-exec with a neutral argv; the harness Protocol (with its optional `limit_hit`) and Claude argv; the SQLite connection and DDL; the journal (schema 1) |
+| 5 | Adapters | `locks`, `detach`, `argv_guard`, `harness.base`, `harness.claude`, *`store.db`*, *`store.journal`* | File locks; process fork; re-exec with a neutral argv; the harness Protocol (with its optional `limit_hit`) and Claude argv; the SQLite connection and DDL; the journal line envelope and its event kinds, reading journal files an older `am` wrote |
 | 6 | Adapters | *`store.replay`*, *`store.queries`*, *`store.leases`*, *`store.checkpoints`*, *`store.outbox`*, *`store.projects`*, *`store.events`*, *`store.backup`* | Replay and divergence; read models; per-table row types and SQL; `projects` rows resolved or created by `repo_dir`; append-only `events` rows: insert, reads by `seq`, head (they never commit); an online copy of `am.db` through SQLite's backup API, read-only on the source |
 | 7 | Adapters | *`store.writer`*, *`store.legacy`* | `Store`: every write, as a job on one writer thread, under the fence (§6.4); legacy per-project databases read through a private copy and merged into `am.db`, their runs' journals imported into `events` in the same one transaction, marker last |
 | 8 | Adapters | `board`, `control`, `harness.launcher`, `harness.registry` | `brd`; the lease, claims and controls, both ends; process launch; harness lookup |
@@ -132,7 +132,7 @@ All 66 `.py` files (59 modules plus 7 `__init__.py`) appear here exactly once. `
 | 5.8 | `steps/verify.py` | runs the card's verification commands | holds |
 | 5.9 | `detach.py` | `os.fork`, `os.setsid` | holds (`detach.py:149,170`) |
 | 5.10 | `locks.py` | `fcntl` | holds |
-| 5.11 | `paths.py` | derives every path under `<data dir>`. Directories are created only by `paths.ensure`. | **violated:** `cli.py:2411` and `store.py:406` build paths by hand; `paths.py:18,33,57` call `mkdir` |
+| 5.11 | `paths.py` | derives every path under `<data dir>`. The database's path is `db_path()` (`am.db`), which creates nothing. Directories are created only by `paths.ensure`. | **violated:** `cli.py:3383`, `store/journal.py:112`, `migrate.py:183`, `export.py:132` and `store/db.py:273` join data paths by hand; `paths.py:24,44,60,115,122,129` call `mkdir` |
 | 5.12 | `clock.py` | reads the wall clock (`datetime.now`). Use cases take `now` or a clock callable. | **violated:** `_utcnow` copies at `cli.py:201`, `orchestrate.py:310`, `control.py:43`, `dispatch.py:323`, `runtime/walk.py:220`; inline reads at `comments.py:391`, `store.py:528` and `store/writer.py` `Store.open` |
 | 5.15 | `argv_guard.py` | `os.execve` | holds (`argv_guard.py:91`) |
 
@@ -146,7 +146,7 @@ Other rules:
 | Board | `board` functions | fake `board_api` / `FakeBoard` | a parameter; `milestone.run.Collaborators.board` |
 | Launcher | `harness.launcher.run_direct` | `FakeLauncher` | `RunnerFactory` (`runs.py:110`). Patching `cli.run_direct` is legacy (§11.4). |
 | Agent-phase runner | `dispatch.AgentRunner` | `FakeDriver`, fake runner | `RunnerFactory`, `driver=` |
-| Store | `store.writer.Store` | the real `Store` under `tmp_path` | a parameter. There is no fake store: the journal-then-row rule is tested on the real one. |
+| Store | `store.writer.Store` | the real `Store` under `tmp_path` | a parameter. There is no fake store: the rule that an event and its row commit in one transaction is tested on the real one. |
 | Clock | `clock.utcnow` | a fixed `now` | a parameter at the use-case entry |
 | Git | `worktree.run_git` | real git in `tmp_path` | `Collaborators.run_git` |
 
@@ -196,7 +196,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | Target module | L | Takes | Note |
 |---|---|---|---|
 | `store/db.py` | 5 | `_SCHEMA`, WAL setup, `_ADDED_COLUMNS`, `open_db`, `immediate`, the read-transaction helper `read_snapshot`, `iso`, `BUSY_TIMEOUT_SECONDS`, `STORE_ID_KEY`, `store_id`, the retry primitive `run_with_retry` with `RETRY_ATTEMPTS`, `RETRY_DEADLINE_SECONDS`, `RETRY_FIRST_PAUSE` and `RETRY_PAUSE_CAP`, and a `StoreBusyError` that replaces `sqlite3.OperationalError` | |
-| `store/journal.py` | 5 | `Journal`, `JournalLine`, `EventKind`, `NODE_KINDS`, the `JournalError` family; `read_verbatim`, `VerbatimJournal`, `VerbatimLine`, `UnimportableLineError`: a journal read as `am migrate` imports it, every value as the file holds it | the schema contract (§10.1) |
+| `store/journal.py` | 5 | `JournalLine`, `EventKind`, `NODE_KINDS`, `ts_text`, the `JournalError` family; `Journal`, the reader of a journal file an older `am` wrote, which creates nothing; `read_verbatim`, `VerbatimJournal`, `VerbatimLine`, `UnimportableLineError`: a journal read as `am migrate` imports it, every value as the file holds it | the schema contract (§10.1) |
 | `store/replay.py` | 6 | `replay`, `diverging`, `Mismatch`, `ProjectionDivergedError`, `_RETIRED_ATTEMPT_KEYS`, `_walk` and its helpers | pure over journal lines and rows |
 | `store/queries.py` | 6 | `RunLease`, `RunSummary`, `RunProgress`, `ProgressCount`, `ProgressCurrent`, `list_runs`, `latest_run_id`, `load_run`, `run_status`, `run_known` | take a connection |
 | `store/leases.py` | 6 | `LeaseRow`, `ClaimRow`, `ControlRow`, `LeaseTake`, their readers, `claim_conflicts`, `held_claims`, `control_requests`, `add_control`, the lease/claim errors, the SQL behind lease writes | never commits |
@@ -210,7 +210,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 
 ### 6.4 What stays in one piece
 
-- **`Store`** keeps every write method, together with its writer thread and job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_events`. Each write is one job on the writer thread, one `BEGIN IMMEDIATE` transaction under the fence; heartbeat writes waiting together share one transaction, each in its own savepoint; each `record_*` job covers both the journal append and the row write (`store.py:1582-1647`). Only `Store` commits (`store.py:1568-1571`), apart from `store.legacy.merge`'s one migration transaction. A forked child gets an inert copy of every `Store` the parent still had open: its every write and read raises `sqlite3.ProgrammingError`, and the child opens a `Store` of its own.
+- **`Store`** keeps every write method, together with its writer thread, its job queue and its bound lease token. That covers the run-tree `record_*` methods, `save_checkpoint`, the comment outbox writes, the lease writes and `rebuild_from_events`. One writer thread drains a FIFO job queue (`store/writer.py:144,247-291`); the queue replaces the old `RLock` as the one critical section. Each write is one job, run as one `BEGIN IMMEDIATE` transaction under the fence and run again while the database is busy (`store/writer.py:361`). Jobs that coalesce share one transaction, each in its own savepoint (`store/writer.py:372`). A `record_*` job inserts the event and writes the row it explains in that one transaction, and writes nothing outside the database (`store/writer.py:441-502`). Only `Store` commits, apart from `store.legacy.merge`'s one migration transaction. A forked child gets an inert copy of every `Store` the parent still had open (`store/writer.py:233-245,1251-1257`): its every write and read raises `sqlite3.ProgrammingError`, and the child opens a `Store` of its own.
 - **`lane` and `StoryRecorder`.** The order in which story and subtask rows are recorded, and the escalation path through `stop.trigger`, form one state machine.
 - **`supervise`, `run_until_killed` and `build_dag_tree`.** These own the grafo executor's lifetime and the workarounds for its hangs.
 - **`control.Lease`** with its heartbeat, its watcher and `run_lease`. Token binding into `Store` happens here.
@@ -242,9 +242,9 @@ Each step can ship on its own and leaves `uv run pytest` green. No step changes 
 | Phase | Declare it in `workflow/<wf>.py`. A deterministic step is `steps/<name>.py`. An agent phase needs a role bundle, a result model in `results.py`, and its input names in `prompt.py`. | `runtime/` |
 | Gate | `steps/reducers.py`. It must be pure. A check that needs I/O is a step. | an adapter, the runtime |
 | Harness | `harness/<name>.py` implementing `HarnessAdapter` (argv only), registered in `harness/registry.py` | spawning outside `harness/launcher.py` |
-| Journal field | A payload key on the node model in `models.py` (additive). A column goes in `store/db.py` `_ADDED_COLUMNS` plus `store/replay.py`. A new `JournalLine` field is a schema change (§10.1). | a row written without its journal line |
+| Event field | A payload key on the node model in `models.py` (additive). A column goes in `store/db.py` `_ADDED_COLUMNS` plus `store/replay.py`. A new `JournalLine` field is a schema change (§10.1). | an event and its row in different transactions |
 | `brd` interaction | `board.py`. A status write with rollup goes in `steps/rollup.py`. | any other module running `brd` |
-| Status value | `models.Status` plus the README journal table. A new run status is a contract change (§10.1). | a bare string literal |
+| Status value | `models.Status` plus the README's "The journal line" tables. A new run status is a contract change (§10.1). | a bare string literal |
 | Use case | A new Application module that takes its collaborators as parameters | `cli/` |
 | Exception | `errors.py`. Its class name is the envelope's `error.type` (§10.2). | `cli/` |
 | Third-party library | one module, added to §5 | spread across modules |
@@ -305,12 +305,12 @@ The migration has landed. Items 1 and 2 are the rules in force; items 3-6 are th
 
 These outrank every layering move. A move that would change one of them is not a layering move: it needs its own compatibility plan, as §9 has.
 
-1. **The journal line** (`JournalLine`, `store.py:321-338`; `extra="forbid"`), its event kinds, `(run_id, seq)` cursoring, and the `am watch` / `am logs --follow` streams with their hello lines. The watch hello is `schema: 2`; the `am logs --follow` hello stays `schema: 1`.
+1. **The event line** (`JournalLine`, `store/journal.py:48-65`; `extra="forbid"`) and its ten event kinds. It is the line contract of `am watch`, `am events` and `am export`, each line carrying the additive `gseq`. Cursoring is by `gseq` (`--since-seq`) and by `(run_id, seq)` (`--since`). The five lease and control kinds appear only in output read from `am.db`, and their payloads are outside the contract. The `am watch` and `am logs --follow` streams keep their hello lines: the watch hello is `schema: 2`, with `head`, `cursor_reset` and `store_id` additive; the `am logs --follow` hello stays `schema: 1`.
 2. **The envelope** `{"ok": true, "data"}` / `{"ok": false, "error": {"type", "message"}}`, and exit codes 0 / 1 / 3 (2 is Typer's usage errors). `error.type` is the exception's class name (`cli.py:183-186`), so moving an exception class is safe and renaming one is a contract change.
 3. **Workflow identity.** The digest names callables by `module.qualname` (`workflow/phases.py:67-68,131-149`), and the checkpoint pool tags pydantic models as `module:qualname` (`runtime/context.py:31`). Moving or renaming any step, gate, `when` predicate, or result model in `results.py` that a shipped workflow references invalidates resumes of checkpointed runs.
-4. **Write order and fencing.** The journal line is written before the row. Every run write is fenced by the lease token (§6.4).
+4. **Write order and fencing.** The event and the row it explains are written in one transaction (one `BEGIN IMMEDIATE` job). Every run write is fenced by the lease token (§6.4). Commit order is `gseq` order.
 5. **`steps/reducers.py` behaviour**, including the camelCase/snake_case dual read.
-6. **The documented data-dir layout** (`<data dir>/runs/<run-id>/{journal.jsonl,run.log,report.json}`, documented in the README). Inferred: the README documents it to users.
+6. **The documented data-dir layout** (`<data dir>/{am.db (+ am.db-wal, am.db-shm), backups/, runs/<run-id>/{run.log,report.json,<attempt dirs>}, boards/, projects/<digest>.{board,git}.lock}`, documented in the README). Legacy `projects/<digest>.db` and `runs/<run-id>/journal.jsonl` are read only by `am migrate`; `am` writes neither. Inferred: the README documents it to users.
 
 ## 11. Known exceptions
 
@@ -349,7 +349,7 @@ This list may only shrink. Each entry must disappear when the named step of §6.
 | `cli.py:61-85` | `cli.X is runs.X` aliases (§4.5) | M9 |
 | `cli.py:24,3011,3062,3129` | `sqlite3` and a transaction outside `store` (5.4) | M5 |
 | 5.12 sites | wall clock outside `clock` | M3 |
-| `cli.py:2411`, `store.py:406`, `paths.py:18,33,57` | hand-joined data path; `mkdir` in derivation (5.11) | M13 |
+| `cli.py:3383`, `store/journal.py:112`, `migrate.py:183`, `export.py:132`, `store/db.py:273`, `paths.py:24,44,60,115,122,129` | hand-joined data path; `mkdir` in derivation (5.11) | M13 |
 | `tests/e2e/test_live_control.py:181`, `test_milestone_resume.py:241`, `test_milestone_run.py:229,356`, `tests/test_cli.py:2254,7679` | patch `cli.run_direct` instead of injecting (5.14) | M6 |
 
 ## 12. How this will be enforced
@@ -378,7 +378,7 @@ Design only. The architecture test is written separately. It scans `src/agent_ma
 | D4 | `dispatch` | Stays `agent_manager/dispatch.py` (L14) | Moving it into `runtime/`: churn with no rule gained. |
 | D5 | Package shape | `store/` and `milestone/` packages imported by leaf module; `bases`/`integration` stay flat | Flat sibling modules: crowds the top-level namespace. |
 | D6 | `cli` shape | A `cli/` package with sub-layers L26-L29. `envelope` stays in Application (L17), because detached children write the same envelope to `report.json`. | One Typer module of about 900 lines. |
-| D7 | `Store` writes | `Store` keeps every write; concern modules supply SQL and never commit | Per-concern writer classes sharing a lock and fence: splits one critical section. |
+| D7 | `Store` writes | `Store` keeps every write on its writer thread and job queue; the queue still keeps one critical section; concern modules supply SQL and never commit | Per-concern writer classes sharing a lock and fence: splits one critical section. |
 | D8 | Private names | Forbidden across modules, including within one sub-package | Allowing them inside `runtime/` and `steps/`. |
 | D9 | Clock | `clock.utcnow` plus `now` parameters | A `Clock` protocol injected everywhere: heavier, and no test needs it. |
 | D10 | `canceled` in the journal | The journal writes `canceled`; the watch hello moves to schema 2; both spellings are read forever (§9) | Keeping schema 1, or keeping `cancelled` on the wire. |
@@ -386,3 +386,9 @@ Design only. The architecture test is written separately. It scans `src/agent_ma
 | D12 | `InvalidCardIdError` | Accepted. `error.type` for a bad card id changes from `ValueError`, documented as a contract change. | Keeping bare `ValueError` in `HANDLED`. |
 | D13 | `CLAUDE.md` | Points to this document for layering | Leaving the frozen design spec as the source of truth. |
 | D14 | `runtime.walk` → `store` | Keep the concrete import and type it later through a `RunDeps` Protocol | Making Runtime import no adapter: moves the record helpers out of the walk. |
+| D15 | Truth | `am.db` is the truth; the journal is an export (`am export`) | The journal as truth with a SQLite projection: two stores to keep in step, and a line written before its row. |
+| D16 | Database scope | One machine-wide `am.db`; legacy per-project databases are merged by an explicit `am migrate` | Per-project databases: no reads across projects and no machine-wide `gseq`. Lazy migration on first write: a migration hidden inside an unrelated command. |
+| D17 | Write concurrency | One writer thread and job queue per process replace `Store`'s `RLock` | Callers writing under a shared lock: every caller blocks on SQLite. A daemon: one more process to start, supervise and upgrade. |
+| D18 | Line contract | The journal line becomes the export and watch contract; `gseq` is additive; the watch hello stays at schema 2 | Schema 3 with a global `seq`: breaks every consumer for a field that can be added. |
+| D19 | Live journal file | No live journal file; the dual-write checker is deleted | Keeping the checker as a maintenance command: it would check a file nothing writes. |
+| D20 | Backups | `am backup` is built in, through SQLite's online-backup API | Documenting `sqlite3 .backup` only: needs the `sqlite3` binary and the data dir's location. |
