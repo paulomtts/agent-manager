@@ -803,6 +803,30 @@ The journal line is a public contract, version 1. A consumer that follows these 
 - Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a schema bump is signaled. It is `2` today. Schema 1 became 2 when `am` started writing a canceled run's status as `canceled` instead of `cancelled`; nothing else changed. Lines are replayed as stored, so a schema-2 stream still carries `cancelled` for a run canceled by an older `am`: accept both, whatever the schema.
 
+#### Snapshots and cursors
+
+`am` numbers every event it records on the machine with one counter, `gseq`. `gseq` is increasing, may skip: never assume it is contiguous. `head` is the largest `gseq` recorded, `0` when there is none. The readers tie what they print to it:
+
+- `am runs` and `am status` carry `as_of_seq`, the head their rows were read at, and `store_id`, both read in the same read transaction as every row (see [Listing runs](#listing-runs)).
+- `am events` carries `head`, read in the same snapshot as its lines, so no line's `gseq` is above it.
+- `am watch --follow` puts `head` and `store_id` in its hello line, and `cursor_reset` when the `--since-seq` it was given is above head.
+
+To read a snapshot and then follow every later event with no gap and no repeat, take `as_of_seq` from the snapshot and pass it on as the cursor:
+
+```bash
+am runs --all-projects                    # data.as_of_seq is, say, 1187
+am watch --all --follow --since-seq 1187
+am events 20261002T140000Z-19efcddc --after-seq 1187
+```
+
+Every event with a `gseq` up to `as_of_seq` is already in the snapshot, and the stream prints exactly the ones above it. The same holds for `--after-seq` on `am events`, given the `gseq` of the last line read.
+
+- A `--since-seq` above head cannot be a cursor into this database. The stream starts at head instead, its hello line has `cursor_reset: true`, and every event recorded after head is printed. The exit code is 0: drop what you held and read a snapshot again.
+- `--from-now` starts at head, with no backlog.
+- `store_id` is the identity of one `am.db`. A `store_id` other than the one you saw means the database was replaced: drop every `as_of_seq` and cursor you hold and read a snapshot again.
+
+A restored backup is the one case neither catches. A backup restored over `am.db` keeps the `store_id` it was taken with, which is the database's own, and its head goes back to the head at backup time, which can be lower than a cursor you hold. New events then take the `gseq` numbers above the restored head again. A consumer that reconnects after those new events have pushed head past its old cursor gets no `cursor_reset`, and silently skips the events between the restored head and its cursor. So after a restore every consumer must drop its cursors and read a snapshot again (see [Backing up and restoring `am.db`](#backing-up-and-restoring-amdb)).
+
 ### Reading an attempt's output
 
 `am logs` prints what one attempt of one phase of one subtask was given and wrote. Like `am status` and `am runs`, it reads the projection and takes no lease, no claim and no lock, so it works beside any number of live runs.

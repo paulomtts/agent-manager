@@ -1021,3 +1021,43 @@ def test_backup_and_restore_section():
     assert heads[titles.index(BACKUP_TITLE)][1] == 3
     assert _slug(BACKUP_TITLE) == "backing-up-and-restoring-amdb"
     assert "several-am-processes" in _assert_anchors_resolve(section)
+
+
+SNAPSHOTS_TITLE = "Snapshots and cursors"
+
+
+def test_snapshots_and_cursors_section():
+    section = _section(SNAPSHOTS_TITLE)
+    for name in (
+        "`as_of_seq`",
+        "`head`",
+        "`gseq`",
+        "`store_id`",
+        "`cursor_reset`",
+        "`--since-seq`",
+        "`--after-seq`",
+        "`--from-now`",
+    ):
+        assert name in section, name
+    assert "increasing, may skip" in section
+    for line in section.splitlines():
+        if "contiguous" in line:
+            assert "never assume" in line, line
+    assert "am runs --all-projects" in section
+    assert "am watch --all --follow --since-seq 1187" in section
+    assert "no gap and no repeat" in section
+    assert "`cursor_reset: true`" in section
+    assert "keeps the `store_id` it was taken with" in section
+    assert "gets no `cursor_reset`" in section
+    assert RESNAPSHOT in section
+    anchors = _assert_anchors_resolve(section)
+    assert "listing-runs" in anchors
+    assert _slug(BACKUP_TITLE) in anchors
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    position = titles.index(SNAPSHOTS_TITLE)
+    assert heads[position][1] == 4
+    parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
+    assert parent[1:] == (3, "Watching a run")
+    assert titles.index("Reading the stream safely") < position < titles.index(LOGS_TITLE)
