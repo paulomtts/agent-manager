@@ -593,6 +593,33 @@ def test_events_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(
     }
 
 
+@pytest.mark.parametrize("project", [False, True], ids=["all", "project"])
+def test_events_escalations_on_an_unknown_repo_is_empty_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch, project
+):
+    """Spec test 16: with no `am.db` (`fresh`) the page is empty with head 0
+    and nothing is created; beside another project's runs, still empty."""
+    monkeypatch.chdir(unknown_repo)
+    argv = ["events", "--escalations"]
+    if project:
+        argv += ["--project", str(unknown_repo)]
+
+    result = _invoke_creating_nothing(tmp_path, argv)
+
+    assert result.exit_code == 0, result.output
+    head = 0
+    if paths.db_path().exists():
+        conn = store_db.open_db_for_reading(unknown_repo)
+        try:
+            head = store_events.head(conn)
+        finally:
+            conn.close()
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"events": [], "head": head},
+    }
+
+
 def test_status_run_without_repo_dir_refuses_an_unmigrated_machine(
     tmp_path, monkeypatch
 ):

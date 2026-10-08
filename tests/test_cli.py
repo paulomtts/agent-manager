@@ -6739,6 +6739,113 @@ def test_escalations_for_rejects_bad_values_before_opening_the_db(
     assert str(caught.value) == message
 
 
+def test_events_escalations_through_the_cli_lists_every_runs_escalations(escalation_repos):
+    """Spec test 8 through the command: the same envelope as `escalations_for`."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+
+    data = _events(["--escalations"])
+
+    assert data == cli.escalations_for()
+    assert _gseqs(data) == [rows[1].seq, rows[3].seq, rows[5].seq]
+    for line in data["events"]:
+        assert set(line) == EVENT_LINE_KEYS
+    assert data["head"] == rows[-1].seq
+
+
+def test_events_escalations_through_the_cli_pages_forward(escalation_repos):
+    """Spec test 9, plan Review Focus 4: an explicit --after-seq 0 is the bare form."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+    full = _events(["--escalations"])
+
+    assert _events(["--escalations", "--after-seq", "0"]) == full
+    first = _events(["--escalations", "--limit", "1"])
+    second = _events(
+        ["--escalations", "--after-seq", str(_gseqs(first)[-1]), "--limit", "1"]
+    )
+    rest = _events(["--escalations", "--after-seq", str(_gseqs(second)[-1])])
+    assert _gseqs(first) == [rows[1].seq]
+    assert _gseqs(second) == [rows[3].seq]
+    assert _gseqs(rest) == [rows[5].seq]
+    assert _events(["--escalations", "--after-seq", str(rows[5].seq)]) == {
+        "events": [],
+        "head": full["head"],
+    }
+
+
+def test_events_escalations_project_through_the_cli(escalation_repos, monkeypatch):
+    """Spec tests 10 and 11 through the command."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+    monkeypatch.setenv("HOME", str(root.parent))
+
+    narrowed = _events(["--escalations", "--project", f"~/{other.name}"])
+    missing = _events(["--escalations", "--project", str(root.parent / "deleted-repo")])
+
+    assert _gseqs(narrowed) == [rows[3].seq]
+    assert narrowed["head"] == rows[-1].seq
+    assert missing == {"events": [], "head": rows[-1].seq}
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        ([EVENTS_RUN_A, "--escalations"], "--escalations cannot be combined with RUN"),
+        ([], "RUN is required unless --escalations is given"),
+        (["--after-seq", "3"], "RUN is required unless --escalations is given"),
+        (["--project", "."], "--project requires --escalations"),
+        ([EVENTS_RUN_A, "--project", "."], "--project requires --escalations"),
+        (["--escalations", "--tail", "1"], "--escalations cannot be combined with --tail"),
+        (
+            ["--escalations", "--before-seq", "5"],
+            "--escalations cannot be combined with --before-seq",
+        ),
+        (
+            ["--escalations", "--tail", "1", "--before-seq", "5"],
+            "--escalations cannot be combined with --tail",
+        ),
+        (["--escalations", "--limit", "0"], "--limit must be at least 1, got 0"),
+        (["--escalations", "--after-seq", "-1"], "--after-seq must be 0 or more, got -1"),
+        (["--escalations", "--limit", "0", "--tail", "1"], "--limit must be at least 1, got 0"),
+        ([EVENTS_RUN_A, "--escalations", "--tail", "0"], "--tail must be at least 1, got 0"),
+        (
+            [EVENTS_RUN_A, "--escalations", "--tail", "5", "--after-seq", "3"],
+            "--escalations cannot be combined with RUN",
+        ),
+        (
+            [EVENTS_RUN_A, "--project", ".", "--tail", "5", "--limit", "2"],
+            "--project requires --escalations",
+        ),
+    ],
+)
+def test_events_refuses_a_bad_form_before_opening_the_db(
+    projection, monkeypatch, argv, message
+):
+    """Spec test 14: each form refusal with its exact message, value checks
+    first, form checks before the RUN form's combination checks."""
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal(argv) == {"type": "CliError", "message": message}
+
+
+def test_events_escalations_help_texts():
+    parameters = inspect.signature(cli.events).parameters
+
+    assert parameters["run_id"].default.default is None
+    assert parameters["escalations"].default.help == (
+        "List every run's escalation events (a run_upsert whose status is"
+        " escalated) instead of one run's. Not with RUN, --tail or --before-seq."
+    )
+    assert parameters["project"].default.help == (
+        "With --escalations, list only this repository's escalations. A path"
+        " that never ran is an empty page."
+    )
+    assert "--escalations" in cli.events.__doc__
+    assert "--before-seq" in cli.events.__doc__
+    assert "--tail N" in cli.events.__doc__
+
+
 def _write_logs_attempt(
     run_id: str,
     phase: str,

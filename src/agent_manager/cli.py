@@ -2823,9 +2823,47 @@ def escalations_for(
         conn.close()
 
 
+def _check_events_form(
+    run_id: str | None,
+    *,
+    escalations: bool,
+    project: Path | None,
+    tail: int | None,
+    before_seq: int | None,
+) -> None:
+    """Which of `am events`' two forms was asked for, as `CliError`s, the
+    first failing one in this order: RUN with `--escalations`, `--project`
+    without `--escalations`, neither, `--escalations` with `--tail`, with
+    `--before-seq`. The escalation read pages forward only."""
+    if escalations and run_id is not None:
+        raise CliError("--escalations cannot be combined with RUN")
+    if project is not None and not escalations:
+        raise CliError("--project requires --escalations")
+    if not escalations and run_id is None:
+        raise CliError("RUN is required unless --escalations is given")
+    if escalations:
+        for flag, value in (("--tail", tail), ("--before-seq", before_seq)):
+            if value is not None:
+                raise CliError(f"--escalations cannot be combined with {flag}")
+
+
 @app.command("events")
 def events(
-    run_id: str = typer.Argument(..., metavar="RUN", help="The run whose events are read."),
+    run_id: str | None = typer.Argument(
+        None, metavar="RUN", help="The run whose events are read."
+    ),
+    escalations: bool = typer.Option(
+        False,
+        "--escalations",
+        help="List every run's escalation events (a run_upsert whose status is"
+        " escalated) instead of one run's. Not with RUN, --tail or --before-seq.",
+    ),
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        help="With --escalations, list only this repository's escalations. A path"
+        " that never ran is an empty page.",
+    ),
     after_seq: int | None = typer.Option(
         None,
         "--after-seq",
@@ -2850,17 +2888,33 @@ def events(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """List one run's events in gseq order, with the machine-wide head.
+    """List one run's events, or every run's escalations, in gseq order, with
+    the machine-wide head.
 
     The run is found by id alone, whichever repository recorded it. Pass the
     last gseq as --after-seq to read the next page, or the first gseq as
     --before-seq (with --limit) to read the previous one; --tail N reads the
-    last N.
+    last N. --escalations, given instead of RUN, lists the escalation events
+    of every run (or of one --project), paged forward the same way with
+    --after-seq and --limit.
     """
     try:
-        payload = events_for(
-            run_id, after_seq=after_seq, limit=limit, tail=tail, before_seq=before_seq
+        _check_event_values(
+            after_seq=after_seq, limit=limit, tail=tail, before_seq=before_seq
         )
+        _check_events_form(
+            run_id,
+            escalations=escalations,
+            project=project,
+            tail=tail,
+            before_seq=before_seq,
+        )
+        if escalations:
+            payload = escalations_for(after_seq=after_seq, limit=limit, project=project)
+        else:
+            payload = events_for(
+                run_id, after_seq=after_seq, limit=limit, tail=tail, before_seq=before_seq
+            )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
