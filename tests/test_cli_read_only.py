@@ -1,8 +1,9 @@
 """The read-only commands create nothing under the data directory.
 
-`am runs`, `am status`, `am logs`, `am watch` and `am run --dry-run` against a
-repository with no projection leave the data directory byte-for-byte as they
-found it, and still answer as they do for an unknown run.
+`am runs`, `am status`, `am events`, `am logs`, `am watch` and
+`am run --dry-run` against a repository with no projection leave the data
+directory byte-for-byte as they found it, and still answer as they do for an
+unknown run.
 """
 
 import json
@@ -569,6 +570,21 @@ def test_status_of_an_unknown_run_without_repo_dir_refuses_and_creates_nothing(
     monkeypatch.chdir(unknown_repo)
 
     result = _invoke_creating_nothing(tmp_path, ["status", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+def test_events_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch
+):
+    """Review Focus 5: with no `am.db` (`fresh`) nothing is created either."""
+    monkeypatch.chdir(unknown_repo)
+
+    result = _invoke_creating_nothing(tmp_path, ["events", "nope"])
 
     assert result.exit_code == cli.EXIT_ERROR, result.output
     assert json.loads(result.stdout) == {

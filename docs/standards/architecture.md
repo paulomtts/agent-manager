@@ -168,7 +168,7 @@ Measured: `cli.py` has 3329 lines, `orchestrate.py` 2784 and `store.py` 2352. To
 | `card_run` | 19 | `card_run_status`, `card_outcome_comment`, `CardPreflight`, `preflight_card`, `RecordedRun`, `recorded_card_run`, `run_card_engine`, `run_card`, `detach_card` |
 | `resume` | 25 | `checkpoint_resume_phase`, `_resume_from_checkpoint`, `resume_run` (`cli.py:608-649, 2724-2946`) |
 | `preview` | 25 | `already_done_entries` ... `dry_run_board` (`cli.py:1207-1378`), plus `runs.DryRunPlan` and `compute_dry_run_plan` |
-| `cli/views.py` | 26 | `RUN_IDENTITY` ... `step_logs_payload` (`cli.py:205-605`, without `checkpoint_resume_phase`), `status_for`, `runs_for`, `LogsSelection`, `select_logs`, `logs_for`, `logs_end_status` |
+| `cli/views.py` | 26 | `RUN_IDENTITY` ... `step_logs_payload` (`cli.py:205-605`, without `checkpoint_resume_phase`), `status_for`, `runs_for`, `events_for`, `LogsSelection`, `select_logs`, `logs_for`, `logs_end_status` |
 | `cli/output.py` | 26 | printing an envelope (`--pretty`) and mapping `HANDLED` to exit 3. The only exit-code site. |
 | `cli/options.py` | 26 | shared `typer.Option`/`Argument` declarations (`--repo-dir`, `--pretty`, ...) and `RUN_EXAMPLES` |
 | `cli/streams.py` | 27 | the watch and logs-follow protocols: `cli.py:2301-2660` (hello lines, poll/follow, UTF-8 chunking, `WATCH_*`) |

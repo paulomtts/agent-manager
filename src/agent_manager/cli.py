@@ -2665,6 +2665,90 @@ def runs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
+def events_for(
+    run_id: str, *, after_seq: int = 0, limit: int | None = None
+) -> dict[str, Any]:
+    """`run_id`'s events with a global `seq` above `after_seq`, ascending, at
+    most `limit` of them, and the machine-wide `head`.
+
+    Each line is the row's `store_events.journal_line` dumped in JSON mode
+    plus `gseq`, the row's global `seq`; its own `seq` stays the per-run
+    number. Every kind is included and no other run's row ever is. A caller
+    pages forward by passing the last `gseq` as `after_seq`; a page past the
+    run's last event, or past `head`, is `[]`, not a refusal.
+
+    `limit` below 1 and `after_seq` below 0 are `CliError`s raised before the
+    database is opened. A run with no `events` row and no `runs` row is an
+    `UnknownRunError`; a `runs` row with no events is an empty page. Run ids
+    are machine-unique, so no repository is resolved: `open_db_for_reading`
+    gets `Path(".")` only because it takes a root, which never chooses the
+    file.
+
+    Every statement runs in one `store_db.read_snapshot`, and the first one
+    reads `store_events.head`: the run check and the page see every event up
+    to it and none after it, so no line's `gseq` exceeds `head`. Read-only;
+    the connection is closed on every path.
+    """
+    if limit is not None and limit < 1:
+        raise CliError(f"--limit must be at least 1, got {limit}")
+    if after_seq < 0:
+        raise CliError(f"--after-seq must be 0 or more, got {after_seq}")
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        with store_db.read_snapshot(conn):
+            head = store_events.head(conn)
+            # Lease and claim events can precede the run's `run_upsert`, and a
+            # `runs` row can exist without events: either makes the run known.
+            if (
+                not store_events.has_run(conn, run_id)
+                and store_queries.load_run(conn, run_id) is None
+            ):
+                raise UnknownRunError(
+                    f"run {run_id!r} is not in the projection"
+                    " (`agent-manager runs --all-projects` lists the ones that are)"
+                )
+            rows = store_events.read(
+                conn, after_seq=after_seq, limit=limit, run_id=run_id
+            )
+            lines = [
+                {
+                    **store_events.journal_line(row).model_dump(mode="json"),
+                    "gseq": row.seq,
+                }
+                for row in rows
+            ]
+            return {"events": lines, "head": head}
+    finally:
+        conn.close()
+
+
+@app.command("events")
+def events(
+    run_id: str = typer.Argument(..., metavar="RUN", help="The run whose events are read."),
+    after_seq: int = typer.Option(
+        0,
+        "--after-seq",
+        help="List events with a gseq above this (0 or more). To page forward,"
+        " pass the last gseq of the previous page.",
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="List at most this many events (at least 1)."
+    ),
+    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
+) -> None:
+    """List one run's events in gseq order, with the machine-wide head.
+
+    The run is found by id alone, whichever repository recorded it. Pass the
+    last gseq as --after-seq to read the next page.
+    """
+    try:
+        payload = events_for(run_id, after_seq=after_seq, limit=limit)
+    except HANDLED as error:
+        typer.echo(render(error_envelope(error), pretty=pretty))
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(render(ok_envelope(payload), pretty=pretty))
+
+
 @dataclass(frozen=True)
 class LogsSelection:
     """The attempt `am logs` reports on, as `select_logs` chose it.

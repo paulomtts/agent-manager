@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import typer
@@ -5847,6 +5847,369 @@ def test_a_repo_dir_that_is_a_file_is_an_envelope_for_both_commands(tmp_path, mo
         result = runner.invoke(cli.app, argv)
         assert result.exit_code == cli.EXIT_ERROR, argv
         assert json.loads(result.stdout)["error"]["type"] == "RepoDirError"
+
+
+EVENTS_RUN_A = "20261007T090000Z-aaaaaaaa"
+EVENTS_RUN_B = "20261007T090000Z-bbbbbbbb"
+EVENT_TS = "2026-10-07T12:00:00+00:00"
+"""Stored with `+00:00`; a line renders it the `JournalLine` way, with `Z`."""
+
+EVENT_LINE_KEYS = {
+    "seq",
+    "ts",
+    "run_id",
+    "event",
+    "story",
+    "card",
+    "phase",
+    "attempt",
+    "payload",
+    "gseq",
+}
+
+ALL_EVENT_KINDS = (
+    "run_upsert",
+    "story_upsert",
+    "subtask_upsert",
+    "phase_upsert",
+    "attempt_upsert",
+    "control_requested",
+    "control_handled",
+    "lease_acquired",
+    "lease_taken_over",
+    "claim_conflict",
+)
+
+EVENTS_UNKNOWN_MESSAGE = (
+    "run 'no-such-run' is not in the projection"
+    " (`agent-manager runs --all-projects` lists the ones that are)"
+)
+
+
+def _insert_events(root: Path, *specs: tuple[str, str]) -> list[store_events.EventRow]:
+    """One `events` row per `(run_id, kind)`, in order, with payload `{"n": i}`,
+    committed together on a connection of its own; the rows as stored."""
+    conn = store_db.open_db(root)
+    try:
+        project_id = store_projects.resolve(conn, root, now=RECORDED_AT)
+        rows = [
+            store_events.insert(
+                conn,
+                project_id=project_id,
+                run_id=run_id,
+                ts=EVENT_TS,
+                kind=kind,
+                payload={"n": index},
+                source="live",
+            )
+            for index, (run_id, kind) in enumerate(specs)
+        ]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _events(argv: list[str]) -> dict[str, Any]:
+    """`am events ARGV` through the CLI: exit 0, an ok envelope; its data."""
+    result = runner.invoke(cli.app, ["events", *argv])
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    return envelope["data"]
+
+
+def _events_refusal(argv: list[str]) -> dict[str, Any]:
+    """`am events ARGV` through the CLI: exit 3, an error envelope; its error."""
+    result = runner.invoke(cli.app, ["events", *argv])
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    return envelope["error"]
+
+
+def test_events_returns_the_runs_lines_in_gseq_order_with_head(projection):
+    """Review Focus 1: B's rows interleave A's by `seq`, and B writes last."""
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+        (EVENTS_RUN_B, "story_upsert"),
+        (EVENTS_RUN_A, "lease_acquired"),
+        (EVENTS_RUN_B, "lease_acquired"),
+    )
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+
+    data = _events([EVENTS_RUN_A])
+
+    assert set(data) == {"events", "head"}
+    lines = data["events"]
+    assert [line["gseq"] for line in lines] == [row.seq for row in a_rows]
+    assert [line["seq"] for line in lines] == [1, 2, 3]
+    assert [line["event"] for line in lines] == [
+        "run_upsert",
+        "story_upsert",
+        "lease_acquired",
+    ]
+    assert {line["run_id"] for line in lines} == {EVENTS_RUN_A}
+    for line in lines:
+        assert set(line) == EVENT_LINE_KEYS
+    assert data["head"] == rows[-1].seq == _events_head(projection)
+    assert data["head"] > lines[-1]["gseq"]
+
+
+def test_events_line_is_the_journal_line_plus_gseq(projection):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_A, "control_requested"),
+    )
+
+    data = cli.events_for(EVENTS_RUN_A)
+
+    assert [
+        {key: value for key, value in line.items() if key != "gseq"}
+        for line in data["events"]
+    ] == [store_events.journal_line(row).model_dump(mode="json") for row in rows]
+    assert [line["gseq"] for line in data["events"]] == [row.seq for row in rows]
+    assert rows[0].ts == EVENT_TS
+    assert [line["ts"] for line in data["events"]] == ["2026-10-07T12:00:00Z"] * 2
+    assert [line["payload"] for line in data["events"]] == [{"n": 0}, {"n": 1}]
+
+
+def test_events_includes_every_event_kind(projection):
+    assert set(ALL_EVENT_KINDS) == set(get_args(store_journal.EventKind))
+    _insert_events(projection, *[(EVENTS_RUN_A, kind) for kind in ALL_EVENT_KINDS])
+
+    data = _events([EVENTS_RUN_A])
+
+    assert [line["event"] for line in data["events"]] == list(ALL_EVENT_KINDS)
+
+
+def test_events_after_seq_and_limit_page_forward_without_gap_or_repeat(projection):
+    _insert_events(
+        projection,
+        *[(run, "phase_upsert") for _ in range(3) for run in (EVENTS_RUN_A, EVENTS_RUN_B)],
+    )
+    full = _events([EVENTS_RUN_A])
+    pages: list[list[dict[str, Any]]] = []
+    after = 0
+
+    for _ in range(10):
+        page = _events([EVENTS_RUN_A, "--limit", "2", "--after-seq", str(after)])
+        assert page["head"] == full["head"]
+        if not page["events"]:
+            break
+        pages.append(page["events"])
+        after = page["events"][-1]["gseq"]
+    else:
+        pytest.fail("paging never reached an empty page")
+
+    assert len(full["events"]) == 3
+    assert [len(page) for page in pages] == [2, 1]
+    assert [line for page in pages for line in page] == full["events"]
+
+
+@pytest.mark.parametrize("beyond", [0, 100])
+def test_events_after_seq_beyond_head_is_an_empty_page(projection, beyond):
+    """Review Focus 4."""
+    _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
+    head = _events_head(projection)
+
+    data = _events([EVENTS_RUN_A, "--after-seq", str(head + beyond)])
+
+    assert data == {"events": [], "head": head}
+
+
+def test_events_of_a_known_run_without_events_is_an_empty_page(projection):
+    """`events` is append-only, so the run's rows are removed behind its
+    trigger's back; the `runs` row stays."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, with_phases=False)
+    _insert_events(projection, (EVENTS_RUN_B, "run_upsert"))
+    conn = store_db.open_db(projection)
+    try:
+        conn.execute("DROP TRIGGER events_no_delete")
+        conn.execute("DELETE FROM events WHERE run_id = ?", (SNAPSHOT_RUN_ID,))
+        conn.commit()
+        assert store_events.has_run(conn, SNAPSHOT_RUN_ID) is False
+        assert store_queries.load_run(conn, SNAPSHOT_RUN_ID) is not None
+    finally:
+        conn.close()
+
+    data = _events([SNAPSHOT_RUN_ID])
+
+    assert data == {"events": [], "head": _events_head(projection)}
+    assert data["head"] > 0
+
+
+def test_events_of_a_run_known_only_by_events_is_listed(projection):
+    """Review Focus 3: a lease event can precede the `run_upsert`."""
+    rows = _insert_events(projection, (EVENTS_RUN_A, "lease_acquired"))
+
+    data = _events([EVENTS_RUN_A])
+
+    assert [(line["event"], line["gseq"]) for line in data["events"]] == [
+        ("lease_acquired", rows[0].seq)
+    ]
+
+
+def test_events_unknown_run_refuses(projection):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+
+    assert _events_refusal(["no-such-run"]) == {
+        "type": "UnknownRunError",
+        "message": EVENTS_UNKNOWN_MESSAGE,
+    }
+
+
+def _refuse_to_open_the_db(monkeypatch) -> None:
+    def refuse(root):
+        raise AssertionError("the database was opened")
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", refuse)
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_events_rejects_limit_below_one_before_opening_the_db(
+    projection, monkeypatch, limit
+):
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal([EVENTS_RUN_A, "--limit", limit]) == {
+        "type": "CliError",
+        "message": f"--limit must be at least 1, got {limit}",
+    }
+
+
+@pytest.mark.parametrize("after_seq", ["-1", "-100"])
+def test_events_rejects_negative_after_seq_before_opening_the_db(
+    projection, monkeypatch, after_seq
+):
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal([EVENTS_RUN_A, "--after-seq", after_seq]) == {
+        "type": "CliError",
+        "message": f"--after-seq must be 0 or more, got {after_seq}",
+    }
+
+
+def _open_event_writer(root: Path) -> tuple[sqlite3.Connection, int]:
+    """A writing connection on the projection, held open across the read so the
+    database stays in WAL with its sidecars, plus `root`'s project id."""
+    writer = store_db.open_db(root)
+    project_id = store_projects.resolve(writer, root, now=RECORDED_AT)
+    writer.commit()
+    return writer, project_id
+
+
+def test_events_never_shows_an_event_after_head(projection, monkeypatch):
+    """Review Focus 2: an event of the run commits right after `head` returns."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    head_before = _events_head(projection)
+    writer, project_id = _open_event_writer(projection)
+    try:
+
+        def write() -> None:
+            store_events.insert(
+                writer,
+                project_id=project_id,
+                run_id=EVENTS_RUN_A,
+                ts=EVENT_TS,
+                kind="story_upsert",
+                payload={},
+                source="live",
+            )
+            writer.commit()
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", write)
+        during = cli.events_for(EVENTS_RUN_A)
+
+        assert fired == [True]
+        assert during["head"] == head_before
+        assert [line["event"] for line in during["events"]] == ["run_upsert"]
+        assert all(line["gseq"] <= during["head"] for line in during["events"])
+        after = cli.events_for(EVENTS_RUN_A)
+        assert after["head"] > head_before
+        assert [line["event"] for line in after["events"]] == [
+            "run_upsert",
+            "story_upsert",
+        ]
+    finally:
+        writer.close()
+
+
+def test_events_unknown_run_check_is_inside_the_snapshot(projection, monkeypatch):
+    """The run's first event commits right after `head` returns: the in-flight
+    read still refuses, and the next one lists it."""
+    _insert_events(projection, (EVENTS_RUN_B, "run_upsert"))
+    writer, project_id = _open_event_writer(projection)
+    try:
+
+        def write() -> None:
+            store_events.insert(
+                writer,
+                project_id=project_id,
+                run_id=EVENTS_RUN_A,
+                ts=EVENT_TS,
+                kind="lease_acquired",
+                payload={},
+                source="live",
+            )
+            writer.commit()
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", write)
+        with pytest.raises(cli.UnknownRunError) as caught:
+            cli.events_for(EVENTS_RUN_A)
+
+        assert fired == [True]
+        assert str(caught.value) == (
+            f"run {EVENTS_RUN_A!r} is not in the projection"
+            " (`agent-manager runs --all-projects` lists the ones that are)"
+        )
+        after = cli.events_for(EVENTS_RUN_A)
+        assert [line["event"] for line in after["events"]] == ["lease_acquired"]
+    finally:
+        writer.close()
+
+
+def test_events_ignores_the_working_directory(projection, tmp_path, monkeypatch):
+    _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "lease_acquired")
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    monkeypatch.chdir(projection)
+    here = runner.invoke(cli.app, ["events", EVENTS_RUN_A])
+    monkeypatch.chdir(elsewhere)
+    there = runner.invoke(cli.app, ["events", EVENTS_RUN_A])
+    scoped = runner.invoke(
+        cli.app, ["events", EVENTS_RUN_A, "--repo-dir", str(projection)]
+    )
+
+    assert here.exit_code == 0, here.output
+    assert there.exit_code == 0, there.output
+    assert here.stdout == there.stdout
+    assert len(json.loads(there.stdout)["data"]["events"]) == 2
+    assert scoped.exit_code == 2
+
+
+def test_events_pretty_indents_the_same_envelope(projection):
+    _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
+
+    plain = runner.invoke(cli.app, ["events", EVENTS_RUN_A])
+    pretty = runner.invoke(cli.app, ["events", EVENTS_RUN_A, "--pretty"])
+
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    assert "\n" not in plain.stdout.strip()
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == json.loads(plain.stdout)
 
 
 def _write_logs_attempt(
