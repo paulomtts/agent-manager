@@ -39,6 +39,7 @@ _PUBLIC_QUERY_NAMES = (
     "load_run",
     "run_status",
     "run_project_id",
+    "run_known",
     "run_cursor",
 )
 
@@ -225,6 +226,23 @@ def test_run_project_id_is_the_runs_project_or_none(conns, project_id, other_pro
     assert store_queries.run_project_id(conn, "run-mine") == project_id
     assert store_queries.run_project_id(conn, "run-theirs") == other_project_id
     assert store_queries.run_project_id(conn, "no-such-run") is None
+
+
+def test_run_known_is_true_for_an_events_row_or_a_runs_row(conns, project_id):
+    conn, _ = conns
+    _insert_run(conn, "run-rows", project_id=project_id, started_at=None)
+    conn.execute(
+        "INSERT INTO events (project_id, run_id, run_seq, ts, kind, payload, source)"
+        " VALUES (?, 'run-events', 1, '2026-10-07T10:00:00+00:00', 'lease_acquired',"
+        " '{}', 'live')",
+        (project_id,),
+    )
+    conn.commit()
+
+    assert store_queries.run_known(conn, "run-rows") is True
+    assert store_queries.run_known(conn, "run-events") is True
+    assert store_queries.run_known(conn, "nope") is False
+    assert not conn.in_transaction
 
 
 @pytest.mark.parametrize("name", ["list_runs", "latest_run_id"])

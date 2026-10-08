@@ -129,6 +129,7 @@ MOVED_NAMES = (
     "RunnerFactory",
     "gate_context",
     "UnknownRunError",
+    "unknown_run",
     "NotResumableError",
     "CheckpointMismatchError",
     "select_resumable",
@@ -144,6 +145,16 @@ def test_cli_re_exports_the_moved_name_as_the_same_object(name):
     from agent_manager import cli
 
     assert getattr(cli, name) is getattr(runs, name)
+
+
+def test_unknown_run_names_the_run_and_the_listing_command():
+    error = runs.unknown_run("nope")
+
+    assert isinstance(error, runs.UnknownRunError)
+    assert str(error) == (
+        "run 'nope' is not in the projection"
+        " (`agent-manager runs --all-projects` lists the ones that are)"
+    )
 
 
 def test_cli_error_subclasses_share_the_moved_base():

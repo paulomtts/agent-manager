@@ -60,6 +60,16 @@ class UnknownRunError(CliError):
     """
 
 
+def unknown_run(run_id: str) -> UnknownRunError:
+    """The `UnknownRunError` for a run looked up by id alone that
+    `store_queries.run_known` does not know: one message for `am events`,
+    `am watch` and `am export`."""
+    return UnknownRunError(
+        f"run {run_id!r} is not in the projection"
+        " (`agent-manager runs --all-projects` lists the ones that are)"
+    )
+
+
 class NotResumableError(CliError):
     """The run was found, and it holds nothing `resume` can pick up.
 

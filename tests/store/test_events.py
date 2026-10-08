@@ -297,7 +297,11 @@ def test_events_is_a_leaf_module_of_the_store_package():
     for function in (
         store_events.insert,
         store_events.read,
+        store_events.read_last,
+        store_events.read_escalations,
         store_events.head,
+        store_events.has_run,
+        store_events.read_run,
         store_events.run_lines,
         store_events.journal_line,
     ):
@@ -305,7 +309,18 @@ def test_events_is_a_leaf_module_of_the_store_package():
     assert store_events.EventRow.__module__ == "agent_manager.store.events"
     assert inspect.ismodule(store.events)
     assert store.events is store_events
-    for name in ("insert", "read", "head", "run_lines", "journal_line", "EventRow"):
+    for name in (
+        "insert",
+        "read",
+        "read_last",
+        "read_escalations",
+        "head",
+        "has_run",
+        "read_run",
+        "run_lines",
+        "journal_line",
+        "EventRow",
+    ):
         assert not hasattr(store, name)
 
 
@@ -646,6 +661,62 @@ def test_run_ids_lists_each_run_once_sorted_over_every_kind_and_project(
     assert not conn.in_transaction
 
 
+# ── has_run ──────────────────────────────────────────────────────────────────
+
+
+def test_has_run_is_true_for_a_run_with_any_event_row(conns, project_id):
+    conn, _ = conns
+    _insert(conn, project_id, run_id="run-a", kind="lease_acquired", payload={"token": "t1"})
+    conn.commit()
+
+    assert store_events.has_run(conn, "run-a") is True
+    assert not conn.in_transaction
+
+
+def test_has_run_is_false_for_an_absent_run_and_an_empty_table(conns, project_id):
+    conn, _ = conns
+    assert store_events.has_run(conn, "run-a") is False
+
+    _insert(conn, project_id, run_id="run-b", kind="run_upsert")
+    conn.commit()
+
+    assert store_events.has_run(conn, "run-a") is False
+    assert store_events.has_run(conn, "run-b") is True
+
+
+# ── read_run ─────────────────────────────────────────────────────────────────
+
+
+def test_read_run_returns_every_kind_of_one_run_by_run_seq(
+    conns, project_id, other_project_id
+):
+    conn, _ = conns
+    third = _insert(conn, project_id, run_id="run-a", kind="lease_acquired", run_seq=3)
+    _insert(conn, other_project_id, run_id="run-b", kind="run_upsert")
+    first = _insert(conn, project_id, run_id="run-a", kind="run_upsert", run_seq=1)
+    second = _insert(conn, project_id, run_id="run-a", kind="phase_upsert", run_seq=2)
+    _insert(conn, other_project_id, run_id="run-b", kind="story_upsert")
+    conn.commit()
+
+    found = store_events.read_run(conn, "run-a")
+
+    assert found == [first, second, third]
+    assert [row.run_seq for row in found] == [1, 2, 3]
+    # Inserted first, so its global seq is the smallest: run_seq order wins.
+    assert third.seq < first.seq
+    assert not conn.in_transaction
+
+
+def test_read_run_of_an_unknown_run_is_empty(conns, project_id):
+    conn, _ = conns
+    assert store_events.read_run(conn, "run-a") == []
+
+    _insert(conn, project_id, run_id="run-b")
+    conn.commit()
+
+    assert store_events.read_run(conn, "run-a") == []
+
+
 # ── read ─────────────────────────────────────────────────────────────────────
 
 
@@ -728,6 +799,105 @@ def test_read_and_head_open_no_transaction(conns, project_id, other_project_id):
 
     store_events.read(conn, limit=2)
     store_events.head(conn)
+
+    assert not conn.in_transaction
+
+
+# ── read_last ────────────────────────────────────────────────────────────────
+
+
+def test_read_last_with_no_bound_and_no_limit_is_every_row_ascending(
+    conns, project_id, other_project_id
+):
+    """S1."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn) == rows == store_events.read(conn)
+
+
+def test_read_last_limit_is_the_last_rows_not_the_first(
+    conns, project_id, other_project_id
+):
+    """S2, Review Focus 2: an ascending `LIMIT` would return rows 1-2."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, limit=2) == [rows[3], rows[4]]
+    assert store_events.read_last(conn, limit=1) == [rows[4]]
+    assert store_events.read_last(conn, limit=10) == rows
+
+
+def test_read_last_before_seq_is_strict(conns, project_id, other_project_id):
+    """S3, Review Focus 1."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=rows[3].seq) == rows[:3]
+
+
+def test_read_last_before_seq_with_limit_is_the_nearest_rows_before_it(
+    conns, project_id, other_project_id
+):
+    """S4."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=rows[4].seq, limit=2) == [
+        rows[2],
+        rows[3],
+    ]
+
+
+@pytest.mark.parametrize("before_seq", [1, 0])
+def test_read_last_before_the_first_seq_is_empty(
+    conns, project_id, other_project_id, before_seq
+):
+    """S5."""
+    conn, _ = conns
+    _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, before_seq=before_seq) == []
+    assert store_events.read_last(conn, before_seq=before_seq, limit=3) == []
+
+
+def test_read_last_filters_by_run_and_project_before_limiting(
+    conns, project_id, other_project_id
+):
+    """S6, Review Focus 3: run-c's row 5 is the newest, yet run-a's last row
+    is row 4 and its last two are rows 1 and 4."""
+    conn, _ = conns
+    rows = _five_rows(conn, project_id, other_project_id)
+
+    assert store_events.read_last(conn, run_id="run-a", limit=1) == [rows[3]]
+    assert store_events.read_last(conn, run_id="run-a", limit=2) == [rows[0], rows[3]]
+    assert store_events.read_last(conn, project_id=project_id, limit=2) == [
+        rows[1],
+        rows[3],
+    ]
+    assert store_events.read_last(
+        conn, run_id="run-a", project_id=project_id, limit=5
+    ) == [rows[0], rows[3]]
+    assert store_events.read_last(conn, run_id="run-c", project_id=project_id) == []
+    assert store_events.read_last(
+        conn, run_id="run-a", before_seq=rows[3].seq, limit=5
+    ) == [rows[0]]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_read_last_refuses_a_non_positive_limit(conns, limit):
+    """S7."""
+    conn, _ = conns
+    with pytest.raises(ValueError, match=f"^limit must be at least 1, got {limit}$"):
+        store_events.read_last(conn, limit=limit)
+
+
+def test_read_last_opens_no_transaction(conns, project_id, other_project_id):
+    conn, _ = conns
+    _five_rows(conn, project_id, other_project_id)
+    assert not conn.in_transaction
+
+    store_events.read_last(conn, limit=2, before_seq=4, run_id="run-a")
 
     assert not conn.in_transaction
 
@@ -859,5 +1029,177 @@ def test_run_lines_open_no_transaction(conns, project_id):
     conn.commit()
 
     store_events.run_lines(conn, "run-a")
+
+    assert not conn.in_transaction
+
+
+# ── read_escalations ─────────────────────────────────────────────────────────
+
+
+def _escalation_mix(conn, project_id, other_project_id) -> list[store_events.EventRow]:
+    """Ten rows of three runs in two projects; only indexes 1, 4 and 7 are
+    escalations (a `run_upsert` whose `status` is `"escalated"`). Every other
+    node kind also says `"escalated"`, and so does a non-node kind."""
+    specs = [
+        ("run-a", project_id, "run_upsert", {"status": "running"}),
+        ("run-a", project_id, "run_upsert", {"status": "escalated"}),
+        ("run-a", project_id, "story_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "subtask_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "run_upsert", {"status": "escalated"}),
+        ("run-b", other_project_id, "phase_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "attempt_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "run_upsert", {"status": "escalated"}),
+        ("run-c", project_id, "run_upsert", {"status": "done"}),
+        ("run-a", project_id, "lease_acquired", {"status": "escalated"}),
+    ]
+    rows = [
+        _insert(conn, project, run_id=run, kind=kind, payload=payload)
+        for run, project, kind, payload in specs
+    ]
+    conn.commit()
+    return rows
+
+
+def test_read_escalations_are_only_run_upserts_whose_status_is_escalated(
+    conns, project_id, other_project_id
+):
+    """Spec test 1, Review focus 1: other node kinds saying "escalated" are not."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn) == [rows[1], rows[4], rows[7]]
+
+
+def test_read_escalations_span_projects_unless_one_is_named(
+    conns, project_id, other_project_id
+):
+    """Spec test 2."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn, project_id=None) == [
+        rows[1],
+        rows[4],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, project_id=project_id) == [
+        rows[1],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, project_id=other_project_id) == [rows[4]]
+    assert store_events.read_escalations(conn, project_id=other_project_id + 100) == []
+
+
+def test_read_escalations_after_seq_is_strict(conns, project_id, other_project_id):
+    """Spec test 3."""
+    conn, _ = conns
+    rows = _escalation_mix(conn, project_id, other_project_id)
+
+    assert store_events.read_escalations(conn, after_seq=rows[1].seq - 1) == [
+        rows[1],
+        rows[4],
+        rows[7],
+    ]
+    assert store_events.read_escalations(conn, after_seq=rows[1].seq) == [rows[4], rows[7]]
+    assert store_events.read_escalations(conn, after_seq=rows[7].seq) == []
+    assert store_events.read_escalations(conn, after_seq=rows[-1].seq + 10) == []
+
+
+def test_read_escalations_limit_counts_escalations_only(conns, project_id):
+    """Spec test 4, Review focus 2: twenty rows that are not escalations come
+    first and use up none of the limit."""
+    conn, _ = conns
+    for n in range(20):
+        _insert(conn, project_id, kind="run_upsert", payload={"status": "running", "n": n})
+    escalations = [
+        _insert(conn, project_id, run_id=run, kind="run_upsert", payload={"status": "escalated"})
+        for run in ("run-x", "run-y", "run-z")
+    ]
+    conn.commit()
+
+    assert store_events.read_escalations(conn, limit=2) == escalations[:2]
+    assert store_events.read_escalations(
+        conn, after_seq=escalations[0].seq, limit=1
+    ) == [escalations[1]]
+    assert store_events.read_escalations(conn, limit=10) == escalations
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_read_escalations_refuse_a_non_positive_limit(conns, limit):
+    """Spec test 4."""
+    conn, _ = conns
+    with pytest.raises(ValueError, match="limit"):
+        store_events.read_escalations(conn, limit=limit)
+
+
+def test_read_escalations_return_every_row_of_a_run_escalated_twice(conns, project_id):
+    """Spec test 5, Review focus 5: one row per record, not one per run."""
+    conn, _ = conns
+    first = _insert(conn, project_id, kind="run_upsert", payload={"status": "escalated"})
+    _insert(conn, project_id, kind="phase_upsert", payload={"status": "running"})
+    second = _insert(
+        conn, project_id, kind="run_upsert", payload={"status": "escalated", "note": "again"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [first, second]
+    assert store_events.read_escalations(conn, after_seq=first.seq) == [second]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"status": None},
+        {"status": "Escalated"},
+        {"status": "ESCALATED"},
+        {"status": "escalated "},
+        {"status": ["escalated"]},
+        {"status": {"value": "escalated"}},
+        {"status": True},
+        {"run": {"status": "escalated"}},
+    ],
+    ids=[
+        "no-status",
+        "null",
+        "capitalised",
+        "upper",
+        "trailing-space",
+        "list",
+        "object",
+        "bool",
+        "nested",
+    ],
+)
+def test_read_escalations_match_the_status_exactly(conns, project_id, payload):
+    """Spec test 6: only the top-level string "escalated" matches; the
+    escalation after it shows the read is not empty."""
+    conn, _ = conns
+    _insert(conn, project_id, kind="run_upsert", payload=payload)
+    match = _insert(
+        conn, project_id, run_id="run-b", kind="run_upsert", payload={"status": "escalated"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [match]
+
+
+def test_read_escalations_skip_a_row_whose_payload_is_not_json(conns, project_id):
+    """Plan Review Focus 1: one corrupt row does not stop the read."""
+    conn, _ = conns
+    _raw_node_row(conn, project_id, run_seq=1, payload="{not json")
+    match = _insert(
+        conn, project_id, run_id="run-b", kind="run_upsert", payload={"status": "escalated"}
+    )
+    conn.commit()
+
+    assert store_events.read_escalations(conn) == [match]
+
+
+def test_read_escalations_open_no_transaction(conns, project_id, other_project_id):
+    conn, _ = conns
+    _escalation_mix(conn, project_id, other_project_id)
+
+    store_events.read_escalations(conn, after_seq=1, limit=2, project_id=project_id)
 
     assert not conn.in_transaction

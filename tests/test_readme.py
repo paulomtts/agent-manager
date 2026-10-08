@@ -7,6 +7,7 @@ tier and carries no marker.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import re
@@ -14,6 +15,7 @@ import typing
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 import typer
 
 from agent_manager import (
@@ -22,12 +24,19 @@ from agent_manager import (
     detach,
     dispatch,
     errors,
+    export,
+    migrate,
     models,
     orchestrate,
+    paths,
     prompt,
     runs,
 )
 from agent_manager.harness import launcher
+from agent_manager.store import backup as store_backup
+from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
+from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
 
 README = Path(__file__).resolve().parents[1] / "README.md"
@@ -121,6 +130,26 @@ def _command_param(command: str, name: str):
     """The Click parameter `name` of the `am` subcommand `command`, introspected in-process."""
     group = typer.main.get_command(cli.app)
     return next(param for param in group.commands[command].params if param.name == name)
+
+
+def _long_options(command: str) -> set[str]:
+    """Every `--long` option of the `am` subcommand `command`, introspected in-process."""
+    group = typer.main.get_command(cli.app)
+    return {
+        opt
+        for param in group.commands[command].params
+        for opt in param.opts
+        if opt.startswith("--")
+    }
+
+
+def _backticked_flags(text: str) -> set[str]:
+    """Every `--flag` token inside a backtick span of `text`."""
+    return {
+        flag
+        for span in re.findall(r"`([^`\n]+)`", text)
+        for flag in re.findall(r"--[a-z][a-z-]*", span)
+    }
 
 
 def _paragraph(opening: str) -> str:
@@ -277,20 +306,20 @@ def test_board_section_documents_stacking():
     assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
 
 
+WATCH_SHAPE = (
+    "The shape is `am watch RUN_ID | --all | --all-projects | --project PATH"
+    " [--since SEQ] [--since-seq GSEQ] [--follow [--from-now]]`:"
+)
+
+
 def test_watch_documents_from_now():
     section = _section("Watching a run")
-    assert (
-        "The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:"
-        in section
-    )
+    assert WATCH_SHAPE in section
     assert "am watch --all --follow --from-now" in section
     assert "- `--from-now` together with `--since`, any value, 0 included;" in section
+    assert "- `--from-now` together with `--since-seq`, any value, 0 included;" in section
     assert "- `--from-now` without `--follow`;" in section
-    assert "only lines appended after the command started" in section
-    assert (
-        "A line that was still being written when the command started"
-        " is printed once it is complete." in section
-    )
+    assert "only events recorded after the command started" in section
     # The section's pre-existing hello example already holds `"schema":2`,
     # so pin the --from-now paragraph's own sentence, not the bare token.
     assert 'The hello line is the same, `"schema":2`.' in section
@@ -851,3 +880,523 @@ def test_checkout_install_never_shows_an_editable_command():
     for line in fenced_lines:
         assert "-e " not in line, line
         assert "--editable" not in line, line
+
+
+MIGRATE_TITLE = "Migrating from per-project databases"
+
+
+def test_migrate_section():
+    section = _section(MIGRATE_TITLE)
+    group = typer.main.get_command(cli.app)
+    # "takes no arguments" stays true only while `--pretty` is its one parameter.
+    assert [param.name for param in group.commands["migrate"].params] == ["pretty"]
+    assert _long_options("migrate") <= _backticked_flags(section)
+    assert (
+        "The shape is `am migrate [--pretty]`; it takes no arguments and has no `--dry-run`."
+        in section
+    )
+    assert "in one transaction" in section
+    assert "`already_migrated: true`" in section
+    assert "left untouched" in section
+
+    for field in dataclasses.fields(migrate.MigrationReport):
+        assert f"- `{field.name}`: " in section, field.name
+    for model in (migrate.MigratedProject, migrate.ImportedJournal):
+        for field in dataclasses.fields(model):
+            assert re.search(rf"\b{field.name}\b", section), f"{model.__name__}.{field.name}"
+    assert "`journals[].torn_line`" in section
+
+    required = store_db.MigrationRequiredError.__name__
+    assert f"`{required}`" in section
+    tail = "run `am migrate` first. Nothing has been changed"
+    assert tail in str(store_db.MigrationRequiredError([]))
+    assert tail in section
+
+    refused = migrate.MigrationRefusedError.__name__
+    assert f"`{refused}`" in section
+    template = str(migrate.MigrationRefusedError("<reason>", "<detail>", files=()))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(migrate.RefusalReason):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+    assert "wait for it to finish, or stop it" in section
+
+    assert "run `am backup` first" in section
+    assert "XDG_DATA_HOME=" in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(MIGRATE_TITLE) < titles.index(
+        "Resuming: what runs again"
+    )
+    assert heads[titles.index(MIGRATE_TITLE)][1] == 3
+    _assert_anchors_resolve(section)
+
+
+DATA_DIR_TITLE = "The data directory"
+
+
+def test_data_directory_notes():
+    section = _section(DATA_DIR_TITLE)
+    assert paths.data_path().name == "agent-manager"
+    assert paths.db_path().name == "am.db"
+    assert store_journal.JOURNAL_NAME == "journal.jsonl"
+    for name in (
+        "`$XDG_DATA_HOME/agent-manager`",
+        "`~/.local/share/agent-manager`",
+        "`am.db`",
+        "`am.db-wal`",
+        "`am.db-shm`",
+        "`backups/`",
+        "`runs/<run-id>/`",
+        f"`{detach.RUN_LOG_NAME}`",
+        f"`{detach.REPORT_NAME}`",
+        f"`{store_journal.JOURNAL_NAME}`",
+        "`boards/`",
+        "`projects/<digest>.board.lock`",
+        "`projects/<digest>.git.lock`",
+        "legacy `projects/<digest>.db`",
+    ):
+        assert name in section, name
+    assert "read only by `am migrate`" in section
+    assert "still appends to but no longer reads" in section
+    anchors = _assert_anchors_resolve(section)
+    assert "several-am-processes" in anchors
+    assert _slug(MIGRATE_TITLE) in anchors
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(MIGRATE_TITLE) < titles.index(DATA_DIR_TITLE) < titles.index(
+        "Resuming: what runs again"
+    )
+    assert heads[titles.index(DATA_DIR_TITLE)][1] == 3
+
+    several = _section("Several am processes")
+    assert "the project database `<digest>.db`" not in several
+    assert "with its own database" not in several
+    lines = several.splitlines()
+    one_dir = next(line for line in lines if line.startswith("- **One data directory per machine.**"))
+    assert "`am.db`" in one_dir
+    known = next(
+        line for line in lines if line.startswith("- **A repository is known by its resolved path.**")
+    )
+    assert "a different project in `am.db`" in known
+
+
+BACKUP_TITLE = "Backing up and restoring `am.db`"
+RESNAPSHOT = "must drop its cursors and read a snapshot again"
+
+
+def test_backup_and_restore_section():
+    section = _section(BACKUP_TITLE)
+    assert "The shape is `am backup [--out FILE] [--pretty]`:" in section
+    assert _long_options("backup") <= _backticked_flags(section)
+    assert "online-backup API" in section
+    assert "safe while runs are live" in section
+    assert "`<data dir>/backups/am-<YYYYMMDDTHHMMSSZ>.db`" in section
+    for field in dataclasses.fields(store_backup.BackupResult):
+        assert f"`{field.name}`" in section, field.name
+
+    assert f"`{store_backup.BackupRefusedError.__name__}`" in section
+    template = str(store_backup.BackupRefusedError("<reason>", Path("<path>")))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(store_backup.BackupRefusal):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+
+    assert "There is no `am restore` command" in section
+    numbered = [line for line in lines if re.match(r"\d+\. ", line)]
+    assert [line.split(".")[0] for line in numbered] == ["1", "2", "3"]
+    assert "`lease.live`" in numbered[0]
+    assert "`am.db-wal`" in numbered[1] and "`am.db-shm`" in numbered[1]
+    assert "Do not delete them" in numbered[1]
+    assert "No `am.db-wal` or `am.db-shm` may remain beside it." in numbered[2]
+    assert "`store_id` is the one the backup was taken with" in section
+    assert "possibly lower than before" in section
+    assert "`am journal-check`" in section
+    assert RESNAPSHOT in section
+    assert "`am resume` takes it over" in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(BACKUP_TITLE) < titles.index(MIGRATE_TITLE)
+    assert heads[titles.index(BACKUP_TITLE)][1] == 3
+    assert _slug(BACKUP_TITLE) == "backing-up-and-restoring-amdb"
+    assert "several-am-processes" in _assert_anchors_resolve(section)
+
+
+SNAPSHOTS_TITLE = "Snapshots and cursors"
+
+
+def test_snapshots_and_cursors_section():
+    section = _section(SNAPSHOTS_TITLE)
+    for name in (
+        "`as_of_seq`",
+        "`head`",
+        "`gseq`",
+        "`store_id`",
+        "`cursor_reset`",
+        "`--since-seq`",
+        "`--after-seq`",
+        "`--from-now`",
+    ):
+        assert name in section, name
+    assert "increasing, may skip" in section
+    for line in section.splitlines():
+        if "contiguous" in line:
+            assert "never assume" in line, line
+    assert "am runs --all-projects" in section
+    assert "am watch --all --follow --since-seq 1187" in section
+    assert "no gap and no repeat" in section
+    assert "`cursor_reset: true`" in section
+    assert "keeps the `store_id` it was taken with" in section
+    assert "gets no `cursor_reset`" in section
+    assert RESNAPSHOT in section
+    anchors = _assert_anchors_resolve(section)
+    assert "listing-runs" in anchors
+    assert _slug(BACKUP_TITLE) in anchors
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    position = titles.index(SNAPSHOTS_TITLE)
+    assert heads[position][1] == 4
+    parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
+    assert parent[1:] == (3, "Watching a run")
+    assert titles.index("Reading the stream safely") < position < titles.index(LOGS_TITLE)
+
+
+WATCH_STALE = (
+    "ordered by `(run_id, seq)`",
+    "that every run writes to",
+    "reads every run under",
+    "a corrupt journal",
+    "a run id with no journal",
+)
+WATCH_REFUSALS = (
+    (
+        "- `RUN_ID` together with `--project`;",
+        {"run_id": "r", "project": Path("p")},
+        "--project cannot be combined with RUN",
+    ),
+    (
+        "- `--project` together with `--all` or `--all-projects`;",
+        {"run_id": None, "all_runs": True, "project": Path("p")},
+        "--project cannot be combined with --all or --all-projects",
+    ),
+    (
+        "- none of `RUN_ID`, `--all`, `--all-projects` and `--project`,"
+        " or `RUN_ID` together with `--all` or `--all-projects`;",
+        {"run_id": None},
+        "give exactly one of RUN_ID",
+    ),
+    ("- a `--since` below 0;", {"run_id": "r", "since": -1}, "--since must be 0 or more"),
+    (
+        "- a `--since-seq` below 0;",
+        {"run_id": "r", "since_seq": -1},
+        "--since-seq must be 0 or more",
+    ),
+    (
+        "- `--from-now` together with `--since`, any value, 0 included;",
+        {"run_id": "r", "follow": True, "from_now": True, "since_given": True},
+        "--from-now and --since are exclusive",
+    ),
+    (
+        "- `--from-now` together with `--since-seq`, any value, 0 included;",
+        {"run_id": "r", "follow": True, "from_now": True, "since_seq": 0},
+        "--from-now and --since-seq are exclusive",
+    ),
+    (
+        "- `--from-now` without `--follow`;",
+        {"run_id": "r", "from_now": True},
+        "--from-now needs --follow",
+    ),
+)
+
+
+def test_watch_documents_selectors_and_since_seq():
+    section = _section("Watching a run")
+    intro = section.split("\n#### ")[0]
+    assert _long_options("watch") <= _backticked_flags(section)
+    for flag in ("`--all-projects`", "`--project PATH`", "`--since-seq GSEQ`"):
+        assert flag in intro, flag
+    assert "`--all` and `--all-projects` are the same set" in intro
+    assert "a path `am` has never run in gives no events, not an error" in intro
+    assert "With both `--since` and `--since-seq`, a line must pass both." in intro
+    assert "the list is ordered by `gseq`" in intro
+    assert "A `--since-seq` at or above head gives `[]`, not an error." in intro
+    assert "- a `RUN_ID` with no event and no run row in `am.db`, as `UnknownRunError`." in intro
+    for phrase in WATCH_STALE:
+        assert phrase not in intro, phrase
+
+    # Every refusal bullet is a real refusal, in the order the code checks them.
+    positions = []
+    for bullet, call, message in WATCH_REFUSALS:
+        assert bullet in intro, bullet
+        positions.append(intro.index(bullet))
+        kwargs = dict(call)
+        with pytest.raises(cli.CliError, match=re.escape(message)):
+            cli.watch_for(kwargs.pop("run_id"), **kwargs)
+    assert positions == sorted(positions)
+
+    anchors = _assert_anchors_resolve(intro)
+    assert _slug(DATA_DIR_TITLE) in anchors
+    assert _slug(SNAPSHOTS_TITLE) in anchors
+
+
+FOLLOW_TITLE = "Following with `--follow`"
+
+
+def test_watch_hello_example_matches_code():
+    examples = [
+        item for item in _fenced_json_lines(_section(FOLLOW_TITLE)) if item[1].get("event") == "watch"
+    ]
+    assert len(examples) == 1
+    raw, hello = examples[0]
+    assert set(hello) == set(cli._watch_hello(head=0, cursor_reset=False, store_id=None))
+    assert hello["schema"] == 2
+    assert isinstance(hello["head"], int) and not isinstance(hello["head"], bool)
+    assert isinstance(hello["cursor_reset"], bool)
+    assert hello["store_id"] is None or re.fullmatch(r"[0-9a-f]{32}", hello["store_id"])
+    assert hello["runs_dir"].endswith("/agent-manager/runs")
+    assert raw == cli.render(hello)
+
+
+def test_watch_follow_section_describes_the_start():
+    section = _section(FOLLOW_TITLE)
+    for phrase in (
+        "`head` is the largest `gseq` on the machine when the stream started, `0` with no `am.db`.",
+        "`cursor_reset` is `true` when `--since-seq` was above `head`",
+        "The cursor starts at 0, at `--since-seq` when it is at or below `head`,"
+        " and at `head` with `--from-now` or a reset.",
+        "`am watch: <message>`",
+        'The hello line is the same, `"schema":2`.',
+    ):
+        assert phrase in section, phrase
+    assert "a corrupt journal" not in section
+    assert "A line that was still being written" not in _section("Watching a run")
+    assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
+
+
+def test_journal_line_lists_every_event_kind():
+    section = _section("The journal line")
+    for kind in typing.get_args(store_journal.EventKind):
+        assert f"`{kind}`" in section, kind
+    rows = [line for line in section.splitlines() if line.startswith("| `gseq` |")]
+    assert len(rows) == 1
+    assert "increasing, may skip" in rows[0]
+    assert "not in a `journal.jsonl` file" in rows[0]
+    assert "one of the ten below" in section
+    assert "one of the five below" not in section
+    assert LEGACY_JOURNAL_NOTE in section
+    assert "`started`, then `done`, `escalated`, `stopped` or `canceled` |" in section
+
+
+def test_stream_section_cursors_by_gseq():
+    section = _section("Reading the stream safely")
+    assert "Cursor by `gseq`" in section
+    assert "pass the highest `gseq` you have seen as `--since-seq`" in section
+    assert "`(run_id, seq)` with `--since` still works" in section
+    assert "in a `journal.jsonl` file you read yourself" in section
+    assert WATCH_SCHEMA_NOTE in section.splitlines()
+    assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
+
+
+EVENTS_TITLE = "Reading events with `am events`"
+EVENTS_RUN_SHAPE = (
+    "`am events RUN [--after-seq N] [--limit N] [--tail N] [--before-seq N] [--pretty]`"
+)
+EVENTS_ESCALATIONS_SHAPE = (
+    "`am events --escalations [--project PATH] [--after-seq N] [--limit N] [--pretty]`"
+)
+EVENTS_REFUSALS = (
+    (
+        "- a `--limit` below 1;",
+        lambda: cli._check_event_values(limit=0),
+        "--limit must be at least 1",
+    ),
+    (
+        "- an `--after-seq` below 0;",
+        lambda: cli._check_event_values(after_seq=-1),
+        "--after-seq must be 0 or more",
+    ),
+    (
+        "- a `--tail` below 1;",
+        lambda: cli._check_event_values(tail=0),
+        "--tail must be at least 1",
+    ),
+    (
+        "- a `--before-seq` below 1;",
+        lambda: cli._check_event_values(before_seq=0),
+        "--before-seq must be at least 1",
+    ),
+    (
+        "- `--escalations` together with `RUN`;",
+        lambda: cli._check_events_form(
+            "r", escalations=True, project=None, tail=None, before_seq=None
+        ),
+        "--escalations cannot be combined with RUN",
+    ),
+    (
+        "- `--project` without `--escalations`;",
+        lambda: cli._check_events_form(
+            "r", escalations=False, project=Path("p"), tail=None, before_seq=None
+        ),
+        "--project requires --escalations",
+    ),
+    (
+        "- neither `RUN` nor `--escalations`;",
+        lambda: cli._check_events_form(
+            None, escalations=False, project=None, tail=None, before_seq=None
+        ),
+        "RUN is required unless --escalations is given",
+    ),
+    (
+        "- `--escalations` together with `--tail` or `--before-seq`;",
+        lambda: cli._check_events_form(
+            None, escalations=True, project=None, tail=1, before_seq=None
+        ),
+        "--escalations cannot be combined with --tail",
+    ),
+    (
+        "- `--tail` together with `--after-seq`, `--before-seq` or `--limit`;",
+        lambda: cli.events_for("r", tail=1, limit=1),
+        "--tail cannot be combined with --limit",
+    ),
+    (
+        "- `--before-seq` together with `--after-seq`.",
+        lambda: cli.events_for("r", before_seq=5, after_seq=1),
+        "--before-seq cannot be combined with --after-seq",
+    ),
+)
+
+
+def _row(line: dict) -> store_events.EventRow:
+    """The `events` row a documented example line stands for."""
+    return store_events.EventRow(
+        seq=line["gseq"],
+        project_id=1,
+        run_id=line["run_id"],
+        run_seq=line["seq"],
+        ts=line["ts"],
+        kind=line["event"],
+        story_id=line["story"],
+        card_id=line["card"],
+        phase=line["phase"],
+        attempt=line["attempt"],
+        schema=1,
+        payload=line["payload"],
+        source="live",
+    )
+
+
+def test_events_section_documents_every_flag_and_refusal():
+    section = _section(EVENTS_TITLE)
+    assert EVENTS_RUN_SHAPE in section
+    assert EVENTS_ESCALATIONS_SHAPE in section
+    shapes = _backticked_flags(EVENTS_RUN_SHAPE) | _backticked_flags(EVENTS_ESCALATIONS_SHAPE)
+    assert shapes == _long_options("events")
+    assert '`{"ok": true, "data": {"events": [...], "head": H}}`' in section
+    assert "pass the last `gseq` of the previous page as `--after-seq`" in section
+    assert "pass the first `gseq` of the page as the next `--before-seq`" in section
+    assert "An empty window is `[]`, not an error" in section
+    assert "A `--before-seq` above head reads up to head." in section
+    assert "A path `am` has never run in gives an empty page." in section
+    assert "it stays machine-wide with `--project`" in section
+    assert "found by its id alone, whichever repository recorded it" in section
+    assert "`CliError`" in section
+    assert "as `UnknownRunError`, exit code 3" in section
+
+    positions = []
+    for bullet, call, message in EVENTS_REFUSALS:
+        assert bullet in section, bullet
+        positions.append(section.index(bullet))
+        with pytest.raises(cli.CliError, match=re.escape(message)):
+            call()
+    assert positions == sorted(positions)
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert (
+        titles.index("Watching a run")
+        < titles.index(SNAPSHOTS_TITLE)
+        < titles.index(EVENTS_TITLE)
+        < titles.index(LOGS_TITLE)
+    )
+    assert heads[titles.index(EVENTS_TITLE)][1] == 3
+    anchors = _assert_anchors_resolve(section)
+    assert "the-journal-line" in anchors
+    assert _slug(SNAPSHOTS_TITLE) in anchors
+
+
+def test_events_example_line_matches_code():
+    examples = _fenced_json_lines(_section(EVENTS_TITLE))
+    assert len(examples) == 1
+    raw, envelope = examples[0]
+    assert raw == cli.render(envelope)
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == {"events", "head"}
+    lines = envelope["data"]["events"]
+    assert lines
+    for line in lines:
+        assert set(line) == set(store_journal.JournalLine.model_fields) | {"gseq"}
+        assert line["gseq"] <= envelope["data"]["head"]
+        assert cli._event_line(_row(line)) == line
+
+
+EXPORT_TITLE = "Exporting a run"
+
+
+def test_export_section():
+    section = _section(EXPORT_TITLE)
+    assert "The shape is `am export RUN [--out FILE] [--pretty]`:" in section
+    assert _long_options("export") <= _backticked_flags(section)
+    assert "the output is not an envelope" in section
+    assert "ascending per-run `seq`" in section
+    for field in dataclasses.fields(export.ExportResult):
+        assert f"`{field.name}`" in section, field.name
+    assert f"`{export.ExportRefusedError.__name__}`" in section
+    template = str(export.ExportRefusedError("<reason>", Path("<path>")))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(export.ExportRefusal):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+    assert "`am export` never writes to a run's `journal.jsonl`." in section
+    assert "the exported line without `gseq` is the same bytes" in section
+    assert "as `UnknownRunError`, exit code 3, and creates nothing" in section
+    assert "Any refusal is printed as the usual envelope on stdout, with or without `--out`." in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(EXPORT_TITLE) < titles.index(BACKUP_TITLE)
+    assert heads[titles.index(EXPORT_TITLE)][1] == 3
+    _assert_anchors_resolve(section)
+
+
+def test_export_example_line_matches_code():
+    examples = _fenced_json_lines(_section(EXPORT_TITLE))
+    assert len(examples) == 1
+    raw, line = examples[0]
+    assert set(line) == set(store_journal.JournalLine.model_fields) | {"gseq"}
+    assert raw == json.dumps(line, sort_keys=True)
+    assert export.line(_row(line)) == raw
+
+
+def test_usage_names_export_as_a_non_envelope_output():
+    paragraph = _usage_paragraph()
+    assert "`am export` without `--out` is a third" in paragraph
+    assert "with no envelope" in paragraph
+    assert _slug(EXPORT_TITLE) in _assert_anchors_resolve(paragraph)
+
+
+def test_new_sections_link_only_to_headings():
+    for title in (
+        "Several am processes",
+        "Watching a run",
+        EVENTS_TITLE,
+        EXPORT_TITLE,
+        BACKUP_TITLE,
+        MIGRATE_TITLE,
+        DATA_DIR_TITLE,
+    ):
+        _assert_anchors_resolve(_section(title))
+    _assert_anchors_resolve(_usage_paragraph())

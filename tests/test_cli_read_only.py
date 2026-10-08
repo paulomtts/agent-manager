@@ -1,8 +1,9 @@
 """The read-only commands create nothing under the data directory.
 
-`am runs`, `am status`, `am logs`, `am watch` and `am run --dry-run` against a
-repository with no projection leave the data directory byte-for-byte as they
-found it, and still answer as they do for an unknown run.
+`am runs`, `am status`, `am events`, `am logs`, `am watch` and
+`am run --dry-run` against a repository with no projection leave the data
+directory byte-for-byte as they found it, and still answer as they do for an
+unknown run.
 """
 
 import json
@@ -511,6 +512,36 @@ def test_journal_check_refuses_an_unmigrated_machine_and_writes_nothing(
     assert not (paths.data_path() / "runs").exists()
 
 
+def test_export_refuses_an_unmigrated_machine_and_writes_nothing(tmp_path, monkeypatch):
+    # export is machine-wide and takes no --repo-dir, so it cannot join the
+    # parametrization above, which appends one to every argv.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, ["export", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_export_of_an_unknown_run_creates_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = _invoke_creating_nothing(tmp_path, ["export", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+    assert not (tmp_path / "xdg").exists()
+
+
 def _db_head_and_store_id() -> tuple[int, str | None]:
     conn = store_db.open_db_for_reading(Path("."))
     try:
@@ -574,6 +605,48 @@ def test_status_of_an_unknown_run_without_repo_dir_refuses_and_creates_nothing(
     assert json.loads(result.stdout) == {
         "ok": False,
         "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+def test_events_of_a_run_on_an_unknown_repo_refuses_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch
+):
+    """Review Focus 5: with no `am.db` (`fresh`) nothing is created either."""
+    monkeypatch.chdir(unknown_repo)
+
+    result = _invoke_creating_nothing(tmp_path, ["events", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+@pytest.mark.parametrize("project", [False, True], ids=["all", "project"])
+def test_events_escalations_on_an_unknown_repo_is_empty_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch, project
+):
+    """Spec test 16: with no `am.db` (`fresh`) the page is empty with head 0
+    and nothing is created; beside another project's runs, still empty."""
+    monkeypatch.chdir(unknown_repo)
+    argv = ["events", "--escalations"]
+    if project:
+        argv += ["--project", str(unknown_repo)]
+
+    result = _invoke_creating_nothing(tmp_path, argv)
+
+    assert result.exit_code == 0, result.output
+    head = 0
+    if paths.db_path().exists():
+        conn = store_db.open_db_for_reading(unknown_repo)
+        try:
+            head = store_events.head(conn)
+        finally:
+            conn.close()
+    assert json.loads(result.stdout) == {
+        "ok": True,
+        "data": {"events": [], "head": head},
     }
 
 
