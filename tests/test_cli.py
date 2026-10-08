@@ -13257,6 +13257,138 @@ def test_watch_follow_from_now_on_an_empty_machine_emits_every_later_event(
     assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in later]]
 
 
+# ── am watch --since-seq (card b3818d9f) ───────────────────────────────────
+#
+# Default (unit) tier per design §14, like the --from-now tests above: rows in
+# the projection under tmp_path, polling driven by the fake `cli._watch_sleep`,
+# no subprocess.
+
+WATCH_SINCE_SEQ_EXCLUSIVE = (
+    "--from-now and --since-seq are exclusive: --from-now starts at head,"
+    " --since-seq resumes after a cursor you already hold; give one of them"
+)
+
+
+def test_watch_since_seq_one_shot_resumes_after_gseq(projection, monkeypatch):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+        (EVENTS_RUN_B, "story_upsert"),
+    )
+    assert [row.seq for row in rows] == [1, 2, 3, 4]
+
+    # Only rows whose global gseq is above 2, ascending, for every selector.
+    above_two = {"events": [_watch_event(row) for row in rows[2:]]}
+    assert _watch_data("--all", "--since-seq", "2") == above_two
+    assert _watch_data("--all-projects", "--since-seq", "2") == above_two
+    assert _watch_data("--project", str(projection), "--since-seq", "2") == above_two
+    assert _watch_data(EVENTS_RUN_A, "--since-seq", "2") == {
+        "events": [_watch_event(rows[2])]
+    }
+
+    # `--since-seq 0` is the same as no flag.
+    for selector in ([EVENTS_RUN_A], ["--all"], ["--project", str(projection)]):
+        assert _watch_data(*selector, "--since-seq", "0") == _watch_data(*selector)
+
+    # At head (4) and above it: no events, not an error.
+    for value in ("4", "9"):
+        assert _watch_data("--all", "--since-seq", value) == {"events": []}
+        assert _watch_data(EVENTS_RUN_A, "--since-seq", value) == {"events": []}
+
+    # `--pretty` indents the envelope, which is still filtered.
+    pretty = _watch("--all", "--since-seq", "2", "--pretty")
+    assert pretty.exit_code == 0, pretty.output
+    assert "\n" in pretty.stdout.strip()
+    assert json.loads(pretty.stdout) == {"ok": True, "data": above_two}
+
+    # An unknown RUN is still refused, one-shot and follow, before any hello.
+    unknown = _watch("no-such-run", "--since-seq", "1")
+    assert unknown.exit_code == cli.EXIT_ERROR, unknown.output
+    assert len(unknown.stdout.splitlines()) == 1
+    assert json.loads(unknown.stdout)["error"]["type"] == "UnknownRunError"
+    followed, sleeps = _watch_follow(monkeypatch, "no-such-run", "--since-seq", "1")
+    assert followed.exit_code == cli.EXIT_ERROR, followed.output
+    assert sleeps == []
+    assert len(followed.stdout.splitlines()) == 1
+    assert json.loads(followed.stdout)["error"]["type"] == "UnknownRunError"
+
+
+def test_watch_from_now_refused_with_since_seq(projection, monkeypatch):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
+
+    for selector in ([EVENTS_RUN_A], ["--all"], ["--project", str(projection)]):
+        for value in ("0", "2"):
+            argv = [*selector, "--from-now", "--since-seq", value]
+            followed, sleeps = _watch_follow(monkeypatch, *argv)
+            assert sleeps == [], argv
+            envelope = _assert_one_cli_error(followed, "--from-now", "--since-seq", "exclusive")
+            assert envelope["error"]["message"] == WATCH_SINCE_SEQ_EXCLUSIVE, argv
+            one_shot = _watch(*argv)
+            _assert_one_cli_error(one_shot, "--from-now", "--since-seq", "exclusive")
+
+    # `--pretty` still indents the refusal, and it is still the only output.
+    pretty, sleeps = _watch_follow(
+        monkeypatch, "--all", "--from-now", "--since-seq", "0", "--pretty"
+    )
+    assert pretty.exit_code == cli.EXIT_ERROR, pretty.output
+    assert sleeps == []
+    assert "\n" in pretty.stdout.strip()
+    envelope = json.loads(pretty.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "CliError"
+    assert envelope["error"]["message"] == WATCH_SINCE_SEQ_EXCLUSIVE
+
+
+def test_watch_since_seq_negative_refused(projection, monkeypatch):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+
+    for selector in ([EVENTS_RUN_A], ["--all"], ["--project", str(projection)]):
+        one_shot = _watch(*selector, "--since-seq", "-1")
+        _assert_one_cli_error(one_shot, "--since-seq must be 0 or more, got -1")
+        followed, sleeps = _watch_follow(monkeypatch, *selector, "--since-seq", "-1")
+        assert sleeps == [], selector
+        _assert_one_cli_error(followed, "--since-seq must be 0 or more, got -1")
+
+    # Not an integer: Typer's usage error (exit 2), like `--since abc`, no envelope.
+    not_a_number = _watch("--all", "--since-seq", "abc")
+    assert not_a_number.exit_code == 2, not_a_number.output
+    assert '"ok"' not in not_a_number.stdout
+
+
+def test_watch_since_seq_refusal_order(projection, monkeypatch):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+
+    # --since below 0 is checked before --since-seq below 0.
+    both_negative = _watch("--all", "--since", "-1", "--since-seq", "-1")
+    _assert_one_cli_error(both_negative, "--since must be 0 or more, got -1")
+
+    # --since-seq below 0 is checked before the --from-now conflicts.
+    negative_from_now, sleeps = _watch_follow(
+        monkeypatch, "--all", "--since-seq", "-1", "--from-now"
+    )
+    assert sleeps == []
+    _assert_one_cli_error(negative_from_now, "--since-seq must be 0 or more, got -1")
+
+    # --from-now with --since is reported before --from-now with --since-seq.
+    since_conflict, sleeps = _watch_follow(
+        monkeypatch, "--all", "--from-now", "--since", "1", "--since-seq", "1"
+    )
+    assert sleeps == []
+    envelope = _assert_one_cli_error(since_conflict, "--from-now", "--since", "exclusive")
+    assert "--since-seq" not in envelope["error"]["message"]
+
+    # --from-now with --since-seq is reported before --from-now without --follow.
+    no_follow = _watch("--all", "--from-now", "--since-seq", "1")
+    envelope = _assert_one_cli_error(no_follow, "--from-now", "--since-seq", "exclusive")
+    assert envelope["error"]["message"] == WATCH_SINCE_SEQ_EXCLUSIVE
+
+    # The selector form comes first of all.
+    form = _watch(EVENTS_RUN_A, "--all", "--since-seq", "-1")
+    _assert_one_cli_error(form, "give exactly one of")
+
+
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
 #
 # Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo

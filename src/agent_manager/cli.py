@@ -3261,6 +3261,7 @@ def watch_for(
     follow: bool = False,
     from_now: bool = False,
     since_given: bool = False,
+    since_seq: int | None = None,
 ) -> dict[str, Any] | None:
     """The payload of `am watch`: `{"events": [...]}`, or `None` with `follow`.
 
@@ -3273,13 +3274,17 @@ def watch_for(
 
     Each line is `_event_line(row)`: the journal line plus `gseq`. Lines are in
     ascending `gseq` order, and `since` keeps only rows whose per-run `seq`
-    (`run_seq`) is above it, for each run alike.
+    (`run_seq`) is above it, for each run alike. `since_seq` (`--since-seq`,
+    `None` when not given) keeps only rows whose global `gseq` is above it,
+    the same meaning as `am events --after-seq`; with both, a row must pass
+    both. A `since_seq` at or above head is not an error: no rows.
 
     The refusals are `CliError`s raised before the database is opened, the
     first failing one in this order: `_check_watch_form`, `since` below 0,
-    `from_now` with `since_given` (any `--since` on the command line, 0
-    included), `from_now` without `follow`. So `watch` prints them as the usual
-    exit-3 envelope with no stream line.
+    `since_seq` below 0, `from_now` with `since_given` (any `--since` on the
+    command line, 0 included), `from_now` with `since_seq` given (0
+    included), `from_now` without `follow`. So `watch` prints them as the
+    usual exit-3 envelope with no stream line.
 
     Without `follow` the events are read in one `store_db.read_snapshot` on
     one `open_db_for_reading(Path("."))` connection (the root never chooses
@@ -3291,10 +3296,17 @@ def watch_for(
     _check_watch_form(run_id, all_runs=all_runs, project=project)
     if since < 0:
         raise CliError(f"--since must be 0 or more, got {since}")
+    if since_seq is not None and since_seq < 0:
+        raise CliError(f"--since-seq must be 0 or more, got {since_seq}")
     if from_now and since_given:
         raise CliError(
             "--from-now and --since are exclusive: --from-now skips the whole"
             " backlog, --since picks where in it to start; give one of them"
+        )
+    if from_now and since_seq is not None:
+        raise CliError(
+            "--from-now and --since-seq are exclusive: --from-now starts at head,"
+            " --since-seq resumes after a cursor you already hold; give one of them"
         )
     if from_now and not follow:
         raise CliError(
@@ -3321,7 +3333,12 @@ def watch_for(
                 project_id = store_projects.lookup(conn, Path(project).expanduser())
                 if project_id is None:
                     return {"events": []}
-            rows = store_events.read(conn, run_id=run_id, project_id=project_id)
+            rows = store_events.read(
+                conn,
+                after_seq=since_seq or 0,
+                run_id=run_id,
+                project_id=project_id,
+            )
     finally:
         conn.close()
     return {"events": [_event_line(row) for row in rows if row.run_seq > since]}
@@ -3680,12 +3697,19 @@ def watch(
         "--follow",
         help="Keep printing events, one JSON object per line, until interrupted.",
     ),
+    since_seq: int | None = typer.Option(
+        None,
+        "--since-seq",
+        metavar="GSEQ",
+        help="Only events whose global gseq is greater than GSEQ: resume after"
+        " the last gseq you read. Exclusive with --from-now.",
+    ),
     from_now: bool = typer.Option(
         False,
         "--from-now",
         help=(
             "With --follow, skip the backlog: print only events appended after"
-            " the command starts. Exclusive with --since."
+            " the command starts. Exclusive with --since and --since-seq."
         ),
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
@@ -3696,8 +3720,10 @@ def watch(
     With --follow, print a hello line and then each event as its own line of
     JSON, the backlog first and then new ones as they are recorded, until
     interrupted. With --follow --from-now, the backlog is skipped and only
-    events recorded after the start are printed. A refusal is still one
-    envelope at exit 3, printed before any stream line.
+    events recorded after the start are printed. With --since-seq GSEQ, only
+    events whose gseq is above GSEQ are printed, once or as a stream: pass
+    the last gseq you read to resume. A refusal is still one envelope at
+    exit 3, printed before any stream line.
     """
     # `None` means --since was not given, which --from-now must tell apart
     # from an explicit `--since 0`; every other use wants the number.
@@ -3712,6 +3738,7 @@ def watch(
             follow=follow,
             from_now=from_now,
             since_given=since_given,
+            since_seq=since_seq,
         )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
