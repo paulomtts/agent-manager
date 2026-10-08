@@ -301,6 +301,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
         store_events.read_escalations,
         store_events.head,
         store_events.has_run,
+        store_events.read_run,
         store_events.run_lines,
         store_events.journal_line,
     ):
@@ -315,6 +316,7 @@ def test_events_is_a_leaf_module_of_the_store_package():
         "read_escalations",
         "head",
         "has_run",
+        "read_run",
         "run_lines",
         "journal_line",
         "EventRow",
@@ -680,6 +682,39 @@ def test_has_run_is_false_for_an_absent_run_and_an_empty_table(conns, project_id
 
     assert store_events.has_run(conn, "run-a") is False
     assert store_events.has_run(conn, "run-b") is True
+
+
+# ── read_run ─────────────────────────────────────────────────────────────────
+
+
+def test_read_run_returns_every_kind_of_one_run_by_run_seq(
+    conns, project_id, other_project_id
+):
+    conn, _ = conns
+    third = _insert(conn, project_id, run_id="run-a", kind="lease_acquired", run_seq=3)
+    _insert(conn, other_project_id, run_id="run-b", kind="run_upsert")
+    first = _insert(conn, project_id, run_id="run-a", kind="run_upsert", run_seq=1)
+    second = _insert(conn, project_id, run_id="run-a", kind="phase_upsert", run_seq=2)
+    _insert(conn, other_project_id, run_id="run-b", kind="story_upsert")
+    conn.commit()
+
+    found = store_events.read_run(conn, "run-a")
+
+    assert found == [first, second, third]
+    assert [row.run_seq for row in found] == [1, 2, 3]
+    # Inserted first, so its global seq is the smallest: run_seq order wins.
+    assert third.seq < first.seq
+    assert not conn.in_transaction
+
+
+def test_read_run_of_an_unknown_run_is_empty(conns, project_id):
+    conn, _ = conns
+    assert store_events.read_run(conn, "run-a") == []
+
+    _insert(conn, project_id, run_id="run-b")
+    conn.commit()
+
+    assert store_events.read_run(conn, "run-a") == []
 
 
 # ── read ─────────────────────────────────────────────────────────────────────

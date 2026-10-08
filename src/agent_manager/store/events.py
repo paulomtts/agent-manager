@@ -242,6 +242,16 @@ def has_run(conn: sqlite3.Connection, run_id: str) -> bool:
     return row is not None
 
 
+def read_run(conn: sqlite3.Connection, run_id: str) -> list[EventRow]:
+    """Every row of `run_id`, of every kind and every project, ascending by
+    `run_seq` (the journal's own order, which can differ from `seq` order);
+    `[]` when the run has none. No other run's row is read. Read-only."""
+    rows = conn.execute(
+        "SELECT * FROM events WHERE run_id = ? ORDER BY run_seq", (run_id,)
+    ).fetchall()
+    return [_event_from_row(row) for row in rows]
+
+
 def journal_line(event: EventRow) -> store_journal.JournalLine:
     """The journal line `event` is: its `run_seq` is the line's `seq` and its
     `kind` the line's `event`; `ts`, coordinates and payload are the event's
