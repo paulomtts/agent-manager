@@ -2710,6 +2710,20 @@ def events_for(
         raise CliError(f"--limit must be at least 1, got {limit}")
     if after_seq is not None and after_seq < 0:
         raise CliError(f"--after-seq must be 0 or more, got {after_seq}")
+    if tail is not None and tail < 1:
+        raise CliError(f"--tail must be at least 1, got {tail}")
+    if before_seq is not None and before_seq < 1:
+        raise CliError(f"--before-seq must be at least 1, got {before_seq}")
+    if tail is not None:
+        for flag, value in (
+            ("--after-seq", after_seq),
+            ("--before-seq", before_seq),
+            ("--limit", limit),
+        ):
+            if value is not None:
+                raise CliError(f"--tail cannot be combined with {flag}")
+    if before_seq is not None and after_seq is not None:
+        raise CliError("--before-seq cannot be combined with --after-seq")
     conn = store_db.open_db_for_reading(Path("."))
     try:
         with store_db.read_snapshot(conn):

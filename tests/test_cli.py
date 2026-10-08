@@ -6414,6 +6414,94 @@ def test_events_tail_and_before_seq_help_texts():
     assert "--tail N" in cli.events.__doc__
 
 
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--tail", "0", "--tail must be at least 1, got 0"),
+        ("--tail", "-1", "--tail must be at least 1, got -1"),
+        ("--before-seq", "0", "--before-seq must be at least 1, got 0"),
+        ("--before-seq", "-5", "--before-seq must be at least 1, got -5"),
+    ],
+)
+def test_events_rejects_tail_and_before_seq_below_one_before_opening_the_db(
+    projection, monkeypatch, flag, value, message
+):
+    """C9."""
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal([EVENTS_RUN_A, flag, value]) == {
+        "type": "CliError",
+        "message": message,
+    }
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--tail", "5", "--after-seq", "3"], "--tail cannot be combined with --after-seq"),
+        (["--tail", "5", "--after-seq", "0"], "--tail cannot be combined with --after-seq"),
+        (["--tail", "5", "--before-seq", "9"], "--tail cannot be combined with --before-seq"),
+        (["--tail", "5", "--limit", "2"], "--tail cannot be combined with --limit"),
+        (
+            ["--before-seq", "9", "--after-seq", "3"],
+            "--before-seq cannot be combined with --after-seq",
+        ),
+        (
+            ["--before-seq", "9", "--after-seq", "0"],
+            "--before-seq cannot be combined with --after-seq",
+        ),
+        (
+            ["--tail", "5", "--before-seq", "9", "--after-seq", "3", "--limit", "2"],
+            "--tail cannot be combined with --after-seq",
+        ),
+    ],
+)
+def test_events_rejects_conflicting_paging_flags_before_opening_the_db(
+    projection, monkeypatch, flags, message
+):
+    """C10, Review Focus 4 (an explicit default `--after-seq 0` is still
+    given), and Review Focus (plan) 5 for `--before-seq`."""
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal([EVENTS_RUN_A, *flags]) == {
+        "type": "CliError",
+        "message": message,
+    }
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--tail", "0", "--limit", "2"], "--tail must be at least 1, got 0"),
+        (["--before-seq", "0", "--after-seq", "3"], "--before-seq must be at least 1, got 0"),
+        (["--tail", "5", "--limit", "0"], "--limit must be at least 1, got 0"),
+        (["--tail", "0", "--after-seq", "-1"], "--after-seq must be 0 or more, got -1"),
+    ],
+)
+def test_events_value_checks_come_before_combination_checks(
+    projection, monkeypatch, flags, message
+):
+    """C11: values 1-4 in order, then combinations."""
+    _refuse_to_open_the_db(monkeypatch)
+
+    assert _events_refusal([EVENTS_RUN_A, *flags]) == {
+        "type": "CliError",
+        "message": message,
+    }
+
+
+def test_events_before_seq_with_limit_alone_is_accepted(projection):
+    """`--before-seq` with `--limit` is the backward page, not a conflict;
+    `--after-seq 0` alone stays accepted."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
+
+    page = _events([EVENTS_RUN_A, "--before-seq", "100", "--limit", "1"])
+    forward = _events([EVENTS_RUN_A, "--after-seq", "0"])
+
+    assert [line["event"] for line in page["events"]] == ["story_upsert"]
+    assert [line["event"] for line in forward["events"]] == ["run_upsert", "story_upsert"]
+
+
 def _write_logs_attempt(
     run_id: str,
     phase: str,
