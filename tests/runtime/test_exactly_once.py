@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 from pydantic import BaseModel, ConfigDict
 from pygents import AgentRegistry, ToolRegistry
 
@@ -316,7 +317,7 @@ def _phase_rows(opened, phase: str) -> list[str]:
     """Every `phase_upsert` status of `phase` in `opened`'s own journal, in order."""
     return [
         line.payload["status"]
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert" and line.phase == phase
     ]
 

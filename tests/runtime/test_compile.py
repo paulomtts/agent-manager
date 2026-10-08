@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 from pygents import Agent, ContextPool, ContextQueue, ToolRegistry
 
 from agent_manager import models
@@ -98,7 +99,7 @@ async def _drive(workflow, deps) -> Agent:
 def _phase_rows(opened) -> list[tuple[str | None, str]]:
     return [
         (line.phase, line.payload["status"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 

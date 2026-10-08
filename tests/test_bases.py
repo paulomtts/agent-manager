@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 
 from agent_manager import bases, dispatch, models
 from agent_manager.dag import RootPlan
@@ -577,7 +578,7 @@ async def test_the_resolver_walk_is_journalled_under_the_bases_story(
     assert subtask.base_branch == "m7/a"
     assert subtask.worktree_path == base_worktree(repo)
     assert [phase.name for phase in subtask.phases] == ["resolve", "verify"]
-    events = [(line.event, line.story, line.card) for line in store.journal.read()]
+    events = [(line.event, line.story, line.card) for line in eventlines.run_lines(store.run_id)]
     story_at = events.index(("story_upsert", "bases", None))
     subtask_at = events.index(("subtask_upsert", "bases", CARD_C))
     first_phase_at = next(
