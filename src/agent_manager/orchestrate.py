@@ -596,7 +596,7 @@ def resumable_milestone_run(root: Path, run_id: str) -> models.Run:
     """The recorded milestone run `run_id`, or the refusal that says why not.
 
     Read-only through the free `open_db` / `load_run`, like `cli.resume_run`:
-    `Store.open` would construct a `Journal`. Refused, in this order (live
+    a refusal opens no `Store`. Refused, in this order (live
     control C9): an unknown run (a run of another repository's project is
     unknown), a run of another workflow, then a run canceled in either
     spelling and a `done` run (card 54e4ec29, card 0e1edf31).

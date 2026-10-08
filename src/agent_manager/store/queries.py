@@ -358,10 +358,8 @@ def load_run(conn: sqlite3.Connection, run_id: str) -> models.Run | None:
     """Assemble one run's projection back into the §9 tree, or `None` if absent.
 
     A free function over a connection, because the reader that needs it -- the
-    `status` command -- has no `Journal` and must not create one: `Journal`
-    derives its path from `paths.run_dir`, which creates the directory, so
-    looking up a run that does not exist through `Store.open` would leave an
-    artifact directory behind for a run nobody ever started.
+    `status` command -- is read-only and opens no `Store`: `Store.open`
+    resolves, or creates, the project row.
 
     Every value goes back through the `models` validators, so a projection that
     drifted from the schema fails here rather than downstream.
