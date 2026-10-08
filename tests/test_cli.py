@@ -49,6 +49,7 @@ from agent_manager import (
     detach,
     dispatch,
     errors,
+    export,
     integration,
     locks,
     models,
@@ -2138,7 +2139,7 @@ def test_no_run_artifact_is_written_inside_the_repository(project, cards):
     # would pass on nothing.
     assert porcelain, "the run's own worktree should show up as untracked"
     assert all(".claude" in line or ".brd" in line for line in porcelain), porcelain
-    assert (paths.run_dir(payload["run_id"]) / "journal.jsonl").is_file()
+    assert not eventlines.journal_file(payload["run_id"]).exists()
 
 
 @pytest.mark.git
@@ -11657,11 +11658,11 @@ def test_a_card_run_is_refused_while_another_live_run_claims_the_card(
 
 
 @pytest.mark.git
-def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir(
+def test_a_claim_taken_after_the_preflight_is_refused_leaving_no_run_dir(
     project, cards, monkeypatch
 ):
     """Review Focus 1: the preflight passed, then another run claimed the card
-    before `take_lease`; the only leftover is the empty run directory."""
+    before `take_lease`; nothing is left under `runs/`."""
     now = datetime.now(timezone.utc)
     _freeze_clock(monkeypatch, now)
     key = control.card_claim(cards["subtask"])
@@ -11681,8 +11682,7 @@ def test_a_claim_taken_after_the_preflight_is_refused_with_only_an_empty_run_dir
     error = json.loads(result.stdout)["error"]
     assert error["type"] == "ClaimedError"
     assert error["message"].startswith(f"card {cards['subtask']} is being driven by run {OTHER_RUN_ID}")
-    (run_dir,) = _run_dirs()
-    assert list(run_dir.iterdir()) == []
+    assert _run_dirs() == []
     assert _recorded_run_ids(project) == []
     assert _claim_rows(project) == [(key, OTHER_RUN_ID, "other-life")]
 
@@ -12428,6 +12428,30 @@ def test_watch_run_known_only_by_lease_events_is_listed(projection):
     )
 
     assert _watch_data(EVENTS_RUN_A) == {"events": [_watch_event(row) for row in rows]}
+
+
+def test_events_watch_and_export_serve_a_run_with_no_journal_file(projection, tmp_path):
+    """3.1.1 B3: a run recorded after the live journal was retired has events
+    and no journal file; `events`, `watch` and `export` read `am.db` only."""
+    _record(projection, EVENTS_RUN_A, started_at=RECORDED_AT, with_phases=False)
+    assert not eventlines.journal_file(EVENTS_RUN_A).exists()
+    reader = store_db.open_reader(paths.db_path())
+    try:
+        rows = store_events.read(reader, run_id=EVENTS_RUN_A)
+    finally:
+        reader.close()
+    assert [row.kind for row in rows] == ["run_upsert", "story_upsert", "subtask_upsert"]
+    out = tmp_path / "export.jsonl"
+
+    listed = _events([EVENTS_RUN_A])["events"]
+    watched = _watch_data(EVENTS_RUN_A)
+    exported = runner.invoke(cli.app, ["export", EVENTS_RUN_A, "--out", str(out)])
+
+    assert listed == [_watch_event(row) for row in rows]
+    assert watched == {"events": [_watch_event(row) for row in rows]}
+    assert exported.exit_code == 0, exported.output
+    assert out.read_text(encoding="utf-8") == "".join(export.line(row) + "\n" for row in rows)
+    assert not eventlines.journal_file(EVENTS_RUN_A).exists()
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", "..", ""])
@@ -15117,24 +15141,29 @@ def test_reset_rereads_the_status_under_the_lease_and_never_overwrites_done(
     assert _lease(projection) is None
 
 
-def test_reset_of_a_run_whose_journal_is_torn_mid_file_is_an_envelope(projection):
-    """Spec test 9: `Store.open` reads the journal's highest `seq`, and a
-    non-JSON line in its middle is `CorruptJournalError` -- a refusal at
-    exit 3, not a traceback."""
+def test_reset_of_a_run_whose_journal_is_torn_mid_file_succeeds_and_leaves_the_file(
+    projection,
+):
+    """3.1.1 B2: a journal file an `am` before 3.1.1 left, torn in its middle,
+    is no longer read. `am reset` closes the run as it would one with no file,
+    and the file keeps every byte."""
     _plant_run(projection, status="stopped")
-    path = store_journal.Journal(CONTROL_RUN_ID).path
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    path.write_text(lines[0] + "{torn\n" + "".join(lines[1:]), encoding="utf-8")
+    texts = eventlines.run_line_texts(CONTROL_RUN_ID)
+    path = eventlines.journal_file(CONTROL_RUN_ID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        texts[0] + "\n{torn\n" + "".join(text + "\n" for text in texts[1:]),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
 
     result = _invoke_reset(projection)
 
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "CorruptJournalError"
-    assert f"{path}:2:" in envelope["error"]["message"]
-    assert _recorded_status(projection) == "stopped"
-    assert _lease(projection) is None
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert (data["previous_status"], data["status"]) == ("stopped", "canceled")
+    assert _recorded_status(projection) == "canceled"
+    assert path.read_bytes() == before
 
 
 def test_handled_takes_a_corrupt_journal_but_not_every_journal_error():
@@ -15242,12 +15271,6 @@ RUN_CANCELLED_BY_HAND = {
 }
 """What `_plant_run` (journaled `started`) reports after `_hand_edit_run_status(..., "cancelled")`:
 the hand-edited legacy spelling reads back as `canceled`."""
-
-
-def _journal_path(run_id: str = CONTROL_RUN_ID) -> Path:
-    """The run's journal file, located without `Journal(run_id)`, which would
-    create the run directory."""
-    return paths.data_dir() / "runs" / run_id / store_journal.JOURNAL_NAME
 
 
 def _hand_edit_run_status(root: Path, status: str, run_id: str = CONTROL_RUN_ID) -> None:
@@ -15402,23 +15425,21 @@ def test_status_reports_a_run_hand_edited_to_cancelled_as_one_foreign_mismatch(
     assert _controls(projection) == []
 
 
-def test_the_integrity_check_writes_no_row_and_no_journal_byte(projection, monkeypatch):
-    """Spec test 3: every table and the journal's bytes are identical after a
-    `status` that found and reported a mismatch."""
+def test_the_integrity_check_writes_no_row_and_no_file(projection, monkeypatch):
+    """Spec test 3: every table is identical, and nothing appears under
+    `runs/`, after a `status` that found and reported a mismatch."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     _hand_edit_run_status(projection, "cancelled")
     tables_before = _projection_snapshot(projection)
-    journal_before = _journal_path().read_bytes()
-    runs_before = sorted(p.name for p in (paths.data_dir() / "runs").iterdir())
+    assert not (paths.data_path() / "runs").exists()
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
     assert data["integrity"]["checked"] is True
     assert data["integrity"]["mismatches"] == [RUN_CANCELLED_BY_HAND]
     assert _projection_snapshot(projection) == tables_before
-    assert _journal_path().read_bytes() == journal_before
-    assert sorted(p.name for p in (paths.data_dir() / "runs").iterdir()) == runs_before
+    assert not (paths.data_path() / "runs").exists()
 
 
 def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
@@ -15428,14 +15449,13 @@ def test_status_of_a_run_with_no_events_says_so_and_never_opens_a_journal(
     _freeze_clock(monkeypatch)
     _plant_run(projection)
     run_dir = paths.data_dir() / "runs" / CONTROL_RUN_ID
-    shutil.rmtree(run_dir)
+    assert not run_dir.exists()
     _drop_events(projection)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("status must not construct a Journal")
 
     monkeypatch.setattr(store_journal.Journal, "__init__", forbidden)
-    monkeypatch.setattr(store_journal.Journal, "_for_reading", forbidden)
 
     data = _status_data(projection, CONTROL_RUN_ID)
 
@@ -15449,7 +15469,7 @@ def test_status_of_a_clean_run_with_its_journal_file_gone_is_still_checked_clean
     """Spec test 17: the events, not the file, are compared."""
     _freeze_clock(monkeypatch)
     _plant_run(projection)
-    shutil.rmtree(paths.data_dir() / "runs" / CONTROL_RUN_ID)
+    assert not (paths.data_dir() / "runs" / CONTROL_RUN_ID).exists()
 
     data = _status_data(projection, CONTROL_RUN_ID)
 

@@ -832,7 +832,7 @@ def test_a_relaunch_whose_source_journal_file_is_gone_still_adopts_from_its_even
     with pytest.raises(_Crash):
         _go(_workflow([]), store, _runner(store, launcher, roles))
     crashed = store.latest_checkpoint(CARD_ID)
-    store.journal.path.unlink()
+    assert not eventlines.journal_file(store.run_id).exists()
 
     _new_process()
     other = store_writer.Store.open(tmp_path / "repo", OTHER_RUN_ID)

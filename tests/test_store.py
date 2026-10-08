@@ -1,9 +1,10 @@
-"""Behaviour of the SQLite projection and the append-only journal (spec §9, D5).
+"""Behaviour of the SQLite projection and the events that explain it (spec §9, D5).
 
-This module touches real files — a SQLite database and a JSONL journal — so it
-is not in the "pure functions" tier of spec §14. These are the deterministic,
-no-network, temporary-directory tests of the "steps" I/O tier: real temp DB
-files and real temp journals rather than mocks. None of them dispatches a
+This module touches real files — a SQLite database, and a few hand-written
+journal files an older `am` could have left — so it is not in the "pure
+functions" tier of spec §14. These are the deterministic, no-network,
+temporary-directory tests of the "steps" I/O tier: real temp DB files rather
+than mocks. None of them dispatches a
 harness, so none belongs in the single opt-in "end to end" test, and they all
 run in the default `uv run pytest` suite.
 
@@ -14,7 +15,6 @@ writes nowhere real.
 import ast
 import dataclasses
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -101,8 +101,8 @@ def _run(repo: Path, run_id: str = RUN_ID) -> models.Run:
 
 
 def test_a_resumed_store_continues_the_journal_sequence(repo):
-    # Review Focus 5: `Store.open` builds the journal, so a resumed run
-    # numbers its next record after the last line already on disk.
+    # Review Focus 5: a resumed run numbers its next record after the last
+    # event already committed.
     st = store_writer.Store.open(repo, RUN_ID)
     try:
         st.record_run(_run(repo))
@@ -242,8 +242,8 @@ def _journal_a_story_whose_row_never_landed() -> None:
 
 
 def test_a_failed_sqlite_write_leaves_neither_line_nor_event(repo):
-    # The event and the row are one transaction, and the file line is mirrored
-    # only after its commit, so a failed row write leaves none of the three.
+    # The event and the row are one transaction, so a failed row write leaves
+    # neither.
     st = store_writer.Store.open(repo, RUN_ID)
     st.record_run(_run(repo))
     _record_story_whose_row_write_fails(st)
@@ -320,7 +320,7 @@ def test_recording_a_run_writes_nothing_into_the_repo_directory(repo, tmp_path):
 
     assert list(repo.iterdir()) == []
     assert paths.db_path().is_relative_to(tmp_path / "data")
-    assert store_journal.Journal(RUN_ID).path.is_relative_to(tmp_path / "data")
+    assert not eventlines.journal_file(RUN_ID).exists()
 
 
 def _record_full_run(st: store_writer.Store, repo: Path) -> None:
@@ -495,14 +495,14 @@ def _plant_raw_payload(repo: Path, kind: str, text: str, *, run_id: str = RUN_ID
 
 
 def test_a_projection_lost_mid_run_is_rebuilt_from_its_events_without_its_journal_file(repo):
-    # Spec test 6: the journal file is gone too, so only the events can say.
+    # Spec test 6: there is no journal file, so only the events can say.
     st = store_writer.Store.open(repo, RUN_ID)
     _record_full_run(st, repo)
     before = st.load_run(RUN_ID)
     st.close()
 
     _wipe_tree_rows(repo)
-    (paths.run_dir(RUN_ID) / store_journal.JOURNAL_NAME).unlink()
+    assert not eventlines.journal_file(RUN_ID).exists()
 
     rebuilt = store_writer.Store.open(repo, RUN_ID)
     try:
@@ -1925,8 +1925,7 @@ def test_latest_run_id_is_none_for_a_project_with_no_runs(repo):
 
 def test_load_run_reads_the_tree_from_a_bare_connection(repo):
     """`status` has no run id until it has read the database, so it cannot use
-    `Store.open(root, run_id)` -- and must not, since a `Journal` mkdirs a run
-    directory for a run that may not exist."""
+    `Store.open(root, run_id)` -- and a read-only command opens no store."""
     opened = store_writer.Store.open(repo, RUN_ID)
     try:
         opened.record_run(_run(repo))
@@ -2029,11 +2028,10 @@ class _SpyingConnection:
         return getattr(self._real, name)
 
 
-def test_every_record_inserts_its_event_writes_its_row_then_mirrors_on_the_writer_thread(
+def test_every_record_inserts_its_event_and_writes_its_row_on_the_writer_thread(
     repo, monkeypatch
 ):
-    # The event and the row are written in one job; the file line follows the
-    # commit, on the same thread, before the next job.
+    # The event and the row are written in one job, on the writer thread.
     st = store_writer.Store.open(repo, RUN_ID)
     seen: list[tuple[str, bool]] = []
 
@@ -2044,14 +2042,6 @@ def test_every_record_inserts_its_event_writes_its_row_then_mirrors_on_the_write
         return real_insert(*args, **kwargs)
 
     monkeypatch.setattr(store_events, "insert", spying_insert)
-
-    real_mirror = st.journal.mirror
-
-    def spying_mirror(*args, **kwargs):
-        seen.append(("mirror", _on_the_writer()))
-        return real_mirror(*args, **kwargs)
-
-    monkeypatch.setattr(st.journal, "mirror", spying_mirror)
 
     for writer in (
         "_write_run_row",
@@ -2082,19 +2072,14 @@ def test_every_record_inserts_its_event_writes_its_row_then_mirrors_on_the_write
     assert seen == [
         ("event", True),
         ("_write_run_row", True),
-        ("mirror", True),
         ("event", True),
         ("_write_story_row", True),
-        ("mirror", True),
         ("event", True),
         ("_write_subtask_row", True),
-        ("mirror", True),
         ("event", True),
         ("_write_phase_row", True),
-        ("mirror", True),
         ("event", True),
         ("_write_attempt_row", True),
-        ("mirror", True),
     ]
 
 
@@ -5323,7 +5308,7 @@ def test_replay_events_of_another_run_reads_its_events_with_its_journal_file_gon
         other.record_story(_story())
     finally:
         other.close()
-    shutil.rmtree(paths.data_dir() / "runs" / ADOPTING_RUN_ID)
+    assert not (paths.data_dir() / "runs" / ADOPTING_RUN_ID).exists()
 
     st = store_writer.Store.open(repo, RUN_ID)
     try:
