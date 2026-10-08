@@ -712,34 +712,42 @@ New keys are additive: a newer `am` may add keys to these objects, but never rem
 
 ### Watching a run
 
-`am watch` prints a run's journal: the append-only log, one JSON object per line, that every run writes to `<data dir>/runs/<run-id>/journal.jsonl` (`<data dir>` is defined under [Several am processes](#several-am-processes)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine writes under the same `<data dir>/runs/`, one `am watch --all` sees the runs of every repository at once.
+`am watch` prints run events from `am.db`, the machine-wide store under `<data dir>` (`<data dir>` is defined under [Several am processes](#several-am-processes); see [The data directory](#the-data-directory)). It takes no lease, no claim and no lock, so it works beside any number of live runs, and since every run on the machine records its events in the same `am.db`, one `am watch --all` sees the runs of every repository at once.
 
 ```bash
 am watch 20260923T140506Z-19efcddc
 am watch --all --since 40
+am watch --project ~/code/my-repo --since-seq 1187
 am watch 20260923T140506Z-19efcddc --follow
 am watch --all --follow --from-now
+am watch --all --follow --since-seq 1187
 ```
 
-The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:
+The shape is `am watch RUN_ID | --all | --all-projects | --project PATH [--since SEQ] [--since-seq GSEQ] [--follow [--from-now]]`:
 
-- Give exactly one of `RUN_ID` and `--all`.
-- `--all` reads every run under `<data dir>/runs/`. A run with no journal yet is skipped. A missing data directory, or a different one (for example under another `XDG_DATA_HOME`), gives no events, not an error.
-- `--since SEQ` keeps only the lines whose `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
-- `--from-now` needs `--follow` and skips the backlog: the stream prints only lines appended after the command started. It cannot be combined with `--since`, whatever its value.
+- Give exactly one selector: `RUN_ID`, `--all` (or `--all-projects`), or `--project PATH`.
+- `--all` and `--all-projects` are the same set: every run of every project on the machine. Giving both is the same as giving one.
+- `--project PATH` reads only the runs of the repository at `PATH`, looked up by its resolved path. Nothing is created for it, and a path `am` has never run in gives no events, not an error.
+- `RUN_ID` is found by its id alone, whichever repository recorded it.
+- `--since SEQ` keeps only the lines whose per-run `seq` is greater than `SEQ`. It filters each run by its own `seq`, so with `--all` the same `SEQ` applies to every run. It defaults to 0, every line.
+- `--since-seq GSEQ` keeps only the lines whose `gseq` is greater than `GSEQ`, the same meaning as `am events --after-seq`. `gseq` is one number across every run on the machine, so it is the cursor to use with `--all` and `--project` (see [Snapshots and cursors](#snapshots-and-cursors)). With both `--since` and `--since-seq`, a line must pass both.
+- `--from-now` needs `--follow` and skips the backlog: the stream starts at head and prints only events recorded after the command started. It cannot be combined with `--since` or `--since-seq`, whatever their value.
 
-Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line), and the list is ordered by `(run_id, seq)`.
+Without `--follow`, `am watch` prints one envelope and exits 0: `{"ok": true, "data": {"events": [...]}}`. Each event is one [journal line](#the-journal-line) plus its `gseq`, and the list is ordered by `gseq`. A `--since-seq` at or above head gives `[]`, not an error. With no `am.db` there are no events, and nothing is created.
 
-These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3:
+These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3, as `CliError` unless named otherwise, the first failing one in this order:
 
-- both `RUN_ID` and `--all`, or neither;
+- `RUN_ID` together with `--project`;
+- `--project` together with `--all` or `--all-projects`;
+- none of `RUN_ID`, `--all`, `--all-projects` and `--project`, or `RUN_ID` together with `--all` or `--all-projects`;
 - a `--since` below 0;
+- a `--since-seq` below 0;
 - `--from-now` together with `--since`, any value, 0 included;
+- `--from-now` together with `--since-seq`, any value, 0 included;
 - `--from-now` without `--follow`;
-- a run id with no journal, or one that is not a single directory name (`.`, `..`, or anything with a `/`), as `UnknownRunError`;
-- a corrupt journal: a line that is not JSON (other than a final line still being written, see below), or a line that does not have the journal line's shape.
+- a `RUN_ID` with no event and no run row in `am.db`, as `UnknownRunError`.
 
-Watching a run id that does not exist creates no run directory.
+Watching a run id that does not exist creates nothing.
 
 #### Following with `--follow`
 

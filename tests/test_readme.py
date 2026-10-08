@@ -304,20 +304,20 @@ def test_board_section_documents_stacking():
     assert set(anchors) <= slugs, f"dangling anchors: {set(anchors) - slugs}"
 
 
+WATCH_SHAPE = (
+    "The shape is `am watch RUN_ID | --all | --all-projects | --project PATH"
+    " [--since SEQ] [--since-seq GSEQ] [--follow [--from-now]]`:"
+)
+
+
 def test_watch_documents_from_now():
     section = _section("Watching a run")
-    assert (
-        "The shape is `am watch RUN_ID | --all [--since SEQ] [--follow [--from-now]]`:"
-        in section
-    )
+    assert WATCH_SHAPE in section
     assert "am watch --all --follow --from-now" in section
     assert "- `--from-now` together with `--since`, any value, 0 included;" in section
+    assert "- `--from-now` together with `--since-seq`, any value, 0 included;" in section
     assert "- `--from-now` without `--follow`;" in section
-    assert "only lines appended after the command started" in section
-    assert (
-        "A line that was still being written when the command started"
-        " is printed once it is complete." in section
-    )
+    assert "only events recorded after the command started" in section
     # The section's pre-existing hello example already holds `"schema":2`,
     # so pin the --from-now paragraph's own sentence, not the bare token.
     assert 'The hello line is the same, `"schema":2`.' in section
@@ -1061,3 +1061,65 @@ def test_snapshots_and_cursors_section():
     parent = next(head for head in reversed(heads[:position]) if head[1] < 4)
     assert parent[1:] == (3, "Watching a run")
     assert titles.index("Reading the stream safely") < position < titles.index(LOGS_TITLE)
+
+
+WATCH_STALE = (
+    "ordered by `(run_id, seq)`",
+    "that every run writes to",
+    "reads every run under",
+    "a corrupt journal",
+    "a run id with no journal",
+)
+WATCH_REFUSALS = (
+    ("- `RUN_ID` together with `--project`;", {"run_id": "r", "project": Path("p")}),
+    (
+        "- `--project` together with `--all` or `--all-projects`;",
+        {"run_id": None, "all_runs": True, "project": Path("p")},
+    ),
+    (
+        "- none of `RUN_ID`, `--all`, `--all-projects` and `--project`,"
+        " or `RUN_ID` together with `--all` or `--all-projects`;",
+        {"run_id": None},
+    ),
+    ("- a `--since` below 0;", {"run_id": "r", "since": -1}),
+    ("- a `--since-seq` below 0;", {"run_id": "r", "since_seq": -1}),
+    (
+        "- `--from-now` together with `--since`, any value, 0 included;",
+        {"run_id": "r", "follow": True, "from_now": True, "since_given": True},
+    ),
+    (
+        "- `--from-now` together with `--since-seq`, any value, 0 included;",
+        {"run_id": "r", "follow": True, "from_now": True, "since_seq": 0},
+    ),
+    ("- `--from-now` without `--follow`;", {"run_id": "r", "from_now": True}),
+)
+
+
+def test_watch_documents_selectors_and_since_seq():
+    section = _section("Watching a run")
+    intro = section.split("\n#### ")[0]
+    assert _long_options("watch") <= _backticked_flags(section)
+    for flag in ("`--all-projects`", "`--project PATH`", "`--since-seq GSEQ`"):
+        assert flag in intro, flag
+    assert "`--all` and `--all-projects` are the same set" in intro
+    assert "a path `am` has never run in gives no events, not an error" in intro
+    assert "With both `--since` and `--since-seq`, a line must pass both." in intro
+    assert "the list is ordered by `gseq`" in intro
+    assert "A `--since-seq` at or above head gives `[]`, not an error." in intro
+    assert "- a `RUN_ID` with no event and no run row in `am.db`, as `UnknownRunError`." in intro
+    for phrase in WATCH_STALE:
+        assert phrase not in intro, phrase
+
+    # Every refusal bullet is a real refusal, in the order the code checks them.
+    positions = []
+    for bullet, call in WATCH_REFUSALS:
+        assert bullet in intro, bullet
+        positions.append(intro.index(bullet))
+        kwargs = dict(call)
+        with pytest.raises(cli.CliError):
+            cli.watch_for(kwargs.pop("run_id"), **kwargs)
+    assert positions == sorted(positions)
+
+    anchors = _assert_anchors_resolve(intro)
+    assert _slug(DATA_DIR_TITLE) in anchors
+    assert _slug(SNAPSHOTS_TITLE) in anchors
