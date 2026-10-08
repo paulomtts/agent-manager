@@ -23,10 +23,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import eventlines
 
 from agent_manager import board, cli, models
 from agent_manager.store import db as store_db
-from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
 from agent_manager.store import writer as store_writer
 from agent_manager.runtime.stop import StopSignal
@@ -187,13 +187,15 @@ def test_the_journal_of_a_two_lane_run_is_strictly_increasing_and_rebuilds_the_p
 
     assert result.exit_code == 0, (result.output, result.exception)
     run_id = _envelope(result)["run_id"]
-    lines = store_journal.Journal(run_id).read()
+    # Production wiring (the CLI, its lanes, adoption) writes no journal file.
+    assert not eventlines.journal_file(run_id).exists()
+    lines = eventlines.run_lines(run_id)
     seqs = [line.seq for line in lines]
     # Strictly increasing, not contiguous: the run's lease and control events
-    # take `run_seq` numbers the journal file skips (card 1.2.7).
+    # take `run_seq` numbers `run_lines` skips (card 1.2.7).
     assert seqs == sorted(set(seqs)) and seqs[0] >= 1, seqs
     # Non-vacuity: the two lanes' phase lines really interleave, so the order
-    # was tested under concurrent appends and not a sequential run. Phase lines
+    # was tested under concurrent records and not a sequential run. Phase lines
     # only: `record_plan` journals every story `pending` up front, so story
     # lines would interleave even in a one-lane run.
     phase_lines = [line for line in lines if line.event == "phase_upsert"]
