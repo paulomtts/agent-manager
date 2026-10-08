@@ -3386,7 +3386,8 @@ def _emit_stream_line(obj: Mapping[str, Any]) -> None:
 @dataclass
 class _WatchCursor:
     """Where `am watch --follow` has read to: `gseq`, the largest global `seq`
-    any poll read (emitted or filtered out by `--since`), and `project_id`,
+    any poll read (emitted or filtered out by `--since`), starting at
+    `--since-seq` or, with `--from-now`, at head; and `project_id`,
     `--project`'s id once a poll found it."""
 
     gseq: int = 0
@@ -3448,6 +3449,7 @@ def _follow_watch(
     sleep: Callable[[float], None],
     max_polls: int | None,
     from_now: bool = False,
+    since_seq: int = 0,
 ) -> Iterator[dict[str, Any]]:
     """The backlog, then every event recorded after it.
 
@@ -3456,12 +3458,16 @@ def _follow_watch(
     `_WatchCursor` spans every poll, so no event is emitted twice and none is
     skipped, however runs interleave across polls.
 
+    The cursor starts at `since_seq` (`--since-seq`, 0 when not given), so
+    the backlog is the selected events above it; a `since_seq` at or above
+    head is not an error, only events committed later above it are emitted.
+
     With `from_now` there is no backlog poll: the cursor starts at the
     machine-wide `head`, so only events committed after the start are
     emitted, and a run or project that appears later is emitted from its
-    first event.
+    first event. `watch_for` refuses `from_now` with `--since-seq`.
     """
-    cursor = _WatchCursor()
+    cursor = _WatchCursor(gseq=since_seq)
     if from_now:
         cursor.gseq = _watch_head()
     else:
@@ -3495,16 +3501,18 @@ def _stream_watch(
     project: Path | None = None,
     since: int,
     from_now: bool = False,
+    since_seq: int = 0,
 ) -> None:
     """The body of `am watch --follow`, once `watch_for` has accepted the call.
 
-    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
-    test that replaces them controls every poll. Ctrl-C and a closed pipe are
-    how a stream normally ends: exit 0, nothing on stderr. An error after the
-    hello line (a busy or too-new database, a row whose payload is not JSON or
-    whose kind `JournalLine` refuses) cannot get an envelope, because every
-    line after the first must be an event line. So its message goes to stderr
-    and the exit is `EXIT_ERROR`.
+    `since_seq` is where the stream's `gseq` cursor starts (`--since-seq`, 0
+    when not given). `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at
+    call time, so a test that replaces them controls every poll. Ctrl-C and a
+    closed pipe are how a stream normally ends: exit 0, nothing on stderr. An
+    error after the hello line (a busy or too-new database, a row whose
+    payload is not JSON or whose kind `JournalLine` refuses) cannot get an
+    envelope, because every line after the first must be an event line. So
+    its message goes to stderr and the exit is `EXIT_ERROR`.
     """
     try:
         _emit_stream_line(_watch_hello())
@@ -3515,6 +3523,7 @@ def _stream_watch(
             sleep=_watch_sleep,
             max_polls=WATCH_MAX_POLLS,
             from_now=from_now,
+            since_seq=since_seq,
         ):
             _emit_stream_line(event)
     except KeyboardInterrupt:
@@ -3744,7 +3753,13 @@ def watch(
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
     if follow:
-        _stream_watch(run_id, project=project, since=since_value, from_now=from_now)
+        _stream_watch(
+            run_id,
+            project=project,
+            since=since_value,
+            from_now=from_now,
+            since_seq=since_seq or 0,
+        )
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 

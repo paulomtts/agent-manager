@@ -13389,6 +13389,168 @@ def test_watch_since_seq_refusal_order(projection, monkeypatch):
     _assert_one_cli_error(form, "give exactly one of")
 
 
+def test_watch_follow_since_seq_resumes_then_follows_without_repeat(
+    projection, tmp_path, monkeypatch
+):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+    )
+
+    def record(*specs: tuple[str, str]):
+        return lambda: rows.extend(_insert_events(projection, *specs))
+
+    for argv, keep in (
+        (["--all"], lambda row: True),
+        ([EVENTS_RUN_A], lambda row: row.run_id == EVENTS_RUN_A),
+        (["--project", str(projection)], lambda row: True),
+    ):
+        # The cursor sits two rows below head, so the backlog is not empty.
+        since_seq = rows[-1].seq - 2
+        result, sleeps = _watch_follow(
+            monkeypatch,
+            *argv,
+            "--since-seq",
+            str(since_seq),
+            actions=[
+                record((EVENTS_RUN_B, "subtask_upsert"), (EVENTS_RUN_A, "subtask_upsert")),
+                record((EVENTS_RUN_A, "phase_upsert")),
+                lambda: None,  # an idle last poll: nothing may repeat
+            ],
+        )
+
+        assert result.exit_code == 0, (argv, result.output)
+        assert sleeps == [cli.WATCH_POLL_SECONDS] * 3, argv
+        lines = _stream(result)
+        expected = [row for row in rows if row.seq > since_seq and keep(row)]
+        assert lines == [_hello(tmp_path), *[_watch_event(row) for row in expected]], argv
+        gseqs = [line["gseq"] for line in lines[1:]]
+        assert gseqs == sorted(set(gseqs)), argv
+        assert all(gseq > since_seq for gseq in gseqs), argv
+        if argv == [EVENTS_RUN_A]:
+            assert {line["run_id"] for line in lines[1:]} == {EVENTS_RUN_A}
+        assert result.stderr == ""
+
+
+def test_watch_follow_since_seq_above_head_is_not_an_error(
+    projection, tmp_path, monkeypatch
+):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
+    head = 2
+
+    # At head and above it, nothing new written: the hello alone, exit 0.
+    for selector in (["--all"], [EVENTS_RUN_A]):
+        for since_seq in (head, head + 5):
+            idle, sleeps = _watch_follow(
+                monkeypatch, *selector, "--since-seq", str(since_seq), actions=[lambda: None]
+            )
+            assert idle.exit_code == 0, (selector, since_seq, idle.output)
+            assert sleeps == [cli.WATCH_POLL_SECONDS]
+            assert _stream(idle) == [_hello(tmp_path)]
+            # No reset in this card: the hello carries no cursor_reset.
+            assert "cursor_reset" not in _stream(idle)[0]
+            assert idle.stderr == ""
+
+    # Rows written later are emitted only once their gseq exceeds the cursor.
+    later: list[store_events.EventRow] = []
+
+    def record_seven() -> None:
+        later.extend(_insert_events(projection, *[(EVENTS_RUN_A, "subtask_upsert")] * 7))
+
+    since_seq = head + 5
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--all",
+        "--since-seq",
+        str(since_seq),
+        actions=[record_seven, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [row.seq for row in later] == [3, 4, 5, 6, 7, 8, 9]
+    expected = [row for row in later if row.seq > since_seq]
+    assert [row.seq for row in expected] == [8, 9]
+    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in expected]]
+
+
+def test_watch_since_seq_and_since_both_filter(projection, tmp_path, monkeypatch):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),  # gseq 1, run_seq 1
+        (EVENTS_RUN_A, "story_upsert"),  # gseq 2, run_seq 2: run_seq > 1, gseq <= 2
+        (EVENTS_RUN_B, "run_upsert"),  # gseq 3, run_seq 1: gseq > 2, run_seq <= 1
+    )
+
+    def record_rest() -> None:
+        rows.extend(
+            _insert_events(
+                projection,
+                (EVENTS_RUN_A, "subtask_upsert"),  # gseq 4, run_seq 3
+                (EVENTS_RUN_B, "story_upsert"),  # gseq 5, run_seq 2
+            )
+        )
+
+    # Follow: the backlog poll and the later poll both apply the two filters.
+    result, _ = _watch_follow(
+        monkeypatch,
+        "--all",
+        "--since", "1",
+        "--since-seq", "2",
+        actions=[record_rest, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected = [row for row in rows if row.seq > 2 and row.run_seq > 1]
+    assert [(row.seq, row.run_seq) for row in expected] == [(4, 3), (5, 2)]
+    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in expected]]
+
+    # One-shot: the same rows.
+    assert _watch_data("--all", "--since", "1", "--since-seq", "2") == {
+        "events": [_watch_event(row) for row in expected]
+    }
+
+
+def test_watch_follow_since_seq_project_created_later(projection, tmp_path, monkeypatch):
+    """Review Focus 2: a --project path with no row yet is looked up on every
+    poll, and once it exists only its rows above the cursor are emitted."""
+    _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),  # gseq 1
+        (EVENTS_RUN_A, "story_upsert"),  # gseq 2
+    )
+    later_root = tmp_path / "later"
+    later_root.mkdir()
+    later: list[store_events.EventRow] = []
+
+    def create_project() -> None:
+        later.extend(
+            _insert_events(
+                later_root,
+                (EVENTS_RUN_B, "run_upsert"),  # gseq 3
+                (EVENTS_RUN_B, "story_upsert"),  # gseq 4
+            )
+        )
+        # Another project's row after it: never emitted.
+        _insert_events(projection, (EVENTS_RUN_A, "subtask_upsert"))
+
+    result, sleeps = _watch_follow(
+        monkeypatch,
+        "--project",
+        str(later_root),
+        "--since-seq",
+        "3",
+        actions=[lambda: None, create_project, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(sleeps) == 3
+    assert [row.seq for row in later] == [3, 4]
+    assert _stream(result) == [_hello(tmp_path), _watch_event(later[1])]
+    assert result.stderr == ""
+
+
 # ── run pre-flight, recorded stage and engine seam (card 5daa944e) ──────────
 #
 # Unit tier: the FakeBoard (`fake_board`) answers every board call, the repo
