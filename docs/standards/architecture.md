@@ -48,7 +48,7 @@ New modules are those §6 creates. Their positions follow the imports their code
 | 15 | Runtime | `runtime.checkpoint`, `runtime.compile` | Checkpoint hooks; the workflow compiled into pygents tools |
 | 16 | Runtime | `runtime.engine` | One subtask, one agent, one loop |
 | 17 | Application | `runs`, `comments`, *`envelope`* | Run identity and the shared subtask driver; the comment outbox; the envelope and exit-code contract |
-| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `journal_check`, `export` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; the dual-write checker: `events` against each run's journal file; events to journal-shaped lines: `am export` |
+| 18 | Application | *`handoff`*, *`resolver`*, *`reset`*, `migrate`, `export` | The generic detach hand-off; the one conflict resolver; `am reset`; merging the legacy per-project databases and their runs' journals into `am.db`; events to journal-shaped lines: `am export` |
 | 19 | Application | `bases`, `integration`, *`card_run`* | The merged base; Integrate; the `--card` run |
 | 20 | Application | *`milestone.plan`*, *`milestone.payloads`* | Pure story plan; lane outcome types and report shapes |
 | 21 | Application | *`milestone.lane`* | The per-story state machine |
@@ -86,7 +86,7 @@ All 67 `.py` files (60 modules plus 7 `__init__.py`) appear here exactly once. `
 | 11-12 | `workflow.task` (L11); `workflow.integrate` (L12) |
 | 13-16 | `runtime.walk`, `runtime.bridge`, `runtime.state` (L13); `runtime.context`, `dispatch` (L14); `runtime.checkpoint`, `runtime.compile` (L15); `runtime.engine` (L16) |
 | 17 | `runs`, `comments` |
-| 18 | `migrate`, `journal_check`, `export` |
+| 18 | `migrate`, `export` |
 | 19 | `bases`, `integration` |
 | 24 | `orchestrate` (splits into L19-L24) |
 | 29 | `cli` (splits into L17-L29) |

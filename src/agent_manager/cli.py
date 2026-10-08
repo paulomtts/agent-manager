@@ -45,7 +45,6 @@ from agent_manager import (
     detach,
     dispatch,
     export,
-    journal_check,
     locks,
     migrate,
     models,
@@ -4618,26 +4617,3 @@ def export_command(
         typer.echo("".join(f"{text}\n" for text in lines), nl=False)
         return
     typer.echo(render(ok_envelope(asdict(result)), pretty=pretty))
-
-
-@app.command("journal-check")
-def journal_check_command(
-    run_id: str | None = typer.Argument(
-        None, metavar="[RUN]", help="The run to check; or give --all."
-    ),
-    all_runs: bool = typer.Option(
-        False, "--all", help="Check every run in am.db or with a journal file."
-    ),
-    pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
-) -> None:
-    """Compare each run's `events` with its `journal.jsonl` and report every
-    difference, changing nothing; a run live meanwhile can show its in-flight
-    tail as a transient difference."""
-    try:
-        if (run_id is not None) == all_runs:
-            raise CliError("give exactly one of RUN and --all")
-        report = journal_check.check(run_id)
-    except HANDLED as error:
-        typer.echo(render(error_envelope(error), pretty=pretty))
-        raise typer.Exit(EXIT_ERROR) from None
-    typer.echo(render(ok_envelope(asdict(report)), pretty=pretty))

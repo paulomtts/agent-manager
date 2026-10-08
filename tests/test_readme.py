@@ -1013,7 +1013,7 @@ def test_backup_and_restore_section():
     assert "No `am.db-wal` or `am.db-shm` may remain beside it." in numbered[2]
     assert "`store_id` is the one the backup was taken with" in section
     assert "possibly lower than before" in section
-    assert "`am journal-check`" in section
+    assert "Events recorded after the backup are not in it." in section
     assert RESNAPSHOT in section
     assert "`am resume` takes it over" in section
 
@@ -1023,6 +1023,13 @@ def test_backup_and_restore_section():
     assert heads[titles.index(BACKUP_TITLE)][1] == 3
     assert _slug(BACKUP_TITLE) == "backing-up-and-restoring-amdb"
     assert "several-am-processes" in _assert_anchors_resolve(section)
+
+
+def test_readme_names_no_journal_checker():
+    text = README.read_text()
+
+    assert "journal-check" not in text
+    assert "journal_check" not in text
 
 
 SNAPSHOTS_TITLE = "Snapshots and cursors"

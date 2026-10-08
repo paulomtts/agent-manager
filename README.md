@@ -1018,7 +1018,7 @@ After a restore:
 
 - `store_id` is the one the backup was taken with, so a restore of a database's own backup does not change it.
 - `head`, and every `as_of_seq`, are the backup's, possibly lower than before. New events take the `gseq` numbers above the restored head again.
-- Events recorded after the backup are not in it. A run's `journal.jsonl` may still hold its node events; `am journal-check` compares a run's events with its journal.
+- Events recorded after the backup are not in it.
 - Every consumer must drop its cursors and read a snapshot again. Neither `store_id` nor `cursor_reset` tells a consumer that a restore happened.
 - A run that was live when the backup was taken shows the lease it had then. Its process is gone, so `am resume` takes it over as it takes over any dead lease (see `took_over` under [Several am processes](#several-am-processes)).
 

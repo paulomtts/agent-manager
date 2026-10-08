@@ -15,6 +15,7 @@ Two tiers live here, per design §14 lines 477-492 and the spec's Tests section:
 import asyncio
 import dataclasses
 import io
+import importlib.util
 import inspect
 import json
 import os
@@ -18433,3 +18434,30 @@ def test_run_agent_phases_follow_the_run_shape():
     assert cli.run_agent_phases(run("task")) == cli.TASK_AGENT_PHASES
     assert cli.run_agent_phases(run("milestone", "story-1")) == cli.TASK_AGENT_PHASES
     assert cli.run_agent_phases(run("milestone")) == cli.MILESTONE_AGENT_PHASES
+
+
+@pytest.mark.parametrize(
+    "argv", [[], ["--all"], ["some-run"], ["--all", "--pretty"]]
+)
+def test_journal_check_with_any_arguments_is_no_such_command(tmp_path, monkeypatch, argv):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    result = runner.invoke(cli.app, ["journal-check", *argv])
+
+    assert result.exit_code == 2, result.output
+    assert "No such command 'journal-check'" in result.output
+    assert '"ok"' not in result.output
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_journal_check_is_no_longer_a_command():
+    assert "journal-check" not in [c.name for c in cli.app.registered_commands]
+    assert importlib.util.find_spec("agent_manager.journal_check") is None
+
+
+def test_help_lists_no_journal_check():
+    result = runner.invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "journal-check" not in result.output

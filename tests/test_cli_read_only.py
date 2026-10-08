@@ -493,25 +493,6 @@ def test_every_store_command_refuses_an_unmigrated_machine_and_writes_nothing(
     assert not (paths.data_path() / "runs").exists()
 
 
-def test_journal_check_refuses_an_unmigrated_machine_and_writes_nothing(
-    tmp_path, monkeypatch
-):
-    # journal-check is machine-wide and takes no --repo-dir, so it cannot join
-    # the parametrization above, which appends one to every argv.
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _leave_a_legacy_database()
-
-    result = _invoke_creating_nothing(tmp_path, ["journal-check", "--all"])
-
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "MigrationRequiredError"
-    assert "am migrate" in envelope["error"]["message"]
-    assert not paths.db_path().exists()
-    assert not (paths.data_path() / "runs").exists()
-
-
 def test_export_refuses_an_unmigrated_machine_and_writes_nothing(tmp_path, monkeypatch):
     # export is machine-wide and takes no --repo-dir, so it cannot join the
     # parametrization above, which appends one to every argv.
