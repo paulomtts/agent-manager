@@ -27,11 +27,13 @@ from agent_manager import (
     migrate,
     models,
     orchestrate,
+    paths,
     prompt,
     runs,
 )
 from agent_manager.harness import launcher
 from agent_manager.store import db as store_db
+from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
 
 README = Path(__file__).resolve().parents[1] / "README.md"
@@ -926,3 +928,53 @@ def test_migrate_section():
     )
     assert heads[titles.index(MIGRATE_TITLE)][1] == 3
     _assert_anchors_resolve(section)
+
+
+DATA_DIR_TITLE = "The data directory"
+
+
+def test_data_directory_notes():
+    section = _section(DATA_DIR_TITLE)
+    assert paths.data_path().name == "agent-manager"
+    assert paths.db_path().name == "am.db"
+    assert store_journal.JOURNAL_NAME == "journal.jsonl"
+    for name in (
+        "`$XDG_DATA_HOME/agent-manager`",
+        "`~/.local/share/agent-manager`",
+        "`am.db`",
+        "`am.db-wal`",
+        "`am.db-shm`",
+        "`backups/`",
+        "`runs/<run-id>/`",
+        f"`{detach.RUN_LOG_NAME}`",
+        f"`{detach.REPORT_NAME}`",
+        f"`{store_journal.JOURNAL_NAME}`",
+        "`boards/`",
+        "`projects/<digest>.board.lock`",
+        "`projects/<digest>.git.lock`",
+        "legacy `projects/<digest>.db`",
+    ):
+        assert name in section, name
+    assert "read only by `am migrate`" in section
+    assert "still appends to but no longer reads" in section
+    anchors = _assert_anchors_resolve(section)
+    assert "several-am-processes" in anchors
+    assert _slug(MIGRATE_TITLE) in anchors
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(MIGRATE_TITLE) < titles.index(DATA_DIR_TITLE) < titles.index(
+        "Resuming: what runs again"
+    )
+    assert heads[titles.index(DATA_DIR_TITLE)][1] == 3
+
+    several = _section("Several am processes")
+    assert "the project database `<digest>.db`" not in several
+    assert "with its own database" not in several
+    lines = several.splitlines()
+    one_dir = next(line for line in lines if line.startswith("- **One data directory per machine.**"))
+    assert "`am.db`" in one_dir
+    known = next(
+        line for line in lines if line.startswith("- **A repository is known by its resolved path.**")
+    )
+    assert "a different project in `am.db`" in known

@@ -471,7 +471,7 @@ Readers always work and take nothing. `am status`, `am runs`, `am logs` and `am 
 
 `LeaseLostError`. A process that was stuck rather than dead (stopped with SIGSTOP, or on a laptop that was suspended) may wake after another process has taken its run over. Every write of a run checks that this process still holds the lease, so the stuck process stops at its next store write: it writes nothing, not even the journal line, its lanes are cancelled as on a kill, and it exits 3 with `type: "LeaseLostError"` and the message `this process lost the lease of run '<run-id>': pid <pid> on <host> holds it now`. The new owner's rows are untouched. What this does not cover: a `git` or `brd` call the stuck process had already started finishes on its own. Such a call is bounded by one phase.
 
-Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is the same per-repository digest as the project database `<digest>.db` beside them, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
+Locks. Board writes (a card status and its rollup) and git worktree operations (`git worktree add`, and a run's starting `git fetch` and `git worktree prune`) are serialised across processes by two lock files, `<data dir>/projects/<digest>.board.lock` and `<data dir>/projects/<digest>.git.lock`. `<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager`, and `<digest>` is a per-repository digest, the sha256 of the repository's resolved path, so the lock files are never inside the repository or a worktree. A process waits at most 600 seconds for one. Past that, the wait fails with `LockTimeoutError` and the message `timed out after 600.0s waiting for the lock <path>`. Inside a phase, the phase fails and the subtask escalates with that as its `detail`, prefixed `LockTimeoutError: `; run `am resume <run-id>` once the other process has let go. While a run is starting, the command instead exits 3 with `type: "LockTimeoutError"`. A holder that is killed, even with SIGKILL, releases its lock at once.
 
 Limits, stated plainly:
 
@@ -484,10 +484,10 @@ Limits, stated plainly:
 - **Machine load.** N lanes means up to N `claude -p` processes at once, and
   nothing rate-limits them.
 - **`--max-concurrent` is per process.** Two `am` processes with `--max-concurrent 4` each can run 8 lanes, and 8 `claude -p` processes, at once. Nothing caps lanes across processes.
-- **One data directory per machine.** Leases, claims and lock files live under the data directory. Two processes that see different data directories, for example through a different `XDG_DATA_HOME`, do not see each other's runs and are not kept apart.
+- **One data directory per machine.** The store, `am.db`, which holds every run with its leases and claims, and the lock files live under the data directory (see [The data directory](#the-data-directory)). Two processes that see different data directories, for example through a different `XDG_DATA_HOME`, do not see each other's runs and are not kept apart.
 - **Not over NFS.** The locks are `flock`s, which are not reliable on a network filesystem. Keep the data directory on a local disk.
 - **POSIX only.** The locks use `fcntl`, so `am` does not run on Windows.
-- **A repository is known by its resolved path.** A linked worktree of the repository given as `--repo-dir` is a different project, with its own database, leases and locks, so a run there is not kept apart from a run on the main checkout.
+- **A repository is known by its resolved path.** A linked worktree of the repository given as `--repo-dir` is a different project in `am.db`, with its own leases, claims and locks, so a run there is not kept apart from a run on the main checkout.
 
 #### Multiple blockers
 
@@ -896,6 +896,17 @@ mkdir -p /tmp/am-rehearsal
 cp -a ~/.local/share/agent-manager /tmp/am-rehearsal/agent-manager
 XDG_DATA_HOME=/tmp/am-rehearsal am migrate --pretty
 ```
+
+### The data directory
+
+`<data dir>` is `$XDG_DATA_HOME/agent-manager`, or `~/.local/share/agent-manager` when `XDG_DATA_HOME` is unset. It holds:
+
+- `am.db`: the one machine-wide store of every run, event, lease and claim, with its `am.db-wal` and `am.db-shm` sidecars beside it while it is in use;
+- `backups/`: where `am backup` writes without `--out`;
+- `runs/<run-id>/`: one run's files: `run.log` and `report.json` for a detached run, one directory per agent attempt, and `journal.jsonl`, a mirror of the run's node events that `am` still appends to but no longer reads;
+- `boards/`: a detached `--board` run's log and report;
+- `projects/<digest>.board.lock` and `projects/<digest>.git.lock`: the lock files of [Several am processes](#several-am-processes);
+- legacy `projects/<digest>.db`: an older `am`'s per-project databases, read only by `am migrate` (see [Migrating from per-project databases](#migrating-from-per-project-databases)).
 
 ## Resuming: what runs again
 
