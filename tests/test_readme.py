@@ -32,6 +32,7 @@ from agent_manager import (
     runs,
 )
 from agent_manager.harness import launcher
+from agent_manager.store import backup as store_backup
 from agent_manager.store import db as store_db
 from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
@@ -978,3 +979,45 @@ def test_data_directory_notes():
         line for line in lines if line.startswith("- **A repository is known by its resolved path.**")
     )
     assert "a different project in `am.db`" in known
+
+
+BACKUP_TITLE = "Backing up and restoring `am.db`"
+RESNAPSHOT = "must drop its cursors and read a snapshot again"
+
+
+def test_backup_and_restore_section():
+    section = _section(BACKUP_TITLE)
+    assert "The shape is `am backup [--out FILE] [--pretty]`:" in section
+    assert _long_options("backup") <= _backticked_flags(section)
+    assert "online-backup API" in section
+    assert "safe while runs are live" in section
+    assert "`<data dir>/backups/am-<YYYYMMDDTHHMMSSZ>.db`" in section
+    for field in dataclasses.fields(store_backup.BackupResult):
+        assert f"`{field.name}`" in section, field.name
+
+    assert f"`{store_backup.BackupRefusedError.__name__}`" in section
+    template = str(store_backup.BackupRefusedError("<reason>", Path("<path>")))
+    assert f"`{template}`" in section
+    lines = section.splitlines()
+    for reason in typing.get_args(store_backup.BackupRefusal):
+        assert any(line.startswith(f"- `{reason}`: ") for line in lines), reason
+
+    assert "There is no `am restore` command" in section
+    numbered = [line for line in lines if re.match(r"\d+\. ", line)]
+    assert [line.split(".")[0] for line in numbered] == ["1", "2", "3"]
+    assert "`lease.live`" in numbered[0]
+    assert "`am.db-wal`" in numbered[1] and "`am.db-shm`" in numbered[1]
+    assert "Do not delete them" in numbered[1]
+    assert "No `am.db-wal` or `am.db-shm` may remain beside it." in numbered[2]
+    assert "`store_id` is the one the backup was taken with" in section
+    assert "possibly lower than before" in section
+    assert "`am journal-check`" in section
+    assert RESNAPSHOT in section
+    assert "`am resume` takes it over" in section
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert titles.index(LOGS_TITLE) < titles.index(BACKUP_TITLE) < titles.index(MIGRATE_TITLE)
+    assert heads[titles.index(BACKUP_TITLE)][1] == 3
+    assert _slug(BACKUP_TITLE) == "backing-up-and-restoring-amdb"
+    assert "several-am-processes" in _assert_anchors_resolve(section)

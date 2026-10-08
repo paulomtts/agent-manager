@@ -853,6 +853,53 @@ The hello line's `schema` is the stream's own version, `1` today. It is independ
 
 New keys are additive: a newer `am` may add keys to the hello, chunk and end lines, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
+### Backing up and restoring `am.db`
+
+`am backup` copies `am.db` to a new file through SQLite's online-backup API. It is safe while runs are live: the copy is one consistent snapshot, read in one read transaction, and holds every committed event, even one not yet checkpointed out of `am.db-wal`. It takes no write lock, so live runs keep writing.
+
+```bash
+am backup
+am backup --out ~/am-before-upgrade.db
+```
+
+The shape is `am backup [--out FILE] [--pretty]`:
+
+- Without `--out`, the copy goes to `<data dir>/backups/am-<YYYYMMDDTHHMMSSZ>.db`, stamped in UTC; `backups/` is created when it is missing.
+- A relative `--out` is taken from the current directory.
+- The copy is built in a temporary file beside the target and then linked into place, so `am backup` never overwrites anything.
+- `am.db` is copied as it is, without being opened as a store: an `am.db` that still needs `am migrate`, or one written by a newer `am`, is backed up all the same.
+
+It prints `{"ok": true, "data": {"path", "size_bytes"}}`: the absolute `path` of the copy and its `size_bytes`. The copy is one self-contained file, with no `-wal` or `-shm` beside it.
+
+These are refused with `BackupRefusedError`, exit code 3, and nothing written. The message reads `am backup refused (<reason>): <path>; nothing has been written`, and `<reason>` is one of:
+
+- `no_database`: there is no `am.db`; nothing is created, not even the data directory;
+- `target_exists`: something is already at the target, a dangling symlink and `am.db` itself included, or appeared there while the copy ran;
+- `no_target_dir`: the directory of `--out` does not exist.
+
+The temporary file, and anything SQLite left beside it, is removed on every refusal.
+
+There is no `am restore` command. To restore a backup:
+
+1. Make sure no `am` process uses the data directory: `am runs --all-projects` must show no run with `lease.live` `true`, and every `am watch --follow` stream and any other `am` command must be stopped.
+2. Move `<data dir>/am.db` aside, together with `am.db-wal` and `am.db-shm` if they are beside it. Do not delete them: they are the only copy of anything recorded after the backup.
+3. Copy the backup file to `<data dir>/am.db`. No `am.db-wal` or `am.db-shm` may remain beside it.
+
+```bash
+cd ~/.local/share/agent-manager
+mkdir aside
+for name in am.db am.db-wal am.db-shm; do [ -e "$name" ] && mv "$name" aside/; done
+cp backups/am-20261007T090000Z.db am.db
+```
+
+After a restore:
+
+- `store_id` is the one the backup was taken with, so a restore of a database's own backup does not change it.
+- `head`, and every `as_of_seq`, are the backup's, possibly lower than before. New events take the `gseq` numbers above the restored head again.
+- Events recorded after the backup are not in it. A run's `journal.jsonl` may still hold its node events; `am journal-check` compares a run's events with its journal.
+- Every consumer must drop its cursors and read a snapshot again. Neither `store_id` nor `cursor_reset` tells a consumer that a restore happened.
+- A run that was live when the backup was taken shows the lease it had then. Its process is gone, so `am resume` takes it over as it takes over any dead lease (see `took_over` under [Several am processes](#several-am-processes)).
+
 ### Migrating from per-project databases
 
 An older `am` kept one database per repository, `<data dir>/projects/<digest>.db`. This version keeps every repository in one machine-wide database, `<data dir>/am.db`. `am migrate` moves the old data across:
