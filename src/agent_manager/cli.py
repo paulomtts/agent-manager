@@ -89,6 +89,7 @@ from agent_manager.runs import (
     BaseBranchError,
     RunnerFactory,
     UnknownRunError,
+    unknown_run,
     compute_dry_run_plan,
     continuable_checkpoint,
     gate_context,
@@ -2693,18 +2694,11 @@ def _check_event_values(
 
 
 def _refuse_unknown_run(conn: sqlite3.Connection, run_id: str) -> None:
-    """`UnknownRunError` naming `run_id` unless it has an `events` row or a
-    `runs` row. Lease and claim events can precede the run's `run_upsert`, and
-    a `runs` row can exist without events: either makes the run known. Run it
-    inside the caller's snapshot. Read-only."""
-    if (
-        not store_events.has_run(conn, run_id)
-        and store_queries.load_run(conn, run_id) is None
-    ):
-        raise UnknownRunError(
-            f"run {run_id!r} is not in the projection"
-            " (`agent-manager runs --all-projects` lists the ones that are)"
-        )
+    """`unknown_run(run_id)` unless `store_queries.run_known` knows the run (an
+    `events` row or a `runs` row). Run it inside the caller's snapshot.
+    Read-only."""
+    if not store_queries.run_known(conn, run_id):
+        raise unknown_run(run_id)
 
 
 def events_for(

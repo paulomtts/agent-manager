@@ -475,6 +475,19 @@ def run_project_id(conn: sqlite3.Connection, run_id: str) -> int | None:
     return None if row is None else row["project_id"]
 
 
+def run_known(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Whether `run_id` has an `events` row, of any kind and any project, or a
+    `runs` row. Lease and claim events can precede the run's `run_upsert`, and
+    a `runs` row can exist without events: either makes the run known. The
+    one definition of a run looked up by id alone. Read-only."""
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?)"
+        " OR EXISTS (SELECT 1 FROM runs WHERE id = ?)",
+        (run_id, run_id),
+    ).fetchone()
+    return bool(row[0])
+
+
 def run_cursor(conn: sqlite3.Connection, run_id: str) -> tuple[RunCursor, int] | None:
     """`run_id` as a `list_runs` `before` cursor, with its `runs.project_id`,
     or `None` if the run was never recorded.
