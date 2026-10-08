@@ -312,7 +312,35 @@ def _is_none_like(command: object) -> bool:
     return isinstance(command, str) and _NONE_LIKE.match(command) is not None
 
 
-def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
+def _explore_command_runnable(argv: list[str], worktree_path: str | None) -> bool:
+    """Whether `argv[0]` resolves to something actually runnable.
+
+    A second, broader defense alongside `_is_none_like`: that regex only
+    catches a sentence that *starts* with `none`/`n/a`/`null`/`nil`, but
+    Explore has also been seen writing e.g. `"no separate lint command; ..."`
+    -- "no", not "none" -- which the regex misses entirely. Rather than grow
+    the regex indefinitely, this checks the thing that actually matters:
+    whether `argv[0]` resolves against `PATH` or, for a relative path,
+    against the worktree. A true typo in a real command still surfaces
+    normally; a stray sentence is treated as the blank case `_argv_for`
+    already skips.
+    """
+    import shutil
+
+    head = argv[0]
+    if shutil.which(head) is not None:
+        return True
+    path = Path(head)
+    if path.is_absolute():
+        return path.is_file()
+    if worktree_path is not None:
+        return (Path(worktree_path) / head).is_file()
+    return path.is_file()
+
+
+def _plan_explore_commands(
+    explore: object, worktree_path: str | None = None
+) -> list[tuple[object, list[str]]]:
     """Explore's `verification.typecheck` then each `verification.lint` entry.
 
     Pygents design G9 item 4: these run after the `--verify` commands, in that
@@ -322,6 +350,11 @@ def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
     exactly like a malformed `--verify` command. `typecheck` and `lint` carry
     no alias in `results.Verification`, so the engine's snake_case dump and a
     hand-written camelCase result use the same two keys.
+
+    An entry whose `argv[0]` does not resolve to anything runnable
+    (`_explore_command_runnable`) is also skipped, exactly like a blank
+    entry: see that function's docstring for why this catches cases
+    `_is_none_like` doesn't.
     """
     verification = _field(explore, "verification")
     planned: list[tuple[object, list[str]]] = []
@@ -329,14 +362,16 @@ def _plan_explore_commands(explore: object) -> list[tuple[object, list[str]]]:
     typecheck = _field(verification, "typecheck")
     if typecheck is not None and not _is_none_like(typecheck):
         argv = _argv_for(typecheck)
-        if argv is not None:
+        if argv is not None and _explore_command_runnable(argv, worktree_path):
             planned.append((typecheck, argv))
 
     lint = _field(verification, "lint")
     if lint is not None:
         if isinstance(lint, (list, tuple)):
             lint = [entry for entry in lint if not _is_none_like(entry)]
-        planned.extend(_plan_commands(lint))
+        for entry, argv in _plan_commands(lint):
+            if _explore_command_runnable(argv, worktree_path):
+                planned.append((entry, argv))
 
     return planned
 
@@ -422,8 +457,11 @@ def run_suite(
     call -- the runner is called as `runner(argv, cwd)`, exactly as before,
     and `run_command` then runs the command with neither variable set.
     """
-    planned = [*_plan_commands(commands), *_plan_explore_commands(explore)]
     worktree_path = _required_worktree(worktree)
+    planned = [
+        *_plan_commands(commands),
+        *_plan_explore_commands(explore, worktree_path),
+    ]
     overlay = _id_overlay(run_id, card)
     if log_dir is not None:
         _start_logs(Path(log_dir))
