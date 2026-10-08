@@ -3364,14 +3364,24 @@ def _watch_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _watch_hello() -> dict[str, Any]:
+def _watch_hello(*, head: int, cursor_reset: bool, store_id: str | None) -> dict[str, Any]:
     """The first line of `am watch --follow`, and the only one that is not a
     JournalLine. Its `schema` is 2; the journal lines after it are emitted as
-    stored."""
+    stored.
+
+    `head` is the machine-wide head the stream started from (0 with no
+    `am.db`); `cursor_reset` is whether `--since-seq` was above it, so the
+    stream starts at head instead; `store_id` is the id of the database read
+    at start (`None` with no `am.db`), so a consumer can tell a replaced
+    database even when its head is at or above the cursor it holds.
+    """
     return {
         "event": "watch",
         "schema": 2,
         "am": __version__,
+        "head": head,
+        "cursor_reset": cursor_reset,
+        "store_id": store_id,
         "runs_dir": str(paths.data_path() / "runs"),
     }
 
@@ -3386,21 +3396,23 @@ def _emit_stream_line(obj: Mapping[str, Any]) -> None:
 @dataclass
 class _WatchCursor:
     """Where `am watch --follow` has read to: `gseq`, the largest global `seq`
-    any poll read (emitted or filtered out by `--since`), starting at
-    `--since-seq` or, with `--from-now`, at head; and `project_id`,
+    any poll read (emitted or filtered out by `--since`), starting where
+    `_stream_watch` chose from the start read; and `project_id`,
     `--project`'s id once a poll found it."""
 
     gseq: int = 0
     project_id: int | None = None
 
 
-def _watch_head() -> int:
-    """The machine-wide `head`, on a read connection of its own, closed
-    before returning; 0 with no `am.db`."""
+def _watch_start() -> tuple[int, str | None]:
+    """The machine-wide `head` and `store_db.store_id` a stream starts from,
+    read in one snapshot on a read connection of its own, closed on every
+    path; `(0, None)` with no `am.db`, and nothing is created. The stream's
+    only head read."""
     conn = store_db.open_db_for_reading(Path("."))
     try:
         with store_db.read_snapshot(conn):
-            return store_events.head(conn)
+            return store_events.head(conn), store_db.store_id(conn)
     finally:
         conn.close()
 
@@ -3448,8 +3460,8 @@ def _follow_watch(
     since: int,
     sleep: Callable[[float], None],
     max_polls: int | None,
-    from_now: bool = False,
-    since_seq: int = 0,
+    start_gseq: int = 0,
+    backlog: bool = True,
 ) -> Iterator[dict[str, Any]]:
     """The backlog, then every event recorded after it.
 
@@ -3458,19 +3470,14 @@ def _follow_watch(
     `_WatchCursor` spans every poll, so no event is emitted twice and none is
     skipped, however runs interleave across polls.
 
-    The cursor starts at `since_seq` (`--since-seq`, 0 when not given), so
-    the backlog is the selected events above it; a `since_seq` at or above
-    head is not an error, only events committed later above it are emitted.
-
-    With `from_now` there is no backlog poll: the cursor starts at the
-    machine-wide `head`, so only events committed after the start are
-    emitted, and a run or project that appears later is emitted from its
-    first event. `watch_for` refuses `from_now` with `--since-seq`.
+    The cursor starts at `start_gseq`, which `_stream_watch` chose from the
+    start read; this never reads head itself. Without `backlog`
+    (`--from-now`) there is no poll before the first sleep, so only events
+    committed after the start are emitted, and a run or project that appears
+    later is emitted from its first event.
     """
-    cursor = _WatchCursor(gseq=since_seq)
-    if from_now:
-        cursor.gseq = _watch_head()
-    else:
+    cursor = _WatchCursor(gseq=start_gseq)
+    if backlog:
         yield from _poll_watch(cursor, run_id=run_id, project=project, since=since)
     polls = 0
     while max_polls is None or polls < max_polls:
@@ -3500,30 +3507,45 @@ def _stream_watch(
     *,
     project: Path | None = None,
     since: int,
+    head: int,
+    store_id: str | None,
     from_now: bool = False,
-    since_seq: int = 0,
+    since_seq: int | None = None,
 ) -> None:
-    """The body of `am watch --follow`, once `watch_for` has accepted the call.
+    """The body of `am watch --follow`, once `watch_for` has accepted the call
+    and `watch` has made the start read (`_watch_start`).
 
-    `since_seq` is where the stream's `gseq` cursor starts (`--since-seq`, 0
-    when not given). `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at
-    call time, so a test that replaces them controls every poll. Ctrl-C and a
-    closed pipe are how a stream normally ends: exit 0, nothing on stderr. An
-    error after the hello line (a busy or too-new database, a row whose
-    payload is not JSON or whose kind `JournalLine` refuses) cannot get an
-    envelope, because every line after the first must be an event line. So
-    its message goes to stderr and the exit is `EXIT_ERROR`.
+    The cursor starts at 0 with no `since_seq`, at `since_seq` when it is at
+    or below `head`, and at `head` with `from_now` (no backlog poll) or when
+    `since_seq` is above it: that cursor belongs to another database, so the
+    hello says `cursor_reset: true` and every event committed after the
+    start is emitted. A reset is not an error.
+
+    `_watch_sleep` and `WATCH_MAX_POLLS` are looked up at call time, so a
+    test that replaces them controls every poll. Ctrl-C and a closed pipe
+    are how a stream normally ends: exit 0, nothing on stderr. An error
+    after the hello line (a busy or too-new database, a row whose payload is
+    not JSON or whose kind `JournalLine` refuses) cannot get an envelope,
+    because every line after the first must be an event line. So its
+    message goes to stderr and the exit is `EXIT_ERROR`.
     """
+    cursor_reset = since_seq is not None and since_seq > head
+    if from_now or cursor_reset:
+        start_gseq = head
+    else:
+        start_gseq = since_seq or 0
     try:
-        _emit_stream_line(_watch_hello())
+        _emit_stream_line(
+            _watch_hello(head=head, cursor_reset=cursor_reset, store_id=store_id)
+        )
         for event in _follow_watch(
             run_id,
             project=project,
             since=since,
             sleep=_watch_sleep,
             max_polls=WATCH_MAX_POLLS,
-            from_now=from_now,
-            since_seq=since_seq,
+            start_gseq=start_gseq,
+            backlog=not from_now,
         ):
             _emit_stream_line(event)
     except KeyboardInterrupt:
@@ -3749,16 +3771,22 @@ def watch(
             since_given=since_given,
             since_seq=since_seq,
         )
+        # The stream's one start read comes before any stream line, so its
+        # failure is a refusal envelope like `watch_for`'s.
+        start = _watch_start() if follow else None
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None
-    if follow:
+    if start is not None:
+        head, store_id = start
         _stream_watch(
             run_id,
             project=project,
             since=since_value,
+            head=head,
+            store_id=store_id,
             from_now=from_now,
-            since_seq=since_seq or 0,
+            since_seq=since_seq,
         )
         return
     typer.echo(render(ok_envelope(payload), pretty=pretty))

@@ -12611,18 +12611,36 @@ def _stream(result) -> list[dict[str, Any]]:
     return [json.loads(line) for line in result.stdout.splitlines()]
 
 
-def _hello(tmp_path: Path) -> dict[str, Any]:
+WATCH_HELLO_KEYS = {"event", "schema", "am", "head", "cursor_reset", "store_id", "runs_dir"}
+
+
+def _hello(
+    tmp_path: Path, *, head: int, store_id: str | None, cursor_reset: bool = False
+) -> dict[str, Any]:
+    """The hello of a stream that started at machine-wide `head` on the
+    database `store_id` names (`None`: no `am.db` at start)."""
     return {
         "event": "watch",
         "schema": 2,
         "am": agent_manager.__version__,
+        "head": head,
+        "cursor_reset": cursor_reset,
+        "store_id": store_id,
         "runs_dir": str(_watch_runs_dir(tmp_path)),
     }
 
 
 def test_watch_hello_is_schema_2(projection, tmp_path, monkeypatch):
-    hello = cli._watch_hello()
-    assert hello["schema"] == 2
+    hello = cli._watch_hello(head=7, cursor_reset=True, store_id="abc")
+    assert hello == {
+        "event": "watch",
+        "schema": 2,
+        "am": agent_manager.__version__,
+        "head": 7,
+        "cursor_reset": True,
+        "store_id": "abc",
+        "runs_dir": str(_watch_runs_dir(tmp_path)),
+    }
     assert type(hello["schema"]) is int
     _insert_events(
         projection,
@@ -12630,6 +12648,8 @@ def test_watch_hello_is_schema_2(projection, tmp_path, monkeypatch):
         (EVENTS_RUN_A, "story_upsert"),
         (EVENTS_RUN_B, "run_upsert"),
     )
+    store_id = _store_id(projection)
+    assert isinstance(store_id, str) and store_id
 
     for argv in (
         [EVENTS_RUN_A],
@@ -12645,9 +12665,11 @@ def test_watch_hello_is_schema_2(projection, tmp_path, monkeypatch):
         assert result.exit_code == 0, (argv, result.output)
         lines = _stream(result)
         first = lines[0]
-        assert set(first) == {"event", "schema", "am", "runs_dir"}, argv
+        assert set(first) == WATCH_HELLO_KEYS, argv
         assert type(first["schema"]) is int, argv
-        assert first == _hello(tmp_path), argv
+        assert type(first["head"]) is int, argv
+        assert first["cursor_reset"] is False, argv
+        assert first == _hello(tmp_path, head=3, store_id=store_id), argv
         # One hello per stream; every other line is an event with a gseq.
         assert [line for line in lines if "gseq" not in line] == [first], argv
 
@@ -12669,7 +12691,7 @@ def test_watch_schema_2_replays_legacy_cancelled_unchanged(projection, tmp_path,
 
     assert result.exit_code == 0, result.output
     lines = _stream(result)
-    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in rows]]
+    assert lines == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in rows]]
     assert lines[0]["schema"] == 2
     assert lines[1]["payload"] == {"run_id": "run-old", "status": "cancelled"}
 
@@ -12688,7 +12710,7 @@ def test_watch_follow_hello_line_shape(projection, tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert sleeps == []
     lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
+    assert lines[0] == _hello(tmp_path, head=4, store_id=_store_id(projection))
     assert lines[1:] == [_watch_event(row) for row in rows[2:]]
     assert [line["seq"] for line in lines[1:]] == [3, 4]
     # Bare lines: no envelope, and compact, one object per line.
@@ -12780,7 +12802,7 @@ def test_watch_follow_observes_an_event_inserted_after_start(
     assert cli.WATCH_POLL_SECONDS == 0.25
     assert sleeps == [cli.WATCH_POLL_SECONDS, cli.WATCH_POLL_SECONDS]
     lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
+    assert lines[0] == _hello(tmp_path, head=2, store_id=_store_id(projection))
     assert lines[1:] == [_watch_event(row) for row in backlog + inserted]
     assert [line["seq"] for line in lines[1:]] == [1, 2, 3]
     assert [line["gseq"] for line in lines[1:]] == [row.seq for row in backlog + inserted]
@@ -12811,7 +12833,7 @@ def test_watch_follow_one_cursor_across_runs(projection, tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert len(sleeps) == 4
     lines = _stream(result)
-    assert lines[0] == _hello(tmp_path)
+    assert lines[0] == _hello(tmp_path, head=2, store_id=_store_id(projection))
     # Every row exactly once, in gseq order, whichever run and poll it came in.
     assert lines[1:] == [_watch_event(row) for row in written]
     gseqs = [line["gseq"] for line in lines[1:]]
@@ -12851,7 +12873,7 @@ def test_watch_follow_since_filtered_rows_advance_the_cursor(
     assert result.exit_code == 0, result.output
     a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
     assert _stream(result) == [
-        _hello(tmp_path),
+        _hello(tmp_path, head=2, store_id=_store_id(projection)),
         _watch_event(a_rows[2]),
         _watch_event(a_rows[3]),
     ]
@@ -12864,12 +12886,14 @@ def test_watch_follow_since_filtered_rows_advance_the_cursor(
     def poll_three() -> None:
         rows.extend(_insert_events(projection, (EVENTS_RUN_A, "attempt_upsert")))
 
+    quiet_head = rows[-1].seq
     quiet, _ = _watch_follow(
         monkeypatch, EVENTS_RUN_A, "--since", "99", actions=[poll_three, lambda: None]
     )
 
     assert quiet.exit_code == 0, quiet.output
-    assert _stream(quiet) == [_hello(tmp_path)]
+    assert quiet_head == 5
+    assert _stream(quiet) == [_hello(tmp_path, head=quiet_head, store_id=_store_id(projection))]
     assert reads == [0, a_rows[3].seq, rows[-1].seq]
 
 
@@ -12879,7 +12903,7 @@ def test_watch_follow_all_picks_up_a_database_created_later(
     # Nothing to watch yet: the hello line alone, and nothing created.
     idle, _ = _watch_follow(monkeypatch, "--all", actions=[lambda: None, lambda: None])
     assert idle.exit_code == 0, idle.output
-    assert _stream(idle) == [_hello(tmp_path)]
+    assert _stream(idle) == [_hello(tmp_path, head=0, store_id=None)]
     assert not paths.db_path().exists()
 
     created: list[store_events.EventRow] = []
@@ -12894,7 +12918,7 @@ def test_watch_follow_all_picks_up_a_database_created_later(
     result, _ = _watch_follow(monkeypatch, "--all", actions=[create, lambda: None])
 
     assert result.exit_code == 0, result.output
-    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in created]]
+    assert _stream(result) == [_hello(tmp_path, head=0, store_id=None), *[_watch_event(row) for row in created]]
 
 
 def test_watch_follow_project_picks_up_a_project_that_appears_later(
@@ -12925,7 +12949,7 @@ def test_watch_follow_project_picks_up_a_project_that_appears_later(
 
     assert result.exit_code == 0, result.output
     assert _stream(result) == [
-        _hello(tmp_path),
+        _hello(tmp_path, head=1, store_id=_store_id(root)),
         _watch_event(later[0]),
         _watch_event(later[2]),
     ]
@@ -12953,7 +12977,7 @@ def test_watch_follow_mid_stream_error_ends_with_stderr_line(
     assert result.exit_code == cli.EXIT_ERROR, result.output
     assert len(sleeps) == 2  # the stream ended on the unreadable poll
     assert _stream(result) == [
-        _hello(tmp_path),
+        _hello(tmp_path, head=1, store_id=_store_id(projection)),
         *[_watch_event(row) for row in backlog + inserted],
     ]
     message = result.stderr.strip()
@@ -12973,7 +12997,7 @@ def test_watch_follow_ctrl_c_exits_zero_quietly(projection, tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
-    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in backlog]]
+    assert _stream(result) == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in backlog]]
 
 
 def test_watch_follow_closed_pipe_exits_zero_quietly(projection, tmp_path, monkeypatch):
@@ -12993,7 +13017,7 @@ def test_watch_follow_closed_pipe_exits_zero_quietly(projection, tmp_path, monke
 
     assert result.exit_code == 0, result.output
     assert result.stderr == ""
-    assert _stream(result) == [_hello(tmp_path)]
+    assert _stream(result) == [_hello(tmp_path, head=2, store_id=_store_id(projection))]
 
 
 def test_watch_follow_closed_pipe_points_stdout_at_devnull(monkeypatch):
@@ -13009,6 +13033,102 @@ def test_watch_follow_closed_pipe_points_stdout_at_devnull(monkeypatch):
         assert (target.st_dev, target.st_ino) == (devnull.st_dev, devnull.st_ino)
         dead_pipe.write("after the reader left\n")
         dead_pipe.flush()  # would raise BrokenPipeError on the pipe
+
+
+def test_watch_follow_hello_on_an_empty_machine(projection, tmp_path, monkeypatch):
+    """Review Focus 4 and 5: no `am.db`, so head 0 and a JSON null store_id,
+    and the start read creates nothing."""
+    result, sleeps = _watch_follow(monkeypatch, "--all", actions=[lambda: None])
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [cli.WATCH_POLL_SECONDS]
+    assert result.stderr == ""
+    assert '"store_id":null' in result.stdout.splitlines()[0]
+    assert _stream(result) == [_hello(tmp_path, head=0, store_id=None)]
+    hello = _stream(result)[0]
+    assert hello["head"] == 0
+    assert hello["cursor_reset"] is False
+    assert hello["store_id"] is None
+    assert not paths.db_path().exists()
+
+
+def test_watch_follow_from_now_hello_head_is_where_the_stream_starts(
+    projection, tmp_path, monkeypatch
+):
+    """Review Focus 2: head is read once, and the hello's head is exactly
+    where --from-now starts the cursor."""
+    _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+        (EVENTS_RUN_A, "subtask_upsert"),
+    )
+    store_id = _store_id(projection)
+    original_head = store_events.head
+    head_reads: list[int] = []
+
+    def counting_head(conn) -> int:
+        value = original_head(conn)
+        head_reads.append(value)
+        return value
+
+    monkeypatch.setattr(store_events, "head", counting_head)
+    later: list[store_events.EventRow] = []
+
+    def record_two() -> None:
+        later.extend(
+            _insert_events(projection, (EVENTS_RUN_A, "phase_upsert"), (EVENTS_RUN_B, "run_upsert"))
+        )
+
+    result, _ = _watch_follow(
+        monkeypatch, "--all", "--from-now", actions=[record_two, lambda: None]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert [row.seq for row in later] == [4, 5]
+    assert _stream(result) == [
+        _hello(tmp_path, head=3, store_id=store_id),
+        *[_watch_event(row) for row in later],
+    ]
+    assert head_reads == [3]
+
+
+def test_watch_follow_start_read_failure_is_an_envelope(projection, tmp_path, monkeypatch):
+    """Review Focus 3: the start read fails before any stream line, so it is
+    a refusal: one envelope on stdout, nothing on stderr, no hello, no poll."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    raw = sqlite3.connect(paths.db_path())
+    try:
+        raw.execute(f"PRAGMA user_version = {store_db.SCHEMA_VERSION + 1}")
+        raw.commit()
+    finally:
+        raw.close()
+
+    for extra in ([], ["--pretty"]):
+        result, sleeps = _watch_follow(monkeypatch, "--all", *extra, actions=[lambda: None])
+
+        assert result.exit_code == cli.EXIT_ERROR, (extra, result.output)
+        assert result.stderr == "", extra
+        assert sleeps == [], extra
+        envelope = json.loads(result.stdout)
+        assert envelope["ok"] is False, extra
+        assert envelope["error"]["type"] == "StoreSchemaError", extra
+        assert "event" not in envelope, extra
+        assert '"watch"' not in result.stdout, extra
+        if extra:
+            assert "\n" in result.stdout.strip()
+        else:
+            assert len(result.stdout.splitlines()) == 1
+
+
+def test_watch_one_shot_has_no_hello_fields(projection, tmp_path, monkeypatch):
+    rows = _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+
+    data = _watch_data("--all")
+
+    assert set(data) == {"events"}
+    assert data == {"events": [_watch_event(rows[0])]}
 
 
 def test_watch_follow_silence_stdout_leaves_a_descriptorless_stdout_alone(monkeypatch):
@@ -13170,7 +13290,7 @@ def test_watch_follow_from_now_skips_backlog(projection, tmp_path, monkeypatch):
     )
     assert idle.exit_code == 0, idle.output
     assert idle_sleeps == [cli.WATCH_POLL_SECONDS]
-    assert _stream(idle) == [_hello(tmp_path)]
+    assert _stream(idle) == [_hello(tmp_path, head=3, store_id=_store_id(projection))]
 
     inserted: list[store_events.EventRow] = []
 
@@ -13196,7 +13316,7 @@ def test_watch_follow_from_now_skips_backlog(projection, tmp_path, monkeypatch):
     assert sleeps == [cli.WATCH_POLL_SECONDS] * 3
     lines = _stream(result)
     a_rows = [row for row in inserted if row.run_id == EVENTS_RUN_A]
-    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in a_rows]]
+    assert lines == [_hello(tmp_path, head=3, store_id=_store_id(projection)), *[_watch_event(row) for row in a_rows]]
     assert [line["seq"] for line in lines[1:]] == [3, 4]
     assert result.stderr == ""
 
@@ -13231,7 +13351,7 @@ def test_watch_follow_all_from_now_emits_runs_created_later_in_full(
     assert result.exit_code == 0, result.output
     assert len(sleeps) == 2
     lines = _stream(result)
-    assert lines == [_hello(tmp_path), *[_watch_event(row) for row in later]]
+    assert lines == [_hello(tmp_path, head=2, store_id=_store_id(projection)), *[_watch_event(row) for row in later]]
     assert [line["seq"] for line in lines[1:] if line["run_id"] == EVENTS_RUN_B] == [1, 2, 3]
     assert result.stderr == ""
 
@@ -13254,7 +13374,7 @@ def test_watch_follow_from_now_on_an_empty_machine_emits_every_later_event(
     )
 
     assert result.exit_code == 0, result.output
-    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in later]]
+    assert _stream(result) == [_hello(tmp_path, head=0, store_id=None), *[_watch_event(row) for row in later]]
 
 
 # ── am watch --since-seq (card b3818d9f) ───────────────────────────────────
@@ -13407,8 +13527,10 @@ def test_watch_follow_since_seq_resumes_then_follows_without_repeat(
         ([EVENTS_RUN_A], lambda row: row.run_id == EVENTS_RUN_A),
         (["--project", str(projection)], lambda row: True),
     ):
-        # The cursor sits two rows below head, so the backlog is not empty.
-        since_seq = rows[-1].seq - 2
+        # The cursor sits two rows below head, so the backlog is not empty
+        # and there is no reset.
+        head = rows[-1].seq
+        since_seq = head - 2
         result, sleeps = _watch_follow(
             monkeypatch,
             *argv,
@@ -13425,7 +13547,11 @@ def test_watch_follow_since_seq_resumes_then_follows_without_repeat(
         assert sleeps == [cli.WATCH_POLL_SECONDS] * 3, argv
         lines = _stream(result)
         expected = [row for row in rows if row.seq > since_seq and keep(row)]
-        assert lines == [_hello(tmp_path), *[_watch_event(row) for row in expected]], argv
+        assert lines == [
+            _hello(tmp_path, head=head, store_id=_store_id(projection)),
+            *[_watch_event(row) for row in expected],
+        ], argv
+        assert lines[0]["cursor_reset"] is False, argv
         gseqs = [line["gseq"] for line in lines[1:]]
         assert gseqs == sorted(set(gseqs)), argv
         assert all(gseq > since_seq for gseq in gseqs), argv
@@ -13434,45 +13560,127 @@ def test_watch_follow_since_seq_resumes_then_follows_without_repeat(
         assert result.stderr == ""
 
 
-def test_watch_follow_since_seq_above_head_is_not_an_error(
+def test_watch_follow_since_seq_above_head_resets_the_cursor(
     projection, tmp_path, monkeypatch
 ):
+    """Review Focus 1: a cursor equal to head is not a reset; one above it
+    is, and is not an error: exit 0, nothing on stderr."""
     _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
     head = 2
+    store_id = _store_id(projection)
 
-    # At head and above it, nothing new written: the hello alone, exit 0.
+    # Nothing new written: the hello alone, with or without a reset.
     for selector in (["--all"], [EVENTS_RUN_A]):
-        for since_seq in (head, head + 5):
+        for since_seq, reset in ((head, False), (head + 5, True)):
             idle, sleeps = _watch_follow(
                 monkeypatch, *selector, "--since-seq", str(since_seq), actions=[lambda: None]
             )
             assert idle.exit_code == 0, (selector, since_seq, idle.output)
             assert sleeps == [cli.WATCH_POLL_SECONDS]
-            assert _stream(idle) == [_hello(tmp_path)]
-            # No reset in this card: the hello carries no cursor_reset.
-            assert "cursor_reset" not in _stream(idle)[0]
+            assert _stream(idle) == [
+                _hello(tmp_path, head=head, store_id=store_id, cursor_reset=reset)
+            ], (selector, since_seq)
+            assert _stream(idle)[0]["cursor_reset"] is reset
             assert idle.stderr == ""
 
-    # Rows written later are emitted only once their gseq exceeds the cursor.
     later: list[store_events.EventRow] = []
 
     def record_seven() -> None:
         later.extend(_insert_events(projection, *[(EVENTS_RUN_A, "subtask_upsert")] * 7))
 
-    since_seq = head + 5
     result, _ = _watch_follow(
         monkeypatch,
         "--all",
         "--since-seq",
-        str(since_seq),
+        str(head + 5),
         actions=[record_seven, lambda: None],
     )
 
     assert result.exit_code == 0, result.output
+    assert result.stderr == ""
     assert [row.seq for row in later] == [3, 4, 5, 6, 7, 8, 9]
-    expected = [row for row in later if row.seq > since_seq]
-    assert [row.seq for row in expected] == [8, 9]
-    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in expected]]
+    # The reset moved the cursor to head: every later row, not only 8 and 9.
+    assert _stream(result) == [
+        _hello(tmp_path, head=head, store_id=store_id, cursor_reset=True),
+        *[_watch_event(row) for row in later],
+    ]
+
+
+def test_watch_follow_since_seq_reset_respects_selector_and_since(
+    projection, tmp_path, monkeypatch
+):
+    """A reset only moves where the cursor starts: RUN and --since still filter."""
+    _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),  # gseq 1, run_seq 1
+        (EVENTS_RUN_B, "run_upsert"),  # gseq 2
+        (EVENTS_RUN_A, "story_upsert"),  # gseq 3, run_seq 2
+    )
+    head = 3
+    store_id = _store_id(projection)
+    later: list[store_events.EventRow] = []
+
+    def record_later() -> None:
+        later.extend(
+            _insert_events(
+                projection,
+                (EVENTS_RUN_B, "story_upsert"),  # gseq 4: another run
+                (EVENTS_RUN_A, "subtask_upsert"),  # gseq 5, run_seq 3: not above --since 3
+                (EVENTS_RUN_A, "phase_upsert"),  # gseq 6, run_seq 4
+            )
+        )
+
+    result, _ = _watch_follow(
+        monkeypatch,
+        EVENTS_RUN_A,
+        "--since-seq",
+        str(head + 10),
+        "--since",
+        "3",
+        actions=[record_later, lambda: None],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    expected = [row for row in later if row.run_id == EVENTS_RUN_A and row.run_seq > 3]
+    assert [(row.seq, row.run_seq) for row in expected] == [(6, 4)]
+    assert _stream(result) == [
+        _hello(tmp_path, head=head, store_id=store_id, cursor_reset=True),
+        *[_watch_event(row) for row in expected],
+    ]
+
+
+def test_watch_follow_hello_store_id_tells_a_replaced_database(
+    projection, tmp_path, monkeypatch
+):
+    """A replaced database whose head is at or above the consumer's cursor
+    is no reset, but its hello names a different store_id."""
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert"))
+    before, _ = _watch_follow(monkeypatch, "--all")
+    assert before.exit_code == 0, before.output
+    old = _stream(before)[0]
+    assert old["head"] == 2
+    old_store_id = old["store_id"]
+    assert isinstance(old_store_id, str) and old_store_id
+
+    db = paths.db_path()
+    for path in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+        path.unlink(missing_ok=True)
+    rows = _insert_events(projection, *[(EVENTS_RUN_B, "run_upsert")] * 5)
+    assert [row.seq for row in rows] == [1, 2, 3, 4, 5]
+    new_store_id = _store_id(projection)
+    assert isinstance(new_store_id, str) and new_store_id != old_store_id
+
+    # The consumer holds (old_store_id, 2): 2 <= 5, so no reset...
+    resumed, _ = _watch_follow(monkeypatch, "--all", "--since-seq", "2")
+
+    assert resumed.exit_code == 0, resumed.output
+    lines = _stream(resumed)
+    # ...but the store_id tells it the cursor belongs to another database.
+    assert lines[0] == _hello(tmp_path, head=5, store_id=new_store_id)
+    assert lines[0]["cursor_reset"] is False
+    assert lines[0]["store_id"] != old_store_id
+    assert lines[1:] == [_watch_event(row) for row in rows[2:]]
 
 
 def test_watch_since_seq_and_since_both_filter(projection, tmp_path, monkeypatch):
@@ -13504,7 +13712,10 @@ def test_watch_since_seq_and_since_both_filter(projection, tmp_path, monkeypatch
     assert result.exit_code == 0, result.output
     expected = [row for row in rows if row.seq > 2 and row.run_seq > 1]
     assert [(row.seq, row.run_seq) for row in expected] == [(4, 3), (5, 2)]
-    assert _stream(result) == [_hello(tmp_path), *[_watch_event(row) for row in expected]]
+    assert _stream(result) == [
+        _hello(tmp_path, head=3, store_id=_store_id(projection)),
+        *[_watch_event(row) for row in expected],
+    ]
 
     # One-shot: the same rows.
     assert _watch_data("--all", "--since", "1", "--since-seq", "2") == {
@@ -13513,8 +13724,10 @@ def test_watch_since_seq_and_since_both_filter(projection, tmp_path, monkeypatch
 
 
 def test_watch_follow_since_seq_project_created_later(projection, tmp_path, monkeypatch):
-    """Review Focus 2: a --project path with no row yet is looked up on every
-    poll, and once it exists only its rows above the cursor are emitted."""
+    """Review Focus 2 of card b3818d9f: a --project path with no row yet is
+    looked up on every poll, and once it exists only its rows above the
+    cursor are emitted. Here --since-seq 3 is above head 2, so the cursor is
+    reset to head and both of the project's later rows are emitted."""
     _insert_events(
         projection,
         (EVENTS_RUN_A, "run_upsert"),  # gseq 1
@@ -13547,7 +13760,11 @@ def test_watch_follow_since_seq_project_created_later(projection, tmp_path, monk
     assert result.exit_code == 0, result.output
     assert len(sleeps) == 3
     assert [row.seq for row in later] == [3, 4]
-    assert _stream(result) == [_hello(tmp_path), _watch_event(later[1])]
+    assert _stream(result) == [
+        _hello(tmp_path, head=2, store_id=_store_id(projection), cursor_reset=True),
+        _watch_event(later[0]),
+        _watch_event(later[1]),
+    ]
     assert result.stderr == ""
 
 
