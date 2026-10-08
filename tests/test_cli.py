@@ -6502,6 +6502,243 @@ def test_events_before_seq_with_limit_alone_is_accepted(projection):
     assert [line["event"] for line in forward["events"]] == ["run_upsert", "story_upsert"]
 
 
+# ── am events --escalations (card 4b44104a) ──────────────────────────────────
+
+
+def _insert_rows(*specs: tuple[Path, str, str, dict[str, Any]]) -> list[store_events.EventRow]:
+    """One `events` row per `(repo, run_id, kind, payload)`, in order, each in
+    `repo`'s project, committed together on a connection of its own; the rows
+    as stored. No `runs` row is written."""
+    conn = store_db.open_db(specs[0][0])
+    try:
+        rows = []
+        for repo, run_id, kind, payload in specs:
+            project_id = store_projects.resolve(conn, repo, now=RECORDED_AT)
+            rows.append(
+                store_events.insert(
+                    conn,
+                    project_id=project_id,
+                    run_id=run_id,
+                    ts=EVENT_TS,
+                    kind=kind,
+                    payload=payload,
+                    source="live",
+                )
+            )
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def escalation_repos(projection) -> tuple[Path, Path]:
+    """`projection` and a sibling repository, `other-repo`, both directories."""
+    other = projection.parent / "other-repo"
+    other.mkdir()
+    return projection, other
+
+
+def _insert_escalation_mix(root: Path, other: Path) -> list[store_events.EventRow]:
+    """Run A in `root`, run B in `other`; only indexes 1, 3 and 5 are
+    escalations (A, B, then A again), and the newest row is not one."""
+    return _insert_rows(
+        (root, EVENTS_RUN_A, "run_upsert", {"status": "running"}),
+        (root, EVENTS_RUN_A, "run_upsert", {"status": "escalated"}),
+        (other, EVENTS_RUN_B, "story_upsert", {"status": "escalated"}),
+        (other, EVENTS_RUN_B, "run_upsert", {"status": "escalated"}),
+        (root, EVENTS_RUN_A, "lease_acquired", {}),
+        (root, EVENTS_RUN_A, "run_upsert", {"status": "escalated", "again": True}),
+        (other, EVENTS_RUN_B, "run_upsert", {"status": "done"}),
+    )
+
+
+def test_escalations_for_lists_every_runs_escalations_in_gseq_order(escalation_repos):
+    """Spec test 8, plan Review Focus 5: two runs in two projects, and no
+    `runs` row for either."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+
+    data = cli.escalations_for()
+
+    assert set(data) == {"events", "head"}
+    assert _gseqs(data) == [rows[1].seq, rows[3].seq, rows[5].seq]
+    assert [line["run_id"] for line in data["events"]] == [
+        EVENTS_RUN_A,
+        EVENTS_RUN_B,
+        EVENTS_RUN_A,
+    ]
+    assert [line["seq"] for line in data["events"]] == [2, 2, 4]
+    for line in data["events"]:
+        assert set(line) == EVENT_LINE_KEYS
+        assert line["event"] == "run_upsert"
+        assert line["payload"]["status"] == "escalated"
+    assert data["events"] == [
+        {**store_events.journal_line(row).model_dump(mode="json"), "gseq": row.seq}
+        for row in (rows[1], rows[3], rows[5])
+    ]
+    assert data["head"] == rows[-1].seq == _events_head(root)
+
+
+def test_escalations_for_pages_forward_by_gseq(escalation_repos):
+    """Spec test 9, Review focus 5: --limit 1 pages visit each escalation once,
+    the re-recorded run's two rows included, then an empty page."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+    full = cli.escalations_for()
+
+    walked = []
+    after = 0
+    for _ in range(10):
+        page = cli.escalations_for(after_seq=after, limit=1)
+        assert page["head"] == full["head"]
+        if not page["events"]:
+            break
+        assert len(page["events"]) == 1
+        walked.extend(page["events"])
+        after = page["events"][-1]["gseq"]
+    else:
+        pytest.fail("paging never reached an empty page")
+
+    assert walked == full["events"]
+    assert _gseqs(cli.escalations_for(after_seq=rows[3].seq)) == [rows[5].seq]
+    assert _gseqs(cli.escalations_for(limit=2)) == [rows[1].seq, rows[3].seq]
+
+
+def test_escalations_for_project_narrows_and_head_stays_machine_wide(escalation_repos):
+    """Spec test 10."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+
+    only_other = cli.escalations_for(project=other)
+    only_root = cli.escalations_for(project=root, after_seq=rows[1].seq)
+
+    assert _gseqs(only_other) == [rows[3].seq]
+    assert _gseqs(only_root) == [rows[5].seq]
+    assert only_other["head"] == only_root["head"] == rows[-1].seq
+
+
+def test_escalations_for_project_matches_every_spelling_of_the_directory(
+    escalation_repos, monkeypatch
+):
+    """Spec test 10, Review focus 3, plan Review Focus 2: `..`, a symlink, a
+    relative path and `~` all name `other`."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+    link = root.parent / "link-to-other"
+    link.symlink_to(other)
+    monkeypatch.setenv("HOME", str(root.parent))
+    monkeypatch.chdir(root)
+
+    for spelling in (
+        root / ".." / other.name,
+        link,
+        Path("..") / other.name,
+        Path("~") / other.name,
+    ):
+        assert _gseqs(cli.escalations_for(project=spelling)) == [rows[3].seq], spelling
+
+
+def test_escalations_for_an_unrecorded_project_is_an_empty_page(escalation_repos):
+    """Spec test 11, Review focus 4, plan Review Focus 3: a missing path, an
+    existing directory that never ran, and a regular file."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+    never_ran = root.parent / "never-ran"
+    never_ran.mkdir()
+    a_file = root.parent / "README.md"
+    a_file.write_text("not a repo\n", encoding="utf-8")
+
+    for project in (root.parent / "deleted-repo", never_ran, a_file):
+        assert cli.escalations_for(project=project) == {
+            "events": [],
+            "head": rows[-1].seq,
+        }, project
+
+
+def test_escalations_for_without_escalations_is_an_empty_page(projection):
+    """Spec test 12: no escalations at all, and an `after_seq` above `head`."""
+    _insert_events(
+        projection, (EVENTS_RUN_A, "run_upsert"), (EVENTS_RUN_A, "story_upsert")
+    )
+    head = _events_head(projection)
+
+    assert cli.escalations_for() == {"events": [], "head": head}
+    assert cli.escalations_for(after_seq=head + 100) == {"events": [], "head": head}
+
+
+def test_escalations_for_after_head_is_an_empty_page(escalation_repos):
+    """Spec test 12."""
+    root, other = escalation_repos
+    rows = _insert_escalation_mix(root, other)
+
+    assert cli.escalations_for(after_seq=rows[-1].seq) == {
+        "events": [],
+        "head": rows[-1].seq,
+    }
+    assert cli.escalations_for(after_seq=rows[5].seq) == {
+        "events": [],
+        "head": rows[-1].seq,
+    }
+
+
+def test_escalations_for_never_shows_an_escalation_after_head(projection, monkeypatch):
+    """Spec test 13: an escalation commits right after `head` returns."""
+    _insert_rows((projection, EVENTS_RUN_A, "run_upsert", {"status": "escalated"}))
+    head_before = _events_head(projection)
+    writer, project_id = _open_event_writer(projection)
+    try:
+
+        def write() -> None:
+            store_events.insert(
+                writer,
+                project_id=project_id,
+                run_id=EVENTS_RUN_B,
+                ts=EVENT_TS,
+                kind="run_upsert",
+                payload={"status": "escalated"},
+                source="live",
+            )
+            writer.commit()
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", write)
+        during = cli.escalations_for()
+
+        assert fired == [True]
+        assert during["head"] == head_before
+        assert [line["run_id"] for line in during["events"]] == [EVENTS_RUN_A]
+        assert all(line["gseq"] <= during["head"] for line in during["events"])
+        after = cli.escalations_for()
+        assert after["head"] > head_before
+        assert [line["run_id"] for line in after["events"]] == [
+            EVENTS_RUN_A,
+            EVENTS_RUN_B,
+        ]
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"limit": 0}, "--limit must be at least 1, got 0"),
+        ({"limit": -1}, "--limit must be at least 1, got -1"),
+        ({"after_seq": -1}, "--after-seq must be 0 or more, got -1"),
+        ({"limit": 0, "after_seq": -1}, "--limit must be at least 1, got 0"),
+    ],
+)
+def test_escalations_for_rejects_bad_values_before_opening_the_db(
+    projection, monkeypatch, kwargs, message
+):
+    """Spec test 14 (value half), with the same messages as `events_for`."""
+    _refuse_to_open_the_db(monkeypatch)
+
+    with pytest.raises(cli.CliError) as caught:
+        cli.escalations_for(**kwargs)
+
+    assert str(caught.value) == message
+
+
 def _write_logs_attempt(
     run_id: str,
     phase: str,

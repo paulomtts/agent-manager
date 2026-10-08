@@ -2665,6 +2665,33 @@ def runs(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
+def _event_line(row: store_events.EventRow) -> dict[str, Any]:
+    """One `am events` line: `row`'s `store_events.journal_line` dumped in
+    JSON mode plus `gseq`, the row's global `seq`. Its own `seq` stays the
+    per-run number."""
+    return {**store_events.journal_line(row).model_dump(mode="json"), "gseq": row.seq}
+
+
+def _check_event_values(
+    *,
+    after_seq: int | None = None,
+    limit: int | None = None,
+    tail: int | None = None,
+    before_seq: int | None = None,
+) -> None:
+    """`am events`' value checks, as `CliError`s, the first failing one in
+    this order: `limit` below 1, `after_seq` below 0, `tail` below 1,
+    `before_seq` below 1. `None` means "not given" and is never refused."""
+    if limit is not None and limit < 1:
+        raise CliError(f"--limit must be at least 1, got {limit}")
+    if after_seq is not None and after_seq < 0:
+        raise CliError(f"--after-seq must be 0 or more, got {after_seq}")
+    if tail is not None and tail < 1:
+        raise CliError(f"--tail must be at least 1, got {tail}")
+    if before_seq is not None and before_seq < 1:
+        raise CliError(f"--before-seq must be at least 1, got {before_seq}")
+
+
 def events_for(
     run_id: str,
     *,
@@ -2706,14 +2733,9 @@ def events_for(
     to it and none after it, so no line's `gseq` exceeds `head`. Read-only;
     the connection is closed on every path.
     """
-    if limit is not None and limit < 1:
-        raise CliError(f"--limit must be at least 1, got {limit}")
-    if after_seq is not None and after_seq < 0:
-        raise CliError(f"--after-seq must be 0 or more, got {after_seq}")
-    if tail is not None and tail < 1:
-        raise CliError(f"--tail must be at least 1, got {tail}")
-    if before_seq is not None and before_seq < 1:
-        raise CliError(f"--before-seq must be at least 1, got {before_seq}")
+    _check_event_values(
+        after_seq=after_seq, limit=limit, tail=tail, before_seq=before_seq
+    )
     if tail is not None:
         for flag, value in (
             ("--after-seq", after_seq),
@@ -2748,14 +2770,55 @@ def events_for(
                 rows = store_events.read(
                     conn, after_seq=after_seq or 0, limit=limit, run_id=run_id
                 )
-            lines = [
-                {
-                    **store_events.journal_line(row).model_dump(mode="json"),
-                    "gseq": row.seq,
-                }
-                for row in rows
-            ]
-            return {"events": lines, "head": head}
+            return {"events": [_event_line(row) for row in rows], "head": head}
+    finally:
+        conn.close()
+
+
+def escalations_for(
+    *,
+    after_seq: int | None = None,
+    limit: int | None = None,
+    project: Path | None = None,
+) -> dict[str, Any]:
+    """Every run's escalation events above `after_seq`, ascending by global
+    `seq`, and the machine-wide `head`.
+
+    An escalation event is what `store_events.read_escalations` says it is (a
+    `run_upsert` whose payload `status` is `"escalated"`); nothing here
+    filters rows. `None` means "not given": `after_seq` reads from 0, and
+    `limit` keeps the first `limit` escalations, so a caller pages forward by
+    passing the last `gseq` as `after_seq`. Lines are `events_for`'s, built
+    by `_event_line`, of every run and every project.
+
+    `project` narrows the page to one repository: `Path(project).expanduser()`
+    is looked up through `store_projects.lookup` (non-strict `resolve()`), so
+    `..` and symlinked spellings of one directory match. It is never created
+    or required to exist, so a path with no `projects` row (a deleted
+    repository, a directory that never ran, a file) is an empty page. `head`
+    stays machine-wide either way.
+
+    `limit` below 1 and `after_seq` below 0 are `CliError`s raised before the
+    database is opened, with `events_for`'s messages. `open_db_for_reading`
+    gets `Path(".")` only because it takes a root, which never chooses the
+    file. Every statement runs in one `store_db.read_snapshot`, and the first
+    one reads `store_events.head`, so no line's `gseq` exceeds `head`.
+    Read-only; the connection is closed on every path.
+    """
+    _check_event_values(after_seq=after_seq, limit=limit)
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        with store_db.read_snapshot(conn):
+            head = store_events.head(conn)
+            project_id = None
+            if project is not None:
+                project_id = store_projects.lookup(conn, Path(project).expanduser())
+                if project_id is None:
+                    return {"events": [], "head": head}
+            rows = store_events.read_escalations(
+                conn, after_seq=after_seq or 0, limit=limit, project_id=project_id
+            )
+            return {"events": [_event_line(row) for row in rows], "head": head}
     finally:
         conn.close()
 
