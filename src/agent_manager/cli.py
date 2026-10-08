@@ -4320,9 +4320,10 @@ def request_control(
     One `BEGIN IMMEDIATE` transaction covers the refusals, the idempotence
     check, the insert and its `control_requested` event (`ts` the request's
     clock), so two requesters cannot both insert and a refusal or a failed
-    event insert leaves no row. A no-op request inserts neither. The project is looked up, never created, so a
-    refusal creates no `projects` row either. The process holding the lease
-    applies the request at its next poll; this function only records it.
+    event insert leaves no row. A no-op request inserts neither. The project
+    is looked up, never created, so a refusal creates no `projects` row
+    either. The process holding the lease applies the request at its next
+    poll; this function only records it.
     SQLite is the only channel (C1).
     """
     if command not in CONTROL_COMMANDS:
