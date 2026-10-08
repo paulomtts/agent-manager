@@ -19,6 +19,7 @@ import pytest
 
 from agent_manager import paths, store
 from agent_manager.store import db
+from agent_manager.store import events as store_events
 from agent_manager.store import leases as store_leases
 from agent_manager.store import projects as store_projects
 from agent_manager.store.writer import Store
@@ -152,6 +153,7 @@ _REPO = Path(__file__).resolve().parents[2]
 _DB_NAMES = (
     "open_db",
     "immediate",
+    "read_snapshot",
     "open_db_for_reading",
     "BUSY_TIMEOUT_SECONDS",
     "_SCHEMA",
@@ -195,6 +197,7 @@ def test_db_is_a_leaf_module_of_the_store_package():
     for function in (
         db.open_db,
         db.immediate,
+        db.read_snapshot,
         db.open_db_for_reading,
         db.store_id,
         db.run_with_retry,
@@ -1561,3 +1564,169 @@ def test_open_reader_is_read_only_and_sees_committed_rows(repo):
 
     assert "committed" in keys
     assert "uncommitted" not in keys
+
+
+def _append_event(writer: sqlite3.Connection, project_id: int) -> int:
+    """Commit one event on `writer` under `immediate` and return its `seq`."""
+    with db.immediate(writer):
+        row = store_events.insert(
+            writer,
+            project_id=project_id,
+            run_id=RUN_ID,
+            ts=_STAMP,
+            kind="run_upsert",
+            payload={},
+            source="live",
+        )
+    return row.seq
+
+
+def _live_writer(repo: Path) -> tuple[sqlite3.Connection, int]:
+    """A writing connection the caller keeps open, with `repo`'s project row
+    and one event committed.
+
+    While it is open the `-wal` and `-shm` sidecars exist, so
+    `open_db_for_reading` opens `mode=ro` and later commits are visible to a
+    reader; with every connection closed it would open `immutable=1`, which
+    never sees a later commit and would make a snapshot test vacuous.
+    """
+    writer = db.open_db(repo)
+    project_id = store_projects.resolve(writer, repo, now=NOW)
+    writer.commit()
+    _append_event(writer, project_id)
+    return writer, project_id
+
+
+def _count_events(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+
+def test_read_snapshot_leaves_no_transaction_open(repo):
+    writer, _ = _live_writer(repo)
+    reader = db.open_db_for_reading(repo)
+    try:
+        assert reader.in_transaction is False
+        with db.read_snapshot(reader) as snapshot:
+            assert snapshot is reader
+            assert store_events.head(reader) == 1
+            assert reader.in_transaction is True
+        assert reader.in_transaction is False
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("DELETE FROM projects")
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_read_snapshot_hides_a_commit_made_after_its_first_read(repo):
+    writer, project_id = _live_writer(repo)
+    reader = db.open_db_for_reading(repo)
+    try:
+        with db.read_snapshot(reader):
+            first = store_events.head(reader)
+            count = _count_events(reader)
+            added = _append_event(writer, project_id)
+            assert added > first
+            assert store_events.head(reader) == first
+            assert _count_events(reader) == count
+        assert store_events.head(reader) == added
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_read_snapshot_sees_a_commit_made_before_its_first_read(repo):
+    writer, project_id = _live_writer(repo)
+    reader = db.open_db_for_reading(repo)
+    try:
+        with db.read_snapshot(reader):
+            added = _append_event(writer, project_id)
+            assert store_events.head(reader) == added
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_without_read_snapshot_a_later_statement_sees_a_concurrent_commit(repo):
+    # The negative control for the two tests above: the fixture is live, and
+    # legacy-mode sqlite3 gives no snapshot across statements on its own.
+    writer, project_id = _live_writer(repo)
+    reader = db.open_db_for_reading(repo)
+    try:
+        first = store_events.head(reader)
+        added = _append_event(writer, project_id)
+        assert added > first
+        assert store_events.head(reader) == added
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_read_snapshot_rolls_back_and_reraises_on_error(repo):
+    writer, _ = _live_writer(repo)
+    reader = db.open_db_for_reading(repo)
+    error = ValueError("boom")
+    try:
+        with pytest.raises(ValueError) as caught:
+            with db.read_snapshot(reader):
+                store_events.head(reader)
+                raise error
+        assert caught.value is error
+        assert reader.in_transaction is False
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_read_snapshot_refuses_an_open_transaction(repo):
+    conn = db.open_db(repo)
+    try:
+        conn.execute(
+            "INSERT INTO projects (repo_dir, created_at) VALUES (?, ?)",
+            ("/elsewhere", _STAMP),
+        )
+        assert conn.in_transaction is True
+        with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+            with db.read_snapshot(conn):
+                pytest.fail("the block must not run")
+        assert conn.in_transaction is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM projects WHERE repo_dir = '/elsewhere'"
+        ).fetchone()[0] == 1
+        conn.rollback()
+    finally:
+        conn.close()
+    check = db.open_db(repo)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM projects WHERE repo_dir = '/elsewhere'"
+        ).fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+def test_read_snapshot_on_the_in_memory_projection(repo):
+    assert not paths.db_path().exists()
+    conn = db.open_db_for_reading(repo)
+    try:
+        with db.read_snapshot(conn):
+            assert store_events.head(conn) == 0
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+    assert not paths.db_path().exists()
+
+
+def test_read_snapshot_on_an_immutable_connection(repo):
+    writer, _ = _live_writer(repo)
+    writer.close()
+    sidecars = [paths.db_path().with_name(paths.db_path().name + s) for s in ("-wal", "-shm")]
+    assert not any(path.exists() for path in sidecars)
+    conn = db.open_db_for_reading(repo)
+    try:
+        with db.read_snapshot(conn):
+            assert store_events.head(conn) == 1
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+    assert not any(path.exists() for path in sidecars)

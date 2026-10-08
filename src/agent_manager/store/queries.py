@@ -4,9 +4,10 @@ connection and never writes or commits."""
 
 import json
 import sqlite3
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -71,6 +72,18 @@ class RunProgress(BaseModel):
     current: ProgressCurrent | None
 
 
+class RunProject(BaseModel):
+    """The `project` of one `am runs` entry: the run's `runs.project_id` and
+    that project's `projects.repo_dir`, the resolved path the project is
+    keyed by. It can differ in spelling from the run's own `repo_dir`, which
+    is the path the run recorded; neither is rewritten."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    repo_dir: Path
+
+
 class RunSummary(BaseModel):
     """One row of the shared `runs` table, without the tree hanging off it.
 
@@ -99,6 +112,12 @@ class RunSummary(BaseModel):
     `RunProgress`. `list_runs` always fills it (a run with no tree rows is 0
     of 0 with no `current`); it defaults to `None` only so that a
     `RunSummary` built by hand stays valid, which keeps it additive.
+
+    `project` is the run's project as a `RunProject`. `list_runs` always
+    fills it from a `LEFT JOIN projects`, and leaves it `None` only when
+    `runs.project_id` names no `projects` row (possible only in a
+    hand-damaged database): such a run is still listed. It defaults to
+    `None`, so it is additive.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -115,6 +134,7 @@ class RunSummary(BaseModel):
     story_id: str | None = None
     lease: RunLease | None = None
     progress: RunProgress | None = None
+    project: RunProject | None = None
 
 
 def _progress_count(
@@ -160,19 +180,91 @@ def _run_progress(conn: sqlite3.Connection, run_id: str) -> RunProgress:
     )
 
 
-def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSummary]:
-    """Every run of project `project_id`, newest first.
+@dataclass(frozen=True)
+class AllProjects:
+    """The type of `ALL_PROJECTS`: `list_runs(project_id=ALL_PROJECTS)` lists
+    every project's runs. A type of its own, so "no filter" can never be
+    confused with `None`, which means "this repository has no project row"."""
+
+
+ALL_PROJECTS: Final = AllProjects()
+"""The one `AllProjects` value callers pass."""
+
+
+@dataclass(frozen=True)
+class RunCursor:
+    """Where a `list_runs` page starts: the rows strictly after this run in the
+    listing order. `started_at` is the cursor run's stored column text, not a
+    parsed value, so the keyset compares exactly as `ORDER BY` sorts.
+    `run_cursor` builds one from a run id."""
+
+    started_at: str | None
+    id: str
+
+
+def _summary(conn: sqlite3.Connection, row: sqlite3.Row) -> RunSummary:
+    """One `list_runs` row as a `RunSummary`, with its `progress` counted and
+    its `project` built from the joined `project_key` / `project_repo_dir`
+    columns (`None` when the join found no `projects` row)."""
+    fields = dict(row)
+    project_key = fields.pop("project_key")
+    project_repo_dir = fields.pop("project_repo_dir")
+    return RunSummary.model_validate(
+        {
+            **fields,
+            "story_id": None
+            if fields["story_id"] is None
+            else json.loads(fields["story_id"]),
+            "progress": _run_progress(conn, fields["id"]),
+            "project": None
+            if project_key is None
+            else RunProject(id=project_key, repo_dir=project_repo_dir),
+        }
+    )
+
+
+def list_runs(
+    conn: sqlite3.Connection,
+    *,
+    project_id: int | None | AllProjects,
+    limit: int | None = None,
+    before: RunCursor | datetime | None = None,
+) -> list[RunSummary]:
+    """The runs of project `project_id`, newest first.
 
     Only rows whose `runs.project_id` is `project_id` are listed: the
     projection holds every repository's runs, and a listing for one
     repository shows that repository's alone. `None` (a repository with no
-    `projects` row) lists nothing. Takes a connection rather than a root so
-    one caller can list the history and then load a run's tree over the same
-    connection, and close it once.
+    `projects` row) lists nothing. `ALL_PROJECTS` lists every run of every
+    project in one order, not grouped by project. Takes a connection rather
+    than a root so one caller can list the history and then load a run's
+    tree over the same connection, and close it once.
 
     `started_at DESC` puts a NULL start time last (SQLite orders NULL below every
     value, so descending sends it to the end) and the id breaks a tie, which run
     ids minted at second resolution really do produce.
+
+    `limit` keeps at most that many rows (`None`: all of them); the caller
+    checks it is at least 1. `before` starts the page later in that order:
+
+    - a `RunCursor` keeps the rows strictly after the cursor run, the keyset
+      `(started_at, id) < (cursor.started_at, cursor.id)` under the order
+      above. With a dated cursor that is every earlier `started_at`, the same
+      `started_at` with a smaller id, and every NULL `started_at`; with a
+      NULL one, the NULL `started_at` rows with a smaller id. Paging by the
+      last id of each page therefore never skips or repeats a run, even
+      inside a group sharing one `started_at`.
+    - a `datetime` keeps the rows whose `started_at` is a strictly earlier
+      instant; NULL `started_at` rows have no instant and are dropped. A
+      naive value is taken as UTC, an aware one is converted to UTC, and the
+      result is compared as `isoformat()` text. That text comparison is the
+      instant comparison because every `started_at` is written by
+      `store_db.iso` from a UTC-aware datetime (`store/writer.py`
+      `_write_run_row`, `cli._utcnow`), so all share one format and offset;
+      `'+'` sorts below `'.'`, so a whole second precedes its fractions.
+
+    `LIMIT` and the keyset are applied in SQL, so `progress` is counted only
+    for the rows returned.
 
     `card_id` is derived, not stored: a `task` run (`am run --card`) records one
     story and one subtask, and that subtask's card is the run's card. Any other
@@ -198,10 +290,38 @@ def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSu
     from rows, not from liveness: a run whose process died mid-phase still
     shows the phase it stopped in, and `lease.live` tells whether anyone is
     still working on it. A run with no tree rows is 0 of 0 with no `current`.
+
+    `project` is joined from `projects` (`LEFT JOIN`), so a run whose
+    `project_id` names no `projects` row is still listed, with `project`
+    `None`.
     """
+    where: list[str] = []
+    params: list[object] = []
     if project_id is None:
         return []
-    rows = conn.execute(
+    if not isinstance(project_id, AllProjects):
+        where.append("runs.project_id = ?")
+        params.append(project_id)
+    if isinstance(before, RunCursor):
+        if before.started_at is None:
+            where.append("(runs.started_at IS NULL AND runs.id < ?)")
+            params.append(before.id)
+        else:
+            where.append(
+                "(runs.started_at < ?"
+                " OR (runs.started_at = ? AND runs.id < ?)"
+                " OR runs.started_at IS NULL)"
+            )
+            params.extend([before.started_at, before.started_at, before.id])
+    elif isinstance(before, datetime):
+        instant = (
+            before.replace(tzinfo=timezone.utc)
+            if before.tzinfo is None
+            else before.astimezone(timezone.utc)
+        )
+        where.append("runs.started_at < ?")
+        params.append(instant.isoformat())
+    sql = (
         "SELECT runs.id, runs.workflow, runs.repo_dir, runs.base_branch,"
         " runs.branch_prefix, runs.status, runs.started_at, runs.milestone_id,"
         " runs.config -> '$.story_id' AS story_id,"
@@ -209,23 +329,18 @@ def list_runs(conn: sqlite3.Connection, *, project_id: int | None) -> list[RunSu
         "   SELECT subtasks.card_id FROM subtasks"
         "    WHERE subtasks.run_id = runs.id"
         "    ORDER BY subtasks.position, subtasks.card_id LIMIT 1"
-        " ) END AS card_id"
-        " FROM runs WHERE runs.project_id = ?"
-        " ORDER BY runs.started_at DESC, runs.id DESC",
-        (project_id,),
-    ).fetchall()
-    return [
-        RunSummary.model_validate(
-            {
-                **dict(row),
-                "story_id": None
-                if row["story_id"] is None
-                else json.loads(row["story_id"]),
-                "progress": _run_progress(conn, row["id"]),
-            }
-        )
-        for row in rows
-    ]
+        " ) END AS card_id,"
+        " projects.id AS project_key, projects.repo_dir AS project_repo_dir"
+        " FROM runs LEFT JOIN projects ON projects.id = runs.project_id"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY runs.started_at DESC, runs.id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [_summary(conn, row) for row in rows]
 
 
 def latest_run_id(conn: sqlite3.Connection, *, project_id: int | None) -> str | None:
@@ -358,3 +473,19 @@ def run_project_id(conn: sqlite3.Connection, run_id: str) -> int | None:
         "SELECT project_id FROM runs WHERE id = ?", (run_id,)
     ).fetchone()
     return None if row is None else row["project_id"]
+
+
+def run_cursor(conn: sqlite3.Connection, run_id: str) -> tuple[RunCursor, int] | None:
+    """`run_id` as a `list_runs` `before` cursor, with its `runs.project_id`,
+    or `None` if the run was never recorded.
+
+    The cursor holds the stored `started_at` text, so the keyset compares
+    exactly the value `ORDER BY` sorted. The project id lets a repo-scoped
+    caller refuse a run of another project.
+    """
+    row = conn.execute(
+        "SELECT started_at, id, project_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return RunCursor(started_at=row["started_at"], id=row["id"]), row["project_id"]

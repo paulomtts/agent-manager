@@ -4603,6 +4603,271 @@ def test_status_with_no_run_id_against_a_project_with_no_runs_is_an_envelope(pro
     assert "most recent" in envelope["error"]["message"]
 
 
+SNAPSHOT_RUN_ID = "20260923T090000Z-cbe34d00"
+
+
+def _events_head(root: Path) -> int:
+    """`store_events.head` read on a connection of its own, outside any command."""
+    conn = store_db.open_db_for_reading(cli.resolve_repo_dir(root))
+    try:
+        return store_events.head(conn)
+    finally:
+        conn.close()
+
+
+_HEX_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _store_id(root: Path) -> str | None:
+    """`store_db.store_id` read on a connection of its own, outside any command."""
+    conn = store_db.open_db_for_reading(cli.resolve_repo_dir(root))
+    try:
+        return store_db.store_id(conn)
+    finally:
+        conn.close()
+
+
+def _write_once_after(monkeypatch, module, name: str, write) -> list[bool]:
+    """Patch `module.name` so it returns what it always did, and on its first
+    call only, after the original returned, runs `write`.
+
+    The returned list holds `True` once `write` has run, so a test can assert
+    the injection actually fired.
+    """
+    original = getattr(module, name)
+    fired: list[bool] = []
+
+    def wrapper(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            write()
+        return result
+
+    monkeypatch.setattr(module, name, wrapper)
+    return fired
+
+
+def test_status_as_of_seq_is_the_events_head(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    head = _events_head(projection)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert isinstance(payload["as_of_seq"], int)
+    assert payload["as_of_seq"] == head > 0
+    assert set(payload) == {
+        "run",
+        "stories",
+        "rows",
+        "control",
+        "warnings",
+        "integrity",
+        "as_of_seq",
+        "store_id",
+    }
+    argv = ["status", SNAPSHOT_RUN_ID, "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["as_of_seq"] == head
+
+
+def test_status_store_id_is_the_meta_store_id(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    expected = _store_id(projection)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert isinstance(payload["store_id"], str)
+    assert _HEX_ID.fullmatch(payload["store_id"])
+    assert payload["store_id"] == expected
+    argv = ["status", SNAPSHOT_RUN_ID, "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["store_id"] == expected
+
+
+def test_status_store_id_is_stable(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    first = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+    second = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+    _record(
+        projection,
+        "20260930T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+    )
+    third = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert first["store_id"] == second["store_id"] == third["store_id"]
+    assert _HEX_ID.fullmatch(first["store_id"])
+    assert third["as_of_seq"] > first["as_of_seq"]
+
+
+def test_status_store_id_differs_across_databases(projection, tmp_path, monkeypatch):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    first = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)["store_id"]
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "other-xdg"))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    second = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)["store_id"]
+
+    assert _HEX_ID.fullmatch(first)
+    assert _HEX_ID.fullmatch(second)
+    assert first != second
+
+
+def test_status_reads_store_id_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 2: on the command's own connection, inside `read_snapshot`."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    opened: list[sqlite3.Connection] = []
+    seen: list[tuple[sqlite3.Connection, bool]] = []
+    original_open = cli.store_db.open_db_for_reading
+    original_store_id = cli.store_db.store_id
+
+    def capture_open(root):
+        conn = original_open(root)
+        opened.append(conn)
+        return conn
+
+    def capture_store_id(conn):
+        seen.append((conn, conn.in_transaction))
+        return original_store_id(conn)
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture_open)
+    monkeypatch.setattr(cli.store_db, "store_id", capture_store_id)
+
+    payload = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+    assert len(opened) == 1
+    assert seen == [(opened[0], True)]
+    assert _HEX_ID.fullmatch(payload["store_id"])
+
+
+def test_status_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
+    """The card's key test: a run and a phase change, each with its event,
+    commit right after `head` returns, while `status` is still reading."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        before = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+        head_before = _events_head(projection)
+
+        def fail_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+            writer.record_phase(
+                "story-1",
+                "card-1",
+                models.PhaseRun(name="verify", kind="deterministic", status="failed"),
+            )
+            writer.take_lease(
+                token="snapshot-life",
+                pid=os.getpid(),
+                host=socket.gethostname(),
+                now=datetime.now(timezone.utc),
+                is_live=lambda row: False,
+            )
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", fail_the_run)
+        during = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert during["run"]["status"] == "started"
+        assert during["stories"] == before["stories"]
+        assert during["rows"] == before["rows"]
+        assert during["control"] == before["control"]
+        assert during["control"]["lease"] is None
+        assert during["integrity"] == before["integrity"]
+
+        after = cli.status_for(SNAPSHOT_RUN_ID, repo_dir=projection)
+        assert after["run"]["status"] == "failed"
+        assert ("story-1", "card-1", "verify", None, "failed") in [
+            (row["story"], row["subtask"], row["phase"], row["attempt"], row["state"])
+            for row in after["rows"]
+        ]
+        assert after["as_of_seq"] > during["as_of_seq"]
+        assert after["control"]["lease"] is not None
+    finally:
+        writer.close()
+
+
+def test_status_default_run_is_chosen_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 1: a run recorded after `head` must not become the run
+    `status` with no RUN reports."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+    newer_id = "20260930T090000Z-cbe34d00"
+    writer = store_writer.Store.open(projection, newer_id)
+    try:
+        head_before = _events_head(projection)
+
+        def start_a_newer_run() -> None:
+            writer.record_run(
+                models.Run(
+                    id=newer_id,
+                    workflow="task",
+                    repo_dir=projection,
+                    base_branch="main",
+                    branch_prefix="m1",
+                    status="started",
+                    started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+                )
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_events, "head", start_a_newer_run
+        )
+        during = cli.status_for(None, repo_dir=projection)
+
+        assert fired == [True]
+        assert during["run"]["id"] == SNAPSHOT_RUN_ID
+        assert during["as_of_seq"] == head_before
+        assert cli.status_for(None, repo_dir=projection)["run"]["id"] == newer_id
+    finally:
+        writer.close()
+
+
+def test_status_error_paths_are_unchanged_and_close_the_snapshot(projection, monkeypatch):
+    """Review Focus 2. A guard: the refusals predate this card and already
+    close their connection; this pins that the snapshot does not change that."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    other = projection.parent / "no-runs"
+    other.mkdir()
+    opened: list[sqlite3.Connection] = []
+    original = cli.store_db.open_db_for_reading
+
+    def capture(root):
+        conn = original(root)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture)
+
+    for argv in (
+        ["status", "no-such-run", "--repo-dir", str(projection)],
+        ["status", "--repo-dir", str(other)],
+    ):
+        result = runner.invoke(cli.app, argv)
+
+        assert result.exit_code == cli.EXIT_ERROR, result.output
+        envelope = json.loads(result.stdout)
+        assert set(envelope) == {"ok", "error"}
+        assert envelope["error"]["type"] == "UnknownRunError"
+        assert "as_of_seq" not in result.stdout
+        assert "store_id" not in result.stdout
+    assert len(opened) == 2
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+
 def test_status_of_a_run_that_died_before_its_first_phase_is_ok_with_no_rows(projection):
     """`run_card` writes the run, story and subtask rows before the walk starts
     (cli.py:228-230) exactly so `status` can see a run that died on its first
@@ -4685,6 +4950,22 @@ def test_runs_lists_the_projects_history_newest_first(projection):
     assert envelope["data"]["runs"][0]["repo_dir"] == str(projection.resolve())
 
 
+def test_runs_entries_carry_the_project_id_and_its_repo_dir(projection):
+    _record(projection, "20260923T090000Z-cbe34d00", started_at=RECORDED_AT)
+
+    result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
+
+    assert result.exit_code == 0, result.output
+    [entry] = json.loads(result.stdout)["data"]["runs"]
+    conn = store_db.open_db_for_reading(projection.resolve())
+    try:
+        project_id = store_projects.lookup(conn, projection.resolve())
+    finally:
+        conn.close()
+    assert entry["project"] == {"id": project_id, "repo_dir": str(projection.resolve())}
+    assert entry["repo_dir"] == str(projection.resolve())
+
+
 def test_runs_on_a_project_that_has_never_been_run_is_ok_and_empty(projection):
     """A project nobody has run yet is a fact, not a fault."""
     result = runner.invoke(cli.app, ["runs", "--repo-dir", str(projection)])
@@ -4730,10 +5011,12 @@ RUNS_ENTRY_KEYS = {
     "story_id",
     "lease",
     "progress",
+    "project",
 }
 """Every `data.runs[]` entry: the seven names `am runs` always had, plus
 `milestone_id` and `card_id` (card 0b5a15d7), `lease` (card 6bf47e74),
-`progress` (card 882b212b) and `story_id` (card 3d2a3ef8)."""
+`progress` (card 882b212b), `story_id` (card 3d2a3ef8) and `project`
+(card 5d9554f6)."""
 
 RUNS_LEASE_KEYS = {"live", "pid", "host", "heartbeat_at", "accepting"}
 """A non-null `data.runs[].lease`: `am status`'s `control.lease` minus
@@ -4866,7 +5149,8 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_
     for envelope in (json.loads(plain.stdout), json.loads(pretty.stdout)):
         assert set(envelope) == {"ok", "data"}
         assert envelope["ok"] is True
-        assert set(envelope["data"]) == {"runs"}
+        assert set(envelope["data"]) == {"runs", "as_of_seq", "store_id"}
+        assert isinstance(envelope["data"]["as_of_seq"], int)
         assert len(envelope["data"]["runs"]) == 3
         for entry in envelope["data"]["runs"]:
             assert set(entry) == RUNS_ENTRY_KEYS
@@ -4875,6 +5159,373 @@ def test_runs_entries_have_exactly_the_old_keys_plus_milestone_id_card_id_story_
             RUNS_STORY_ID,
             None,
         ]
+
+
+SNAPSHOT_OLDER_RUN_ID = "20260922T090000Z-cbe34d00"
+
+
+def _record_two_started_runs(root: Path) -> None:
+    _record(
+        root,
+        SNAPSHOT_OLDER_RUN_ID,
+        started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc),
+        status="started",
+    )
+    _record(root, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, status="started")
+
+
+def _statuses(payload: dict[str, Any]) -> dict[str, str]:
+    return {entry["id"]: entry["status"] for entry in payload["runs"]}
+
+
+def test_runs_never_shows_state_ahead_of_as_of_seq(projection, monkeypatch):
+    """A run status change, with its event, commits right after `head` returns."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def fail_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+
+        fired = _write_once_after(monkeypatch, cli.store_events, "head", fail_the_run)
+        during = cli.runs_for(repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert _statuses(during) == {
+            SNAPSHOT_OLDER_RUN_ID: "started",
+            SNAPSHOT_RUN_ID: "started",
+        }
+        after = cli.runs_for(repo_dir=projection)
+        assert _statuses(after)[SNAPSHOT_RUN_ID] == "failed"
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_runs_reads_every_lease_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 4, the spec's second T11 variant: the write lands after
+    `list_runs` returned and before the first `read_lease`, so only a
+    `read_lease` outside the snapshot could see it."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def take_over_the_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(run.model_copy(update={"status": "failed"}))
+            writer.take_lease(
+                token="snapshot-life",
+                pid=os.getpid(),
+                host=socket.gethostname(),
+                now=datetime.now(timezone.utc),
+                is_live=lambda row: False,
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_queries, "list_runs", take_over_the_run
+        )
+        during = cli.runs_for(repo_dir=projection)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert _statuses(during) == {
+            SNAPSHOT_OLDER_RUN_ID: "started",
+            SNAPSHOT_RUN_ID: "started",
+        }
+        assert [entry["lease"] for entry in during["runs"]] == [None, None]
+        after = cli.runs_for(repo_dir=projection)
+        leases = {entry["id"]: entry["lease"] for entry in after["runs"]}
+        assert leases[SNAPSHOT_RUN_ID] is not None
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+PAGED_RUN_IDS = (
+    "20260923T090000Z-cccccccc",
+    "20260923T090000Z-bbbbbbbb",
+    "20260923T090000Z-aaaaaaaa",
+    "20260921T090000Z-cbe34d00",
+)
+"""The listing order of `_record_paged_runs`: three runs share one
+`started_at`, so only the id orders them."""
+
+
+def _record_paged_runs(root: Path) -> None:
+    for run_id in PAGED_RUN_IDS[:3]:
+        _record(root, run_id, started_at=RECORDED_AT)
+    _record(
+        root, PAGED_RUN_IDS[3], started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)
+    )
+
+
+def _listed_ids(argv: list[str]) -> list[str]:
+    result = runner.invoke(cli.app, argv)
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is True
+    return [entry["id"] for entry in envelope["data"]["runs"]]
+
+
+def test_runs_pages_by_last_run_id_through_equal_start_times(projection):
+    _record_paged_runs(projection)
+    base = ["runs", "--repo-dir", str(projection)]
+
+    full = _listed_ids(base)
+    first = _listed_ids([*base, "--limit", "2"])
+    second = _listed_ids([*base, "--limit", "2", "--before", first[-1]])
+    third = _listed_ids([*base, "--limit", "2", "--before", second[-1]])
+
+    assert full == list(PAGED_RUN_IDS)
+    assert first == list(PAGED_RUN_IDS[:2])
+    assert first + second == full
+    assert third == []
+
+
+def test_runs_limit_beyond_the_listing_returns_it_all_and_the_next_page_is_empty(
+    projection,
+):
+    """Review Focus 4."""
+    _record_paged_runs(projection)
+    base = ["runs", "--repo-dir", str(projection)]
+
+    page = _listed_ids([*base, "--limit", "50"])
+
+    assert page == list(PAGED_RUN_IDS)
+    assert _listed_ids([*base, "--limit", "50", "--before", page[-1]]) == []
+
+
+@pytest.mark.parametrize("pretty", [[], ["--pretty"]])
+def test_runs_before_without_limit_is_refused_before_the_database_is_opened(
+    projection, monkeypatch, pretty
+):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    def refuse(root):
+        raise AssertionError("the database was opened")
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", refuse)
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(projection), "--before", SNAPSHOT_RUN_ID, *pretty],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "CliError", "message": "--before requires --limit"},
+    }
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_runs_limit_below_one_is_refused(projection, monkeypatch, limit):
+    def refuse(root):
+        raise AssertionError("the database was opened")
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", refuse)
+
+    result = runner.invoke(
+        cli.app, ["runs", "--repo-dir", str(projection), "--limit", limit]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "CliError",
+        "message": f"--limit must be at least 1, got {limit}",
+    }
+
+
+@pytest.mark.parametrize("before", ["no-such-thing", ""])
+def test_runs_before_neither_a_run_id_nor_a_timestamp_is_an_unknown_run(
+    projection, before
+):
+    """Review Focus 2 is the empty string."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(projection), "--limit", "5", "--before", before],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"--before {before!r} is neither a run id nor an ISO 8601 timestamp"
+        " (pass the last run id of the previous page)",
+    }
+
+
+@pytest.mark.parametrize(
+    "before",
+    ["2026-09-22T09:00:00Z", "2026-09-22T11:00:00+02:00", "2026-09-22T09:00:00", "2026-09-22"],
+    ids=["z", "offset", "naive", "date"],
+)
+def test_runs_before_a_timestamp_lists_runs_started_strictly_before_it(
+    projection, before
+):
+    """Review Focus 3: every spelling is one instant (the date is midnight UTC)."""
+    _record(projection, "20260921T090000Z-cbe34d00", started_at=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    _record(projection, "20260922T090000Z-cbe34d00", started_at=datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    assert _listed_ids(
+        ["runs", "--repo-dir", str(projection), "--limit", "5", "--before", before]
+    ) == ["20260921T090000Z-cbe34d00"]
+
+
+def test_runs_reads_the_before_cursor_inside_the_snapshot(projection, monkeypatch):
+    """The cursor run's `started_at` moves after `head` returned: only a
+    `run_cursor` outside the snapshot could see the new value, and it would
+    then list nothing."""
+    _record_two_started_runs(projection)
+    writer = store_writer.Store.open(projection, SNAPSHOT_RUN_ID)
+    try:
+        head_before = _events_head(projection)
+
+        def move_the_cursor_run() -> None:
+            run = writer.load_run(SNAPSHOT_RUN_ID)
+            writer.record_run(
+                run.model_copy(
+                    update={"started_at": datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc)}
+                )
+            )
+
+        fired = _write_once_after(
+            monkeypatch, cli.store_events, "head", move_the_cursor_run
+        )
+        during = cli.runs_for(repo_dir=projection, limit=5, before=SNAPSHOT_RUN_ID)
+
+        assert fired == [True]
+        assert during["as_of_seq"] == head_before
+        assert [entry["id"] for entry in during["runs"]] == [SNAPSHOT_OLDER_RUN_ID]
+        after = cli.runs_for(repo_dir=projection, limit=5, before=SNAPSHOT_RUN_ID)
+        assert after["runs"] == []
+        assert after["as_of_seq"] > during["as_of_seq"]
+    finally:
+        writer.close()
+
+
+def test_runs_before_a_run_on_a_repo_with_no_project_is_unknown(projection, tmp_path):
+    """Review Focus 5: `stranger` has no `projects` row, so every run is foreign to it."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+
+    result = runner.invoke(
+        cli.app,
+        ["runs", "--repo-dir", str(stranger), "--limit", "5", "--before", SNAPSHOT_RUN_ID],
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {SNAPSHOT_RUN_ID!r} is not in the projection for {stranger.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+
+
+def test_runs_store_id_is_the_meta_store_id(projection):
+    _record_two_started_runs(projection)
+    expected = _store_id(projection)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert isinstance(payload["store_id"], str)
+    assert _HEX_ID.fullmatch(payload["store_id"])
+    assert payload["store_id"] == expected
+    argv = ["runs", "--repo-dir", str(projection)]
+    plain = runner.invoke(cli.app, argv)
+    pretty = runner.invoke(cli.app, [*argv, "--pretty"])
+    assert plain.exit_code == 0, plain.output
+    assert pretty.exit_code == 0, pretty.output
+    for result in (plain, pretty):
+        assert json.loads(result.stdout)["data"]["store_id"] == expected
+
+
+def test_runs_store_id_is_stable(projection):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+
+    first = cli.runs_for(repo_dir=projection)
+    second = cli.runs_for(repo_dir=projection)
+    _record(
+        projection,
+        "20260930T090000Z-cbe34d00",
+        started_at=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+    )
+    third = cli.runs_for(repo_dir=projection)
+
+    assert first["store_id"] == second["store_id"] == third["store_id"]
+    assert _HEX_ID.fullmatch(first["store_id"])
+    assert third["as_of_seq"] > first["as_of_seq"]
+
+
+def test_runs_store_id_differs_across_databases(projection, tmp_path, monkeypatch):
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    first = cli.runs_for(repo_dir=projection)["store_id"]
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "other-xdg"))
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    second = cli.runs_for(repo_dir=projection)["store_id"]
+
+    assert _HEX_ID.fullmatch(first)
+    assert _HEX_ID.fullmatch(second)
+    assert first != second
+
+
+def test_runs_reads_store_id_inside_the_snapshot(projection, monkeypatch):
+    """Review Focus 2: on the command's own connection, inside `read_snapshot`."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    opened: list[sqlite3.Connection] = []
+    seen: list[tuple[sqlite3.Connection, bool]] = []
+    original_open = cli.store_db.open_db_for_reading
+    original_store_id = cli.store_db.store_id
+
+    def capture_open(root):
+        conn = original_open(root)
+        opened.append(conn)
+        return conn
+
+    def capture_store_id(conn):
+        seen.append((conn, conn.in_transaction))
+        return original_store_id(conn)
+
+    monkeypatch.setattr(cli.store_db, "open_db_for_reading", capture_open)
+    monkeypatch.setattr(cli.store_db, "store_id", capture_store_id)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert len(opened) == 1
+    assert seen == [(opened[0], True)]
+    assert _HEX_ID.fullmatch(payload["store_id"])
+
+
+def test_runs_store_id_on_an_empty_listing(projection):
+    """No `am.db`: `null`, and nothing created. Then another repo's runs make
+    the database exist: this repo's listing is still empty, but it carries
+    that database's id, since `store_id` is machine-wide like `as_of_seq`."""
+    assert cli.runs_for(repo_dir=projection) == {
+        "runs": [],
+        "as_of_seq": 0,
+        "store_id": None,
+    }
+    assert not paths.db_path().exists()
+
+    elsewhere = projection.parent / "elsewhere"
+    elsewhere.mkdir()
+    _record(elsewhere, SNAPSHOT_RUN_ID, started_at=RECORDED_AT)
+    head = _events_head(elsewhere)
+    expected = _store_id(elsewhere)
+
+    payload = cli.runs_for(repo_dir=projection)
+
+    assert payload["runs"] == []
+    assert payload["as_of_seq"] == head > 0
+    assert expected is not None
+    assert payload["store_id"] == expected
 
 
 RUNS_NEWER_RUN_ID = "20260930T090000Z-cbe34d00"
@@ -13070,7 +13721,16 @@ def test_status_of_a_clean_run_is_checked_and_otherwise_unchanged(projection, mo
     finally:
         conn.close()
     before = cli.status_payload(run, cli.control_view(None, [], now=CONTROL_NOW))
-    expected = cli.render(cli.ok_envelope({**before, "integrity": CLEAN_INTEGRITY}))
+    expected = cli.render(
+        cli.ok_envelope(
+            {
+                **before,
+                "integrity": CLEAN_INTEGRITY,
+                "as_of_seq": _events_head(projection),
+                "store_id": _store_id(projection),
+            }
+        )
+    )
 
     for args in (["status", CONTROL_RUN_ID], ["status"]):
         result = runner.invoke(cli.app, [*args, "--repo-dir", str(projection)])

@@ -2408,8 +2408,20 @@ def _project_run(conn: sqlite3.Connection, root: Path, run_id: str) -> models.Ru
     return run
 
 
-def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
-    """The §9 tree and §10 table of one run of this project.
+def status_for(run_id: str | None, *, repo_dir: Path | None) -> dict[str, Any]:
+    """The §9 tree and §10 table of one run, of this project or, by id, of any.
+
+    `repo_dir` given: it is resolved (`RepoDirError` if it is no directory)
+    and the run must be one of its project's, through `_project_run`; with no
+    `run_id`, the default run is its project's most recent. `repo_dir` `None`
+    with no `run_id` means `Path(".")`, so the command and direct callers
+    agree. `repo_dir` `None` with a `run_id` is the machine-wide lookup: run
+    ids are machine-unique, so `store_queries.load_run` finds the run
+    whichever project recorded it, even one whose `projects` row is missing.
+    No directory is resolved then -- the current directory plays no part --
+    and `open_db_for_reading` gets `Path(".")` only because it takes a root,
+    which never chooses the file. An id it does not hold is an
+    `UnknownRunError` naming no repository.
 
     Read-only: no `record_*` is called, and the connection is closed on every
     path including the refusals, the way `run_card` closes its store. The default
@@ -2419,44 +2431,65 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     same connection and rendered by `control_view`, still without a write.
     The `integrity` key compares the run's events with the loaded tree through
     `integrity_view`, on the same connection, writing nothing either.
+
+    Every statement runs in one `store_db.read_snapshot`, and the first one
+    reads `store_events.head`: that is `as_of_seq`, and the payload reflects
+    every event up to it and none after it. Lease liveness is still judged at
+    read time, against `now`. `store_id` is `store_db.store_id`, read in the
+    same snapshot and never minted here: it names the database read, so a
+    consumer seeing a different one drops any `as_of_seq` it holds.
     """
-    root = resolve_repo_dir(repo_dir)
+    machine_wide = run_id is not None and repo_dir is None
+    root = Path(".") if machine_wide else resolve_repo_dir(repo_dir or Path("."))
     conn = store_db.open_db_for_reading(root)
     try:
-        wanted = run_id
-        if wanted is None:
-            wanted = store_queries.latest_run_id(
-                conn, project_id=store_projects.lookup(conn, root)
-            )
+        with store_db.read_snapshot(conn):
+            as_of_seq = store_events.head(conn)
+            store_id = store_db.store_id(conn)
+            wanted = run_id
             if wanted is None:
-                raise UnknownRunError(
-                    f"no run has been recorded for {root}, so there is no most recent"
-                    " run to report on; pass a run id or start one with `run --card`"
+                wanted = store_queries.latest_run_id(
+                    conn, project_id=store_projects.lookup(conn, root)
                 )
-        run = _project_run(conn, root, wanted)
-        if run is None:
-            raise UnknownRunError(
-                f"run {wanted!r} is not in the projection for {root}"
-                " (`agent-manager runs` lists the ones that are)"
+                if wanted is None:
+                    raise UnknownRunError(
+                        f"no run has been recorded for {root}, so there is no most recent"
+                        " run to report on; pass a run id or start one with `run --card`"
+                    )
+            if machine_wide:
+                run = store_queries.load_run(conn, wanted)
+                if run is None:
+                    raise UnknownRunError(
+                        f"run {wanted!r} is not in the projection"
+                        " (`agent-manager runs --all-projects` lists the ones that are)"
+                    )
+            else:
+                run = _project_run(conn, root, wanted)
+                if run is None:
+                    raise UnknownRunError(
+                        f"run {wanted!r} is not in the projection for {root}"
+                        " (`agent-manager runs` lists the ones that are)"
+                    )
+            lease = store_leases.read_lease(conn, wanted)
+            now = _utcnow()
+            # Only a live lease's claims count (X5): a dead one's leftover rows
+            # are anyone's to take, so they are not shown as held.
+            claims = (
+                [claim.key for claim in store_leases.held_claims(conn, wanted, lease.token)]
+                if lease is not None and control.lease_is_live(lease, now=now)
+                else []
             )
-        lease = store_leases.read_lease(conn, wanted)
-        now = _utcnow()
-        # Only a live lease's claims count (X5): a dead one's leftover rows
-        # are anyone's to take, so they are not shown as held.
-        claims = (
-            [claim.key for claim in store_leases.held_claims(conn, wanted, lease.token)]
-            if lease is not None and control.lease_is_live(lease, now=now)
-            else []
-        )
-        state = control_view(
-            lease,
-            store_leases.control_requests(conn, wanted),
-            now=now,
-            claims=claims,
-        )
-        payload = status_payload(run, state)
-        payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
-        return payload
+            state = control_view(
+                lease,
+                store_leases.control_requests(conn, wanted),
+                now=now,
+                claims=claims,
+            )
+            payload = status_payload(run, state)
+            payload["integrity"] = integrity_view(conn, wanted, run, lease, now=now)
+            payload["as_of_seq"] = as_of_seq
+            payload["store_id"] = store_id
+            return payload
     finally:
         conn.close()
 
@@ -2466,12 +2499,20 @@ def status(
     run_id: str | None = typer.Argument(
         None, metavar="[RUN_ID]", help="The run to report on. Defaults to the most recent."
     ),
-    repo_dir: Path = typer.Option(
-        Path("."), "--repo-dir", help="The repository whose projection is read."
+    repo_dir: Path | None = typer.Option(
+        None,
+        "--repo-dir",
+        help="The repository whose projection is read (default: the current"
+        " directory). Without it, a RUN_ID is looked up across every project.",
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Report one run as story / subtask / phase / attempt / state."""
+    """Report one run as story / subtask / phase / attempt / state.
+
+    With RUN_ID and no --repo-dir the run is found by id alone, whichever
+    repository recorded it; with --repo-dir it must be that repository's.
+    With no RUN_ID it is the most recent run of --repo-dir (default `.`).
+    """
     try:
         payload = status_for(run_id, repo_dir=repo_dir)
     except HANDLED as error:
@@ -2480,13 +2521,63 @@ def status(
     typer.echo(render(ok_envelope(payload), pretty=pretty))
 
 
-def runs_for(*, repo_dir: Path) -> dict[str, Any]:
-    """This project's run history, newest first, each run with its lease and progress.
+def _runs_before(
+    conn: sqlite3.Connection,
+    before: str,
+    *,
+    scope: int | None | store_queries.AllProjects,
+    root: Path,
+) -> store_queries.RunCursor | datetime:
+    """`am runs --before X` as `store_queries.list_runs`' `before`.
+
+    X is looked up as a run id first: a run in `scope` is its `RunCursor`
+    (`ALL_PROJECTS` takes any run). A run recorded for another project, when
+    the listing is scoped to `root`'s, is an `UnknownRunError` -- the same
+    refusal `status` gives a run of another repository -- not a position in
+    this listing. A value that is no run id is parsed with
+    `datetime.fromisoformat` (a date alone is midnight); `list_runs` reads a
+    naive value as UTC. Neither is an `UnknownRunError`.
+    """
+    found = store_queries.run_cursor(conn, before)
+    if found is not None:
+        cursor, project_id = found
+        if isinstance(scope, store_queries.AllProjects) or project_id == scope:
+            return cursor
+        raise UnknownRunError(
+            f"run {before!r} is not in the projection for {root}"
+            " (`agent-manager runs` lists the ones that are)"
+        )
+    try:
+        return datetime.fromisoformat(before)
+    except ValueError:
+        raise UnknownRunError(
+            f"--before {before!r} is neither a run id nor an ISO 8601 timestamp"
+            " (pass the last run id of the previous page)"
+        ) from None
+
+
+def runs_for(
+    *,
+    repo_dir: Path,
+    all_projects: bool = False,
+    limit: int | None = None,
+    before: str | None = None,
+) -> dict[str, Any]:
+    """This project's run history, or every project's, newest first, each run
+    with its lease and progress.
 
     An empty history is an empty list, not a refusal: a project that has never
     been run is a fact. `model_dump()` keeps the `Path` and `datetime` objects
     for `render`'s `default=str`, exactly as `status_payload` does, so a run
     looks the same in both commands.
+
+    `all_projects` lists every project's runs in one order. `--repo-dir` is
+    then ignored: never resolved, so a directory that does not exist is no
+    `RepoDirError`, and handed to `open_db_for_reading` only because that
+    takes a root, which never chooses the file. `limit` keeps the first
+    `limit` rows; `before` starts after it (see `_runs_before`). `--limit`
+    below 1, and `--before` without `--limit`, are `CliError`s raised before
+    the database is opened.
 
     `lease` is filled here, not in `store_queries.list_runs`: `live` needs `control`,
     which `store` must not import. Each run's `run_leases` row is read on the
@@ -2494,25 +2585,51 @@ def runs_for(*, repo_dir: Path) -> dict[str, Any]:
     uses, so it is `am status`'s `control.lease` minus `acquired_at`, or
     `None` when the run has no lease row. One `now` judges the whole listing.
 
-    `progress` arrives already counted by `store_queries.list_runs`; `model_copy`
-    keeps it and `model_dump` carries it into the entry unchanged.
+    `progress` and `project` arrive already filled by `store_queries.list_runs`;
+    `model_copy` keeps them and `model_dump` carries them into the entry
+    unchanged.
+
+    Every statement runs in one `store_db.read_snapshot`, and the first one
+    reads `store_events.head`: that is `as_of_seq`, the machine-wide head (so
+    it can be above 0 on an empty listing), and the listing -- the `--before`
+    lookup included -- reflects every event up to it and none after it.
+    `store_id` is `store_db.store_id`, read in the same snapshot and never
+    minted here, so it is `None` when no `am.db` exists yet or its `meta` has
+    no `store_id` row.
     """
-    root = resolve_repo_dir(repo_dir)
+    if limit is not None and limit < 1:
+        raise CliError(f"--limit must be at least 1, got {limit}")
+    if before is not None and limit is None:
+        raise CliError("--before requires --limit")
+    root = repo_dir if all_projects else resolve_repo_dir(repo_dir)
     conn = store_db.open_db_for_reading(root)
     try:
-        now = _utcnow()
-        entries = []
-        for summary in store_queries.list_runs(
-            conn, project_id=store_projects.lookup(conn, root)
-        ):
-            lease = store_leases.read_lease(conn, summary.id)
-            shown = (
-                None
-                if lease is None
-                else store_queries.RunLease(**_lease_fields(lease, now=now))
+        with store_db.read_snapshot(conn):
+            as_of_seq = store_events.head(conn)
+            store_id = store_db.store_id(conn)
+            scope = (
+                store_queries.ALL_PROJECTS
+                if all_projects
+                else store_projects.lookup(conn, root)
             )
-            entries.append(summary.model_copy(update={"lease": shown}).model_dump())
-        return {"runs": entries}
+            start = (
+                None
+                if before is None
+                else _runs_before(conn, before, scope=scope, root=root)
+            )
+            now = _utcnow()
+            entries = []
+            for summary in store_queries.list_runs(
+                conn, project_id=scope, limit=limit, before=start
+            ):
+                lease = store_leases.read_lease(conn, summary.id)
+                shown = (
+                    None
+                    if lease is None
+                    else store_queries.RunLease(**_lease_fields(lease, now=now))
+                )
+                entries.append(summary.model_copy(update={"lease": shown}).model_dump())
+            return {"runs": entries, "as_of_seq": as_of_seq, "store_id": store_id}
     finally:
         conn.close()
 
@@ -2522,11 +2639,26 @@ def runs(
     repo_dir: Path = typer.Option(
         Path("."), "--repo-dir", help="The repository whose projection is read."
     ),
+    all_projects: bool = typer.Option(
+        False, "--all-projects", help="List every project's runs; --repo-dir is ignored."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="List at most this many runs (at least 1)."
+    ),
+    before: str | None = typer.Option(
+        None,
+        "--before",
+        help="Start the page after this run: pass the last run id of the previous"
+        " page. An ISO 8601 timestamp lists runs started strictly before it."
+        " Needs --limit.",
+    ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """List this project's run history, newest first."""
+    """List this project's run history, or every project's, newest first."""
     try:
-        payload = runs_for(repo_dir=repo_dir)
+        payload = runs_for(
+            repo_dir=repo_dir, all_projects=all_projects, limit=limit, before=before
+        )
     except HANDLED as error:
         typer.echo(render(error_envelope(error), pretty=pretty))
         raise typer.Exit(EXIT_ERROR) from None

@@ -151,7 +151,7 @@ def test_usage_names_both_streaming_commands():
 
 def test_runs_section_documents_new_keys():
     section = _section("Listing runs")
-    new_keys = ("milestone_id", "card_id", "story_id", "lease", "progress")
+    new_keys = ("milestone_id", "card_id", "story_id", "lease", "progress", "project")
     assert set(new_keys) <= set(store_queries.RunSummary.model_fields)
     for key in new_keys:
         assert f"`{key}`" in section, key
@@ -160,6 +160,7 @@ def test_runs_section_documents_new_keys():
         store_queries.RunProgress,
         store_queries.ProgressCount,
         store_queries.ProgressCurrent,
+        store_queries.RunProject,
     ):
         for field in model.model_fields:
             assert re.search(rf"\b{field}\b", section), f"{model.__name__}.{field}"
@@ -170,6 +171,10 @@ def test_runs_section_documents_new_keys():
     assert "its `milestone_id` is still the story's parent milestone" in section
     assert "`null` if no process has a lease row for it" in section
     assert "`am status <run-id>` shows in `control.lease`" in section
+    assert "`project`: `{id, repo_dir}`" in section
+    for flag in ("`--all-projects`", "`--limit N`", "`--before X`"):
+        assert flag in section, flag
+    assert "pass the last run id of the previous page" in section
     assert ADDITIVE in section
     assert IGNORE_UNKNOWN in section
 

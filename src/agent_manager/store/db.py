@@ -631,6 +631,31 @@ def immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     conn.commit()
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One read transaction: every statement in the block sees one committed database.
+
+    Python's `sqlite3` in legacy transaction mode never opens a transaction
+    for a `SELECT`, so on its own each statement sees what was committed when
+    it began. This executes a deferred `BEGIN` and yields `conn`: the WAL read
+    snapshot is fixed at the first read inside the block, and every later
+    statement sees exactly that snapshot whatever other connections commit
+    meanwhile. So the first statement is the one that fixes the cut. No write
+    lock is taken, and a writer elsewhere commits without waiting.
+
+    Every exit, normal or by an exception, ends the transaction with
+    `rollback()` (nothing was written); an exception is re-raised unchanged.
+    It never commits: an already-open transaction on `conn` makes the `BEGIN`
+    raise `sqlite3.OperationalError` and is left as it was. Works on every
+    connection `open_db_for_reading` returns.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+
+
 def is_busy(error: sqlite3.OperationalError) -> bool:
     """Whether `error` is SQLite reporting busy or locked, extended codes included.
 

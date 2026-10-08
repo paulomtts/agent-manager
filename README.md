@@ -638,6 +638,10 @@ Which report you get when more than one thing happened:
 
 `am status <run-id>` also always has an `integrity` key: `{"checked", "reason", "mismatches"}`. It compares the run's events, which `am` records in the same transaction as every row it writes, with the projection `am status` reads; the run's `journal.jsonl` file is not read. The events rebuild only the run's tree (`runs`, `stories`, `subtasks`, `phases`, `attempts`); the six row-only tables (`checkpoints`, `checkpoint_floors`, `run_controls`, `run_leases`, `run_claims`, `board_comments`) have no events and are the projection's alone, so they are never compared. When no comparison was made, `checked` is `false` and `reason` says why: `"lease is live"` (a running process's writes in flight are not divergence), `"no events"`, or `"events unreadable: <error>"`. Otherwise `checked` is `true` and `reason` is `null`. Each entry of `mismatches` is `{"node", "field", "journal", "projection", "kind"}`: `node` is `{"story", "card", "phase", "attempt"}`, all `null` for the run itself; `field` is `"status"` when both sides have the node with different statuses and `null` when only one side has it; `journal` is the status the run's events replay to and `projection` the projection's, each `null` on the side that lacks the node. Only statuses and the tree's shape are compared. The check only reports: it writes nothing and never changes the exit code. A `stale` mismatch means the events are ahead, and a resume or a rebuild moves the projection forward. A `foreign` mismatch means something other than `am` wrote this row.
 
+`am status` also always has an `as_of_seq` key: the `seq` of the newest event the report reflects (`0` when no event has been recorded). Everything in the report is read in one read transaction together with that number, so it reflects every event up to `as_of_seq` and none after it; only `control.lease.live` is judged at the moment you ask.
+
+`am status` also always has a `store_id` key: the identity of the `am.db` the report was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds.
+
 `am status <run-id>` also always has a `warnings` key: `[]`, or a list holding the run's isolation warning, `isolation: none (bwrap and unshare are unavailable): agents can signal the engine`, when `--isolation auto` found neither `bwrap` nor `unshare` and the run went un-isolated (see [Isolating agents with `--isolation`](#isolating-agents-with---isolation)).
 
 A request is refused, with `{"ok": false, "error": {"type", "message"}}`, exit code 3 and nothing recorded, in this order:
@@ -681,7 +685,14 @@ for everything deferred.
 
 ```bash
 am runs --repo-dir . --pretty
+am runs --all-projects --limit 20
+am runs --all-projects --limit 20 --before 20260923T140506Z-19efcddc
 ```
+
+- `--all-projects` lists the runs of every project on the machine, in one order (newest first, not grouped by project). `--repo-dir` is then ignored, even if it names no directory.
+- `--limit N` lists at most the first `N` runs; `N` must be at least 1. Without it the listing is unbounded.
+- `--before X` needs `--limit` and starts the page after `X`. To read the next page, pass the last run id of the previous page: paging by run id never skips or repeats a run, even when several runs started in the same second. In a single repository's listing, `X` must be a run of that repository. `X` may also be an ISO 8601 timestamp (a date alone means midnight; no offset means UTC): the page then holds only runs that started strictly before that instant, and runs with no `started_at` are left out. Paging by timestamp can skip the rest of a group of runs that started in the same second, so prefer the run id.
+- `--before` without `--limit`, or a `--limit` below 1, is refused with a `CliError`; an `X` that is neither a run id nor an ISO timestamp, or a run of another repository, is an `UnknownRunError`. Both are exit code 3.
 
 `data.runs` is a list with one object per run. Each object has these keys:
 
@@ -691,6 +702,11 @@ am runs --repo-dir . --pretty
 - `story_id`: the story card an `am run --story` run drives. It is `null` on any other run (a milestone, `--card` or `--board` run), and on a run recorded by an `am` too old to store it. A story run's `workflow` is `milestone`, its `card_id` is `null`, and its `milestone_id` is still the story's parent milestone, so a consumer that maps a run to its milestone keeps working.
 - `lease`: the process holding the run, or `null` if no process has a lease row for it. When present it is `{live, pid, host, heartbeat_at, accepting}`, the same values `am status <run-id>` shows in `control.lease` (without `acquired_at`). `live` is worked out when you ask: the heartbeat is at most 30 seconds old, and the lease is on another host or its pid is alive here. `heartbeat_at` is an ISO 8601 string. `accepting` is `false` once the run's control window has closed.
 - `progress`: how far the run has got, counted from its recorded tree: `{stories: {done, total}, subtasks: {done, total}, current}`. `done` counts only rows whose status is `done`; `failed`, `escalated`, `stopped` and `canceled` rows count toward `total` only. A milestone run that had to resolve a merge conflict also counts its synthetic `Integrate` story and that story's resolver subtasks, so it shows one story more than the milestone has. `current` is `{card, phase, attempt}` for the `started` phase that started most recently (`attempt` is that phase's highest attempt number, `null` before its first attempt), or `null` when no phase is started. It is read from the recorded rows, not from a live process: a run whose process died mid-phase still shows the phase it stopped in, so check `lease.live` to know whether anyone is still working on it. A run with nothing recorded below it shows `0` of `0` at both levels and `current: null`; `progress` itself is never `null`.
+- `project`: `{id, repo_dir}`, the project the run belongs to. `id` is the project's number in the machine database and `repo_dir` is the resolved path the project is keyed by. It can be spelled differently from the run's own `repo_dir`, which is the path the run recorded. It is `null` only for a run whose project row is missing from a damaged database; such a run is still listed.
+
+`data.as_of_seq` is the `seq` of the newest event the listing reflects (`0` when no event has been recorded). It is the machine-wide newest event, so it can be above `0` when this repository has no runs. Every row in the listing is read in one read transaction together with it; only `lease.live` is judged at the moment you ask.
+
+`data.store_id` is the identity of the `am.db` the listing was read from, a 32-character lowercase hex string read in the same read transaction as `as_of_seq`. Like `as_of_seq` it is machine-wide, so an empty listing still carries it. It never changes for that database, and a replaced or restored-from-elsewhere `am.db` has a different one, so a consumer that sees a different `store_id` must drop any `as_of_seq` or cursor it holds. It is `null` when no database exists yet; `am runs` never creates one to report it.
 
 New keys are additive: a newer `am` may add keys to these objects, but never removes or renames one. Consumers should ignore any key they do not recognize.
 
