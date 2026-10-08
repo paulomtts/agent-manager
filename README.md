@@ -843,6 +843,57 @@ Every event with a `gseq` up to `as_of_seq` is already in the snapshot, and the 
 
 A restored backup is the one case neither catches. A backup restored over `am.db` keeps the `store_id` it was taken with, which is the database's own, and its head goes back to the head at backup time, which can be lower than a cursor you hold. New events then take the `gseq` numbers above the restored head again. A consumer that reconnects after those new events have pushed head past its old cursor gets no `cursor_reset`, and silently skips the events between the restored head and its cursor. So after a restore every consumer must drop its cursors and read a snapshot again (see [Backing up and restoring `am.db`](#backing-up-and-restoring-amdb)).
 
+### Reading events with `am events`
+
+`am events` reads the events of one run, or every run's escalations, from `am.db` as one envelope. Like `am watch`, it takes no lease, no claim and no lock, and never writes.
+
+```bash
+am events 20261002T140000Z-19efcddc
+am events 20261002T140000Z-19efcddc --after-seq 1187 --limit 100
+am events 20261002T140000Z-19efcddc --tail 20
+am events 20261002T140000Z-19efcddc --before-seq 1187 --limit 100
+am events --escalations --after-seq 1187
+am events --escalations --project ~/code/my-repo
+```
+
+It has two forms. One run's events have the shape `am events RUN [--after-seq N] [--limit N] [--tail N] [--before-seq N] [--pretty]`:
+
+- `RUN` is found by its id alone, whichever repository recorded it.
+- With no window flag, or with `--after-seq` and `--limit`, the page is the first `--limit` events whose `gseq` is above `--after-seq` (0 when not given; every such event when there is no `--limit`). To read the next page, pass the last `gseq` of the previous page as `--after-seq`.
+- `--tail N` is the run's last `N` events.
+- `--before-seq X` is the events whose `gseq` is below `X`, the nearest `--limit` of them, or all of them with no `--limit`. To page backward, pass the first `gseq` of the page as the next `--before-seq`.
+
+The escalations have the shape `am events --escalations [--project PATH] [--after-seq N] [--limit N] [--pretty]`:
+
+- The page is every run's `run_upsert` lines whose `payload.status` is `escalated`, ascending by `gseq`, paged forward with `--after-seq` and `--limit` as above.
+- `--project PATH` narrows it to the repository at `PATH`, looked up by its resolved path and never created. A path `am` has never run in gives an empty page.
+
+Either way, `am events` prints `{"ok": true, "data": {"events": [...], "head": H}}` and exits 0:
+
+```
+{"data":{"events":[{"attempt":null,"card":"<subtask-id>","event":"phase_upsert","gseq":1187,"payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}],"head":1204},"ok":true}
+```
+
+- `events` is ascending by `gseq`. Each event is a [journal line](#the-journal-line) plus its `gseq`, of any of the ten kinds.
+- `head` is the machine-wide head, read in the same snapshot as the page, so no line's `gseq` is above it, and it stays machine-wide with `--project`. It serves as an `as_of_seq` (see [Snapshots and cursors](#snapshots-and-cursors)).
+- An empty window is `[]`, not an error: past the run's last event, past head, or a `--before-seq` at or below the run's first event. A `--before-seq` above head reads up to head.
+- A run with a run row but no event yet is an empty page.
+
+These are refused with `{"ok": false, "error": {"type", "message"}}` and exit code 3, as `CliError` before `am.db` is opened, the first failing one in this order:
+
+- a `--limit` below 1;
+- an `--after-seq` below 0;
+- a `--tail` below 1;
+- a `--before-seq` below 1;
+- `--escalations` together with `RUN`;
+- `--project` without `--escalations`;
+- neither `RUN` nor `--escalations`;
+- `--escalations` together with `--tail` or `--before-seq`;
+- `--tail` together with `--after-seq`, `--before-seq` or `--limit`;
+- `--before-seq` together with `--after-seq`.
+
+A `RUN` with no event and no run row in `am.db` is refused as `UnknownRunError`, exit code 3.
+
 ### Reading an attempt's output
 
 `am logs` prints what one attempt of one phase of one subtask was given and wrote. Like `am status` and `am runs`, it reads the projection and takes no lease, no claim and no lock, so it works beside any number of live runs.

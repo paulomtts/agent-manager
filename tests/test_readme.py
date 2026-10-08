@@ -34,6 +34,7 @@ from agent_manager import (
 from agent_manager.harness import launcher
 from agent_manager.store import backup as store_backup
 from agent_manager.store import db as store_db
+from agent_manager.store import events as store_events
 from agent_manager.store import journal as store_journal
 from agent_manager.store import queries as store_queries
 
@@ -1181,3 +1182,123 @@ def test_stream_section_cursors_by_gseq():
     assert "in a `journal.jsonl` file you read yourself" in section
     assert WATCH_SCHEMA_NOTE in section.splitlines()
     assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
+
+
+EVENTS_TITLE = "Reading events with `am events`"
+EVENTS_RUN_SHAPE = (
+    "`am events RUN [--after-seq N] [--limit N] [--tail N] [--before-seq N] [--pretty]`"
+)
+EVENTS_ESCALATIONS_SHAPE = (
+    "`am events --escalations [--project PATH] [--after-seq N] [--limit N] [--pretty]`"
+)
+EVENTS_REFUSALS = (
+    ("- a `--limit` below 1;", lambda: cli._check_event_values(limit=0)),
+    ("- an `--after-seq` below 0;", lambda: cli._check_event_values(after_seq=-1)),
+    ("- a `--tail` below 1;", lambda: cli._check_event_values(tail=0)),
+    ("- a `--before-seq` below 1;", lambda: cli._check_event_values(before_seq=0)),
+    (
+        "- `--escalations` together with `RUN`;",
+        lambda: cli._check_events_form(
+            "r", escalations=True, project=None, tail=None, before_seq=None
+        ),
+    ),
+    (
+        "- `--project` without `--escalations`;",
+        lambda: cli._check_events_form(
+            "r", escalations=False, project=Path("p"), tail=None, before_seq=None
+        ),
+    ),
+    (
+        "- neither `RUN` nor `--escalations`;",
+        lambda: cli._check_events_form(
+            None, escalations=False, project=None, tail=None, before_seq=None
+        ),
+    ),
+    (
+        "- `--escalations` together with `--tail` or `--before-seq`;",
+        lambda: cli._check_events_form(
+            None, escalations=True, project=None, tail=1, before_seq=None
+        ),
+    ),
+    (
+        "- `--tail` together with `--after-seq`, `--before-seq` or `--limit`;",
+        lambda: cli.events_for("r", tail=1, limit=1),
+    ),
+    (
+        "- `--before-seq` together with `--after-seq`.",
+        lambda: cli.events_for("r", before_seq=5, after_seq=1),
+    ),
+)
+
+
+def _row(line: dict) -> store_events.EventRow:
+    """The `events` row a documented example line stands for."""
+    return store_events.EventRow(
+        seq=line["gseq"],
+        project_id=1,
+        run_id=line["run_id"],
+        run_seq=line["seq"],
+        ts=line["ts"],
+        kind=line["event"],
+        story_id=line["story"],
+        card_id=line["card"],
+        phase=line["phase"],
+        attempt=line["attempt"],
+        schema=1,
+        payload=line["payload"],
+        source="live",
+    )
+
+
+def test_events_section_documents_every_flag_and_refusal():
+    section = _section(EVENTS_TITLE)
+    assert EVENTS_RUN_SHAPE in section
+    assert EVENTS_ESCALATIONS_SHAPE in section
+    shapes = _backticked_flags(EVENTS_RUN_SHAPE) | _backticked_flags(EVENTS_ESCALATIONS_SHAPE)
+    assert shapes == _long_options("events")
+    assert '`{"ok": true, "data": {"events": [...], "head": H}}`' in section
+    assert "pass the last `gseq` of the previous page as `--after-seq`" in section
+    assert "pass the first `gseq` of the page as the next `--before-seq`" in section
+    assert "An empty window is `[]`, not an error" in section
+    assert "A `--before-seq` above head reads up to head." in section
+    assert "A path `am` has never run in gives an empty page." in section
+    assert "it stays machine-wide with `--project`" in section
+    assert "found by its id alone, whichever repository recorded it" in section
+    assert "`CliError`" in section
+    assert "as `UnknownRunError`, exit code 3" in section
+
+    positions = []
+    for bullet, call in EVENTS_REFUSALS:
+        assert bullet in section, bullet
+        positions.append(section.index(bullet))
+        with pytest.raises(cli.CliError):
+            call()
+    assert positions == sorted(positions)
+
+    heads = _headings()
+    titles = [title for _, _, title in heads]
+    assert (
+        titles.index("Watching a run")
+        < titles.index(SNAPSHOTS_TITLE)
+        < titles.index(EVENTS_TITLE)
+        < titles.index(LOGS_TITLE)
+    )
+    assert heads[titles.index(EVENTS_TITLE)][1] == 3
+    anchors = _assert_anchors_resolve(section)
+    assert "the-journal-line" in anchors
+    assert _slug(SNAPSHOTS_TITLE) in anchors
+
+
+def test_events_example_line_matches_code():
+    examples = _fenced_json_lines(_section(EVENTS_TITLE))
+    assert len(examples) == 1
+    raw, envelope = examples[0]
+    assert raw == cli.render(envelope)
+    assert envelope["ok"] is True
+    assert set(envelope["data"]) == {"events", "head"}
+    lines = envelope["data"]["events"]
+    assert lines
+    for line in lines:
+        assert set(line) == set(store_journal.JournalLine.model_fields) | {"gseq"}
+        assert line["gseq"] <= envelope["data"]["head"]
+        assert cli._event_line(_row(line)) == line
