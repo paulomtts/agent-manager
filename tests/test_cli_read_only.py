@@ -509,3 +509,181 @@ def test_journal_check_refuses_an_unmigrated_machine_and_writes_nothing(
     assert "am migrate" in envelope["error"]["message"]
     assert not paths.db_path().exists()
     assert not (paths.data_path() / "runs").exists()
+
+
+def _db_head_and_store_id() -> tuple[int, str | None]:
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        return store_events.head(conn), store_db.store_id(conn)
+    finally:
+        conn.close()
+
+
+MACHINE_WIDE_UNKNOWN = (
+    "run 'nope' is not in the projection"
+    " (`agent-manager runs --all-projects` lists the ones that are)"
+)
+
+
+def test_status_of_another_repos_run_without_repo_dir_reports_it_and_writes_nothing(
+    two_repos, monkeypatch
+):
+    a, b = two_repos
+    monkeypatch.chdir(a)
+    runs_root = paths.data_path() / "runs"
+    runs_before = _tree(runs_root)
+    rows_before = _row_counts()
+    head, store_id = _db_head_and_store_id()
+
+    result = runner.invoke(cli.app, ["status", B_RUN])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["run"]["id"] == B_RUN
+    assert data["run"]["repo_dir"] == str(b.resolve())
+    assert data["as_of_seq"] == head
+    assert data["store_id"] == store_id
+    assert store_id is not None
+    assert _tree(runs_root) == runs_before
+    assert _row_counts() == rows_before
+
+
+def test_status_run_without_repo_dir_from_a_cwd_with_no_project_reports_it(
+    two_repos, tmp_path, monkeypatch
+):
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    monkeypatch.chdir(stranger)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["status", A_RUN])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["run"]["id"] == A_RUN
+    assert _row_counts() == rows_before
+
+
+def test_status_of_an_unknown_run_without_repo_dir_refuses_and_creates_nothing(
+    unknown_repo, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(unknown_repo)
+
+    result = _invoke_creating_nothing(tmp_path, ["status", "nope"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }
+
+
+def test_status_run_without_repo_dir_refuses_an_unmigrated_machine(
+    tmp_path, monkeypatch
+):
+    # The parametrized unmigrated test above appends --repo-dir to every argv,
+    # so it cannot cover the machine-wide form.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    _leave_a_legacy_database()
+
+    result = _invoke_creating_nothing(tmp_path, ["status", RUN_ID])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "MigrationRequiredError"
+    assert "am migrate" in envelope["error"]["message"]
+    assert not paths.db_path().exists()
+    assert not (paths.data_path() / "runs").exists()
+
+
+def test_status_without_run_id_or_repo_dir_reports_the_cwd_repos_latest(
+    two_repos, monkeypatch
+):
+    a, _ = two_repos
+    monkeypatch.chdir(a)
+
+    result = runner.invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"]["run"]["id"] == A_RUN
+
+
+@pytest.mark.parametrize("given", ["a", "~/a"])
+def test_status_run_with_a_relative_or_home_repo_dir_stays_scoped(
+    two_repos, tmp_path, monkeypatch, given
+):
+    """Review Focus 1: an explicit --repo-dir is still resolved and still scopes."""
+    a, _ = two_repos
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rows_before = _row_counts()
+
+    own = runner.invoke(cli.app, ["status", A_RUN, "--repo-dir", given])
+    other = runner.invoke(cli.app, ["status", B_RUN, "--repo-dir", given])
+
+    assert own.exit_code == 0, own.output
+    assert json.loads(own.stdout)["data"]["run"]["id"] == A_RUN
+    assert other.exit_code == cli.EXIT_ERROR, other.output
+    assert json.loads(other.stdout)["error"] == {
+        "type": "UnknownRunError",
+        "message": f"run {B_RUN!r} is not in the projection for {a.resolve()}"
+        " (`agent-manager runs` lists the ones that are)",
+    }
+    assert _row_counts() == rows_before
+
+
+def test_status_run_with_a_repo_dir_that_is_not_a_directory_is_a_repo_dir_error(
+    two_repos, tmp_path
+):
+    """Review Focus 2: an explicit --repo-dir is never ignored, even with RUN."""
+    missing = tmp_path / "missing"
+
+    result = _invoke_creating_nothing(
+        tmp_path, ["status", A_RUN, "--repo-dir", str(missing)]
+    )
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert json.loads(result.stdout)["error"]["type"] == "RepoDirError"
+
+
+def test_status_run_without_repo_dir_reports_a_run_whose_project_row_is_missing(
+    two_repos, monkeypatch
+):
+    """Review Focus 3: `load_run` does not consult `projects`."""
+    a, b = two_repos
+    conn = sqlite3.connect(paths.db_path())
+    try:
+        conn.execute(
+            "DELETE FROM projects WHERE id = (SELECT project_id FROM runs WHERE id = ?)",
+            (B_RUN,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.chdir(a)
+    rows_before = _row_counts()
+
+    result = runner.invoke(cli.app, ["status", B_RUN])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)["data"]
+    assert data["run"]["id"] == B_RUN
+    assert data["run"]["repo_dir"] == str(b.resolve())
+    assert _row_counts() == rows_before
+
+
+def test_status_of_an_unknown_run_without_repo_dir_honours_pretty(
+    two_repos, tmp_path, monkeypatch
+):
+    """Review Focus 4: the new refusal is the usual envelope under --pretty."""
+    a, _ = two_repos
+    monkeypatch.chdir(a)
+
+    result = _invoke_creating_nothing(tmp_path, ["status", "nope", "--pretty"])
+
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    assert "\n  " in result.stdout
+    assert json.loads(result.stdout) == {
+        "ok": False,
+        "error": {"type": "UnknownRunError", "message": MACHINE_WIDE_UNKNOWN},
+    }

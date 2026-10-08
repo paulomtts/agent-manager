@@ -47,7 +47,10 @@ class BaseBranchError(CliError):
 
 
 class UnknownRunError(CliError):
-    """`status` was asked for a run this project's projection does not hold.
+    """A command was asked for a run the projection does not hold.
+
+    Scoped to `--repo-dir`'s project when one is given, or machine-wide when
+    `status` looks a run up by id alone; the message says which.
 
     A `CliError` so it rides the existing `HANDLED` tuple into an `ok: false`
     envelope at exit 3 rather than reaching the renderer as a `None` tree. The

@@ -2408,8 +2408,20 @@ def _project_run(conn: sqlite3.Connection, root: Path, run_id: str) -> models.Ru
     return run
 
 
-def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
-    """The §9 tree and §10 table of one run of this project.
+def status_for(run_id: str | None, *, repo_dir: Path | None) -> dict[str, Any]:
+    """The §9 tree and §10 table of one run, of this project or, by id, of any.
+
+    `repo_dir` given: it is resolved (`RepoDirError` if it is no directory)
+    and the run must be one of its project's, through `_project_run`; with no
+    `run_id`, the default run is its project's most recent. `repo_dir` `None`
+    with no `run_id` means `Path(".")`, so the command and direct callers
+    agree. `repo_dir` `None` with a `run_id` is the machine-wide lookup: run
+    ids are machine-unique, so `store_queries.load_run` finds the run
+    whichever project recorded it, even one whose `projects` row is missing.
+    No directory is resolved then -- the current directory plays no part --
+    and `open_db_for_reading` gets `Path(".")` only because it takes a root,
+    which never chooses the file. An id it does not hold is an
+    `UnknownRunError` naming no repository.
 
     Read-only: no `record_*` is called, and the connection is closed on every
     path including the refusals, the way `run_card` closes its store. The default
@@ -2427,7 +2439,8 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
     same snapshot and never minted here: it names the database read, so a
     consumer seeing a different one drops any `as_of_seq` it holds.
     """
-    root = resolve_repo_dir(repo_dir)
+    machine_wide = run_id is not None and repo_dir is None
+    root = Path(".") if machine_wide else resolve_repo_dir(repo_dir or Path("."))
     conn = store_db.open_db_for_reading(root)
     try:
         with store_db.read_snapshot(conn):
@@ -2443,12 +2456,20 @@ def status_for(run_id: str | None, *, repo_dir: Path) -> dict[str, Any]:
                         f"no run has been recorded for {root}, so there is no most recent"
                         " run to report on; pass a run id or start one with `run --card`"
                     )
-            run = _project_run(conn, root, wanted)
-            if run is None:
-                raise UnknownRunError(
-                    f"run {wanted!r} is not in the projection for {root}"
-                    " (`agent-manager runs` lists the ones that are)"
-                )
+            if machine_wide:
+                run = store_queries.load_run(conn, wanted)
+                if run is None:
+                    raise UnknownRunError(
+                        f"run {wanted!r} is not in the projection"
+                        " (`agent-manager runs --all-projects` lists the ones that are)"
+                    )
+            else:
+                run = _project_run(conn, root, wanted)
+                if run is None:
+                    raise UnknownRunError(
+                        f"run {wanted!r} is not in the projection for {root}"
+                        " (`agent-manager runs` lists the ones that are)"
+                    )
             lease = store_leases.read_lease(conn, wanted)
             now = _utcnow()
             # Only a live lease's claims count (X5): a dead one's leftover rows
@@ -2478,12 +2499,20 @@ def status(
     run_id: str | None = typer.Argument(
         None, metavar="[RUN_ID]", help="The run to report on. Defaults to the most recent."
     ),
-    repo_dir: Path = typer.Option(
-        Path("."), "--repo-dir", help="The repository whose projection is read."
+    repo_dir: Path | None = typer.Option(
+        None,
+        "--repo-dir",
+        help="The repository whose projection is read (default: the current"
+        " directory). Without it, a RUN_ID is looked up across every project.",
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Report one run as story / subtask / phase / attempt / state."""
+    """Report one run as story / subtask / phase / attempt / state.
+
+    With RUN_ID and no --repo-dir the run is found by id alone, whichever
+    repository recorded it; with --repo-dir it must be that repository's.
+    With no RUN_ID it is the most recent run of --repo-dir (default `.`).
+    """
     try:
         payload = status_for(run_id, repo_dir=repo_dir)
     except HANDLED as error:
