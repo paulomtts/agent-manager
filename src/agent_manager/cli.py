@@ -2692,6 +2692,21 @@ def _check_event_values(
         raise CliError(f"--before-seq must be at least 1, got {before_seq}")
 
 
+def _refuse_unknown_run(conn: sqlite3.Connection, run_id: str) -> None:
+    """`UnknownRunError` naming `run_id` unless it has an `events` row or a
+    `runs` row. Lease and claim events can precede the run's `run_upsert`, and
+    a `runs` row can exist without events: either makes the run known. Run it
+    inside the caller's snapshot. Read-only."""
+    if (
+        not store_events.has_run(conn, run_id)
+        and store_queries.load_run(conn, run_id) is None
+    ):
+        raise UnknownRunError(
+            f"run {run_id!r} is not in the projection"
+            " (`agent-manager runs --all-projects` lists the ones that are)"
+        )
+
+
 def events_for(
     run_id: str,
     *,
@@ -2750,16 +2765,7 @@ def events_for(
     try:
         with store_db.read_snapshot(conn):
             head = store_events.head(conn)
-            # Lease and claim events can precede the run's `run_upsert`, and a
-            # `runs` row can exist without events: either makes the run known.
-            if (
-                not store_events.has_run(conn, run_id)
-                and store_queries.load_run(conn, run_id) is None
-            ):
-                raise UnknownRunError(
-                    f"run {run_id!r} is not in the projection"
-                    " (`agent-manager runs --all-projects` lists the ones that are)"
-                )
+            _refuse_unknown_run(conn, run_id)
             if tail is not None:
                 rows = store_events.read_last(conn, limit=tail, run_id=run_id)
             elif before_seq is not None:
@@ -3262,34 +3268,60 @@ def _journal_events(run_id: str, *, since: int) -> list[dict[str, Any]]:
     return [line.model_dump(mode="json") for line in lines if line.seq > since]
 
 
+def _check_watch_form(
+    run_id: str | None, *, all_runs: bool, project: Path | None
+) -> None:
+    """Which events `am watch` was asked for, as `CliError`s, the first
+    failing one in this order: RUN with `--project`, `--project` with `--all`
+    or `--all-projects`, then anything but exactly one of RUN, `--all` (or
+    `--all-projects`, the same set) and `--project`. `all_runs` is `--all` or
+    `--all-projects`."""
+    if project is not None and run_id is not None:
+        raise CliError("--project cannot be combined with RUN")
+    if project is not None and all_runs:
+        raise CliError("--project cannot be combined with --all or --all-projects")
+    if (run_id is not None) + all_runs + (project is not None) != 1:
+        raise CliError(
+            "give exactly one of RUN_ID, --all (or --all-projects) or --project:"
+            " `am watch RUN_ID` reads one run, `am watch --all` every run of every"
+            " project, `am watch --project PATH` one repository's runs"
+        )
+
+
 def watch_for(
     run_id: str | None,
     *,
     all_runs: bool = False,
+    project: Path | None = None,
     since: int = 0,
     follow: bool = False,
     from_now: bool = False,
     since_given: bool = False,
-) -> dict[str, Any]:
-    """The payload of `am watch`: `{"events": [...]}`.
+) -> dict[str, Any] | None:
+    """The payload of `am watch`: `{"events": [...]}`, or `None` with `follow`.
 
-    Exactly one of `run_id` and `all_runs`. With `run_id`, a run with no
-    journal is `UnknownRunError`. With `all_runs`, every directory under
-    `<data dir>/runs/` is read, a run with no journal yet is skipped, and a
-    missing `runs/` is no events: a watcher pointed at the wrong data
-    directory sees nothing, not an error (am-watch design 3.7). Events are
-    ordered by `(run_id, seq)`; `since` filters each run's own `seq`.
+    Exactly one selector: `run_id` (that run's events), `all_runs` (`--all`
+    or `--all-projects`: every run of every project) or `project` (the runs of
+    the repository `Path(project).expanduser()` names, looked up through
+    `store_projects.lookup`, so it is never created or required to exist; a
+    path with no `projects` row has no events). A run with no `events` row and
+    no `runs` row is `UnknownRunError`; a run id is never joined onto a path.
 
-    `from_now` (`--from-now`) is refused with `since_given` (any `--since`
-    on the command line, 0 included) and without `follow`. Both refusals
-    come before any journal is read, so `watch` prints them as the usual
+    Each line is `_event_line(row)`: the journal line plus `gseq`. Lines are in
+    ascending `gseq` order, and `since` keeps only rows whose per-run `seq`
+    (`run_seq`) is above it, for each run alike.
+
+    The refusals are `CliError`s raised before the database is opened, the
+    first failing one in this order: `_check_watch_form`, `since` below 0,
+    `from_now` with `since_given` (any `--since` on the command line, 0
+    included), `from_now` without `follow`. So `watch` prints them as the usual
     exit-3 envelope with no stream line.
+
+    Without `follow` the events are read in one `store_db.read_snapshot` on
+    one `open_db_for_reading(Path("."))` connection (the root never chooses
+    the file), closed on every path; with no `am.db` nothing is created.
     """
-    if all_runs == (run_id is not None):
-        raise CliError(
-            "give exactly one of RUN_ID or --all:"
-            " `am watch RUN_ID` reads one run, `am watch --all` reads every run"
-        )
+    _check_watch_form(run_id, all_runs=all_runs, project=project)
     if since < 0:
         raise CliError(f"--since must be 0 or more, got {since}")
     if from_now and since_given:
@@ -3302,22 +3334,32 @@ def watch_for(
             "--from-now needs --follow: it skips the backlog of a stream,"
             " and without --follow there is only the backlog"
         )
-    if run_id is not None:
-        _check_watch_run_id(run_id)
-        try:
-            return {"events": _journal_events(run_id, since=since)}
-        except store_journal.MissingJournalError as error:
-            raise UnknownRunError(
-                f"run {run_id!r} has no journal under the data directory"
-                " (`agent-manager watch --all` reads every run there is)"
-            ) from error
-    events: list[dict[str, Any]] = []
-    for each in paths.list_run_ids():
-        try:
-            events.extend(_journal_events(each, since=since))
-        except store_journal.MissingJournalError:
-            continue
-    return {"events": events}
+    if follow:
+        # The stream still reads journals; Task 2 replaces this block.
+        if run_id is not None:
+            _check_watch_run_id(run_id)
+            try:
+                _journal_events(run_id, since=since)
+            except store_journal.MissingJournalError as error:
+                raise UnknownRunError(
+                    f"run {run_id!r} has no journal under the data directory"
+                    " (`agent-manager watch --all` reads every run there is)"
+                ) from error
+        return None
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        with store_db.read_snapshot(conn):
+            project_id = None
+            if run_id is not None:
+                _refuse_unknown_run(conn, run_id)
+            elif project is not None:
+                project_id = store_projects.lookup(conn, Path(project).expanduser())
+                if project_id is None:
+                    return {"events": []}
+            rows = store_events.read(conn, run_id=run_id, project_id=project_id)
+    finally:
+        conn.close()
+    return {"events": [_event_line(row) for row in rows if row.run_seq > since]}
 
 
 WATCH_POLL_SECONDS = 0.25
@@ -3605,16 +3647,30 @@ def watch(
     run_id: str | None = typer.Argument(
         None,
         metavar="[RUN_ID]",
-        help="The run whose journal is read. Omit it and pass --all for every run.",
+        help="The run whose events are read. Omit it and pass --all,"
+        " --all-projects or --project.",
     ),
     all_runs: bool = typer.Option(
-        False, "--all", help="Read every run's journal under the data directory."
+        False, "--all", help="Read every run's events, of every project."
+    ),
+    all_projects: bool = typer.Option(
+        False,
+        "--all-projects",
+        help="Read every run's events, of every project (the same as --all).",
+    ),
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        metavar="PATH",
+        help="Read only the runs of this repository. A path that never ran has"
+        " no events.",
     ),
     since: int | None = typer.Option(
         None,
         "--since",
         metavar="SEQ",
-        help="Only events whose seq is greater than SEQ (default 0).",
+        help="Only events whose per-run seq is greater than SEQ (default 0);"
+        " across runs, each run's own seq.",
     ),
     follow: bool = typer.Option(
         False,
@@ -3631,12 +3687,13 @@ def watch(
     ),
     pretty: bool = typer.Option(False, "--pretty", help="Indent the JSON envelope."),
 ) -> None:
-    """Print a run's journal events, or every run's, once as one envelope.
+    """Print a run's events, every run's, or one repository's, once as one
+    envelope, in gseq order. Each event is a journal line plus its gseq.
 
     With --follow, print a hello line and then each event as its own line of
-    JSON, the backlog first and then new ones as they are appended, until
+    JSON, the backlog first and then new ones as they are recorded, until
     interrupted. With --follow --from-now, the backlog is skipped and only
-    events appended after the start are printed. A refusal is still one
+    events recorded after the start are printed. A refusal is still one
     envelope at exit 3, printed before any stream line.
     """
     # `None` means --since was not given, which --from-now must tell apart
@@ -3646,7 +3703,8 @@ def watch(
     try:
         payload = watch_for(
             run_id,
-            all_runs=all_runs,
+            all_runs=all_runs or all_projects,
+            project=project,
             since=since_value,
             follow=follow,
             from_now=from_now,

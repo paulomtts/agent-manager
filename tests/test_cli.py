@@ -12313,202 +12313,302 @@ def _watch(*args: str):
     return runner.invoke(cli.app, ["watch", *args])
 
 
-def test_watch_single_run_returns_events_envelope(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
+def _watch_event(row: store_events.EventRow) -> dict[str, Any]:
+    """The line `am watch` prints for `row`: its journal line, JSON-mode, plus
+    `gseq`, the row's global `seq`."""
+    return {**store_events.journal_line(row).model_dump(mode="json"), "gseq": row.seq}
 
-    result = _watch("run-a")
 
+def _watch_data(*argv: str) -> dict[str, Any]:
+    """`am watch ARGV`, one-shot: exit 0, an ok envelope; its data."""
+    result = _watch(*argv)
     assert result.exit_code == 0, result.output
     envelope = json.loads(result.stdout)
-    assert envelope == {"ok": True, "data": {"events": written}}
-    assert [event["seq"] for event in envelope["data"]["events"]] == [1, 2, 3]
+    assert envelope["ok"] is True
+    return envelope["data"]
 
-    pretty = _watch("run-a", "--pretty")
+
+def _watch_refusal(*argv: str) -> dict[str, Any]:
+    """`am watch ARGV`, one-shot: exit 3, one error envelope; its error."""
+    result = _watch(*argv)
+    assert result.exit_code == cli.EXIT_ERROR, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["ok"] is False
+    return envelope["error"]
+
+
+def _project_count() -> int:
+    """How many `projects` rows the machine-wide database holds (0 without one)."""
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()
+
+
+WATCH_PROJECT_WITH_RUN = "--project cannot be combined with RUN"
+WATCH_PROJECT_WITH_ALL = "--project cannot be combined with --all or --all-projects"
+WATCH_EXACTLY_ONE = (
+    "give exactly one of RUN_ID, --all (or --all-projects) or --project:"
+    " `am watch RUN_ID` reads one run, `am watch --all` every run of every"
+    " project, `am watch --project PATH` one repository's runs"
+)
+
+
+def test_watch_single_run_lines_are_journal_lines_plus_gseq(projection):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_B, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+        (EVENTS_RUN_B, "story_upsert"),
+        (EVENTS_RUN_A, "lease_acquired"),
+    )
+    a_rows = [row for row in rows if row.run_id == EVENTS_RUN_A]
+
+    data = _watch_data(EVENTS_RUN_A)
+
+    assert data == {"events": [_watch_event(row) for row in a_rows]}
+    lines = data["events"]
+    assert [line["gseq"] for line in lines] == [rows[0].seq, rows[2].seq, rows[4].seq]
+    assert [line["seq"] for line in lines] == [1, 2, 3]
+    assert [line["event"] for line in lines] == [
+        "run_upsert",
+        "story_upsert",
+        "lease_acquired",
+    ]
+    for line in lines:
+        assert set(line) == EVENT_LINE_KEYS
+
+    pretty = _watch(EVENTS_RUN_A, "--pretty")
     assert pretty.exit_code == 0, pretty.output
     assert "\n" in pretty.stdout.strip()
-    assert json.loads(pretty.stdout) == json.loads(result.stdout)
+    assert json.loads(pretty.stdout) == {"ok": True, "data": data}
 
 
-def test_watch_since_filters_to_later_seqs(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    written = _write_watch_journal(tmp_path, "run-a", [1, 2, 3, 4])
-
-    result = _watch("run-a", "--since", "2")
-
-    assert result.exit_code == 0, result.output
-    events = json.loads(result.stdout)["data"]["events"]
-    assert [event["seq"] for event in events] == [3, 4]
-    assert events == written[2:]
-
-
-def test_watch_since_past_the_last_seq_is_empty(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1, 2])
-
-    result = _watch("run-a", "--since", "99")
-
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"ok": True, "data": {"events": []}}
-
-
-def test_watch_refuses_a_negative_since(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1])
-
-    result = _watch("run-a", "--since", "-1")
-
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "CliError"
-    assert "--since" in envelope["error"]["message"]
-
-
-def test_watch_unknown_run_refuses_and_creates_no_run_directory(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-
-    result = _watch("no-such-run")
-
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "UnknownRunError"
-    assert "no-such-run" in envelope["error"]["message"]
-    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
-    assert not _watch_runs_dir(tmp_path).exists()
-
-
-def test_watch_tolerates_a_torn_last_line(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    written = _write_watch_journal(
-        tmp_path, "run-a", [1, 2], tail='{"seq": 3, "ts": "2026-10'
+def test_watch_since_filters_each_runs_own_seq(projection):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),  # A seq 1
+        (EVENTS_RUN_B, "run_upsert"),  # B seq 1
+        (EVENTS_RUN_A, "story_upsert"),  # A seq 2
+        (EVENTS_RUN_B, "story_upsert"),  # B seq 2
+        (EVENTS_RUN_A, "subtask_upsert"),  # A seq 3
+        (EVENTS_RUN_B, "subtask_upsert"),  # B seq 3
+        (EVENTS_RUN_A, "phase_upsert"),  # A seq 4
     )
 
-    result = _watch("run-a")
+    one = _watch_data(EVENTS_RUN_A, "--since", "2")
+    assert one == {"events": [_watch_event(rows[4]), _watch_event(rows[6])]}
+    assert [line["seq"] for line in one["events"]] == [3, 4]
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["data"]["events"] == written
+    every = _watch_data("--all", "--since", "2")
+    assert every == {"events": [_watch_event(row) for row in rows[4:]]}
+    assert [(line["run_id"], line["seq"]) for line in every["events"]] == [
+        (EVENTS_RUN_A, 3),
+        (EVENTS_RUN_B, 3),
+        (EVENTS_RUN_A, 4),
+    ]
+
+    assert _watch_data(EVENTS_RUN_A, "--since", "99") == {"events": []}
+    assert _watch_data("--all", "--since", "99") == {"events": []}
 
 
-def test_watch_corrupt_journal_is_an_envelope_not_a_traceback(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    # Newline-terminated, so it is not a torn tail: a corrupt line.
-    _write_watch_journal(tmp_path, "run-a", [1], tail="not json\n")
+def test_watch_refuses_a_negative_since(projection):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
 
-    result = _watch("run-a")
+    assert _watch_refusal(EVENTS_RUN_A, "--since", "-1") == {
+        "type": "CliError",
+        "message": "--since must be 0 or more, got -1",
+    }
 
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "CorruptJournalError"
+
+def test_watch_unknown_run_refuses_and_creates_nothing(projection, tmp_path):
+    unknown = {"type": "UnknownRunError", "message": EVENTS_UNKNOWN_MESSAGE}
+
+    assert _watch_refusal("no-such-run") == unknown
+    assert not paths.db_path().exists()
+    assert not _watch_runs_dir(tmp_path).exists()
+
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    assert _watch_refusal("no-such-run") == unknown
+    assert not (_watch_runs_dir(tmp_path) / "no-such-run").exists()
+
+
+def test_watch_known_run_with_no_events_is_empty(projection):
+    """`events` is append-only, so the run's rows are removed behind its
+    trigger's back; the `runs` row stays."""
+    _record(projection, SNAPSHOT_RUN_ID, started_at=RECORDED_AT, with_phases=False)
+    _insert_events(projection, (EVENTS_RUN_B, "run_upsert"))
+    _drop_events(projection, SNAPSHOT_RUN_ID)
+    conn = store_db.open_db_for_reading(Path("."))
+    try:
+        assert store_events.has_run(conn, SNAPSHOT_RUN_ID) is False
+        assert store_queries.load_run(conn, SNAPSHOT_RUN_ID) is not None
+    finally:
+        conn.close()
+
+    assert _watch_data(SNAPSHOT_RUN_ID) == {"events": []}
+
+
+def test_watch_run_known_only_by_lease_events_is_listed(projection):
+    """Review Focus 4: lease and claim events can precede the `run_upsert`."""
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "lease_acquired"),
+        (EVENTS_RUN_A, "claim_conflict"),
+    )
+
+    assert _watch_data(EVENTS_RUN_A) == {"events": [_watch_event(row) for row in rows]}
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "a/b", ".", "..", ""])
-def test_watch_refuses_a_run_id_that_is_a_path(tmp_path, monkeypatch, run_id):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    # runs/ must exist for "runs/../escape" to resolve on disk, so that without
-    # the guard "../escape" really would read the journal one level above it.
-    _watch_runs_dir(tmp_path).mkdir(parents=True)
+def test_watch_path_like_run_ids_are_unknown_runs(projection, tmp_path, run_id):
+    _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    # A journal one level above runs/: reading it would be a CorruptJournalError.
     escape = tmp_path / "xdg" / "agent-manager" / "escape"
     escape.mkdir(parents=True)
-    line = store_journal.JournalLine(
-        seq=1, ts=WATCH_TS, run_id="escape", event="run_upsert"
-    ).model_dump(mode="json")
-    (escape / store_journal.JOURNAL_NAME).write_text(
-        json.dumps(line) + "\n", encoding="utf-8"
+    (escape / store_journal.JOURNAL_NAME).write_text("not json\n", encoding="utf-8")
+
+    error = _watch_refusal(run_id)
+
+    assert error["type"] == "UnknownRunError"
+    assert f"run {run_id!r} is not in the projection" in error["message"]
+
+
+def test_watch_all_and_all_projects_read_every_project_in_gseq_order(escalation_repos):
+    root, other = escalation_repos
+    # B (in `other`) first, so the order is gseq, not run id.
+    rows = _insert_rows(
+        (other, EVENTS_RUN_B, "run_upsert", {"n": 0}),
+        (root, EVENTS_RUN_A, "run_upsert", {"n": 1}),
+        (other, EVENTS_RUN_B, "story_upsert", {"n": 2}),
+        (root, EVENTS_RUN_A, "story_upsert", {"n": 3}),
     )
+    assert len({row.project_id for row in rows}) == 2
+    expected = {"events": [_watch_event(row) for row in rows]}
 
-    result = _watch(run_id)
+    for argv in (["--all"], ["--all-projects"], ["--all", "--all-projects"]):
+        assert _watch_data(*argv) == expected, argv
 
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
-    assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "UnknownRunError"
-    # The path guard refused it, not a journal lookup that happened to miss.
-    assert "not a run directory name" in envelope["error"]["message"]
-    assert list(_watch_runs_dir(tmp_path).iterdir()) == []
-
-
-def test_watch_all_reads_across_more_than_one_run(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    # Written b first, so the order in the output is the sort, not creation order.
-    run_b = _write_watch_journal(tmp_path, "run-b", [1, 2])
-    run_a = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
-
-    result = _watch("--all")
-
-    assert result.exit_code == 0, result.output
-    events = json.loads(result.stdout)["data"]["events"]
-    assert events == run_a + run_b
-    assert [(event["run_id"], event["seq"]) for event in events] == [
-        ("run-a", 1),
-        ("run-a", 2),
-        ("run-a", 3),
-        ("run-b", 1),
-        ("run-b", 2),
+    gseqs = [line["gseq"] for line in expected["events"]]
+    assert gseqs == sorted(gseqs)
+    assert [line["run_id"] for line in expected["events"]] == [
+        EVENTS_RUN_B,
+        EVENTS_RUN_A,
+        EVENTS_RUN_B,
+        EVENTS_RUN_A,
     ]
 
 
-def test_watch_all_applies_since_to_each_runs_own_seq(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    run_a = _write_watch_journal(tmp_path, "run-a", [1, 2, 3])
-    run_b = _write_watch_journal(tmp_path, "run-b", [1, 2, 3, 4])
+def test_watch_project_reads_only_that_projects_runs(escalation_repos, monkeypatch):
+    root, other = escalation_repos
+    rows = _insert_rows(
+        (other, EVENTS_RUN_B, "run_upsert", {"n": 0}),
+        (root, EVENTS_RUN_A, "run_upsert", {"n": 1}),
+        (other, EVENTS_RUN_B, "story_upsert", {"n": 2}),
+        (root, EVENTS_RUN_A, "story_upsert", {"n": 3}),
+    )
+    root_lines = [_watch_event(row) for row in rows if row.run_id == EVENTS_RUN_A]
+    monkeypatch.setenv("HOME", str(root.parent))
 
-    result = _watch("--all", "--since", "2")
+    for spelling in (str(root), f"~/{root.name}", str(other / ".." / root.name)):
+        assert _watch_data("--project", spelling) == {"events": root_lines}, spelling
+    assert _watch_data("--project", str(other), "--since", "1") == {
+        "events": [_watch_event(rows[2])]
+    }
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["data"]["events"] == run_a[2:] + run_b[2:]
+    deleted = root.parent / "deleted-repo"
+    assert _watch_data("--project", str(deleted)) == {"events": []}
+    assert _project_count() == 2
 
 
-def test_watch_all_with_no_runs_directory_returns_empty(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+def test_watch_project_matches_relative_and_symlinked_spellings(
+    escalation_repos, monkeypatch
+):
+    """Review Focus 2: a relative path, a symlink to the root, and a file."""
+    root, other = escalation_repos
+    rows = _insert_rows(
+        (root, EVENTS_RUN_A, "run_upsert", {}),
+        (other, EVENTS_RUN_B, "run_upsert", {}),
+    )
+    link = root.parent / "link-to-recorded"
+    link.symlink_to(root, target_is_directory=True)
+    a_file = root / "README.md"
+    a_file.write_text("not a repository\n", encoding="utf-8")
+    monkeypatch.chdir(root.parent)
+    expected = {"events": [_watch_event(rows[0])]}
 
-    result = _watch("--all")
+    assert _watch_data("--project", root.name) == expected
+    assert _watch_data("--project", str(link)) == expected
+    assert _watch_data("--project", str(a_file)) == {"events": []}
+    assert _project_count() == 2
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"ok": True, "data": {"events": []}}
+
+def test_watch_all_with_no_database_returns_empty_and_creates_nothing(
+    projection, tmp_path
+):
+    for argv in (["--all"], ["--all-projects"], ["--project", str(projection)]):
+        assert _watch_data(*argv) == {"events": []}, argv
+
+    assert not paths.db_path().exists()
     assert not _watch_runs_dir(tmp_path).exists()
 
 
-def test_watch_all_skips_a_run_with_no_journal_yet(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    run_a = _write_watch_journal(tmp_path, "run-a", [1])
-    (_watch_runs_dir(tmp_path) / "run-not-started").mkdir()
-    (_watch_runs_dir(tmp_path) / "stray.txt").write_text("not a run\n")
+def test_watch_reads_past_a_writer_holding_a_write_transaction(projection):
+    """Review Focus 3: an uncommitted insert neither blocks the read nor shows."""
+    rows = _insert_events(projection, (EVENTS_RUN_A, "run_upsert"))
+    writer, project_id = _open_event_writer(projection)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        store_events.insert(
+            writer,
+            project_id=project_id,
+            run_id=EVENTS_RUN_A,
+            ts=EVENT_TS,
+            kind="story_upsert",
+            payload={},
+            source="live",
+        )
 
-    result = _watch("--all")
+        assert _watch_data("--all") == {"events": [_watch_event(rows[0])]}
+        assert _watch_data(EVENTS_RUN_A) == {"events": [_watch_event(rows[0])]}
+    finally:
+        writer.rollback()
+        writer.close()
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["data"]["events"] == run_a
-    assert sorted(p.name for p in (_watch_runs_dir(tmp_path) / "run-not-started").iterdir()) == []
 
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["no-such-run", "--project", "."], WATCH_PROJECT_WITH_RUN),
+        (["no-such-run", "--project", ".", "--all"], WATCH_PROJECT_WITH_RUN),
+        (["no-such-run", "--project", ".", "--since", "-1"], WATCH_PROJECT_WITH_RUN),
+        (["--project", ".", "--all"], WATCH_PROJECT_WITH_ALL),
+        (["--project", ".", "--all-projects"], WATCH_PROJECT_WITH_ALL),
+        (["--project", ".", "--all", "--since", "-1"], WATCH_PROJECT_WITH_ALL),
+        (["run-a", "--all-projects"], WATCH_EXACTLY_ONE),
+        (["run-a", "--all"], WATCH_EXACTLY_ONE),
+        ([], WATCH_EXACTLY_ONE),
+        (["--since", "-1"], WATCH_EXACTLY_ONE),
+        (["--since", "3"], WATCH_EXACTLY_ONE),
+    ],
+)
+def test_watch_selector_refusals(projection, monkeypatch, argv, message):
+    """The first failing check wins, and every one comes before the database
+    is opened, with or without --follow (no hello, no poll)."""
+    _refuse_to_open_the_db(monkeypatch)
 
-def test_watch_all_corrupt_journal_is_an_envelope(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1])
-    _write_watch_journal(tmp_path, "run-b", [1], tail="not json\n")
+    assert _watch_refusal(*argv) == {"type": "CliError", "message": message}
 
-    result = _watch("--all")
-
-    assert result.exit_code == cli.EXIT_ERROR, result.output
-    envelope = json.loads(result.stdout)
+    followed, sleeps = _watch_follow(monkeypatch, *argv)
+    assert followed.exit_code == cli.EXIT_ERROR, followed.output
+    assert sleeps == []
+    lines = followed.stdout.splitlines()
+    assert len(lines) == 1, followed.stdout
+    envelope = json.loads(lines[0])
     assert envelope["ok"] is False
-    assert envelope["error"]["type"] == "CorruptJournalError"
-
-
-def test_watch_rejects_run_id_with_all_and_neither(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    _write_watch_journal(tmp_path, "run-a", [1])
-
-    for argv in (["run-a", "--all"], []):
-        result = _watch(*argv)
-        assert result.exit_code == cli.EXIT_ERROR, (argv, result.output)
-        envelope = json.loads(result.stdout)
-        assert envelope["ok"] is False, argv
-        assert envelope["error"]["type"] == "CliError", argv
-        message = envelope["error"]["message"]
-        assert "RUN_ID" in message and "--all" in message, argv
+    assert envelope["error"] == {"type": "CliError", "message": message}
 
 
 # ── am watch --follow (card cba3e48f) ──────────────────────────────────────
@@ -13005,15 +13105,21 @@ def test_watch_from_now_refused_without_follow(tmp_path, monkeypatch):
         _assert_one_cli_error(result, "--from-now", "--follow")
 
 
-def test_watch_from_now_keeps_existing_refusals_and_since_zero(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    written = _write_watch_journal(tmp_path, "run-a", [1, 2])
+def test_watch_from_now_keeps_existing_refusals_and_since_zero(
+    projection, tmp_path, monkeypatch
+):
+    rows = _insert_events(
+        projection,
+        (EVENTS_RUN_A, "run_upsert"),
+        (EVENTS_RUN_A, "story_upsert"),
+    )
 
     # RUN_ID handling is unchanged under --from-now: no hello line, no polls.
     for argv, kind in (
         (["no-such-run", "--from-now"], "UnknownRunError"),
         (["../escape", "--from-now"], "UnknownRunError"),
-        (["run-a", "--all", "--from-now"], "CliError"),
+        ([EVENTS_RUN_A, "--all", "--from-now"], "CliError"),
+        ([EVENTS_RUN_A, "--project", str(projection), "--from-now"], "CliError"),
     ):
         refused, sleeps = _watch_follow(monkeypatch, *argv)
         assert refused.exit_code == cli.EXIT_ERROR, (argv, refused.output)
@@ -13027,10 +13133,13 @@ def test_watch_from_now_keeps_existing_refusals_and_since_zero(tmp_path, monkeyp
 
     # Without --from-now, `--since 0` is still the default and `--since -1`
     # is still refused by the old check.
-    zero = _watch("run-a", "--since", "0")
+    zero = _watch(EVENTS_RUN_A, "--since", "0")
     assert zero.exit_code == 0, zero.output
-    assert json.loads(zero.stdout) == {"ok": True, "data": {"events": written}}
-    negative = _watch("run-a", "--since", "-1")
+    assert json.loads(zero.stdout) == {
+        "ok": True,
+        "data": {"events": [_watch_event(row) for row in rows]},
+    }
+    negative = _watch(EVENTS_RUN_A, "--since", "-1")
     _assert_one_cli_error(negative, "--since must be 0 or more")
 
 
