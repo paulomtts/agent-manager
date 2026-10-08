@@ -754,22 +754,27 @@ Watching a run id that does not exist creates nothing.
 `--follow` turns the output into a stream. The first line is a hello line, the only line that is not a journal line:
 
 ```
-{"am":"0.1.0","event":"watch","runs_dir":"/home/you/.local/share/agent-manager/runs","schema":2}
+{"am":"0.1.0","cursor_reset":false,"event":"watch","head":1204,"runs_dir":"/home/you/.local/share/agent-manager/runs","schema":2,"store_id":"3f2a9c0e8b7d4e6fa1c2b3d4e5f60718"}
 ```
 
-`am` is the version of `am` printing the stream, and `runs_dir` is the `<data dir>/runs` it reads. After the hello line comes every journal line above `--since` (the backlog), then each line as it is appended, one JSON object per line, until stopped. Each is a bare journal line with no envelope, flushed as soon as it is written. With `--all`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
+- `am` is the version of `am` printing the stream, and `runs_dir` is `<data dir>/runs`.
+- `head` is the largest `gseq` on the machine when the stream started, `0` with no `am.db`.
+- `store_id` is the identity of the `am.db` the stream reads, the same value `am runs` and `am status` report, or `null` with no `am.db` (see [Snapshots and cursors](#snapshots-and-cursors)).
+- `cursor_reset` is `true` when `--since-seq` was above `head`: that cursor cannot belong to this database, so the stream starts at head instead and prints every event recorded after it. A reset is not an error. It is `false` otherwise.
 
-With `--from-now`, the hello line comes first as always, then no backlog: only lines appended after the command started. A line that was still being written when the command started is printed once it is complete. A run with no complete line yet when the command started, and with `--all` a run that starts later, is printed from its first line. The hello line is the same, `"schema":2`.
+After the hello line comes the backlog, every selected event above the cursor, then each event as it is recorded, one JSON object per line, until stopped. The cursor starts at 0, at `--since-seq` when it is at or below `head`, and at `head` with `--from-now` or a reset. Each line is a bare journal line plus `gseq`, with no envelope, flushed as soon as it is read. With `--all`, `--all-projects` or `--project`, a run that starts after the stream began is picked up. Stream lines are always compact: `--pretty` only indents a refusal's envelope.
 
-Every refusal listed above, a corrupt journal included, comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream starts with `"event": "watch"`.
+With `--from-now`, the hello line comes first as always, then no backlog: only events recorded after the command started. The hello line is the same, `"schema":2`.
 
-Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. A journal that turns corrupt after the stream has started cannot get an envelope, because every line after the hello line must be a journal line: `am watch` prints `am watch: <message>` on stderr and exits 3.
+Every refusal listed above comes as the usual envelope with exit code 3 before any stream line is written. So the first line tells a stream from a refusal: only a refusal has an `"ok"` key, and only a stream's first line has `"event":"watch"`.
 
-`am watch --follow` checks for new lines about every 250 ms. That interval is internal and is not part of the contract.
+Ctrl-C, or the reader closing the pipe, ends the stream with exit code 0 and nothing on stderr. An error after the hello line, such as a database that stays busy, cannot get an envelope, because every line after the hello line must be a journal line: `am watch` prints `am watch: <message>` on stderr and exits 3.
+
+`am watch --follow` checks for new events about every 250 ms. That interval is internal and is not part of the contract.
 
 #### The journal line
 
-Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`):
+Every event, in the envelope's `events` and on the stream, is one journal line (`JournalLine` in `src/agent_manager/store/journal.py`) plus `gseq`. This is a line as a run's `journal.jsonl` file holds it, without `gseq`:
 
 ```
 {"attempt":null,"card":"<subtask-id>","event":"phase_upsert","payload":{"detail":null,"ended_at":null,"kind":"agent","name":"implement","started_at":"2026-10-02T14:03:11.410000Z","status":"started"},"phase":"implement","run_id":"20261002T140000Z-19efcddc","seq":17,"story":"<story-id>","ts":"2026-10-02T14:03:11.412000Z"}
@@ -777,17 +782,18 @@ Every event, in the envelope's `events` and on the stream, is one journal line (
 
 | Field | What it holds |
 |---|---|
-| `seq` | the line's number in its run's journal, increasing; a run's other events (lease and control) take numbers too, so the first line may be above 1 and numbers may skip |
+| `seq` | the line's number within its run, increasing; a run's lease and control events take numbers too, so in a `journal.jsonl` file the first line may be above 1 and numbers may skip |
+| `gseq` | the event's number across every run on the machine: increasing, may skip. It is on the lines `am watch`, `am events` and `am export` print; not in a `journal.jsonl` file |
 | `ts` | when the line was written, ISO 8601 in UTC |
 | `run_id` | the run |
-| `event` | which kind of node the line records, one of the five below |
+| `event` | which kind of event the line records, one of the ten below |
 | `story` | the story id; `null` on a `run_upsert` |
 | `card` | the subtask id on subtask, phase and attempt lines; otherwise `null` |
 | `phase` | the phase name on phase and attempt lines; otherwise `null` |
 | `attempt` | the attempt number on an attempt line; otherwise `null` |
 | `payload` | the node itself, as the run recorded it, without its children |
 
-Every line records one node of the run's tree. A status change is the same node recorded again with its new status; there is no separate transition event.
+Five kinds record one node of the run's tree each. A status change is the same node recorded again with its new status; there is no separate transition event.
 
 | `event` | Covers |
 |---|---|
@@ -797,6 +803,8 @@ Every line records one node of the run's tree. A status change is the same node 
 | `phase_upsert` | a phase of a subtask: `started`, `done` or `failed`, with `detail` saying why a phase failed, or, on a `started` one, that it is waiting for a usage limit to reset (see [Usage limits](#usage-limits)) |
 | `attempt_upsert` | one dispatch of a phase: `started`, then `ok`, `schema_invalid`, `gate_failed` or `harness_error`, with its `exit_code` and `duration` |
 
+The other five kinds record lease and control facts: `control_requested`, `control_handled`, `lease_acquired`, `lease_taken_over` and `claim_conflict`. They are only in output read from `am.db` (`am watch`, `am events` and `am export`), never in a `journal.jsonl` file, and their payloads are not part of the contract: ignore what you do not recognize.
+
 There is no separate "run finished" or "escalation" event. A run has finished when a `run_upsert` line's `payload.status` is `done`, `escalated`, `stopped` or `canceled`, and it escalated when that status is `escalated`.
 
 Journals written before this version of `am` record a canceled run as `cancelled`, and those lines are never rewritten. Read both spellings as the same status. `am status` and `am runs` report such a run as `canceled`.
@@ -805,9 +813,9 @@ Journals written before this version of `am` record a canceled run as `cancelled
 
 The journal line is a public contract, version 1. A consumer that follows these rules keeps working across `am` versions:
 
-- Cursor by `(run_id, seq)`, never by time or line count. To pick up where you left off, pass the highest `seq` you have seen as `--since`. The cursor survives a lease takeover: the process that takes a run over keeps appending to the same journal at a higher `seq`.
+- Cursor by `gseq`, never by time or line count. To pick up where you left off, pass the highest `gseq` you have seen as `--since-seq`; it works the same for one run, `--project` and `--all`. Cursoring by `(run_id, seq)` with `--since` still works for one run. Either cursor survives a lease takeover: the process that takes a run over keeps recording at a higher `seq` and `gseq`. After a restore of `am.db`, drop every cursor and read a snapshot again (see [Snapshots and cursors](#snapshots-and-cursors)).
 - Ignore any `event` value, and any `payload` key, you do not recognize. A newer `am` may write either.
-- An unterminated final line is a write in flight, not a malformed file. `am watch` skips it, and emits it once it is complete.
+- An unterminated final line in a `journal.jsonl` file you read yourself is a write in flight, not a malformed file: skip it until it is complete. `am watch` reads `am.db` and never prints a partial line.
 - Know the synthetic ids. Story `"integrate"` is [Integrate](#integrate)'s resolver, story `"bases"` holds the [merged-base](#multiple-blockers) resolvers, and under it each resolver is subtask `"base-<story id>"`. A run's `repo_dir` and `milestone_id` (`null` on a `--card` run, the milestone's id on a `--milestone` or `--board` run, the parent milestone's id on a `--story` run) are in the `payload` of its first line, a `run_upsert`. So is `payload.config.story_id`, the story's id, which is `null` unless the run is an `am run --story` run. A `--board` run has no journal of its own: each milestone it starts is a run with its own journal, and the synthetic ids can recur across them, so key them by `(run_id, story)` (see [Running every open milestone with `--board`](#running-every-open-milestone-with---board)).
 - The hello line's `schema` field is where a schema bump is signaled. It is `2` today. Schema 1 became 2 when `am` started writing a canceled run's status as `canceled` instead of `cancelled`; nothing else changed. Lines are replayed as stored, so a schema-2 stream still carries `cancelled` for a run canceled by an older `am`: accept both, whatever the schema.
 

@@ -1123,3 +1123,61 @@ def test_watch_documents_selectors_and_since_seq():
     anchors = _assert_anchors_resolve(intro)
     assert _slug(DATA_DIR_TITLE) in anchors
     assert _slug(SNAPSHOTS_TITLE) in anchors
+
+
+FOLLOW_TITLE = "Following with `--follow`"
+
+
+def test_watch_hello_example_matches_code():
+    examples = [
+        item for item in _fenced_json_lines(_section(FOLLOW_TITLE)) if item[1].get("event") == "watch"
+    ]
+    assert len(examples) == 1
+    raw, hello = examples[0]
+    assert set(hello) == set(cli._watch_hello(head=0, cursor_reset=False, store_id=None))
+    assert hello["schema"] == 2
+    assert isinstance(hello["head"], int) and not isinstance(hello["head"], bool)
+    assert isinstance(hello["cursor_reset"], bool)
+    assert hello["store_id"] is None or re.fullmatch(r"[0-9a-f]{32}", hello["store_id"])
+    assert hello["runs_dir"].endswith("/agent-manager/runs")
+    assert raw == cli.render(hello)
+
+
+def test_watch_follow_section_describes_the_start():
+    section = _section(FOLLOW_TITLE)
+    for phrase in (
+        "`head` is the largest `gseq` on the machine when the stream started, `0` with no `am.db`.",
+        "`cursor_reset` is `true` when `--since-seq` was above `head`",
+        "The cursor starts at 0, at `--since-seq` when it is at or below `head`,"
+        " and at `head` with `--from-now` or a reset.",
+        "`am watch: <message>`",
+        'The hello line is the same, `"schema":2`.',
+    ):
+        assert phrase in section, phrase
+    assert "a corrupt journal" not in section
+    assert "A line that was still being written" not in _section("Watching a run")
+    assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
+
+
+def test_journal_line_lists_every_event_kind():
+    section = _section("The journal line")
+    for kind in typing.get_args(store_journal.EventKind):
+        assert f"`{kind}`" in section, kind
+    rows = [line for line in section.splitlines() if line.startswith("| `gseq` |")]
+    assert len(rows) == 1
+    assert "increasing, may skip" in rows[0]
+    assert "not in a `journal.jsonl` file" in rows[0]
+    assert "one of the ten below" in section
+    assert "one of the five below" not in section
+    assert LEGACY_JOURNAL_NOTE in section
+    assert "`started`, then `done`, `escalated`, `stopped` or `canceled` |" in section
+
+
+def test_stream_section_cursors_by_gseq():
+    section = _section("Reading the stream safely")
+    assert "Cursor by `gseq`" in section
+    assert "pass the highest `gseq` you have seen as `--since-seq`" in section
+    assert "`(run_id, seq)` with `--since` still works" in section
+    assert "in a `journal.jsonl` file you read yourself" in section
+    assert WATCH_SCHEMA_NOTE in section.splitlines()
+    assert _slug(SNAPSHOTS_TITLE) in _assert_anchors_resolve(section)
