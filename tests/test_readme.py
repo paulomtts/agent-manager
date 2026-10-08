@@ -1073,27 +1073,43 @@ WATCH_STALE = (
     "a run id with no journal",
 )
 WATCH_REFUSALS = (
-    ("- `RUN_ID` together with `--project`;", {"run_id": "r", "project": Path("p")}),
+    (
+        "- `RUN_ID` together with `--project`;",
+        {"run_id": "r", "project": Path("p")},
+        "--project cannot be combined with RUN",
+    ),
     (
         "- `--project` together with `--all` or `--all-projects`;",
         {"run_id": None, "all_runs": True, "project": Path("p")},
+        "--project cannot be combined with --all or --all-projects",
     ),
     (
         "- none of `RUN_ID`, `--all`, `--all-projects` and `--project`,"
         " or `RUN_ID` together with `--all` or `--all-projects`;",
         {"run_id": None},
+        "give exactly one of RUN_ID",
     ),
-    ("- a `--since` below 0;", {"run_id": "r", "since": -1}),
-    ("- a `--since-seq` below 0;", {"run_id": "r", "since_seq": -1}),
+    ("- a `--since` below 0;", {"run_id": "r", "since": -1}, "--since must be 0 or more"),
+    (
+        "- a `--since-seq` below 0;",
+        {"run_id": "r", "since_seq": -1},
+        "--since-seq must be 0 or more",
+    ),
     (
         "- `--from-now` together with `--since`, any value, 0 included;",
         {"run_id": "r", "follow": True, "from_now": True, "since_given": True},
+        "--from-now and --since are exclusive",
     ),
     (
         "- `--from-now` together with `--since-seq`, any value, 0 included;",
         {"run_id": "r", "follow": True, "from_now": True, "since_seq": 0},
+        "--from-now and --since-seq are exclusive",
     ),
-    ("- `--from-now` without `--follow`;", {"run_id": "r", "from_now": True}),
+    (
+        "- `--from-now` without `--follow`;",
+        {"run_id": "r", "from_now": True},
+        "--from-now needs --follow",
+    ),
 )
 
 
@@ -1114,11 +1130,11 @@ def test_watch_documents_selectors_and_since_seq():
 
     # Every refusal bullet is a real refusal, in the order the code checks them.
     positions = []
-    for bullet, call in WATCH_REFUSALS:
+    for bullet, call, message in WATCH_REFUSALS:
         assert bullet in intro, bullet
         positions.append(intro.index(bullet))
         kwargs = dict(call)
-        with pytest.raises(cli.CliError):
+        with pytest.raises(cli.CliError, match=re.escape(message)):
             cli.watch_for(kwargs.pop("run_id"), **kwargs)
     assert positions == sorted(positions)
 
@@ -1193,41 +1209,63 @@ EVENTS_ESCALATIONS_SHAPE = (
     "`am events --escalations [--project PATH] [--after-seq N] [--limit N] [--pretty]`"
 )
 EVENTS_REFUSALS = (
-    ("- a `--limit` below 1;", lambda: cli._check_event_values(limit=0)),
-    ("- an `--after-seq` below 0;", lambda: cli._check_event_values(after_seq=-1)),
-    ("- a `--tail` below 1;", lambda: cli._check_event_values(tail=0)),
-    ("- a `--before-seq` below 1;", lambda: cli._check_event_values(before_seq=0)),
+    (
+        "- a `--limit` below 1;",
+        lambda: cli._check_event_values(limit=0),
+        "--limit must be at least 1",
+    ),
+    (
+        "- an `--after-seq` below 0;",
+        lambda: cli._check_event_values(after_seq=-1),
+        "--after-seq must be 0 or more",
+    ),
+    (
+        "- a `--tail` below 1;",
+        lambda: cli._check_event_values(tail=0),
+        "--tail must be at least 1",
+    ),
+    (
+        "- a `--before-seq` below 1;",
+        lambda: cli._check_event_values(before_seq=0),
+        "--before-seq must be at least 1",
+    ),
     (
         "- `--escalations` together with `RUN`;",
         lambda: cli._check_events_form(
             "r", escalations=True, project=None, tail=None, before_seq=None
         ),
+        "--escalations cannot be combined with RUN",
     ),
     (
         "- `--project` without `--escalations`;",
         lambda: cli._check_events_form(
             "r", escalations=False, project=Path("p"), tail=None, before_seq=None
         ),
+        "--project requires --escalations",
     ),
     (
         "- neither `RUN` nor `--escalations`;",
         lambda: cli._check_events_form(
             None, escalations=False, project=None, tail=None, before_seq=None
         ),
+        "RUN is required unless --escalations is given",
     ),
     (
         "- `--escalations` together with `--tail` or `--before-seq`;",
         lambda: cli._check_events_form(
             None, escalations=True, project=None, tail=1, before_seq=None
         ),
+        "--escalations cannot be combined with --tail",
     ),
     (
         "- `--tail` together with `--after-seq`, `--before-seq` or `--limit`;",
         lambda: cli.events_for("r", tail=1, limit=1),
+        "--tail cannot be combined with --limit",
     ),
     (
         "- `--before-seq` together with `--after-seq`.",
         lambda: cli.events_for("r", before_seq=5, after_seq=1),
+        "--before-seq cannot be combined with --after-seq",
     ),
 )
 
@@ -1269,10 +1307,10 @@ def test_events_section_documents_every_flag_and_refusal():
     assert "as `UnknownRunError`, exit code 3" in section
 
     positions = []
-    for bullet, call in EVENTS_REFUSALS:
+    for bullet, call, message in EVENTS_REFUSALS:
         assert bullet in section, bullet
         positions.append(section.index(bullet))
-        with pytest.raises(cli.CliError):
+        with pytest.raises(cli.CliError, match=re.escape(message)):
             call()
     assert positions == sorted(positions)
 
