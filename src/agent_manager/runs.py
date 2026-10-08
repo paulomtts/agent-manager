@@ -250,7 +250,7 @@ def select_resumable(run: models.Run) -> tuple[models.StoryRun, models.SubtaskRu
 
     Pure over the tree `load_run` assembled, like `find_subtask`: which subtask
     is resumable is a question about recorded state, and answering it before any
-    store is opened is what keeps a refusal from minting a run directory.
+    store is opened is what keeps a refusal from writing anything.
 
     Exactly one `started` or `stopped` subtask is the resumable shape. A
     `stopped` subtask (addendum P4) was parked between phases, and its parked

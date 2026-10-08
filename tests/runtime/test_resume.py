@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import eventlines
 from pygents import Agent, AgentRegistry, ToolRegistry
 from pygents.errors import UnregisteredAgentError
 
@@ -192,7 +193,7 @@ def _head(agent: dict) -> str:
 def _phase_rows(opened) -> list[tuple[str | None, str]]:
     return [
         (line.phase, line.payload["status"])
-        for line in opened.journal.read()
+        for line in eventlines.run_lines(opened.run_id)
         if line.event == "phase_upsert"
     ]
 
@@ -399,7 +400,7 @@ def test_a_changed_workflow_is_refused(store):
     changed = Workflow("five", wf.phases + (Step("f", _extra),))
     assert changed.digest() != wf.digest()
     rows_before = _reasons(store)
-    journal_before = len(store.journal.read())
+    journal_before = len(eventlines.run_lines(store.run_id))
 
     with pytest.raises(runtime_engine.CheckpointMismatch) as caught:
         _go(changed, store, resume_from=parked)
@@ -409,7 +410,7 @@ def test_a_changed_workflow_is_refused(store):
     assert changed.digest() in str(caught.value)
     assert ran == ["a"]
     assert _reasons(store) == rows_before
-    assert len(store.journal.read()) == journal_before
+    assert len(eventlines.run_lines(store.run_id)) == journal_before
 
 
 def test_a_refused_resume_leaves_the_card_runnable(store):
