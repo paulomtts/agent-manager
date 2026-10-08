@@ -363,3 +363,42 @@ def test_cursor_at_head_is_not_a_reset(repo, am, children):
 
     line = follower.next_json()
     assert line["gseq"] == written and line["run_id"] == "at-d", line
+
+
+@pytest.mark.e2e_fake
+def test_replaced_database_has_a_new_store_id(repo, am, children):
+    """D:246-249, D:550-552, C6. The new head is at or above the old cursor,
+    so `cursor_reset` cannot tell: only `store_id` does."""
+    _record(repo, "old-a", "old-b")
+    first = _snapshot(am)
+    assert first["as_of_seq"] == 2, first
+    _replace_database()
+    _record(repo, *(f"new-{i}" for i in range(5)))
+
+    second = _snapshot(am)
+    assert second["as_of_seq"] == 5, second
+    assert second["store_id"] and second["store_id"] != first["store_id"], (first, second)
+    status = _data(*am("status", "new-0"))
+    assert status["store_id"] == second["store_id"], status
+
+    follower, hello = children.follow("--since-seq", str(first["as_of_seq"]))
+    assert hello["cursor_reset"] is False, hello
+    assert hello["head"] == 5, hello
+    assert hello["store_id"] == second["store_id"], hello
+    newer = [event for event in _events(am) if event["gseq"] > first["as_of_seq"]]
+    assert _gseqs(newer) == [3, 4, 5], newer
+    assert follower.until_gseq(5) == newer
+
+
+@pytest.mark.e2e_fake
+def test_replaced_smaller_database_resets_and_has_a_new_store_id(repo, am, children):
+    """D:243-252, C5, C6. The old cursor is above the new head: reset, and a new id."""
+    _record(repo, "old-a", "old-b")
+    first = _snapshot(am)
+    _replace_database()
+    _record(repo, "new-a")
+
+    _, hello = children.follow("--since-seq", str(first["as_of_seq"]))
+    assert hello["cursor_reset"] is True, hello
+    assert hello["head"] == 1, hello
+    assert hello["store_id"] and hello["store_id"] != first["store_id"], (first, hello)
